@@ -1,2 +1,2 @@
 # devboule
-An integrated dev dashboard orchestrating AI agents via MCP and LanceDB, visualized through an ancient Greek city-builder grid.
+A development dashboard and agent orchestrator powered by an MCP server and LanceDB vector memory, featuring a Caesar III-style isometric grid to manage and monitor your coding workflows.
