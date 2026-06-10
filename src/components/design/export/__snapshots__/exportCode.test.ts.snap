@@ -1,0 +1,35 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`exportCode — absolute mode > matches the absolute snapshot 1`] = `
+"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Landing</title>
+</head>
+<body>
+<div style="position:relative;width:1440px;height:1024px;margin:0 auto">
+<div data-node-id="hero" style="position:absolute;left:80px;top:80px;z-index:1;width:420px;height:auto"><section data-node-id="hero"><h1>Hi</h1></section></div>
+<div data-node-id="cta" style="position:absolute;left:80px;top:260px;z-index:2;width:160px;height:48px"><button data-node-id="cta">Go</button></div>
+</div>
+</body>
+</html>"
+`;
+
+exports[`exportCode — flow mode > matches the flow snapshot 1`] = `
+"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Landing</title>
+</head>
+<body>
+<div style="display:flex;flex-direction:column;gap:24px;padding:24px;max-width:1200px;margin:0 auto">
+<div data-node-id="hero" style="width:420px;max-width:100%"><section data-node-id="hero"><h1>Hi</h1></section></div>
+<div data-node-id="cta" style="width:160px;max-width:100%"><button data-node-id="cta">Go</button></div>
+</div>
+</body>
+</html>"
+`;

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Projects — Dev Harness</title>
+    <style>
+      /* The real app's global index.css forces html,body {overflow:hidden;
+         height:100%} for the desktop shell, which clips everything below the
+         fold in this harness (the TASK board went invisible). Override it so
+         the harness scrolls normally as a plain web page. */
+      html,
+      body {
+        margin: 0;
+        overflow: auto !important;
+        height: auto !important;
+        min-height: 100%;
+        background: #f4f0e6;
+        font-family: Inter, system-ui, -apple-system, sans-serif;
+        color: #4a4742;
+      }
+      /* Clear the fixed top bar so content is not hidden under it. */
+      #projects-dev-host {
+        padding-top: 48px;
+      }
+      #projects-dev-bar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 50;
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        padding: 8px 14px;
+        background: rgba(255, 255, 255, 0.92);
+        border-bottom: 1px solid #ede8e3;
+        backdrop-filter: blur(6px);
+        font-size: 12px;
+      }
+      #projects-dev-bar strong {
+        color: #2d2a26;
+        font-size: 13px;
+      }
+      #projects-dev-info {
+        margin-left: auto;
+        color: #6b6661;
+        font-family: "JetBrains Mono", monospace;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 50vw;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="projects-dev-bar">
+      <strong>Projects · Dev Harness</strong>
+      <span id="projects-dev-info">Mock data · no Tauri · no backend</span>
+    </div>
+    <div id="projects-dev-host"></div>
+    <script type="module" src="/projects-dev.tsx"></script>
+  </body>
+</html>

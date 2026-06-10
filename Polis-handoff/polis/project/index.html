@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Polis — Atlante degli edifici</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --parch:#efe7d6; --parch2:#e6dcc6; --ink:#34302a; --muted:#7a7163;
+    --line:#cdc2a8; --accent:#b23b34; --accent2:#2f5d8a; --gold:#c98a2b;
+    --panel:#f5efe1;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;overflow:hidden;background:#cdd6d6;
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);}
+  #app{display:flex;height:100vh;width:100vw;}
+  /* ---- sidebar ---- */
+  #panel{width:286px;flex:0 0 286px;height:100%;background:
+      linear-gradient(180deg,var(--panel),var(--parch2));
+    border-right:1px solid var(--line);display:flex;flex-direction:column;
+    box-shadow:2px 0 18px rgba(0,0,0,.08);z-index:5;}
+  .pad{padding:18px 18px 14px;}
+  .brand{display:flex;align-items:baseline;gap:9px;border-bottom:1px solid var(--line);}
+  .brand h1{font-family:"Cinzel",serif;font-weight:700;font-size:21px;letter-spacing:.06em;
+    margin:0 0 2px;color:#2c2722;}
+  .brand .sub{font-family:"Spline Sans Mono",monospace;font-size:10.5px;color:var(--muted);
+    letter-spacing:.02em;}
+  .scroll{overflow-y:auto;flex:1;}
+  section{padding:14px 18px;border-bottom:1px solid var(--line);}
+  .lbl{font-family:"Spline Sans Mono",monospace;font-size:10px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 9px;font-weight:600;}
+  /* segmented */
+  .seg{display:flex;background:#e2d8c2;border:1px solid var(--line);border-radius:8px;
+    padding:3px;gap:3px;}
+  .seg button{flex:1;border:0;background:transparent;padding:7px 4px;border-radius:6px;
+    font:inherit;font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer;
+    transition:.15s;}
+  .seg button.on{background:var(--ink);color:var(--parch);box-shadow:0 1px 4px rgba(0,0,0,.18);}
+  /* slider */
+  .tier{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:6px;}
+  .tier .name{font-family:"Cinzel",serif;font-size:16px;font-weight:600;}
+  .tier .num{font-family:"Spline Sans Mono",monospace;font-size:11px;color:var(--muted);}
+  input[type=range]{width:100%;-webkit-appearance:none;height:5px;border-radius:4px;
+    background:linear-gradient(90deg,var(--accent),var(--gold));outline:none;margin:6px 0 4px;}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;
+    border-radius:50%;background:var(--panel);border:2px solid var(--ink);cursor:pointer;
+    box-shadow:0 1px 3px rgba(0,0,0,.3);}
+  .ticks{display:flex;justify-content:space-between;font-family:"Spline Sans Mono",monospace;
+    font-size:9px;color:var(--muted);margin-top:2px;}
+  /* toggles */
+  .row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;}
+  .row span{font-size:13px;}
+  .sw{width:40px;height:23px;border-radius:14px;background:#cabd a2;background:#cabfa2;
+    border:1px solid var(--line);position:relative;cursor:pointer;transition:.18s;flex:0 0 auto;}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:.18s;}
+  .sw.on{background:var(--accent2);}
+  .sw.on::after{left:20px;}
+  select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;
+    background:var(--panel);font:inherit;font-size:13px;color:var(--ink);cursor:pointer;}
+  .hint{font-family:"Spline Sans Mono",monospace;font-size:10px;line-height:1.7;color:var(--muted);}
+  .hint b{color:var(--ink);font-weight:600;}
+  .mapctl{display:none;}
+  .ghost{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:8px;
+    font:inherit;font-size:12px;font-weight:600;color:var(--ink);cursor:pointer;width:100%;}
+  .ghost:hover{background:#ece2cd;}
+  /* stage */
+  #stagewrap{flex:1;position:relative;min-width:0;}
+  #stage{position:absolute;inset:0;}
+  #hud{position:absolute;left:16px;bottom:14px;font-family:"Spline Sans Mono",monospace;
+    font-size:10.5px;color:#4a463e;background:rgba(245,239,225,.82);border:1px solid var(--line);
+    border-radius:8px;padding:7px 11px;backdrop-filter:blur(3px);pointer-events:none;}
+  #hud b{color:#1f1c17;}
+  .credit{padding:12px 18px;font-family:"Spline Sans Mono",monospace;font-size:9.5px;color:var(--muted);}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <div class="pad brand">
+      <h1>POLIS</h1>
+      <span class="sub">atlante · 14 edifici + ?</span>
+    </div>
+    <div class="scroll">
+      <section>
+        <p class="lbl">Vista</p>
+        <div class="seg" id="viewSeg">
+          <button data-v="gallery" class="on">Galleria</button>
+          <button data-v="map">Mappa</button>
+          <button data-v="people">Cittadini</button>
+        </div>
+      </section>
+
+      <section>
+        <p class="lbl">Taglia / livello</p>
+        <div class="tier"><span class="name" id="tierName">Synoikia</span><span class="num" id="tierNum">3 / 5</span></div>
+        <input type="range" id="level" min="1" max="5" step="1" value="3" />
+        <div class="ticks"><span>kalybe</span><span>oikia</span><span>synoikia</span><span>megaron</span><span>mnemeion</span></div>
+      </section>
+
+      <section>
+        <p class="lbl">Resa</p>
+        <div class="row"><span>Animazioni</span><div class="sw on" id="swAnim"></div></div>
+        <div class="row"><span>Griglia & footprint</span><div class="sw" id="swGrid"></div></div>
+        <div class="row"><span>Contorni</span><div class="sw" id="swOutline"></div></div>
+      </section>
+
+      <section>
+        <p class="lbl">Direzione del sole</p>
+        <div class="seg" id="sunSeg">
+          <button data-s="NW" class="on">↖ Nord-Ovest</button>
+          <button data-s="NE">↗ Nord-Est</button>
+        </div>
+      </section>
+
+      <section class="mapctl" id="mapctl">
+        <p class="lbl">Posa edificio</p>
+        <select id="typeSel"></select>
+        <div style="height:8px"></div>
+        <button class="ghost" id="clearMap">Svuota mappa</button>
+        <div style="height:8px"></div>
+        <p class="hint">Clic su una cella per posare · clic destro per rimuovere.</p>
+      </section>
+
+      <section>
+        <p class="lbl">Specifiche</p>
+        <p class="hint">
+          tile <b>96×48</b> · iso <b>2:1</b><br/>
+          ancora <b>front-bottom</b><br/>
+          sole <b>top-left</b> (3 toni/volume)<br/>
+          5 taglie per tipo · parti animate separate
+        </p>
+      </section>
+      <section>
+        <p class="lbl">Viste</p>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <a style="font-family:'Spline Sans Mono',monospace;font-size:11px;color:#2c2722;font-weight:600;text-decoration:none;">▸ Atlante edifici</a>
+          <a href="Meraviglie.html" style="font-family:'Spline Sans Mono',monospace;font-size:11px;color:var(--accent2);text-decoration:none;">▸ Meraviglie · 12</a>
+          <a href="Mappa.html" style="font-family:'Spline Sans Mono',monospace;font-size:11px;color:var(--accent2);text-decoration:none;">▸ Mappa · diorama</a>
+        </div>
+      </section>
+    </div>
+    <div class="credit">trascina = pan · rotella = zoom</div>
+  </aside>
+  <div id="stagewrap">
+    <canvas id="stage"></canvas>
+    <div id="hud"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.2/dist/pixi.min.js"></script>
+<script src="js/iso.js"></script>
+<script src="js/anims.js"></script>
+<script src="js/detail.js"></script>
+<script src="js/people.js"></script>
+<script src="js/buildings_a.js"></script>
+<script src="js/buildings_b.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

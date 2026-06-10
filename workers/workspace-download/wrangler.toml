@@ -1,0 +1,15 @@
+name = "aspis-workspace-download"
+main = "src/worker.js"
+compatibility_date = "2026-05-01"
+
+# The R2 bucket that holds the encrypted .aspiswspkg bootstrap packages.
+# Create it once:
+#   wrangler r2 bucket create aspis-bio-workspace
+[[r2_buckets]]
+binding = "WORKSPACE_BUCKET"
+bucket_name = "aspis-bio-workspace"
+
+# DOWNLOAD_TOKEN is intentionally NOT stored in this file. Set it as an encrypted
+# Worker secret instead:
+#   wrangler secret put DOWNLOAD_TOKEN
+# (paste a long random value, e.g. `openssl rand -base64 32`).

@@ -1,0 +1,82 @@
+[package]
+name = "aspis-management"
+version = "0.1.0"
+description = "Aspis Bio Management Dashboard"
+edition = "2021"
+
+[lib]
+name = "aspis_management_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+chrono = { version = "0.4", features = ["serde"] }
+# keyring 3.x ships NO default features: with none enabled it silently falls back
+# to the in-memory `mock` store, where `set_password` returns Ok but the secret is
+# kept only inside that one `Entry` object — a freshly constructed `Entry::new`
+# returns `NoEntry`. That made EVERY vault credential (Oracle LLM key, provider
+# tokens, device keys) appear to save yet never persist (Bug B). Enable the
+# platform-native OS keystores; keyring compiles only the one matching the build
+# target, so listing both is the correct Windows+macOS setup.
+keyring = { version = "3.6", features = ["windows-native", "apple-native"] }
+open = "5.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+# Async runtime primitives for the design-LLM transport (Phase 2 STEP 2): streaming
+# HTTP generation reads `reqwest::Response::bytes_stream()` on the shared async client,
+# and the buffered CLI path spawns + (on cancel) kills a child via `tokio::process`.
+# tokio is ALREADY in the tree transitively (via tauri); listing it directly with this
+# feature subset is purely additive feature unification — no new top-level crate.
+tokio = { version = "1", features = ["process", "io-util", "rt", "time", "sync", "macros"] }
+thiserror = "2"
+urlencoding = "2.1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+getrandom = "0.3"
+quick-xml = { version = "0.38", features = ["serialize"] }
+futures-util = "0.3"
+fs2 = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+tar = "0.4"
+zeroize = "1.8"
+subtle = "2.6"
+uuid = { version = "1", features = ["v4"] }
+notify = "6"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# App-hosted agent terminals (PTY). Cross-platform by design (ConPTY on Windows,
+# openpty on unix/macOS), so the dependency is NOT cfg-gated — only the program/
+# args choice at spawn time is. Same stack/crate as the studied terax-ai (Apache-2.0).
+portable-pty = "0.9"
+# ripgrep's gitignore engine. Polis' file scanner uses `ignore::gitignore::Gitignore`
+# to honor `.gitignore` + a custom `.oracleignore` at the scan root (gitignore-style,
+# nested), UNIFYING Polis' ignore policy with the Oracle indexer's. Only the matcher
+# (`Gitignore`/`GitignoreBuilder`) is used — NOT the threaded `Walk`/`WalkBuilder` — so
+# the existing hand-rolled DFS walk (symlink guard, MAX_FILES descent stop, cycle guard)
+# is preserved. `default-features = false` drops the unused parallel-walk machinery.
+ignore = { version = "0.4", default-features = false }
+
+# Windows-only WinRT/Win32 bindings. All `use windows::` call sites in src/ are
+# `#[cfg(windows)]`-gated, so target-gate the crate too: it is never fetched or
+# built on macOS/Linux.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+
+# macOS Touch ID / device-owner authentication (LocalAuthentication). Target-gated
+# so it is never fetched or built on Windows. UNVERIFIED on real hardware — see
+# the macOS branch in backend/auth.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSString", "NSError"] }
+objc2-local-authentication = { version = "0.2", features = ["LAContext", "LAError"] }
+block2 = "0.5"

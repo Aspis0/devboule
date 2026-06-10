@@ -1,0 +1,94 @@
+# Aspis Oracle ignore policy.
+#
+# SECURITY NOTE: this file is a SECOND, softer layer. The hard secret-exclusion
+# invariant is enforced in code by
+# oracle/ingestion/parser.py:is_sensitive_relative_path (default-deny) and is
+# applied even when this file is missing. Do NOT rely on this file alone for
+# secret safety. Patterns here additionally trim noise and large/binary data.
+
+# --- Secrets and credentials (defense in depth; also hardcoded) ---
+.secrets/
+aspis-secrets/
+.env
+.env.*
+.dev.vars
+credentials.json
+credentials.yaml
+credentials.yml
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.toml
+token.txt
+tokens.txt
+api-keys.json
+creds.txt
+vault.json
+*.key
+*.pem
+*.pfx
+*.p12
+id_rsa
+id_rsa.*
+
+# --- Agent + tooling state ---
+.claude/
+.codex/
+.deepseek/
+.agents/
+codex-sessions/
+codex-runs/
+
+# --- Dependencies and virtual environments ---
+node_modules/
+.venv/
+venv/
+.gradle-home/
+.gradle-home-release/
+
+# --- Build / dist / output artifacts ---
+build/
+dist/
+out/
+outputs/
+target/
+coverage/
+test-results/
+playwright-report/
+
+# --- Old graph / Oracle generated artifacts ---
+legacy-graph-out/
+oracle-data/
+
+# --- Image / raw / model / binary data ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.svg
+*.webp
+*.ico
+*.raw
+*.czi
+*.nd2
+*.tar
+*.zip
+*.gz
+*.7z
+*.bin
+*.onnx
+*.pt
+*.pth
+*.h5
+*.safetensors
+*.ckpt
+*.npz
+*.npy
+*.parquet
+
+# --- Workspace packaging / imports ---
+_workspace/packages/
+_workspace/imports/

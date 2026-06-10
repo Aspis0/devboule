@@ -1,0 +1,125 @@
+// @vitest-environment jsdom
+//
+// Tests for PolisBottomBar: oracle item in BAR_ITEMS, toggling renders OracleAskPanel.
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+// Mock OracleAskPanel so the PolisBottomBar test does not need a full AppContext.
+vi.mock("./OracleAskPanel", () => ({
+  OracleAskPanel: () =>
+    createElement("div", { "data-testid": "oracle-ask-panel" }, "OraclePanel"),
+  default: () =>
+    createElement("div", { "data-testid": "oracle-ask-panel" }, "OraclePanel"),
+}));
+
+// useCityStore: return empty values (PolisBottomBar calls it via FileTypesPanel)
+vi.mock("../../store/cityStore", () => ({
+  useCityStore: (selector: (s: unknown) => unknown) =>
+    selector({
+      getScanExtensions: vi.fn(),
+      applyScanExtensions: vi.fn(),
+    }),
+}));
+
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
+  true;
+
+// ---------------------------------------------------------------------------
+// Module under test — import after mocks
+// ---------------------------------------------------------------------------
+
+let PolisBottomBar: typeof import("./PolisBottomBar").PolisBottomBar;
+
+beforeEach(async () => {
+  ({ PolisBottomBar } = await import("./PolisBottomBar"));
+});
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function renderBar(
+  props = { buildingCount: 3, roadCount: 2, agentCount: 1, onFocusFile: vi.fn() },
+): { container: HTMLElement; root: Root } {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  let root!: Root;
+  act(() => {
+    root = createRoot(container);
+    root.render(createElement(PolisBottomBar, props));
+  });
+  return { container, root };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("PolisBottomBar", () => {
+  it("renders the Oracle bar button", () => {
+    const { container } = renderBar();
+    const oracleBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Oracle"),
+    );
+    expect(oracleBtn).toBeDefined();
+  });
+
+  it("BAR_ITEMS contains an oracle entry", async () => {
+    // Access via the static markup — the oracle button must be present
+    const html = renderToStaticMarkup(
+      createElement(PolisBottomBar, {
+        buildingCount: 1,
+        roadCount: 0,
+        agentCount: 0,
+      }),
+    );
+    expect(html).toContain("Oracle");
+  });
+
+  it("toggling the Oracle button renders OracleAskPanel", () => {
+    const { container } = renderBar();
+
+    // Panel should not be present before clicking
+    expect(container.querySelector("[data-testid='oracle-ask-panel']")).toBeNull();
+
+    const oracleBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Oracle"),
+    )!;
+
+    act(() => {
+      oracleBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(
+      container.querySelector("[data-testid='oracle-ask-panel']"),
+    ).not.toBeNull();
+  });
+
+  it("toggling the Oracle button again closes OracleAskPanel", () => {
+    const { container } = renderBar();
+
+    const oracleBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Oracle"),
+    )!;
+
+    act(() => {
+      oracleBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(
+      container.querySelector("[data-testid='oracle-ask-panel']"),
+    ).not.toBeNull();
+
+    // Toggle off
+    act(() => {
+      oracleBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(container.querySelector("[data-testid='oracle-ask-panel']")).toBeNull();
+  });
+});

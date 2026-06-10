@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicjhan/tauri-v2-react-template/refs/heads/main/src-tauri/capabilities/default.json",
+  "identifier": "default",
+  "description": "Default capabilities for Aspis Management",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-notify"
+  ]
+}

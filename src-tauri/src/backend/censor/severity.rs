@@ -1,0 +1,343 @@
+//! Pure normalizers mapping each known tool's native severity/level vocabulary
+//! onto Censor's `(Severity, Category)`. The A2 deterministic runners call these
+//! after parsing each tool's structured output, so the mapping policy lives in
+//! ONE tested place rather than scattered through the parsers.
+//!
+//! Every normalizer is pure and total: an unknown/empty input NEVER panics and
+//! falls back to a conservative default. The default is `Medium` severity (don't
+//! cry wolf, don't hide it) with a category appropriate to the tool's domain
+//! (e.g. clippy/eslint → Correctness, ruff → Style). Matching is
+//! case-insensitive on the level string because tools disagree on casing
+//! (`HIGH` vs `high`, `Warn` vs `warning`).
+//!
+//! These normalizers are defined ahead of their first caller (A2 wires the
+//! runners). The transient dead-code is annotated PER ITEM, not module-wide, so
+//! that future genuinely-dead code in this file is still flagged.
+
+use super::schema::{Category, Severity};
+
+/// clippy / rustc diagnostic level. clippy emits `error` (often via `-D`
+/// "deny"), `warning`, `note`, `help`. We treat deny/error as High, warnings as
+/// Medium, anything quieter as Low. Category is Correctness (clippy lints are
+/// correctness/idiom, not style for our taxonomy).
+#[allow(dead_code)] // first caller is the A2 clippy runner.
+pub fn severity_from_clippy(level: &str) -> (Severity, Category) {
+    let sev = match level.trim().to_ascii_lowercase().as_str() {
+        "deny" | "error" | "ice" => Severity::High,
+        "warn" | "warning" => Severity::Medium,
+        "note" | "help" | "info" => Severity::Low,
+        _ => Severity::Medium,
+    };
+    (sev, Category::Correctness)
+}
+
+/// `cargo check` / rustc compiler diagnostics. `error` is a hard build failure
+/// (High); `warning` Medium; notes Low. Always Correctness.
+#[allow(dead_code)] // first caller is the A2 cargo-check runner.
+pub fn severity_from_cargo_check(level: &str) -> (Severity, Category) {
+    let sev = match level.trim().to_ascii_lowercase().as_str() {
+        "error" | "error: internal compiler error" | "ice" => Severity::High,
+        "warn" | "warning" => Severity::Medium,
+        "note" | "help" | "info" => Severity::Low,
+        _ => Severity::High, // an unrecognized cargo-check diagnostic still likely blocks the build
+    };
+    (sev, Category::Correctness)
+}
+
+/// ruff (Python linter). ruff has no severity field; it is style/lint by nature.
+/// We map by rule-code prefix where useful: `S` (flake8-bandit security) → High
+/// Security; `B` (bugbear) → Medium Correctness; everything else → Low Style.
+#[allow(dead_code)] // first caller is the A2 ruff runner.
+pub fn severity_from_ruff(rule_code: &str) -> (Severity, Category) {
+    let code = rule_code.trim();
+    let upper = code.to_ascii_uppercase();
+    if upper.starts_with('S') {
+        (Severity::High, Category::Security)
+    } else if upper.starts_with('B') || upper.starts_with("E9") || upper.starts_with('F') {
+        // E9 = syntax errors, F = pyflakes (undefined name etc.), B = bugbear.
+        (Severity::Medium, Category::Correctness)
+    } else {
+        (Severity::Low, Category::Style)
+    }
+}
+
+/// bandit (Python security scanner). Native severity `LOW|MEDIUM|HIGH`. Always
+/// Security category.
+#[allow(dead_code)] // first caller is the A2 bandit runner.
+pub fn severity_from_bandit(sev: &str) -> (Severity, Category) {
+    let s = match sev.trim().to_ascii_uppercase().as_str() {
+        "HIGH" => Severity::High,
+        "MEDIUM" => Severity::Medium,
+        "LOW" => Severity::Low,
+        _ => Severity::Medium,
+    };
+    (s, Category::Security)
+}
+
+/// vulture (Python dead-code). No severity; it reports unused code with a
+/// confidence percentage. Dead code is Low severity, DeadCode category.
+#[allow(dead_code)] // first caller is the A2 vulture runner.
+pub fn severity_from_vulture() -> (Severity, Category) {
+    (Severity::Low, Category::DeadCode)
+}
+
+/// gitleaks (secret scanner). A leaked secret is always the most serious finding
+/// we surface: High Security.
+#[allow(dead_code)] // first caller is the A2 gitleaks runner.
+pub fn gitleaks_category() -> (Severity, Category) {
+    (Severity::High, Category::Security)
+}
+
+/// jscpd (copy/paste detector). Duplication is Medium Duplication.
+#[allow(dead_code)] // first caller is the A2 jscpd runner.
+pub fn jscpd_category() -> (Severity, Category) {
+    (Severity::Medium, Category::Duplication)
+}
+
+/// lizard (cyclomatic complexity). Returns `Some((Medium, Complexity))` only
+/// when the function's CCN exceeds the configured threshold; below threshold
+/// there is no finding (`None`). A `threshold` of 0 is treated as "report any"
+/// to avoid a divide-by-nothing surprise, but still requires ccn > 0.
+#[allow(dead_code)] // first caller is the A2 lizard runner.
+pub fn lizard_complexity(ccn: u32, threshold: u32) -> Option<(Severity, Category)> {
+    if ccn > threshold {
+        Some((Severity::Medium, Category::Complexity))
+    } else {
+        None
+    }
+}
+
+/// eslint. Native numeric severity: 2 = error, 1 = warning, 0 = off. The JSON
+/// reporter emits the integer; runners stringify it. Correctness category.
+#[allow(dead_code)] // first caller is the A2 eslint runner.
+pub fn severity_from_eslint(level: &str) -> (Severity, Category) {
+    let sev = match level.trim().to_ascii_lowercase().as_str() {
+        "2" | "error" => Severity::High,
+        "1" | "warn" | "warning" => Severity::Medium,
+        "0" | "off" => Severity::Low,
+        _ => Severity::Medium,
+    };
+    (sev, Category::Correctness)
+}
+
+/// tsc (TypeScript compiler). A type error blocks the build: High Correctness.
+/// tsc has no warning tier in `--noEmit` diagnostics, but `suggestion`/`message`
+/// categories from the JSON-ish output map to Low.
+#[allow(dead_code)] // first caller is the A2 tsc runner.
+pub fn severity_from_tsc(category: &str) -> (Severity, Category) {
+    let sev = match category.trim().to_ascii_lowercase().as_str() {
+        "error" => Severity::High,
+        "warning" => Severity::Medium,
+        "suggestion" | "message" | "info" => Severity::Low,
+        _ => Severity::High,
+    };
+    (sev, Category::Correctness)
+}
+
+/// semgrep. Native severity `ERROR|WARNING|INFO`. semgrep rules are mostly
+/// security/correctness; without a rule taxonomy we default the category to
+/// Security (semgrep's headline use is security patterns) but let the runner
+/// override per-rule later. Unknown level → Medium.
+#[allow(dead_code)] // first caller is the A2 semgrep runner.
+pub fn severity_from_semgrep(sev: &str) -> (Severity, Category) {
+    let s = match sev.trim().to_ascii_uppercase().as_str() {
+        "ERROR" => Severity::High,
+        "WARNING" => Severity::Medium,
+        "INFO" => Severity::Low,
+        _ => Severity::Medium,
+    };
+    (s, Category::Security)
+}
+
+/// knip (unused files/exports/dependencies in JS/TS projects). Dead code: Low
+/// DeadCode.
+#[allow(dead_code)] // first caller is the A2 knip runner.
+pub fn knip_category() -> (Severity, Category) {
+    (Severity::Low, Category::DeadCode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clippy_levels() {
+        assert_eq!(
+            severity_from_clippy("deny"),
+            (Severity::High, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_clippy("ERROR"),
+            (Severity::High, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_clippy("warning"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_clippy("help"),
+            (Severity::Low, Category::Correctness)
+        );
+        // unknown → Medium/Correctness, no panic.
+        assert_eq!(
+            severity_from_clippy("banana"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_clippy(""),
+            (Severity::Medium, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn cargo_check_levels() {
+        assert_eq!(
+            severity_from_cargo_check("error"),
+            (Severity::High, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_cargo_check("warning"),
+            (Severity::Medium, Category::Correctness)
+        );
+        // unknown defaults High (likely blocks build).
+        assert_eq!(
+            severity_from_cargo_check("???"),
+            (Severity::High, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn ruff_codes() {
+        assert_eq!(
+            severity_from_ruff("S105"),
+            (Severity::High, Category::Security)
+        );
+        assert_eq!(
+            severity_from_ruff("B008"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_ruff("F401"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(severity_from_ruff("E501"), (Severity::Low, Category::Style));
+        assert_eq!(severity_from_ruff(""), (Severity::Low, Category::Style));
+    }
+
+    #[test]
+    fn bandit_levels() {
+        assert_eq!(
+            severity_from_bandit("HIGH"),
+            (Severity::High, Category::Security)
+        );
+        assert_eq!(
+            severity_from_bandit("medium"),
+            (Severity::Medium, Category::Security)
+        );
+        assert_eq!(
+            severity_from_bandit("Low"),
+            (Severity::Low, Category::Security)
+        );
+        assert_eq!(
+            severity_from_bandit("???"),
+            (Severity::Medium, Category::Security)
+        );
+    }
+
+    #[test]
+    fn vulture_is_dead_code() {
+        assert_eq!(severity_from_vulture(), (Severity::Low, Category::DeadCode));
+    }
+
+    #[test]
+    fn gitleaks_is_high_security() {
+        assert_eq!(gitleaks_category(), (Severity::High, Category::Security));
+    }
+
+    #[test]
+    fn jscpd_is_duplication() {
+        assert_eq!(jscpd_category(), (Severity::Medium, Category::Duplication));
+    }
+
+    #[test]
+    fn lizard_threshold() {
+        assert_eq!(
+            lizard_complexity(20, 15),
+            Some((Severity::Medium, Category::Complexity))
+        );
+        assert_eq!(lizard_complexity(15, 15), None);
+        assert_eq!(lizard_complexity(10, 15), None);
+        // threshold 0 reports anything above 0.
+        assert_eq!(
+            lizard_complexity(1, 0),
+            Some((Severity::Medium, Category::Complexity))
+        );
+        assert_eq!(lizard_complexity(0, 0), None);
+    }
+
+    #[test]
+    fn eslint_levels() {
+        assert_eq!(
+            severity_from_eslint("2"),
+            (Severity::High, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_eslint("error"),
+            (Severity::High, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_eslint("1"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_eslint("0"),
+            (Severity::Low, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_eslint("9"),
+            (Severity::Medium, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn tsc_levels() {
+        assert_eq!(
+            severity_from_tsc("error"),
+            (Severity::High, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_tsc("suggestion"),
+            (Severity::Low, Category::Correctness)
+        );
+        // unknown → High (type errors block).
+        assert_eq!(
+            severity_from_tsc("???"),
+            (Severity::High, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn semgrep_levels() {
+        assert_eq!(
+            severity_from_semgrep("ERROR"),
+            (Severity::High, Category::Security)
+        );
+        assert_eq!(
+            severity_from_semgrep("warning"),
+            (Severity::Medium, Category::Security)
+        );
+        assert_eq!(
+            severity_from_semgrep("INFO"),
+            (Severity::Low, Category::Security)
+        );
+        assert_eq!(
+            severity_from_semgrep("???"),
+            (Severity::Medium, Category::Security)
+        );
+    }
+
+    #[test]
+    fn knip_is_dead_code() {
+        assert_eq!(knip_category(), (Severity::Low, Category::DeadCode));
+    }
+}

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Polis — Mappa · terra, fiumi e mare</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --parch:#efe7d6; --parch2:#e6dcc6; --ink:#34302a; --muted:#7a7163;
+    --line:#cdc2a8; --accent:#b23b34; --accent2:#2f5d8a; --gold:#c98a2b;
+    --panel:#f5efe1;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;overflow:hidden;background:#cdd6d6;
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);}
+  #app{display:flex;height:100vh;width:100vw;}
+  #panel{width:288px;flex:0 0 288px;height:100%;background:
+      linear-gradient(180deg,var(--panel),var(--parch2));
+    border-right:1px solid var(--line);display:flex;flex-direction:column;
+    box-shadow:2px 0 18px rgba(0,0,0,.08);z-index:5;}
+  .pad{padding:18px 18px 14px;}
+  .brand{display:flex;align-items:baseline;gap:9px;border-bottom:1px solid var(--line);flex-wrap:wrap;}
+  .brand h1{font-family:"Cinzel",serif;font-weight:700;font-size:21px;letter-spacing:.06em;
+    margin:0 0 2px;color:#2c2722;}
+  .brand .sub{font-family:"Spline Sans Mono",monospace;font-size:10.5px;color:var(--muted);
+    letter-spacing:.02em;}
+  .scroll{overflow-y:auto;flex:1;}
+  section{padding:14px 18px;border-bottom:1px solid var(--line);}
+  .lbl{font-family:"Spline Sans Mono",monospace;font-size:10px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 9px;font-weight:600;}
+  .seg{display:flex;background:#e2d8c2;border:1px solid var(--line);border-radius:8px;
+    padding:3px;gap:3px;}
+  .seg button{flex:1;border:0;background:transparent;padding:7px 4px;border-radius:6px;
+    font:inherit;font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer;transition:.15s;}
+  .seg button.on{background:var(--ink);color:var(--parch);box-shadow:0 1px 4px rgba(0,0,0,.18);}
+  .row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;}
+  .row span{font-size:13px;}
+  .sw{width:40px;height:23px;border-radius:14px;background:#cabfa2;
+    border:1px solid var(--line);position:relative;cursor:pointer;transition:.18s;flex:0 0 auto;}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:.18s;}
+  .sw.on{background:var(--accent2);}
+  .sw.on::after{left:20px;}
+  .hint{font-family:"Spline Sans Mono",monospace;font-size:10px;line-height:1.7;color:var(--muted);}
+  .hint b{color:var(--ink);font-weight:600;}
+  .legend{display:flex;flex-direction:column;gap:7px;}
+  .leg{display:flex;align-items:center;gap:9px;font-size:12px;}
+  .leg i{width:13px;height:10px;border-radius:2px;flex:0 0 auto;}
+  .leg .lt{margin-left:auto;font-family:"Spline Sans Mono",monospace;font-size:9.5px;color:var(--muted);}
+  .nav{display:flex;flex-direction:column;gap:6px;}
+  .nav a{font-family:"Spline Sans Mono",monospace;font-size:11px;color:var(--accent2);text-decoration:none;}
+  .nav a:hover{text-decoration:underline;}
+  .nav a.cur{color:var(--ink);font-weight:600;}
+  #stagewrap{flex:1;position:relative;min-width:0;}
+  #stage{position:absolute;inset:0;}
+  #hud{position:absolute;left:16px;bottom:14px;font-family:"Spline Sans Mono",monospace;
+    font-size:10.5px;color:#4a463e;background:rgba(245,239,225,.82);border:1px solid var(--line);
+    border-radius:8px;padding:7px 11px;backdrop-filter:blur(3px);pointer-events:none;}
+  #hud b{color:#1f1c17;}
+  .credit{padding:12px 18px;font-family:"Spline Sans Mono",monospace;font-size:9.5px;color:var(--muted);}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <div class="pad brand">
+      <h1>MAPPA</h1>
+      <span class="sub">polis · diorama isometrico</span>
+    </div>
+    <div class="scroll">
+      <section>
+        <p class="lbl">Direzione del sole</p>
+        <div class="seg" id="sunSeg">
+          <button data-s="NW" class="on">↖ Nord-Ovest</button>
+          <button data-s="NE">↗ Nord-Est</button>
+        </div>
+      </section>
+
+      <section>
+        <p class="lbl">Resa</p>
+        <div class="row"><span>Animazioni</span><div class="sw on" id="swAnim"></div></div>
+        <div class="row"><span>Griglia tiles</span><div class="sw" id="swGrid"></div></div>
+      </section>
+
+      <section>
+        <p class="lbl">Terreno</p>
+        <div class="legend">
+          <div class="leg"><i style="background:#9aa356"></i><span>Terra</span><span class="lt">chora</span></div>
+          <div class="leg"><i style="background:#cdb888"></i><span>Riva</span><span class="lt">aigialos</span></div>
+          <div class="leg"><i style="background:#cdba8e"></i><span>Strada</span><span class="lt">hodos</span></div>
+          <div class="leg"><i style="background:#3c7b92"></i><span>Fiume</span><span class="lt">potamos ×2</span></div>
+          <div class="leg"><i style="background:#2e6072"></i><span>Mare</span><span class="lt">thalassa</span></div>
+        </div>
+      </section>
+
+      <section>
+        <p class="lbl">In scena</p>
+        <p class="hint">
+          1 <b>meraviglia</b> (Mausōleion) sull’agorà,<br/>
+          12 edifici, <b>porto</b> + faro sulla costa,<br/>
+          ponti sui fiumi, 9 cittadini.<br/>
+          I cittadini camminano <b>solo</b> sulle<br/>
+          strade — mai su acqua o edifici.
+        </p>
+      </section>
+
+      <section>
+        <p class="lbl">Viste</p>
+        <div class="nav">
+          <a href="index.html">▸ Atlante edifici</a>
+          <a href="Meraviglie.html">▸ Meraviglie · 12</a>
+          <a class="cur">▸ Mappa · diorama</a>
+        </div>
+      </section>
+    </div>
+    <div class="credit">trascina = pan · rotella = zoom</div>
+  </aside>
+  <div id="stagewrap">
+    <canvas id="stage"></canvas>
+    <div id="hud"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.2/dist/pixi.min.js"></script>
+<script src="js/iso.js"></script>
+<script src="js/anims.js"></script>
+<script src="js/detail.js"></script>
+<script src="js/people.js"></script>
+<script src="js/buildings_a.js"></script>
+<script src="js/buildings_b.js"></script>
+<script src="js/figures.js"></script>
+<script src="js/monuments_a.js"></script>
+<script src="js/monuments_b.js"></script>
+<script src="js/map_app.js"></script>
+</body>
+</html>
