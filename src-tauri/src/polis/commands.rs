@@ -127,7 +127,12 @@ fn scan_and_store(
     polis: &State<'_, PolisState>,
     live: Option<AgentLiveState>,
 ) -> Result<CityState, String> {
-    let mut city = scanner::generate_city_state(path)?;
+    // EXPLICIT/USER-INITIATED scan path: use the metrics-returning builder so we can
+    // emit the payload-composition debug line ONCE per scan, AFTER real agents are
+    // attached. The watcher's debounced rescans use `scanner::generate_city_state`
+    // (the thin wrapper) instead, which neither serializes the city nor logs — so a
+    // file-save storm never pays a full `serde_json::to_vec` + a log write per save.
+    let (mut city, mut metrics) = scanner::generate_city_state_with_metrics(path)?;
 
     // Populate REAL agents as players. Sourced ONLY from the real live state;
     // the project-id -> root map comes from the real project files. A telemetry
@@ -157,6 +162,17 @@ fn scan_and_store(
         .cached_provider_inventories()
         .unwrap_or_default();
     crate::polis::cloud::attach_external_services(&mut city, &inventories);
+
+    // PAYLOAD-COMPOSITION LOG (Phase-0 measurement). Fire-and-forget, ONCE per
+    // user-initiated scan: now that the FINAL shipped city is assembled (real agents
+    // + external services folded in), fill the two figures the pure core left at 0 —
+    // the real agent count and the serialized size of the city actually shipped to
+    // the front end — and append one bounded debug line. Serializing once per
+    // explicit scan is acceptable; the watcher path never does this. IO errors are
+    // ignored on purpose (best-effort diagnostic).
+    metrics.agents = city.agents.len();
+    metrics.json_bytes = serde_json::to_vec(&city).map(|v| v.len()).unwrap_or(0);
+    polis_debug_append(&scanner::format_build_log(&metrics));
 
     {
         let mut guard = polis.lock_city()?;
@@ -265,8 +281,41 @@ pub struct ScanExtensions {
 /// diagnostic strings (counts, heap sizes, fileIds) are written, local-only.
 #[tauri::command]
 pub fn polis_debug_log(line: String) {
+    polis_debug_append(&line);
+}
+
+/// Hard ceiling for the diagnostic log: once `%TEMP%/aspis-polis-debug.log` exceeds
+/// this it is TRUNCATED (recreated) so a long session can never bloat `%TEMP%`.
+const POLIS_DEBUG_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
+/// Fire-and-forget: append one line to `%TEMP%/aspis-polis-debug.log`. Shared by
+/// the `polis_debug_log` command (front-end render diagnostics) and the backend
+/// payload-composition log (`scanner::generate_city_state_with_metrics`, emitted
+/// once per user-initiated scan by `scan_and_store`). Local-only, no auth.
+///
+/// BOUNDED: this is a DIAGNOSTIC file, never user-facing state. Before appending,
+/// if it already exceeds `POLIS_DEBUG_LOG_MAX_BYTES` (5 MB) it is truncated
+/// (recreated) with a single `--- log rotated ---` marker, so a long-lived session
+/// (front-end heap samples + every user scan) can never let it grow without bound.
+/// All IO is best-effort: every error is ignored on purpose.
+pub(crate) fn polis_debug_append(line: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("aspis-polis-debug.log");
+
+    // Rotate (truncate) if the file has exceeded the ceiling. Best-effort: a
+    // metadata/recreate failure just falls through to the normal append below.
+    let over_cap = std::fs::metadata(&path)
+        .map(|md| md.len() > POLIS_DEBUG_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if over_cap {
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let _ = writeln!(f, "--- log rotated (exceeded 5MB) ---");
+            let _ = writeln!(f, "{line}");
+            return;
+        }
+        // If recreate failed, fall through and try a plain append anyway.
+    }
+
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

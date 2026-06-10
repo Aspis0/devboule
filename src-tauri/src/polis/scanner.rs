@@ -204,7 +204,29 @@ pub struct ScannedFile {
 // ---------------------------------------------------------------------------
 
 /// Build a full `CityState` for `project_path` (pure, no network).
+///
+/// THIN WRAPPER over [`generate_city_state_with_metrics`] that discards the build
+/// metrics. This is the WATCHER-SAFE entry point: it performs NO full-city
+/// serialization and writes NO debug-log line, so a debounced file-save rescan
+/// pays zero extra cost (the watcher rescans on every save — see
+/// `watcher::rescan_and_emit`). The payload-composition debug line is emitted ONCE
+/// per user-initiated scan by the command layer (`commands::scan_and_store`),
+/// which calls `generate_city_state_with_metrics` directly.
 pub fn generate_city_state(project_path: &Path) -> Result<CityState, String> {
+    Ok(generate_city_state_with_metrics(project_path)?.0)
+}
+
+/// Build a full `CityState` for `project_path` (pure, no network), returning the
+/// pure city PLUS the [`BuildMetrics`] gathered during the build (building/road
+/// counts, pre-cap road count, waypoints, districts).
+///
+/// PURITY: this NEVER serializes the city (`BuildMetrics::json_bytes` is left 0)
+/// and NEVER appends to the debug log. The `agents` count is 0 here (the pure core
+/// is agent-free). The command layer fills `json_bytes`/`agents` and emits the log
+/// line exactly once, AFTER real agents are attached.
+pub(crate) fn generate_city_state_with_metrics(
+    project_path: &Path,
+) -> Result<(CityState, BuildMetrics), String> {
     let project_name = project_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -366,12 +388,20 @@ pub fn generate_city_state(project_path: &Path) -> Result<CityState, String> {
     // registry computed above.
     let districts = layout(&mut buildings, &mut meta, &feature_result.features);
 
+    // Phase 4a — PROPORTIONAL ROAD CAP (applied BEFORE routing so a dropped road
+    // never pays the per-road A* cost). At Polis scale the routed road polylines
+    // dominate the payload, so the road set is trimmed to `road_cap_for(buildings)`
+    // here. Placed AFTER classification/feature assignment (which read the FULL
+    // import-graph degree) and BEFORE phase 4b routing — so only routing + payload
+    // are bounded, the structural signals are not perturbed. Zero-cost under cap.
+    let roads_before_cap = cap_roads(&mut roads, buildings.len());
+
     // Phase 4b — WORLD-GRID road routing. Now that buildings have coords, route
     // each import road as a STREET on a shared occupancy grid: A* that avoids
     // building tiles and prefers cells already used by previously-routed roads
     // (emergent shared street network). Fully deterministic; fills `Road::path`.
     // Roads with no path within budget keep `path = None` (straight fallback).
-    let _route_stats = grid::route_roads(&buildings, &mut roads);
+    let route_stats = grid::route_roads(&buildings, &mut roads);
 
     // Phase 4c — TERRAIN FRAME (sea + rivers + shores + bridges). ADDITIVE: now
     // that buildings have coords and roads have routed paths, classify the
@@ -432,7 +462,7 @@ pub fn generate_city_state(project_path: &Path) -> Result<CityState, String> {
     // larger than the legacy `grid_size_for(n)` formula); covers the packed bbox.
     let grid = grid_size_for_extent(&buildings);
 
-    Ok(CityState {
+    let city = CityState {
         version: CITY_STATE_VERSION,
         project_name,
         era,
@@ -448,7 +478,67 @@ pub fn generate_city_state(project_path: &Path) -> Result<CityState, String> {
         sins: sin_result.city_wide,
         scan_note,
         terrain,
-    })
+    };
+
+    // PAYLOAD-COMPOSITION METRICS (Phase-0 measurement, backend side). The pure
+    // core only GATHERS the figures it already computed (counts, pre-cap roads,
+    // waypoints, districts). It does NOT serialize the city and does NOT append a
+    // debug-log line — that would charge a full `serde_json::to_vec(&city)` and one
+    // unbounded log write on EVERY watcher rescan (every debounced file save). The
+    // command layer (`commands::scan_and_store`) fills `agents`/`json_bytes` and
+    // emits the line ONCE per user-initiated scan, after real agents are attached.
+    let metrics = BuildMetrics {
+        buildings: city.buildings.len(),
+        roads: city.roads.len(),
+        roads_before_cap,
+        waypoints: route_stats.total_waypoints,
+        districts: city.districts.len(),
+        connected: connected_building_count(&city.roads),
+        // Filled by the command layer (agent-free pure core; not serialized here).
+        agents: 0,
+        json_bytes: 0,
+    };
+
+    Ok((city, metrics))
+}
+
+/// Inputs to [`format_build_log`] — the payload-composition figures for one built
+/// city. Pure data so the formatting can be unit-tested without any IO.
+pub(crate) struct BuildMetrics {
+    pub(crate) buildings: usize,
+    pub(crate) roads: usize,
+    /// Pre-cap road count (the `M` in "capped from M"). Equals `roads` when the
+    /// city was under the cap.
+    pub(crate) roads_before_cap: usize,
+    pub(crate) waypoints: usize,
+    pub(crate) districts: usize,
+    /// Distinct building ids that appear as an endpoint (`from` or `to`) of a
+    /// SURVIVING road — the size of the navigable graph's node set. Surfaces silent
+    /// navigation-graph degradation when the road cap bites (roads drop but the
+    /// counts alone wouldn't show how many buildings lost all their connections).
+    pub(crate) connected: usize,
+    pub(crate) agents: usize,
+    pub(crate) json_bytes: usize,
+}
+
+/// Distinct building ids touched by `roads` as a `from` or `to` endpoint. Cheap
+/// counters only (a single `BTreeSet` pass); used for `BuildMetrics::connected`.
+fn connected_building_count(roads: &[Road]) -> usize {
+    let mut ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for r in roads {
+        ids.insert(r.from.as_str());
+        ids.insert(r.to.as_str());
+    }
+    ids.len()
+}
+
+/// Format the one-line payload-composition log for a built city. PURE (no IO), so
+/// the exact wire format is unit-testable.
+pub(crate) fn format_build_log(m: &BuildMetrics) -> String {
+    format!(
+        "BUILD[rust] buildings={} roads={} (capped from {}) connected={} waypoints={} districts={} agents={} json_bytes={}",
+        m.buildings, m.roads, m.roads_before_cap, m.connected, m.waypoints, m.districts, m.agents, m.json_bytes
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2682,6 +2772,105 @@ pub fn build_import_roads(
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3a — proportional ROAD CAP (applied BEFORE routing)
+// ---------------------------------------------------------------------------
+
+/// Proportional road-budget ratio: `roads <= buildings * RATIO`. ANCHOR (user-set):
+/// 400_000 buildings -> 50_000 roads (0.125). At Polis scale the routed road paths
+/// (each an A* polyline) dominate the payload, so the road set is capped *before*
+/// routing — a dropped road never pays the per-road A* cost.
+const ROAD_CAP_RATIO: f64 = 0.125;
+/// Floor: small repos keep ALL their import connections (a city with <= 3_000 roads
+/// is never trimmed, even though `buildings * RATIO` would be tiny). E.g. an
+/// 878-building repo has ~1_583 roads < 3_000 -> untouched, zero cost.
+const ROAD_CAP_FLOOR: usize = 3_000;
+/// Ceiling: even a million-building monorepo ships at most 50_000 roads.
+const ROAD_CAP_CEIL: usize = 50_000;
+
+/// The proportional road cap for a city of `building_count` buildings:
+/// `clamp(building_count * RATIO, FLOOR, CEIL)`.
+fn road_cap_for(building_count: usize) -> usize {
+    let raw = building_count as f64 * ROAD_CAP_RATIO;
+    // `raw` is finite and non-negative; clamp into the [FLOOR, CEIL] integer band.
+    (raw as usize).clamp(ROAD_CAP_FLOOR, ROAD_CAP_CEIL)
+}
+
+/// Trim `roads` to the proportional cap for `building_count`, IN PLACE, returning
+/// the ORIGINAL road count (the `M` reported in the build log; `roads.len()` after
+/// this call is the post-cap count `<= cap`).
+///
+/// ZERO-COST when under cap: if `roads.len() <= cap` the set is left exactly as-is
+/// (same roads, same order) — a small city pays nothing.
+///
+/// SELECTION when over cap — keep the top-`cap` roads sorted by:
+///   1. `weight` DESC      — high weight = hot dependency (many importers), the
+///                           structurally important edges to keep.
+///   2. endpoint-degree DESC — sum of the two endpoints' road-degree (computed over
+///                           the FULL pre-cap import-road set); high-degree endpoints
+///                           are central hubs, so their edges are kept preferentially.
+///   3. `(from, to)` ASC   — final lexicographic tiebreak. This makes the cut FULLY
+///                           DETERMINISTIC: among equal `(weight, degree)` roads the
+///                           survivors are a stable lexicographic prefix, so the same
+///                           input yields the same survivors every scan (no churn).
+///
+/// Roads are NOT distinguished by `road_type` here: today only `import` roads exist
+/// (semantic/infrastructure are documented future work), and the ranking signals
+/// (`weight`, endpoint degree) are universal, so any future road kind is ranked on
+/// the same footing rather than silently bypassing the budget.
+fn cap_roads(roads: &mut Vec<Road>, building_count: usize) -> usize {
+    let original = roads.len();
+    let cap = road_cap_for(building_count);
+    if original <= cap {
+        return original; // under budget — leave the set untouched (zero cost).
+    }
+
+    // Endpoint road-degree over the FULL pre-cap set: how many roads touch each
+    // file_id (as `from` OR `to`). BTreeMap: ordered, hash-seed-free determinism.
+    let mut degree: BTreeMap<&str, u32> = BTreeMap::new();
+    for r in roads.iter() {
+        *degree.entry(r.from.as_str()).or_insert(0) += 1;
+        *degree.entry(r.to.as_str()).or_insert(0) += 1;
+    }
+
+    // Precompute the endpoint-degree SCORE for each road ONCE into a parallel Vec
+    // (indexed like `roads`), so the comparator does O(1) Vec lookups instead of two
+    // BTreeMap lookups per call (a comparator runs O(N log N) times). Same observable
+    // ranking — only the per-comparison cost drops.
+    let score: Vec<u32> = roads
+        .iter()
+        .map(|r| {
+            degree.get(r.from.as_str()).copied().unwrap_or(0)
+                + degree.get(r.to.as_str()).copied().unwrap_or(0)
+        })
+        .collect();
+
+    // Rank by the documented key. We sort INDICES (score/roads borrowed), then
+    // materialize the survivors so we never clone a road just to rank it.
+    let mut order: Vec<usize> = (0..original).collect();
+    order.sort_by(|&a, &b| {
+        let (ra, rb) = (&roads[a], &roads[b]);
+        // weight DESC, endpoint-degree DESC, (from, to) ASC.
+        rb.weight
+            .cmp(&ra.weight)
+            .then_with(|| score[b].cmp(&score[a]))
+            .then_with(|| (&ra.from, &ra.to).cmp(&(&rb.from, &rb.to)))
+    });
+    order.truncate(cap);
+
+    // Materialize survivors by index. `mem::take` lets us move the kept roads out
+    // of the original vec (the dropped ones are freed when `roads` is overwritten).
+    let mut taken: Vec<Option<Road>> = roads.drain(..).map(Some).collect();
+    let mut survivors: Vec<Road> = Vec::with_capacity(cap);
+    for idx in order {
+        if let Some(r) = taken[idx].take() {
+            survivors.push(r);
+        }
+    }
+    *roads = survivors;
+    original
 }
 
 /// Resolves an import specifier to a known file id.
@@ -8530,5 +8719,253 @@ import { cdn } from 'https://cdn.example.com/x';
         assert!(prompt.contains("src/auth/a.ts"));
         // Must explicitly forbid the degenerate collapse.
         assert!(prompt.to_lowercase().contains("do not"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4a — proportional ROAD CAP + payload-composition log
+    // -----------------------------------------------------------------------
+
+    /// Minimal import road for the cap tests. `path = None` (un-routed): the cap
+    /// runs BEFORE routing, so the inputs it sees never carry a path.
+    fn mk_road(id: &str, from: &str, to: &str, weight: u32) -> Road {
+        Road {
+            road_id: id.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            road_type: road_type::IMPORT.to_string(),
+            style: road_style::LASTRICATA.to_string(),
+            weight,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn road_cap_math_truth_table() {
+        // ANCHOR + floor/ceil corners (user-set ratio 0.125).
+        assert_eq!(road_cap_for(878), 3_000, "below floor -> floor");
+        assert_eq!(road_cap_for(40_000), 5_000, "40k * 0.125 = 5_000");
+        assert_eq!(road_cap_for(400_000), 50_000, "anchor: 400k -> 50_000");
+        assert_eq!(road_cap_for(1_000_000), 50_000, "above ceil -> ceil");
+        // Exactly at the floor boundary: 24_000 * 0.125 = 3_000 (== floor).
+        assert_eq!(road_cap_for(24_000), 3_000);
+        // Empty city clamps up to the floor (never negative/zero).
+        assert_eq!(road_cap_for(0), 3_000);
+    }
+
+    #[test]
+    fn cap_under_floor_leaves_roads_untouched() {
+        // A small city: 878 buildings -> floor 3_000. 1_583 roads < 3_000, so the
+        // set is returned EXACTLY as-is (same count, same order, same set).
+        let mut roads: Vec<Road> = (0..1_583)
+            .map(|i| mk_road(&format!("r{i}"), &format!("f{i}"), &format!("t{i}"), 1))
+            .collect();
+        let before = roads.clone();
+        let m = cap_roads(&mut roads, 878);
+        assert_eq!(m, 1_583, "returns the original count");
+        assert_eq!(roads.len(), 1_583, "count unchanged under floor");
+        assert_eq!(roads, before, "exact same set AND order under floor");
+    }
+
+    #[test]
+    fn cap_over_budget_keeps_exactly_cap_roads() {
+        // 40_000 buildings -> cap 5_000. Hand it 6_000 roads -> exactly 5_000 survive.
+        let mut roads: Vec<Road> = (0..6_000)
+            .map(|i| mk_road(&format!("r{i}"), &format!("f{i}"), &format!("t{i}"), 1))
+            .collect();
+        let m = cap_roads(&mut roads, 40_000);
+        assert_eq!(m, 6_000, "returns the original (pre-cap) count");
+        assert_eq!(roads.len(), 5_000, "trimmed to exactly the cap");
+    }
+
+    #[test]
+    fn cap_keeps_highest_weight_roads() {
+        // cap 3_000 (floor). Build 3_010 roads, 10 of which have a strictly higher
+        // weight; those 10 must all survive the cut.
+        let cap = road_cap_for(10); // floor = 3_000
+        assert_eq!(cap, 3_000);
+        let mut roads: Vec<Road> = Vec::new();
+        // 10 hot roads (weight 5) — must survive.
+        for i in 0..10 {
+            roads.push(mk_road(&format!("hot{i}"), &format!("hf{i}"), &format!("ht{i}"), 5));
+        }
+        // 3_000 cold roads (weight 1).
+        for i in 0..3_000 {
+            roads.push(mk_road(&format!("cold{i}"), &format!("cf{i}"), &format!("ct{i}"), 1));
+        }
+        let total = roads.len();
+        let m = cap_roads(&mut roads, 10);
+        assert_eq!(m, total);
+        assert_eq!(roads.len(), 3_000);
+        // Every weight-5 road must be present; the cut dropped only weight-1 roads.
+        for i in 0..10 {
+            let id = format!("hot{i}");
+            assert!(
+                roads.iter().any(|r| r.road_id == id),
+                "high-weight road {id} must survive the cap"
+            );
+        }
+        assert!(
+            roads.iter().all(|r| r.weight == 5 || r.weight == 1),
+            "only the seeded weights exist"
+        );
+    }
+
+    #[test]
+    fn cap_is_deterministic_across_runs() {
+        // All-equal-weight, equal-degree roads: the survivors must be a STABLE
+        // lexicographic prefix on `(from, to)`, identical across two independent
+        // runs of the same input (no scan-to-scan churn).
+        let build = || -> Vec<Road> {
+            // Use shuffled-ish ids so insertion order != lexicographic order; the
+            // cut must still be by (from,to) ASC, not by input position.
+            (0..4_000)
+                .map(|i| {
+                    // zero-pad so lexicographic == numeric for a clean assertion.
+                    let key = format!("{:05}", (i * 7) % 4_000);
+                    mk_road(&format!("r{key}"), &format!("f{key}"), &format!("t{key}"), 1)
+                })
+                .collect()
+        };
+        let mut a = build();
+        let mut b = build();
+        cap_roads(&mut a, 8); // floor 3_000
+        cap_roads(&mut b, 8);
+        assert_eq!(a.len(), 3_000);
+        assert_eq!(a, b, "same input -> identical survivors (deterministic)");
+        // The survivors are EXACTLY the lexicographic prefix f00000..f02999 of the
+        // 4_000 distinct keys — a gap-free check (no tautological self-compare): once
+        // sorted, `froms[i]` must equal the i-th key in order, proving the cut kept a
+        // contiguous prefix and dropped the tail f03000..f03999.
+        let mut froms: Vec<&str> = a.iter().map(|r| r.from.as_str()).collect();
+        froms.sort();
+        assert_eq!(froms.len(), 3_000);
+        for (i, from) in froms.iter().enumerate() {
+            assert_eq!(
+                *from,
+                format!("f{i:05}"),
+                "survivors are the gap-free lexicographic prefix f00000..f02999"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_runs_before_routing_dropped_roads_never_routed() {
+        // Order proof: cap_roads() is applied to UN-ROUTED roads (path == None) and
+        // returns only survivors; routing then fills paths ONLY for survivors. So a
+        // dropped road can never have paid A* / carry a path. We assert the cap
+        // output is path-free and shorter, then route only those.
+        let cap = road_cap_for(40_000); // 5_000
+        let mut buildings: Vec<Building> = Vec::new();
+        let mut roads: Vec<Road> = Vec::new();
+        // 6_000 roads between 6_001 buildings laid in a line so routing is cheap.
+        for i in 0..=6_000usize {
+            buildings.push(mk_building(
+                &format!("b{i}"),
+                &format!("src/b{i}.ts"),
+                purpose::HOUSE,
+                10,
+            ));
+        }
+        for i in 0..6_000usize {
+            roads.push(mk_road(
+                &format!("r{i}"),
+                &format!("b{i}"),
+                &format!("b{}", i + 1),
+                1,
+            ));
+        }
+        let m = cap_roads(&mut roads, 40_000);
+        assert_eq!(m, 6_000);
+        assert_eq!(roads.len(), cap, "only survivors remain before routing");
+        assert!(
+            roads.iter().all(|r| r.path.is_none()),
+            "cap output is un-routed: routing has not run yet"
+        );
+        // Routing now touches ONLY the survivors; the dropped 1_000 are already gone.
+        let stats = grid::route_roads(&buildings, &mut roads);
+        assert_eq!(
+            stats.routed + stats.fallback,
+            cap,
+            "routing only ever saw the {cap} surviving roads, never the dropped ones"
+        );
+    }
+
+    #[test]
+    fn build_log_formats_correctly() {
+        // Pure format unit test — no IO. Exact wire shape the Phase-0 measurement
+        // greps for.
+        let line = format_build_log(&BuildMetrics {
+            buildings: 400_000,
+            roads: 50_000,
+            roads_before_cap: 612_345,
+            connected: 380_000,
+            waypoints: 1_234_567,
+            districts: 42,
+            agents: 3,
+            json_bytes: 98_765_432,
+        });
+        assert_eq!(
+            line,
+            "BUILD[rust] buildings=400000 roads=50000 (capped from 612345) \
+connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
+        );
+    }
+
+    #[test]
+    fn build_log_capped_from_equals_roads_when_under_cap() {
+        // When the city was under the cap, M == roads (no "phantom" trimming).
+        let line = format_build_log(&BuildMetrics {
+            buildings: 878,
+            roads: 1_583,
+            roads_before_cap: 1_583,
+            connected: 800,
+            waypoints: 9_000,
+            districts: 5,
+            agents: 0,
+            json_bytes: 2_000_000,
+        });
+        assert!(
+            line.contains("roads=1583 (capped from 1583)"),
+            "under cap: M == roads. got: {line}"
+        );
+        assert!(
+            line.contains("connected=800"),
+            "connected node-set size is surfaced. got: {line}"
+        );
+    }
+
+    #[test]
+    fn with_metrics_variant_is_pure_no_serialize_no_log() {
+        // FIX 1 purity contract: the WATCHER-usable builder must NOT serialize the
+        // city and must NOT write a debug-log line. We can't directly observe "no IO
+        // happened", but the variant's RETURNED metrics carry the witnesses: it never
+        // serializes (`json_bytes == 0`) and never folds in agents (`agents == 0`).
+        // The command layer is the ONLY place that fills those + emits the line.
+        let t = TempTree::new("with_metrics_purity");
+        t.file("src/a.ts", "import './b';\n");
+        t.file("src/b.ts", "export const b = 1;\n");
+
+        let (city, m) = generate_city_state_with_metrics(&t.root).expect("scan succeeds");
+
+        assert_eq!(m.json_bytes, 0, "pure core must NOT serialize the city");
+        assert_eq!(m.agents, 0, "pure core is agent-free");
+        // The metrics mirror the built city (so the command layer logs real figures).
+        assert_eq!(m.buildings, city.buildings.len());
+        assert_eq!(m.roads, city.roads.len());
+        assert_eq!(m.districts, city.districts.len());
+        // `connected` is the distinct-endpoint count over the surviving roads.
+        assert_eq!(m.connected, connected_building_count(&city.roads));
+    }
+
+    #[test]
+    fn connected_building_count_counts_distinct_endpoints() {
+        // Two roads sharing the building `b` touch exactly 3 distinct ids (a,b,c).
+        let roads = vec![
+            mk_road("r1", "a", "b", 1),
+            mk_road("r2", "b", "c", 1),
+        ];
+        assert_eq!(connected_building_count(&roads), 3);
+        // Empty road set -> no connected buildings.
+        assert_eq!(connected_building_count(&[]), 0);
     }
 }
