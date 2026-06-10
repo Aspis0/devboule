@@ -191,6 +191,15 @@ pub struct MetaStore {
     /// `polis_reclassify_features`. `#[serde(default)]` so a pre-F2 meta loads empty.
     #[serde(default)]
     pub feature_merges: BTreeMap<String, String>,
+    /// Polis — the `scanner::LAYOUT_ALGO_VERSION` that last laid this city out.
+    /// SCANNER-OWNED: stamped after every `layout()` run. The persisted-coord
+    /// reuse fast path requires this to equal the current `LAYOUT_ALGO_VERSION`,
+    /// so a pure PLACEMENT-SEMANTICS change re-deploys to an already-laid-out city
+    /// (the per-building inputs are unchanged, so the move-guard alone never would).
+    /// `#[serde(default)]` -> an older `.aspis-meta.json` (no field) loads as `0`,
+    /// which never matches a real version, forcing exactly one clean repack.
+    #[serde(default)]
+    pub layout_version: u32,
 }
 
 fn default_version() -> u32 {
@@ -212,6 +221,7 @@ impl Default for MetaStore {
             features: Vec::new(),
             feature_label_overrides: BTreeMap::new(),
             feature_merges: BTreeMap::new(),
+            layout_version: 0,
         }
     }
 }
@@ -381,6 +391,17 @@ impl MetaStore {
             .district_id = Some(district_id.into());
     }
 
+    /// The `scanner::LAYOUT_ALGO_VERSION` that last laid this city out (0 = never,
+    /// or an old meta file written before the field existed -> forces a repack).
+    pub fn layout_version(&self) -> u32 {
+        self.layout_version
+    }
+
+    /// Stamp the layout-algorithm version after a `layout()` run.
+    pub fn set_layout_version(&mut self, version: u32) {
+        self.layout_version = version;
+    }
+
     /// Learned purpose override for `rel_path`, if any.
     pub fn purpose(&self, rel_path: &str) -> Option<String> {
         self.files.get(rel_path).and_then(|m| m.purpose.clone())
@@ -488,6 +509,8 @@ impl MetaStore {
 
         // Top-level registry is scanner-owned (recomputed each scan).
         disk.features = self.features.clone();
+        // Layout-algorithm version is scanner-owned (stamped by `layout()`).
+        disk.layout_version = self.layout_version;
         // `era`, `enabled_extensions`, `feature_label_overrides`, `feature_merges`
         // are left as loaded from disk — owned by their respective commands.
     }
@@ -702,6 +725,33 @@ mod tests {
         .unwrap();
         let store = MetaStore::load(&dir.path);
         assert_eq!(store.era(), "Alpha");
+    }
+
+    #[test]
+    fn layout_version_defaults_zero_and_round_trips() {
+        let dir = TempDir::new("layout_version");
+        // A fresh store has never been laid out -> version 0.
+        let mut store = MetaStore::load(&dir.path);
+        assert_eq!(store.layout_version(), 0);
+
+        store.set_layout_version(2);
+        store.save(&dir.path).unwrap();
+        let reloaded = MetaStore::load(&dir.path);
+        assert_eq!(reloaded.layout_version(), 2, "version survives round-trip");
+    }
+
+    #[test]
+    fn layout_version_missing_in_old_meta_defaults_zero() {
+        // An old meta file written before the field existed must load, defaulting
+        // the version to 0 (which forces a one-time repack on the next layout).
+        let dir = TempDir::new("layout_version_legacy");
+        std::fs::write(
+            MetaStore::path_in(&dir.path),
+            br#"{"version":1,"era":"Alpha","files":{"a.ts":{"fileId":"x"}}}"#,
+        )
+        .unwrap();
+        let store = MetaStore::load(&dir.path);
+        assert_eq!(store.layout_version(), 0);
     }
 
     #[test]
@@ -1027,6 +1077,7 @@ mod tests {
         scanner_mem.ensure_file_id("src/worker.ts");
         scanner_mem.set_coords("src/worker.ts", Coords::new(7.0, 8.0));
         scanner_mem.set_feature("src/worker.ts", "rnaseq", "directory", "rnaseq");
+        scanner_mem.set_layout_version(2); // scanner-owned, stamped by layout().
 
         // Scanner terminal save — fresh reload + apply scanner-owned fields only.
         MetaStore::with_write_lock(&dir.path, |disk| scanner_mem.apply_scanner_owned_onto(disk))
@@ -1041,6 +1092,11 @@ mod tests {
         assert_eq!(
             reloaded.feature("src/worker.ts"),
             Some(("rnaseq".into(), "directory".into(), "rnaseq".into()))
+        );
+        assert_eq!(
+            reloaded.layout_version(),
+            2,
+            "layout version is scanner-owned and persisted through the terminal save"
         );
         // Non-scanner fields PRESERVED.
         assert_eq!(reloaded.era(), "Gamma", "era preserved across scanner save");

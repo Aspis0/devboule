@@ -497,6 +497,18 @@ pub(crate) fn generate_city_state_with_metrics(
     // unbounded log write on EVERY watcher rescan (every debounced file save). The
     // command layer (`commands::scan_and_store`) fills `agents`/`json_bytes` and
     // emits the line ONCE per user-initiated scan, after real agents are attached.
+    // DISTRICT BREAKDOWN — per-district building counts over the built buildings'
+    // `district_id` (the RESOLVED district, so folded sub-MIN features count under
+    // `commons`). BTreeMap -> id-sorted tallies; then re-sort by (count DESC, id
+    // ASC) for the log. Surfaces an undifferentiated blob (one district holding
+    // most of the city), the symptom the adaptive split targets.
+    let mut district_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for b in &city.buildings {
+        *district_counts.entry(b.district_id.clone()).or_insert(0) += 1;
+    }
+    let mut districts_breakdown: Vec<(String, usize)> = district_counts.into_iter().collect();
+    districts_breakdown.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
     let metrics = BuildMetrics {
         buildings: city.buildings.len(),
         roads: city.roads.len(),
@@ -507,6 +519,7 @@ pub(crate) fn generate_city_state_with_metrics(
         // Filled by the command layer (agent-free pure core; not serialized here).
         agents: 0,
         json_bytes: 0,
+        districts_breakdown,
     };
 
     Ok((city, metrics))
@@ -529,7 +542,16 @@ pub(crate) struct BuildMetrics {
     pub(crate) connected: usize,
     pub(crate) agents: usize,
     pub(crate) json_bytes: usize,
+    /// Per-district building counts, SORTED count DESC then id ASC. Surfaces an
+    /// undifferentiated blob (one district holding most of the city) at a glance —
+    /// the symptom the adaptive split targets. `format_build_log` renders the top
+    /// 12 with a ` +N more` tail when truncated. Computed in
+    /// `generate_city_state_with_metrics` from the built buildings' `district_id`.
+    pub(crate) districts_breakdown: Vec<(String, usize)>,
 }
+
+/// How many districts the build log lists explicitly before the ` +N more` tail.
+const DISTRICT_BREAKDOWN_TOP_N: usize = 12;
 
 /// Distinct building ids touched by `roads` as a `from` or `to` endpoint. Cheap
 /// counters only (a single `BTreeSet` pass); used for `BuildMetrics::connected`.
@@ -545,10 +567,29 @@ fn connected_building_count(roads: &[Road]) -> usize {
 /// Format the one-line payload-composition log for a built city. PURE (no IO), so
 /// the exact wire format is unit-testable.
 pub(crate) fn format_build_log(m: &BuildMetrics) -> String {
-    format!(
+    let mut line = format!(
         "BUILD[rust] buildings={} roads={} (capped from {}) connected={} waypoints={} districts={} agents={} json_bytes={}",
         m.buildings, m.roads, m.roads_before_cap, m.connected, m.waypoints, m.districts, m.agents, m.json_bytes
-    )
+    );
+    // DISTRICT BREAKDOWN: `districts=[id:count id:count ...]`, top N by the
+    // already-sorted (count DESC, id ASC) order, with a ` +N more` tail when the
+    // city has more districts than we list. Surfaces an undifferentiated blob.
+    if !m.districts_breakdown.is_empty() {
+        let shown = m.districts_breakdown.len().min(DISTRICT_BREAKDOWN_TOP_N);
+        let mut inner = String::new();
+        for (i, (id, count)) in m.districts_breakdown.iter().take(shown).enumerate() {
+            if i > 0 {
+                inner.push(' ');
+            }
+            inner.push_str(&format!("{id}:{count}"));
+        }
+        let extra = m.districts_breakdown.len() - shown;
+        if extra > 0 {
+            inner.push_str(&format!(" +{extra} more"));
+        }
+        line.push_str(&format!(" districts=[{inner}]"));
+    }
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,6 +2014,21 @@ pub const COMMONS_HUB_MIN_SPINES: usize = 3;
 /// dependency-heavy orchestrator). Tunable.
 pub const COMMONS_HUB_MAX_OUT_DEGREE: u32 = 2;
 
+/// ADAPTIVE DISTRICT SPLIT cap (Polis, folder-agnostic). A non-commons feature
+/// group with MORE than this many buildings reads on the map as one
+/// undifferentiated blob — a top-level folder like `aspis-lab/` that actually
+/// contains many sub-areas (`rna-seq/`, `scrna-seq/`, `orasis/`) collapses into a
+/// single giant district. When a group exceeds this cap AND its files have a
+/// DEEPER directory level to descend into, the deterministic post-pass in
+/// `assign_features` re-keys each file to a deeper feature id
+/// (`"<parent>/<next-segment>"`), recursing until every group is at or under the
+/// cap or has no deeper level left. Tunable — purely a legibility threshold, not
+/// a correctness bound. (Files sitting directly in the parent dir, with no deeper
+/// segment, stay in the parent id; a sub-group that ends up under
+/// `MIN_DISTRICT_BUILDINGS` follows the EXISTING fold-to-commons rule at F3
+/// district-grouping time.)
+pub const MAX_DISTRICT_BUILDINGS: usize = 120;
+
 /// On-palette accent colors for features. A feature's color is picked
 /// DETERMINISTICALLY by a stable hash of its key (see `feature_color_for_key`),
 /// so the same key always gets the same on-palette color, run to run, machine to
@@ -2057,6 +2113,58 @@ pub(crate) fn directory_spine_key(rel_path: &str) -> String {
         // no meaningful spine -> root.
         String::new()
     }
+}
+
+/// The ORDERED list of MEANINGFUL directory segments of a path, applying the
+/// SAME three-tier wrapper-skip (`SPINE_SKIP_*`) BETWEEN each level — used by the
+/// adaptive district SPLIT. `directory_spine_key` returns only the FIRST of these
+/// (the top-level feature); the split needs the NEXT segment to descend.
+///
+/// At every level we skip a run of wrappers (Tier A source roots + Tier B
+/// monorepo containers always; Tier C app-shells only directly after a Tier-B
+/// container), then take the next non-wrapper DIRECTORY segment, and repeat from
+/// there. The basename is never a segment. Lowercased, so case is stable.
+/// Examples:
+///   - `aspis-lab/src/rna-seq/x.py` -> ["aspis-lab", "rna-seq"]
+///     (`src` is a wrapper between `aspis-lab` and `rna-seq`)
+///   - `apps/web/rnaseq/quant.ts`   -> ["rnaseq"]   (no deeper dir)
+///   - `aspis-lab/rna-seq/sub/y.py` -> ["aspis-lab", "rna-seq", "sub"]
+///   - `src/main.tsx`               -> []           (no meaningful dir)
+pub(crate) fn spine_segments(rel_path: &str) -> Vec<String> {
+    let norm = normalize_rel_path(rel_path);
+    let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 2 {
+        return Vec::new();
+    }
+    let dir_segs = &segs[..segs.len() - 1];
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    // Whether the LAST CONSUMED wrapper in the current run was a Tier-B container
+    // (gates Tier-C app-shell skipping), reset at the start of each skip run.
+    while i < dir_segs.len() {
+        let mut prev_was_monorepo = false;
+        // Skip a run of wrappers (mirrors `directory_spine_key`'s tier rules).
+        while i < dir_segs.len() {
+            let lower = dir_segs[i].to_ascii_lowercase();
+            if SPINE_SKIP_SOURCE_ROOTS.contains(&lower.as_str()) {
+                prev_was_monorepo = false;
+                i += 1;
+            } else if SPINE_SKIP_MONOREPO.contains(&lower.as_str()) {
+                prev_was_monorepo = true;
+                i += 1;
+            } else if prev_was_monorepo && SPINE_SKIP_APP_SHELLS.contains(&lower.as_str()) {
+                prev_was_monorepo = false;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if i < dir_segs.len() {
+            out.push(dir_segs[i].to_ascii_lowercase());
+            i += 1;
+        }
+    }
+    out
 }
 
 /// `true` if any path segment of `rel_path` is a generic shared/cross-cutting
@@ -2187,7 +2295,16 @@ pub fn assign_features(
         // detect this: the file's own dir-spine is unchanged.)
         if let Some((fid, fsrc, fspine)) = meta.feature(path) {
             let is_hub_commons = fsrc == feature_source::COMMONS && !is_commons_dir(path);
-            if !fid.is_empty() && fspine == *spine && !is_hub_commons {
+            // A SPLIT-DERIVED deep id ("aspis-lab/rna-seq") is NOT structurally
+            // stable either: it exists only because its group exceeded
+            // MAX_DISTRICT_BUILDINGS on some past scan. Reusing it would pin the
+            // split forever — a fresh clone of the SAME (shrunken) tree would
+            // compute the coarse id, and two machines would render different
+            // cities. Decline reuse and fall through to the directory-spine rule;
+            // the split post-pass re-derives the deep id iff the CURRENT group
+            // size still warrants it (fresh == incremental, both directions).
+            let is_split_deep = fid.contains('/') && fsrc == feature_source::DIRECTORY;
+            if !fid.is_empty() && fspine == *spine && !is_hub_commons && !is_split_deep {
                 let kind = kind_for_feature_id(&fid);
                 used.entry(fid.clone()).or_insert(kind);
                 by_path.insert(
@@ -2264,6 +2381,24 @@ pub fn assign_features(
         );
     }
 
+    // --- ADAPTIVE DISTRICT SPLIT (pure POST-PASS over the FINAL assignment). ---
+    // Runs over `by_path` AFTER every other rule (reused + fresh alike) so it is
+    // driven ONLY by the CURRENT group sizes — which makes it OVERRIDE a stale,
+    // coarse persisted `feature_id` that the STABILITY REUSE block pinned (a
+    // giant repo scanned before this change persisted e.g. "aspis-lab" for every
+    // file; the spine is unchanged so reuse keeps it; this post-pass re-derives
+    // the deepened ids from current sizes regardless). Deterministic.
+    split_oversized_features(&mut by_path);
+
+    // --- Rebuild the used-feature set from the FINAL (post-split) assignment, so
+    // the registry has an entry (label/color/kind) for every emitted deep id and
+    // NONE for an id the split fully drained. Deterministic via BTreeMap. ---
+    let mut used: BTreeMap<String, FeatureKind> = BTreeMap::new();
+    for a in by_path.values() {
+        used.entry(a.feature_id.clone())
+            .or_insert_with(|| kind_for_feature_id(&a.feature_id));
+    }
+
     // --- Build the registry (sorted by id -> deterministic). ---
     let features: Vec<Feature> = used
         .into_iter()
@@ -2277,6 +2412,99 @@ pub fn assign_features(
         .collect();
 
     FeatureAssignmentResult { by_path, features }
+}
+
+/// ADAPTIVE DISTRICT SPLIT — deterministically descend any oversized Domain
+/// feature group into deeper sub-features so no single district reads as an
+/// undifferentiated blob (Polis, folder-agnostic). Mutates `by_path` in place.
+///
+/// A group is a SPLIT CANDIDATE iff its current `feature_id` is a directory-spine
+/// assignment (`feature_source == "directory"`) — commons (cross-cutting), root
+/// (lone files), and hub-derived ids are NEVER split. While any candidate group
+/// has MORE than `MAX_DISTRICT_BUILDINGS` members AND at least one of its files
+/// has a DEEPER spine segment than the group's current depth, every file with a
+/// deeper segment is re-keyed to `"<current_id>/<next-segment>"` (the next
+/// meaningful segment from `spine_segments`, which applies the SAME wrapper-skip
+/// tiers — so `aspis-lab/src/rna-seq/x.py` yields `aspis-lab/rna-seq`). Files
+/// with NO deeper segment (sitting directly in the parent dir) STAY in the parent
+/// id. The new sub-groups are re-examined, so a sub-district still over the cap
+/// splits again (recursion via a worklist).
+///
+/// The full slug PATH is the id (`"a/b"`), so a same-named child under two
+/// different parents (`p1/sub`, `p2/sub`) stays DISTINCT. A sub-group that lands
+/// under `MIN_DISTRICT_BUILDINGS` is NOT handled here — it follows the EXISTING
+/// fold-to-commons rule at F3 district-grouping time (keeps its own feature_id,
+/// district becomes commons). Pure + deterministic: iteration is over a sorted
+/// BTreeSet worklist and a sorted scan of `by_path` (itself a BTreeMap); no RNG,
+/// no clock, no hash-order.
+fn split_oversized_features(by_path: &mut BTreeMap<String, FeatureAssignment>) {
+    use std::collections::BTreeSet;
+
+    // The split depth of a directory-spine id is its number of slug segments
+    // (the top-level spine is depth 1, `a/b` is depth 2, ...).
+    let depth_of = |id: &str| id.split('/').filter(|s| !s.is_empty()).count();
+
+    // Worklist of candidate group ids to (re)examine. Seed with every distinct
+    // directory-spine feature id currently present (sorted for determinism).
+    let mut worklist: BTreeSet<String> = by_path
+        .values()
+        .filter(|a| a.feature_source == feature_source::DIRECTORY && !a.feature_id.is_empty())
+        .map(|a| a.feature_id.clone())
+        .collect();
+
+    while let Some(group_id) = worklist.iter().next().cloned() {
+        worklist.remove(&group_id);
+        let depth = depth_of(&group_id);
+
+        // Members of this group that are directory-spine assignments (only those
+        // can descend). Collected as (path, deeper_segment_opt) over the sorted
+        // BTreeMap, so the decision is order-independent anyway.
+        let mut members: Vec<(String, Option<String>)> = Vec::new();
+        for (path, a) in by_path.iter() {
+            if a.feature_id == group_id && a.feature_source == feature_source::DIRECTORY {
+                let segs = spine_segments(path);
+                // The next segment BELOW the group's current depth, if any.
+                let deeper = segs.get(depth).cloned();
+                members.push((path.clone(), deeper));
+            }
+        }
+
+        // Only split when over the cap AND at least one file can descend.
+        if members.len() <= MAX_DISTRICT_BUILDINGS {
+            continue;
+        }
+        if !members.iter().any(|(_, d)| d.is_some()) {
+            // Over the cap but NO deeper level anywhere: leave whole (the
+            // breakdown log will show the big district honestly).
+            continue;
+        }
+
+        // Re-key each file with a deeper segment to `"<group_id>/<segment>"`;
+        // files with no deeper segment STAY in the parent id. Record the new
+        // child ids so they can be re-examined (a child still over the cap with
+        // its own deeper level must split again).
+        let mut new_children: BTreeSet<String> = BTreeSet::new();
+        for (path, deeper) in members {
+            if let Some(seg) = deeper {
+                let child_id = format!("{group_id}/{seg}");
+                if let Some(a) = by_path.get_mut(&path) {
+                    a.feature_id = child_id.clone();
+                    // `feature_source` stays "directory" (still a dir-spine
+                    // assignment, just deeper) and `spine` (the stability
+                    // witness) is intentionally LEFT as the file's top-level
+                    // spine: the split is re-derived from sizes each scan, so the
+                    // witness must keep comparing the structural top-level spine.
+                }
+                new_children.insert(child_id);
+            }
+        }
+        // The parent id may still be over the cap (the files that stayed), but it
+        // has no deeper level for those files by construction, so re-adding it
+        // would loop without progress — only the new children can split further.
+        for c in new_children {
+            worklist.insert(c);
+        }
+    }
 }
 
 /// The `FeatureKind` for a feature id at registry-build time. `commons` is the
@@ -2295,11 +2523,18 @@ fn kind_for_feature_id(id: &str) -> FeatureKind {
 /// `"object-store"` -> `"Object Store"`) via the module's shared `title_case_slug`.
 /// F2 (Oracle) may replace this with a richer human name.
 ///
+/// SPLIT-AWARE: an adaptive-split deep id is the full slug PATH
+/// (`"aspis-lab/rna-seq"`), kept globally unique so same-named children under
+/// different parents never collide. The LABEL, however, is the LAST path segment
+/// humanized (`"rna-seq"` -> `"Rna Seq"`) — the district reads as its own area,
+/// not the whole path. The full path stays the id (and the dossier can show it).
+///
 /// Always called with a NON-empty registry key: an empty dir-spine is mapped to
 /// `ROOT_FEATURE_ID` ("root") before it ever reaches the registry (see
 /// `assign_features`), so `""` never arrives here.
 pub(crate) fn feature_label_for_key(key: &str) -> String {
-    crate::polis::model::title_case_slug(key)
+    let last = key.rsplit('/').next().unwrap_or(key);
+    crate::polis::model::title_case_slug(last)
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,7 +2592,27 @@ pub const MAX_MERGE_COLLAPSE_FRACTION: f64 = 0.60;
 ///     resolves to the SAME canonical. Deterministic + always terminates.
 ///   - A self-map (`merges[id] == id`) is a no-op fixed point.
 pub(crate) fn resolve_canonical_feature(id: &str, merges: &BTreeMap<String, String>) -> String {
+    // SPLIT-AWARE PREFIX RESOLUTION: an Oracle merge recorded for a coarse id
+    // ("aspis-lab" -> "lab") must also govern split-derived children
+    // ("aspis-lab/rna-seq" -> "lab/rna-seq") — otherwise the adaptive split
+    // silently discards the Oracle's classification. When the id has no exact
+    // merge entry, rewrite its LONGEST '/'-prefix that does (resolved through
+    // its own chain), keep the remainder, then resolve the rewritten id through
+    // the normal chain below. Prefixes are strictly shorter and carry an exact
+    // entry, so the recursion terminates.
     let mut cur = id.to_string();
+    if !merges.contains_key(id) && id.contains('/') {
+        let mut k = id.len();
+        while let Some(slash) = id[..k].rfind('/') {
+            let prefix = &id[..slash];
+            if merges.contains_key(prefix) {
+                let canonical_prefix = resolve_canonical_feature(prefix, merges);
+                cur = format!("{canonical_prefix}{}", &id[slash..]);
+                break;
+            }
+            k = slash;
+        }
+    }
     // The ORDERED visited path (for cycle detection + cycle-only min). `seen` maps
     // each id to its position in `path` so a revisit instantly locates the cycle's
     // start; everything before that position is the (non-cycle) tail and is excluded.
@@ -3172,6 +3427,24 @@ fn any_footprint_overlap(entries: &[(usize, Coords, u32, u32)]) -> bool {
 /// never merged away. Documented, deterministic; tune here.
 pub const MIN_DISTRICT_BUILDINGS: usize = 3;
 
+/// LAYOUT ALGORITHM VERSION. Stamped into the meta store after every `layout()`
+/// run; the persisted-coord reuse fast path (`use_persisted`) additionally
+/// requires the stored version to EQUAL this. The point: a change to the
+/// PLACEMENT SEMANTICS (not just inputs) must deploy to already-laid-out cities
+/// even though the per-building inputs are unchanged — otherwise the city would
+/// freeze on coords computed by the OLD algorithm forever (a building only moves
+/// when its inputs change, so the move-guard alone never triggers a re-layout for
+/// a pure algorithm change). A stale/missing version forces ONE clean repack,
+/// after which the new version is persisted and the fast path resumes.
+///
+///   - v1 — blind golden-angle spiral district placement (pre-A2).
+///   - v2 — A2 SEMANTIC placement (coupling meta-graph + weighted-centroid seeds)
+///          AND the adaptive district split (deep feature ids).
+///
+/// BUMP THIS on any future change to placement semantics or the split that should
+/// re-deploy to existing cities.
+pub const LAYOUT_ALGO_VERSION: u32 = 2;
+
 /// The `District::type` string for a feature kind (Polis F3). A CLOSED vocabulary
 /// mirroring `FeatureKind` — `commons` / `feature` / `external`. The renderer
 /// does not switch on this (it draws `bounds` + `colorAccent`); it feeds the
@@ -3617,8 +3890,16 @@ pub fn layout(
                 None => false,
             });
 
+    // LAYOUT-VERSION GATE: a pure PLACEMENT-SEMANTICS change (A2, the adaptive
+    // split) must re-deploy to an already-laid-out city even though the per-file
+    // inputs are unchanged — the move-guard alone never fires for an algorithm
+    // change. So reuse additionally requires the persisted layout version to equal
+    // the CURRENT `LAYOUT_ALGO_VERSION`. A stale (older algo) or missing (0, old
+    // meta file) version forces exactly one clean repack; the version is then
+    // stamped below so the fast path resumes next scan.
+    let layout_version_current = meta.layout_version() == LAYOUT_ALGO_VERSION;
     let use_persisted = match &persisted_all {
-        Some(pv) => !any_footprint_overlap(pv) && no_district_moves,
+        Some(pv) => !any_footprint_overlap(pv) && no_district_moves && layout_version_current,
         None => false,
     };
 
@@ -3688,6 +3969,11 @@ pub fn layout(
             color_accent,
         });
     }
+
+    // Stamp the layout-algorithm version (BOTH paths: reuse and fresh repack just
+    // ran). Next scan's reuse fast path is gated on this matching the current
+    // `LAYOUT_ALGO_VERSION`, so a stale-version city repacks exactly once.
+    meta.set_layout_version(LAYOUT_ALGO_VERSION);
 
     districts
 }
@@ -5352,6 +5638,281 @@ mod tests {
         );
     }
 
+    // ---- Polis: ADAPTIVE DISTRICT SPLIT -----------------------------------
+
+    /// Count files assigned to a given feature id in a result.
+    fn feat_count(r: &FeatureAssignmentResult, feature_id: &str) -> usize {
+        r.by_path
+            .values()
+            .filter(|a| a.feature_id == feature_id)
+            .count()
+    }
+
+    /// Build `n` files under `dir` (e.g. `dir="aspis-lab/rna-seq"`) named
+    /// `f{i}.ts`, returning the (rel_path, no-imports) pairs.
+    fn files_under(dir: &str, n: usize) -> Vec<(String, Vec<&'static str>)> {
+        (0..n)
+            .map(|i| (format!("{dir}/f{i}.ts"), Vec::new()))
+            .collect()
+    }
+
+    /// Run `assign_features` over a flat list of owned (path, imports) pairs.
+    fn assign_owned(files: &[(String, Vec<&str>)]) -> FeatureAssignmentResult {
+        let refs: Vec<(&str, &[&str])> = files
+            .iter()
+            .map(|(p, im)| (p.as_str(), im.as_slice()))
+            .collect();
+        let (scanned, ids) = feature_inputs(&refs);
+        assign_features(&scanned, &ids, &[], &MetaStore::default())
+    }
+
+    #[test]
+    fn split_oversized_group_descends_one_level() {
+        // `aspis-lab` over the cap, made of TWO deeper subdirs -> splits into
+        // `aspis-lab/rna-seq` + `aspis-lab/scrna-seq`, neither over the cap.
+        let half = MAX_DISTRICT_BUILDINGS; // 120 each -> 240 > cap.
+        let mut files = files_under("aspis-lab/rna-seq", half);
+        files.extend(files_under("aspis-lab/scrna-seq", half));
+        let r = assign_owned(&files);
+
+        assert_eq!(feat_count(&r, "aspis-lab"), 0, "coarse parent fully drained");
+        assert_eq!(feat_count(&r, "aspis-lab/rna-seq"), half);
+        assert_eq!(feat_count(&r, "aspis-lab/scrna-seq"), half);
+        // Registry has the deep ids with last-segment labels, Domain kind.
+        let reg: BTreeMap<&str, &Feature> = r.features.iter().map(|f| (f.id.as_str(), f)).collect();
+        assert_eq!(reg["aspis-lab/rna-seq"].label, "Rna Seq");
+        assert_eq!(reg["aspis-lab/rna-seq"].kind, FeatureKind::Domain);
+        assert!(!reg.contains_key("aspis-lab"), "drained parent not in registry");
+    }
+
+    #[test]
+    fn split_recurses_when_subgroup_still_over_cap() {
+        // `lab/a` is itself over the cap and made of two deeper dirs -> must split
+        // AGAIN into `lab/a/x` + `lab/a/y`. `lab/b` is small and stays put.
+        let big = MAX_DISTRICT_BUILDINGS; // 120 each subdir of a.
+        let mut files = files_under("lab/a/x", big);
+        files.extend(files_under("lab/a/y", big));
+        files.extend(files_under("lab/b", 5));
+        let r = assign_owned(&files);
+
+        assert_eq!(feat_count(&r, "lab/a"), 0, "mid-level fully descended");
+        assert_eq!(feat_count(&r, "lab/a/x"), big);
+        assert_eq!(feat_count(&r, "lab/a/y"), big);
+        assert_eq!(feat_count(&r, "lab/b"), 5, "small sibling untouched");
+    }
+
+    #[test]
+    fn split_keeps_direct_parent_files_in_parent() {
+        // `lab` over the cap: a deep subdir `lab/deep` (big) splits out, but files
+        // sitting DIRECTLY in `lab/` (no deeper segment) stay in `lab`.
+        let big = MAX_DISTRICT_BUILDINGS + 1;
+        let mut files = files_under("lab/deep", big);
+        // 10 files directly in lab/ (their spine is `lab`, no deeper dir).
+        for i in 0..10 {
+            files.push((format!("lab/top{i}.ts"), Vec::new()));
+        }
+        let r = assign_owned(&files);
+
+        assert_eq!(feat_count(&r, "lab/deep"), big, "deep subdir split out");
+        assert_eq!(
+            feat_count(&r, "lab"),
+            10,
+            "files directly in the parent dir stay in the parent id"
+        );
+    }
+
+    #[test]
+    fn split_untouched_at_or_under_cap() {
+        // Exactly at the cap with deeper structure -> NOT split (cap is inclusive
+        // ceiling: only > cap splits).
+        let at_cap = files_under("lab/sub", MAX_DISTRICT_BUILDINGS);
+        let r = assign_owned(&at_cap);
+        assert_eq!(feat_count(&r, "lab"), MAX_DISTRICT_BUILDINGS, "<=cap stays whole");
+        assert_eq!(feat_count(&r, "lab/sub"), 0, "no split at the cap");
+    }
+
+    #[test]
+    fn split_over_cap_with_no_subdirs_stays_whole() {
+        // Over the cap but EVERY file sits directly in `lab/` (no deeper segment):
+        // nothing to descend into, so the group stays whole (the breakdown log
+        // shows the big district honestly).
+        let n = MAX_DISTRICT_BUILDINGS + 5;
+        let files: Vec<(String, Vec<&str>)> =
+            (0..n).map(|i| (format!("lab/f{i}.ts"), Vec::new())).collect();
+        let r = assign_owned(&files);
+        assert_eq!(feat_count(&r, "lab"), n, "no deeper level -> whole big district");
+    }
+
+    #[test]
+    fn split_skips_wrappers_in_the_deeper_segment() {
+        // The deeper segment goes through a wrapper run: `aspis-lab/src/rna-seq/...`
+        // must yield `aspis-lab/rna-seq` (the `src` wrapper is skipped at the
+        // second level too).
+        let half = MAX_DISTRICT_BUILDINGS;
+        let mut files = files_under("aspis-lab/src/rna-seq", half);
+        files.extend(files_under("aspis-lab/src/scrna-seq", half));
+        let r = assign_owned(&files);
+        assert_eq!(feat_count(&r, "aspis-lab/rna-seq"), half, "wrapper skipped deep");
+        assert_eq!(feat_count(&r, "aspis-lab/scrna-seq"), half);
+        assert_eq!(feat_count(&r, "aspis-lab"), 0);
+    }
+
+    #[test]
+    fn split_same_named_children_under_different_parents_stay_distinct() {
+        // Two parents both over the cap, each with a same-named child `core`: the
+        // full slug PATH keys them, so `p1/core` and `p2/core` never collide.
+        let big = MAX_DISTRICT_BUILDINGS + 1;
+        let mut files = files_under("p1/core", big);
+        files.extend(files_under("p1/extra", big));
+        files.extend(files_under("p2/core", big));
+        files.extend(files_under("p2/extra", big));
+        let r = assign_owned(&files);
+        assert_eq!(feat_count(&r, "p1/core"), big);
+        assert_eq!(feat_count(&r, "p2/core"), big);
+        // They are DISTINCT registry entries.
+        let ids: BTreeSet<&str> = r.features.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains("p1/core") && ids.contains("p2/core"));
+    }
+
+    #[test]
+    fn split_is_deterministic_across_runs() {
+        let big = MAX_DISTRICT_BUILDINGS;
+        let mut files = files_under("lab/a", big);
+        files.extend(files_under("lab/b", big));
+        let reference = assign_owned(&files);
+        for _ in 0..16 {
+            let r = assign_owned(&files);
+            assert_eq!(r, reference, "split assignment must be byte-stable");
+        }
+    }
+
+    #[test]
+    fn split_overrides_stale_persisted_coarse_id() {
+        // REGRESSION (the live pinning pitfall): a giant repo previously scanned
+        // persisted the COARSE feature id `aspis-lab` for every file, with the
+        // file's top-level spine `aspis-lab` as the witness. The spine is UNCHANGED
+        // this scan, so the STABILITY REUSE block keeps the coarse id — yet the
+        // post-pass, driven by CURRENT group size, MUST still descend it into the
+        // deep ids. (Before the post-pass existed, reuse pinned the un-split id
+        // forever and the city stayed one giant blob district.)
+        let half = MAX_DISTRICT_BUILDINGS;
+        let mut files = files_under("aspis-lab/rna-seq", half);
+        files.extend(files_under("aspis-lab/scrna-seq", half));
+        let refs: Vec<(&str, &[&str])> = files
+            .iter()
+            .map(|(p, im)| (p.as_str(), im.as_slice()))
+            .collect();
+        let (scanned, ids) = feature_inputs(&refs);
+
+        // Persist the COARSE assignment for every file: feature_id `aspis-lab`,
+        // source "directory", spine `aspis-lab` (the UNCHANGED witness).
+        let mut meta = MetaStore::default();
+        for (p, _) in &files {
+            meta.set_feature(p, "aspis-lab", feature_source::DIRECTORY, "aspis-lab");
+        }
+        let r = assign_features(&scanned, &ids, &[], &meta);
+
+        assert_eq!(
+            feat_count(&r, "aspis-lab"),
+            0,
+            "stale coarse id must be OVERRIDDEN by the post-pass, not pinned by reuse"
+        );
+        assert_eq!(feat_count(&r, "aspis-lab/rna-seq"), half);
+        assert_eq!(feat_count(&r, "aspis-lab/scrna-seq"), half);
+    }
+
+    #[test]
+    fn split_shrunken_group_reverts_to_coarse_id_fresh_equals_incremental() {
+        // REGRESSION (review BLOCKER): files were deleted and a once-split group
+        // shrank below MAX_DISTRICT_BUILDINGS. The meta still carries the DEEP
+        // ids; reusing them would pin the split forever, while a FRESH clone of
+        // the same tree would compute the coarse id — two machines, two different
+        // cities. Deep-id reuse must be DECLINED so the post-pass re-derives the
+        // assignment from current sizes: incremental == fresh, both directions.
+        let n = 60; // well under MAX_DISTRICT_BUILDINGS
+        let files = files_under("aspis-lab/rna-seq", n);
+        let refs: Vec<(&str, &[&str])> = files
+            .iter()
+            .map(|(p, im)| (p.as_str(), im.as_slice()))
+            .collect();
+        let (scanned, ids) = feature_inputs(&refs);
+
+        // Incremental: meta persists the DEEP id with the coarse spine witness.
+        let mut meta = MetaStore::default();
+        for (p, _) in &files {
+            meta.set_feature(p, "aspis-lab/rna-seq", feature_source::DIRECTORY, "aspis-lab");
+        }
+        let incremental = assign_features(&scanned, &ids, &[], &meta);
+
+        // Fresh: no meta at all.
+        let fresh = assign_features(&scanned, &ids, &[], &MetaStore::default());
+
+        assert_eq!(
+            feat_count(&incremental, "aspis-lab"),
+            n,
+            "shrunken group must revert to the coarse id (deep reuse declined)"
+        );
+        assert_eq!(feat_count(&incremental, "aspis-lab/rna-seq"), 0);
+        // Strong form: the two scans agree file-by-file.
+        for (p, _) in &files {
+            assert_eq!(
+                incremental.by_path.get(p).map(|a| &a.feature_id),
+                fresh.by_path.get(p).map(|a| &a.feature_id),
+                "fresh and incremental must assign the same feature for {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_canonical_feature_applies_prefix_merges_to_deep_ids() {
+        // REGRESSION (review WARNING): an Oracle merge recorded for a COARSE id
+        // must govern split-derived children, or the split silently discards the
+        // Oracle's classification.
+        let mut merges = BTreeMap::new();
+        merges.insert("aspis-lab".to_string(), "lab".to_string());
+        assert_eq!(
+            resolve_canonical_feature("aspis-lab/rna-seq", &merges),
+            "lab/rna-seq",
+            "coarse merge applies to the deep child via prefix"
+        );
+        // An EXACT entry for the deep id always wins over the prefix route.
+        merges.insert("aspis-lab/x".to_string(), "y".to_string());
+        assert_eq!(resolve_canonical_feature("aspis-lab/x", &merges), "y");
+        // Prefix target itself resolves through its chain.
+        merges.insert("lab".to_string(), "core".to_string());
+        assert_eq!(
+            resolve_canonical_feature("aspis-lab/rna-seq", &merges),
+            "core/rna-seq"
+        );
+        // No merge anywhere on the prefix chain -> unchanged.
+        assert_eq!(
+            resolve_canonical_feature("other/child", &merges),
+            "other/child"
+        );
+    }
+
+    #[test]
+    fn split_does_not_touch_commons_or_root() {
+        // A big commons group (shared dir) and many root files: neither is a
+        // directory-spine assignment, so the split leaves them whole regardless of
+        // size.
+        let n = MAX_DISTRICT_BUILDINGS + 50;
+        let mut files: Vec<(String, Vec<&str>)> = (0..n)
+            .map(|i| (format!("src/utils/u{i}.ts"), Vec::new()))
+            .collect();
+        // Many lone root files (no spine -> ROOT_FEATURE_ID).
+        for i in 0..(MAX_DISTRICT_BUILDINGS + 50) {
+            files.push((format!("r{i}.ts"), Vec::new()));
+        }
+        let r = assign_owned(&files);
+        assert_eq!(feat_count(&r, COMMONS_FEATURE_ID), n, "commons never split");
+        assert_eq!(
+            feat_count(&r, ROOT_FEATURE_ID),
+            MAX_DISTRICT_BUILDINGS + 50,
+            "root never split"
+        );
+    }
+
     #[test]
     fn feature_end_to_end_scan_stamps_and_persists() {
         // Full scan: buildings carry feature_id/feature_source, the city has a
@@ -5409,6 +5970,64 @@ mod tests {
             .find(|b| b.file_path == "src/auth/session.ts")
             .unwrap();
         assert_eq!(auth2.feature_id, "auth", "feature stable across re-scan");
+    }
+
+    /// END-TO-END adaptive split: a real scan of a tree where one top-level folder
+    /// (`aspis-lab`) is over the cap and contains deeper subdirs descends into deep
+    /// feature/district ids, persists them, and stays stable on a rescan (the
+    /// persisted deep ids are NOT re-coarsened, the layout version reuses coords).
+    #[test]
+    fn split_end_to_end_descends_persists_and_is_stable() {
+        let tree = TempTree::new("split_e2e");
+        let per = MAX_DISTRICT_BUILDINGS; // each subdir over half -> parent over cap.
+        for i in 0..per {
+            tree.file(&format!("aspis-lab/rna-seq/f{i}.ts"), "export const x = 1;\n");
+            tree.file(&format!("aspis-lab/scrna-seq/g{i}.ts"), "export const y = 1;\n");
+        }
+
+        let city = generate_city_state(&tree.root).expect("scan succeeds");
+        let count = |fid: &str| city.buildings.iter().filter(|b| b.feature_id == fid).count();
+        assert_eq!(count("aspis-lab"), 0, "coarse parent drained by the split");
+        assert_eq!(count("aspis-lab/rna-seq"), per);
+        assert_eq!(count("aspis-lab/scrna-seq"), per);
+        // The deep ids became real districts (each well over MIN_DISTRICT_BUILDINGS).
+        let district_ids: BTreeSet<&str> =
+            city.districts.iter().map(|d| d.district_id.as_str()).collect();
+        assert!(district_ids.contains("aspis-lab/rna-seq"));
+        assert!(district_ids.contains("aspis-lab/scrna-seq"));
+        // Deep district label is the LAST segment, humanized.
+        let rna = city
+            .districts
+            .iter()
+            .find(|d| d.district_id == "aspis-lab/rna-seq")
+            .unwrap();
+        assert_eq!(rna.name, "Rna Seq");
+
+        // Persisted: the deep id + the stamped layout version survive.
+        let meta = MetaStore::load(&tree.root);
+        assert_eq!(
+            meta.feature("aspis-lab/rna-seq/f0.ts").map(|t| t.0),
+            Some("aspis-lab/rna-seq".to_string()),
+            "deep feature id persisted"
+        );
+        assert_eq!(meta.layout_version(), LAYOUT_ALGO_VERSION);
+
+        // RESCAN: the deep ids are NOT re-coarsened (stable), the building keeps
+        // its deep feature id and its coords are reused (version matches).
+        let coord0 = city
+            .buildings
+            .iter()
+            .find(|b| b.file_path == "aspis-lab/rna-seq/f0.ts")
+            .unwrap()
+            .coords;
+        let city2 = generate_city_state(&tree.root).expect("rescan succeeds");
+        let b0 = city2
+            .buildings
+            .iter()
+            .find(|b| b.file_path == "aspis-lab/rna-seq/f0.ts")
+            .unwrap();
+        assert_eq!(b0.feature_id, "aspis-lab/rna-seq", "deep id stable on rescan");
+        assert_eq!(b0.coords, coord0, "coords reused (layout version matches)");
     }
 
     // ---- visual_tier thresholds ----
@@ -6152,6 +6771,110 @@ const y = await import('@/lazy');
                 "steady-state F3 scan must reuse the persisted (now coherent) coords"
             );
         }
+    }
+
+    // ---- Polis: LAYOUT_ALGO_VERSION reuse gate ----------------------------
+
+    /// A coherent meta (coords + district persisted, no move) but a STALE layout
+    /// version must force ONE repack (persisted coords NOT reused), then the
+    /// current version is stamped so the next scan reuses. A meta at the CURRENT
+    /// version keeps the fast path.
+    #[test]
+    fn stale_layout_version_forces_repack_then_reuses() {
+        let features = vec![mk_feature("auth", FeatureKind::Domain)];
+        let make = || {
+            vec![
+                mk_building_feat("1", "src/auth/a.ts", purpose::HOUSE, 100, "auth"),
+                mk_building_feat("2", "src/auth/b.ts", purpose::HOUSE, 100, "auth"),
+                mk_building_feat("3", "src/auth/c.ts", purpose::HOUSE, 100, "auth"),
+            ]
+        };
+
+        // Lay out fresh -> persists coords, district ids, and the CURRENT version.
+        let mut meta = MetaStore::default();
+        let mut b0 = make();
+        layout(&mut b0, &mut meta, &features, &[]);
+        assert_eq!(meta.layout_version(), LAYOUT_ALGO_VERSION, "version stamped");
+        let laid = |id: &str| b0.iter().find(|x| x.file_id == id).unwrap().coords;
+
+        // Now SIMULATE a city laid out by an OLDER algorithm: rewrite every coord
+        // to a distinct, non-overlapping STALE position and downgrade the version.
+        // District ids stay (no move), coords don't overlap -> ONLY the version
+        // gate can reject reuse.
+        let stale: Vec<(&str, f64, f64)> = vec![
+            ("src/auth/a.ts", 500.0, 0.0),
+            ("src/auth/b.ts", 500.0, 20.0),
+            ("src/auth/c.ts", 500.0, 40.0),
+        ];
+        for (p, x, y) in &stale {
+            meta.set_coords(p, Coords::new(*x, *y));
+        }
+        meta.set_layout_version(1); // older algorithm.
+
+        // Re-layout: stale-version -> MUST repack to the fresh coords, NOT reuse.
+        let mut b1 = make();
+        layout(&mut b1, &mut meta, &features, &[]);
+        for b in &b1 {
+            assert_eq!(
+                b.coords,
+                laid(&b.file_id),
+                "stale layout version must force a fresh repack"
+            );
+            let s = stale.iter().find(|(p, _, _)| *p == b.file_path).unwrap();
+            assert_ne!(
+                b.coords,
+                Coords::new(s.1, s.2),
+                "stale-algo coord must NOT be reused"
+            );
+        }
+        // The repack re-stamped the current version.
+        assert_eq!(meta.layout_version(), LAYOUT_ALGO_VERSION);
+
+        // CURRENT version now -> the fast path reuses the (coherent) coords.
+        let mut b2 = make();
+        layout(&mut b2, &mut meta, &features, &[]);
+        for b in &b2 {
+            assert_eq!(b.coords, laid(&b.file_id), "current version reuses coords");
+        }
+    }
+
+    /// A pre-version meta (the field defaults to 0 on an old `.aspis-meta.json`)
+    /// is treated as stale: ONE repack, then stable.
+    #[test]
+    fn missing_layout_version_defaults_stale_and_repacks_once() {
+        let features = vec![mk_feature("auth", FeatureKind::Domain)];
+        let make = || {
+            vec![
+                mk_building_feat("1", "src/auth/a.ts", purpose::HOUSE, 100, "auth"),
+                mk_building_feat("2", "src/auth/b.ts", purpose::HOUSE, 100, "auth"),
+                mk_building_feat("3", "src/auth/c.ts", purpose::HOUSE, 100, "auth"),
+            ]
+        };
+        // Compute the canonical fresh layout.
+        let mut fresh = make();
+        let mut fresh_meta = MetaStore::default();
+        layout(&mut fresh, &mut fresh_meta, &features, &[]);
+        let fresh_coord = |id: &str| fresh.iter().find(|x| x.file_id == id).unwrap().coords;
+
+        // Build a meta with coherent district ids + non-overlapping STALE coords
+        // but layout_version left at the DEFAULT 0 (old meta file).
+        let mut meta = MetaStore::default();
+        for (p, y) in [("src/auth/a.ts", 0.0), ("src/auth/b.ts", 20.0), ("src/auth/c.ts", 40.0)] {
+            meta.set_coords(p, Coords::new(900.0, y));
+            meta.set_district(p, "auth");
+        }
+        assert_eq!(meta.layout_version(), 0, "old meta defaults to 0");
+
+        let mut b1 = make();
+        layout(&mut b1, &mut meta, &features, &[]);
+        for b in &b1 {
+            assert_eq!(
+                b.coords,
+                fresh_coord(&b.file_id),
+                "version 0 must repack, not freeze the stale coords"
+            );
+        }
+        assert_eq!(meta.layout_version(), LAYOUT_ALGO_VERSION, "stamped after repack");
     }
 
     // ---- Polis F3 — districts by feature ----
@@ -9444,12 +10167,66 @@ import { cdn } from 'https://cdn.example.com/x';
             districts: 42,
             agents: 3,
             json_bytes: 98_765_432,
+            districts_breakdown: Vec::new(),
         });
         assert_eq!(
             line,
             "BUILD[rust] buildings=400000 roads=50000 (capped from 612345) \
 connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         );
+    }
+
+    #[test]
+    fn build_log_appends_district_breakdown_sorted_and_capped() {
+        // Breakdown is rendered count DESC then id ASC; >12 districts truncate to
+        // the top 12 with a ` +N more` tail.
+        let mut breakdown: Vec<(String, usize)> = Vec::new();
+        // 14 districts: counts 14..=1 so the sort + cap are both exercised. Build
+        // them already in the (count DESC, id ASC) order the metrics carry.
+        for n in (1..=14).rev() {
+            breakdown.push((format!("d{:02}", 15 - n), n));
+        }
+        let line = format_build_log(&BuildMetrics {
+            buildings: 105,
+            roads: 0,
+            roads_before_cap: 0,
+            connected: 0,
+            waypoints: 0,
+            districts: 14,
+            agents: 0,
+            json_bytes: 0,
+            districts_breakdown: breakdown,
+        });
+        // Top 12 listed in order, then ` +2 more`.
+        assert!(
+            line.contains(
+                "districts=[d01:14 d02:13 d03:12 d04:11 d05:10 d06:9 d07:8 d08:7 d09:6 d10:5 d11:4 d12:3 +2 more]"
+            ),
+            "breakdown must list top 12 sorted + tail. got: {line}"
+        );
+    }
+
+    #[test]
+    fn build_log_breakdown_no_tail_when_not_truncated() {
+        // Exactly 12 districts -> no ` +N more`.
+        let breakdown: Vec<(String, usize)> = (1..=12).rev().map(|n| (format!("d{n:02}"), n)).collect();
+        let mut sorted = breakdown.clone();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let line = format_build_log(&BuildMetrics {
+            buildings: 78,
+            roads: 0,
+            roads_before_cap: 0,
+            connected: 0,
+            waypoints: 0,
+            districts: 12,
+            agents: 0,
+            json_bytes: 0,
+            districts_breakdown: sorted,
+        });
+        assert!(!line.contains("more"), "no tail at exactly 12: {line}");
+        // count DESC then id ASC: d12 has count 12 (highest) so it heads the list.
+        assert!(line.contains("districts=[d12:12"), "lists all 12: {line}");
+        assert!(line.contains("d01:1]"), "smallest district is last: {line}");
     }
 
     #[test]
@@ -9464,6 +10241,7 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
             districts: 5,
             agents: 0,
             json_bytes: 2_000_000,
+            districts_breakdown: Vec::new(),
         });
         assert!(
             line.contains("roads=1583 (capped from 1583)"),
