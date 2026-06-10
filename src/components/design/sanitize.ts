@@ -94,6 +94,16 @@ const ID_ATTR = "id";
 const HREF_ATTR = "href";
 const SAFE_HREF_RE = /^(?:(?:https?|mailto|tel):|#|\/(?![/\\])|\.{0,2}\/)/i;
 
+// M2: an SVG `<image href="…">` is a RESOURCE load, not a navigation link, so the
+// link policy (which permits http(s)) is wrong for it — a remote
+// `href="https://evil/x.png"` is an exfil/beacon vector (it pings the attacker's
+// host the moment the SVG renders) we cannot distinguish from a legit asset at this
+// layer. Mirror the inline-style `url()` policy instead: only an in-document
+// `data:image/` payload or a same-document `#fragment` ref is allowed on SVG
+// <image> href; everything else (incl. http(s)) is dropped.
+const SVG_IMAGE_TAG = "image";
+const SAFE_SVG_IMAGE_HREF_RE = /^(?:data:image\/|#)/i;
+
 // --- Inline-style neutralization -------------------------------------------
 // DOMPurify's `ALLOWED_URI_REGEXP` clamps href/src-style URI attributes, but it
 // does NOT inspect URIs embedded inside an inline `style` attribute. That leaves
@@ -117,8 +127,12 @@ const CSS_URL_RE = /url\(\s*(['"]?)([^)'"]*)\1\s*\)/gi;
 // external paths) is replaced with `url(about:blank)`.
 const SAFE_CSS_URL_RE = /^(?:data:image\/|#)/i;
 // `position:fixed` / `position:sticky` — a node must not escape its host div to
-// overlay the canvas. The host owns placement; strip these declarations.
-const DANGEROUS_POSITION_RE = /position\s*:\s*(?:fixed|sticky)\s*;?/gi;
+// overlay the canvas. The host owns placement; strip these declarations. W7: also
+// tolerate an `!important` qualifier (with arbitrary surrounding whitespace) so
+// `position: fixed !important` cannot slip past the strip and override the host's
+// containment.
+const DANGEROUS_POSITION_RE =
+  /position\s*:\s*(?:fixed|sticky)(?:\s*!\s*important)?\s*;?/gi;
 // CSS `expression(...)` (legacy IE dynamic-property XSS); kill it wholesale.
 const CSS_EXPRESSION_RE = /expression\s*\(/gi;
 
@@ -154,7 +168,7 @@ function ensureNodeIdHook(): void {
   // Mark installed BEFORE registering so a re-entrant call (hook bodies never call
   // back here, but defense in depth) cannot double-register the same hook.
   hookInstalled = true;
-  DOMPurify.addHook("uponSanitizeAttribute", (_node, data) => {
+  DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
     if (data.attrName === DATA_NODE_ID_ATTR) {
       // Keep only a well-formed id; drop anything else (and never force-keep an
       // attacker-controlled arbitrary data-node-id value).
@@ -162,10 +176,21 @@ function ensureNodeIdHook(): void {
       return;
     }
     if (data.attrName === HREF_ATTR && typeof data.attrValue === "string") {
-      // Clamp the scheme of a PLAIN `href` (HTML <a> and SVG <a>/<image>/<use>).
-      // Anything that is not an allowed safe scheme/fragment/relative path is
-      // dropped so `javascript:`/`data:`/`vbscript:` can never survive on href.
-      if (!SAFE_HREF_RE.test(data.attrValue.trim())) {
+      const value = data.attrValue.trim();
+      // M2: an SVG <image> href is a RESOURCE fetch — apply the stricter
+      // image-url policy (data:image/ or #fragment only) so a remote beacon
+      // `href="https://evil/x.png"` is dropped while a link's http(s) href is not.
+      // `nodeName` for an SVG element is its lowercase local name in jsdom; lowercase
+      // defensively for the browser path.
+      const tag = (node as Element)?.nodeName?.toLowerCase?.() ?? "";
+      if (tag === SVG_IMAGE_TAG) {
+        if (!SAFE_SVG_IMAGE_HREF_RE.test(value)) data.keepAttr = false;
+        return;
+      }
+      // Clamp the scheme of a PLAIN `href` (HTML <a> and SVG <a>/<use>). Anything
+      // that is not an allowed safe scheme/fragment/relative path is dropped so
+      // `javascript:`/`data:`/`vbscript:` can never survive on href.
+      if (!SAFE_HREF_RE.test(value)) {
         data.keepAttr = false;
       }
       return;
@@ -184,9 +209,21 @@ function ensureNodeIdHook(): void {
   DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     // Only elements carry attributes; guard for the DOM type.
     const el = node as Element;
-    if (typeof el.removeAttribute !== "function") return;
-    if (el.hasAttribute(CLASS_ATTR)) el.removeAttribute(CLASS_ATTR);
-    if (el.hasAttribute(ID_ATTR)) el.removeAttribute(ID_ATTR);
+    if (typeof el.removeAttribute !== "function" || el.attributes == null) return;
+    // M3: SVG (and foreign-content) attribute names are CASE-SENSITIVE in the DOM,
+    // so `CLASS`/`ID`/`Class` on an SVG element are DISTINCT attributes that a
+    // case-sensitive `hasAttribute("class")` misses entirely — they would survive.
+    // Compare by lowercased name instead, and remove EVERY attribute whose name is
+    // `class` or `id` in any case. Collect names first: removeAttribute mutates the
+    // live `attributes` NamedNodeMap, so iterating + removing in one pass skips
+    // entries. `data-node-id` is a data-* attr (not `class`/`id`) and is untouched.
+    const toRemove: string[] = [];
+    for (let i = 0; i < el.attributes.length; i += 1) {
+      const name = el.attributes[i]?.name ?? "";
+      const lower = name.toLowerCase();
+      if (lower === CLASS_ATTR || lower === ID_ATTR) toRemove.push(name);
+    }
+    for (const name of toRemove) el.removeAttribute(name);
   });
 }
 

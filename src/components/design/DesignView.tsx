@@ -33,7 +33,17 @@ import type {
   DesignProject,
   DesignProjectEntry,
 } from "../../types/design";
-import { Canvas } from "./Canvas";
+import "@fontsource-variable/instrument-sans";
+import "@fontsource-variable/source-serif-4";
+import "./design.css";
+import { DesignCanvas } from "./canvas/DesignCanvas";
+import {
+  createHistory,
+  push as pushHistory,
+  undo as undoHistory,
+  redo as redoHistory,
+  type History,
+} from "./history";
 import { sanitizeNodeMarkup } from "./sanitize";
 import { useDesignStream } from "./useDesignStream";
 import {
@@ -150,12 +160,64 @@ function formatLastOpened(iso: string): string {
   return new Date(t).toLocaleDateString();
 }
 
+/** An undo/redo snapshot: the parts of a project an interactive edit can change.
+ *  Meta fields other than `nodeOrder` are not mutated by canvas edits, so they are
+ *  restored from the live project at apply time. */
+interface DesignSnapshot {
+  manifest: DesignManifest;
+  components: Record<string, string>;
+  nodeOrder: string[];
+}
+
+// W2: SHALLOW by design. A snapshot holds REFERENCES to the live manifest /
+// components / nodeOrder objects — it does NOT deep-clone them. Component markup is
+// stored as immutable strings (every edit replaces the whole string, never mutates
+// it in place) and manifest/nodeOrder mutations always produce NEW objects via the
+// immutable engine ops, so sharing references between snapshots is safe: a later
+// edit cannot retroactively alter an earlier snapshot. Memory posture: strings are
+// shared (not duplicated) across snapshots, and the 60-entry history cap
+// (MAX_HISTORY) bounds the snapshot COUNT, so total retained memory stays small.
+function snapshotOf(project: DesignProject): DesignSnapshot {
+  return {
+    manifest: project.manifest,
+    components: project.components,
+    nodeOrder: project.meta.nodeOrder,
+  };
+}
+
 export function DesignView() {
   const [project, setProject] = useState<DesignProject>(() => buildDemoProject());
   const [folder, setFolder] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Undo/redo history over interactive canvas/inspector edits. `onBeginChange`
+  // (fired by the canvas BEFORE each committed mutation) snapshots the live project
+  // here; undo/redo restore a snapshot through the SAME persistence path the edits
+  // use. Generation/load REPLACE the project wholesale and clear history (a new
+  // baseline) so undo never crosses a generation boundary.
+  //
+  // B1+M6+W4: the History VALUE lives in a ref (not React state) so undo()/redo()
+  // can run imperatively — read ref, compute, mutate ref, then call applySnapshot
+  // OUTSIDE any state updater. Doing the IPC-persisting applySnapshot inside a
+  // setState updater double-fires under StrictMode and races on rapid Ctrl+Z.
+  // Rendering (the toolbar's enabled/disabled state) only needs the can* flags, so
+  // a tiny `historyFlags` state mirrors them. `setHistoryValue` is the single point
+  // that writes the ref AND syncs the flags.
+  const historyRef = useRef<History<DesignSnapshot>>(createHistory<DesignSnapshot>());
+  const [historyFlags, setHistoryFlags] = useState<{
+    canUndo: boolean;
+    canRedo: boolean;
+  }>({ canUndo: false, canRedo: false });
+  const setHistoryValue = useCallback((h: History<DesignSnapshot>) => {
+    historyRef.current = h;
+    setHistoryFlags((prev) =>
+      prev.canUndo === h.canUndo && prev.canRedo === h.canRedo
+        ? prev
+        : { canUndo: h.canUndo, canRedo: h.canRedo },
+    );
+  }, []);
 
   // Phase 3 (management plane) — the recent-projects registry (metadata only, in
   // config.json). Loaded on mount; refreshed after every remember/rename/remove (the
@@ -444,6 +506,7 @@ export function DesignView() {
         project: seeded,
       });
       setProject(seeded);
+      setHistoryValue(createHistory<DesignSnapshot>()); // new baseline — clear undo/redo
       setStatus("Created and seeded the project on disk.");
       // Remember it in the recent-projects registry (metadata only). Use the project
       // name from the freshly created meta.
@@ -453,7 +516,7 @@ export function DesignView() {
     } finally {
       setBusy(null);
     }
-  }, [folder, rememberProject]);
+  }, [folder, rememberProject, setHistoryValue]);
 
   // Core load flow shared by the "Load" button and the recent-projects list. Loads the
   // given working folder, adopts it as the current `folder`, re-derives shapes, seeds
@@ -477,6 +540,7 @@ export function DesignView() {
           { workingFolderPath: folderPath },
         );
         setProject(loaded);
+        setHistoryValue(createHistory<DesignSnapshot>()); // new baseline — clear undo/redo
         // Re-derive the in-memory ShapeMap from the loaded markup (BLOCKER 3):
         // shapesRef is in-memory only and would otherwise be {} after a reload, so
         // the first post-reload regeneration would re-mint any id the model drops and
@@ -510,7 +574,7 @@ export function DesignView() {
         setBusy(null);
       }
     },
-    [seedTokens, rememberProject],
+    [seedTokens, rememberProject, setHistoryValue],
   );
 
   const runLoad = useCallback(async () => {
@@ -657,6 +721,85 @@ export function DesignView() {
     },
     [tauri],
   );
+
+  // --- interactive edit history (undo/redo) ---------------------------------
+
+  // Snapshot the LIVE project into the undo stack. The canvas/inspector call this
+  // synchronously BEFORE each committed mutation, so the snapshot is the pre-edit
+  // state. Reads `projectRef.current` (the freshest project, incl. prior drags).
+  const onBeginChange = useCallback(() => {
+    setHistoryValue(pushHistory(historyRef.current, snapshotOf(projectRef.current)));
+  }, [setHistoryValue]);
+
+  // Commit a STRUCTURAL interactive change (delete removes a component / duplicate
+  // adds one / layer ops touch nodeOrder). Update state immediately and persist the
+  // whole project through the EXISTING consolidating writer (which also cancels any
+  // pending throttled drag write so it cannot clobber this).
+  const onProjectChange = useCallback(
+    (next: DesignProject) => {
+      setProject(next);
+      persistProject(next);
+    },
+    [persistProject],
+  );
+
+  // Apply an undo/redo snapshot back onto the live project (preserving meta fields
+  // the snapshot doesn't carry) and persist it through the same whole-project path.
+  const applySnapshot = useCallback(
+    (snap: DesignSnapshot) => {
+      const next: DesignProject = {
+        ...projectRef.current,
+        manifest: snap.manifest,
+        components: snap.components,
+        meta: { ...projectRef.current.meta, nodeOrder: snap.nodeOrder },
+      };
+      setProject(next);
+      persistProject(next);
+    },
+    [persistProject],
+  );
+
+  // B1+M6+W4: imperative — read ref, compute, apply the snapshot OUTSIDE any state
+  // updater, then store the new history. A no-op (nothing to undo) leaves the ref
+  // and flags untouched. Running under StrictMode invokes this callback once per
+  // user action (not the double-invoked render/updater path), so exactly one
+  // applySnapshot -> one persistProject fires per Ctrl+Z.
+  const undo = useCallback(() => {
+    const res = undoHistory(historyRef.current, snapshotOf(projectRef.current));
+    if (!res) return;
+    applySnapshot(res.value);
+    setHistoryValue(res.history);
+  }, [applySnapshot, setHistoryValue]);
+
+  const redo = useCallback(() => {
+    const res = redoHistory(historyRef.current, snapshotOf(projectRef.current));
+    if (!res) return;
+    applySnapshot(res.value);
+    setHistoryValue(res.history);
+  }, [applySnapshot, setHistoryValue]);
+
+  // Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or Ctrl+Y = redo. Ignored while focus is in
+  // an input/textarea/contenteditable (so typing a prompt isn't hijacked).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const target = e.target as HTMLElement | null;
+      const tag = (target?.tagName ?? "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || target?.isContentEditable) {
+        return;
+      }
+      const key = e.key.toLowerCase();
+      if (key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((key === "z" && e.shiftKey) || (key === "y" && !e.shiftKey)) {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, redo]);
 
   // Persist a single node after an edit (cheap path): its markup + the manifest
   // (kind may have changed). Best-effort.
@@ -968,6 +1111,7 @@ export function DesignView() {
         } else {
           shapesRef.current = shapes;
           setProject(next);
+          setHistoryValue(createHistory<DesignSnapshot>()); // generation = new baseline
           persistProject(next);
           // Surface any dropped-node warnings (foster-parented / empty roots) on the
           // committed result so the operator sees what the guard removed.
@@ -1002,6 +1146,7 @@ export function DesignView() {
         }
 
         setProject(next);
+        setHistoryValue(createHistory<DesignSnapshot>()); // edit = new baseline
         // BLOCKER 1: refresh the edited node's stored structural shape from its NEW
         // markup. Without this, shapesRef holds the pre-edit shape, so the next full
         // generation can't structurally re-anchor the (possibly restructured / id-
@@ -1040,6 +1185,7 @@ export function DesignView() {
     persistNode,
     appendGenerationLog,
     launchRepair,
+    setHistoryValue,
   ]);
 
   // Drop a stale selection: after a generation/load removes the selected node,
@@ -1372,11 +1518,44 @@ export function DesignView() {
         </div>
       </section>
 
-      <div className="min-h-0 flex-1">
-        <Canvas
+      {/* Temporary undo/redo controls (the real TopBar arrives in the next phase). */}
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={undo}
+          disabled={!historyFlags.canUndo}
+          className="inline-flex items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-[13px] font-medium text-cream-700 shadow-soft-sm transition-colors hover:bg-cream-100 disabled:opacity-50"
+        >
+          Undo
+        </button>
+        <button
+          type="button"
+          onClick={redo}
+          disabled={!historyFlags.canRedo}
+          className="inline-flex items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-[13px] font-medium text-cream-700 shadow-soft-sm transition-colors hover:bg-cream-100 disabled:opacity-50"
+        >
+          Redo
+        </button>
+      </div>
+
+      {/*
+        DATA-MODEL DEVIATION (noted): the spec asked to wrap the WHOLE view root in
+        `.dsgn`. `.dsgn` is `display:flex; height:100%` and re-themes typography/color
+        for everything inside — applying it to the whole view would fight the existing
+        Tailwind shell (the folder picker, generation forms, recent list). To keep that
+        shell visually intact while still scoping the Devboule canvas chrome, the `.dsgn`
+        wrapper is placed around the CANVAS subtree only (canvas + Inspector/Layers/
+        Zoom/Tool float cards, which the prototype renders inside `.canvas-wrap`). The
+        full-shell reskin is the next phase.
+      */}
+      <div className="dsgn min-h-0 flex-1">
+        <DesignCanvas
           project={project}
           onManifestChange={onManifestChange}
+          onProjectChange={onProjectChange}
           onSelect={setSelectedId}
+          selectedId={selectedId}
+          onBeginChange={onBeginChange}
         />
       </div>
     </div>

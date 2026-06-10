@@ -214,6 +214,12 @@
 
 .dsgn .node-host { position: absolute; border-radius: 14px; }
 .dsgn .node-card {
+  /* B2: position:relative makes the card the containing block for any inner
+     position:absolute node markup, so overflow:hidden actually CLIPS it. Without
+     a positioning context here, an inner `position:absolute;top:-9999px` would
+     resolve against an ancestor / the viewport and ESCAPE the card to overlay the
+     canvas. (position:fixed/sticky are separately stripped in sanitize.ts.) */
+  position: relative;
   border-radius: 14px; overflow: hidden;
   background: var(--card);
   box-shadow: 0 1px 3px rgba(62,47,24,.08), 0 8px 28px rgba(62,47,24,.06);

@@ -35,8 +35,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 // Stub Canvas: render a button that fires the parent's onManifestChange with a
 // known manifest, so the test triggers exactly one pending write.
-vi.mock("./Canvas", () => ({
-  Canvas: (props: { onManifestChange: (m: DesignManifest) => void }) =>
+vi.mock("./canvas/DesignCanvas", () => ({
+  DesignCanvas: (props: { onManifestChange: (m: DesignManifest) => void }) =>
     createElement("button", {
       type: "button",
       "data-testid": "commit",

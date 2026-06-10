@@ -47,8 +47,8 @@ vi.mock("./useDesignStream", () => ({
   }),
 }));
 
-vi.mock("./Canvas", () => ({
-  Canvas: () => createElement("div", { "data-testid": "canvas" }),
+vi.mock("./canvas/DesignCanvas", () => ({
+  DesignCanvas: () => createElement("div", { "data-testid": "canvas" }),
 }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =

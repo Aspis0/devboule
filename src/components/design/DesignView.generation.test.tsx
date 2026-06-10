@@ -74,8 +74,8 @@ let lastProject: DesignProject | null = null;
 let lastOnManifestChange:
   | ((m: DesignProject["manifest"]) => void)
   | null = null;
-vi.mock("./Canvas", () => ({
-  Canvas: (props: {
+vi.mock("./canvas/DesignCanvas", () => ({
+  DesignCanvas: (props: {
     project: DesignProject;
     onSelect: (id: string | null) => void;
     onManifestChange: (m: DesignProject["manifest"]) => void;

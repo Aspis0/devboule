@@ -166,6 +166,25 @@ describe("sanitizeNodeMarkup — neutralizes XSS", () => {
     expect(sticky).not.toContain("position:sticky");
   });
 
+  it("W7: strips position:fixed/sticky even with an !important qualifier", () => {
+    const fixed = clean(
+      '<div style="position: fixed !important; inset:0; z-index:99999">x</div>',
+    );
+    expect(fixed).not.toContain("position: fixed");
+    expect(fixed).not.toContain("position:fixed");
+    // the !important declaration must not leave a dangling `position` anywhere
+    expect(fixed).not.toMatch(/position\s*:\s*fixed/);
+    const sticky = clean('<div style="position:sticky !important;top:0">x</div>');
+    expect(sticky).not.toMatch(/position\s*:\s*sticky/);
+  });
+
+  it("W7: still allows position:absolute (neutralized by host containment, not stripped)", () => {
+    const out = clean('<div style="position:absolute;top:-9999px;left:-9999px">x</div>');
+    // absolute is NOT stripped at the sanitize layer — the host .node-card
+    // (position:relative; overflow:hidden) clips it (B2). It must remain in the CSS.
+    expect(out).toContain("position:absolute");
+  });
+
   it("kills CSS expression() (legacy IE dynamic-property XSS)", () => {
     const out = clean('<div style="width:expression(alert(1))">x</div>');
     expect(out).not.toContain("expression(");
@@ -221,6 +240,28 @@ describe("sanitizeNodeMarkup — direct-DOM isolation (class/id stripping)", () 
     expect(out).toContain("<svg"); // the SVG itself still renders
     expect(out).toContain("<rect");
   });
+
+  it("M3: strips UPPERCASE CLASS/ID on SVG elements (case-sensitive attr names)", () => {
+    // SVG attribute names are case-sensitive in the DOM, so CLASS/ID are distinct
+    // from class/id; a case-sensitive hasAttribute check would let them survive.
+    const out = clean('<svg><rect CLASS="x" ID="y" data-node-id="hero"/></svg>');
+    expect(out).not.toContain("class=");
+    expect(out).not.toContain('"x"');
+    expect(out).not.toContain('"y"'); // the id VALUE is gone
+    // no standalone `id=` attribute (data-node-id= legitimately contains the
+    // substring "id=", so match a word boundary instead of a bare substring)
+    expect(out).not.toMatch(/(?:^|[\s"])id=/);
+    expect(out).not.toContain("user-content");
+    // a legitimate data-node-id on the same element is untouched
+    expect(out).toContain('data-node-id="hero"');
+  });
+
+  it("M3: strips lowercase class/id on SVG too (regression — unchanged behavior)", () => {
+    const out = clean('<svg><rect class="a" id="b"/></svg>');
+    expect(out).not.toContain("class=");
+    expect(out).not.toContain("id=");
+    expect(out).not.toContain("user-content");
+  });
 });
 
 describe("sanitizeNodeMarkup — preserves legitimate markup", () => {
@@ -251,6 +292,24 @@ describe("sanitizeNodeMarkup — preserves legitimate markup", () => {
     const out = sanitizeNodeMarkup('<svg viewBox="0 0 10 10"><rect width="10" height="10"/></svg>');
     expect(out.toLowerCase()).toContain("<svg");
     expect(out.toLowerCase()).toContain("<rect");
+  });
+
+  it("M2: drops a REMOTE href on an SVG <image> (exfil/beacon resource fetch)", () => {
+    // A remote http(s) href on <image> passes the LINK policy but is a resource
+    // beacon — it must be dropped. The <image> element itself may remain, but with
+    // no remote href to fetch.
+    const out = clean(
+      '<svg><image href="https://evil.example/x.png" width="10" height="10"/></svg>',
+    );
+    expect(out).not.toContain("evil.example");
+    expect(out).not.toContain("https://");
+  });
+
+  it("M2: keeps a data:image/ href on an SVG <image> (legit inline asset)", () => {
+    const out = clean(
+      '<svg><image href="data:image/png;base64,iVBORw0KGgg==" width="10" height="10"/></svg>',
+    );
+    expect(out).toContain("data:image/png");
   });
 });
 
