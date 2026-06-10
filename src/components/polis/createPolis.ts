@@ -9,6 +9,13 @@
 // installed pixi.js@8 — so we use it directly (drag/pinch/wheel/clampZoom)
 // rather than a manual fallback.
 
+// CSP: the app's Content-Security-Policy (tauri.conf.json) forbids
+// `unsafe-eval`, and PixiJS v8's WebGL renderer compiles shader/uniform glue
+// with `new Function` — so `app.init` THROWS in the packaged webview and the
+// map stays grey. This official Pixi side-effect module swaps those code paths
+// for precompiled equivalents; it must be imported before the renderer is
+// created. Do NOT "fix" this by adding unsafe-eval to the CSP.
+import "pixi.js/unsafe-eval";
 import { Application, Container } from "pixi.js";
 import { Viewport } from "pixi-viewport";
 import type {
