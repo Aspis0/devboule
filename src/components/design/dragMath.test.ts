@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeDragCommit, otherRects } from "./useDrag";
+import { computeDragCommit, otherRects } from "./canvas/dragCommit";
 import type { DesignManifest, DesignNodePlacement } from "../../types/design";
 
 function placement(over: Partial<DesignNodePlacement> = {}): DesignNodePlacement {

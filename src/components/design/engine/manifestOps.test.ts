@@ -5,6 +5,8 @@ import {
   resizeNode,
   bringToFront,
   sendToBack,
+  moveForward,
+  moveBackward,
   reorder,
 } from "./manifestOps";
 import type { DesignManifest, DesignNodePlacement } from "../../../types/design";
@@ -145,6 +147,87 @@ describe("manifestOps — bringToFront / sendToBack", () => {
     const before = JSON.stringify(m);
     bringToFront(m, "a");
     expect(JSON.stringify(m)).toBe(before);
+  });
+});
+
+describe("manifestOps — moveForward / moveBackward", () => {
+  it("moveForward swaps z with the nearest-higher neighbour", () => {
+    const m = manifest({
+      a: placement({ z: 1 }),
+      b: placement({ z: 5 }),
+      c: placement({ z: 3 }),
+    });
+    // a (z=1) nearest-higher is c (z=3): swap.
+    const next = moveForward(m, "a");
+    expect(next.nodes.a.z).toBe(3);
+    expect(next.nodes.c.z).toBe(1);
+    expect(next.nodes.b.z).toBe(5); // untouched
+  });
+
+  it("moveBackward swaps z with the nearest-lower neighbour", () => {
+    const m = manifest({
+      a: placement({ z: 1 }),
+      b: placement({ z: 5 }),
+      c: placement({ z: 3 }),
+    });
+    // b (z=5) nearest-lower is c (z=3): swap.
+    const next = moveBackward(m, "b");
+    expect(next.nodes.b.z).toBe(3);
+    expect(next.nodes.c.z).toBe(5);
+    expect(next.nodes.a.z).toBe(1);
+  });
+
+  it("moveForward is a no-op (same reference) for the top node", () => {
+    const m = manifest({ a: placement({ z: 1 }), b: placement({ z: 9 }) });
+    expect(moveForward(m, "b")).toBe(m);
+  });
+
+  it("moveBackward is a no-op (same reference) for the bottom node", () => {
+    const m = manifest({ a: placement({ z: 1 }), b: placement({ z: 9 }) });
+    expect(moveBackward(m, "a")).toBe(m);
+  });
+
+  it("moveForward / moveBackward on a missing id return the same manifest", () => {
+    const m = manifest({ a: placement({ z: 1 }) });
+    expect(moveForward(m, "ghost")).toBe(m);
+    expect(moveBackward(m, "ghost")).toBe(m);
+  });
+
+  it("a single node is at both extremes (both ops no-op)", () => {
+    const m = manifest({ a: placement({ z: 4 }) });
+    expect(moveForward(m, "a")).toBe(m);
+    expect(moveBackward(m, "a")).toBe(m);
+  });
+
+  it("moveForward then moveBackward returns to the original z layout", () => {
+    const m = manifest({
+      a: placement({ z: 1 }),
+      b: placement({ z: 2 }),
+      c: placement({ z: 3 }),
+    });
+    const fwd = moveForward(m, "a"); // a<->b: a=2, b=1
+    const back = moveBackward(fwd, "a"); // a<->b again: a=1, b=2
+    expect(back.nodes.a.z).toBe(1);
+    expect(back.nodes.b.z).toBe(2);
+    expect(back.nodes.c.z).toBe(3);
+  });
+
+  it("does not mutate the input manifest", () => {
+    const m = manifest({ a: placement({ z: 1 }), b: placement({ z: 2 }) });
+    const before = JSON.stringify(m);
+    moveForward(m, "a");
+    moveBackward(m, "b");
+    expect(JSON.stringify(m)).toBe(before);
+  });
+
+  it("shares untouched nodes by identity", () => {
+    const m = manifest({
+      a: placement({ z: 1 }),
+      b: placement({ z: 2 }),
+      c: placement({ z: 9 }),
+    });
+    const next = moveForward(m, "a"); // swaps a<->b; c untouched
+    expect(next.nodes.c).toBe(m.nodes.c);
   });
 });
 

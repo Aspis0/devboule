@@ -47,6 +47,18 @@ export interface DesignNodePlacement {
   w: number;
   h: DesignNodeHeight;
   kind: DesignNodeKind;
+  /**
+   * Corner radius (px) applied to the node card. OPTIONAL: absent means the
+   * default card radius from the stylesheet. Mirrors the Rust `radius` field
+   * (omitted on the wire when `None`).
+   */
+  radius?: number;
+  /** When true, render the card "flat" (no card chrome/shadow). OPTIONAL. */
+  flat?: boolean;
+  /** When true, the node is hidden on the canvas (layer visibility). OPTIONAL. */
+  hidden?: boolean;
+  /** Display label for the layers panel / node tag. OPTIONAL. */
+  name?: string;
 }
 
 /** `manifest.json` — placement-only authority over top-level nodes, keyed by id. */

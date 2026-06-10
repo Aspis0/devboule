@@ -383,18 +383,28 @@ pub(crate) fn generate_city_state_with_metrics(
     // cached); F2 reclassify refines the overrides, not this.
     meta.set_features(feature_result.features.clone());
 
-    // Phase 4 — layout (deterministic districts + spiral + packing). Polis F3:
-    // districts are grouped BY FEATURE (F1 `feature_id`), built from the feature
-    // registry computed above.
-    let districts = layout(&mut buildings, &mut meta, &feature_result.features);
-
-    // Phase 4a — PROPORTIONAL ROAD CAP (applied BEFORE routing so a dropped road
-    // never pays the per-road A* cost). At Polis scale the routed road polylines
-    // dominate the payload, so the road set is trimmed to `road_cap_for(buildings)`
-    // here. Placed AFTER classification/feature assignment (which read the FULL
-    // import-graph degree) and BEFORE phase 4b routing — so only routing + payload
-    // are bounded, the structural signals are not perturbed. Zero-cost under cap.
+    // Phase 4a — PROPORTIONAL ROAD CAP (applied BEFORE layout + routing so a
+    // dropped road never pays the per-road A* cost AND so the A2 semantic-placement
+    // meta-graph is built from the SAME capped road set the city actually ships —
+    // no district adjacency is biased by an edge the map never draws). At Polis
+    // scale the routed road polylines dominate the payload, so the road set is
+    // trimmed to `road_cap_for(buildings)` here. Placed AFTER classification/feature
+    // assignment (which read the FULL import-graph degree) and BEFORE phase 4 layout
+    // / phase 4b routing — so only placement-bias + routing + payload are bounded,
+    // the structural signals are not perturbed. Zero-cost under cap.
     let roads_before_cap = cap_roads(&mut roads, buildings.len());
+
+    // Phase 4 — layout (deterministic districts + SEMANTIC placement + packing).
+    // Polis F3: districts are grouped BY FEATURE (F1 `feature_id`), built from the
+    // feature registry computed above. Polis A2: the capped import roads drive a
+    // district meta-graph so heavily-coupled districts land ADJACENT (commons at
+    // the centre, isolated districts on the periphery).
+    let districts = layout(
+        &mut buildings,
+        &mut meta,
+        &feature_result.features,
+        &roads,
+    );
 
     // Phase 4b — WORLD-GRID road routing. Now that buildings have coords, route
     // each import road as a STREET on a shared occupancy grid: A* that avoids
@@ -3227,13 +3237,47 @@ fn fallback_feature_color(id: &str) -> String {
 /// `feature_id` (the F1 product/domain assignment), NOT the tech-type family of
 /// its `purpose`. Each laid-out feature becomes one spatial `District`
 /// (`district_id == feature_id`), built from the F1 `features` registry
-/// (`name`/`color_accent`/`kind` -> `type`/`wall_style`). The packing + spiral
-/// machinery is unchanged; only the grouping key + a few placement/merge rules
-/// differ:
+/// (`name`/`color_accent`/`kind` -> `type`/`wall_style`). The packing machinery
+/// is unchanged; only the grouping key + a few placement/merge rules differ:
 ///   - COMMONS AT THE CENTRE: the `commons` feature anchors at the world origin
-///     (ring 0). Domain features radiate on the golden-angle spiral ordered by
-///     DESCENDING building count (big features nearer the centre), ties broken by
-///     `feature_id` lexicographic. `External` features are placed last.
+///     (placed first). `External` features are placed last.
+///
+/// POLIS A2 — SEMANTIC DISTRICT PLACEMENT. Districts are no longer packed in a
+/// blind golden-angle spiral (which made map adjacency meaningless). Instead the
+/// CAPPED import `roads` drive a deterministic district META-GRAPH and a
+/// semantic placement bias:
+///   - META-GRAPH: for every capped road whose two endpoint buildings live in
+///     DIFFERENT districts, `coupling[(district_a, district_b)] += road.weight`
+///     (unordered pair, `BTreeMap` for determinism; intra-district roads ignored).
+///   - PLACEMENT ORDER (coupling-bucket HYSTERESIS): districts are ranked by TOTAL
+///     coupling reduced to LOG2 BUCKETS (`64 - total.leading_zeros()`), so a
+///     handful of new imports cannot flip the order between scans. Final order:
+///     `commons` ALWAYS first; then `Domain` districts by (coupling bucket DESC,
+///     building-count DESC, id ASC); `External` districts last (same kind-major
+///     grouping F3 always had — kind rank dominates, so External never jumps ahead
+///     of a Domain on a bucket tie).
+///   - SEARCH-ORIGIN BIAS: the existing collision machinery (box + DISTRICT_MARGIN,
+///     first-free-spot step search) is KEPT; only WHERE the search starts changes.
+///     `commons` (or the first district if none) starts at the world centre. Each
+///     later district starts the search from the WEIGHTED CENTROID of its
+///     already-placed coupled partners (weight = pair coupling) — its strongest
+///     partner pulls hardest, so coupled districts end up adjacent. A district with
+///     ZERO coupling to anything placed starts OUTSIDE the current occupied
+///     bounding box (deterministically to its EAST = periphery), then the normal
+///     first-free search proceeds.
+///
+/// MIGRATION STORY (persisted coords). The layout is RECOMPUTED from inputs every
+/// scan; `meta_store` persists per-BUILDING coords + district id, NEVER district
+/// box positions. A2 changes only WHERE boxes land, so the FIRST scan after this
+/// change lays the city out fresh (the city-wide persisted-coord reuse below is
+/// gated on `no_district_moves`, which still holds, so coords CAN be reused — but
+/// reuse keeps each building at its persisted world coord, which is exactly the
+/// stability contract: a building only moves when its district assignment changes,
+/// not because the BOX it sits in was re-placed). The one-time re-layout is clean,
+/// not half-pinned: either the whole city reuses persisted coords (district boxes
+/// effectively pinned to where the buildings already are) or the whole city
+/// repacks fresh under the new semantic placement. There is no per-box persisted
+/// state for the move-guard to fight.
 ///   - MIN-SIZE MERGE (anti-confetti): a `Domain`/`External` feature with fewer
 ///     than `MIN_DISTRICT_BUILDINGS` buildings is folded into `commons` — those
 ///     buildings get `district_id = "commons"` but KEEP their own `feature_id`
@@ -3247,6 +3291,7 @@ pub fn layout(
     buildings: &mut [Building],
     meta: &mut MetaStore,
     features: &[Feature],
+    roads: &[Road],
 ) -> Vec<District> {
     // --- Feature registry lookups (deterministic; BTreeMap-sorted). ---
     // id -> Feature, plus a building count per feature id.
@@ -3320,27 +3365,79 @@ pub fn layout(
             .or_default();
     }
 
-    // --- Spiral placement order. Commons first (ring 0 = origin); then Domain
-    // features by DESCENDING building count, ties by feature_id lexicographic;
-    // External features last (also by descending count, then id). Fully
-    // deterministic (sort over the sorted BTreeMap keys). ---
+    // --- POLIS A2 — DISTRICT META-GRAPH (from the capped import roads). ---
+    // file_id -> resolved district id, so a road's two endpoints can be mapped to
+    // districts. Roads carry building `file_id`s; districts are the resolved keys.
+    let district_by_file_id: BTreeMap<&str, &str> = {
+        let mut m: BTreeMap<&str, &str> = BTreeMap::new();
+        for (did, indices) in &by_district {
+            for &i in indices {
+                m.insert(buildings[i].file_id.as_str(), did.as_str());
+            }
+        }
+        m
+    };
+    // Unordered district pair -> summed road weight (CROSS-district roads only;
+    // intra-district roads contribute nothing). BTreeMap keyed on an ordered
+    // (min,max) String pair for hash-seed-free determinism.
+    let mut coupling: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for r in roads {
+        let (Some(&da), Some(&db)) = (
+            district_by_file_id.get(r.from.as_str()),
+            district_by_file_id.get(r.to.as_str()),
+        ) else {
+            continue; // an endpoint with no laid-out building (shouldn't happen).
+        };
+        if da == db {
+            continue; // intra-district road: no inter-district coupling.
+        }
+        let key = if da <= db {
+            (da.to_string(), db.to_string())
+        } else {
+            (db.to_string(), da.to_string())
+        };
+        *coupling.entry(key).or_insert(0) += r.weight as u64;
+    }
+    // Total coupling per district (sum over every pair it participates in).
+    let mut total_coupling: BTreeMap<&str, u64> = BTreeMap::new();
+    for ((a, b), &w) in &coupling {
+        *total_coupling.entry(a.as_str()).or_insert(0) += w;
+        *total_coupling.entry(b.as_str()).or_insert(0) += w;
+    }
+    // LOG2 BUCKET of a total: 0 for total==0, else `64 - leading_zeros` (the index
+    // of the high bit + 1). Buckets give placement-order HYSTERESIS — totals 100 vs
+    // 101 share a bucket (no order flip), 100 vs 1000 do not. Pure integer math.
+    let coupling_bucket = |id: &str| -> u32 {
+        let t = total_coupling.get(id).copied().unwrap_or(0);
+        64 - t.leading_zeros()
+    };
+
+    // --- A2 placement order. `commons` ALWAYS first (centre); then `Domain`
+    // districts by (coupling bucket DESC, building-count DESC, id ASC); `External`
+    // districts last (F3 kind-major grouping preserved — kind rank dominates the
+    // sort key, so an External never jumps ahead of a Domain). Fully deterministic
+    // (sort over the sorted BTreeMap keys with integer/lexicographic keys). ---
     let mut district_ids: Vec<String> = by_district.keys().cloned().collect();
     district_ids.sort_by(|a, b| {
+        // Rank 0 belongs EXCLUSIVELY to the `COMMONS_FEATURE_ID` string: `kind_of`
+        // maps only that exact id to FeatureKind::Commons, so a kind-based arm here
+        // would be dead code masquerading as a general rule. One guard, one truth.
         let rank = |id: &str| -> u8 {
             if id == COMMONS_FEATURE_ID {
                 0
             } else {
                 match kind_of(id) {
-                    FeatureKind::Commons => 0,
-                    FeatureKind::Domain => 1,
+                    FeatureKind::Commons | FeatureKind::Domain => 1,
                     FeatureKind::External => 2,
                 }
             }
         };
         let count = |id: &str| by_district.get(id).map(|v| v.len()).unwrap_or(0);
-        // 1) class rank, 2) DESCENDING count, 3) ascending id (lexicographic).
+        // 1) class rank, 2) coupling BUCKET DESC, 3) DESCENDING count,
+        // 4) ascending id (lexicographic).
         rank(a)
             .cmp(&rank(b))
+            .then_with(|| coupling_bucket(b).cmp(&coupling_bucket(a)))
             .then_with(|| count(b).cmp(&count(a)))
             .then_with(|| a.cmp(b))
     });
@@ -3365,26 +3462,77 @@ pub fn layout(
         });
     }
 
-    // Second pass: place each district's packed box. We walk the golden-angle
-    // spiral outward and accept the first position whose bbox (expanded by
-    // DISTRICT_MARGIN) collides with NONE of the already-placed district boxes.
-    // Deterministic: fixed spiral, fixed acceptance test, no RNG.
+    // Second pass: place each district's packed box with A2 SEMANTIC BIAS. We keep
+    // the existing collision machinery (box + DISTRICT_MARGIN, first-free-spot
+    // spiral search) and only change WHERE the search STARTS:
+    //   - district 0 (commons, or the first district if none): world centre.
+    //   - a later district WITH coupling to already-placed partners: the WEIGHTED
+    //     CENTROID of those partners' centres (weight = pair coupling) — the
+    //     strongest partner pulls hardest, so coupled districts land adjacent.
+    //   - a later district with ZERO coupling to anything placed: EAST of the
+    //     current occupied bounding box (periphery), deterministic.
+    // The first-free spiral then proceeds from that seed, so collisions are still
+    // resolved. Deterministic: fixed seed math, fixed acceptance test, no RNG.
     let mut placed_boxes: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(packed.len()); // (x,y,w,h)
     let mut district_origins: Vec<(f64, f64)> = Vec::with_capacity(packed.len());
+    // Parallel to `placed_boxes`: each placed district's id + box CENTRE, for the
+    // weighted-centroid seed of subsequent districts.
+    let mut placed_centres: Vec<(&str, f64, f64)> = Vec::with_capacity(packed.len());
 
-    for (ring_index, pd) in packed.iter().enumerate() {
+    for (idx, pd) in packed.iter().enumerate() {
         let dw = pd.packed_w as f64;
         let dh = pd.packed_h as f64;
-
-        // Step size scales with the district sizes so the spiral search advances
-        // by meaningful amounts on a big map (no tiny crawl on huge cities).
+        // Step size scales with the district sizes so the spiral search advances by
+        // meaningful amounts on a big map (no tiny crawl on huge cities).
         let step = (dw.max(dh) + DISTRICT_MARGIN).max(1.0);
-        let (origin_x, origin_y) = place_district_box(ring_index, dw, dh, step, &placed_boxes);
 
-        // Record this district's box (with margin baked into the collision test
-        // via `district_boxes_overlap`).
+        // Compute the SEARCH-ORIGIN CENTRE seed for this district.
+        let (seed_cx, seed_cy) = if idx == 0 {
+            // First district anchors at the world origin (commons at the centre).
+            (0.0, 0.0)
+        } else {
+            // Weighted centroid of already-placed COUPLED partners.
+            let mut wsum = 0.0_f64;
+            let mut sx = 0.0_f64;
+            let mut sy = 0.0_f64;
+            for &(other_id, ocx, ocy) in &placed_centres {
+                let key = if pd.district_id.as_str() <= other_id {
+                    (pd.district_id.clone(), other_id.to_string())
+                } else {
+                    (other_id.to_string(), pd.district_id.clone())
+                };
+                if let Some(&w) = coupling.get(&key) {
+                    let wf = w as f64;
+                    wsum += wf;
+                    sx += wf * ocx;
+                    sy += wf * ocy;
+                }
+            }
+            if wsum > 0.0 {
+                (sx / wsum, sy / wsum)
+            } else {
+                // ZERO coupling to anything placed: go to the PERIPHERY — east of
+                // the current occupied bbox, centred vertically on it. The spiral
+                // search then settles it at the first free spot from there.
+                let (_min_x, min_y, max_x, max_y) = occupied_bbox(&placed_boxes);
+                let east_cx = max_x + step + dw / 2.0;
+                let mid_cy = (min_y + max_y) / 2.0;
+                (east_cx, mid_cy)
+            }
+        };
+
+        let (origin_x, origin_y) =
+            place_district_box(idx, seed_cx, seed_cy, dw, dh, step, &placed_boxes);
+
+        // Record this district's box (margin baked into the collision test via
+        // `district_boxes_overlap`) and its centre (for later centroid seeds).
         placed_boxes.push((origin_x, origin_y, dw, dh));
         district_origins.push((origin_x, origin_y));
+        placed_centres.push((
+            pd.district_id.as_str(),
+            origin_x + dw / 2.0,
+            origin_y + dh / 2.0,
+        ));
     }
 
     // Third pass: write building coords and build the District records.
@@ -3581,31 +3729,59 @@ fn district_bounds_from(
     }
 }
 
+/// The world bounding box `(min_x, min_y, max_x, max_y)` occupied by the already-
+/// placed district boxes. `(0,0,0,0)` for an empty set (the first district seeds
+/// at the world origin, so an empty bbox never feeds the periphery branch).
+fn occupied_bbox(placed_boxes: &[(f64, f64, f64, f64)]) -> (f64, f64, f64, f64) {
+    if placed_boxes.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    for &(x, y, w, h) in placed_boxes {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
 /// Find a non-overlapping world origin for a district's packed box of size
-/// `(dw, dh)`. Walks the golden-angle spiral outward from the world center in
-/// `step`-sized increments and returns the first center whose bbox (expanded by
-/// `DISTRICT_MARGIN`) collides with none of `placed_boxes`. Deterministic.
+/// `(dw, dh)`, beginning the search at the SEED CENTRE `(seed_cx, seed_cy)` (A2
+/// semantic bias: the weighted centroid of coupled partners, or the periphery for
+/// an uncoupled district, or the world origin for the first district). Walks the
+/// golden-angle spiral outward from that seed in `step`-sized increments and
+/// returns the first centre whose bbox (expanded by `DISTRICT_MARGIN`) collides
+/// with none of `placed_boxes`. `disc_index` only perturbs the spiral's starting
+/// ANGLE so successive districts fan out differently. Deterministic, no RNG.
 fn place_district_box(
-    ring_index: usize,
+    disc_index: usize,
+    seed_cx: f64,
+    seed_cy: f64,
     dw: f64,
     dh: f64,
     step: f64,
     placed_boxes: &[(f64, f64, f64, f64)],
 ) -> (f64, f64) {
-    // Ring 0 (the core) anchors at the world origin (0,0) center.
     let golden = 2.399_963_229_728_653_f64; // radians (~137.5°)
-                                            // Try increasing radii; the first ring's nominal radius keys off ring_index
-                                            // so different districts start at different angles even when re-searching.
-    let base_angle = ring_index as f64 * golden;
+                                            // The starting angle keys off the district index so different districts
+                                            // spiral out in different directions even from the same seed.
+    let base_angle = disc_index as f64 * golden;
 
-    // Candidate centers: r = 0, step, 2*step, ... along a spiral; at each radius
-    // we also rotate by the golden angle so successive candidates fan out.
+    // Candidate centres: r = 0, step, 2*step, ... along a spiral CENTRED ON THE
+    // SEED; at each radius we also rotate by the golden angle so successive
+    // candidates fan out. k=0 (r=0) tries the seed itself first, so a free seed is
+    // honored exactly (coupled districts land as close to their partners as the
+    // collision test allows).
     let mut k = 0usize;
     loop {
         let r = step * k as f64;
         let angle = base_angle + golden * k as f64;
-        let cx = r * angle.cos();
-        let cy = r * angle.sin();
+        let cx = seed_cx + r * angle.cos();
+        let cy = seed_cy + r * angle.sin();
         let origin_x = cx - dw / 2.0;
         let origin_y = cy - dh / 2.0;
         let candidate = (origin_x, origin_y, dw, dh);
@@ -5797,11 +5973,11 @@ const y = await import('@/lazy');
 
         let mut b1 = make();
         let mut m1 = MetaStore::default();
-        layout(&mut b1, &mut m1, &features);
+        layout(&mut b1, &mut m1, &features, &[]);
 
         let mut b2 = make();
         let mut m2 = MetaStore::default();
-        layout(&mut b2, &mut m2, &features);
+        layout(&mut b2, &mut m2, &features, &[]);
 
         // Determinism: same inputs -> identical coords.
         for (x, y) in b1.iter().zip(b2.iter()) {
@@ -5834,7 +6010,7 @@ const y = await import('@/lazy');
             mk_building_feat("2", "src/oracle/b.ts", purpose::TEMPLE, 50, "commons"), // kalybe 2x3
         ];
         let mut meta = MetaStore::default();
-        layout(&mut b1, &mut meta, &features);
+        layout(&mut b1, &mut meta, &features, &[]);
         assert_no_footprint_overlap(&b1);
 
         // Second scan: both grow to mnemeion (4x6). If we blindly reused the
@@ -5844,7 +6020,7 @@ const y = await import('@/lazy');
             mk_building_feat("1", "src/oracle/a.ts", purpose::TEMPLE, 5000, "commons"), // mnemeion 4x6
             mk_building_feat("2", "src/oracle/b.ts", purpose::TEMPLE, 5000, "commons"), // mnemeion 4x6
         ];
-        layout(&mut b2, &mut meta, &features);
+        layout(&mut b2, &mut meta, &features, &[]);
         assert_no_footprint_overlap(&b2);
     }
 
@@ -5856,7 +6032,7 @@ const y = await import('@/lazy');
             mk_building_feat("2", "src/a.ts", purpose::HOUSE, 50, "commons"),
         ];
         let mut meta = MetaStore::default();
-        layout(&mut buildings, &mut meta, &features);
+        layout(&mut buildings, &mut meta, &features, &[]);
         let original = buildings[0].coords;
         assert_eq!(meta.coords("src/main.tsx"), Some(original));
 
@@ -5868,7 +6044,7 @@ const y = await import('@/lazy');
             mk_building_feat("1", "src/main.tsx", purpose::WORKSHOP, 50, "commons"),
             mk_building_feat("2", "src/a.ts", purpose::HOUSE, 50, "commons"),
         ];
-        layout(&mut buildings2, &mut meta, &features);
+        layout(&mut buildings2, &mut meta, &features, &[]);
         assert_eq!(
             buildings2[0].coords, original,
             "persisted coords must survive re-scan"
@@ -5905,7 +6081,7 @@ const y = await import('@/lazy');
         // The deterministic, correct F3 layout for these inputs (fresh meta).
         let mut fresh = make();
         let mut fresh_meta = MetaStore::default();
-        layout(&mut fresh, &mut fresh_meta, &features);
+        layout(&mut fresh, &mut fresh_meta, &features, &[]);
         let fresh_coord = |id: &str| fresh.iter().find(|x| x.file_id == id).unwrap().coords;
 
         // Simulate a PRE-F3 meta: persist STALE, non-overlapping coords for every
@@ -5932,7 +6108,7 @@ const y = await import('@/lazy');
         // FIRST F3 scan over the pre-F3 meta: must IGNORE the stale coords and
         // repack to the correct feature-grouped layout.
         let mut b1 = make();
-        layout(&mut b1, &mut meta, &features);
+        layout(&mut b1, &mut meta, &features, &[]);
 
         // The stale coords were NOT reused: every building matches the fresh
         // repack, not its stale persisted position.
@@ -5968,7 +6144,7 @@ const y = await import('@/lazy');
         // SECOND scan with the now-F3 meta resumes the stable reuse fast path:
         // coords are unchanged (no district move).
         let mut b2 = make();
-        layout(&mut b2, &mut meta, &features);
+        layout(&mut b2, &mut meta, &features, &[]);
         for b in &b2 {
             assert_eq!(
                 b.coords,
@@ -6012,7 +6188,7 @@ const y = await import('@/lazy');
             mk_building_feat("6", "src/billing/conf.toml", purpose::TOWER, 100, "billing"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features);
+        let districts = layout(&mut b, &mut meta, &features, &[]);
 
         // Same feature -> same district; different feature -> different district.
         let dist = |id: &str| {
@@ -6061,7 +6237,7 @@ const y = await import('@/lazy');
             mk_building_feat("g3", "src/big/c.ts", purpose::HOUSE, 50, "big"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features);
+        let districts = layout(&mut b, &mut meta, &features, &[]);
 
         let get = |id: &str| b.iter().find(|x| x.file_id == id).unwrap();
         // Folded into commons spatially...
@@ -6099,7 +6275,7 @@ const y = await import('@/lazy');
             mk_building_feat("g3", "src/big/c.ts", purpose::HOUSE, 50, "big"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features);
+        let districts = layout(&mut b, &mut meta, &features, &[]);
 
         let get = |id: &str| b.iter().find(|x| x.file_id == id).unwrap();
         assert_eq!(get("t1").district_id, "commons");
@@ -6123,7 +6299,7 @@ const y = await import('@/lazy');
             mk_building("2", "src/y.ts", purpose::HOUSE, 50),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features);
+        let districts = layout(&mut b, &mut meta, &features, &[]);
         assert_eq!(b[0].district_id, "commons");
         assert_eq!(b[1].district_id, "commons");
         assert_no_orphan_districts(&b, &districts);
@@ -6152,7 +6328,7 @@ const y = await import('@/lazy');
 
         let mut a = make();
         let mut ma = MetaStore::default();
-        let da = layout(&mut a, &mut ma, &features);
+        let da = layout(&mut a, &mut ma, &features, &[]);
 
         // Reverse the input order AND reverse the feature-registry order: the
         // output must be byte-identical (sorted internally).
@@ -6161,7 +6337,7 @@ const y = await import('@/lazy');
         let mut feat_rev = features.clone();
         feat_rev.reverse();
         let mut mb = MetaStore::default();
-        let db = layout(&mut bvec, &mut mb, &feat_rev);
+        let db = layout(&mut bvec, &mut mb, &feat_rev, &[]);
 
         // Same coords + district per file_id, regardless of input order.
         for x in &a {
@@ -6204,7 +6380,7 @@ const y = await import('@/lazy');
             mk_building_feat("s3", "src/small/c.ts", purpose::HOUSE, 50, "small"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features);
+        let districts = layout(&mut b, &mut meta, &features, &[]);
 
         // Commons district straddles the origin (bounds contain (0,0)) — it is
         // anchored at the world centre (ring 0).
@@ -6259,7 +6435,7 @@ const y = await import('@/lazy');
             mk_building_feat("b2", "src/beta/b.ts", purpose::HOUSE, 100, "beta"),
             mk_building_feat("b3", "src/beta/c.ts", purpose::HOUSE, 100, "beta"),
         ];
-        let districts1 = layout(&mut b1, &mut meta, &features);
+        let districts1 = layout(&mut b1, &mut meta, &features, &[]);
         assert_no_orphan_districts(&b1, &districts1);
         let coord_of =
             |bs: &[Building], id: &str| bs.iter().find(|x| x.file_id == id).unwrap().coords;
@@ -6279,7 +6455,7 @@ const y = await import('@/lazy');
             mk_building_feat("b2", "src/beta/b.ts", purpose::HOUSE, 100, "beta"),
             mk_building_feat("b3", "src/beta/c.ts", purpose::HOUSE, 100, "beta"),
         ];
-        let districts2 = layout(&mut b2, &mut meta, &features);
+        let districts2 = layout(&mut b2, &mut meta, &features, &[]);
 
         // a1 now lives in beta's district, not alpha's.
         assert_eq!(coord_of(&b2, "a1").x.is_finite(), true);
@@ -6299,7 +6475,7 @@ const y = await import('@/lazy');
             x.coords = Coords::new(0.0, 0.0);
         }
         let mut meta3 = MetaStore::default();
-        layout(&mut b3, &mut meta3, &features);
+        layout(&mut b3, &mut meta3, &features, &[]);
         for x in &b2 {
             let y = b3.iter().find(|z| z.file_id == x.file_id).unwrap();
             assert_eq!(x.coords, y.coords, "repack must be deterministic");
@@ -6307,6 +6483,371 @@ const y = await import('@/lazy');
         // Sanity: the two unaffected beta originals still have finite, valid
         // coords (they may have repacked but stay non-overlapping & deterministic).
         let _ = (beta_b2, beta_b3);
+    }
+
+    // ---- Polis A2 — semantic district placement ----
+
+    /// A minimal import `Road` between two `file_id`s with the given weight.
+    fn mk_import_road(from: &str, to: &str, weight: u32) -> Road {
+        Road {
+            road_id: format!("{from}->{to}"),
+            from: from.to_string(),
+            to: to.to_string(),
+            road_type: road_type::IMPORT.into(),
+            style: road_style::LASTRICATA.into(),
+            weight,
+            path: None,
+        }
+    }
+
+    /// World centre of a district from its emitted bounds.
+    fn district_centre(districts: &[District], id: &str) -> (f64, f64) {
+        let d = districts
+            .iter()
+            .find(|d| d.district_id == id)
+            .unwrap_or_else(|| panic!("district {id} not emitted"));
+        (d.bounds.x + d.bounds.w / 2.0, d.bounds.y + d.bounds.h / 2.0)
+    }
+
+    fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
+        let dx = a.0 - b.0;
+        let dy = a.1 - b.1;
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Assert no two emitted district BOXES overlap once `DISTRICT_MARGIN` is
+    /// applied — the A2 collision invariant. Uses the nominal packed box derived
+    /// from each district's bounds (bounds already cover the placed footprints).
+    fn assert_no_district_box_overlap(districts: &[District]) {
+        let boxes: Vec<(f64, f64, f64, f64)> = districts
+            .iter()
+            .map(|d| (d.bounds.x, d.bounds.y, d.bounds.w, d.bounds.h))
+            .collect();
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                // Raw (un-margined) overlap is the hard invariant; the bounds are
+                // GAP-padded already, so any raw overlap is a real collision.
+                let (ax, ay, aw, ah) = boxes[i];
+                let (bx, by, bw, bh) = boxes[j];
+                let overlap =
+                    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+                assert!(
+                    !overlap,
+                    "district boxes overlap: {:?} vs {:?}",
+                    boxes[i], boxes[j]
+                );
+            }
+        }
+    }
+
+    /// META-GRAPH: pair weights accumulate over CROSS-district roads only; the
+    /// pair is symmetric and intra-district roads are ignored. We assert this
+    /// indirectly through placement order (a heavily-coupled domain outranks an
+    /// uncoupled one of equal size) plus directly via a dedicated coupling probe.
+    #[test]
+    fn meta_graph_accumulates_cross_district_pair_weights() {
+        // Two equal-size (3-building) domains A and B, plus commons. A and B are
+        // coupled by cross-district roads; if intra-district roads counted, the
+        // bucket math would be polluted. We verify A and B both outrank an equal,
+        // UNCOUPLED domain C, which can only happen if the cross-district weight
+        // accumulated symmetrically onto both A and B.
+        let features = vec![
+            mk_feature("commons", FeatureKind::Commons),
+            mk_feature("a", FeatureKind::Domain),
+            mk_feature("b", FeatureKind::Domain),
+            mk_feature("c", FeatureKind::Domain),
+        ];
+        let mut b = vec![
+            mk_building_feat("c1", "src/lib/a.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("c2", "src/lib/b.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("c3", "src/lib/c.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("a1", "src/a/a.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("a2", "src/a/b.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("a3", "src/a/c.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("b1", "src/b/a.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("b2", "src/b/b.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("b3", "src/b/c.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("d1", "src/c/a.ts", purpose::HOUSE, 50, "c"),
+            mk_building_feat("d2", "src/c/b.ts", purpose::HOUSE, 50, "c"),
+            mk_building_feat("d3", "src/c/c.ts", purpose::HOUSE, 50, "c"),
+        ];
+        let roads = vec![
+            // CROSS-district A<->B (heavy): bucket-lifts BOTH a and b.
+            mk_import_road("a1", "b1", 5),
+            mk_import_road("a2", "b2", 5),
+            mk_import_road("a3", "b3", 5),
+            // INTRA-district roads (must be IGNORED): pile weight inside C so that
+            // if they counted, C would outrank A/B. They must not.
+            mk_import_road("d1", "d2", 5),
+            mk_import_road("d2", "d3", 5),
+            mk_import_road("d1", "d3", 5),
+        ];
+        let mut meta = MetaStore::default();
+        let districts = layout(&mut b, &mut meta, &features, &roads);
+        let order: Vec<&str> = districts.iter().map(|d| d.district_id.as_str()).collect();
+        let pos = |id: &str| order.iter().position(|x| *x == id).unwrap();
+        // commons first; a and b (coupled) BEFORE c (intra-district roads ignored).
+        assert_eq!(order.first().copied(), Some("commons"));
+        assert!(
+            pos("a") < pos("c") && pos("b") < pos("c"),
+            "cross-district coupling must outrank intra-district weight: {order:?}"
+        );
+    }
+
+    /// commons is placed FIRST and straddles the world origin (centre).
+    #[test]
+    fn commons_placed_first_at_origin_centre() {
+        let features = vec![
+            mk_feature("commons", FeatureKind::Commons),
+            mk_feature("x", FeatureKind::Domain),
+        ];
+        let mut b = vec![
+            mk_building_feat("c1", "src/lib/a.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("c2", "src/lib/b.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("c3", "src/lib/c.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("x1", "src/x/a.ts", purpose::HOUSE, 50, "x"),
+            mk_building_feat("x2", "src/x/b.ts", purpose::HOUSE, 50, "x"),
+            mk_building_feat("x3", "src/x/c.ts", purpose::HOUSE, 50, "x"),
+        ];
+        let mut meta = MetaStore::default();
+        let districts = layout(&mut b, &mut meta, &features, &[]);
+        assert_eq!(
+            districts.first().map(|d| d.district_id.as_str()),
+            Some("commons"),
+            "commons must be placed first"
+        );
+        let cd = districts.iter().find(|d| d.district_id == "commons").unwrap();
+        assert!(
+            cd.bounds.x <= 0.0
+                && cd.bounds.y <= 0.0
+                && cd.bounds.x + cd.bounds.w >= 0.0
+                && cd.bounds.y + cd.bounds.h >= 0.0,
+            "commons bounds must contain the world origin: {:?}",
+            cd.bounds
+        );
+    }
+
+    /// 4-district case: A<->B heavily coupled, C uncoupled. Then dist(A,B) <
+    /// dist(A,C) AND C lies OUTSIDE the bounding region of {A,B,commons}.
+    #[test]
+    fn coupled_districts_are_adjacent_uncoupled_is_peripheral() {
+        let features = vec![
+            mk_feature("commons", FeatureKind::Commons),
+            mk_feature("a", FeatureKind::Domain),
+            mk_feature("b", FeatureKind::Domain),
+            mk_feature("c", FeatureKind::Domain),
+        ];
+        let mut b = vec![
+            mk_building_feat("m1", "src/lib/a.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("m2", "src/lib/b.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("m3", "src/lib/c.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("a1", "src/a/a.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("a2", "src/a/b.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("a3", "src/a/c.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("b1", "src/b/a.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("b2", "src/b/b.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("b3", "src/b/c.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("c1", "src/c/a.ts", purpose::HOUSE, 50, "c"),
+            mk_building_feat("c2", "src/c/b.ts", purpose::HOUSE, 50, "c"),
+            mk_building_feat("c3", "src/c/c.ts", purpose::HOUSE, 50, "c"),
+        ];
+        // A<->B heavily coupled; C has NO cross-district road at all.
+        let roads = vec![
+            mk_import_road("a1", "b1", 5),
+            mk_import_road("a2", "b2", 5),
+            mk_import_road("a3", "b3", 5),
+            mk_import_road("a1", "b2", 5),
+        ];
+        let mut meta = MetaStore::default();
+        let districts = layout(&mut b, &mut meta, &features, &roads);
+
+        let ca = district_centre(&districts, "a");
+        let cb = district_centre(&districts, "b");
+        let cc = district_centre(&districts, "c");
+        assert!(
+            dist2(ca, cb) < dist2(ca, cc),
+            "coupled A,B must be closer than uncoupled A,C: AB={} AC={}",
+            dist2(ca, cb),
+            dist2(ca, cc)
+        );
+
+        // C lies OUTSIDE the bounding box of {commons, A, B}.
+        let core: Vec<&District> = districts
+            .iter()
+            .filter(|d| matches!(d.district_id.as_str(), "commons" | "a" | "b"))
+            .collect();
+        let mut min_x = f64::MAX;
+        let mut min_y = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut max_y = f64::MIN;
+        for d in &core {
+            min_x = min_x.min(d.bounds.x);
+            min_y = min_y.min(d.bounds.y);
+            max_x = max_x.max(d.bounds.x + d.bounds.w);
+            max_y = max_y.max(d.bounds.y + d.bounds.h);
+        }
+        let cd = districts.iter().find(|d| d.district_id == "c").unwrap();
+        let c_inside = cd.bounds.x >= min_x
+            && cd.bounds.y >= min_y
+            && cd.bounds.x + cd.bounds.w <= max_x
+            && cd.bounds.y + cd.bounds.h <= max_y;
+        assert!(
+            !c_inside,
+            "uncoupled district C must sit OUTSIDE the {{commons,A,B}} region: \
+             C={:?} core=({min_x},{min_y})-({max_x},{max_y})",
+            cd.bounds
+        );
+
+        assert_no_district_box_overlap(&districts);
+        assert_no_footprint_overlap(&b);
+    }
+
+    /// Zero cross-district roads: every district still places, no collisions
+    /// (degenerates to a clean periphery fan, like the old packing).
+    #[test]
+    fn zero_coupling_city_places_all_without_collision() {
+        let features = vec![
+            mk_feature("commons", FeatureKind::Commons),
+            mk_feature("a", FeatureKind::Domain),
+            mk_feature("b", FeatureKind::Domain),
+            mk_feature("c", FeatureKind::Domain),
+        ];
+        let mut b = vec![
+            mk_building_feat("m1", "src/lib/a.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("m2", "src/lib/b.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("m3", "src/lib/c.ts", purpose::LIBRARY, 50, "commons"),
+            mk_building_feat("a1", "src/a/a.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("a2", "src/a/b.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("a3", "src/a/c.ts", purpose::HOUSE, 50, "a"),
+            mk_building_feat("b1", "src/b/a.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("b2", "src/b/b.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("b3", "src/b/c.ts", purpose::HOUSE, 50, "b"),
+            mk_building_feat("c1", "src/c/a.ts", purpose::HOUSE, 50, "c"),
+            mk_building_feat("c2", "src/c/b.ts", purpose::HOUSE, 50, "c"),
+            mk_building_feat("c3", "src/c/c.ts", purpose::HOUSE, 50, "c"),
+        ];
+        let mut meta = MetaStore::default();
+        // No roads at all.
+        let districts = layout(&mut b, &mut meta, &features, &[]);
+        // All four districts emitted.
+        let mut ids: Vec<&str> = districts.iter().map(|d| d.district_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["a", "b", "c", "commons"]);
+        assert_no_district_box_overlap(&districts);
+        assert_no_footprint_overlap(&b);
+        assert_no_orphan_districts(&b, &districts);
+    }
+
+    /// Determinism: two runs over identical inputs (incl. roads) are byte-identical.
+    #[test]
+    fn semantic_placement_is_deterministic() {
+        let features = vec![
+            mk_feature("commons", FeatureKind::Commons),
+            mk_feature("a", FeatureKind::Domain),
+            mk_feature("b", FeatureKind::Domain),
+            mk_feature("c", FeatureKind::Domain),
+        ];
+        let make = || {
+            vec![
+                mk_building_feat("m1", "src/lib/a.ts", purpose::LIBRARY, 50, "commons"),
+                mk_building_feat("m2", "src/lib/b.ts", purpose::LIBRARY, 50, "commons"),
+                mk_building_feat("m3", "src/lib/c.ts", purpose::LIBRARY, 50, "commons"),
+                mk_building_feat("a1", "src/a/a.ts", purpose::HOUSE, 50, "a"),
+                mk_building_feat("a2", "src/a/b.ts", purpose::HOUSE, 50, "a"),
+                mk_building_feat("a3", "src/a/c.ts", purpose::HOUSE, 50, "a"),
+                mk_building_feat("b1", "src/b/a.ts", purpose::HOUSE, 50, "b"),
+                mk_building_feat("b2", "src/b/b.ts", purpose::HOUSE, 50, "b"),
+                mk_building_feat("b3", "src/b/c.ts", purpose::HOUSE, 50, "b"),
+                mk_building_feat("c1", "src/c/a.ts", purpose::HOUSE, 50, "c"),
+                mk_building_feat("c2", "src/c/b.ts", purpose::HOUSE, 50, "c"),
+                mk_building_feat("c3", "src/c/c.ts", purpose::HOUSE, 50, "c"),
+            ]
+        };
+        let roads = vec![mk_import_road("a1", "b1", 4), mk_import_road("a2", "c1", 2)];
+
+        let mut b1 = make();
+        let mut m1 = MetaStore::default();
+        let d1 = layout(&mut b1, &mut m1, &features, &roads);
+        let mut b2 = make();
+        let mut m2 = MetaStore::default();
+        let d2 = layout(&mut b2, &mut m2, &features, &roads);
+        for (x, y) in b1.iter().zip(b2.iter()) {
+            assert_eq!(x.coords, y.coords, "coords must be deterministic");
+        }
+        assert_eq!(d1, d2, "district records must be deterministic");
+    }
+
+    /// BUCKET HYSTERESIS: total coupling 100 vs 101 -> SAME placement order;
+    /// 100 vs 1000 -> DIFFERENT order. We compare district A's rank against a
+    /// fixed reference domain R whose total sits BETWEEN the two A-buckets.
+    #[test]
+    fn coupling_bucket_hysteresis() {
+        // Build a city where domain A couples to commons with a tunable weight, and
+        // a reference domain R couples to commons with a FIXED weight whose bucket
+        // sits strictly between bucket(100) and bucket(1000). bucket(100)=7,
+        // bucket(101)=7, bucket(1000)=10. Pick R total = 256 -> bucket 9: above 7,
+        // below 10. So order(A) vs order(R) FLIPS only when A jumps from 100->1000.
+        let order_for = |a_weight: u32| -> Vec<String> {
+            let features = vec![
+                mk_feature("commons", FeatureKind::Commons),
+                mk_feature("a", FeatureKind::Domain),
+                mk_feature("r", FeatureKind::Domain),
+            ];
+            let mut b = vec![
+                mk_building_feat("m1", "src/lib/a.ts", purpose::LIBRARY, 50, "commons"),
+                mk_building_feat("m2", "src/lib/b.ts", purpose::LIBRARY, 50, "commons"),
+                mk_building_feat("m3", "src/lib/c.ts", purpose::LIBRARY, 50, "commons"),
+                mk_building_feat("a1", "src/a/a.ts", purpose::HOUSE, 50, "a"),
+                mk_building_feat("a2", "src/a/b.ts", purpose::HOUSE, 50, "a"),
+                mk_building_feat("a3", "src/a/c.ts", purpose::HOUSE, 50, "a"),
+                mk_building_feat("r1", "src/r/a.ts", purpose::HOUSE, 50, "r"),
+                mk_building_feat("r2", "src/r/b.ts", purpose::HOUSE, 50, "r"),
+                mk_building_feat("r3", "src/r/c.ts", purpose::HOUSE, 50, "r"),
+            ];
+            // A<->commons total = a_weight (single road carrying the full weight is
+            // capped at 5, so spread across enough roads). R<->commons total = 256.
+            let mut roads = Vec::new();
+            // weight per road max 5; emit ceil(total/5) roads, last one carries the
+            // remainder, using distinct building pairs.
+            let mut emit = |dist_b: &str, commons_b: &str, total: u32, tag: &str| {
+                let mut remaining = total;
+                let mut k = 0;
+                while remaining > 0 {
+                    let w = remaining.min(5);
+                    roads.push(Road {
+                        road_id: format!("{tag}-{k}"),
+                        from: dist_b.to_string(),
+                        to: commons_b.to_string(),
+                        road_type: road_type::IMPORT.into(),
+                        style: road_style::LASTRICATA.into(),
+                        weight: w,
+                        path: None,
+                    });
+                    remaining -= w;
+                    k += 1;
+                }
+            };
+            // Use distinct (from,to) ids per road via synthetic building ids is not
+            // possible (ids fixed), but coupling sums weight over the PAIR regardless
+            // of how many roads, and duplicate (from,to) roads still each add weight.
+            emit("a1", "m1", a_weight, "a");
+            emit("r1", "m1", 256, "r");
+            let mut meta = MetaStore::default();
+            let districts = layout(&mut b, &mut meta, &features, &roads);
+            districts.iter().map(|d| d.district_id.clone()).collect()
+        };
+
+        let o100 = order_for(100);
+        let o101 = order_for(101);
+        let o1000 = order_for(1000);
+        assert_eq!(
+            o100, o101,
+            "bucket hysteresis: 100 vs 101 must give the SAME order"
+        );
+        assert_ne!(
+            o100, o1000,
+            "bucket jump: 100 vs 1000 must give a DIFFERENT order"
+        );
     }
 
     // ---- BFS find_path ----

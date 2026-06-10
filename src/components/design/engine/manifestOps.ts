@@ -99,6 +99,80 @@ export function sendToBack(
   return withNode(manifest, id, (n) => ({ ...n, z: target }));
 }
 
+/**
+ * Move a node ONE step forward in the z-order: swap its `z` with the node that has
+ * the NEAREST-HIGHER `z` (the immediate neighbour above it). No-op (SAME reference)
+ * if `id` is absent or the node is already at the top (no node above it). Both the
+ * target and its neighbour change, mirroring a paint-order nudge; every other node
+ * is shared by identity. Deterministic and immutable like the rest of this module.
+ *
+ * `nodeOrder` from the project is NOT consulted here — z is the placement authority
+ * (1.5) and these ops nudge it directly, matching `bringToFront`/`sendToBack`.
+ */
+export function moveForward(
+  manifest: DesignManifest,
+  id: string,
+): DesignManifest {
+  const target = manifest.nodes[id];
+  if (!target) return manifest;
+  // Find the neighbour with the smallest z that is STILL strictly greater than the
+  // target's z (ties broken by id so the choice is deterministic).
+  let neighborId: string | null = null;
+  let neighborZ = Infinity;
+  for (const [otherId, node] of Object.entries(manifest.nodes)) {
+    if (otherId === id) continue;
+    if (node.z > target.z && node.z < neighborZ) {
+      neighborZ = node.z;
+      neighborId = otherId;
+    }
+  }
+  if (neighborId === null) return manifest; // already at the top
+  return swapZ(manifest, id, neighborId);
+}
+
+/**
+ * Move a node ONE step backward in the z-order: swap its `z` with the NEAREST-LOWER
+ * `z` neighbour. No-op (SAME reference) if `id` is absent or already at the back.
+ * Mirror of {@link moveForward}.
+ */
+export function moveBackward(
+  manifest: DesignManifest,
+  id: string,
+): DesignManifest {
+  const target = manifest.nodes[id];
+  if (!target) return manifest;
+  let neighborId: string | null = null;
+  let neighborZ = -Infinity;
+  for (const [otherId, node] of Object.entries(manifest.nodes)) {
+    if (otherId === id) continue;
+    if (node.z < target.z && node.z > neighborZ) {
+      neighborZ = node.z;
+      neighborId = otherId;
+    }
+  }
+  if (neighborId === null) return manifest; // already at the back
+  return swapZ(manifest, id, neighborId);
+}
+
+/** Swap the `z` of two distinct nodes, returning a new manifest. Both ids are
+ *  assumed present (callers verified). Other nodes are shared by identity. */
+function swapZ(
+  manifest: DesignManifest,
+  idA: string,
+  idB: string,
+): DesignManifest {
+  const a = manifest.nodes[idA];
+  const b = manifest.nodes[idB];
+  return {
+    ...manifest,
+    nodes: {
+      ...manifest.nodes,
+      [idA]: { ...a, z: b.z },
+      [idB]: { ...b, z: a.z },
+    },
+  };
+}
+
 /** Clamp an index into `[0, len-1]` (or `[0, len]` for an insertion point). */
 function clamp(value: number, lo: number, hi: number): number {
   if (value < lo) return lo;

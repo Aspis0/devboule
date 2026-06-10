@@ -62,6 +62,29 @@ const FORBID_ATTR = [
 const NODE_ID_CHARSET = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const DATA_NODE_ID_ATTR = "data-node-id";
 
+// --- class / id stripping (direct-DOM canvas isolation) --------------------
+// The canvas renders sanitized node markup DIRECTLY in the parent (app) DOM, not
+// inside an iframe document. A node's `class`/`id` must therefore never collide
+// with — or be targeted by — the app's own selectors (Tailwind utilities, global
+// ids, component styles). We strip BOTH attributes from EVERY element of the
+// sanitized markup:
+//   - `class`: a node's visual styling is inline `style` only; class names would
+//     leak app/Tailwind selectors onto nodes (and let a node match app rules).
+//   - `id`: a global duplicate id breaks `getElementById`/`label[for]` in the app
+//     and an attacker-chosen id enables DOM-clobbering.
+//
+// SVG INTERNAL ID REFS ARE NOT SUPPORTED (deliberate). One might want to keep `id`
+// inside an SVG subtree so `url(#grad)`/`clip-path`/`xlink:href="#sym"` still
+// resolve — BUT the BASE_CONFIG already sets `SANITIZE_NAMED_PROPS: true`, which
+// rewrites every `id` to `user-content-<id>` (anti-DOM-clobbering) WITHOUT
+// rewriting the matching `url(#…)`/`href="#…"` reference. That mismatch already
+// severs SVG internal refs regardless of this hook, so preserving the SVG `id`
+// would buy nothing. We therefore strip `id` everywhere — simplest correct option.
+// Node markup that needs gradients/clip-paths should use inline values, not
+// id-referenced defs. (`data-node-id` is a data-* attr, NOT `id`, and survives.)
+const CLASS_ATTR = "class";
+const ID_ATTR = "id";
+
 // Plain `href` scheme clamp (B3 — defense in depth). DOMPurify's
 // `ALLOWED_URI_REGEXP` governs href in HTML, but a bare `href` on SVG
 // <a>/<image>/<use> (SVG2) is not always clamped the same way across versions.
@@ -152,6 +175,18 @@ function ensureNodeIdHook(): void {
       // place (url() schemes, position:fixed/sticky overlays, expression()).
       data.attrValue = sanitizeStyleValue(data.attrValue);
     }
+  });
+  // Strip `class` and `id` from every element (see the CLASS_ATTR/ID_ATTR
+  // rationale above). `afterSanitizeAttributes` runs once per element with the
+  // real node in hand, AFTER SANITIZE_NAMED_PROPS may have rewritten `id` to
+  // `user-content-…`; removing it here drops both the original and any rewritten
+  // form. `data-node-id` is a data-* attribute, not `id`, so it is untouched.
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    // Only elements carry attributes; guard for the DOM type.
+    const el = node as Element;
+    if (typeof el.removeAttribute !== "function") return;
+    if (el.hasAttribute(CLASS_ATTR)) el.removeAttribute(CLASS_ATTR);
+    if (el.hasAttribute(ID_ATTR)) el.removeAttribute(ID_ATTR);
   });
 }
 

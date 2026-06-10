@@ -51,6 +51,16 @@ const MAX_DESIGN_FILE_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
 /// into an unbounded loop / IO storm.
 const MAX_DESIGN_NODES: usize = 2000;
 
+/// Upper bound (px) on a node's optional corner `radius`. Mirrors the bounded posture
+/// the plan calls for: a save carrying a negative, NaN/inf, or absurdly large radius is
+/// rejected rather than persisted. 200px is far beyond any realistic card corner.
+const MAX_NODE_RADIUS: f64 = 200.0;
+
+/// Cap (chars) on a node's optional display `name`. A pathological/crafted payload could
+/// otherwise carry an unbounded label into the manifest and every downstream consumer; we
+/// hard-fail a save whose name exceeds this. ~80 chars per the plan.
+const MAX_NODE_NAME_CHARS: usize = 80;
+
 /// Cap on the number of load warnings we retain. A pathological manifest could otherwise
 /// produce thousands of warning strings; we keep the first `MAX_DESIGN_WARNINGS` and add
 /// a final truncation note.
@@ -149,6 +159,13 @@ pub enum AutoHeight {
 }
 
 /// One manifest entry: top-level placement in global canvas coords + size + kind.
+///
+/// The four trailing fields (`radius`/`flat`/`hidden`/`name`) are OPTIONAL canvas
+/// presentation hints added after schema v1 shipped. Each is `#[serde(default,
+/// skip_serializing_if = "Option::is_none")]` so an OLD `manifest.json` written
+/// without them deserializes cleanly AND a node that does not set them adds zero
+/// schema churn on disk (the keys are simply absent). They are placement/display
+/// metadata only — markup remains opaque to Rust.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesignNodePlacement {
@@ -158,6 +175,20 @@ pub struct DesignNodePlacement {
     pub w: f64,
     pub h: NodeHeight,
     pub kind: DesignNodeKind,
+    /// Corner radius (px) for the node card. Bounded `[0, MAX_NODE_RADIUS]` on save
+    /// (negative / absurd values rejected). Absent => the stylesheet default radius.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    /// Render the card "flat" (no card chrome). Absent => not flat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat: Option<bool>,
+    /// Hide the node on the canvas (layer visibility). Absent => visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    /// Display label for the layers panel / node tag. Capped at `MAX_NODE_NAME_CHARS`
+    /// on save. Absent => no custom label (the id is used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// `manifest.json` — placement-only authority over top-level nodes.
@@ -215,6 +246,36 @@ pub(crate) fn validate_node_id(id: &str) -> Result<(), String> {
         let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-';
         if !ok {
             return Err(format!("node id contains an invalid character {c:?}: {id}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a single placement's OPTIONAL presentation fields before a save. Mirrors the
+/// "validate everything up front, hard-fail" posture used for ids: a `radius` that is
+/// non-finite, negative, or beyond `MAX_NODE_RADIUS`, or a `name` longer than
+/// `MAX_NODE_NAME_CHARS`, is rejected so a hostile/buggy payload can never persist an
+/// absurd value into the manifest. The geometry fields (`x/y/z/w/h`) keep their existing
+/// posture — they are NOT range-checked here (the current code never bounded them), so we
+/// only gate the NEW fields. Pure + total: unit-testable without a filesystem.
+fn validate_placement(id: &str, p: &DesignNodePlacement) -> Result<(), String> {
+    if let Some(r) = p.radius {
+        if !r.is_finite() || r < 0.0 || r > MAX_NODE_RADIUS {
+            return Err(format!(
+                "node \"{}\" has an invalid radius ({r}); expected 0..={MAX_NODE_RADIUS}",
+                sanitize_id_for_warning(id)
+            ));
+        }
+    }
+    if let Some(name) = &p.name {
+        // Count CHARS (not bytes) so a multibyte label is bounded the way a user perceives
+        // it; the cap also protects every downstream consumer of the label.
+        if name.chars().count() > MAX_NODE_NAME_CHARS {
+            return Err(format!(
+                "node \"{}\" name is too long ({} > {MAX_NODE_NAME_CHARS} chars)",
+                sanitize_id_for_warning(id),
+                name.chars().count()
+            ));
         }
     }
     Ok(())
@@ -629,8 +690,11 @@ pub fn design_save_project(
     }
 
     // Validate ALL ids up front so we never write a partial set then fail on a bad id.
-    for id in project.manifest.nodes.keys() {
+    for (id, placement) in &project.manifest.nodes {
         validate_node_id(id)?;
+        // Gate the optional presentation fields (radius/name bounds) up front too, so a
+        // bad value is rejected atomically rather than after a partial write.
+        validate_placement(id, placement)?;
     }
     for id in project.components.keys() {
         validate_node_id(id)?;
@@ -674,8 +738,9 @@ pub fn design_write_manifest(
     state.ensure_unlocked()?;
     let _guard = design_write_guard()?;
     let canonical = canonical_working_folder(&working_folder_path)?;
-    for id in manifest.nodes.keys() {
+    for (id, placement) in &manifest.nodes {
         validate_node_id(id)?;
+        validate_placement(id, placement)?;
     }
     write_manifest_file(&canonical, &manifest)
 }
@@ -1676,6 +1741,10 @@ mod tests {
             w: 300.0,
             h,
             kind: DesignNodeKind::Html,
+            radius: None,
+            flat: None,
+            hidden: None,
+            name: None,
         }
     }
 
@@ -1926,6 +1995,79 @@ mod tests {
         assert!(json.contains("\"h\":10.0"), "got {json}");
         let back: DesignNodePlacement = serde_json::from_str(&json).unwrap();
         assert_eq!(back, p);
+    }
+
+    // ---- optional placement fields (radius/flat/hidden/name) --------------
+
+    #[test]
+    fn old_placement_json_without_new_fields_deserializes() {
+        // An OLD manifest entry (schema v1, before the four optional fields existed)
+        // must still deserialize: serde `default` fills each as None.
+        let old = r#"{"x":1.0,"y":2.0,"z":3,"w":300.0,"h":"auto","kind":"html"}"#;
+        let p: DesignNodePlacement = serde_json::from_str(old).unwrap();
+        assert_eq!(p.radius, None);
+        assert_eq!(p.flat, None);
+        assert_eq!(p.hidden, None);
+        assert_eq!(p.name, None);
+    }
+
+    #[test]
+    fn placement_with_new_fields_round_trips() {
+        // create -> serialize -> deserialize preserves every new field exactly.
+        let mut p = placement(4, NodeHeight::Fixed(120.0));
+        p.radius = Some(16.0);
+        p.flat = Some(true);
+        p.hidden = Some(true);
+        p.name = Some("Hero section".to_string());
+        let json = serde_json::to_string(&p).unwrap();
+        let back: DesignNodePlacement = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.radius, Some(16.0));
+        assert_eq!(back.flat, Some(true));
+        assert_eq!(back.hidden, Some(true));
+        assert_eq!(back.name.as_deref(), Some("Hero section"));
+    }
+
+    #[test]
+    fn placement_omits_none_optional_fields_on_serialize() {
+        // A node that sets none of the new fields adds ZERO schema churn: the keys are
+        // simply absent (skip_serializing_if = Option::is_none).
+        let p = placement(1, NodeHeight::Auto(AutoHeight::Auto));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("radius"), "got {json}");
+        assert!(!json.contains("flat"), "got {json}");
+        assert!(!json.contains("hidden"), "got {json}");
+        assert!(!json.contains("name"), "got {json}");
+    }
+
+    #[test]
+    fn validate_placement_bounds_radius_and_name() {
+        let base = placement(1, NodeHeight::Auto(AutoHeight::Auto));
+        // Valid: in-range radius + short name.
+        let mut ok = base.clone();
+        ok.radius = Some(24.0);
+        ok.name = Some("Card".to_string());
+        assert!(validate_placement("hero", &ok).is_ok());
+        // Boundary radii accepted.
+        let mut zero = base.clone();
+        zero.radius = Some(0.0);
+        assert!(validate_placement("hero", &zero).is_ok());
+        let mut maxr = base.clone();
+        maxr.radius = Some(MAX_NODE_RADIUS);
+        assert!(validate_placement("hero", &maxr).is_ok());
+        // Negative / over-cap / non-finite radii rejected.
+        for bad in [-1.0, MAX_NODE_RADIUS + 1.0, f64::NAN, f64::INFINITY] {
+            let mut p = base.clone();
+            p.radius = Some(bad);
+            assert!(validate_placement("hero", &p).is_err(), "should reject {bad}");
+        }
+        // Over-long name rejected; exactly-at-cap accepted.
+        let mut long = base.clone();
+        long.name = Some("x".repeat(MAX_NODE_NAME_CHARS + 1));
+        assert!(validate_placement("hero", &long).is_err());
+        let mut atcap = base;
+        atcap.name = Some("x".repeat(MAX_NODE_NAME_CHARS));
+        assert!(validate_placement("hero", &atcap).is_ok());
     }
 
     #[test]

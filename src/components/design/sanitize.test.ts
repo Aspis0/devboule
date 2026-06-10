@@ -185,11 +185,50 @@ describe("sanitizeNodeMarkup — neutralizes XSS", () => {
   });
 });
 
+describe("sanitizeNodeMarkup — direct-DOM isolation (class/id stripping)", () => {
+  it("strips the class attribute from HTML elements (no app/Tailwind selector leak)", () => {
+    const out = clean('<div class="card flex gap-2">Hello</div>');
+    expect(out).not.toContain("class=");
+    expect(out).not.toContain("card");
+    expect(out).toContain("hello"); // content (lowercased by clean) survives
+  });
+
+  it("strips the id attribute from HTML elements (no global id clobbering)", () => {
+    const out = clean('<section id="root"><h1>Hi</h1></section>');
+    expect(out).not.toContain('id="root"');
+    expect(out).not.toContain("id=");
+    expect(out).toContain("<h1>");
+  });
+
+  it("strips class even when combined with a kept data-node-id", () => {
+    const out = clean('<div class="card" data-node-id="hero">x</div>');
+    expect(out).not.toContain('class="card"');
+    // data-node-id is a data-* attr, NOT the `id` attr — it must survive intact.
+    expect(out).toContain('data-node-id="hero"');
+  });
+
+  it("strips id even inside an SVG subtree (DECISION: SVG internal id refs unsupported)", () => {
+    // DECISION (documented in sanitize.ts): `id` is stripped EVERYWHERE, including
+    // SVG. DOMPurify's SANITIZE_NAMED_PROPS already rewrites `id` to
+    // `user-content-…` without rewriting the matching `url(#…)` ref, so SVG
+    // internal refs are already severed — keeping the id would buy nothing. The
+    // SVG shapes themselves still render; only the id-referenced fill is dropped.
+    const out = clean(
+      '<svg viewBox="0 0 10 10"><defs><linearGradient id="g1"><stop offset="0%" stop-color="#fff"/></linearGradient></defs><rect width="10" height="10" fill="url(#g1)"/></svg>',
+    );
+    expect(out).not.toContain('id="g1"');
+    expect(out).not.toContain("user-content-g1");
+    expect(out).toContain("<svg"); // the SVG itself still renders
+    expect(out).toContain("<rect");
+  });
+});
+
 describe("sanitizeNodeMarkup — preserves legitimate markup", () => {
-  it("keeps a normal div with class and text", () => {
+  it("keeps a normal div's text content (class is intentionally stripped)", () => {
     const out = sanitizeNodeMarkup('<div class="card">Hello</div>');
     expect(out).toContain("Hello");
-    expect(out.toLowerCase()).toContain("class=\"card\"");
+    // class is removed for direct-DOM isolation; only the element + text remain.
+    expect(out.toLowerCase()).not.toContain("class=");
   });
 
   it("KEEPS data-node-id (the placement marker)", () => {
