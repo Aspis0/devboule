@@ -113,3 +113,25 @@ export interface DesignProjectEntry {
   lastOpenedAt: string;
   thumbnailPath?: string;
 }
+
+/**
+ * Compact Oracle grounding status for a design project's target, returned by the Rust
+ * `design_oracle_status` command. Mirrors the Rust `DesignOracleStatus` (camelCase). The
+ * command NEVER fails: when the target's index is not ready/empty (or any error occurs)
+ * it returns `{ grounded: false }` with the optional fields absent.
+ *
+ * PRIVACY: `rootLabel` is the LEAF folder name of the resolved grounding root ONLY — never
+ * the absolute path (the backend keeps the user's filesystem layout off the IPC boundary).
+ */
+export interface DesignOracleStatus {
+  /** Whether the target has a usable Oracle index (any indexed file/chunk present). */
+  grounded: boolean;
+  /** Leaf folder name of the grounding root (never an absolute path). OPTIONAL. */
+  rootLabel?: string;
+  /** Indexed chunk count, when known. OPTIONAL. */
+  chunks?: number;
+  /** Indexed file count, when known. OPTIONAL. */
+  files?: number;
+  /** ISO-8601 time of the last completed index job, when known. OPTIONAL. */
+  lastSyncIso?: string;
+}

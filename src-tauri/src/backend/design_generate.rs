@@ -60,10 +60,29 @@ const MAX_GENERATION_BYTES: usize = 4 * 1024 * 1024;
 /// `stream.next()` in this timeout and treat elapse as a terminal stream error.
 const HTTP_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Overall wall-clock cap for one HTTP generation (mirrors the CLI 180s budget). A server
-/// that trickles a byte just under the inactivity timeout indefinitely must not run
-/// unbounded; once this elapses we stop and emit an error terminal.
-const HTTP_GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// Default per-run wall-clock budget (seconds) when the backend does not configure
+/// `timeoutSecs`. Applies to BOTH the HTTP overall cap and the CLI wall-clock cap so the
+/// two transports share one budget. A backend may override it within `[60, 600]` (validated
+/// at config time by `validate_design_llm_backend`); [`resolve_generation_timeout`]
+/// re-clamps defensively in case a hand-edited config slipped past the command validator.
+const DEFAULT_GENERATION_TIMEOUT_SECS: u64 = 180;
+
+/// Resolve the per-run wall-clock budget for a generation from the backend config. `None`
+/// => the [`DEFAULT_GENERATION_TIMEOUT_SECS`] default; a configured value is RE-CLAMPED to
+/// `[60, 600]` even though the validator already rejects out-of-range — defense in depth so
+/// a hand-edited config.json that bypassed the command validator can never set an absurd or
+/// zero budget here. The 30s HTTP INACTIVITY timeout is unaffected (it stays fixed). PURE +
+/// total: unit-testable without I/O.
+fn resolve_generation_timeout(backend: &DesignLlmBackend) -> std::time::Duration {
+    let secs = backend
+        .timeout_secs
+        .unwrap_or(DEFAULT_GENERATION_TIMEOUT_SECS)
+        .clamp(
+            super::design_llm::DESIGN_TIMEOUT_SECS_MIN,
+            super::design_llm::DESIGN_TIMEOUT_SECS_MAX,
+        );
+    std::time::Duration::from_secs(secs)
+}
 
 /// Default loopback base for the ollama OpenAI-compatible API. ollama exposes the
 /// chat-completions endpoint under `/v1`; the daemon listens on loopback only. NEVER
@@ -615,7 +634,9 @@ async fn run_http_stream(
     let mut acc = SseAccumulator::new();
     let mut emitted: usize = 0;
     let mut raw_bytes: usize = 0;
-    let overall_deadline = tokio::time::Instant::now() + HTTP_GENERATION_TIMEOUT;
+    // Per-run overall wall-clock cap (the 30s per-chunk INACTIVITY timeout above stays
+    // fixed). A backend may widen/narrow this within [60, 600]; default 180s.
+    let overall_deadline = tokio::time::Instant::now() + resolve_generation_timeout(backend);
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -716,6 +737,30 @@ struct CliCommand {
 /// NOTE: this returns the BARE program name. `run_cli_buffered` resolves it to a full path
 /// via [`super::provider_detect::resolve_program`] before spawning (GUI launches do not
 /// inherit the shell PATH) and injects the augmented PATH into the child env.
+/// Return a configured `effort` ONLY if it is safe to place on argv: non-empty after trim
+/// AND composed exclusively of `[a-z]` (which `low`/`medium`/`high` satisfy). The value is
+/// already validated + lowercased by `validate_design_llm_backend`; this is a final,
+/// independent charset gate so a hand-edited config that bypassed the command validator can
+/// never smuggle a separator/flag/space onto the codex command line. Returns `None` (so the
+/// flag is simply omitted) for absent/empty/illegal input — NEVER an error (a bad effort
+/// must not break a generation; it just drops the override). PURE + total.
+///
+/// NOTE: HTTP kinds (`ollama`/`omlx`) never reach `build_cli_command` at all, so their
+/// effort no-op is structural; only `codex` maps this to a CLI flag.
+fn effort_for_argv(effort: Option<&str>) -> Option<String> {
+    let value = effort.map(str::trim).filter(|e| !e.is_empty())?;
+    if value.bytes().all(|b| b.is_ascii_lowercase()) {
+        Some(value.to_string())
+    } else {
+        // The value failed the charset gate (a hand-edited config that bypassed the
+        // command validator). Drop it silently from argv but log that we did — REDACTED to
+        // length only (the value failed validation, so treat it as untrusted/sensitive and
+        // never echo its content to the process log).
+        eprintln!("[design] dropping invalid effort (len {})", value.len());
+        None
+    }
+}
+
 fn build_cli_command(backend: &DesignLlmBackend) -> Result<CliCommand, String> {
     match backend.kind {
         DesignLlmBackendKind::Codex => {
@@ -731,12 +776,25 @@ fn build_cli_command(backend: &DesignLlmBackend) -> Result<CliCommand, String> {
                     args.push(model.to_string());
                 }
             }
+            // Reasoning-effort knob: codex consumes it via a `-c` config override
+            // (`model_reasoning_effort=<low|medium|high>`). The value is already validated
+            // (low/medium/high, lowercased) by `validate_design_llm_backend`, but we
+            // RE-ASSERT the charset before it ever reaches argv (belt-and-suspenders: a
+            // hand-edited config bypassing the command validator must not smuggle a flag/
+            // separator onto the codex command line). It is NOT a secret. Only codex maps
+            // effort to a CLI flag; the other kinds ignore it (see their arms).
+            if let Some(effort) = effort_for_argv(backend.effort.as_deref()) {
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort={effort}"));
+            }
             Ok(CliCommand {
                 program: "codex".to_string(),
                 args,
             })
         }
         DesignLlmBackendKind::Claude => {
+            // NO-OP for effort: the `claude` CLI has no reasoning-effort flag, so a
+            // configured effort is intentionally ignored here (not placed on argv).
             // Print/non-interactive mode: returns the completion text on stdout and exits.
             // `--output-format text` is the plain-text default; we set it explicitly so a
             // future default change can never turn our buffered reader into a JSON parser.
@@ -755,6 +813,8 @@ fn build_cli_command(backend: &DesignLlmBackend) -> Result<CliCommand, String> {
             })
         }
         DesignLlmBackendKind::Api => {
+            // NO-OP for effort: the api command is an opaque operator-configured shell line;
+            // we never rewrite its argv (and never append a model-effort flag to it).
             let command = backend
                 .command
                 .as_deref()
@@ -873,10 +933,6 @@ fn resolve_working_dir(working_folder_path: Option<&str>) -> Option<std::path::P
     }
 }
 
-/// Hard wall-clock budget for a buffered CLI generation. A hung CLI must not block the
-/// channel forever; on timeout we kill the child and surface an error.
-const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
 /// Poll interval while waiting on a CLI child, so a cancel flag is observed promptly
 /// without busy-spinning.
 const CLI_POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -965,7 +1021,8 @@ async fn run_cli_buffered(
     // Read stdout to completion (bounded), polling the cancel flag + a wall-clock budget.
     let read_fut = read_bounded(&mut stdout);
     tokio::pin!(read_fut);
-    let deadline = std::time::Instant::now() + CLI_TIMEOUT;
+    // Per-run wall-clock budget (default 180s; a backend may set [60, 600]).
+    let deadline = std::time::Instant::now() + resolve_generation_timeout(backend);
 
     let captured: Vec<u8> = loop {
         tokio::select! {
@@ -1512,6 +1569,8 @@ mod tests {
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let c = build_cli_command(&bare).unwrap();
         assert_eq!(c.program, "codex");
@@ -1526,6 +1585,8 @@ mod tests {
             model: Some("gpt-5-codex".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let c = build_cli_command(&with_model).unwrap();
         assert_eq!(
@@ -1542,12 +1603,123 @@ mod tests {
     }
 
     #[test]
+    fn build_cli_codex_appends_effort_config_override_when_set() {
+        // With a validated effort, codex gets `-c model_reasoning_effort=<value>` AFTER the
+        // model flag. Without effort, no `-c` is present (argv unchanged from the bare case).
+        let with_effort = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Codex,
+            model: Some("gpt-5-codex".into()),
+            command: None,
+            base_url: None,
+            effort: Some("high".into()),
+            timeout_secs: None,
+        };
+        let c = build_cli_command(&with_effort).unwrap();
+        assert_eq!(
+            c.args,
+            vec![
+                "exec".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "-m".to_string(),
+                "gpt-5-codex".to_string(),
+                "-c".to_string(),
+                "model_reasoning_effort=high".to_string(),
+            ]
+        );
+
+        // No effort => no `-c` override on argv.
+        let no_effort = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Codex,
+            model: None,
+            command: None,
+            base_url: None,
+            effort: None,
+            timeout_secs: None,
+        };
+        let c = build_cli_command(&no_effort).unwrap();
+        assert!(
+            !c.args.iter().any(|a| a == "-c" || a.contains("model_reasoning_effort")),
+            "no effort must not add a -c override: {:?}",
+            c.args
+        );
+    }
+
+    #[test]
+    fn build_cli_claude_ignores_effort_no_op() {
+        // claude has no reasoning-effort flag: a configured effort must NOT reach argv.
+        let b = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Claude,
+            model: None,
+            command: None,
+            base_url: None,
+            effort: Some("high".into()),
+            timeout_secs: None,
+        };
+        let c = build_cli_command(&b).unwrap();
+        assert!(
+            !c.args.iter().any(|a| a.contains("effort") || a == "-c"),
+            "claude must ignore effort: {:?}",
+            c.args
+        );
+    }
+
+    #[test]
+    fn effort_for_argv_gates_charset_and_emptiness() {
+        assert_eq!(effort_for_argv(Some("high")).as_deref(), Some("high"));
+        assert_eq!(effort_for_argv(Some("  low  ")).as_deref(), Some("low"));
+        // Absent / empty / illegal charset => None (dropped, never an error).
+        assert_eq!(effort_for_argv(None), None);
+        assert_eq!(effort_for_argv(Some("")), None);
+        assert_eq!(effort_for_argv(Some("   ")), None);
+        // Illegal AFTER trim: uppercase, embedded space/separator/flag chars, or a
+        // mid-string control char that survives trimming.
+        for bad in ["HIGH", "low high", "high=x", "high;rm", "-c", "lo\nw"] {
+            assert_eq!(effort_for_argv(Some(bad)), None, "{bad:?} must be dropped");
+        }
+    }
+
+    #[test]
+    fn resolve_generation_timeout_defaults_and_clamps() {
+        let base = |secs: Option<u64>| DesignLlmBackend {
+            kind: DesignLlmBackendKind::Ollama,
+            model: Some("m".into()),
+            command: None,
+            base_url: None,
+            effort: None,
+            timeout_secs: secs,
+        };
+        // None => the 180s default.
+        assert_eq!(
+            resolve_generation_timeout(&base(None)),
+            std::time::Duration::from_secs(180)
+        );
+        // In-range passes through.
+        assert_eq!(
+            resolve_generation_timeout(&base(Some(60))),
+            std::time::Duration::from_secs(60)
+        );
+        // Above the max clamps to 600 (defensive: a hand-edited config bypassing the
+        // validator must not set an unbounded budget).
+        assert_eq!(
+            resolve_generation_timeout(&base(Some(9999))),
+            std::time::Duration::from_secs(600)
+        );
+        // Below the min clamps up to 60.
+        assert_eq!(
+            resolve_generation_timeout(&base(Some(5))),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
     fn build_cli_claude_uses_print_text_and_optional_model_no_secret_on_argv() {
         let bare = DesignLlmBackend {
             kind: DesignLlmBackendKind::Claude,
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let c = build_cli_command(&bare).unwrap();
         assert_eq!(c.program, "claude");
@@ -1565,6 +1737,8 @@ mod tests {
             model: Some("claude-sonnet-4-5".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let c = build_cli_command(&with_model).unwrap();
         assert_eq!(
@@ -1590,6 +1764,8 @@ mod tests {
             model: None,
             command: Some("mycli chat --json".into()),
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let c = build_cli_command(&api).unwrap();
         // The verbatim command line is the shell argument; the PROMPT is NOT here (it is
@@ -1617,6 +1793,8 @@ mod tests {
                 model: Some("m".into()),
                 command: None,
                 base_url: Some("http://127.0.0.1:8000/v1".into()),
+                effort: None,
+                timeout_secs: None,
             };
             assert!(build_cli_command(&b).is_err());
         }
@@ -1629,6 +1807,8 @@ mod tests {
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(build_cli_command(&b).is_err());
     }
@@ -1766,6 +1946,8 @@ mod tests {
             model: Some("qwen".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert_eq!(http_base_url(&b).unwrap(), OLLAMA_OPENAI_BASE);
         assert!(http_base_url(&b).unwrap().starts_with("http://127.0.0.1"));
@@ -1778,6 +1960,8 @@ mod tests {
             model: Some("qwen".into()),
             command: None,
             base_url: Some("http://localhost:8000/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         assert_eq!(http_base_url(&b).unwrap(), "http://localhost:8000/v1");
     }
@@ -1934,6 +2118,8 @@ mod tests {
             model: Some("qwen".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let m = http_unreachable_message(&ollama, OLLAMA_OPENAI_BASE);
         assert!(m.contains("Ollama is not reachable"), "{m}");
@@ -1947,6 +2133,8 @@ mod tests {
             model: Some("m".into()),
             command: None,
             base_url: Some("http://127.0.0.1:8000/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         let m = http_unreachable_message(&omlx, "http://127.0.0.1:8000/v1");
         assert!(m.contains("oMLX server is not reachable"), "{m}");

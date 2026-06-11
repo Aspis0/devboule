@@ -17,10 +17,12 @@ const invokeSpy =
     async () => undefined,
   );
 
+const requestViewSpy = vi.fn();
 vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (command: string, args?: Record<string, unknown>) =>
     invokeSpy(command, args),
   isTauriRuntime: () => true,
+  useAppContext: () => ({ requestView: requestViewSpy }),
 }));
 
 // ---- native folder picker mock --------------------------------------------
@@ -146,35 +148,72 @@ function typePrompt(container: HTMLElement, value: string) {
   });
 }
 
-/** Choose the working folder via the native picker (the dialog mock returns
- *  `value`). This is the ONLY way the folder can be set now (no text input). */
+function openProjectPopover(container: HTMLElement) {
+  if (container.querySelector(".pop.left")) return;
+  const proj = container.querySelector(".tb-proj") as HTMLButtonElement;
+  act(() => proj.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+/** Open the working folder via the ProjectPopover's "Open working folder…" row,
+ *  which picks the folder itself (dialog mock returns `value`) and loads it. The
+ *  folder is the ONLY way the working path is set now (no text input). NOTE: when a
+ *  test mocks `design_load_project` to a project, this also LOADS it. */
 async function pickFolder(container: HTMLElement, value: string) {
   dialogCtl.nextPick = value;
+  openProjectPopover(container);
   const pickBtn = Array.from(container.querySelectorAll("button")).find(
-    (b) => b.textContent?.includes("Choose folder"),
+    (b) => b.textContent?.includes("Open working folder"),
   ) as HTMLButtonElement;
   await act(async () => {
     pickBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    // Flush the dynamic import + awaited open() microtasks.
-    await Promise.resolve();
+    // Flush the deep async chain: dynamic import -> open() -> loadFolder ->
+    // seedTokens (oracle probe + token write) -> remember -> oracle status.
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+  });
+}
+
+/** Open the ExportPopover and click an export row. `which` is the row label prefix
+ *  ("Standalone HTML" for absolute, "HTML scaffold" for flow). */
+async function clickExport(container: HTMLElement, which: string) {
+  const exportBtn = Array.from(container.querySelectorAll("button")).find(
+    (b) => b.textContent?.trim() === "Export" && b.querySelector("svg"),
+  ) as HTMLButtonElement;
+  act(() => exportBtn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  const row = Array.from(container.querySelectorAll("button")).find((b) =>
+    b.textContent?.trim().startsWith(which),
+  ) as HTMLButtonElement;
+  await act(async () => {
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await Promise.resolve();
     await Promise.resolve();
   });
 }
 
 async function clickGenerate(container: HTMLElement) {
-  const btn = Array.from(container.querySelectorAll("button")).find(
-    (b) => b.textContent?.trim() === "Generate" && b.querySelector("svg"),
-  ) as HTMLButtonElement;
-  // runGenerate is async (it awaits readBackendKind + Oracle grounding before
-  // calling startStream). Flush the awaited microtasks so the stream has started
-  // before the test drives the terminal `done`.
+  // The composer's send button drives BOTH generate (no selection) and edit (a node
+  // selected). runGenerate/runEdit are async (await readBackendKind + grounding before
+  // startStream); flush the awaited microtasks so the stream has started before the
+  // test drives the terminal `done`.
+  const btn = container.querySelector(".send-btn") as HTMLButtonElement;
   await act(async () => {
     btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+/** Type an edit instruction into the (single) composer textarea — used after a node
+ *  is selected, when the composer routes to the edit flow. Same element as the prompt;
+ *  this alias documents intent. */
+function typeEdit(container: HTMLElement, value: string) {
+  typePrompt(container, value);
+}
+
+/** Click the composer send button (alias of clickGenerate; the same button sends the
+ *  edit when a node is selected). */
+async function clickSend(container: HTMLElement) {
+  await clickGenerate(container);
 }
 
 describe("DesignView — BLOCKER 2: two sequential generations both apply", () => {
@@ -236,17 +275,8 @@ describe("DesignView — BLOCKER 3: reload restores structural recovery", () => 
     });
 
     const { container } = render();
+    // "Open working folder…" picks C:/proj and loads it (design_load_project mock).
     await pickFolder(container, "C:/proj");
-
-    // Click Load.
-    const loadBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Load",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      loadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
     expect(lastProject?.manifest.nodes["hero"]).toMatchObject({ x: 600, y: 400 });
 
     // Regenerate with the SAME structure but the model dropped the id.
@@ -287,27 +317,10 @@ describe("DesignView — BLOCKER 1: edit refreshes the stored structural shape",
       "[data-testid=select-first]",
     ) as HTMLButtonElement;
     act(() => select.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    // The edit instruction is the only text input now (the folder is picked, not typed).
-    const editInput = container.querySelector(
-      "input[type=text]",
-    ) as HTMLInputElement;
-    const inputSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype,
-      "value",
-    )!.set!;
-    act(() => {
-      inputSetter.call(editInput, "add two paragraphs");
-      editInput.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    const editBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Edit",
-    ) as HTMLButtonElement;
-    // runEdit is async (awaits readBackendKind before startStream): flush microtasks.
-    await act(async () => {
-      editBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    // With a node selected, the composer routes to the edit flow: type into the same
+    // composer textarea and press send.
+    typeEdit(container, "add two paragraphs");
+    await clickSend(container);
     // Edit returns the restructured markup WITHOUT the id (model dropped it).
     emitDone("<section><h1>Card</h1><p>a</p><p>b</p></section>");
     // Edit keeps placement + id; shape stored must now be the RESTRUCTURED form.
@@ -413,9 +426,7 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     await setFolder(container, "C:/target/.aspis-design/landing");
     typePrompt(container, "make a hero");
 
-    const genBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Generate" && b.querySelector("svg"),
-    ) as HTMLButtonElement;
+    const genBtn = container.querySelector(".send-btn") as HTMLButtonElement;
 
     // First click: enters runGenerate, blocks on the pending backend-kind promise.
     await act(async () => {
@@ -504,14 +515,8 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     const { container } = render();
     await setFolder(container, "C:/target/.aspis-design/landing");
 
-    const exportBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Export code",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      exportBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    // Export via the topbar ExportPopover's "Standalone HTML — absolute layout" row.
+    await clickExport(container, "Standalone HTML");
 
     expect(exports.length).toBe(1);
     expect(exports[0].filename).toBe("export-absolute.html");
@@ -550,27 +555,11 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     });
 
     const { container } = render();
+    // "Open working folder…" loads the malicious project from disk in one step.
     await setFolder(container, "C:/target/.aspis-design/landing");
 
-    // Load the malicious project from disk.
-    const loadBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Load",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      loadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // Export it.
-    const exportBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Export code",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      exportBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    // Export it via the topbar ExportPopover.
+    await clickExport(container, "Standalone HTML");
 
     expect(exports.length).toBe(1);
     const html = String(exports[0].content);
@@ -621,17 +610,8 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     });
 
     const { container } = render();
+    // "Open working folder…" picks the path and loads it (running the token seed).
     await setFolder(container, "C:/target/.aspis-design/landing");
-
-    const loadBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Load",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      loadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
 
     // The seed ran (Oracle probed) and persisted within the awaited load flow.
     expect(oracleQueried).toBe(true);
@@ -827,11 +807,16 @@ function typePromptSync(container: HTMLElement, value: string) {
 
 async function setFolderForTest(container: HTMLElement, value: string) {
   dialogCtl.nextPick = value;
+  if (!container.querySelector(".pop.left")) {
+    const proj = container.querySelector(".tb-proj") as HTMLButtonElement;
+    act(() => proj.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  }
   const pickBtn = Array.from(container.querySelectorAll("button")).find(
-    (b) => b.textContent?.includes("Choose folder"),
+    (b) => b.textContent?.includes("Open working folder"),
   ) as HTMLButtonElement;
   await act(async () => {
     pickBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
@@ -839,9 +824,7 @@ async function setFolderForTest(container: HTMLElement, value: string) {
 }
 
 async function clickGenerateFake(container: HTMLElement) {
-  const btn = Array.from(container.querySelectorAll("button")).find(
-    (b) => b.textContent?.trim() === "Generate" && b.querySelector("svg"),
-  ) as HTMLButtonElement;
+  const btn = container.querySelector(".send-btn") as HTMLButtonElement;
   await act(async () => {
     btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await Promise.resolve();
@@ -863,34 +846,15 @@ describe("DesignView — WARNING 4: persistNode serializes node then manifest", 
     const { container } = render();
     // Choose a folder so persistence runs.
     await pickFolder(container, "C:/proj");
-    const setter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype,
-      "value",
-    )!.set!;
 
-    // Select the first node, type an edit instruction, run the edit.
+    // Select the first node, type an edit instruction into the composer, send.
     const select = container.querySelector(
       "[data-testid=select-first]",
     ) as HTMLButtonElement;
     act(() => select.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
-    // The edit instruction is the only text input now (folder is picked, not typed).
-    const editInput = container.querySelector(
-      "input[type=text]",
-    ) as HTMLInputElement;
-    act(() => {
-      setter.call(editInput, "make it blue");
-      editInput.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    const editBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.trim() === "Edit",
-    ) as HTMLButtonElement;
-    // runEdit is async (awaits readBackendKind before startStream): flush microtasks.
-    await act(async () => {
-      editBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    typeEdit(container, "make it blue");
+    await clickSend(container);
 
     emitDone('<section data-node-id="hero"><h1>Edited</h1></section>');
     // Let the serialized async writes settle.
@@ -900,5 +864,54 @@ describe("DesignView — WARNING 4: persistNode serializes node then manifest", 
     });
 
     expect(order).toEqual(["design_write_node", "design_write_manifest"]);
+  });
+});
+
+describe("DesignView — MAJOR: retrying an edit whose node was deleted errors (no silent generate)", () => {
+  it("patches the card to a 'node no longer exists' error instead of running a generate", async () => {
+    const { container } = render();
+
+    // 1) Generate a node so there is a real node id to edit.
+    typePrompt(container, "make a card");
+    await clickGenerate(container);
+    emitDone("<section><h1>Card</h1></section>");
+    const id = Object.keys(lastProject!.manifest.nodes)[0];
+
+    // 2) Select it and EDIT it (the resulting card carries editNodeId === id).
+    const select = container.querySelector(
+      "[data-testid=select-first]",
+    ) as HTMLButtonElement;
+    act(() => select.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    typeEdit(container, "make it blue");
+    await clickSend(container);
+    emitDone('<section data-node-id="' + id + '"><h1>Edited</h1></section>');
+
+    // 3) Delete the edited node from the manifest (a later op removed it).
+    act(() => {
+      lastOnManifestChange?.({ schemaVersion: 1, nodes: {} });
+    });
+    expect(lastProject!.manifest.nodes[id]).toBeUndefined();
+
+    const startsBefore = streamCtl.starts.length;
+
+    // 4) Click the EDIT card's Regenerate (onRerun) — it is the LAST card rendered, so
+    //    pick the last matching button (the first Regenerate belongs to the generate card).
+    //    It must NOT start a generate; it must flip the card to a clear
+    //    "node no longer exists" error.
+    const reruns = Array.from(container.querySelectorAll("button")).filter((b) =>
+      b.textContent?.trim().startsWith("Regenerate"),
+    ) as HTMLButtonElement[];
+    expect(reruns.length).toBeGreaterThan(0);
+    const rerun = reruns[reruns.length - 1];
+    await act(async () => {
+      rerun.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // No new stream was started (it did NOT silently become a generate).
+    expect(streamCtl.starts.length).toBe(startsBefore);
+    const text = container.textContent ?? "";
+    expect(text).toContain("Node no longer exists");
   });
 });

@@ -20,10 +20,58 @@ import {
   type MiniBackendDraft,
 } from "../agents/miniCoderBackend";
 import type {
+  DesignEffort,
   DesignLlmBackend,
   DesignLlmBackendKind,
   MiniCoderBackend,
 } from "../../types/config";
+
+// Per-run timeout bounds. MUST match the Rust `DESIGN_TIMEOUT_SECS_MIN/MAX` exactly
+// (out-of-range is REJECTED on both sides, mirroring the reject-not-normalize posture).
+export const DESIGN_TIMEOUT_SECS_MIN = 60;
+export const DESIGN_TIMEOUT_SECS_MAX = 600;
+
+// The accepted reasoning-effort values, in selector order. Mirrors the Rust accept set.
+export const DESIGN_EFFORTS: readonly DesignEffort[] = ["low", "medium", "high"] as const;
+
+// Validate + normalize the OPTIONAL effort knob. Mirrors the Rust `validate_design_effort`:
+// trims + lowercases, accepts ONLY low/medium/high, and treats absent/empty as "no
+// override" (returns `{ value: undefined }`). An illegal value is REJECTED (ok:false), not
+// silently dropped. Pure + total: never throws.
+export type DesignEffortValidation =
+  | { ok: true; value: DesignEffort | undefined }
+  | { ok: false; value: undefined };
+
+export function validateDesignEffort(
+  effort: string | null | undefined,
+): DesignEffortValidation {
+  const raw = (effort ?? "").trim().toLowerCase();
+  if (raw === "") return { ok: true, value: undefined };
+  if (raw === "low" || raw === "medium" || raw === "high") {
+    return { ok: true, value: raw };
+  }
+  return { ok: false, value: undefined };
+}
+
+// Validate the OPTIONAL per-run timeoutSecs. Mirrors the Rust `validate_design_timeout_secs`:
+// absent => no override; a present value must be an integer within [60, 600] — out-of-range
+// (or non-finite/non-integer) is REJECTED (ok:false), never clamped. Pure + total.
+export function validateDesignTimeoutSecs(
+  timeoutSecs: number | null | undefined,
+): { ok: boolean; value: number | undefined } {
+  if (timeoutSecs === null || timeoutSecs === undefined) {
+    return { ok: true, value: undefined };
+  }
+  if (
+    !Number.isFinite(timeoutSecs) ||
+    !Number.isInteger(timeoutSecs) ||
+    timeoutSecs < DESIGN_TIMEOUT_SECS_MIN ||
+    timeoutSecs > DESIGN_TIMEOUT_SECS_MAX
+  ) {
+    return { ok: false, value: undefined };
+  }
+  return { ok: true, value: timeoutSecs };
+}
 
 // Re-export the shared caps + primitives under design-flavored names so the card can
 // import everything from this one module. These are the SAME values the mini-coder uses
@@ -53,14 +101,47 @@ export interface DesignBackendDraft {
   // The oMLX base URL field. Required+validated only for kind "omlx"; treated as "" when
   // absent.
   baseUrl?: string;
+  // OPTIONAL generation knobs owned by the composer's model popover (NOT the Settings
+  // card). When present they are validated + carried through to the normalized value;
+  // when absent they are simply omitted (the card path passes them through unchanged so a
+  // save from the card never DROPS them — see DesignLlmBackendCard).
+  effort?: string;
+  timeoutSecs?: number;
 }
 
 export interface DesignBackendValidation {
   ok: boolean;
   // Field-keyed inline messages; absent key == that field is valid.
-  errors: Partial<Record<"model" | "command" | "baseUrl", string>>;
+  errors: Partial<Record<"model" | "command" | "baseUrl" | "effort" | "timeoutSecs", string>>;
   // The normalized backend when ok (only the fields the kind uses are kept).
   value: DesignLlmBackend | null;
+}
+
+// Merge the validated OPTIONAL effort/timeout knobs onto a normalized backend value,
+// returning a NEW object (never mutating the input). Shared by every kind arm so the two
+// surfaces (codex/claude special-case + the generic delegation) never drift. Returns the
+// per-field error map (empty when valid), whether both knobs validated, and the
+// resulting value. When a knob is INVALID the value is forced to `null` so the overall
+// result is never a partially-valid object (a rejected save must carry no value). A `null`
+// input value (an upstream kind error) is left null.
+function applyEffortAndTimeout(
+  draft: DesignBackendDraft,
+  value: DesignLlmBackend | null,
+): { errors: DesignBackendValidation["errors"]; ok: boolean; value: DesignLlmBackend | null } {
+  const errors: DesignBackendValidation["errors"] = {};
+  const effort = validateDesignEffort(draft.effort);
+  const timeout = validateDesignTimeoutSecs(draft.timeoutSecs);
+  if (!effort.ok) errors.effort = "Effort must be one of: low, medium, high.";
+  if (!timeout.ok) {
+    errors.timeoutSecs = `Timeout must be between ${DESIGN_TIMEOUT_SECS_MIN} and ${DESIGN_TIMEOUT_SECS_MAX} seconds.`;
+  }
+  const ok = effort.ok && timeout.ok;
+  // A knob failure invalidates the whole save: emit no value, not a half-applied one.
+  if (!ok || value === null) return { errors, ok, value: null };
+  const merged: DesignLlmBackend = { ...value };
+  if (effort.value !== undefined) merged.effort = effort.value;
+  if (timeout.value !== undefined) merged.timeoutSecs = timeout.value;
+  return { errors, ok, value: merged };
 }
 
 // Validate one draft. Pure and total: never throws, returns inline messages for each
@@ -84,10 +165,15 @@ export function validateDesignBackend(
       command: draft.command,
       baseUrl: draft.baseUrl,
     });
-    const value: DesignLlmBackend | null = codexResult.value
+    const baseValue: DesignLlmBackend | null = codexResult.value
       ? { kind: "claude", ...(codexResult.value.model !== undefined ? { model: codexResult.value.model } : {}) }
       : null;
-    return { ok: codexResult.ok, errors: codexResult.errors, value };
+    const knobs = applyEffortAndTimeout(draft, baseValue);
+    return {
+      ok: codexResult.ok && knobs.ok,
+      errors: { ...codexResult.errors, ...knobs.errors },
+      value: knobs.value,
+    };
   }
 
   // DesignBackendDraft is structurally a MiniBackendDraft (the remaining kinds are equal),
@@ -102,10 +188,15 @@ export function validateDesignBackend(
   // The normalized MiniCoderBackend is structurally a DesignLlmBackend (identical fields,
   // same kind union). Re-map explicitly so the public type is DesignLlmBackend, not a
   // structural alias of the mini-coder type.
-  const value: DesignLlmBackend | null = result.value
+  const baseValue: DesignLlmBackend | null = result.value
     ? remapValue(result.value)
     : null;
-  return { ok: result.ok, errors: result.errors, value };
+  const knobs = applyEffortAndTimeout(draft, baseValue);
+  return {
+    ok: result.ok && knobs.ok,
+    errors: { ...result.errors, ...knobs.errors },
+    value: knobs.value,
+  };
 }
 
 // Re-map a normalized MiniCoderBackend onto the DesignLlmBackend shape. They are

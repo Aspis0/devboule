@@ -146,9 +146,21 @@ export function DesignLlmBackendCard() {
     [kind, statusMap],
   );
 
+  // The composer's model popover (NOT this card) owns the effort/timeoutSecs knobs. This
+  // card edits only kind/model/command/baseUrl, so it must PRESERVE any effort/timeoutSecs
+  // already on the persisted backend rather than DROP them on save. Thread the current
+  // values through the draft so validateDesignBackend carries them onto the saved value.
   const validation = useMemo(
-    () => validateDesignBackend({ kind, model, command, baseUrl }),
-    [kind, model, command, baseUrl],
+    () =>
+      validateDesignBackend({
+        kind,
+        model,
+        command,
+        baseUrl,
+        effort: current?.effort,
+        timeoutSecs: current?.timeoutSecs,
+      }),
+    [kind, model, command, baseUrl, current?.effort, current?.timeoutSecs],
   );
   const showModelError =
     (kind === "ollama" ||
@@ -194,7 +206,32 @@ export function DesignLlmBackendCard() {
   const onSave = async () => {
     if (!validation.ok || !validation.value) return;
     try {
-      await save(validation.value);
+      // The composer's model popover can save effort/timeoutSecs CONCURRENTLY with this
+      // card being open. The mount-time `current` is stale for those two knobs, so saving
+      // `validation.value` (built from `current`) would clobber a fresh effort/timeout the
+      // popover just persisted. Re-fetch the backend RIGHT BEFORE saving and rebuild the
+      // payload from the fresh effort/timeoutSecs — everything else (kind/model/url) still
+      // comes from THIS form. If the fresh read fails, fall back to the already-valid draft.
+      let payload = validation.value;
+      try {
+        const fresh = await invokeBackendCommand<DesignLlmBackend | null>(
+          "get_design_llm_backend",
+          {},
+        );
+        const reconciled = validateDesignBackend({
+          kind,
+          model,
+          command,
+          baseUrl,
+          effort: fresh?.effort,
+          timeoutSecs: fresh?.timeoutSecs,
+        });
+        if (reconciled.ok && reconciled.value) payload = reconciled.value;
+      } catch {
+        // Fresh read failed — keep the draft payload (its effort/timeout from mount-time
+        // current). This never makes the save WORSE than the prior behavior.
+      }
+      await save(payload);
     } catch {
       // Error surfaced by save; keep the draft.
     }

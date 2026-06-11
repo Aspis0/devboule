@@ -26,6 +26,7 @@ vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (command: string, args?: Record<string, unknown>) =>
     invokeSpy(command, args),
   isTauriRuntime: () => true,
+  useAppContext: () => ({ requestView: vi.fn() }),
 }));
 
 // ---- native folder picker mock --------------------------------------------
@@ -128,11 +129,30 @@ function findButton(container: HTMLElement, label: string): HTMLButtonElement {
   ) as HTMLButtonElement;
 }
 
-async function clickPick(container: HTMLElement, pick: string | null) {
+// The registry list + folder actions now live inside the TopBar's ProjectPopover.
+// Ensure it is OPEN (idempotent: the trigger toggles, so only click when closed) so
+// its rows are mounted in the DOM. The left-variant `.pop.left` panel presence is
+// the open signal.
+function openProjectPopover(container: HTMLElement) {
+  if (container.querySelector(".pop.left")) return; // already open
+  const proj = container.querySelector(".tb-proj") as HTMLButtonElement;
+  act(() => proj.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+// "Create" maps to the popover's "New project…" row, which picks a folder ITSELF
+// (the dialog mock returns `pick`) and then creates it. "Load" maps to "Open
+// working folder…". A single click does both pick + action.
+async function clickPopoverAction(
+  container: HTMLElement,
+  label: string,
+  pick: string | null,
+) {
   dialogCtl.nextPick = pick;
-  const btn = findButton(container, "Choose folder");
+  openProjectPopover(container);
+  const btn = findButton(container, label);
   await act(async () => {
     btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
@@ -147,6 +167,7 @@ describe("DesignView — recent-projects registry", () => {
     ];
     const container = render();
     await flush();
+    openProjectPopover(container);
 
     expect(
       invokeSpy.mock.calls.some((c) => c[0] === "design_registry_list"),
@@ -157,11 +178,13 @@ describe("DesignView — recent-projects registry", () => {
     expect(container.textContent).toContain("/x/alpha");
   });
 
-  it("renders no recent section when the registry is empty", async () => {
+  it("renders no recent rows when the registry is empty", async () => {
     listCtl.value = [];
     const container = render();
     await flush();
-    expect(container.querySelector("[data-testid=design-recent]")).toBeNull();
+    openProjectPopover(container);
+    // The popover's recent-list container mounts but holds no entry rows.
+    expect(recentItems(container).length).toBe(0);
   });
 
   it("clicking a recent entry loads it via design_load_project", async () => {
@@ -174,6 +197,7 @@ describe("DesignView — recent-projects registry", () => {
     });
     const container = render();
     await flush();
+    openProjectPopover(container);
 
     const openBtn = recentItems(container)[0].querySelector(
       "button",
@@ -204,15 +228,8 @@ describe("DesignView — recent-projects registry", () => {
     });
     const container = render();
     await flush();
-    await clickPick(container, "D:/projects/site");
-
-    const createBtn = findButton(container, "Create");
-    await act(async () => {
-      createBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    // "New project…" picks D:/projects/site and creates it in one click.
+    await clickPopoverAction(container, "New project", "D:/projects/site");
 
     const rememberCall = invokeSpy.mock.calls.find(
       (c) => c[0] === "design_registry_remember",
@@ -232,15 +249,8 @@ describe("DesignView — recent-projects registry", () => {
     });
     const container = render();
     await flush();
-    await clickPick(container, "/Users/me/work/landing");
-
-    const loadBtn = findButton(container, "Load");
-    await act(async () => {
-      loadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    // "Open working folder…" picks the path and loads it in one click.
+    await clickPopoverAction(container, "Open working folder", "/Users/me/work/landing");
 
     const rememberCall = invokeSpy.mock.calls.find(
       (c) => c[0] === "design_registry_remember",
@@ -261,6 +271,7 @@ describe("DesignView — recent-projects registry", () => {
     });
     const container = render();
     await flush();
+    openProjectPopover(container);
 
     const openBtn = recentItems(container)[0].querySelector(
       "button",
@@ -273,8 +284,11 @@ describe("DesignView — recent-projects registry", () => {
     });
 
     // Error surfaced with a prune hint; the recent entry is still listed (no crash).
+    // The error lives in the assistant status column (always mounted), the recent row
+    // re-opens via the popover.
     expect(container.textContent).toMatch(/working folder does not exist/i);
     expect(container.textContent).toMatch(/Remove on the entry/i);
+    openProjectPopover(container);
     expect(recentItems(container).length).toBe(1);
   });
 
@@ -293,6 +307,7 @@ describe("DesignView — recent-projects registry", () => {
     });
     const container = render();
     await flush();
+    openProjectPopover(container);
     expect(recentItems(container).length).toBe(2);
 
     const removeBtn = container.querySelector(
@@ -331,6 +346,7 @@ describe("DesignView — recent-projects registry", () => {
     });
     const container = render();
     await flush();
+    openProjectPopover(container);
 
     const renameBtn = container.querySelector(
       "[aria-label='Rename Alpha']",

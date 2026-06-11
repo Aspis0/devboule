@@ -23,6 +23,7 @@ vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (command: string, args?: Record<string, unknown>) =>
     invokeSpy(command, args),
   isTauriRuntime: () => true,
+  useAppContext: () => ({ requestView: vi.fn() }),
 }));
 
 // Native folder picker mock: a test sets `nextPick` to the path the dialog should
@@ -71,12 +72,19 @@ function render(): { container: HTMLElement; root: Root } {
   return { container, root };
 }
 
-// Choose the working folder via the native picker (the only way it can be set
-// now). Drives the "Choose folder…" button; the mocked dialog returns `value`.
+// Choose the working folder via the native picker. The folder controls now live in
+// the TopBar's ProjectPopover: open it, then click "Open working folder…", which
+// picks the folder itself (dialog mocked to `value`). The folder is adopted
+// synchronously by loadFolder even when the (unmocked) load resolves to nothing, so
+// subsequent manifest writes target it — exactly what this test asserts.
 async function setFolder(container: HTMLElement, value: string) {
   dialogCtl.nextPick = value;
+  if (!container.querySelector(".pop.left")) {
+    const proj = container.querySelector(".tb-proj") as HTMLButtonElement;
+    act(() => proj.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  }
   const pickBtn = Array.from(container.querySelectorAll("button")).find(
-    (b) => b.textContent?.includes("Choose folder"),
+    (b) => b.textContent?.includes("Open working folder"),
   ) as HTMLButtonElement;
   await act(async () => {
     pickBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));

@@ -74,6 +74,62 @@ pub struct DesignLlmBackend {
     /// [`super::mini_coder::validate_omlx_base_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Reasoning-effort knob applied to a generation. Accepts `"low"`/`"medium"`/`"high"`
+    /// (validated + lowercased by [`validate_design_llm_backend`]); any other value is
+    /// REJECTED. Owned by the composer's model popover, NOT the Settings card. Only the
+    /// `codex` CLI path actually consumes it today (`-c model_reasoning_effort=<value>`);
+    /// the other kinds ignore it. Absent => the provider default. NOT a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Per-run wall-clock budget (seconds) for a single generation. Bounded to
+    /// `[60, 600]` by [`validate_design_llm_backend`] (out-of-range is REJECTED, mirroring
+    /// the validator's reject-not-normalize posture for every other field). Absent => the
+    /// built-in 180s default. Consumed by `design_generate` (HTTP + CLI wall-clock cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Minimum per-run generation timeout (seconds). Below this a generation is too short to
+/// be useful (even a small local model needs warm-up); a smaller value is REJECTED.
+pub(crate) const DESIGN_TIMEOUT_SECS_MIN: u64 = 60;
+
+/// Maximum per-run generation timeout (seconds). Bounds a single generation so a hung/
+/// trickling provider cannot occupy the channel for an unbounded time; a larger value is
+/// REJECTED. 600s (10 min) is generous for a full-page markup generation.
+pub(crate) const DESIGN_TIMEOUT_SECS_MAX: u64 = 600;
+
+/// Normalize + validate the OPTIONAL `effort` knob. Trims + lowercases, then accepts ONLY
+/// `low`/`medium`/`high`; anything else is rejected with a clear message (mirroring the
+/// reject-not-normalize posture of every other field here). `None`/empty-after-trim => the
+/// field is simply absent (no effort override). Pure + total: unit-testable.
+fn validate_design_effort(effort: Option<&str>) -> Result<Option<String>, String> {
+    let raw = effort.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let lowered = raw.to_ascii_lowercase();
+    match lowered.as_str() {
+        "low" | "medium" | "high" => Ok(Some(lowered)),
+        _ => Err("Design effort must be one of: low, medium, high.".into()),
+    }
+}
+
+/// Validate the OPTIONAL per-run `timeoutSecs`. `None` => absent (use the default). A
+/// present value must be in `[DESIGN_TIMEOUT_SECS_MIN, DESIGN_TIMEOUT_SECS_MAX]`; an
+/// out-of-range value is REJECTED (mirroring the validator's reject-not-normalize posture).
+/// Pure + total: unit-testable.
+fn validate_design_timeout_secs(timeout_secs: Option<u64>) -> Result<Option<u64>, String> {
+    match timeout_secs {
+        None => Ok(None),
+        Some(secs) => {
+            if !(DESIGN_TIMEOUT_SECS_MIN..=DESIGN_TIMEOUT_SECS_MAX).contains(&secs) {
+                return Err(format!(
+                    "Design timeout must be between {DESIGN_TIMEOUT_SECS_MIN} and {DESIGN_TIMEOUT_SECS_MAX} seconds."
+                ));
+            }
+            Ok(Some(secs))
+        }
+    }
 }
 
 /// Validate + normalize a design-LLM backend config. Applies EXACTLY the same per-kind
@@ -103,6 +159,10 @@ pub fn validate_design_llm_backend(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+    // The effort/timeout knobs are kind-INDEPENDENT (every arm keeps them), so validate +
+    // normalize them ONCE up front. An invalid value is rejected here regardless of kind.
+    let effort = validate_design_effort(backend.effort.as_deref())?;
+    let timeout_secs = validate_design_timeout_secs(backend.timeout_secs)?;
 
     match backend.kind {
         DesignLlmBackendKind::Ollama => {
@@ -124,6 +184,8 @@ pub fn validate_design_llm_backend(
                 model: Some(model),
                 command: None,
                 base_url: None,
+                effort,
+                timeout_secs,
             })
         }
         DesignLlmBackendKind::Api => {
@@ -151,6 +213,8 @@ pub fn validate_design_llm_backend(
                 model: None,
                 command: Some(command),
                 base_url: None,
+                effort,
+                timeout_secs,
             })
         }
         DesignLlmBackendKind::Codex => {
@@ -172,6 +236,8 @@ pub fn validate_design_llm_backend(
                 model: if model.is_empty() { None } else { Some(model) },
                 command: None,
                 base_url: None,
+                effort,
+                timeout_secs,
             })
         }
         DesignLlmBackendKind::Claude => {
@@ -193,6 +259,8 @@ pub fn validate_design_llm_backend(
                 model: if model.is_empty() { None } else { Some(model) },
                 command: None,
                 base_url: None,
+                effort,
+                timeout_secs,
             })
         }
         DesignLlmBackendKind::Omlx => {
@@ -230,6 +298,8 @@ pub fn validate_design_llm_backend(
                 model: Some(model),
                 command: None,
                 base_url: Some(normalized_base),
+                effort,
+                timeout_secs,
             })
         }
     }
@@ -267,6 +337,8 @@ mod tests {
             model: Some("qwen2.5-coder".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let json = serde_json::to_string(&ollama).unwrap();
         assert!(json.contains("\"kind\":\"ollama\""), "json: {json}");
@@ -282,6 +354,8 @@ mod tests {
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let cj = serde_json::to_string(&codex_bare).unwrap();
         assert_eq!(cj, r#"{"kind":"codex"}"#);
@@ -294,6 +368,8 @@ mod tests {
             model: Some("qwen2.5-coder".into()),
             command: None,
             base_url: Some("http://localhost:8000/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         let json = serde_json::to_string(&omlx).unwrap();
         assert!(json.contains("\"kind\":\"omlx\""), "json: {json}");
@@ -317,6 +393,39 @@ mod tests {
         assert_eq!(b.base_url, None);
     }
 
+    #[test]
+    fn old_config_without_effort_or_timeout_parses_unchanged() {
+        // A config.json written BEFORE the effort/timeoutSecs fields existed must still
+        // deserialize cleanly (serde(default)), with both new fields absent.
+        let json = r#"{ "kind": "ollama", "model": "qwen2.5-coder" }"#;
+        let b: DesignLlmBackend = serde_json::from_str(json).unwrap();
+        assert_eq!(b.kind, DesignLlmBackendKind::Ollama);
+        assert_eq!(b.model.as_deref(), Some("qwen2.5-coder"));
+        assert_eq!(b.effort, None);
+        assert_eq!(b.timeout_secs, None);
+        // And it re-serializes WITHOUT the new keys (no churn for an untouched config).
+        let out = serde_json::to_string(&b).unwrap();
+        assert!(!out.contains("effort"), "effort leaked: {out}");
+        assert!(!out.contains("timeoutSecs"), "timeoutSecs leaked: {out}");
+    }
+
+    #[test]
+    fn backend_round_trips_effort_and_timeout_camel_case() {
+        let codex = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Codex,
+            model: None,
+            command: None,
+            base_url: None,
+            effort: Some("high".into()),
+            timeout_secs: Some(300),
+        };
+        let json = serde_json::to_string(&codex).unwrap();
+        assert!(json.contains("\"effort\":\"high\""), "json: {json}");
+        assert!(json.contains("\"timeoutSecs\":300"), "json: {json}");
+        let back: DesignLlmBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(codex, back);
+    }
+
     // -- validation ---------------------------------------------------------
 
     #[test]
@@ -326,6 +435,8 @@ mod tests {
             model: None,
             command: Some("ignored".into()),
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&bad).is_err());
 
@@ -334,6 +445,8 @@ mod tests {
             model: Some("  qwen2.5-coder  ".into()),
             command: Some("dropped".into()),
             base_url: Some("http://localhost:1/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("qwen2.5-coder")); // trimmed
@@ -348,6 +461,8 @@ mod tests {
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&no_cmd).is_err());
 
@@ -361,6 +476,8 @@ mod tests {
                 model: None,
                 command: Some(bad.into()),
                 base_url: None,
+                effort: None,
+                timeout_secs: None,
             };
             assert!(
                 validate_design_llm_backend(&ctrl).is_err(),
@@ -373,6 +490,8 @@ mod tests {
             model: Some("dropped".into()),
             command: Some("  mycli chat --json  ".into()),
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&ok).unwrap();
         assert_eq!(n.command.as_deref(), Some("mycli chat --json"));
@@ -386,6 +505,8 @@ mod tests {
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&bare).unwrap();
         assert_eq!(n.model, None);
@@ -395,6 +516,8 @@ mod tests {
             model: Some("  gpt-5-codex  ".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&with_model).unwrap();
         assert_eq!(n.model.as_deref(), Some("gpt-5-codex"));
@@ -404,6 +527,8 @@ mod tests {
             model: Some("bad model!".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&bad_model).is_err());
     }
@@ -416,6 +541,8 @@ mod tests {
             model: None,
             command: Some("dropped".into()),
             base_url: Some("http://localhost:1/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&bare).unwrap();
         assert_eq!(n.kind, DesignLlmBackendKind::Claude);
@@ -428,6 +555,8 @@ mod tests {
             model: Some("  claude-sonnet-4-5  ".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&with_model).unwrap();
         assert_eq!(n.model.as_deref(), Some("claude-sonnet-4-5"));
@@ -437,6 +566,8 @@ mod tests {
             model: Some("bad model!".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&bad_model).is_err());
     }
@@ -448,6 +579,8 @@ mod tests {
             model: None,
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
         assert_eq!(json, r#"{"kind":"claude"}"#);
@@ -465,6 +598,8 @@ mod tests {
                 model: Some(bad.into()),
                 command: None,
                 base_url: None,
+                effort: None,
+                timeout_secs: None,
             };
             assert!(
                 validate_design_llm_backend(&b).is_err(),
@@ -481,6 +616,8 @@ mod tests {
             model: Some(long_model),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&b).is_err());
 
@@ -490,6 +627,8 @@ mod tests {
             model: None,
             command: Some(long_cmd),
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&b).is_err());
     }
@@ -501,6 +640,8 @@ mod tests {
             model: None,
             command: None,
             base_url: Some("http://localhost:8000/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&no_model).is_err());
 
@@ -509,6 +650,8 @@ mod tests {
             model: Some("qwen2.5-coder".into()),
             command: None,
             base_url: None,
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&no_base).is_err());
     }
@@ -520,6 +663,8 @@ mod tests {
             model: Some("  qwen2.5-coder  ".into()),
             command: Some("dropped".into()),
             base_url: Some("  http://127.0.0.1:8000/v1  ".into()),
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("qwen2.5-coder"));
@@ -542,6 +687,8 @@ mod tests {
                 model: Some("qwen2.5-coder".into()),
                 command: None,
                 base_url: Some(bad.into()),
+                effort: None,
+                timeout_secs: None,
             };
             assert!(
                 validate_design_llm_backend(&b).is_err(),
@@ -558,6 +705,8 @@ mod tests {
             model: Some("m".into()),
             command: None,
             base_url: Some("http://localhost:99999/v1".into()),
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&bad_port).is_err());
 
@@ -567,6 +716,8 @@ mod tests {
             model: Some("m".into()),
             command: None,
             base_url: Some("http://localhost:8000/v1/".into()),
+            effort: None,
+            timeout_secs: None,
         };
         let n = validate_design_llm_backend(&trailing).unwrap();
         assert_eq!(n.base_url.as_deref(), Some("http://localhost:8000/v1"));
@@ -579,6 +730,8 @@ mod tests {
             model: Some("m".into()),
             command: None,
             base_url: Some("http://localhost:8000/v1\u{202e}".into()),
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&ctrl).is_err());
 
@@ -588,7 +741,99 @@ mod tests {
             model: Some("m".into()),
             command: None,
             base_url: Some(long),
+            effort: None,
+            timeout_secs: None,
         };
         assert!(validate_design_llm_backend(&overlong).is_err());
+    }
+
+    // -- effort + timeout (A2) ----------------------------------------------
+
+    #[test]
+    fn validate_normalizes_effort_to_lowercase_and_keeps_it() {
+        // Mixed-case + surrounding whitespace normalizes to a bare lowercase token, and the
+        // effort/timeout survive validation on any kind.
+        let b = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Codex,
+            model: None,
+            command: None,
+            base_url: None,
+            effort: Some("  HIGH ".into()),
+            timeout_secs: Some(120),
+        };
+        let n = validate_design_llm_backend(&b).unwrap();
+        assert_eq!(n.effort.as_deref(), Some("high"));
+        assert_eq!(n.timeout_secs, Some(120));
+
+        // An empty/whitespace effort normalizes to absent (no override), not an error.
+        let blank = DesignLlmBackend {
+            kind: DesignLlmBackendKind::Codex,
+            model: None,
+            command: None,
+            base_url: None,
+            effort: Some("   ".into()),
+            timeout_secs: None,
+        };
+        let n = validate_design_llm_backend(&blank).unwrap();
+        assert_eq!(n.effort, None);
+    }
+
+    #[test]
+    fn validate_rejects_unknown_effort() {
+        for bad in ["ultra", "none", "highest", "0", "low high"] {
+            let b = DesignLlmBackend {
+                kind: DesignLlmBackendKind::Codex,
+                model: None,
+                command: None,
+                base_url: None,
+                effort: Some(bad.into()),
+                timeout_secs: None,
+            };
+            assert!(
+                validate_design_llm_backend(&b).is_err(),
+                "effort {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_in_range_timeout_and_rejects_out_of_range() {
+        for ok in [
+            DESIGN_TIMEOUT_SECS_MIN,
+            180,
+            DESIGN_TIMEOUT_SECS_MAX,
+        ] {
+            let b = DesignLlmBackend {
+                kind: DesignLlmBackendKind::Ollama,
+                model: Some("m".into()),
+                command: None,
+                base_url: None,
+                effort: None,
+                timeout_secs: Some(ok),
+            };
+            assert!(
+                validate_design_llm_backend(&b).is_ok(),
+                "timeout {ok} must be accepted"
+            );
+        }
+        for bad in [
+            DESIGN_TIMEOUT_SECS_MIN - 1,
+            0,
+            DESIGN_TIMEOUT_SECS_MAX + 1,
+            9999,
+        ] {
+            let b = DesignLlmBackend {
+                kind: DesignLlmBackendKind::Ollama,
+                model: Some("m".into()),
+                command: None,
+                base_url: None,
+                effort: None,
+                timeout_secs: Some(bad),
+            };
+            assert!(
+                validate_design_llm_backend(&b).is_err(),
+                "timeout {bad} must be rejected"
+            );
+        }
     }
 }

@@ -879,6 +879,224 @@ pub fn design_oracle_context(
 }
 
 // ---------------------------------------------------------------------------
+// Phase A2 — Oracle grounding STATUS (target-scoped, never-fails)
+// ---------------------------------------------------------------------------
+
+/// Compact, IPC-safe view of the Oracle grounding index for a design project's target.
+/// camelCase over the wire; every count/label is OPTIONAL so a not-ready/empty index (or
+/// any error) degrades to `grounded: false` with the rest absent. PRIVACY: `root_label`
+/// is the LAST PATH COMPONENT of the resolved grounding root ONLY — never the absolute
+/// path (mirrors how `design.rs` keeps FS layout off the IPC boundary). Counts come from
+/// the Oracle `/index/status` payload over the loopback server; no source text is exposed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignOracleStatus {
+    /// Whether the target has a usable Oracle index (any indexed file / chunk present).
+    pub grounded: bool,
+    /// Leaf folder name of the resolved grounding root (NEVER the absolute path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_label: Option<String>,
+    /// Number of indexed chunks (from `index.sqliteChunks`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<u64>,
+    /// Number of indexed files (from `index.indexedFiles`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<u64>,
+    /// ISO-8601 time of the last completed index job (from `job.finishedAt`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_iso: Option<String>,
+}
+
+/// The LEAF component of a resolved path, as an IPC-safe label. Returns `None` for a path
+/// with no final component (e.g. a bare root). NEVER returns the absolute path. PURE +
+/// total: unit-testable. Used so `DesignOracleStatus.root_label` can identify the grounded
+/// folder for the UI without leaking the user's filesystem layout.
+fn path_leaf_label(root: &Path) -> Option<String> {
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Pull an optional `u64` count out of the Oracle `/index/status` JSON at
+/// `payload["index"][key]`. Tolerant: a missing/non-numeric value yields `None`. The
+/// Python server emits these as JSON numbers (see `camelize_index_status`).
+fn status_count(payload: &serde_json::Value, key: &str) -> Option<u64> {
+    payload.get("index")?.get(key)?.as_u64()
+}
+
+/// Report the Oracle grounding status for a design project's target. Resolves the SAME
+/// grounding root `design_oracle_context` uses (`resolve_grounding_root`), then queries the
+/// resident Oracle server's `GET /index/status?root=<root>` via the SHARED HTTP plumbing
+/// `get_oracle_index_status` uses (`run_python_oracle_http_get`) — addressing the server by
+/// THAT root and passing the same `?root=` query (URL-encoded exactly like
+/// `oracle_root_query`).
+///
+/// NEVER FAILS: a locked vault is the only hard error (parity with sibling commands via
+/// `ensure_unlocked`). Any other problem — Oracle not ready, no index for the root, an HTTP
+/// or parse error — degrades to `Ok(DesignOracleStatus { grounded: false, .. })`. The
+/// `root_label` is still populated (leaf-only) when the working folder resolves, so the UI
+/// can name the target even while its index is warming. PRIVACY: only the index ROOT (the
+/// user's own workspace) goes on the wire to the loopback server; the absolute path NEVER
+/// crosses back to the renderer (only the leaf label does), and no source text is exposed.
+#[tauri::command]
+pub async fn design_oracle_status(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+) -> Result<DesignOracleStatus, String> {
+    state.ensure_unlocked()?;
+
+    // Resolve the grounding root (best-effort). If the working folder is unreadable we have
+    // no root to label or query — degrade to "not grounded" without leaking a path.
+    let canonical = match canonical_working_folder(&working_folder_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(DesignOracleStatus::default()),
+    };
+    let root = resolve_grounding_root(&canonical, None);
+    // Leaf-only label: the UI can identify the target without ever seeing the full path.
+    let root_label = path_leaf_label(&root);
+
+    // Query `/index/status?root=<encoded>` over the resident server addressed by THIS root,
+    // exactly as `oracle::commands::get_oracle_index_status` does (same `run_python_oracle_
+    // http_get` plumbing + the same `urlencoding::encode(root)` query idiom as
+    // `oracle_root_query`). Run the blocking HTTP off the async worker.
+    let query_root = root.clone();
+    // The underlying `run_python_oracle_http_get` carries a 90s reqwest timeout — far too
+    // long for a passive UI status badge. A status check that can't answer quickly is, for
+    // our purposes, "not grounded yet". Cap the whole blocking call at a short 10s budget
+    // (tauri::async_runtime is a tokio runtime, so `tokio::time::timeout` drives the
+    // spawn_blocking JoinHandle here); on timeout we fall through to the grounded:false
+    // degrade path below. NOTE: the blocking reqwest call itself is not interruptible, so a
+    // doomed worker thread keeps running until its own 90s timeout — but THIS command
+    // returns within ~10s regardless and never holds the async caller hostage.
+    const ORACLE_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let query = format!(
+            "root={}",
+            urlencoding::encode(&query_root.to_string_lossy())
+        );
+        crate::oracle::python_oracle::run_python_oracle_http_get::<serde_json::Value>(
+            &query_root,
+            &format!("/index/status?{query}"),
+        )
+    });
+    let payload: Result<serde_json::Value, String> =
+        match tokio::time::timeout(ORACLE_STATUS_BUDGET, task).await {
+            Ok(joined) => joined
+                .map_err(|e| format!("Oracle status task failed: {e}"))
+                .and_then(|inner| inner),
+            Err(_) => Err("Oracle status check timed out".to_string()),
+        };
+
+    let payload = match payload {
+        Ok(p) => p,
+        Err(e) => {
+            // Best-effort: the index may simply be warming. Log to the process log only and
+            // return "not grounded" (with the leaf label so the UI can still name the target).
+            eprintln!("[design] oracle status unavailable (degrading): {e}");
+            return Ok(DesignOracleStatus {
+                grounded: false,
+                root_label,
+                ..Default::default()
+            });
+        }
+    };
+
+    let chunks = status_count(&payload, "sqliteChunks");
+    let files = status_count(&payload, "indexedFiles");
+    // The last completed index job's finish time, when present in the `job` sub-object.
+    let last_sync_iso = payload
+        .get("job")
+        .and_then(|j| j.get("finishedAt"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    // Grounded == there is at least one indexed file or chunk for this root.
+    let grounded = chunks.unwrap_or(0) > 0 || files.unwrap_or(0) > 0;
+
+    Ok(DesignOracleStatus {
+        grounded,
+        root_label,
+        chunks,
+        files,
+        last_sync_iso,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase A2 — design.md (human design brief) read/write
+// ---------------------------------------------------------------------------
+
+/// The single design-brief file in a working-folder root. Exactly `design.md` (the Phase C
+/// contract authors/consumes it; this command only persists/reads the raw text).
+const DESIGN_MD_FILE: &str = "design.md";
+
+/// Max bytes of `design.md` we will read or write. A design brief is human-authored prose;
+/// 64 KiB is generous yet bounds a hostile/corrupt file (read) and a crafted frontend
+/// payload (write). Mirrors the `MAX_DESIGN_FILE_BYTES` posture with its OWN, tighter cap.
+const DESIGN_MD_MAX_BYTES: u64 = 65536;
+
+/// Read `design.md` from the working-folder root. Missing file => `Ok(None)`. A file larger
+/// than [`DESIGN_MD_MAX_BYTES`] is an ERROR (never silently truncated). Path-confined via
+/// the canonical working-folder helper; the filename is fixed (no traversal surface).
+#[tauri::command]
+pub fn design_read_design_md(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+) -> Result<Option<String>, String> {
+    state.ensure_unlocked()?;
+    let canonical = canonical_working_folder(&working_folder_path)?;
+    read_design_md_at(&canonical.join(DESIGN_MD_FILE))
+}
+
+/// Read `design.md` from a resolved path, enforcing the dedicated 64 KiB cap BOTH before
+/// and after the read. The pre-read metadata check is a fast path; the post-read length
+/// check is the authoritative one — it closes a TOCTOU race (the file grows between stat
+/// and read) and the fact that the shared read helper uses the larger 8 MiB design cap, so
+/// neither can let an over-cap string escape. Split out so the size invariant is unit-
+/// testable without a `State<BackendState>`.
+fn read_design_md_at(path: &Path) -> Result<Option<String>, String> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > DESIGN_MD_MAX_BYTES {
+            return Err(format!(
+                "design.md too large ({} bytes > {DESIGN_MD_MAX_BYTES} max)",
+                meta.len()
+            ));
+        }
+    }
+    let result = read_design_file(path)?;
+    if let Some(text) = &result {
+        let len = text.len() as u64;
+        if len > DESIGN_MD_MAX_BYTES {
+            return Err(format!(
+                "design.md too large ({len} bytes > {DESIGN_MD_MAX_BYTES} max)"
+            ));
+        }
+    }
+    Ok(result)
+}
+
+/// Atomically write `design.md` to the working-folder root under the design write lock
+/// (mirrors `design_write_tokens`). Content beyond [`DESIGN_MD_MAX_BYTES`] is REJECTED.
+/// The filename is fixed `design.md`, so there is no traversal surface; the working folder
+/// is canonicalized first.
+#[tauri::command]
+pub fn design_write_design_md(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    content: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    let canonical = canonical_working_folder(&working_folder_path)?;
+    if content.len() as u64 > DESIGN_MD_MAX_BYTES {
+        return Err(format!(
+            "design.md too large ({} bytes > {DESIGN_MD_MAX_BYTES} max)",
+            content.len()
+        ));
+    }
+    atomic_write(&canonical.join(DESIGN_MD_FILE), &content, DESIGN_MD_FILE)
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2 STEP 4 — design tokens (W3C DTCG) persistence
 // ---------------------------------------------------------------------------
 
@@ -2855,5 +3073,167 @@ mod tests {
 
         // The symlinked components/ must NOT have its target wiped.
         assert!(precious.exists(), "must not delete through an escaping symlink");
+    }
+
+    // ---- Oracle status (A2) ------------------------------------------------
+
+    #[test]
+    fn oracle_status_serializes_camel_case_and_omits_none() {
+        // The default (not grounded, everything else absent) is the minimal payload: only
+        // `grounded:false` is on the wire; the optional fields are skipped.
+        let bare = DesignOracleStatus::default();
+        let json = serde_json::to_string(&bare).unwrap();
+        assert_eq!(json, r#"{"grounded":false}"#);
+
+        // A populated status uses camelCase keys exactly.
+        let full = DesignOracleStatus {
+            grounded: true,
+            root_label: Some("my-target".into()),
+            chunks: Some(1234),
+            files: Some(56),
+            last_sync_iso: Some("2026-06-10T12:00:00Z".into()),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"grounded\":true"), "{json}");
+        assert!(json.contains("\"rootLabel\":\"my-target\""), "{json}");
+        assert!(json.contains("\"chunks\":1234"), "{json}");
+        assert!(json.contains("\"files\":56"), "{json}");
+        assert!(json.contains("\"lastSyncIso\":\"2026-06-10T12:00:00Z\""), "{json}");
+        // Round-trips back.
+        let back: DesignOracleStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(full, back);
+    }
+
+    #[test]
+    fn path_leaf_label_is_leaf_only_never_absolute() {
+        // The label is ONLY the final component — never the absolute path (IPC hygiene).
+        let p = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\me\code\my-target")
+        } else {
+            PathBuf::from("/home/me/code/my-target")
+        };
+        assert_eq!(path_leaf_label(&p).as_deref(), Some("my-target"));
+        // The returned label must NOT contain any separator or the parent path.
+        let label = path_leaf_label(&p).unwrap();
+        assert!(!label.contains('/') && !label.contains('\\'), "{label}");
+        assert!(!label.contains("code"), "must not leak the parent: {label}");
+    }
+
+    #[test]
+    fn status_count_reads_index_subobject_tolerantly() {
+        let payload = serde_json::json!({
+            "index": { "sqliteChunks": 42, "indexedFiles": 7 },
+            "job": { "finishedAt": "2026-06-10T00:00:00Z" }
+        });
+        assert_eq!(status_count(&payload, "sqliteChunks"), Some(42));
+        assert_eq!(status_count(&payload, "indexedFiles"), Some(7));
+        // Missing key / missing index object / non-numeric -> None (never panics).
+        assert_eq!(status_count(&payload, "nope"), None);
+        assert_eq!(status_count(&serde_json::json!({}), "sqliteChunks"), None);
+        let bad = serde_json::json!({ "index": { "sqliteChunks": "x" } });
+        assert_eq!(status_count(&bad, "sqliteChunks"), None);
+    }
+
+    // ---- design.md read/write (A2) -----------------------------------------
+
+    #[test]
+    fn design_md_round_trips_and_missing_is_none() {
+        let base = tmp_dir();
+        let wf = base.join("proj");
+        fs::create_dir_all(&wf).unwrap();
+        let canonical = canonical_working_folder(&wf.to_string_lossy()).unwrap();
+        let path = canonical.join(DESIGN_MD_FILE);
+
+        // Missing file -> Ok(None) (the read helper the command uses).
+        assert_eq!(read_design_file(&path).unwrap(), None);
+
+        // Write via the same atomic_write the command uses, then read it back verbatim.
+        let content = "# Design brief\n\nMuted olive palette, dense layout.\n";
+        atomic_write(&path, content, DESIGN_MD_FILE).unwrap();
+        assert_eq!(read_design_file(&path).unwrap().as_deref(), Some(content));
+    }
+
+    #[test]
+    fn design_md_oversize_rejected_both_directions() {
+        let base = tmp_dir();
+        let wf = base.join("proj");
+        fs::create_dir_all(&wf).unwrap();
+        let canonical = canonical_working_folder(&wf.to_string_lossy()).unwrap();
+        let path = canonical.join(DESIGN_MD_FILE);
+
+        // WRITE direction: a payload over the cap is rejected by the command's own check.
+        let oversize = "a".repeat((DESIGN_MD_MAX_BYTES as usize) + 1);
+        assert!(
+            oversize.len() as u64 > DESIGN_MD_MAX_BYTES,
+            "fixture must exceed the cap"
+        );
+        // Mirror the command's write-side gate.
+        assert!(oversize.len() as u64 > DESIGN_MD_MAX_BYTES);
+
+        // READ direction: a file already on disk that exceeds the cap is rejected, not
+        // silently truncated. Write it directly (bypassing the command), then assert the
+        // size gate the read command applies would trip.
+        fs::write(&path, &oversize).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert!(
+            meta.len() > DESIGN_MD_MAX_BYTES,
+            "on-disk file must exceed the cap for the read gate to fire"
+        );
+
+        // A file exactly at the cap is allowed (boundary).
+        let at_cap = "b".repeat(DESIGN_MD_MAX_BYTES as usize);
+        atomic_write(&path, &at_cap, DESIGN_MD_FILE).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), DESIGN_MD_MAX_BYTES);
+        assert!(read_design_file(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn read_design_md_at_rejects_oversize_on_disk_file() {
+        // The command-layer reader (sans State) must REJECT an over-cap design.md, not
+        // return its bytes. Write an oversized file directly to disk (bypassing the write
+        // command's own size gate) and assert the read fails. This exercises the same
+        // 64 KiB cap the TOCTOU post-read check enforces.
+        let base = tmp_dir();
+        let wf = base.join("proj");
+        fs::create_dir_all(&wf).unwrap();
+        let canonical = canonical_working_folder(&wf.to_string_lossy()).unwrap();
+        let path = canonical.join(DESIGN_MD_FILE);
+
+        let oversize = "a".repeat((DESIGN_MD_MAX_BYTES as usize) + 1);
+        fs::write(&path, &oversize).unwrap();
+        let err = read_design_md_at(&path).unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+
+        // A file at the cap reads back verbatim (boundary stays allowed).
+        let at_cap = "b".repeat(DESIGN_MD_MAX_BYTES as usize);
+        fs::write(&path, &at_cap).unwrap();
+        assert_eq!(read_design_md_at(&path).unwrap().as_deref(), Some(at_cap.as_str()));
+
+        // Missing file -> Ok(None).
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_design_md_at(&path).unwrap(), None);
+    }
+
+    // NOTE: the pure TOCTOU window (metadata reports <= cap but the file grows before the
+    // read returns) is not deterministically reproducible in a unit test. The post-read
+    // length gate that closes it is covered structurally: `read_design_md_at` re-checks the
+    // returned string's byte length against DESIGN_MD_MAX_BYTES regardless of the metadata
+    // fast-path, and `read_design_file`'s own cap (8 MiB) is larger, so the post-read check
+    // is the binding one for any string between 64 KiB and 8 MiB.
+
+    #[test]
+    fn design_md_working_folder_traversal_rejected() {
+        // The filename is a fixed const (no traversal surface there); the only untrusted
+        // input is the working folder, which `canonical_working_folder` confines/validates.
+        // An empty / non-existent working folder is rejected before any IO (clone of the
+        // existing confinement idiom).
+        assert!(canonical_working_folder("").is_err());
+        assert!(canonical_working_folder("   ").is_err());
+        let missing = std::env::temp_dir().join(format!(
+            "aspis-design-md-no-such-{}",
+            std::process::id()
+        ));
+        assert!(canonical_working_folder(missing.to_string_lossy().as_ref()).is_err());
     }
 }

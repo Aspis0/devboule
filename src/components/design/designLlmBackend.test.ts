@@ -1,10 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
   validateDesignBackend,
+  validateDesignEffort,
+  validateDesignTimeoutSecs,
   DESIGN_MODEL_MAX_LENGTH,
   DESIGN_COMMAND_MAX_LENGTH,
   DESIGN_BASE_URL_MAX_LENGTH,
   DESIGN_BACKEND_KINDS,
+  DESIGN_TIMEOUT_SECS_MIN,
+  DESIGN_TIMEOUT_SECS_MAX,
 } from "./designLlmBackend";
 
 // The design-LLM backend is a 1:1 MIRROR of the mini-coder backend (validateDesignBackend
@@ -123,6 +127,120 @@ describe("validateDesignBackend", () => {
     expect(
       validateDesignBackend({ kind: "api", model: "", command: longCommand }).errors.command,
     ).toBeTruthy();
+  });
+
+  // -- effort + timeout (A2, parity with Rust) ----------------------------
+
+  it("normalizes effort to lowercase and accepts only low/medium/high", () => {
+    expect(validateDesignEffort("  HIGH ")).toEqual({ ok: true, value: "high" });
+    expect(validateDesignEffort("low")).toEqual({ ok: true, value: "low" });
+    expect(validateDesignEffort("Medium")).toEqual({ ok: true, value: "medium" });
+    // Absent / empty => no override (ok, undefined).
+    expect(validateDesignEffort(undefined)).toEqual({ ok: true, value: undefined });
+    expect(validateDesignEffort("   ")).toEqual({ ok: true, value: undefined });
+    // Unknown values are REJECTED (not silently dropped).
+    for (const bad of ["ultra", "none", "highest", "0", "low high"]) {
+      expect(validateDesignEffort(bad).ok, `${bad} must be rejected`).toBe(false);
+    }
+  });
+
+  it("accepts an in-range timeout and rejects out-of-range / non-integer", () => {
+    for (const ok of [DESIGN_TIMEOUT_SECS_MIN, 180, DESIGN_TIMEOUT_SECS_MAX]) {
+      expect(validateDesignTimeoutSecs(ok)).toEqual({ ok: true, value: ok });
+    }
+    expect(validateDesignTimeoutSecs(undefined)).toEqual({ ok: true, value: undefined });
+    for (const bad of [
+      DESIGN_TIMEOUT_SECS_MIN - 1,
+      0,
+      DESIGN_TIMEOUT_SECS_MAX + 1,
+      9999,
+      120.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      expect(validateDesignTimeoutSecs(bad).ok, `${bad} must be rejected`).toBe(false);
+    }
+  });
+
+  it("carries valid effort/timeout onto the normalized value (codex + ollama)", () => {
+    const codex = validateDesignBackend({
+      kind: "codex",
+      model: "",
+      command: "",
+      effort: "  High ",
+      timeoutSecs: 300,
+    });
+    expect(codex.ok).toBe(true);
+    expect(codex.value).toEqual({ kind: "codex", effort: "high", timeoutSecs: 300 });
+
+    const ollama = validateDesignBackend({
+      kind: "ollama",
+      model: "qwen2.5-coder",
+      command: "",
+      effort: "low",
+      timeoutSecs: 90,
+    });
+    expect(ollama.ok).toBe(true);
+    expect(ollama.value).toEqual({
+      kind: "ollama",
+      model: "qwen2.5-coder",
+      effort: "low",
+      timeoutSecs: 90,
+    });
+  });
+
+  it("omits absent effort/timeout (no churn) and rejects invalid knobs", () => {
+    // Absent knobs => the value has neither key.
+    const bare = validateDesignBackend({ kind: "codex", model: "", command: "" });
+    expect(bare.value).toEqual({ kind: "codex" });
+
+    // An invalid knob fails the whole validation with a field-keyed error AND the
+    // overall value must be null (never a partially-valid object: the kind validated
+    // fine, but a rejected knob invalidates the entire save).
+    const badEffort = validateDesignBackend({
+      kind: "codex",
+      model: "",
+      command: "",
+      effort: "ultra",
+    });
+    expect(badEffort.ok).toBe(false);
+    expect(badEffort.errors.effort).toBeTruthy();
+    expect(badEffort.value).toBeNull();
+
+    const badTimeout = validateDesignBackend({
+      kind: "codex",
+      model: "",
+      command: "",
+      timeoutSecs: 9999,
+    });
+    expect(badTimeout.ok).toBe(false);
+    expect(badTimeout.errors.timeoutSecs).toBeTruthy();
+    expect(badTimeout.value).toBeNull();
+  });
+
+  it("builds a NEW value when applying valid knobs (non-mutating, frozen draft OK)", () => {
+    // The draft is frozen: any in-place write to it would throw. validateDesignBackend
+    // must read the knobs and emit a fresh value object without writing back.
+    const frozen = Object.freeze({
+      kind: "codex" as const,
+      model: "",
+      command: "",
+      effort: "high",
+      timeoutSecs: 300,
+    });
+    const res = validateDesignBackend(frozen);
+    expect(res.ok).toBe(true);
+    expect(res.value).toEqual({ kind: "codex", effort: "high", timeoutSecs: 300 });
+    // The returned value is a fresh object, distinct from the input draft.
+    expect(res.value).not.toBe(frozen as unknown as object);
+    // The draft was not mutated (no effort/timeout written back; it stays as authored).
+    expect(frozen).toEqual({
+      kind: "codex",
+      model: "",
+      command: "",
+      effort: "high",
+      timeoutSecs: 300,
+    });
   });
 
   it("exposes exactly the five backend kinds (incl. claude)", () => {

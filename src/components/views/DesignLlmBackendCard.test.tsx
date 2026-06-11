@@ -191,3 +191,60 @@ describe("DesignLlmBackendCard — detection", () => {
     expect(container.querySelector("select")).not.toBeNull();
   });
 });
+
+describe("DesignLlmBackendCard — WARNING: save reconciles fresh effort/timeout (no clobber)", () => {
+  it("re-fetches get_design_llm_backend on save and carries the FRESH effort, not the stale mount value", async () => {
+    // Mount-time config has effort "low". The composer's model popover concurrently
+    // persists effort "high" + a new timeout. On Save, the card must re-read the backend
+    // and build its payload from the FRESH effort/timeout (kind/model/url from the form),
+    // never clobbering the popover's write with the stale mount-time "low".
+    detectResult = [{ kind: "codex", available: true, models: [] }];
+    currentBackend = { kind: "codex", effort: "low", timeoutSecs: 120 };
+
+    // get_design_llm_backend returns the UPDATED knobs (popover saved them after mount).
+    const freshBackend = {
+      kind: "codex",
+      effort: "high",
+      timeoutSecs: 300,
+    } as unknown as DetectedProvider[];
+    invokeMock.mockImplementation(async (name: string) => {
+      if (name === "detect_providers") {
+        detectCalls += 1;
+        return detectResult;
+      }
+      if (name === "get_design_llm_backend") {
+        return freshBackend;
+      }
+      if (name === "set_design_llm_backend") return null;
+      return null;
+    });
+
+    await mount();
+
+    const save = Array.from(container.querySelectorAll("button")).find((b) =>
+      /Save backend/.test(b.textContent ?? ""),
+    ) as HTMLButtonElement;
+    expect(save.disabled).toBe(false);
+
+    await act(async () => {
+      save.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The card re-read the backend before saving…
+    const getCalls = invokeMock.mock.calls.filter(
+      (c) => c[0] === "get_design_llm_backend",
+    );
+    expect(getCalls.length).toBe(1);
+
+    // …and the persisted payload carries the FRESH effort/timeout, not the stale ones.
+    const setCall = invokeMock.mock.calls.find(
+      (c) => c[0] === "set_design_llm_backend",
+    );
+    expect(setCall).toBeTruthy();
+    const payload = (setCall![1] as { backend: DesignLlmBackend }).backend;
+    expect(payload).toMatchObject({ kind: "codex", effort: "high", timeoutSecs: 300 });
+  });
+});

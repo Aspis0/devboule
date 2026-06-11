@@ -22,6 +22,7 @@ vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (command: string, args?: Record<string, unknown>) =>
     invokeSpy(command, args),
   isTauriRuntime: () => true,
+  useAppContext: () => ({ requestView: vi.fn() }),
 }));
 
 // ---- native folder picker mock --------------------------------------------
@@ -108,9 +109,16 @@ function findButton(container: HTMLElement, label: string): HTMLButtonElement {
 
 async function pickFolder(container: HTMLElement, path: string) {
   dialogCtl.nextPick = path;
-  const btn = findButton(container, "Choose folder");
+  // Folder controls now live in the TopBar's ProjectPopover. Open it, then click
+  // "Open working folder…" (which picks + adopts the folder).
+  if (!container.querySelector(".pop.left")) {
+    const proj = container.querySelector(".tb-proj") as HTMLButtonElement;
+    act(() => proj.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+  }
+  const btn = findButton(container, "Open working folder");
   await act(async () => {
     btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();

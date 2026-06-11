@@ -123,7 +123,18 @@ export interface DesignLlmBackend {
   // Required for "omlx"; unused for the other kinds. Stored normalized (no trailing
   // slash) so `<baseUrl>/chat/completions` never double-slashes.
   baseUrl?: string;
+  // Reasoning-effort knob ("low" | "medium" | "high"), owned by the composer's model
+  // popover (NOT the Settings card). Only the codex path maps it to a CLI flag; other
+  // kinds ignore it. Absent => the provider default. Mirrors the Rust `effort` field.
+  effort?: DesignEffort;
+  // Per-run wall-clock budget (seconds), bounded [60, 600]. Absent => the 180s default.
+  // Mirrors the Rust `timeoutSecs` field (omitted on the wire when unset).
+  timeoutSecs?: number;
 }
+
+// The accepted reasoning-effort values. Mirrors the Rust validator's accept set exactly
+// (low/medium/high); any other value is rejected by `validateDesignEffort`.
+export type DesignEffort = "low" | "medium" | "high";
 
 // One provider detected on this machine by the Rust `detect_providers` command
 // (Settings → Workspace). A 1:1 MIRROR of the Rust `DetectedProvider` (camelCase over

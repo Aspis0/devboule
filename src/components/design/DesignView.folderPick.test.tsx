@@ -24,6 +24,7 @@ vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (command: string, args?: Record<string, unknown>) =>
     invokeSpy(command, args),
   isTauriRuntime: () => true,
+  useAppContext: () => ({ requestView: vi.fn() }),
 }));
 
 // ---- native folder picker mock --------------------------------------------
@@ -79,18 +80,32 @@ function findButton(container: HTMLElement, label: string): HTMLButtonElement {
   ) as HTMLButtonElement;
 }
 
-function pathDisplay(container: HTMLElement): HTMLElement {
-  return container.querySelector(
-    "[data-testid=design-folder-path]",
-  ) as HTMLElement;
+/** The working-folder path chip in the topbar (`.tb-path`); only present once a
+ *  project is open. */
+function pathChip(container: HTMLElement): HTMLElement | null {
+  return container.querySelector(".tb-path");
 }
 
-/** Click "Choose folder…" with the dialog mocked to return `pick`. */
-async function clickPick(container: HTMLElement, pick: string | null) {
+function openProjectPopover(container: HTMLElement) {
+  if (container.querySelector(".pop.left")) return;
+  const proj = container.querySelector(".tb-proj") as HTMLButtonElement;
+  act(() => proj.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+}
+
+/** Open the ProjectPopover and click a footer action row ("New project" / "Open
+ *  working folder"), which picks the folder ITSELF (dialog mocked to `pick`) and
+ *  runs create / load. */
+async function clickPopoverAction(
+  container: HTMLElement,
+  label: string,
+  pick: string | null,
+) {
   dialogCtl.nextPick = pick;
-  const btn = findButton(container, "Choose folder");
+  openProjectPopover(container);
+  const btn = findButton(container, label);
   await act(async () => {
     btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
@@ -100,21 +115,19 @@ async function clickPick(container: HTMLElement, pick: string | null) {
 describe("DesignView — native folder picker", () => {
   it("has NO editable text input for the working folder path", () => {
     const container = render();
-    // The folder must be chosen, not typed. The Generate textarea and the (disabled)
-    // edit-instruction input may exist, but there is no path text field to type into.
+    // The folder must be CHOSEN, not typed. The temp Generate textarea and the
+    // (disabled) edit-instruction input may exist, but none is a folder field.
     const textInputs = container.querySelectorAll("input[type=text]");
-    // Only the edit-instruction input is a text input; assert none of them is the
-    // folder field by confirming the read-only display exists instead.
-    expect(pathDisplay(container)).toBeTruthy();
-    // The edit input is disabled until a node is selected; it is not the folder path.
     textInputs.forEach((el) => {
-      expect((el as HTMLInputElement).placeholder).not.toMatch(/folder/i);
+      expect((el as HTMLInputElement).placeholder ?? "").not.toMatch(/folder/i);
     });
+    // No path chip before a project is open.
+    expect(pathChip(container)).toBeNull();
   });
 
   it("opens the native directory dialog with directory:true and a title", async () => {
     const container = render();
-    await clickPick(container, "C:/picked/dir");
+    await clickPopoverAction(container, "Open working folder", "C:/picked/dir");
     expect(openSpy).toHaveBeenCalledTimes(1);
     const opts = openSpy.mock.calls[0][0]!;
     expect(opts.directory).toBe(true);
@@ -122,30 +135,49 @@ describe("DesignView — native folder picker", () => {
     expect(typeof opts.title).toBe("string");
   });
 
-  it("shows the chosen path and enables Create/Load after picking", async () => {
+  it("shows the chosen path chip after opening a working folder", async () => {
+    const loaded: DesignProject = {
+      meta: {
+        schemaVersion: 1,
+        id: "p",
+        name: "Loaded",
+        createdAt: "1970-01-01T00:00:00Z",
+        updatedAt: "1970-01-01T00:00:00Z",
+        canvas: { w: 1440, h: 1024, grid: 8 },
+        nodeOrder: [],
+      },
+      manifest: { schemaVersion: 1, nodes: {} },
+      components: {},
+    };
+    invokeSpy.mockImplementation(async (command: string) => {
+      if (command === "design_load_project") return loaded;
+      return undefined;
+    });
+
     const container = render();
+    // Before opening: no path chip, project name reads "No project".
+    expect(pathChip(container)).toBeNull();
+    expect(
+      (container.querySelector(".tb-proj") as HTMLElement).textContent,
+    ).toContain("No project");
 
-    // Before picking: no path shown, Create/Load disabled.
-    expect(pathDisplay(container).textContent).toContain("No folder chosen");
-    expect(findButton(container, "Create").disabled).toBe(true);
-    expect(findButton(container, "Load").disabled).toBe(true);
-
-    await clickPick(container, "C:/target/.aspis-design/landing");
-
-    expect(pathDisplay(container).textContent).toContain(
+    await clickPopoverAction(
+      container,
+      "Open working folder",
       "C:/target/.aspis-design/landing",
     );
-    expect(findButton(container, "Create").disabled).toBe(false);
-    expect(findButton(container, "Load").disabled).toBe(false);
+
+    expect(pathChip(container)?.textContent).toContain(
+      "C:/target/.aspis-design/landing",
+    );
   });
 
   it("treats a cancelled dialog (open -> null) as a no-op", async () => {
     const container = render();
-    await clickPick(container, null);
+    await clickPopoverAction(container, "Open working folder", null);
 
-    // No path set, controls stay disabled, no error surfaced.
-    expect(pathDisplay(container).textContent).toContain("No folder chosen");
-    expect(findButton(container, "Create").disabled).toBe(true);
+    // No path chip set, no error surfaced.
+    expect(pathChip(container)).toBeNull();
     expect(container.textContent).not.toMatch(/Choose a working folder/i);
   });
 
@@ -169,15 +201,7 @@ describe("DesignView — native folder picker", () => {
     });
 
     const container = render();
-    await clickPick(container, "D:/projects/site");
-
-    const createBtn = findButton(container, "Create");
-    await act(async () => {
-      createBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await clickPopoverAction(container, "New project", "D:/projects/site");
 
     const call = invokeSpy.mock.calls.find(
       (c) => c[0] === "design_create_project",
@@ -208,36 +232,16 @@ describe("DesignView — native folder picker", () => {
     });
 
     const container = render();
-    await clickPick(container, "/Users/me/work/landing");
-
-    const loadBtn = findButton(container, "Load");
-    await act(async () => {
-      loadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await clickPopoverAction(
+      container,
+      "Open working folder",
+      "/Users/me/work/landing",
+    );
 
     const call = invokeSpy.mock.calls.find((c) => c[0] === "design_load_project");
     expect(call).toBeTruthy();
     expect((call![1] as { workingFolderPath: string }).workingFolderPath).toBe(
       "/Users/me/work/landing",
     );
-  });
-
-  it("clears the chosen path with the clear button and re-disables Create/Load", async () => {
-    const container = render();
-    await clickPick(container, "C:/some/dir");
-    expect(findButton(container, "Create").disabled).toBe(false);
-
-    const clearBtn = container.querySelector(
-      "[aria-label='Clear chosen folder']",
-    ) as HTMLButtonElement;
-    expect(clearBtn).toBeTruthy();
-    act(() => clearBtn.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-
-    expect(pathDisplay(container).textContent).toContain("No folder chosen");
-    expect(findButton(container, "Create").disabled).toBe(true);
-    expect(findButton(container, "Load").disabled).toBe(true);
   });
 });
