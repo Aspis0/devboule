@@ -29,6 +29,7 @@ import {
   Application,
   Container,
   Graphics,
+  Sprite,
   Text,
   TextStyle,
   Rectangle,
@@ -80,7 +81,8 @@ import {
   type TerrainChunk,
 } from "./terrain";
 import { occupiedTiles, drawProps } from "./props";
-import { buildBuilding } from "./buildings";
+import { buildBuildingParts, type BuiltParts } from "./buildings";
+import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
 import { buildingChanged, worstSinSeverity } from "./diffCity";
 import { StepClock } from "./effects";
@@ -91,6 +93,16 @@ const CHUNK_SIZE = 8; // tiles per chunk side
 
 // LOD zoom thresholds.
 const LOD_LABELS = 0.6;
+// HYSTERESIS for the label LOD (the only band that ALLOCATES on each crossing — a
+// Text per building, ~879 on a large city). A single threshold makes zoom that
+// oscillates around 0.6 thrash: create-all / destroy-all every frame the scale
+// wobbles across the line. A dead-band fixes that: labels are CREATED only at/above
+// LOD_LABELS_IN and DESTROYED only below LOD_LABELS_OUT; between the two the current
+// label state is held (no alloc, no free). LOD_LABELS stays the seed threshold used
+// when a node is first built (attachBuildingDynamics) — the IN/OUT pair gates only
+// the live zoom transitions in updateCulling.
+const LOD_LABELS_IN = 0.62; // create labels at/above this zoom
+const LOD_LABELS_OUT = 0.58; // destroy labels below this zoom
 const LOD_DETAILS = 0.4;
 const LOD_AGENTS = 0.35;
 // On-map DISASTER overlay (burning buildings with urban sins). Disasters MATTER,
@@ -203,17 +215,34 @@ export interface BuildProgress {
 interface BuildingNode {
   building: Building;
   iso: IsoPoint;
-  /** The kit display container (static body + animated part nodes). Added to a
-   *  chunk; positioned at the building's iso (front-bottom) anchor. */
+  /** The node ROOT Container — added to a chunk; positioned at the building's iso
+   *  (front-bottom) anchor exactly as before. Its FIRST child is `bodySprite` (the
+   *  batched, shared-texture static body); the live overlays (anims, pennant,
+   *  scaffold, disaster, investigation, label) are its other children, and the
+   *  growth transitions mutate its transform. Kept as a Container (not the Sprite
+   *  itself) so it idiomatically owns children in pixi v8 and every existing
+   *  consumer (growthFx, LOD alpha, overlay parenting, eventMode) is unchanged. */
   container: Container;
-  /** Drop shadow (lives on the shadows layer, not in `container`). Tracked so a
-   *  live-diff removal can destroy it explicitly. */
-  shadow: Graphics;
+  /** The batched static-body Sprite (shared per-variant texture from the atlas),
+   *  child 0 of `container`. The TEXTURE is atlas-owned — destroyed with neither
+   *  the sprite nor the container. Swapped in place on a tier/variant change. */
+  bodySprite: Sprite;
+  /** Drop-shadow SPRITE (shared per-variant texture; lives on the shadows layer,
+   *  not in `container`). Tracked so a live-diff removal can destroy it. The
+   *  TEXTURE is owned by the atlas and is NOT destroyed with the sprite. */
+  shadow: Sprite;
   /** The kit's live animated instances (Flame/Beacon/Flag/Smoke/Water). Built
    *  ONCE per building; their update() mutates their own small Graphics. Driven
    *  by the step clock for VISIBLE chunks only. Empty for static buildings. */
   kitAnims: AnimInstance[];
+  /** The filename label Text, or null when LOD-hidden (zoomed out). Now ATTACH-ON-
+   *  DEMAND: the LOD pass creates it on zoom-in past LOD_LABELS and DESTROYS it on
+   *  zoom-out (not just visibility-toggled), so a far view of a huge city retains
+   *  zero label glyphs — the heap win for labels. */
   label: Text | null;
+  /** Silhouette pixel height above the iso anchor — kept so the LOD pass can
+   *  re-create the label (positioned at `-labelDepth - 6`) without re-measuring. */
+  labelDepth: number;
   /** TECH LIVERY (F4): the provider pennant Graphics (child of `container`), or
    *  null for files with no provider. LOD-gated (hidden below LOD_LIVERY) and
    *  destroyed with `container` (children:true) — no separate disposal. */
@@ -380,6 +409,15 @@ export class PolisRenderer {
   private lastTerrainSig: string | null = null;
 
   private buildingNodes = new Map<string, BuildingNode>();
+  // SPRITE-SHEET BUILDINGS — lazy per-variant texture cache. Each building on the
+  // map is ONE batched Sprite referencing a shared texture keyed by (purpose,
+  // level); the heavy static Graphics body is rendered ONCE per variant and
+  // destroyed, killing the ~1MB/building retained-Graphics heap. The cache warms
+  // naturally as the build loop places the first building of each variant. Owned
+  // by the renderer; released in destroy(). dpr-aware, capped resolution.
+  private buildingAtlas = new BuildingTextureAtlas(
+    typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1,
+  );
   private chunks = new Map<string, Chunk>();
   // Polis terrain frame (sea/rivers/shores/bridges) chunks. Parented into the
   // terrain layer (BELOW buildings, correct water-under-buildings draw order),
@@ -874,18 +912,25 @@ export class PolisRenderer {
         addedOrRemoved = true;
         continue;
       }
-      // CHANGED? Rebuild only if a visual input differs.
+      // CHANGED? Update only if a visual input differs.
       if (buildingChanged(node.building, b)) {
         const old = node.building;
-        // Capture the growth deltas from the OLD node BEFORE it is destroyed.
+        // Capture the growth deltas from the OLD node BEFORE it mutates.
         const oldTier = tierRank(old.visualTier);
         const newTier = tierRank(b.visualTier);
         const grew = newTier > oldTier; // file gained tiers → grow transition
         // Agent FINISHED here: agentPresent was SET on the old, UNSET on the new.
         const agentLeft = !!old.agentPresent && !b.agentPresent;
         const at = node.iso;
-        this.destroyBuildingNode(node);
-        const fresh = this.createBuildingNode(b);
+        // SPRITE-SHEET: a coords-unchanged change (tier/status/sins/provider/
+        // suspect/agent — the common file-edit case) is a TEXTURE SWAP + overlay
+        // update on the SAME Sprite, NOT a destroy+rebuild. A coords change must
+        // re-chunk the node, so it still falls back to destroy+rebuild.
+        const moved =
+          old.coords.x !== b.coords.x || old.coords.y !== b.coords.y;
+        const fresh = moved
+          ? (this.destroyBuildingNode(node), this.createBuildingNode(b))
+          : this.updateBuildingNodeInPlace(node, b);
         if (grew) {
           // Grow the larger silhouette into place + a small dust puff. A tier
           // DECREASE (code shrank) is left as a plain swap (no over-animation).
@@ -1763,6 +1808,20 @@ export class PolisRenderer {
   // ---------------------------------------------------------------------------
 
   /**
+   * Destroy the freshly-built kit parts (static body, shadow, pennant) that the
+   * atlas would normally consume — used on the atlas-throw error path where the
+   * atlas ran our `build` closure but never reached its own destroy, leaving these
+   * orphaned. Each destroy is `.destroyed`-guarded so it is safe to call even when
+   * the atlas (or a HIT path) already disposed some of them. The pennant is only
+   * ever an unparented Graphics at this point (attachBuildingDynamics adds it).
+   */
+  private disposeBuiltParts(built: BuiltParts): void {
+    if (!built.staticBody.destroyed) built.staticBody.destroy({ children: true });
+    if (!built.shadow.destroyed) built.shadow.destroy();
+    if (built.pennant && !built.pennant.destroyed) built.pennant.destroy();
+  }
+
+  /**
    * Build ONE building and register it into all the renderer's structures
    * (chunk, node map, animated/smoke node lists). The SINGLE source of truth for
    * "how a building is made" — used by both the chunked `setCityState` build
@@ -1773,137 +1832,117 @@ export class PolisRenderer {
     const iso = cartToIso(b.coords.x, b.coords.y);
     const profile = getProfile(b.purpose);
     const scale = tierScale(b.visualTier);
+    const level = tierRank(b.visualTier); // atlas variant axis (0..4)
 
-    const built = buildBuilding(b, profile, scale);
+    // Build the kit split into STATIC body (textured + cached) vs the cheap live
+    // parts (anims + pennant) we keep per building. The kit build is unavoidable
+    // per building because the animated parts are positioned from its geometry,
+    // but the HEAVY static body Graphics is captured to a SHARED texture and
+    // destroyed (by the atlas on a miss, by us on a hit) so it is never retained.
+    const built = buildBuildingParts(b, profile, scale);
 
-    // Drop shadow → shadow sub-layer (below buildings).
-    built.shadow.position.set(iso.x, iso.y);
-    built.shadow.zIndex = depthKey(b.coords.x, b.coords.y);
-    this.layers.shadows.addChild(built.shadow);
+    // Was the (purpose, level) variant already cached? If so the atlas will NOT
+    // consume our freshly-built static body/shadow — we own their disposal.
+    const wasCached = this.buildingAtlas.has(b.purpose, level);
+    let variant: import("./buildingAtlas").BuildingVariant;
+    try {
+      variant = this.buildingAtlas.get(
+        this.app.renderer as unknown as import("./buildingAtlas").TextureSource,
+        b.purpose,
+        level,
+        () => ({ body: built.staticBody, shadow: built.shadow }),
+      );
+    } catch (err) {
+      // generateTexture (or any atlas step) threw on a MISS: the atlas ran our
+      // `build` closure but never reached its own destroy, so OUR staticBody/shadow
+      // leak; the pennant was never parented anywhere either. Destroy all three
+      // (guarded — the atlas may already have destroyed some) before re-throwing.
+      this.disposeBuiltParts(built);
+      throw err;
+    }
+    if (wasCached) {
+      // HIT: the atlas returned the shared texture without touching our copies —
+      // destroy them so the heavy static Graphics is not retained or orphaned.
+      built.staticBody.destroy({ children: true });
+      built.shadow.destroy();
+    }
+
+    // Drop-shadow SPRITE (shared texture). Anchored so the shadow ORIGIN sits at
+    // iso (where the per-building shadow Graphics was drawn from local (0,0)).
+    const shadowSprite = this.makeShadowSprite(variant);
+    shadowSprite.position.set(iso.x, iso.y);
+    shadowSprite.zIndex = depthKey(b.coords.x, b.coords.y);
+    shadowSprite.eventMode = "none"; // shadows never intercept clicks
+    this.layers.shadows.addChild(shadowSprite);
 
     // SAFETY: everything after this point runs inside a try/catch so that if any
-    // mid-build step throws, we remove and destroy the shadow we just parented (the
-    // only child added to a shared layer so far) before re-throwing. Without this,
-    // the shadow Graphics is an untracked orphan on layers.shadows — invisible to
-    // culling and never destroyed until the next clearScene.
+    // mid-build step throws, we remove and destroy the shadow sprite we just
+    // parented (the only child added to a shared layer so far) before re-throwing.
+    // Without this, the shadow Sprite is an untracked orphan on layers.shadows —
+    // invisible to culling and never destroyed until the next clearScene. (The
+    // shared TEXTURE is owned by the atlas; the sprite destroy never frees it.)
     try {
 
-    // The kit emits ONE container (body + animated part nodes). Position it at
-    // the building's iso/front-bottom anchor (the kit's makeProj already
-    // anchors front-bottom, so local origin (0,0) maps to cartToIso(coords)).
-    const container = built.display;
+    // Node root: a plain Container at the iso anchor (origin at iso, EXACTLY as the
+    // old per-building container) holding the batched body Sprite as child 0. The
+    // Container — not the Sprite — owns the children (idiomatic pixi v8) so the
+    // label/anims/pennant/overlays attach to it with their identical local coords.
+    const container = new Container();
     container.position.set(iso.x, iso.y);
     container.zIndex = depthKey(b.coords.x, b.coords.y);
     container.eventMode = "static";
     container.cursor = "pointer";
     (container as Container & { __fileId?: string }).__fileId = b.fileId;
+    // Body Sprite (child 0) — its anchor places the shared static texture so the
+    // body pixels land exactly where the old kit Graphics did.
+    const bodySprite = this.makeBodySprite(variant);
+    container.addChild(bodySprite);
 
-    // Filename label (LOD-gated). Anchored above the silhouette.
-    const label = new Text({ text: b.label, style: this.labelStyle });
-    label.anchor.set(0.5, 1);
-    label.position.set(0, -built.depth - 6);
-    label.visible = false;
-    container.addChild(label);
-
-    // TECH LIVERY (F4): provider pennant (already parented into `container` by
-    // buildBuilding). LOD-gated — set its initial visibility from the current
-    // zoom so it doesn't flash at the wrong LOD before the first cull pass.
-    if (built.pennant) {
-      built.pennant.visible = this.viewport.scale.x >= LOD_LIVERY;
-    }
-
-    container.on("pointertap", (e) => {
-      // Consume the tap so the viewport background handler doesn't also fire
-      // and immediately deselect what we just selected.
-      e.stopPropagation();
-      this.callbacks.onSelectBuilding?.(b);
-    });
-    container.on("pointerover", () => this.callbacks.onHoverBuilding?.(b));
-    container.on("pointerout", () => this.callbacks.onHoverBuilding?.(null));
+    // NOTE: the provider pennant is parented EXCLUSIVELY by attachBuildingDynamics
+    // (below), which is the SOLE add point shared with the in-place diff path. Do
+    // NOT addChild(built.pennant) here too — a second addChild re-parents in pixi,
+    // appending the pennant ABOVE the scaffold/disaster/investigation overlays and
+    // violating the body < pennant < anims < disaster < investigation < label order.
 
     const chunkKey = this.chunkKey(b.coords.x, b.coords.y);
 
-    // L2 SCAFFOLDING — when a REAL agent is working this file (`agentPresent` is
-    // set), drape procedural scaffolding around the footprint so "an agent is
-    // growing this" reads at a glance, layered with the existing agent glow. It
-    // is an AnimInstance parented INTO the building container (destroyed with the
-    // node — no leak) and pushed into kitAnims so the visible-chunk-only step
-    // driver animates it for free. Keyed on `agentPresent` (the real signal):
-    // `status === "active"` is NOT relied on (it is not emitted by the backend
-    // today). Since `buildingChanged` rebuilds the node on an agentPresent change,
-    // the scaffold appears/clears automatically on a live re-scan.
-    const anims = built.anims;
-    if (b.agentPresent) {
-      const scaffold = new Scaffold(built.hw, built.depth);
-      // Sit the rig just BELOW the filename label (so the label stays legible on
-      // top) but over the body. Parented into the container → pans/culls/destroys
-      // with the node (no separate disposal, no removeFromParent leak).
-      const labelIdx = container.getChildIndex(label);
-      container.addChildAt(scaffold.node, labelIdx);
-      anims.push(scaffold);
-    }
-
-    // ON-MAP DISASTER — when the backend detected URBAN SINS on this file
-    // (`b.sins` non-empty), drape a fire/smoke overlay over the building, scaled
-    // by the WORST sin severity (smoke < fire < inferno) via the SAME rank
-    // ordering the diff rebuild uses (`worstSinSeverity` reuses diffCity's ranks).
-    // It COMPOSES the kit Flame/Smoke art (no hand-authored geometry), is parented
-    // INTO the container (destroyed with the node — no leak; the L1/max-recall leak
-    // class) and pushed into kitAnims (driven by the visible-chunk-only step clock,
-    // no separate driver). It COEXISTS with the scaffolding above: both are
-    // independent children of the same node container, neither clobbers the other.
-    // AUTO-CLEAR is inherent: a fix clears the sins → worst-severity rank drops →
-    // `buildingChanged` rebuilds the node WITHOUT this overlay → the fire vanishes.
-    let disaster: Disaster | null = null;
-    const worst = worstSinSeverity(b);
-    if (worst) {
-      disaster = new Disaster(worst, built.hw, built.depth);
-      // Sit just below the filename label (label stays legible on top), over the
-      // body AND any scaffolding (a building can be both worked-on and burning).
-      const labelIdx = container.getChildIndex(label);
-      container.addChildAt(disaster.node, labelIdx);
-      // Seed visibility from the current zoom so a fresh node doesn't flash a fire
-      // at the wrong LOD before the first cull/LOD pass (mirrors pennant/livery).
-      disaster.node.visible = this.viewport.scale.x >= LOD_DISASTER;
-      anims.push(disaster);
-    }
-
-    // ON-MAP INVESTIGATION (bug-investigation P3) — when an OPEN bug card's Oracle
-    // suspect files resolved to THIS file (`b.suspectOfCardId` set), drape the
-    // tinted-smoke + "?" overlay so "Oracle suspects this file for a bug" reads at a
-    // glance. It COMPOSES the kit Smoke art (no hand-authored geometry), is parented
-    // INTO the container (destroyed with the node — no leak) and pushed into kitAnims
-    // (driven by the visible-chunk-only step clock). It COEXISTS with the disaster
-    // overlay above: inserting at `labelIdx` lands it just below the label and ABOVE
-    // any fire, so a file that is BOTH a confirmed disaster and a bug suspect shows
-    // BOTH the fire and the question-smoke — neither clobbers the other (the HONESTY
-    // invariant: a guess is shown alongside, never instead of, a confirmed problem).
-    // AUTO-CLEAR is inherent: a resolved/deleted bug card drops `suspectOfCardId` →
-    // `buildingChanged` rebuilds the node WITHOUT this overlay → the smoke vanishes.
-    let investigation: Investigation | null = null;
-    if (b.suspectOfCardId) {
-      investigation = new Investigation(built.hw, built.depth);
-      const labelIdx = container.getChildIndex(label);
-      container.addChildAt(investigation.node, labelIdx);
-      // Seed visibility from the current zoom (mirrors disaster/pennant) so a fresh
-      // node doesn't flash the smoke at the wrong LOD before the first cull pass.
-      investigation.node.visible = this.viewport.scale.x >= LOD_DISASTER;
-      anims.push(investigation);
-    }
+    // Attach the live, on-demand dynamic parts (anims, scaffold, disaster,
+    // investigation, pennant, label) onto the Sprite. Shared with the in-place
+    // diff update path so a CHANGED building reuses identical overlay logic.
+    const dyn = this.attachBuildingDynamics(container, b, built);
 
     const node: BuildingNode = {
       building: b,
       iso,
       container,
-      shadow: built.shadow,
-      kitAnims: anims,
-      label,
-      pennant: built.pennant,
-      disaster,
-      investigation,
+      bodySprite,
+      shadow: shadowSprite,
+      kitAnims: dyn.anims,
+      label: dyn.label,
+      labelDepth: built.depth,
+      pennant: dyn.pennant,
+      disaster: dyn.disaster,
+      investigation: dyn.investigation,
       hitRadius: built.hw,
       chunkKey,
     };
+
+    // Pointer handlers read `node.building` at FIRE TIME (not the closure `b`):
+    // `updateBuildingNodeInPlace` preserves this Container + its listeners and only
+    // re-points `node.building`, so the in-place diff path (the common case) would
+    // otherwise deliver a STALE Building (old tier/sins/provider) to the inspector.
+    // The node object exists before these are wired, so the field is always set.
+    container.on("pointertap", (e) => {
+      // Consume the tap so the viewport background handler doesn't also fire
+      // and immediately deselect what we just selected.
+      e.stopPropagation();
+      this.callbacks.onSelectBuilding?.(node.building);
+    });
+    container.on("pointerover", () =>
+      this.callbacks.onHoverBuilding?.(node.building),
+    );
+    container.on("pointerout", () => this.callbacks.onHoverBuilding?.(null));
+
     this.buildingNodes.set(b.fileId, node);
     // Polis-P5 — index the normalized project-relative path → fileId so the Censor
     // relPath→building resolution mirrors the agents' fileId-based resolution.
@@ -1912,21 +1951,270 @@ export class PolisRenderer {
 
     // Track nodes with any animated part for the per-step driver (a scaffold
     // counts, so an agent-present static building still animates its rig).
-    if (anims.length > 0) {
+    if (dyn.anims.length > 0) {
       this.animatedNodes.push(node);
     }
     return node;
     } catch (err) {
-      // Mid-build throw: remove the shadow we already parented to the shared layer
-      // so it does not orphan there until the next clearScene. The container was not
-      // yet added to any chunk/layer, so no container cleanup is needed. Nothing was
-      // written to buildingNodes or fileIdByPath yet (those lines are above, inside
-      // the try), so those indices remain clean. Re-throw so the outer per-node
-      // handler (runBatch) can log+skip, and applyCityDiffInner can propagate.
-      built.shadow.removeFromParent();
-      built.shadow.destroy();
+      // Mid-build throw: remove the shadow SPRITE we already parented to the shared
+      // layer so it does not orphan there until the next clearScene. The container
+      // sprite was not yet added to any chunk/layer, so no container cleanup is
+      // needed. Nothing was written to buildingNodes or fileIdByPath yet (those
+      // lines are below, inside the try), so those indices remain clean. The shared
+      // TEXTURE is owned by the atlas — the sprite destroy never frees it. Re-throw
+      // so the outer per-node handler (runBatch) can log+skip and the diff propagate.
+      shadowSprite.removeFromParent();
+      shadowSprite.destroy();
       throw err;
     }
+  }
+
+  /**
+   * Build the batched body Sprite for a texture variant. The anchor is set to
+   * -frame/size so the Sprite's LOCAL ORIGIN coincides with the building's iso
+   * anchor (front-bottom): placing the Sprite at local (0,0) inside the node
+   * Container (whose origin is iso) renders the texture's pixel that was at local
+   * (frame.x, frame.y) at world iso+(frame.x, frame.y) — i.e. EXACTLY where the
+   * old kit Graphics drew it. Guarded against a zero-size frame.
+   */
+  private makeBodySprite(
+    variant: import("./buildingAtlas").BuildingVariant,
+  ): Sprite {
+    const s = new Sprite(variant.texture);
+    const fr = variant.frame;
+    s.anchor.set(
+      fr.width > 0 ? -fr.x / fr.width : 0,
+      fr.height > 0 ? -fr.y / fr.height : 0,
+    );
+    return s;
+  }
+
+  /** Build the batched shadow Sprite for a variant — same origin-at-iso anchor
+   *  math as {@link makeBodySprite}, applied to the shadow frame. */
+  private makeShadowSprite(
+    variant: import("./buildingAtlas").BuildingVariant,
+  ): Sprite {
+    const s = new Sprite(variant.shadowTexture);
+    const sf = variant.shadowFrame;
+    s.anchor.set(
+      sf.width > 0 ? -sf.x / sf.width : 0,
+      sf.height > 0 ? -sf.y / sf.height : 0,
+    );
+    return s;
+  }
+
+  /**
+   * Build the LOD-gated filename label Text for a building. Extracted so the LOD
+   * pass can attach it lazily (and `createBuildingNode` re-use it): below
+   * LOD_LABELS no Text object exists at all, so a far view of a large city keeps
+   * zero label glyphs in memory. Anchored above the silhouette (`depthPx` = the
+   * building's pixel height above the iso anchor).
+   */
+  private makeLabel(b: Building, depthPx: number): Text {
+    const label = new Text({ text: b.label, style: this.labelStyle });
+    label.anchor.set(0.5, 1);
+    label.position.set(0, -depthPx - 6);
+    return label;
+  }
+
+  /**
+   * Attach the on-demand DYNAMIC parts of a building onto its Sprite `container`:
+   * the kit's live anim part nodes (re-parented off the static body), the L2
+   * scaffold (agentPresent), the disaster (sins) + investigation (suspect)
+   * overlays, the provider pennant, and the LOD-gated filename label. Child
+   * z-order (bottom→top): body texture < pennant < anims/scaffold < disaster <
+   * investigation < label — the label is added LAST so it stays topmost. Shared by
+   * `createBuildingNode` and the in-place diff update so both produce an identical
+   * overlay set. Returns the dynamic refs for the BuildingNode record. The caller
+   * owns `animatedNodes` membership (anims length drives it).
+   */
+  private attachBuildingDynamics(
+    container: Container,
+    b: Building,
+    built: BuiltParts,
+  ): {
+    anims: AnimInstance[];
+    label: Text | null;
+    pennant: Graphics | null;
+    disaster: Disaster | null;
+    investigation: Investigation | null;
+  } {
+    // Provider pennant FIRST (above the body texture, below overlays + label). It
+    // varies by provider so it is an OVERLAY, not baked into the shared texture.
+    let pennant: Graphics | null = built.pennant;
+    if (pennant) {
+      pennant.visible = this.viewport.scale.x >= LOD_LIVERY;
+      container.addChild(pennant);
+    }
+
+    // Kit anim part nodes (Flame/Beacon/Flag/Smoke/Water) — detached from the
+    // static body in buildBuildingParts, re-parented here so they animate live.
+    const anims = built.anims;
+    for (const a of anims) container.addChild(a.node);
+
+    // L2 SCAFFOLDING — agentPresent: an AnimInstance over the body. Pushed into
+    // kitAnims so the visible-chunk-only step driver animates it for free.
+    if (b.agentPresent) {
+      const scaffold = new Scaffold(built.hw, built.depth);
+      container.addChild(scaffold.node);
+      anims.push(scaffold);
+    }
+
+    // ON-MAP DISASTER — worst sin severity drives a kit fire/smoke overlay over the
+    // body + any scaffold. LOD-seeded so it doesn't flash at the wrong zoom.
+    let disaster: Disaster | null = null;
+    const worst = worstSinSeverity(b);
+    if (worst) {
+      disaster = new Disaster(worst, built.hw, built.depth);
+      container.addChild(disaster.node);
+      disaster.node.visible = this.viewport.scale.x >= LOD_DISASTER;
+      anims.push(disaster);
+    }
+
+    // ON-MAP INVESTIGATION (P3) — suspectOfCardId: tinted-smoke + "?" overlay,
+    // COEXISTS with the disaster (a file can be both a suspect and a disaster).
+    let investigation: Investigation | null = null;
+    if (b.suspectOfCardId) {
+      investigation = new Investigation(built.hw, built.depth);
+      container.addChild(investigation.node);
+      investigation.node.visible = this.viewport.scale.x >= LOD_DISASTER;
+      anims.push(investigation);
+    }
+
+    // Filename label LAST (topmost). LAZY: below LOD_LABELS no Text is created, so
+    // a far view of a huge city retains zero label glyphs (LOD pass attaches it).
+    let label: Text | null = null;
+    if (this.viewport.scale.x >= LOD_LABELS) {
+      label = this.makeLabel(b, built.depth);
+      container.addChild(label);
+    }
+
+    return { anims, label, pennant, disaster, investigation };
+  }
+
+  /**
+   * Tear down ONLY the dynamic overlays of a node (anims, scaffold, disaster,
+   * investigation, pennant, label) — detaching + destroying their child nodes —
+   * WITHOUT touching the Sprite, its shared texture, its chunk membership, or the
+   * shadow. Used by the in-place diff update before re-attaching fresh dynamics.
+   * Also splices the node out of `animatedNodes` (re-added by the caller iff the
+   * new dynamics have anims), mirroring destroyBuildingNode's pool discipline.
+   */
+  private detachBuildingDynamics(node: BuildingNode): void {
+    // The anim part nodes, pennant, label, disaster/investigation nodes are all
+    // children of node.container — remove + destroy each so no orphan/leak remains.
+    for (const a of node.kitAnims) {
+      a.node.removeFromParent();
+      a.node.destroy({ children: true });
+    }
+    node.kitAnims = [];
+    if (node.label) {
+      node.label.removeFromParent();
+      node.label.destroy();
+      node.label = null;
+    }
+    if (node.pennant) {
+      node.pennant.removeFromParent();
+      node.pennant.destroy();
+      node.pennant = null;
+    }
+    // disaster/investigation are AnimInstances already destroyed via kitAnims above
+    // (their .node was in kitAnims); just drop the references.
+    node.disaster = null;
+    node.investigation = null;
+    // Drop from the animated pool; re-added by the caller iff new anims exist.
+    removeFromArrayByIdentity(this.animatedNodes, node);
+  }
+
+  /**
+   * LIVE DIFF — update a CHANGED building IN PLACE on its existing Sprite, without
+   * destroying + rebuilding the node, when its grid COORDS are unchanged (the
+   * common case: a file edit changes tier/status/sins/provider/suspect/agent, not
+   * its position). Swaps the building + shadow textures to the new variant
+   * (re-anchoring), tears down + re-attaches the dynamic overlays, and updates the
+   * node's metrics + `building` snapshot. The Sprite object, its chunk membership,
+   * its event handlers, and the node record identity are PRESERVED — so the
+   * selection ring, growth transitions, and any consumer holding the node keep
+   * working. A coords change still falls back to destroy+rebuild (re-chunk) in the
+   * caller. Returns the same (mutated) node.
+   */
+  private updateBuildingNodeInPlace(node: BuildingNode, b: Building): BuildingNode {
+    // Re-point the node's Building snapshot FIRST: the preserved pointer handlers
+    // read `node.building` at fire time, so the new Building must be live before
+    // anything else in this method can run (or a tap mid-update would still resolve
+    // the stale snapshot). The remaining node fields are refreshed below.
+    node.building = b;
+
+    const profile = getProfile(b.purpose);
+    const scale = tierScale(b.visualTier);
+    const level = tierRank(b.visualTier);
+
+    // Build the new kit parts (for fresh anims/pennant/metrics) + the new variant
+    // texture. Same atlas hit/miss disposal contract as createBuildingNode.
+    const built = buildBuildingParts(b, profile, scale);
+    const wasCached = this.buildingAtlas.has(b.purpose, level);
+    let variant: import("./buildingAtlas").BuildingVariant;
+    try {
+      variant = this.buildingAtlas.get(
+        this.app.renderer as unknown as import("./buildingAtlas").TextureSource,
+        b.purpose,
+        level,
+        () => ({ body: built.staticBody, shadow: built.shadow }),
+      );
+    } catch (err) {
+      // Atlas threw on a MISS: destroy our freshly-built parts (the atlas never
+      // reached its own destroy) so they don't leak. The EXISTING node is left
+      // untouched — its old dynamics/textures are still valid — and we re-throw so
+      // the caller's per-node handler logs+skips this diff entry.
+      this.disposeBuiltParts(built);
+      throw err;
+    }
+    if (wasCached) {
+      built.staticBody.destroy({ children: true });
+      built.shadow.destroy();
+    }
+
+    // Tear down the OLD dynamics first (so re-attach lands a clean child set).
+    this.detachBuildingDynamics(node);
+
+    // Swap the BODY sprite texture + re-anchor (the node Container origin stays at
+    // iso, so overlay local coords are unchanged). The OLD shared texture is
+    // atlas-owned — never freed here; another building of the old variant may use it.
+    const fr = variant.frame;
+    node.bodySprite.texture = variant.texture;
+    node.bodySprite.anchor.set(
+      fr.width > 0 ? -fr.x / fr.width : 0,
+      fr.height > 0 ? -fr.y / fr.height : 0,
+    );
+
+    // Swap the shadow texture + re-anchor likewise.
+    const sf = variant.shadowFrame;
+    node.shadow.texture = variant.shadowTexture;
+    node.shadow.anchor.set(
+      sf.width > 0 ? -sf.x / sf.width : 0,
+      sf.height > 0 ? -sf.y / sf.height : 0,
+    );
+
+    // Re-attach fresh dynamics on the SAME Sprite.
+    const dyn = this.attachBuildingDynamics(node.container, b, built);
+
+    // Update the node record in place (identity preserved). `node.building` was
+    // already re-pointed at the top of this method (handlers read it at fire time).
+    node.kitAnims = dyn.anims;
+    node.label = dyn.label;
+    node.labelDepth = built.depth;
+    node.pennant = dyn.pennant;
+    node.disaster = dyn.disaster;
+    node.investigation = dyn.investigation;
+    node.hitRadius = built.hw;
+
+    // Keep the path→fileId index correct (filePath could change with a rename,
+    // though coords-unchanged usually means same path). Re-point to this fileId.
+    this.fileIdByPath.set(PolisRenderer.normalizeRelPath(b.filePath), b.fileId);
+
+    // Re-add to the animated pool iff the new dynamics animate.
+    if (dyn.anims.length > 0) this.animatedNodes.push(node);
+    return node;
   }
 
   /**
@@ -1948,12 +2236,15 @@ export class PolisRenderer {
     // queue first so it can't mutate (or read) a destroyed container next tick.
     this.growthFx.cancelTransition(node.container);
     try {
-      // Remove the body container from its chunk and destroy it (children: water,
-      // label, the scaffold rig, anim container, body all go with it — the
-      // scaffold is parented into the container so no separate disposal).
+      // Remove the building SPRITE from its chunk and destroy it. children:true
+      // tears down its overlays (label, scaffold rig, anim nodes, pennant, disaster/
+      // investigation). texture defaults to FALSE so the SHARED per-variant texture
+      // is NOT freed — it is owned by the atlas (destroying it would pull the rug
+      // out from under every sibling building of the same variant).
       node.container.removeFromParent();
       node.container.destroy({ children: true });
-      // The drop shadow lives on its own layer — destroy it explicitly.
+      // The drop-shadow sprite lives on its own layer — destroy it explicitly. Its
+      // texture is the SHARED shadow texture (atlas-owned), so again texture:false.
       node.shadow.removeFromParent();
       node.shadow.destroy();
     } finally {
@@ -2056,12 +2347,30 @@ export class PolisRenderer {
     const scale = this.viewport.scale.x;
     if (Math.abs(scale - this.lastScale) > 0.02) {
       this.lastScale = scale;
-      const showLabels = scale >= LOD_LABELS;
+      // LABEL LOD with HYSTERESIS (dead-band). `createLabels` only at/above the IN
+      // threshold, `destroyLabels` only below the OUT threshold; between OUT and IN
+      // neither fires, so the existing label state is HELD and zoom oscillating
+      // around the band stops thrashing ~879 Text allocs/frees per crossing.
+      const createLabels = scale >= LOD_LABELS_IN;
+      const destroyLabels = scale < LOD_LABELS_OUT;
       const showDetails = scale >= LOD_DETAILS;
       const showLivery = scale >= LOD_LIVERY;
       const showDisaster = scale >= LOD_DISASTER;
       for (const node of this.buildingNodes.values()) {
-        if (node.label) node.label.visible = showLabels;
+        // LABEL — ATTACH-ON-DEMAND with hysteresis. At/above LOD_LABELS_IN: create
+        // the Text + parent it (topmost child) if absent. Below LOD_LABELS_OUT:
+        // DESTROY + detach it so a far view of a large city retains zero label
+        // glyphs. In the dead-band between OUT and IN, do nothing (hold state).
+        if (createLabels) {
+          if (!node.label) {
+            node.label = this.makeLabel(node.building, node.labelDepth);
+            node.container.addChild(node.label);
+          }
+        } else if (destroyLabels && node.label) {
+          node.label.removeFromParent();
+          node.label.destroy();
+          node.label = null;
+        }
         // TECH LIVERY: hide provider pennants in the far view (a static toggle,
         // allocation-free). Never touched for buildings with no provider (null).
         if (node.pennant) node.pennant.visible = showLivery;
@@ -2291,6 +2600,11 @@ export class PolisRenderer {
     // scene) — do NOT clear them again here or PIXI would double-destroy the same
     // already-destroyed Graphics/Containers.
     this.clearScene();
+    // SPRITE-SHEET BUILDINGS — release every shared per-variant building/shadow
+    // texture. The atlas OWNS these (a building sprite destroy never frees them),
+    // so they must be freed exactly once, here, after clearScene has torn down all
+    // the sprites that referenced them.
+    this.buildingAtlas.destroy();
     // L2: detach + destroy the growth-effect pool Graphics BEFORE the effects
     // layer is destroyed below (no removeFromParent leak — the L1 audit caught
     // this exact pattern).

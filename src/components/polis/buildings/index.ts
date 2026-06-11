@@ -20,7 +20,7 @@
 // Oracle-introduced / unknown slugs fall back to BUILDERS.unknown — never an
 // invented building.
 
-import { Graphics } from "pixi.js";
+import { Container, Graphics } from "pixi.js";
 import type { Building } from "../../../types/city";
 import {
   tierRank,
@@ -129,6 +129,81 @@ export function buildBuilding(
 
   return {
     display: built.container,
+    shadow: buildShadow(W, D),
+    anims: built.anims,
+    pennant,
+    hw,
+    depth,
+    foot: [W, D],
+  };
+}
+
+/**
+ * SPRITE-SHEET path — build a building split into STATIC vs DYNAMIC parts so the
+ * renderer can bake the static body to a shared per-variant texture (see
+ * buildingAtlas.ts) while keeping the cheap animated/livery bits live per
+ * building.
+ *
+ *   - `staticBody`  : a Container holding ONLY the static geometry (the kit body
+ *                     Graphics + any static props/Text). The animated part nodes
+ *                     and the provider pennant are REMOVED from it, so a
+ *                     generateTexture of this container captures EXACTLY the
+ *                     pixels every building of this (purpose, level) shares.
+ *   - `shadow`      : the contact-shadow Graphics (also pure per footprint).
+ *   - `anims`       : the kit's live AnimInstances (Flame/Beacon/Flag/Smoke/
+ *                     Water). Their `.node`s are detached from `staticBody`; the
+ *                     renderer re-parents them onto the building Sprite so they
+ *                     still animate (visible-chunk-gated by the step clock).
+ *   - `pennant`     : the provider pennant Graphics (detached from `staticBody`),
+ *                     or null. The renderer re-parents it onto the Sprite as a
+ *                     LOD-gated overlay — it varies by provider so it is NOT in
+ *                     the texture key.
+ *   - `hw`/`depth`/`foot` : same metrics as buildBuilding (hit radius / label
+ *                     placement / footprint).
+ *
+ * IMPORTANT: the geometry of `staticBody` is a pure function of (purpose, level)
+ * — NOTHING about the specific building `b` (provider, sins, agent, status,
+ * coords) changes it — which is exactly what makes the texture cacheable.
+ */
+export interface BuiltParts {
+  staticBody: Container;
+  shadow: Graphics;
+  anims: BuiltBuilding["anims"];
+  pennant: Graphics | null;
+  hw: number;
+  depth: number;
+  foot: [number, number];
+}
+
+export function buildBuildingParts(
+  b: Building,
+  _profile: BuildingProfile,
+  _scale: { w: number; depth: number },
+): BuiltParts {
+  const level = tierRank(b.visualTier); // 0..4 — same map the kit levels use
+  const built = getBuilder(b.purpose)(level, { outline: false });
+  const [W, D] = built.foot;
+  const container = built.container;
+
+  // Detach the ANIMATED part nodes from the container so they are NOT baked into
+  // the static texture (each anim's .node draws nothing until update() runs, but
+  // we still pull them out so the renderer can re-parent them live onto the
+  // Sprite). The static body keeps the kit body Graphics + any static props/Text.
+  for (const a of built.anims) a.node.removeFromParent();
+
+  // hw / depth measured on the FULL silhouette (anims removed don't change the
+  // static extent — flames/smoke are above the body and were empty here anyway).
+  const bounds = container.getLocalBounds();
+  const hw = Math.max(Math.abs(bounds.x), Math.abs(bounds.x + bounds.width), 1);
+  const depth = Math.max(-bounds.y, 1); // bounds.y is the top (most negative) px
+
+  // Provider pennant — built but NOT added to the static body (it varies by
+  // provider, so it stays an overlay, not part of the cached texture). `null` for
+  // plain local files. Positioned by the same top-y the old path used.
+  const pennant = buildPennant(b.provider, bounds.y);
+
+  return {
+    staticBody: container,
     shadow: buildShadow(W, D),
     anims: built.anims,
     pennant,
