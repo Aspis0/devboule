@@ -59,6 +59,9 @@ function panelProps(overrides: Partial<Parameters<typeof AssistantPanel>[0]> = {
     draft: "",
     setDraft: noop,
     focusSignal: 0,
+    onVisualCheck: noop,
+    visualCheckDisabled: false,
+    visualChecking: false,
     ...overrides,
   };
 }

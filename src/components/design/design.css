@@ -368,6 +368,15 @@
 .dsgn .assist-head .ttl { font-weight: 700; font-size: 14.5px; letter-spacing: -.01em; }
 .dsgn .assist-head .spark { color: var(--accent); }
 .dsgn .assist-head .sub { margin-left: auto; font-size: var(--fs-sm); color: var(--muted); }
+/* Visual-check trigger in the assist head — a compact icon-btn sized for the bar. */
+.dsgn .assist-head .visual-check { margin-left: 8px; display: flex; }
+.dsgn .assist-head .visual-check button {
+  width: 30px; height: 30px; border-radius: 8px;
+  display: grid; place-items: center; color: var(--ink-2);
+}
+.dsgn .assist-head .visual-check button:hover { background: var(--accent-softer); color: var(--ink); }
+.dsgn .assist-head .visual-check button:disabled { color: var(--border-2); cursor: default; background: none; }
+.dsgn .assist-head .visual-check .spin { animation: dsgnRot 1s linear infinite; }
 
 .dsgn .assist-scroll { flex: 1; overflow-y: auto; padding: 4px var(--pad) 12px; display: flex; flex-direction: column; gap: 12px; }
 .dsgn .assist-scroll::-webkit-scrollbar { width: 10px; }

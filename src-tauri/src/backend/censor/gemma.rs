@@ -404,6 +404,22 @@ pub trait GemmaClient: Send + Sync {
     /// defensively via [`parse_gemma`].
     fn generate(&self, prompt: &str) -> Result<String, GemmaError>;
 
+    /// Run ONE MULTIMODAL generation: `prompt` text PLUS one or more base64-encoded images
+    /// (the design visual-critique path passes a single captured PNG). Returns the model's
+    /// raw text response, parsed defensively by the caller. The DEFAULT impl reports
+    /// [`GemmaError::Transport`] (a provider with no vision pathway is treated as
+    /// unavailable for this feature) so only providers that genuinely support image input
+    /// (Ollama's `/api/generate` `images` field) need override it. PRIVACY: the images
+    /// travel ONLY to the loopback endpoint the client is clamped to — same guarantee as
+    /// [`generate`]; the bytes are never logged.
+    fn generate_with_images(
+        &self,
+        _prompt: &str,
+        _images_b64: &[String],
+    ) -> Result<String, GemmaError> {
+        Err(GemmaError::Transport)
+    }
+
     /// A stable, content-free IDENTITY label for the provider behind this client
     /// (`"ollama"` / `"omlx"`). Used ONLY for the once-per-session available/unavailable
     /// log line and for testing the factory wiring. NEVER includes the base URL, model,
@@ -884,6 +900,47 @@ impl GemmaClient for OllamaClient {
         parse_generate_body(&bytes)
     }
 
+    fn generate_with_images(
+        &self,
+        prompt: &str,
+        images_b64: &[String],
+    ) -> Result<String, GemmaError> {
+        // Same loopback `/api/generate` call as `generate`, with the Ollama multimodal
+        // `images` field carrying the base64 PNG(s). `stream:false`, low temperature. The
+        // body is read with the SAME hard size cap before parsing (OOM defense). The
+        // resolved model must be a vision-capable tag for a useful answer; a text-only
+        // model simply returns prose ignoring the image (no crash). The images travel only
+        // to the loopback daemon (the base is clamped) — never logged.
+        let model = self.resolved_model();
+        let url = format!("{}/api/generate", self.base);
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "images": images_b64,
+            "stream": false,
+            "options": { "temperature": 0.1 }
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(self.generate_timeout)
+            .json(&payload)
+            .send()
+            .map_err(|e| {
+                if e.is_timeout() {
+                    GemmaError::Timeout
+                } else {
+                    GemmaError::Transport
+                }
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(GemmaError::Status(status.as_u16()));
+        }
+        let bytes = resp.bytes().map_err(|_| GemmaError::Decode)?;
+        parse_generate_body(&bytes)
+    }
+
     fn provider_label(&self) -> &'static str {
         "ollama"
     }
@@ -1315,6 +1372,23 @@ pub fn run_gemma(
             Vec::new()
         }
     }
+}
+
+/// Re-export the runners' secret-redaction pass at crate scope so OTHER local-AI
+/// callers (the design visual-critique command) can run the SAME `[redacted]` scrub
+/// over a local model's free-text response before it is surfaced — instead of each
+/// caller hand-rolling a divergent redactor. The heuristic lives in exactly one place
+/// (`runners::redact_secrets`); this is a thin, content-free forwarder.
+pub(crate) fn redact_secrets_text(s: &str) -> String {
+    redact_secrets(s)
+}
+
+/// Re-export the runners' char-count truncation cap at crate scope (companion to
+/// [`redact_secrets_text`]) so the design critique can bound an over-long model
+/// response with the SAME multibyte-safe cap the runners use, rather than a private
+/// copy that could drift.
+pub(crate) fn cap_chars(s: &str, max: usize) -> String {
+    cap(s, max)
 }
 
 #[cfg(test)]

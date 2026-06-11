@@ -46,6 +46,12 @@ const MANIFEST_FILE: &str = "manifest.json";
 /// malicious frontend payload can never balloon a component file.
 const MAX_DESIGN_FILE_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
 
+/// Crate-visible accessor for [`MAX_DESIGN_FILE_BYTES`] so the sibling `design_preview`
+/// module caps the export HTML it reads with the EXACT SAME limit (one source of truth).
+pub(crate) fn max_design_file_bytes() -> u64 {
+    MAX_DESIGN_FILE_BYTES
+}
+
 /// Hard cap on the number of nodes we will iterate for a single project. Bounds a
 /// hostile/corrupt manifest (or a malicious save payload) so load/save cannot be turned
 /// into an unbounded loop / IO storm.
@@ -317,7 +323,11 @@ fn push_warning(warnings: &mut Vec<String>, msg: String) {
 /// command here operates on an EXISTING project, except `create` which canonicalizes
 /// the parent then creates the leaf — handled separately). Canonicalizing collapses
 /// `.`/`..`/symlinks to a real path so the under-root assertion below is meaningful.
-fn canonical_working_folder(working_folder_path: &str) -> Result<PathBuf, String> {
+///
+/// `pub(crate)` so the sibling `design_preview` module confines its working-folder
+/// access through the SAME canonicalization (no second, divergent path-confinement
+/// implementation for the preview slice).
+pub(crate) fn canonical_working_folder(working_folder_path: &str) -> Result<PathBuf, String> {
     if working_folder_path.trim().is_empty() {
         return Err("working folder path must not be empty".to_string());
     }
@@ -1615,7 +1625,13 @@ mod registry_ops {
             existing.name = incoming.name;
             existing.updated_at = incoming.updated_at;
             existing.last_opened_at = incoming.last_opened_at;
-            existing.thumbnail_path = incoming.thumbnail_path;
+            // thumbnail_path is only OVERWRITTEN when the incoming remember carries one
+            // (i.e. a fresh capture recorded preview.png). A plain load/create/open
+            // remember omits it (None) and MUST NOT wipe a previously recorded thumbnail —
+            // otherwise the project's thumbnail would vanish on the very next plain open.
+            if incoming.thumbnail_path.is_some() {
+                existing.thumbnail_path = incoming.thumbnail_path;
+            }
             // contract_sha is only OVERWRITTEN when the incoming remember carries one
             // (i.e. the user just Saved/approved a contract). A plain load/create remember
             // omits it (None) and MUST NOT wipe a previously approved hash — otherwise an
@@ -2944,6 +2960,34 @@ mod tests {
         registry_ops::upsert(&mut entries, save, &lexical_key("/a/landing"), &lexical_key);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].contract_sha.as_deref(), Some("newhash"));
+    }
+
+    #[test]
+    fn registry_upsert_carries_and_preserves_thumbnail_path() {
+        // Mirror of the contract_sha preserve test. A recorded thumbnail must survive a
+        // plain open (which omits thumbnailPath → None) and only be replaced by a fresh
+        // capture (Some). Regression for: thumbnail wiped on every plain open.
+        let mut e = entry("p1", "Landing", "/a/landing", "2021-01-01T00:00:00Z");
+        e.thumbnail_path = Some("preview.png".to_string());
+        let mut entries = vec![e];
+
+        // A plain load/open remember (thumbnail_path = None) MUST NOT wipe the thumbnail.
+        let load = entry("p1b", "Landing", "/a/landing", "2022-01-01T00:00:00Z");
+        assert_eq!(load.thumbnail_path, None, "the plain remember omits the thumbnail");
+        registry_ops::upsert(&mut entries, load, &lexical_key("/a/landing"), &lexical_key);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].thumbnail_path.as_deref(),
+            Some("preview.png"),
+            "plain open (None) must preserve the recorded thumbnail"
+        );
+
+        // A capture remember (Some) OVERWRITES it.
+        let mut capture = entry("p1c", "Landing", "/a/landing", "2023-01-01T00:00:00Z");
+        capture.thumbnail_path = Some("preview.png".to_string());
+        registry_ops::upsert(&mut entries, capture, &lexical_key("/a/landing"), &lexical_key);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].thumbnail_path.as_deref(), Some("preview.png"));
     }
 
     #[test]

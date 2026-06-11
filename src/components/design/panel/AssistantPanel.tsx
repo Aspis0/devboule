@@ -6,7 +6,7 @@
 // adds NO pipeline logic.
 
 import { useEffect, useRef } from "react";
-import { Sparkles } from "lucide-react";
+import { Sparkles, ScanEye } from "lucide-react";
 import { AssistantMessages } from "./AssistantMessages";
 import { Composer } from "./Composer";
 import type { AssistantMessage } from "./types";
@@ -35,6 +35,12 @@ export interface AssistantPanelProps {
   notice?: string | null;
   /** Out-of-band error (folder/load/save failures) shown as a muted error strip. */
   error?: string | null;
+  /** Run a visual check (capture the preview + critique). The assist-head icon-button. */
+  onVisualCheck: () => void;
+  /** Disable the visual-check button (no project open). */
+  visualCheckDisabled: boolean;
+  /** True while a visual check is in flight (shows a spinner + disables the button). */
+  visualChecking: boolean;
 }
 
 export function AssistantPanel({
@@ -57,6 +63,9 @@ export function AssistantPanel({
   focusSignal,
   notice,
   error,
+  onVisualCheck,
+  visualCheckDisabled,
+  visualChecking,
 }: AssistantPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -81,6 +90,19 @@ export function AssistantPanel({
         <span className="ttl">Assistant</span>
         <span className="sub">
           {hasAssistant ? `${doneCount} generations` : ""}
+        </span>
+        <span className="visual-check">
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={onVisualCheck}
+            disabled={visualCheckDisabled || visualChecking}
+            title="Visual check"
+            aria-label="Visual check"
+            aria-busy={visualChecking}
+          >
+            <ScanEye size={16} className={visualChecking ? "spin" : undefined} />
+          </button>
         </span>
       </div>
       <AssistantMessages

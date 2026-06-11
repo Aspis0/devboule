@@ -10,6 +10,7 @@
 // open project's working-folder path all come from props so the same source of
 // truth drives both this popover and persistence.
 
+import { useEffect, useRef, useState } from "react";
 import { Palette, Folder, Check, Pencil, Trash2, X, FileText } from "lucide-react";
 import type { DesignProjectEntry } from "../../../types/design";
 import { Popover } from "./Popover";
@@ -39,6 +40,17 @@ export interface ProjectPopoverProps {
   /** Open the design.md contract editor for the open project. Undefined -> the row is
    * hidden (no project is open). */
   onEditContract?: () => void;
+  /**
+   * Backend invoker used to LAZILY read each entry's preview.png thumbnail
+   * (design_read_thumbnail -> a `data:image/png;base64` URI, allowed by the CSP
+   * img-src 'self' data:). Absent/web runtime -> the color block is the only art.
+   */
+  invoke?: <T = unknown>(
+    command: string,
+    args?: Record<string, unknown>,
+  ) => Promise<T>;
+  /** True only in the Tauri desktop runtime (thumbnails available). */
+  tauri?: boolean;
 }
 
 export function ProjectPopover({
@@ -58,7 +70,56 @@ export function ProjectPopover({
   onNewProject,
   onOpenFolder,
   onEditContract,
+  invoke,
+  tauri,
 }: ProjectPopoverProps) {
+  // Lazily-loaded preview.png thumbnails, keyed by entry id. `data:` URI on success,
+  // `null` when the project has no preview.png yet (or any read error) — the row then
+  // keeps its deterministic color block. The effect runs when the popover opens (or the
+  // entry set changes) and fetches ONLY entries not already cached, so a registry update
+  // while the popover is open (e.g. a fresh capture re-orders `recent`) does NOT clear and
+  // re-fetch every thumbnail — already-loaded thumbs stay put (no flicker). An abort flag
+  // drops late results after a close/unmount so we never setState on a stale render.
+  const [thumbs, setThumbs] = useState<Record<string, string | null>>({});
+  // Mirror of `thumbs` for the effect so reading the cache does NOT make the effect depend
+  // on `thumbs` (which would re-run it on every fetch result — defeating the point).
+  const thumbsRef = useRef(thumbs);
+  thumbsRef.current = thumbs;
+
+  useEffect(() => {
+    if (!open || !tauri || !invoke) return;
+    let cancelled = false;
+    // Fetch only entries we have not already resolved (the cache survives deps changes
+    // while open). `id in cache` covers both a loaded URI and a resolved-null.
+    const cache = thumbsRef.current;
+    const pending = recent.filter((entry) => !(entry.id in cache));
+    if (pending.length === 0) return;
+    void Promise.all(
+      pending.map(async (entry) => {
+        try {
+          const uri = await invoke<string | null>("design_read_thumbnail", {
+            workingFolderPath: entry.workingFolderPath,
+          });
+          if (cancelled) return;
+          setThumbs((prev) => ({ ...prev, [entry.id]: uri ?? null }));
+        } catch {
+          if (cancelled) return;
+          setThumbs((prev) => ({ ...prev, [entry.id]: null }));
+        }
+      }),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [open, tauri, invoke, recent]);
+
+  // Reset the cache when the popover CLOSES so a later re-open re-fetches fresh thumbnails
+  // (a capture may have changed a preview.png while it was closed). We DON'T reset on a
+  // deps change while open — that is exactly the flicker this fix removes.
+  useEffect(() => {
+    if (!open) setThumbs({});
+  }, [open]);
+
   return (
     <Popover open={open} onClose={onClose} className="left">
       <div className="pop-head">DESIGN PROJECTS</div>
@@ -74,10 +135,10 @@ export function ProjectPopover({
               data-testid="design-recent-item"
               className={"pop-row" + (isOpen ? " sel" : "")}
             >
-              {entry.thumbnailPath ? (
+              {thumbs[entry.id] ? (
                 <img
                   className="thumb"
-                  src={entry.thumbnailPath}
+                  src={thumbs[entry.id] as string}
                   alt=""
                   style={{ objectFit: "cover" }}
                 />

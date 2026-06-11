@@ -44,6 +44,8 @@ function baseProps(over: Partial<TopBarProps> = {}): TopBarProps {
     runExport: vi.fn(),
     exportTokens: vi.fn(),
     onConsolidate: vi.fn(),
+    onPreview: vi.fn(),
+    previewing: false,
     ...over,
   };
 }

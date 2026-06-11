@@ -17,6 +17,7 @@ import {
   Redo2,
   Save,
   Code2,
+  Eye,
   Maximize2,
   Minimize2,
 } from "lucide-react";
@@ -79,6 +80,12 @@ export interface TopBarProps {
   runExport: (mode: ExportMode) => void;
   exportTokens: () => void;
   onConsolidate: () => void;
+
+  // ---- preview ----
+  /** Open the read-only preview window (absolute layout). */
+  onPreview: () => void;
+  /** True while a preview export/open is in flight (disables the button). */
+  previewing: boolean;
 }
 
 export function TopBar(props: TopBarProps) {
@@ -119,6 +126,8 @@ export function TopBar(props: TopBarProps) {
     runExport,
     exportTokens,
     onConsolidate,
+    onPreview,
+    previewing,
   } = props;
 
   const statusText =
@@ -168,6 +177,8 @@ export function TopBar(props: TopBarProps) {
             onNewProject={onNewProject}
             onOpenFolder={onOpenFolder}
             onEditContract={onEditContract}
+            invoke={invoke}
+            tauri={tauri}
           />
         </div>
         {projectOpen && (
@@ -270,6 +281,17 @@ export function TopBar(props: TopBarProps) {
             exportTokens={exportTokens}
           />
         </div>
+
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={onPreview}
+          disabled={!projectOpen || previewing}
+          title="Preview the design in a read-only window (absolute layout)"
+        >
+          <Eye size={15} />
+          Preview
+        </button>
 
         <div className="pop-wrap split-primary">
           <button

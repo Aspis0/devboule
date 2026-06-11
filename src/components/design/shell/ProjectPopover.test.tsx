@@ -58,6 +58,16 @@ function render(props: ProjectPopoverProps): HTMLElement {
   return container;
 }
 
+/** Render + flush the thumbnail-loading effect's promises (one extra act tick). */
+async function renderAsync(props: ProjectPopoverProps): Promise<HTMLElement> {
+  const container = render(props);
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  return container;
+}
+
 function items(container: HTMLElement): HTMLElement[] {
   return Array.from(
     container.querySelectorAll("[data-testid=design-recent-item]"),
@@ -174,21 +184,132 @@ describe("ProjectPopover", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it("uses a thumbnail image when present, else a color block", () => {
-    const c = render(
+  it("lazily reads each entry's thumbnail via design_read_thumbnail on open", async () => {
+    const invoke = vi.fn(async (_cmd: string, args?: Record<string, unknown>) => {
+      // Entry "a" has a preview.png (data URI); entry "b" has none (null).
+      return (args?.workingFolderPath as string) === "/x/alpha"
+        ? "data:image/png;base64,AAAA"
+        : null;
+    });
+    const c = await renderAsync(
       baseProps({
         recent: [
-          entry({ id: "a", thumbnailPath: "file:///t.png" }),
-          entry({ id: "b" }),
+          entry({ id: "a", name: "Alpha", workingFolderPath: "/x/alpha" }),
+          entry({ id: "b", name: "Beta", workingFolderPath: "/x/beta" }),
         ],
+        currentFolder: "",
+        invoke: invoke as unknown as ProjectPopoverProps["invoke"],
+        tauri: true,
+      }),
+    );
+    // One read per entry, keyed by the working folder path.
+    expect(invoke).toHaveBeenCalledWith("design_read_thumbnail", {
+      workingFolderPath: "/x/alpha",
+    });
+    expect(invoke).toHaveBeenCalledWith("design_read_thumbnail", {
+      workingFolderPath: "/x/beta",
+    });
+    const thumbs = c.querySelectorAll(".thumb");
+    // Entry with a data URI -> IMG; entry with null -> the color block stays a DIV.
+    expect(thumbs[0].tagName).toBe("IMG");
+    expect((thumbs[0] as HTMLImageElement).getAttribute("src")).toBe(
+      "data:image/png;base64,AAAA",
+    );
+    expect(thumbs[1].tagName).toBe("DIV");
+  });
+
+  it("keeps the color block when no invoke/tauri is provided (web runtime)", () => {
+    const c = render(
+      baseProps({
+        recent: [entry({ id: "a", thumbnailPath: "preview.png" })],
         currentFolder: "",
       }),
     );
     const thumbs = c.querySelectorAll(".thumb");
-    expect(thumbs[0].tagName).toBe("IMG");
-    expect((thumbs[0] as HTMLImageElement).getAttribute("src")).toBe(
-      "file:///t.png",
+    // No backend reader -> the deterministic color block, never an absolute/relative img.
+    expect(thumbs[0].tagName).toBe("DIV");
+  });
+
+  it("does not re-fetch cached thumbnails when recent updates while open (no flicker)", async () => {
+    // Flicker regression: a registry update while the popover is open (e.g. a fresh capture
+    // re-orders/adds entries) must NOT clear+re-read already-loaded thumbnails. Only the
+    // genuinely new entry is fetched; existing thumbs stay rendered.
+    const invoke = vi.fn(async (_cmd: string, args?: Record<string, unknown>) => {
+      const p = args?.workingFolderPath;
+      if (p === "/x/alpha") return "data:image/png;base64,ALPHA";
+      return null;
+    });
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    const props1 = baseProps({
+      recent: [entry({ id: "a", name: "Alpha", workingFolderPath: "/x/alpha" })],
+      currentFolder: "",
+      invoke: invoke as unknown as ProjectPopoverProps["invoke"],
+      tauri: true,
+    });
+    await act(async () => {
+      root.render(createElement(ProjectPopover, props1));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("design_read_thumbnail", {
+      workingFolderPath: "/x/alpha",
+    });
+    // Alpha's thumbnail rendered as an IMG.
+    expect((container.querySelectorAll(".thumb")[0] as HTMLElement).tagName).toBe("IMG");
+
+    // Now a new entry "b" appears (recent changes) WHILE the popover stays open.
+    const props2 = baseProps({
+      recent: [
+        entry({ id: "b", name: "Beta", workingFolderPath: "/x/beta" }),
+        entry({ id: "a", name: "Alpha", workingFolderPath: "/x/alpha" }),
+      ],
+      currentFolder: "",
+      invoke: invoke as unknown as ProjectPopoverProps["invoke"],
+      tauri: true,
+    });
+    await act(async () => {
+      root.render(createElement(ProjectPopover, props2));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Only the NEW entry was fetched — alpha was NOT re-read (total 2 calls, beta is new).
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const betaCalls = invoke.mock.calls.filter(
+      (c) => (c[1] as { workingFolderPath?: string })?.workingFolderPath === "/x/beta",
     );
-    expect(thumbs[1].tagName).toBe("DIV");
+    const alphaCalls = invoke.mock.calls.filter(
+      (c) => (c[1] as { workingFolderPath?: string })?.workingFolderPath === "/x/alpha",
+    );
+    expect(betaCalls).toHaveLength(1);
+    expect(alphaCalls).toHaveLength(1); // still just the original read, not re-fetched
+    // Alpha's thumbnail is STILL an IMG (it never flickered back to the color block).
+    const thumbs = container.querySelectorAll(".thumb");
+    const alphaThumb = Array.from(thumbs).find(
+      (t) => (t as HTMLImageElement).getAttribute?.("src") === "data:image/png;base64,ALPHA",
+    );
+    expect(alphaThumb).toBeTruthy();
+
+    act(() => root.unmount());
+  });
+
+  it("keeps the color block when a thumbnail read errors", async () => {
+    const invoke = vi.fn(async () => {
+      throw new Error("read failed");
+    });
+    const c = await renderAsync(
+      baseProps({
+        recent: [entry({ id: "a", workingFolderPath: "/x/alpha" })],
+        currentFolder: "",
+        invoke: invoke as unknown as ProjectPopoverProps["invoke"],
+        tauri: true,
+      }),
+    );
+    const thumbs = c.querySelectorAll(".thumb");
+    expect(thumbs[0].tagName).toBe("DIV");
   });
 });

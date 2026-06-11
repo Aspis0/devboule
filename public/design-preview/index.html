@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Design preview — read-only</title>
+    <!--
+      Standalone preview sandbox loaded by the Rust preview window (URL
+      design-preview/index.html). It is INTENTIONALLY self-contained: NO Tauri
+      imports, NO IPC, no external network, no app bundle. The exported HTML is
+      injected by the window's initialization script as `window.__PREVIEW_HTML`
+      (a string) and rendered inside a sandboxed iframe via `srcdoc` — see
+      preview.js. The iframe uses a FULLY OPAQUE sandbox (`sandbox=""`, an empty
+      attribute = every restriction on, including a unique opaque origin and NO
+      allow-scripts). The exported HTML is self-contained, so it needs neither
+      script execution nor same-origin access; the opaque origin means the
+      previewed markup cannot reach this page's origin, storage, or cookies.
+    -->
+    <style>
+      :root {
+        --cream: #faf7f1;
+        --ink: #3e2f18;
+        --muted: #9a8c74;
+        --border: #e7ded0;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--cream);
+        color: var(--ink);
+        font-family: "Instrument Sans", -apple-system, BlinkMacSystemFont,
+          "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      body { display: flex; flex-direction: column; }
+      .pv-bar {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 34px;
+        padding: 0 14px;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        color: var(--muted);
+        background: var(--cream);
+        border-bottom: 1px solid var(--border);
+      }
+      .pv-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #c9b48f;
+      }
+      .pv-frame-wrap {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+        background: var(--cream);
+      }
+      #frame {
+        width: 100%;
+        height: 100%;
+        border: 0;
+        display: block;
+        background: #ffffff;
+      }
+      .pv-empty {
+        position: absolute;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 24px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .pv-empty b { color: var(--ink); font-size: 14px; }
+      body[data-empty="true"] #frame { display: none; }
+      body[data-empty="true"] .pv-empty { display: flex; }
+    </style>
+  </head>
+  <body>
+    <div class="pv-bar">
+      <span class="pv-dot"></span>
+      Design preview — read-only
+    </div>
+    <div class="pv-frame-wrap">
+      <iframe id="frame" sandbox="" title="Design preview"></iframe>
+      <div class="pv-empty">
+        <b>No preview content</b>
+        <span>Open the preview from the Design view.</span>
+      </div>
+    </div>
+    <script src="./preview.js"></script>
+  </body>
+</html>

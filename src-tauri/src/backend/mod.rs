@@ -8,6 +8,7 @@ pub mod commands;
 pub mod design;
 pub mod design_generate;
 pub mod design_llm;
+pub mod design_preview;
 pub mod devices;
 pub mod fs_replace;
 pub mod fs_watch;

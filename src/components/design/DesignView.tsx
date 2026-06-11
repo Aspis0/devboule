@@ -76,6 +76,7 @@ import { exportCode, type ExportMode } from "./export/exportCode";
 import { TopBar } from "./shell/TopBar";
 import { Toast } from "./shell/Toast";
 import { useSaveState } from "./shell/useSaveState";
+import { usePreview } from "./preview/usePreview";
 
 /** A token-free audit entry mirroring the Rust `GenerationLogEntry` (camelCase). */
 interface GenerationLogEntry {
@@ -1034,13 +1035,17 @@ export function DesignView() {
   }, [beginSaving, endSaving, showToast]);
 
   // Export the current project to standalone HTML (absolute or flow) and write it to
-  // the working folder via the path-confined Rust command. Best-effort with status.
+  // the working folder via the path-confined Rust command. Returns TRUE on a successful
+  // write, FALSE on any failure (validation or backend error). The preview flow relies on
+  // this boolean to NEVER open a window over a stale/missing export (BLOCKER): a swallowed
+  // export error must not let openPreview proceed to design_preview_open. Toolbar callers
+  // ignore the result (best-effort export with on-screen status).
   const runExport = useCallback(
-    async (mode: ExportMode) => {
+    async (mode: ExportMode): Promise<boolean> => {
       const folderPath = folderRef.current.trim();
       if (!folderPath || !tauri) {
         setError("Choose a working folder first.");
-        return;
+        return false;
       }
       setBusy("export");
       setError(null);
@@ -1064,8 +1069,10 @@ export function DesignView() {
         });
         setStatus(`Exported ${mode} layout to ${filename}.`);
         showToast(`Exported to ${filename}`);
+        return true;
       } catch (e) {
         setError(String(e));
+        return false;
       } finally {
         setBusy(null);
       }
@@ -1096,6 +1103,85 @@ export function DesignView() {
       setBusy(null);
     }
   }, [tauri, showToast]);
+
+  // --- Phase B: preview window / visual check --------------------------------
+
+  // Best-effort: record the freshly-captured preview.png as the project thumbnail in
+  // the registry. The path is RELATIVE ("preview.png") — ProjectPopover renders it by
+  // lazily reading design_read_thumbnail (a data: URI), so an absolute path would never
+  // resolve under the CSP img-src 'self' data:. contractSha is intentionally OMITTED so
+  // the Rust upsert PRESERVES any approved contract hash (the preserve-when-None rule).
+  const rememberThumbnail = useCallback(
+    (workingFolderPath: string) => {
+      if (!tauri || !workingFolderPath.trim()) return;
+      invokeBackendCommand<DesignProjectEntry[]>("design_registry_remember", {
+        entry: {
+          id: "",
+          name: projectRef.current.meta.name,
+          workingFolderPath: workingFolderPath.trim(),
+          createdAt: "",
+          updatedAt: "",
+          lastOpenedAt: "",
+          thumbnailPath: "preview.png",
+        },
+      })
+        .then((list) => setRecent(list ?? []))
+        .catch(() => {
+          // Non-fatal: the thumbnail is a convenience; a critique still proceeds.
+        });
+    },
+    [tauri],
+  );
+
+  const preview = usePreview({
+    getFolder: () => folderRef.current,
+    tauri,
+    invoke: invokeBackendCommand,
+    runExport,
+    rememberThumbnail,
+    onToast: showToast,
+  });
+
+  // Visual check (assist-head icon-button): push a user-style chip + a working card,
+  // run the capture→critique flow, then patch the card to done (the critique text) or
+  // error (the backend's clean message). Reuses the existing assistant message model.
+  const onVisualCheck = useCallback(async () => {
+    // SYNCHRONOUS re-entry guard BEFORE pushing anything. beginCheck() claims the slot in
+    // the same tick (a ref, not the async `checking` state), so two rapid clicks can't both
+    // claim — the second returns false and pushes NO cards. This avoids ghost user-chip +
+    // working-card pairs while keeping the card appearing immediately for the real click.
+    if (!preview.beginCheck()) return;
+    pushMessage({ role: "user", text: "Visual check", ctx: "Visual check" });
+    const msgId = pushMessage({
+      role: "assistant",
+      status: "working",
+      title: "Reviewing the preview…",
+      desc: "Capturing the preview window and asking the local AI to critique it…",
+    });
+    // visualCheck adopts the claim beginCheck just made (it won't skip) and releases it.
+    const outcome = await preview.visualCheck();
+    if (outcome.kind === "ok") {
+      patchMessage(msgId, {
+        status: "done",
+        title: "Visual critique",
+        desc: outcome.critique,
+      });
+    } else if (outcome.kind === "error") {
+      patchMessage(msgId, {
+        status: "error",
+        title: "Visual check failed",
+        desc: outcome.message,
+      });
+    } else {
+      // skipped: should not happen (we hold the claim), but stay defensive — drop the card
+      // so it never spins forever.
+      patchMessage(msgId, {
+        status: "error",
+        title: "Visual check in progress",
+        desc: "A visual check is already running.",
+      });
+    }
+  }, [preview, pushMessage, patchMessage]);
 
   // --- Generation / edit flow ------------------------------------------------
 
@@ -2032,6 +2118,8 @@ export function DesignView() {
           runExport={(mode) => void runExport(mode)}
           exportTokens={() => void exportTokens()}
           onConsolidate={() => void runConsolidate()}
+          onPreview={() => void preview.openPreview("absolute")}
+          previewing={preview.opening}
         />
 
         <div className="work" data-side="right" data-screen-label="Design workspace">
@@ -2161,6 +2249,9 @@ export function DesignView() {
             focusSignal={focusSignal}
             notice={status}
             error={error}
+            onVisualCheck={() => void onVisualCheck()}
+            visualCheckDisabled={!projectOpen}
+            visualChecking={preview.checking}
           />
         </div>
       </div>
