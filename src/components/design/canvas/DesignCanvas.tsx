@@ -744,8 +744,14 @@ export function DesignCanvas({
     [onRegionAnalyze],
   );
 
+  // LIVE-E2E FIX: this root must NOT be a second `.canvas-wrap` — DesignView already
+  // wraps the canvas in one. A nested `.canvas-wrap` has `flex:1` inside a non-flex
+  // parent, so its height collapses to 0 (all children are absolutely positioned) and
+  // the ENTIRE canvas (viewport, nodes, float cards) becomes invisible under
+  // `overflow:hidden`. `.canvas-fill` is an absolute inset-0 filler of the outer wrap;
+  // the float cards keep anchoring to it identically (nearest positioned ancestor).
   return (
-    <div className="canvas-wrap" ref={wrapRef}>
+    <div className="canvas-fill" ref={wrapRef}>
       <div
         ref={viewportRef}
         className="canvas-viewport"

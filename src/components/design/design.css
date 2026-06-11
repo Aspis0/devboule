@@ -249,6 +249,10 @@
 }
 
 .dsgn .canvas-wrap { flex: 1; min-width: 0; position: relative; overflow: hidden; background: var(--bg-canvas); }
+/* DesignCanvas's own root: fills the outer .canvas-wrap. MUST be absolutely sized —
+   a nested flex:1 div inside the (non-flex) wrap collapses to height 0 because every
+   child is absolutely positioned (live-e2e bug 2026-06-11). */
+.dsgn .canvas-fill { position: absolute; inset: 0; }
 .dsgn .canvas-viewport { position: absolute; inset: 0; cursor: default; touch-action: none; }
 .dsgn .canvas-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 
