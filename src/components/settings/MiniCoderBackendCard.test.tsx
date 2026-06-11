@@ -29,9 +29,17 @@ import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 // Helpers
 // ---------------------------------------------------------------------------
 
+function setNavigator(platform: string, userAgent: string) {
+  Object.defineProperty(globalThis, "navigator", {
+    value: { platform, userAgent },
+    configurable: true,
+  });
+}
+
 beforeEach(() => {
   invokeMock.mockClear();
   currentConfig = undefined;
+  setNavigator("Win32", "Windows");
 });
 
 // ---------------------------------------------------------------------------
@@ -61,5 +69,29 @@ describe("MiniCoderBackendCard — maxConcurrent field (B-F5)", () => {
     const html = renderToStaticMarkup(<MiniCoderBackendCard />);
     // Option 3 should be pre-selected (value="3" appears in the select).
     expect(html).toContain('value="3"');
+  });
+
+  it("shows Apple on-device in the backend selector and an optional model input", () => {
+    currentConfig = { kind: "appleFm" };
+    const html = renderToStaticMarkup(<MiniCoderBackendCard />);
+    expect(html).toContain('value="appleFm"');
+    expect(html).toContain("Apple on-device");
+    expect(html).toContain("Model (optional)");
+    expect(html).toContain("default");
+    expect(html).toContain("not available on this OS");
+    expect(html).toContain("disabled");
+  });
+
+  it("omits command/baseUrl fields when appleFm is selected", () => {
+    currentConfig = {
+      kind: "appleFm",
+      model: "apple-default",
+      command: "dropped",
+      baseUrl: "http://localhost:8000/v1",
+    };
+    const html = renderToStaticMarkup(<MiniCoderBackendCard />);
+    expect(html).toContain("apple-default");
+    expect(html).not.toContain("Command line");
+    expect(html).not.toContain("Base URL");
   });
 });

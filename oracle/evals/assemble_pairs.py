@@ -82,6 +82,8 @@ class _DirectiveResult:
     files: list[str]
     status: str
     agent_id: str | None
+    attempt: int = 0
+    parent_directive_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,8 @@ def assemble(
                         files=obj.get("files") or [],
                         status=obj.get("status", ""),
                         agent_id=obj.get("parentAgentId"),
+                        attempt=_coerce_int(obj.get("attempt")),
+                        parent_directive_id=obj.get("parentDirectiveId"),
                     )
             elif kind == "censor_verdict":
                 result.total_verdicts += 1
@@ -235,7 +239,7 @@ def _build_pair(
         result.skipped_missing_blob += 1
         return None
 
-    quality, prompt, directive_id, agent_id = _resolve_prompt(dirty, directives)
+    quality, prompt, directive_id, agent_id, chain_meta = _resolve_prompt(dirty, clean, directives)
 
     meta: dict[str, Any] = {
         "file": dirty.file,
@@ -248,6 +252,7 @@ def _build_pair(
         meta["directiveId"] = directive_id
     if agent_id is not None:
         meta["agentId"] = agent_id
+    meta.update(chain_meta)
 
     return {
         "prompt": prompt,
@@ -259,10 +264,11 @@ def _build_pair(
 
 def _resolve_prompt(
     dirty: _Verdict,
+    clean: _Verdict,
     directives: dict[str, _DirectiveResult],
-) -> tuple[str, str, str | None, str | None]:
+) -> tuple[str, str, str | None, str | None, dict[str, Any]]:
     """
-    Return (quality, prompt, directiveId_or_None, agentId_or_None).
+    Return (quality, prompt, directiveId_or_None, agentId_or_None, meta).
 
     High quality: attribution.kind in {"mini"} AND attribution.directiveId
                   resolves to a known directive_result with a task.
@@ -271,12 +277,26 @@ def _resolve_prompt(
     attr = dirty.attribution or {}
     directive_id = attr.get("directiveId")
     agent_id = attr.get("agentId")
+    clean_attr = clean.attribution or {}
+    clean_directive_id = clean_attr.get("directiveId")
+
+    chain_prompt = _resolve_chain_prompt(directive_id, clean_directive_id, directives)
+    if chain_prompt is not None:
+        retry, rejected = chain_prompt
+        return "high", retry.task.strip(), retry.directive_id, retry.agent_id, {
+            "promptSource": "retryTask",
+            "chainRootDirectiveId": _chain_root_id(rejected),
+            "rejectedDirectiveId": rejected.directive_id,
+            "chosenDirectiveId": retry.directive_id,
+            "rejectedAttempt": rejected.attempt,
+            "chosenAttempt": retry.attempt,
+        }
 
     if directive_id and directive_id in directives:
         dr = directives[directive_id]
         task = dr.task.strip()
         if task:
-            return "high", task, directive_id, agent_id
+            return "high", task, directive_id, agent_id, {}
 
     # BLOCKER 5: the censor_verdict record carries only a COUNT (`openFindings`) and a
     # `maxSeverity` — NOT finding titles. Derive the generic low-quality prompt from the
@@ -289,7 +309,42 @@ def _resolve_prompt(
         prompt = f"Improve code quality in {dirty.file}"
 
     # If directiveId was present but not resolved, still treat as low quality
-    return "low", prompt, directive_id if directive_id else None, agent_id
+    return "low", prompt, directive_id if directive_id else None, agent_id, {}
+
+
+def _resolve_chain_prompt(
+    dirty_directive_id: str | None,
+    clean_directive_id: str | None,
+    directives: dict[str, _DirectiveResult],
+) -> tuple[_DirectiveResult, _DirectiveResult] | None:
+    if not dirty_directive_id or not clean_directive_id:
+        return None
+    dirty = directives.get(dirty_directive_id)
+    clean = directives.get(clean_directive_id)
+    if dirty is None or clean is None:
+        return None
+    if not clean.parent_directive_id:
+        return None
+    if _chain_root_id(dirty) != _chain_root_id(clean):
+        return None
+    if clean.attempt <= dirty.attempt:
+        return None
+    if not clean.task.strip():
+        return None
+    return clean, dirty
+
+
+def _chain_root_id(directive: _DirectiveResult) -> str:
+    return directive.parent_directive_id or directive.directive_id
+
+
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _read_blob(blobs_dir: Path, sha: str) -> str | None:

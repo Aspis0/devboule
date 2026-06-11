@@ -6,6 +6,7 @@ import {
   FileText,
   FolderKanban,
   GitBranch,
+  Play,
   Plus,
   ShieldCheck,
 } from "lucide-react";
@@ -56,6 +57,7 @@ import type {
   ProjectSummary,
   ProjectTask,
   ProjectTaskCategory,
+  SavedWorkflow,
 } from "../../types/backend";
 import {
   isOpenClaim,
@@ -84,6 +86,7 @@ import {
   type SpawnLaunchInput,
   type SpawnSelection,
 } from "../agents/agentRowModel";
+import { buildWorkflowLaunchInput } from "../agents/savedWorkflowModel";
 import { ProjectStatusHeader } from "../projects/ProjectStatusHeader";
 import { TaskCard } from "../projects/TaskCard";
 import {
@@ -193,6 +196,10 @@ export function ProjectsView() {
   const [noteDraft, setNoteDraft] = useState("");
   const [rootDraft, setRootDraft] = useState("");
   const [launchMessage, setLaunchMessage] = useState<string | null>(null);
+  const [savedWorkflows, setSavedWorkflows] = useState<SavedWorkflow[]>([]);
+  const [workflowArgs, setWorkflowArgs] = useState<Record<string, string>>({});
+  const [workflowError, setWorkflowError] = useState<string | null>(null);
+  const [workflowBusyName, setWorkflowBusyName] = useState<string | null>(null);
   const [agentState, setAgentState] = useState<AgentLiveState | null>(null);
   // agent_ids with a live app-hosted PTY (from agent_pty_list, fetched on the
   // board poll) + which of their in-app terminal viewers are open. Gates the
@@ -263,6 +270,26 @@ export function ProjectsView() {
     [project, selectedId],
   );
 
+  const loadSavedWorkflows = useCallback(async (projectId: string) => {
+    setWorkflowError(null);
+    try {
+      const workflows = await invokeBackendCommand<SavedWorkflow[]>(
+        "list_saved_workflows",
+        { projectId },
+      );
+      if (selectedIdRef.current === projectId) {
+        setSavedWorkflows(workflows);
+      }
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : "Saved workflows could not be loaded.";
+      if (selectedIdRef.current === projectId) {
+        setSavedWorkflows([]);
+        setWorkflowError(message);
+      }
+    }
+  }, []);
+
   const tasksByColumn = useMemo(() => {
     const grouped: Record<ColumnId, ProjectTask[]> = {
       todo: [],
@@ -318,6 +345,16 @@ export function ProjectsView() {
       }
     }
   }, []);
+
+  useEffect(() => {
+    if (!currentProject) {
+      setSavedWorkflows([]);
+      setWorkflowArgs({});
+      setWorkflowError(null);
+      return;
+    }
+    void loadSavedWorkflows(currentProject.metadata.id);
+  }, [currentProject?.metadata.id, loadSavedWorkflows]);
 
   // Single source of truth for writing agent state into React state: it sets the
   // state AND records the applied signature so the next poll can correctly skip
@@ -1085,6 +1122,51 @@ export function ProjectsView() {
     }
   };
 
+  const runSavedWorkflow = async (workflow: SavedWorkflow) => {
+    if (!currentProject || busyRef.current) return;
+    if (!canLaunchProjectAgents(currentProject)) {
+      setWorkflowError(projectLaunchTitle(currentProject));
+      return;
+    }
+    let input;
+    try {
+      input = buildWorkflowLaunchInput(
+        currentProject.metadata.id,
+        workflow.name,
+        workflowArgs[workflow.name] ?? "",
+        savedWorkflows,
+      );
+    } catch (e) {
+      setWorkflowError(e instanceof Error ? e.message : "Workflow launch failed.");
+      return;
+    }
+    busyRef.current = true;
+    setIsBusy(true);
+    setWorkflowBusyName(workflow.name);
+    setWorkflowError(null);
+    setLaunchMessage(null);
+    try {
+      const result = await invokeBackendCommand<ProjectAgentLaunchResult>(
+        "launch_project_agent_terminal",
+        { input },
+      );
+      setLaunchMessage(
+        `Claude workflow /${workflow.name} launched at ${result.rootPath}.`,
+      );
+      await loadAgentState();
+      await loadProjects();
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : "Saved workflow could not be launched.";
+      setWorkflowError(await recoverFromConflict(message));
+    } finally {
+      setWorkflowBusyName(null);
+      busyRef.current = false;
+      setIsBusy(false);
+      drainPendingAgentRefresh();
+    }
+  };
+
   // Copy a reconnect prompt for a stalled agent. Pure client-side text (project
   // + session data already in React state) — it invents no backend call and
   // reveals no hidden token, mirroring the Agents control-room recovery copy.
@@ -1775,6 +1857,89 @@ export function ProjectsView() {
               onStop={(agentId) => void stopAgent(agentId)}
               onRecovery={(session) => void copyAgentRecovery(session)}
             />
+            )}
+
+            {currentProject.metadata.status !== "archived" && (
+              <section className="rounded-lg border border-cream-200 bg-white p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <h4 className="text-[12px] font-semibold text-cream-800">
+                      Saved workflows
+                    </h4>
+                    <p className="text-[11px] text-cream-500">
+                      Claude Code workflows discovered from this project and your user profile.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void loadSavedWorkflows(currentProject.metadata.id)}
+                    disabled={isBusy}
+                    className="rounded-md border border-cream-200 px-2 py-1 text-[11px] font-semibold text-cream-600 hover:bg-cream-50 disabled:opacity-60"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                {workflowError && (
+                  <p className="mb-2 text-[11px] font-medium text-red-600">
+                    {workflowError}
+                  </p>
+                )}
+                {savedWorkflows.length === 0 ? (
+                  <p className="text-[11px] text-cream-500">
+                    No saved workflows found.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {savedWorkflows.map((workflow) => {
+                      const args = workflowArgs[workflow.name] ?? "";
+                      const running = workflowBusyName === workflow.name;
+                      return (
+                        <div
+                          key={`${workflow.scope}-${workflow.name}`}
+                          className="grid gap-2 rounded-md border border-cream-100 bg-cream-50/50 p-2 md:grid-cols-[minmax(0,1fr)_minmax(12rem,18rem)_auto]"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="truncate font-mono text-[12px] font-semibold text-cream-800">
+                                /{workflow.name}
+                              </span>
+                              <span className="rounded bg-white px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cream-500">
+                                {workflow.scope}
+                              </span>
+                            </div>
+                            {workflow.description && (
+                              <p className="mt-1 line-clamp-2 text-[11px] text-cream-500">
+                                {workflow.description}
+                              </p>
+                            )}
+                          </div>
+                          <input
+                            value={args}
+                            onChange={(event) =>
+                              setWorkflowArgs((prev) => ({
+                                ...prev,
+                                [workflow.name]: event.target.value,
+                              }))
+                            }
+                            placeholder="Args"
+                            spellCheck={false}
+                            className="min-w-0 rounded-md border border-cream-200 bg-white px-2 py-1.5 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void runSavedWorkflow(workflow)}
+                            disabled={isBusy || running}
+                            className="inline-flex items-center justify-center gap-1.5 rounded-md bg-terracotta px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-60"
+                          >
+                            <Play className="h-3.5 w-3.5" />
+                            {running ? "Running..." : "Run"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
             )}
 
             <CollapsibleSection

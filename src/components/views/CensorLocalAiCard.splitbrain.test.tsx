@@ -32,6 +32,17 @@ import { __test_CensorLocalAiCard as CensorLocalAiCard } from "./WorkspaceView";
 let container: HTMLDivElement;
 let root: Root;
 
+function setNavigator(platform: string, userAgent: string) {
+  Object.defineProperty(window.navigator, "platform", {
+    value: platform,
+    configurable: true,
+  });
+  Object.defineProperty(window.navigator, "userAgent", {
+    value: userAgent,
+    configurable: true,
+  });
+}
+
 async function mount() {
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -45,6 +56,7 @@ beforeEach(() => {
   currentConfig = undefined;
   invokeMock.mockClear();
   refreshConfig.mockClear();
+  setNavigator("Win32", "Windows");
 });
 
 afterEach(() => {
@@ -71,6 +83,39 @@ describe("CensorLocalAiCard split-brain preservation", () => {
     expect(cfg.provider).toBe("ollama");
     // The override survives the provider save (no split-brain wipe).
     expect(cfg.ollamaModel).toBe("gemma4:custom");
+  });
+
+  it("saves appleFm with optional model but no stale baseUrl", async () => {
+    setNavigator("MacIntel", "Mac OS X");
+    currentConfig = {
+      provider: "appleFm",
+      baseUrl: "http://localhost:8000/v1",
+      model: "mlx-community/gemma",
+      other: "ignored",
+    };
+    await mount();
+    const saveBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Save provider"),
+    )!;
+    await act(async () => {
+      saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    const cfg = (invokeMock.mock.calls[0][1] as { config: Record<string, unknown> }).config;
+    expect(cfg.provider).toBe("appleFm");
+    expect(cfg).toEqual({ provider: "appleFm", model: "mlx-community/gemma" });
+    expect(cfg).not.toHaveProperty("baseUrl");
+  });
+
+  it("disables appleFm save on non-macOS with a clear note", async () => {
+    currentConfig = { provider: "appleFm" };
+    await mount();
+    const saveBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Save provider"),
+    )!;
+    expect(saveBtn.disabled).toBe(true);
+    expect(container.textContent).toContain("not available on this OS");
   });
 
   it("saves the bare default when no override exists (no churn)", async () => {

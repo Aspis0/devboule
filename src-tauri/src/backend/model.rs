@@ -523,6 +523,14 @@ pub struct DesignHandoffInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectWorkflowRunInput {
+    pub name: String,
+    #[serde(default)]
+    pub args: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectAgentLaunchInput {
     pub project_id: String,
     pub role: String,
@@ -561,6 +569,12 @@ pub struct ProjectAgentLaunchInput {
     /// `designHandoff`) keep their behavior with zero regression. camelCase over IPC.
     #[serde(default)]
     pub design_handoff: Option<DesignHandoffInput>,
+    /// Saved Claude Code workflow launch. Optional and lenient: absent keeps every
+    /// existing launch unchanged. When present, the backend validates `name` against
+    /// list_saved_workflows(projectId) and builds a fixed addendum; callers never
+    /// provide arbitrary prompt text.
+    #[serde(default)]
+    pub workflow_run: Option<ProjectWorkflowRunInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -771,6 +785,26 @@ where
         .into_iter()
         .filter_map(|entry| {
             serde_json::from_value::<crate::backend::mini_coder::MiniCoderDirective>(entry).ok()
+        })
+        .collect())
+}
+
+fn lenient_visual_check_directives<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::backend::visual_check::VisualCheckDirective>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let entries = match raw {
+        serde_json::Value::Array(items) => items,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            serde_json::from_value::<crate::backend::visual_check::VisualCheckDirective>(entry)
+                .ok()
         })
         .collect())
 }
@@ -1055,6 +1089,14 @@ pub struct AgentLiveState {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub mini_coder_directives: Vec<crate::backend::mini_coder::MiniCoderDirective>,
+    // Visual-check directives (agent -> app): the Python MCP appends pending
+    // requests; the Rust executor renders/captures/critiques and stamps result.
+    #[serde(
+        default,
+        deserialize_with = "lenient_visual_check_directives",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub visual_check_directives: Vec<crate::backend::visual_check::VisualCheckDirective>,
     // GH-P4: agent→human git push-approval requests. The agent's MCP
     // `request_git_push` tool appends a `pending_approval` entry; the human's
     // approve/deny Tauri command drives the rest. Additive + skip-if-empty so an
@@ -2160,6 +2202,51 @@ mod tests {
         let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
         assert_eq!(state.mini_coder_directives.len(), 1);
         assert_eq!(state.mini_coder_directives[0].id, "good");
+    }
+
+    #[test]
+    fn live_state_visual_check_directives_round_trip_camel_case_and_lenient() {
+        let json = r#"{
+            "version": 2,
+            "updatedAt": "2026-06-06T10:00:00+00:00",
+            "sessions": [],
+            "visualCheckDirectives": [
+                {
+                    "id": "v1",
+                    "parentAgentId": "coder-1",
+                    "status": "pending",
+                    "htmlPath": "dist/page.html",
+                    "focus": "header",
+                    "resultPath": "v1.json",
+                    "createdAt": "2026-06-06T10:00:00Z"
+                },
+                { "id": 42, "htmlPath": ["wrong"], "status": "pending" },
+                "totally-not-an-object"
+            ]
+        }"#;
+        let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
+        assert_eq!(state.visual_check_directives.len(), 1);
+        assert_eq!(state.visual_check_directives[0].html_path, "dist/page.html");
+        let back = serde_json::to_string(&state).unwrap();
+        assert!(back.contains("\"visualCheckDirectives\""), "json: {back}");
+        assert!(back.contains("\"parentAgentId\":\"coder-1\""), "json: {back}");
+        assert!(!back.contains("html_path"), "snake leaked: {back}");
+    }
+
+    #[test]
+    fn live_state_without_visual_check_directives_loads_and_no_churn() {
+        let json = r#"{
+            "version": 2,
+            "updatedAt": "2026-06-06T10:00:00+00:00",
+            "sessions": []
+        }"#;
+        let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
+        assert!(state.visual_check_directives.is_empty());
+        let back = serde_json::to_string(&state).unwrap();
+        assert!(
+            !back.contains("visualCheckDirectives"),
+            "no-churn violated: {back}"
+        );
     }
 
     #[test]

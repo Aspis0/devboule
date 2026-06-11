@@ -34,6 +34,17 @@ TOOLS = [
         "description": "Lista componenti con stesso label in aree diverse.",
         "parameters": {},
     },
+    {
+        "name": "visual_check",
+        "description": "Render a self-contained HTML artifact in Aspis Management and return a local visual critique.",
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string"},
+            "html_path": {"type": "string"},
+            "focus": {"type": "string", "default": ""},
+            "session_token": {"type": "string"},
+        },
+    },
 ]
 
 
@@ -49,6 +60,10 @@ def handle_tool_call(name: str, arguments: dict) -> dict | list:
         return engine.similar(arguments["id"], arguments.get("limit", 5))
     if name == "oracle_duplicates":
         return engine.duplicates()
+    if name == "visual_check":
+        from oracle.server.aspis_mcp import handle_tool_call as handle_aspis_tool
+
+        return handle_aspis_tool("visual_check", arguments)
     raise ValueError(f"Unknown Oracle MCP tool: {name}")
 
 
@@ -84,6 +99,20 @@ def create_mcp_server():
     def oracle_duplicates() -> list:
         """Lista componenti con stesso label in aree diverse."""
         return handle_tool_call("oracle_duplicates", {})
+
+    @server.tool()
+    def visual_check(agent_id: str, role: str, html_path: str, focus: str = "", session_token: str = "") -> dict:
+        """Render a self-contained HTML artifact in Aspis Management and return a local visual critique."""
+        return handle_tool_call(
+            "visual_check",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "html_path": html_path,
+                "focus": focus,
+                "session_token": session_token,
+            },
+        )
 
     return server
 

@@ -92,6 +92,48 @@ function DetectedProvidersStrip() {
     [detected, statusMap],
   );
 
+  const detectedAppleFm = useMemo(() => {
+    if (!Array.isArray(detected)) return null;
+    const entry = detected.find((candidate) => candidate?.kind === "appleFm");
+    if (!entry) return null;
+    if (typeof entry !== "object") return null;
+    return entry as DetectedProvider;
+  }, [detected]);
+
+  const isAppleHost = useMemo(() => {
+    if (typeof navigator === "undefined") return null;
+    const platform = (navigator.platform ?? "").toLowerCase();
+    const userAgent = (navigator.userAgent ?? "").toLowerCase();
+    const haystack = `${platform} ${userAgent}`;
+    if (haystack.includes("mac") || haystack.includes("darwin")) return true;
+    if (
+      haystack.includes("win") ||
+      haystack.includes("linux") ||
+      haystack.includes("android") ||
+      haystack.includes("iphone") ||
+      haystack.includes("ipad")
+    )
+      return false;
+    return null;
+  }, []);
+
+  const appleFmStatusText = useMemo(() => {
+    if (!detectedAppleFm) return null;
+    const available = detectedAppleFm.available === true && isAppleHost !== false;
+    const details = String(detectedAppleFm.detail ?? "").trim();
+    const models = Array.isArray(detectedAppleFm.models)
+      ? detectedAppleFm.models.filter((m): m is string => typeof m === "string")
+      : [];
+    if (available) {
+      if (models.length > 0) {
+        return `running (${models.length} model${models.length === 1 ? "" : "s"})`;
+      }
+      return details || "configured";
+    }
+    if (isAppleHost === false) return "not available on this OS";
+    return "not found";
+  }, [detectedAppleFm, isAppleHost]);
+
   return (
     <section className="rounded-2xl border border-cream-200 bg-cream-50/60 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -142,6 +184,24 @@ function DetectedProvidersStrip() {
                 </li>
               );
             })}
+            {detectedAppleFm ? (
+              <li
+                key="appleFm"
+                className="flex items-center justify-between gap-2 rounded-md bg-white px-2.5 py-1.5"
+              >
+                <span className="flex items-center gap-1.5 text-[11px] text-cream-700">
+                  {appleFmStatusText?.startsWith("running") ||
+                  appleFmStatusText === "configured" ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-sage-dark" />
+                  ) : (
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-cream-400" />
+                  )}
+                  <span>
+                    Apple on-device (local model) — {appleFmStatusText}
+                  </span>
+                </span>
+              </li>
+            ) : null}
           </ul>
           {noneAvailable ? (
             <p className="mt-2 text-[10px] text-cream-400">

@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   shouldNotify,
+  notificationDecision,
   startAttentionWatcher,
   buildNotificationBody,
+  buildSummaryNotificationBody,
+  buildOutcomeNotificationBody,
   stripSpoofChars,
   notifyAgentsNeedYou,
   NOTIFICATION_BODY_MAX,
@@ -50,6 +53,10 @@ function deps(now: () => number): ShouldNotifyDeps {
 
 const SINCE_A = "2026-06-04T10:00:00.000Z";
 const SINCE_B = "2026-06-04T10:05:00.000Z";
+
+async function flushAsync(turns = 5): Promise<void> {
+  for (let i = 0; i < turns; i += 1) await Promise.resolve();
+}
 
 describe("shouldNotify", () => {
   it("fires on ENTER (first time a needsUser.since is seen)", () => {
@@ -120,6 +127,16 @@ describe("shouldNotify", () => {
     t += 61_000;
     expect(shouldNotify(overflow, d)).toBe(true);
   });
+
+  it("exposes capped as a decision reason", () => {
+    const d = deps(() => 1_000);
+    d.recentFiresMs.push(...Array.from({ length: NOTIFICATION_PER_MINUTE_CAP }, (_, i) => i));
+    const s = session({
+      agentId: "agent-overflow",
+      needsUser: { reason: "needs_user", message: "q", since: SINCE_A },
+    });
+    expect(notificationDecision(s, d)).toBe("capped");
+  });
 });
 
 describe("startAttentionWatcher singleton guard (#4)", () => {
@@ -128,14 +145,19 @@ describe("startAttentionWatcher singleton guard (#4)", () => {
   // exist so we can prove StrictMode's double-start creates only one.
   function mockStore() {
     const listeners = new Set<(state: { sessions: AgentSession[] }) => void>();
+    let current: AgentSession[] = [];
     const store = {
-      getState: () => ({ sessions: [] as AgentSession[] }),
+      getState: () => ({ sessions: current }),
       subscribe: (fn: (state: { sessions: AgentSession[] }) => void) => {
         listeners.add(fn);
         return () => listeners.delete(fn);
       },
     };
-    return { store: store as unknown as AgentAttentionStore, listeners };
+    const emit = (sessions: AgentSession[]) => {
+      current = sessions;
+      for (const listener of listeners) listener({ sessions });
+    };
+    return { store: store as unknown as AgentAttentionStore, listeners, emit };
   }
 
   it("a second concurrent start is a no-op (only one subscription)", () => {
@@ -163,6 +185,114 @@ describe("startAttentionWatcher singleton guard (#4)", () => {
     expect(listeners.size).toBe(1);
     restart();
     expect(listeners.size).toBe(0);
+  });
+
+  it("loads persisted since values before notifying old needs-user requests", async () => {
+    sendNotificationMock.mockClear();
+    permissionPromise = Promise.resolve(true);
+    const { store, emit } = mockStore();
+    emit([
+      session({
+        needsUser: { reason: "needs_user", message: "old", since: SINCE_A },
+      }),
+    ]);
+    const teardown = startAttentionWatcher(store, {
+      loadPrevSinceByAgent: async () => ({ "a-1": SINCE_A }),
+      savePrevSinceByAgent: async () => {},
+    });
+
+    await flushAsync();
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+    teardown();
+  });
+
+  it("schedules one coalesced summary when the cap suppresses needs-user toasts", async () => {
+    sendNotificationMock.mockClear();
+    permissionPromise = Promise.resolve(true);
+    const { store, emit } = mockStore();
+    const notifySummary = vi.fn(
+      async (_count: number, _isCancelled?: () => boolean) => {},
+    );
+    let nowMs = 1_000;
+    let scheduled: (() => void) | null = null;
+    let scheduleCount = 0;
+    const teardown = startAttentionWatcher(store, {
+      now: () => nowMs,
+      recentFiresMs: Array.from({ length: NOTIFICATION_PER_MINUTE_CAP }, (_, i) => 1_000 + i),
+      loadPrevSinceByAgent: async () => ({}),
+      savePrevSinceByAgent: async () => {},
+      notifySummary,
+      setTimeoutFn: ((fn: () => void) => {
+        scheduleCount += 1;
+        scheduled = fn;
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+      clearTimeoutFn: (() => {}) as typeof clearTimeout,
+    });
+    await flushAsync();
+    emit(
+      Array.from({ length: 3 }, (_, i) =>
+        session({
+          agentId: `blocked-${i}`,
+          lastSeenAt: new Date(0).toISOString(),
+          needsUser: {
+            reason: "needs_user",
+            message: "q",
+            since: `${SINCE_A}-${i}`,
+          },
+        }),
+      ),
+    );
+
+    expect(scheduleCount).toBe(1);
+    nowMs = 62_000;
+    const runScheduled = scheduled;
+    expect(runScheduled).not.toBeNull();
+    (runScheduled as unknown as () => void)();
+    await flushAsync();
+    expect(notifySummary).toHaveBeenCalledWith(3, expect.any(Function));
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+    teardown();
+  });
+
+  it("notifies when an app-hosted agent reaches a terminal outcome", async () => {
+    sendNotificationMock.mockClear();
+    permissionPromise = Promise.resolve(true);
+    const { store, emit } = mockStore();
+    const notifyOutcomes = vi.fn(
+      async (_sessions: AgentSession[], _isCancelled?: () => boolean) => {},
+    );
+    const teardown = startAttentionWatcher(store, {
+      loadPrevSinceByAgent: async () => ({}),
+      savePrevSinceByAgent: async () => {},
+      notifyOutcomes,
+    });
+    await flushAsync();
+    emit([
+      session({
+        agentId: "workflow-release",
+        host: "app",
+        status: "wip",
+        lastSeenAt: new Date().toISOString(),
+      }),
+    ]);
+    emit([
+      session({
+        agentId: "workflow-release",
+        host: "app",
+        status: "done",
+        lastSeenAt: new Date().toISOString(),
+      }),
+    ]);
+    await flushAsync();
+
+    expect(notifyOutcomes).toHaveBeenCalledTimes(1);
+    const outcomeSessions = notifyOutcomes.mock.calls[0]?.[0] ?? [];
+    expect(outcomeSessions.map((s) => s.agentId)).toEqual([
+      "workflow-release",
+    ]);
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+    teardown();
   });
 });
 
@@ -208,6 +338,17 @@ describe("buildNotificationBody", () => {
     expect(body).toBe("coder-7: Approve deploy?");
     // No residual bidi/zero-width code points survive.
     expect(/[​-‏‪-‮⁦-⁩﻿]/.test(body)).toBe(false);
+  });
+});
+
+describe("summary and outcome notification bodies", () => {
+  it("formats summary and outcome bodies", () => {
+    expect(buildSummaryNotificationBody(2)).toBe("2 agents need you");
+    expect(
+      buildOutcomeNotificationBody(
+        session({ agentId: "coder-1", host: "app", status: "failed" }),
+      ),
+    ).toBe("coder-1: failed");
   });
 });
 

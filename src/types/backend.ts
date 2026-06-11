@@ -1050,6 +1050,12 @@ export interface ProjectAgentLaunchInput {
   // leaves the verifier prompt unchanged (back-compat). Mirrors the
   // #[serde(default)] censor_review on ProjectAgentLaunchInput in model.rs.
   censorReview?: boolean | null;
+  // Saved Claude Code workflow launch. The backend validates name against
+  // list_saved_workflows(projectId) before building the fixed prompt addendum.
+  workflowRun?: {
+    name: string;
+    args?: string | null;
+  } | null;
 }
 
 export interface ProjectAgentLaunchResult {
@@ -1061,6 +1067,12 @@ export interface ProjectAgentLaunchResult {
   prompt: string;
   launched: boolean;
   message: string;
+}
+
+export interface SavedWorkflow {
+  name: string;
+  description?: string | null;
+  scope: "project" | "global" | string;
 }
 
 // Result of project_git_commit / project_git_push (Work mode top bar). The

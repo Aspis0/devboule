@@ -437,6 +437,7 @@ fn default_agent_live_state() -> AgentLiveState {
         mcp_command: String::new(),
         mcp_client_config: String::new(),
         mini_coder_directives: Vec::new(),
+        visual_check_directives: Vec::new(),
         git_push_requests: Vec::new(),
         plan_approval_requests: Vec::new(),
     }
@@ -778,6 +779,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "oracle_context",
                 "censor_findings",
                 "censor_dispose",
+                "visual_check",
                 "spawn_mini_coder",
                 "request_git_push",
                 "plan_submit",
@@ -807,6 +809,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 // retries), the coder REDOES that file itself — the training rail already
                 // captured the failed attempts — and does NOT re-spawn the mini for it.
                 "If spawn_mini_coder returns status='escalated', REDO that file yourself (the mini's automatic retries failed Censor and the training rail captured them); do NOT re-spawn the mini for the same file.",
+                "When you produce or review a self-contained HTML artifact and need visual feedback, call visual_check(html_path, focus?) and treat the returned critique as advisory evidence.",
             ]
             .into_iter()
             .map(String::from)
@@ -869,6 +872,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "oracle_context",
                 "censor_findings",
                 "censor_dispose",
+                "visual_check",
                 "ask_user",
                 "plan_status",
             ]
@@ -879,6 +883,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "No coding.",
                 "No Cloudflare or Scaleway mutation; read-only provider access.",
                 "No done status unless the task is in review and evidence/confidence are concrete.",
+                "When reviewing a self-contained HTML artifact, call visual_check(html_path, focus?) if visual layout could affect the verdict; treat the critique as advisory evidence.",
             ]
             .into_iter()
             .map(String::from)
@@ -2746,6 +2751,7 @@ mod tests {
             "oracle_context",
             "censor_findings",
             "censor_dispose",
+            "visual_check",
             "spawn_mini_coder",
             "request_git_push",
             "plan_submit",
@@ -2769,6 +2775,7 @@ mod tests {
             "oracle_context",
             "censor_findings",
             "censor_dispose",
+            "visual_check",
             "ask_user",
             "plan_status",
         ];

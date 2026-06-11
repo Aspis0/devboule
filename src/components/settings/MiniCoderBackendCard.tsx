@@ -22,6 +22,23 @@ import type {
   MiniCoderBackendKind,
 } from "../../types/config";
 
+function inferIsAppleHostMac(): boolean | null {
+  if (typeof navigator === "undefined") return null;
+  const platform = (navigator.platform ?? "").toLowerCase();
+  const userAgent = (navigator.userAgent ?? "").toLowerCase();
+  const haystack = `${platform} ${userAgent}`;
+  if (haystack.includes("mac") || haystack.includes("darwin")) return true;
+  if (
+    haystack.includes("win") ||
+    haystack.includes("linux") ||
+    haystack.includes("android") ||
+    haystack.includes("iphone") ||
+    haystack.includes("ipad")
+  )
+    return false;
+  return null;
+}
+
 // Settings → Providers card to configure the single global mini-coder backend
 // (the runtime one-shot mini-coders run on). A discriminated form: pick the kind
 // (Ollama / cheap-API CLI / Codex subscription) and fill the field that kind
@@ -78,6 +95,7 @@ export function MiniCoderBackendCard() {
   const showModelError =
     (kind === "ollama" ||
       kind === "omlx" ||
+      kind === "appleFm" ||
       (kind === "codex" && model.length > 0)) &&
     Boolean(validation.errors.model);
   // M11: the api command is REQUIRED, so surface its error even when empty (mirroring
@@ -88,6 +106,17 @@ export function MiniCoderBackendCard() {
   // required ollama model / api command above) — an empty/invalid base just greys out
   // Save otherwise, with no inline reason for WHY.
   const showBaseUrlError = kind === "omlx" && Boolean(validation.errors.baseUrl);
+  const isAppleHostMac = useMemo(() => inferIsAppleHostMac(), []);
+  const appleFmDisabled = kind === "appleFm" && isAppleHostMac === false;
+
+  const appleFmAvailabilityNote = useMemo(() => {
+    if (kind !== "appleFm") return null;
+    if (isAppleHostMac === true) return null;
+    if (isAppleHostMac === false) {
+      return "Apple on-device is not available on this OS. Configure it on macOS 27+.";
+    }
+    return "Apple on-device requires macOS 27+; saving is still allowed for cross-machine use.";
+  }, [kind, isAppleHostMac]);
 
   const save = useCallback(
     async (next: MiniCoderBackend | null) => {
@@ -179,17 +208,20 @@ export function MiniCoderBackendCard() {
             <option value="codex">Codex (your subscription)</option>
             <option value="ollama">Ollama (local model)</option>
             <option value="omlx">oMLX (local MLX server)</option>
+            <option value="appleFm" disabled={isAppleHostMac === false}>
+              Apple on-device (macOS)
+            </option>
             <option value="api">API CLI (your command)</option>
           </select>
         </label>
 
-        {kind === "ollama" || kind === "codex" || kind === "omlx" ? (
+        {kind === "ollama" || kind === "codex" || kind === "omlx" || kind === "appleFm" ? (
           <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-            Model {kind === "codex" ? "(optional)" : "tag"}
+            Model {kind === "codex" || kind === "appleFm" ? "(optional)" : "tag"}
             <input
               value={model}
               onChange={(event) => setModel(event.target.value)}
-              placeholder={kind === "codex" ? "gpt-5-codex" : "qwen2.5-coder"}
+              placeholder={kind === "appleFm" ? "default" : kind === "codex" ? "gpt-5-codex" : "qwen2.5-coder"}
               maxLength={MINI_MODEL_MAX_LENGTH}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             />
@@ -256,6 +288,19 @@ export function MiniCoderBackendCard() {
           </p>
         ) : null}
 
+        {kind === "appleFm" ? (
+          <p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
+            Apple on-device is a local macOS runtime; no network base URL or command is
+            used for this backend.
+          </p>
+        ) : null}
+
+        {appleFmAvailabilityNote ? (
+          <p className="md:col-span-2 text-[11px] leading-4 text-amber-dark">
+            {appleFmAvailabilityNote}
+          </p>
+        ) : null}
+
         <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
           Max concurrent slots
           <select
@@ -275,7 +320,7 @@ export function MiniCoderBackendCard() {
           <button
             type="button"
             onClick={() => void onSave()}
-            disabled={busy || !validation.ok}
+            disabled={busy || !validation.ok || appleFmDisabled}
             className="inline-flex items-center gap-2 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
           >
             <CheckCircle2 className="h-3.5 w-3.5" />

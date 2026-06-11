@@ -1076,6 +1076,7 @@ mod tests {
             findings: vec![super::super::mini_coder::EscalationFinding {
                 file: "src/x.rs".into(),
                 severity: "high".into(),
+                source: "clippy".into(),
                 title: "unhandled unwrap".into(),
                 line: Some(42),
             }],
@@ -1096,6 +1097,7 @@ mod tests {
         let findings = esc["findings"].as_array().expect("findings array");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["file"], "src/x.rs");
+        assert_eq!(findings[0]["source"], "clippy");
         assert_eq!(findings[0]["title"], "unhandled unwrap");
         assert_eq!(findings[0]["line"], 42);
         std::fs::remove_dir_all(&root).ok();

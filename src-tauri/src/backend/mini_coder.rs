@@ -199,6 +199,8 @@ pub struct EscalationFinding {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub severity: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
@@ -675,7 +677,13 @@ pub fn summarize_findings_for_feedback(findings: &[EscalationFinding]) -> String
         .map(|f| {
             let line = f.line.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
             let sev = if f.severity.is_empty() { "high" } else { &f.severity };
-            format!("- {}:{} [{}] — {}", f.file, line, sev, f.title)
+            let source = f.source.trim();
+            let tag = if source.is_empty() {
+                sev.to_string()
+            } else {
+                format!("{sev}/{source}")
+            };
+            format!("- {}:{} [{}] — {}", f.file, line, tag, f.title)
         })
         .collect();
     if findings.len() > MAX_FEEDBACK_FINDINGS {
@@ -685,6 +693,37 @@ pub fn summarize_findings_for_feedback(findings: &[EscalationFinding]) -> String
         ));
     }
     lines.join("\n")
+}
+
+pub fn blocking_censor_findings(findings: &[EscalationFinding]) -> Vec<EscalationFinding> {
+    findings
+        .iter()
+        .filter(|f| {
+            f.severity.eq_ignore_ascii_case("high")
+                && !f.source.eq_ignore_ascii_case("visual")
+        })
+        .cloned()
+        .collect()
+}
+
+pub const VISUAL_ADVISORY_TITLE_MAX_CHARS: usize = 500;
+
+pub fn visual_advisory_finding(file: &str, critique: &str) -> Option<EscalationFinding> {
+    let trimmed = critique.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let title = match trimmed.char_indices().nth(VISUAL_ADVISORY_TITLE_MAX_CHARS) {
+        Some((idx, _)) => format!("{}...", &trimmed[..idx]),
+        None => trimmed.to_string(),
+    };
+    Some(EscalationFinding {
+        file: file.to_string(),
+        severity: "info".into(),
+        source: "visual".into(),
+        title,
+        line: None,
+    })
 }
 
 /// P6: the pure decision the post-`done` verdict gate produces, computed from the
@@ -739,8 +778,10 @@ pub fn verdict_gate_decision(
     if !trusted {
         return GateDecision::StampTerminal(outcome.clone());
     }
-    // Clean (no High findings) → Done as today.
-    if high_findings.is_empty() {
+    let blocking_findings = blocking_censor_findings(&high_findings);
+    // Clean (no blocking High findings) → Done as today. Visual findings are advisory
+    // only and never force a retry by themselves.
+    if blocking_findings.is_empty() {
         return GateDecision::StampTerminal(outcome.clone());
     }
     // Dirty. Retry if budget remains, else escalate.
@@ -1309,6 +1350,11 @@ pub enum MiniCoderBackendKind {
     /// `base_url` REQUIRED; `command` is unused. The base URL is constrained to a
     /// LOOPBACK http origin (http only; privacy: the prompt never leaves the device).
     Omlx,
+    /// Apple Foundation Models via the macOS `fm respond` CLI. `command`/`base_url` are
+    /// ignored and `model` is optional; execution resolves the trusted `fm` binary and
+    /// feeds the prompt over stdin.
+    #[serde(rename = "appleFm")]
+    AppleFm,
 }
 
 /// The single, global mini-coder backend config persisted in config.json under
@@ -1633,6 +1679,30 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
             }
             Ok(MiniCoderBackend {
                 kind: MiniCoderBackendKind::Codex,
+                model: if model.is_empty() { None } else { Some(model) },
+                command: None,
+                base_url: None,
+                max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+            })
+        }
+        MiniCoderBackendKind::AppleFm => {
+            // AppleFm keeps the same model guardrail as oMLX (bare token), but is OPTIONAL.
+            // Any configured command/base_url are dropped because execution always resolves
+            // the fixed Apple `fm respond` CLI on macOS.
+            if !model.is_empty() {
+                if model.len() > MINI_MODEL_MAX_LEN {
+                    return Err(format!(
+                        "Mini-coder model must be at most {MINI_MODEL_MAX_LEN} characters."
+                    ));
+                }
+                if !is_valid_model(&model) {
+                    return Err(
+                        "Mini-coder model must be a bare tag (letters, digits, . _ : / -).".into(),
+                    );
+                }
+            }
+            Ok(MiniCoderBackend {
+                kind: MiniCoderBackendKind::AppleFm,
                 model: if model.is_empty() { None } else { Some(model) },
                 command: None,
                 base_url: None,
@@ -2592,6 +2662,7 @@ mod tests {
         EscalationFinding {
             file: "src/a.rs".into(),
             severity: "high".into(),
+            source: "clippy".into(),
             title: "unwrap on None".into(),
             line: Some(12),
         }
@@ -2638,6 +2709,27 @@ mod tests {
     }
 
     #[test]
+    fn gate_visual_only_finding_is_advisory_not_retry() {
+        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["dist/page.html".into()],
+            ..Default::default()
+        });
+        let visual = visual_advisory_finding("dist/page.html", "Header text overflows").unwrap();
+        let decision = verdict_gate_decision(
+            &d,
+            &outcome,
+            true,
+            vec![visual],
+            "root-r1",
+            "root-r1.json",
+            "2026-06-06T00:00:10Z",
+        );
+        assert_eq!(decision, GateDecision::StampTerminal(outcome));
+    }
+
+    #[test]
     fn gate_trusted_dirty_with_budget_builds_retry() {
         let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
         let outcome = MiniCoderOutcome::done(MiniCoderResult {
@@ -2661,7 +2753,35 @@ mod tests {
                 assert_eq!(retry.status, MiniCoderStatus::Pending);
                 assert_eq!(retry.parent_directive_id.as_deref(), Some("root"));
                 assert!(retry.task.contains("unwrap on None"), "feedback: {}", retry.task);
+                assert!(retry.task.contains("[high/clippy]"), "feedback: {}", retry.task);
                 assert!(retry.files.contains(&"src/a.rs".to_string()));
+            }
+            other => panic!("expected AwaitingRetryWith, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_mixed_visual_and_blocking_findings_includes_visual_in_retry_feedback() {
+        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["src/a.rs".into(), "dist/page.html".into()],
+            ..Default::default()
+        });
+        let visual = visual_advisory_finding("dist/page.html", "Button overlaps footer").unwrap();
+        let decision = verdict_gate_decision(
+            &d,
+            &outcome,
+            true,
+            vec![high_finding(), visual],
+            "root-r1",
+            "root-r1.json",
+            "2026-06-06T00:00:10Z",
+        );
+        match decision {
+            GateDecision::AwaitingRetryWith { retry } => {
+                assert!(retry.task.contains("[info/visual]"), "feedback: {}", retry.task);
+                assert!(retry.task.contains("Button overlaps footer"), "feedback: {}", retry.task);
             }
             other => panic!("expected AwaitingRetryWith, got {other:?}"),
         }
@@ -3063,11 +3183,57 @@ mod tests {
             (MiniCoderBackendKind::Ollama, "ollama"),
             (MiniCoderBackendKind::Api, "api"),
             (MiniCoderBackendKind::Codex, "codex"),
+            (MiniCoderBackendKind::AppleFm, "appleFm"),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{tok}\""));
             let back: MiniCoderBackendKind = serde_json::from_str(&format!("\"{tok}\"")).unwrap();
             assert_eq!(back, kind);
         }
+    }
+
+    #[test]
+    fn applefm_accepts_optional_model_and_rejects_bad_model() {
+        let no_model = MiniCoderBackend {
+            kind: MiniCoderBackendKind::AppleFm,
+            model: None,
+            command: Some("dropped".into()),
+            base_url: Some("dropped".into()),
+            max_concurrent: Some(0),
+        };
+        let n = validate_mini_coder_backend(&no_model).unwrap();
+        assert_eq!(n.model, None);
+        assert_eq!(n.command, None);
+        assert_eq!(n.base_url, None);
+        assert_eq!(n.max_concurrent, Some(1));
+
+        let bad = MiniCoderBackend {
+            kind: MiniCoderBackendKind::AppleFm,
+            model: Some("bad model".into()),
+            command: None,
+            base_url: None,
+            max_concurrent: Some(9),
+        };
+        assert!(validate_mini_coder_backend(&bad).is_err());
+        assert_eq!(
+            validate_mini_coder_backend(&bad).unwrap_err(),
+            "Mini-coder model must be a bare tag (letters, digits, . _ : / -)."
+        );
+    }
+
+    #[test]
+    fn applefm_keeps_optional_model() {
+        let with_model = MiniCoderBackend {
+            kind: MiniCoderBackendKind::AppleFm,
+            model: Some("gpt-5".into()),
+            command: Some("dropped".into()),
+            base_url: Some("dropped".into()),
+            max_concurrent: None,
+        };
+        let n = validate_mini_coder_backend(&with_model).unwrap();
+        assert_eq!(n.model.as_deref(), Some("gpt-5"));
+        assert_eq!(n.command, None);
+        assert_eq!(n.base_url, None);
+        assert_eq!(n.max_concurrent, None);
     }
 
     #[test]
@@ -3492,6 +3658,7 @@ mod tests {
             findings: vec![EscalationFinding {
                 file: "src/a.rs".into(),
                 severity: "high".into(),
+                source: "clippy".into(),
                 title: "unwrap on None".into(),
                 line: Some(42),
             }],

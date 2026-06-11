@@ -826,6 +826,7 @@ mod tests {
             mcp_command: String::new(),
             mcp_client_config: String::new(),
             mini_coder_directives: Vec::new(),
+            visual_check_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
         };

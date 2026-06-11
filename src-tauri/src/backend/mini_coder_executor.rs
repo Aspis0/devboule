@@ -62,6 +62,7 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 /// Scratch dir name (under the project root) where minis write their result files.
 /// A sibling of `.aspis-censor`; `read_result_file` confines reads to it.
 const MINI_SCRATCH_DIR: &str = ".aspis-mini";
+const VISUAL_CHECK_TIMEOUT_SECS: i64 = 120;
 
 /// Env var carrying the PATH to the OPTIONAL oMLX bearer-token file (oMLX-P2). The
 /// token itself NEVER touches argv/PTY/logs: it lives in a 0600 restricted file whose
@@ -573,8 +574,15 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
     // 1) Locked READ snapshot, then work entirely off the clone (lock released).
     let snapshot = agents::read_agent_live_state_snapshot(app)?;
     let directives = snapshot.mini_coder_directives.clone();
-    if directives.is_empty() {
+    let visual_directives = snapshot.visual_check_directives.clone();
+    if directives.is_empty() && visual_directives.is_empty() {
         return Ok(()); // EARLY EXIT: nothing to do, cheapest idle path.
+    }
+    if !visual_directives.is_empty() {
+        run_visual_check_pass(app, &snapshot, &visual_directives);
+    }
+    if directives.is_empty() {
+        return Ok(());
     }
 
     // WARNING 3 (self-healing): reconcile AwaitingRetry directives whose retry child is
@@ -764,6 +772,117 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn run_visual_check_pass(
+    app: &AppHandle,
+    snapshot: &crate::backend::model::AgentLiveState,
+    directives: &[crate::backend::visual_check::VisualCheckDirective],
+) {
+    let now = Utc::now().to_rfc3339();
+    for directive in directives.iter().filter(|d| {
+        crate::backend::visual_check::claimed_timed_out(d, &now, VISUAL_CHECK_TIMEOUT_SECS)
+    }) {
+        let id = directive.id.clone();
+        let _ = agents::mutate_agent_live_state(app, |state| {
+            transition_visual_directive(state, &id, |d| {
+                crate::backend::visual_check::apply_result(
+                    d,
+                    crate::backend::visual_check::VisualCheckOutcome::timeout(
+                        "visual_check timed out waiting for the local critique",
+                    ),
+                )
+            });
+            cap_pass(state);
+        });
+    }
+
+    if directives.iter().any(|d| d.status == crate::backend::visual_check::VisualCheckStatus::Running) {
+        return;
+    }
+    let Some(candidate) = directives
+        .iter()
+        .find(|d| d.status == crate::backend::visual_check::VisualCheckStatus::Pending)
+        .cloned()
+    else {
+        return;
+    };
+    let parent_project = snapshot_parent_project(snapshot, &candidate.parent_agent_id)
+        .filter(|p| !p.trim().is_empty());
+    let claimed_at = Utc::now().to_rfc3339();
+    let id = candidate.id.clone();
+    let claimed = agents::mutate_agent_live_state(app, |state| {
+        let Some(d) = state.visual_check_directives.iter_mut().find(|d| d.id == id) else {
+            return false;
+        };
+        if d.status != crate::backend::visual_check::VisualCheckStatus::Pending {
+            return false;
+        }
+        match crate::backend::visual_check::apply_claim(d, claimed_at.clone()) {
+            Ok(next) => {
+                *d = next;
+                cap_pass(state);
+                true
+            }
+            Err(_) => false,
+        }
+    });
+    if !matches!(claimed, Ok(true)) {
+        return;
+    }
+    let Some(project_id) = parent_project else {
+        finish_visual_check(
+            app,
+            &candidate.id,
+            crate::backend::visual_check::VisualCheckOutcome::failed(
+                "parent agent has no current project",
+            ),
+        );
+        return;
+    };
+    let project_root = match crate::backend::projects::resolve_project_root_by_id(app, &project_id) {
+        Ok(root) => root,
+        Err(_) => {
+            finish_visual_check(
+                app,
+                &candidate.id,
+                crate::backend::visual_check::VisualCheckOutcome::failed("not under project root"),
+            );
+            return;
+        }
+    };
+    let app_clone = app.clone();
+    let directive = candidate.clone();
+    let spawned = std::thread::Builder::new()
+        .name("visual-check-executor".into())
+        .spawn(move || {
+            let outcome =
+                crate::backend::visual_check::execute_visual_check(app_clone.clone(), &project_root, &directive);
+            finish_visual_check(&app_clone, &directive.id, outcome);
+        });
+    if spawned.is_err() {
+        finish_visual_check(
+            app,
+            &candidate.id,
+            crate::backend::visual_check::VisualCheckOutcome::failed(
+                "could not start visual_check executor",
+            ),
+        );
+    }
+}
+
+fn finish_visual_check(
+    app: &AppHandle,
+    id: &str,
+    outcome: crate::backend::visual_check::VisualCheckOutcome,
+) {
+    let id = id.to_string();
+    let _ = agents::mutate_agent_live_state(app, |state| {
+        transition_visual_directive(state, &id, |d| {
+            crate::backend::visual_check::apply_result(d, outcome)
+        });
+        cap_pass(state);
+    });
 }
 
 /// Atomically claim a pending directive (under the lock, re-checking status so a
@@ -1489,13 +1608,39 @@ fn real_censor_verdict(
                 out.push(mini_coder::EscalationFinding {
                     file: f.file,
                     severity: "high".into(),
+                    source: f.source,
                     title: f.title,
                     line: f.line,
                 });
             }
         }
     }
+    if let Some((html_rel, critique)) = visual_advisory_for_html(app, root, &rel_files) {
+        if let Some(finding) = mini_coder::visual_advisory_finding(&html_rel, &critique) {
+            out.push(finding);
+        }
+    }
     out
+}
+
+fn visual_advisory_for_html(
+    app: &AppHandle,
+    root: &Path,
+    rel_files: &[String],
+) -> Option<(String, String)> {
+    let rel = crate::backend::visual_check::select_self_contained_html(root, rel_files)?;
+    let directive = crate::backend::visual_check::VisualCheckDirective {
+        id: "mini-coder-verdict-visual".into(),
+        parent_agent_id: String::new(),
+        html_path: rel.clone(),
+        focus: Some("Advisory Censor pass: report visible UI defects only. This finding is informational and must not block alone.".into()),
+        ..crate::backend::visual_check::VisualCheckDirective::default()
+    };
+    let outcome = crate::backend::visual_check::execute_visual_check(app.clone(), root, &directive);
+    if outcome.status != crate::backend::visual_check::VisualCheckStatus::Done {
+        return None;
+    }
+    outcome.critique.map(|critique| (rel, critique))
 }
 
 /// PURE decision: the terminal `MiniCoderOutcome` a finished mini's directive should
@@ -1570,12 +1715,28 @@ fn transition_directive(
     // time rather than per directive.
 }
 
+fn transition_visual_directive(
+    state: &mut crate::backend::model::AgentLiveState,
+    id: &str,
+    apply: impl FnOnce(
+        &crate::backend::visual_check::VisualCheckDirective,
+    ) -> Result<crate::backend::visual_check::VisualCheckDirective, String>,
+) {
+    if let Some(d) = state.visual_check_directives.iter_mut().find(|d| d.id == id) {
+        if let Ok(next) = apply(d) {
+            *d = next;
+        }
+    }
+}
+
 /// NITPICK 1: bound the directive queue ONCE per write pass. Called at the end of
 /// every `mutate_agent_live_state` closure that touches directives, so the eviction
 /// (oldest TERMINAL only) runs a single time per persisted write rather than per
 /// `transition_directive`.
 fn cap_pass(state: &mut crate::backend::model::AgentLiveState) {
     mini_coder::cap_directives(&mut state.mini_coder_directives, MAX_DIRECTIVES);
+    state.visual_check_directives =
+        crate::backend::visual_check::cap_directives(std::mem::take(&mut state.visual_check_directives));
 }
 
 /// WARNING 5: like [`cap_pass`] but never evicts the `protect` ids this pass — used by
@@ -1583,6 +1744,8 @@ fn cap_pass(state: &mut crate::backend::model::AgentLiveState) {
 /// stamped terminal in THIS mutate survives the cap until the poll can read its outcome.
 fn cap_pass_protecting(state: &mut crate::backend::model::AgentLiveState, protect: &[String]) {
     mini_coder::cap_directives_protecting(&mut state.mini_coder_directives, MAX_DIRECTIVES, protect);
+    state.visual_check_directives =
+        crate::backend::visual_check::cap_directives(std::mem::take(&mut state.visual_check_directives));
 }
 
 /// WARNING 5: the set of ids freshly stamped terminal in a finalize/propagation mutate
@@ -1801,6 +1964,7 @@ fn backend_client_label(backend: &MiniCoderBackend) -> String {
         MiniCoderBackendKind::Api => "api",
         MiniCoderBackendKind::Codex => "codex",
         MiniCoderBackendKind::Omlx => "omlx",
+        MiniCoderBackendKind::AppleFm => "appleFm",
     }
     .to_string()
 }
@@ -1974,6 +2138,7 @@ and exit; you cannot ask follow-up questions interactively.\n\n",
 - NEVER delete, move, or create files outside the FILE SCOPE above.\n\
 - NEVER make network writes, installs, or external calls.\n\
 - Do ONLY the single task; do not refactor, reformat, or touch unrelated code.\n\
+- If you create or change a self-contained .html artifact, include it in filesTouched so the parent coder can run visual_check for visual feedback.\n\
 - If the task is ambiguous or unsafe, do NOT guess: report needs_clarification.\n\n",
     );
 
@@ -2273,6 +2438,9 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
             let key_env = key_file.map(|_| OMLX_KEY_FILE_ENV);
             let run = build_omlx_run_windows(base_url, model, key_env);
             windows_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+        }
+        MiniCoderBackendKind::AppleFm => {
+            return Err("Apple on-device requires macOS 27+.".to_string());
         }
     };
 
@@ -2612,6 +2780,16 @@ OMLXEOF\n"
     )
 }
 
+#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
+fn build_apple_fm_run_macos(prompt_pipe: &str, fm_path: &str, model: Option<&str>) -> String {
+    let mut parts = vec![sh_single_quote_portable(fm_path), "respond".to_string()];
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        parts.push("--model".to_string());
+        parts.push(sh_single_quote_portable(model));
+    }
+    format!("{prompt_pipe} | {}", parts.join(" "))
+}
+
 #[cfg(target_os = "macos")]
 fn build_mini_command_impl(
     backend: &MiniCoderBackend,
@@ -2745,6 +2923,13 @@ fn build_mini_command_impl(
             let run = build_omlx_run_macos(base_url, model, &prompt_path, key_file.is_some());
             macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
         }
+        MiniCoderBackendKind::AppleFm => {
+            let fm = crate::backend::provider_detect::resolve_program("fm")
+                .ok_or_else(|| "Apple on-device requires macOS 27+.".to_string())?;
+            let fm_path = fm.to_string_lossy();
+            let run = build_apple_fm_run_macos(&prompt_pipe, fm_path.as_ref(), backend.model.as_deref());
+            macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+        }
     };
 
     let script = format!("{preamble}{body}exit 0");
@@ -2826,13 +3011,16 @@ fn sh_single_quote_local(value: &str) -> String {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn build_mini_command_impl(
-    _backend: &MiniCoderBackend,
+    backend: &MiniCoderBackend,
     _project_root: &Path,
     _result_target: &Path,
     _prompt_file: &Path,
     _key_file: Option<&Path>,
     _mcp_roots: Option<&McpRoots>,
 ) -> Result<CommandBuilder, String> {
+    if backend.kind == MiniCoderBackendKind::AppleFm {
+        return Err("Apple on-device requires macOS 27+.".into());
+    }
     Err("Mini-coder is supported on Windows and macOS only.".into())
 }
 
@@ -3082,6 +3270,7 @@ mod tests {
             mcp_command: String::new(),
             mcp_client_config: String::new(),
             mini_coder_directives: Vec::new(),
+            visual_check_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
         };
@@ -3306,6 +3495,7 @@ mod tests {
             mcp_command: String::new(),
             mcp_client_config: String::new(),
             mini_coder_directives: Vec::new(),
+            visual_check_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
         };
@@ -3361,6 +3551,7 @@ mod tests {
             mcp_command: String::new(),
             mcp_client_config: String::new(),
             mini_coder_directives: Vec::new(),
+            visual_check_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
         }
@@ -4183,6 +4374,7 @@ mod tests {
         let findings = vec![mini_coder::EscalationFinding {
             file: "src/a.rs".into(),
             severity: "high".into(),
+            source: "clippy".into(),
             title: "panics on empty input".into(),
             line: Some(7),
         }];
@@ -4463,6 +4655,7 @@ mod tests {
             prompt.contains("outside the FILE SCOPE"),
             "scope constraint missing"
         );
+        assert!(prompt.contains("visual_check"), "visual-check handoff missing");
         // Result schema present.
         assert!(
             prompt.contains("needs_clarification"),
@@ -4529,6 +4722,19 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_command_applefm_windows_returns_clean_macos_only_error() {
+        let root = std::env::temp_dir();
+        let result_target = root.join("d1.json");
+        let prompt_file = root.join("fake-prompt.txt");
+        let b = backend(MiniCoderBackendKind::AppleFm, Some("apple-model"), None);
+        let err =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None)
+                .unwrap_err();
+        assert_eq!(err, "Apple on-device requires macOS 27+.");
     }
 
     #[cfg(windows)]
@@ -5205,6 +5411,20 @@ mod tests {
         );
         // The token VALUE never appears literally — only the file is read.
         assert!(!run.contains("Bearer sk-"), "no literal token in the script: {run}");
+    }
+
+    #[test]
+    fn apple_fm_macos_run_uses_fixed_fm_respond_and_prompt_pipe_only() {
+        let run = build_apple_fm_run_macos(
+            "cat '/tmp/aspis prompt.d/p.txt'",
+            "/usr/bin/fm",
+            Some("apple-default"),
+        );
+        assert_eq!(
+            run,
+            "cat '/tmp/aspis prompt.d/p.txt' | '/usr/bin/fm' respond --model 'apple-default'"
+        );
+        assert!(!run.contains("TOP_SECRET_PROMPT"));
     }
 
     #[test]

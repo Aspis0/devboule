@@ -28,8 +28,18 @@ describe("CensorLocalAiCard", () => {
     expect(html).toContain("Censor local AI");
     expect(html).toContain('value="ollama"');
     expect(html).toContain("Ollama (default)");
+    expect(html).toContain('value="appleFm"');
+    expect(html).toContain("Apple on-device");
     expect(html).toContain('value="omlx"');
     expect(html).toContain("oMLX (local MLX server)");
+  });
+
+  it("renders Apple on-device as optional model-only config with no base URL field", () => {
+    currentConfig = { provider: "appleFm", model: "apple-default" };
+    const html = renderToStaticMarkup(<CensorLocalAiCard />);
+    expect(html).toContain("Model (optional)");
+    expect(html).toContain("apple-default");
+    expect(html).not.toContain("Base URL");
   });
 
   it("hides the oMLX Base URL + Model fields when the provider is Ollama", () => {

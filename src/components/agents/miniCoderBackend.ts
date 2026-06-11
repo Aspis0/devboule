@@ -23,6 +23,7 @@ export const MINI_BACKEND_KINDS: readonly MiniCoderBackendKind[] = [
   "api",
   "codex",
   "omlx",
+  "appleFm",
 ] as const;
 
 // WARNING 6: any control char (0x00-0x1f, DEL 0x7f) PLUS the bidi-control /
@@ -217,6 +218,16 @@ export function validateMiniBackend(
           "Base URL must be a loopback http origin (localhost, 127.0.0.1 or [::1]).";
       }
     }
+  } else if (draft.kind === "appleFm") {
+    // appleFm is Apple on-device and uses an optional model field only.
+    // Save remains permissive for cross-machine workflow: empty keeps only
+    // `{kind:"appleFm"}`, non-empty stores `{kind:"appleFm", model}`.
+    if (model.length > MINI_MODEL_MAX_LENGTH) {
+      errors.model = `Model must be at most ${MINI_MODEL_MAX_LENGTH} characters.`;
+    } else if (model.length > 0 && !MODEL_PATTERN.test(model)) {
+      errors.model =
+        "Model must be a bare tag (letters, digits, . _ : / -).";
+    }
   }
 
   const ok = Object.keys(errors).length === 0;
@@ -235,6 +246,8 @@ export function validateMiniBackend(
     // (NOT `?? baseUrl`) so a future refactor that breaks this invariant surfaces
     // immediately instead of silently persisting an UNVALIDATED url (F3).
     value = { kind: "omlx", model, baseUrl: normalizedBaseUrl! };
+  } else if (draft.kind === "appleFm") {
+    value = model.length > 0 ? { kind: "appleFm", model } : { kind: "appleFm" };
   } else {
     value = model.length > 0 ? { kind: "codex", model } : { kind: "codex" };
   }

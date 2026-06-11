@@ -925,6 +925,23 @@ function seedCensorString(raw: unknown): string {
   return typeof raw === "string" ? raw : "";
 }
 
+function inferIsAppleHostMac(): boolean | null {
+  if (typeof navigator === "undefined") return null;
+  const platform = (navigator.platform ?? "").toLowerCase();
+  const userAgent = (navigator.userAgent ?? "").toLowerCase();
+  const haystack = `${platform} ${userAgent}`;
+  if (haystack.includes("mac") || haystack.includes("darwin")) return true;
+  if (
+    haystack.includes("win") ||
+    haystack.includes("linux") ||
+    haystack.includes("android") ||
+    haystack.includes("iphone") ||
+    haystack.includes("ipad")
+  )
+    return false;
+  return null;
+}
+
 function CensorLocalAiCard() {
   const { config } = useAppContext();
   const { refreshConfig } = useAppActions();
@@ -971,11 +988,23 @@ function CensorLocalAiCard() {
     () => validateCensorLocalAi({ provider, baseUrl, model, ollamaModel: existingOllamaModel }),
     [provider, baseUrl, model, existingOllamaModel],
   );
+  const isAppleHostMac = useMemo(() => inferIsAppleHostMac(), []);
+  const appleFmDisabled = provider === "appleFm" && isAppleHostMac === false;
+  const appleFmAvailabilityNote = useMemo(() => {
+    if (provider !== "appleFm") return null;
+    if (isAppleHostMac === true) return null;
+    if (isAppleHostMac === false) {
+      return "Apple on-device is not available on this OS. Configure it on macOS 27+.";
+    }
+    return "Apple on-device requires macOS 27+; saving is still allowed for cross-machine use.";
+  }, [provider, isAppleHostMac]);
   // The oMLX base/model are REQUIRED, so surface their errors even when empty (mirroring
   // the mini-coder card) — an empty/invalid field just greys out Save otherwise, with no
   // inline reason for WHY.
   const showBaseUrlError = provider === "omlx" && Boolean(validation.errors.baseUrl);
-  const showModelError = provider === "omlx" && Boolean(validation.errors.model);
+  const showModelError =
+    (provider === "omlx" || provider === "appleFm") &&
+    Boolean(validation.errors.model);
 
   const save = useCallback(
     async (next: CensorLocalAi) => {
@@ -1020,8 +1049,8 @@ function CensorLocalAiCard() {
   return (
     <section
       className="rounded-2xl border border-cream-200 bg-white p-4"
-      data-help-title="Censor's tier-2 model can run on Ollama or a local oMLX (MLX) server."
-      data-help-lines="Ollama is the default (today's behavior, no setup). oMLX points Censor at a local MLX server exposing an OpenAI-compatible HTTP API.|Censor sends file content to this model, so the endpoint must be loopback-only (http, on this machine) — a non-loopback host is refused.|Stored in your local config.json; absent means the Ollama default."
+      data-help-title="Censor's tier-2 model can run on Ollama, local oMLX, or Apple on-device."
+      data-help-lines="Ollama is the default (today's behavior, no setup). oMLX points Censor at a local MLX server exposing an OpenAI-compatible HTTP API; Apple on-device uses the local Apple runtime. Censor sends file content to tier-2 models, so remote endpoints are loopback-only.|Stored in your local config.json; absent means the Ollama default."
     >
       <div className="mb-3 flex items-center gap-2">
         <Cpu className="h-4 w-4 text-teal" />
@@ -1032,7 +1061,7 @@ function CensorLocalAiCard() {
       <p className="mb-4 max-w-3xl text-[12px] leading-5 text-cream-500">
         Choose the on-device model provider Censor uses for its optional tier-2
         (Gemma) review. Ollama is the default; oMLX points Censor at a local MLX
-        server.
+        server; Apple on-device uses macOS Foundation Models.
       </p>
 
       <div className="grid gap-3 rounded-2xl border border-cream-200 p-3 md:grid-cols-2">
@@ -1047,16 +1076,19 @@ function CensorLocalAiCard() {
           >
             <option value="ollama">Ollama (default)</option>
             <option value="omlx">oMLX (local MLX server)</option>
+            <option value="appleFm" disabled={isAppleHostMac === false}>
+              Apple on-device
+            </option>
           </select>
         </label>
 
-        {provider === "omlx" ? (
+        {provider === "omlx" || provider === "appleFm" ? (
           <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-            Model
+            Model {provider === "appleFm" ? "(optional)" : "tag"}
             <input
               value={model}
               onChange={(event) => setModel(event.target.value)}
-              placeholder="mlx-community/gemma"
+              placeholder={provider === "appleFm" ? "default" : "mlx-community/gemma"}
               maxLength={CENSOR_MODEL_MAX_LENGTH}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             />
@@ -1072,6 +1104,13 @@ function CensorLocalAiCard() {
             model — no configuration needed.
           </p>
         )}
+
+        {provider === "appleFm" ? (
+          <p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
+            Apple on-device does not use a network base URL; your model name is
+            optional.
+          </p>
+        ) : null}
 
         {provider === "omlx" ? (
           <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
@@ -1100,11 +1139,17 @@ function CensorLocalAiCard() {
           </p>
         ) : null}
 
+        {appleFmAvailabilityNote ? (
+          <p className="md:col-span-2 text-[11px] leading-4 text-amber-dark">
+            {appleFmAvailabilityNote}
+          </p>
+        ) : null}
+
         <div className="md:col-span-2 flex items-center gap-2">
           <button
             type="button"
             onClick={() => void onSave()}
-            disabled={busy || !validation.ok}
+            disabled={busy || !validation.ok || appleFmDisabled}
             className="inline-flex items-center gap-2 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
           >
             <CheckCircle2 className="h-3.5 w-3.5" />

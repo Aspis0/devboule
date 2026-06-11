@@ -91,6 +91,21 @@ describe("ProvidersModelsTab", () => {
     expect(html).toContain("Codex");
   });
 
+  it("renders Apple on-device status when detected", async () => {
+    detectResult = [
+      {
+        kind: "appleFm",
+        available: true,
+        detail: "configured",
+        models: ["default"],
+      },
+    ];
+    await mount();
+    const html = container.innerHTML;
+    expect(html).toContain("Apple on-device (local model)");
+    expect(html).toContain("not available on this OS");
+  });
+
   it("renders all four per-role card sections", async () => {
     await mount();
     expect(

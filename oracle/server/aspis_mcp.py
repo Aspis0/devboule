@@ -74,6 +74,9 @@ MAX_CLAIMS = 500
 # this the oldest TERMINAL directives are evicted first; an active directive
 # (pending/launching/running) is never dropped. (CO-WRITER PARITY — change both.)
 MAX_MINI_CODER_DIRECTIVES = 50
+# Visual-check directive queue cap. Co-owned with the Rust executor; terminal
+# entries are evicted oldest-first, pending/running entries are preserved.
+MAX_VISUAL_CHECK_DIRECTIVES = 50
 # Bounds for the `spawn_mini_coder` tool inputs + its bounded result poll.
 MINI_CODER_MAX_TASK_LEN = 4000
 MINI_CODER_MAX_FILES = 64
@@ -88,6 +91,12 @@ MINI_CODER_POLL_TIMEOUT_SECS = 1800.0
 # Sleep between result re-reads. Bounded so the lock is taken briefly each pass and
 # never held across the sleep (the executor co-writes the same file).
 MINI_CODER_POLL_INTERVAL_SECS = 0.75
+# Visual checks run a native capture + local VLM critique. They should be fast,
+# but the MCP caller must always unblock.
+VISUAL_CHECK_POLL_TIMEOUT_SECS = 120.0
+VISUAL_CHECK_POLL_INTERVAL_SECS = 0.75
+VISUAL_CHECK_MAX_FOCUS_CHARS = 500
+VISUAL_CHECK_MAX_HTML_PATH_CHARS = 1024
 # GH-P4: bound on the agent push-approval queue (mirrors `MAX_PUSH_REQUESTS` in the
 # Rust `git_push.rs`). Only TERMINAL requests are evicted (oldest by createdAt).
 MAX_GIT_PUSH_REQUESTS = 50
@@ -232,6 +241,7 @@ ROLE_RULES = [
             "oracle_context",
             "censor_findings",
             "censor_dispose",
+            "visual_check",
             "spawn_mini_coder",
             "request_git_push",
             "plan_submit",
@@ -244,6 +254,7 @@ ROLE_RULES = [
             "Delega a spawn_mini_coder solo sub-task economici e meccanici (boilerplate, bulk read->summary, edit semplici, docstring, test); pre-carica il contesto necessario; ragiona tu; RIVEDI l'output del mini come bozza prima di usarlo.",
             "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\").",
             "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), rifai il file TU STESSO: il rail di training ha gia' catturato il fallimento, quindi NON rilanciare ciecamente il mini sullo stesso file.",
+            "Quando produci o revisioni un artifact HTML self-contained e serve feedback visuale, chiama visual_check(html_path, focus?) e tratta la critique come evidenza advisory.",
         ],
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
@@ -278,6 +289,7 @@ ROLE_RULES = [
             "oracle_context",
             "censor_findings",
             "censor_dispose",
+            "visual_check",
             "ask_user",
             "plan_status",
         ],
@@ -285,6 +297,7 @@ ROLE_RULES = [
             "Non modifica codice.",
             "Non modifica Cloudflare o Scaleway: solo read-only.",
             "Non marca done se il task non e in review, o senza evidence e confidence >= 0.70.",
+            "Quando revisioni un artifact HTML self-contained, chiama visual_check(html_path, focus?) se il layout visuale puo influire sul verdetto; tratta la critique come evidenza advisory.",
         ],
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
@@ -357,6 +370,17 @@ TOOLS = [
             "files": {"type": "array", "items": {"type": "string"}},
             "backend": {"type": "string", "default": ""},
             "allow_oracle": {"type": "boolean", "default": False},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "visual_check",
+        "description": "Ask the app to render a self-contained HTML artifact, run a local visual critique, and return text feedback.",
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "html_path": {"type": "string"},
+            "focus": {"type": "string", "default": ""},
             "session_token": {"type": "string"},
         },
     },
@@ -1598,6 +1622,10 @@ def normalize_agents_state(state: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(directives, list):
         directives = []
     state["miniCoderDirectives"] = cap_mini_coder_directives(directives)
+    visual_directives = state.get("visualCheckDirectives")
+    if not isinstance(visual_directives, list):
+        visual_directives = []
+    state["visualCheckDirectives"] = cap_visual_check_directives(visual_directives)
     # GH-P4: git push-approval queue, co-owned with the Rust approve/deny commands.
     # Same backfill + non-list-reset + single-choke-point cap discipline as the
     # mini-coder queue. PASSTHROUGH: each request dict is preserved VERBATIM (only
@@ -1747,6 +1775,31 @@ def cap_mini_coder_directives(directives: list[Any]) -> list[dict[str, Any]]:
         d
         for d in clean
         if str(d.get("status") or "").strip().lower() in _MINI_TERMINAL_STATUSES
+    ]
+    if drop_count <= 0 or not terminal:
+        return clean
+    terminal_sorted_oldest = sorted(
+        terminal,
+        key=lambda d: (str(d.get("createdAt") or ""), str(d.get("id") or "")),
+    )
+    to_drop = {id(d) for d in terminal_sorted_oldest[:drop_count]}
+    return [d for d in clean if id(d) not in to_drop]
+
+
+_VISUAL_CHECK_ACTIVE_STATUSES = {"pending", "running"}
+_VISUAL_CHECK_TERMINAL_STATUSES = {"done", "failed", "timeout"}
+
+
+def cap_visual_check_directives(directives: list[Any]) -> list[dict[str, Any]]:
+    """Keep visual-check directives bounded without dropping pending/running work."""
+    clean = [d for d in directives if isinstance(d, dict)]
+    if len(clean) <= MAX_VISUAL_CHECK_DIRECTIVES:
+        return clean
+    drop_count = len(clean) - MAX_VISUAL_CHECK_DIRECTIVES
+    terminal = [
+        d
+        for d in clean
+        if str(d.get("status") or "").strip().lower() in _VISUAL_CHECK_TERMINAL_STATUSES
     ]
     if drop_count <= 0 or not terminal:
         return clean
@@ -4386,6 +4439,148 @@ def dispatch_spawn_mini_coder(
     return {"directiveId": directive_id, "result": synthesized}
 
 
+def clean_visual_html_path(value: Any) -> str:
+    text = strip_invisible_and_bidi(str(value or "")).strip()
+    if not text:
+        raise McpError("visual_check requires html_path.")
+    if len(text) > VISUAL_CHECK_MAX_HTML_PATH_CHARS:
+        raise McpError("visual_check html_path is too long.")
+    if any(ord(ch) < 32 or ch == "\x7f" for ch in text):
+        raise McpError("visual_check html_path must not contain control characters.")
+    return text.replace("\\", "/")
+
+
+def _visual_directive_result(
+    projects_dir: Path, state_lock: Path, directive_id: str
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Read one visual-check directive under the lock.
+
+    Same contract as `_mini_directive_result`: present/status/result or absent.
+    """
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+        for directive in state.get("visualCheckDirectives", []):
+            if not isinstance(directive, dict):
+                continue
+            if str(directive.get("id") or "") == directive_id:
+                status = str(directive.get("status") or "")
+                result = directive.get("result")
+                if isinstance(result, dict) and result:
+                    return True, status, result
+                return True, status, None
+    return False, "", None
+
+
+def _visual_tool_result(directive_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    status = str(result.get("status") or "").strip().lower()
+    if status == "done":
+        critique = clean_text(result.get("critique"), "Visual critique", 4000)
+        return {"directiveId": directive_id, "critique": critique}
+    error = clean_text(result.get("error") or "visual_check failed.", "Visual check error", 1000)
+    return {"directiveId": directive_id, "error": error}
+
+
+def dispatch_visual_check(
+    projects_dir: Path,
+    state_lock: Path,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """Ask the app to render and visually critique one confined HTML artifact."""
+    agent_id, role = require_agent_tool(projects_dir, args, "visual_check")
+    if "visual_check" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use visual_check.")
+
+    html_path = clean_visual_html_path(args.get("html_path"))
+    raw_focus = str(args.get("focus") or "").strip()
+    focus = clean_text(raw_focus, "Visual check focus", VISUAL_CHECK_MAX_FOCUS_CHARS) if raw_focus else None
+
+    directive_id = uuid.uuid4().hex
+    created_at = now()
+    directive = {
+        "id": directive_id,
+        "parentAgentId": agent_id,
+        "status": "pending",
+        "htmlPath": html_path,
+        "resultPath": f"{directive_id}.json",
+        "createdAt": created_at,
+    }
+    if focus is not None:
+        directive["focus"] = focus
+
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+        session = next(
+            (item for item in state["sessions"] if item.get("agentId") == agent_id),
+            None,
+        )
+        status = str((session or {}).get("status") or "").strip().lower()
+        if session is None or status in ("", "closed", "launch_pending"):
+            raise McpError(
+                "visual_check requires a live registered session."
+            )
+        directives = state.setdefault("visualCheckDirectives", [])
+        directives.append(directive)
+        state["visualCheckDirectives"] = cap_visual_check_directives(directives)
+        add_event(
+            state,
+            agent_id,
+            role,
+            "visual_check",
+            "Requested a local visual critique for one HTML artifact.",
+        )
+        write_agents_state(projects_dir, state)
+
+    deadline = time.monotonic() + VISUAL_CHECK_POLL_TIMEOUT_SECS
+    seen = False
+    ever_ran = False
+    while True:
+        present, status, result = _visual_directive_result(projects_dir, state_lock, directive_id)
+        if result is not None:
+            return _visual_tool_result(directive_id, result)
+        if present:
+            seen = True
+            if status == "running":
+                ever_ran = True
+        elif seen:
+            return {
+                "directiveId": directive_id,
+                "error": "visual_check directive vanished before producing a result.",
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(VISUAL_CHECK_POLL_INTERVAL_SECS)
+
+    synthesized = (
+        {"status": "timeout", "error": "visual_check timed out waiting for the local critique."}
+        if ever_ran
+        else {"status": "failed", "error": "visual-check executor did not start this request within the poll window."}
+    )
+    try:
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            for directive in state.get("visualCheckDirectives", []):
+                if not isinstance(directive, dict):
+                    continue
+                if str(directive.get("id") or "") == directive_id:
+                    existing = directive.get("result")
+                    if isinstance(existing, dict) and existing:
+                        synthesized = existing
+                    else:
+                        live_status = str(directive.get("status") or "")
+                        if live_status == "running":
+                            synthesized = {
+                                "status": "timeout",
+                                "error": "visual_check timed out waiting for the local critique.",
+                            }
+                        directive["status"] = synthesized["status"]
+                        directive["result"] = synthesized
+                    break
+            write_agents_state(projects_dir, state)
+    except McpError:
+        pass
+    return _visual_tool_result(directive_id, synthesized)
+
+
 # FIX 4: cheap mirror of the Rust `sanitize_error` GitHub-token families
 # (src-tauri/src/backend/github.rs): classic PATs `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`
 # and fine-grained `github_pat_`, each followed by a run of token-body chars
@@ -5240,6 +5435,9 @@ def handle_tool_call(
     if name == "spawn_mini_coder":
         return dispatch_spawn_mini_coder(projects_dir, state_lock, args)
 
+    if name == "visual_check":
+        return dispatch_visual_check(projects_dir, state_lock, args)
+
     if name == "request_git_push":
         return dispatch_request_git_push(projects_dir, state_lock, args)
 
@@ -5925,6 +6123,26 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
                 "files": files,
                 "backend": backend,
                 "allow_oracle": allow_oracle,
+                "session_token": session_token,
+            },
+        )
+
+    @server.tool()
+    def visual_check(
+        agent_id: str,
+        role: str,
+        html_path: str,
+        focus: str = "",
+        session_token: str = "",
+    ) -> dict:
+        """Render one self-contained HTML artifact through the app and return a local visual critique."""
+        return call(
+            "visual_check",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "html_path": html_path,
+                "focus": focus,
                 "session_token": session_token,
             },
         )

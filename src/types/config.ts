@@ -85,15 +85,16 @@ export interface CustomAgentClient {
 //   - "omlx": a local oMLX (MLX) server exposing an OpenAI-compatible HTTP API; the
 //     mini POSTs chat-completions to `<baseUrl>/chat/completions`. `model` AND
 //     `baseUrl` are REQUIRED; `baseUrl` is a LOOPBACK http origin (http only, like Ollama).
+//   - "appleFm": Apple's Apple on-device integration; `model` is OPTIONAL.
 // Persisted in config.json; absent means no backend configured (minis then fail
 // cleanly with "no mini-coder backend configured").
-export type MiniCoderBackendKind = "ollama" | "api" | "codex" | "omlx";
+export type MiniCoderBackendKind = "ollama" | "api" | "codex" | "omlx" | "appleFm";
 
 export interface MiniCoderBackend {
   kind: MiniCoderBackendKind;
-  // Model tag/name. Required for "ollama"/"omlx", optional for "codex", unused for "api".
+  // Model tag/name. Required for "ollama"/"omlx", optional for "codex"/"appleFm", unused for "api".
   model?: string;
-  // The CLI command line. Required for "api"; unused for "ollama"/"codex"/"omlx".
+  // The CLI command line. Required for "api"; unused for "ollama"/"codex"/"omlx"/"appleFm".
   command?: string;
   // The oMLX server base URL (loopback http only, e.g. http://localhost:8000/v1).
   // Required for "omlx"; unused for the other kinds. Stored normalized (no trailing
@@ -105,8 +106,8 @@ export interface MiniCoderBackend {
 }
 
 // The single, global LLM provider the generative-design module generates node markup
-// with (Settings → Workspace). A SUPERSET of MiniCoderBackend's kinds: the same four
-// (ollama/api/codex/omlx) PLUS "claude" (the user's Claude Code subscription via
+// with (Settings → Workspace). A SUPERSET of MiniCoderBackend's non-Apple kinds plus
+// "claude" (the user's Claude Code subscription via
 // `claude -p --output-format text`, one-shot, rides local auth — no API key). "claude"
 // mirrors "codex": optional model, no command/baseUrl. Persisted in config.json under
 // `designLlmBackend`; absent means no design provider is configured. See the mini-coder
@@ -147,7 +148,8 @@ export type DesignEffort = "low" | "medium" | "high";
 // card's pure helper coerces/clamps before use (a stale/hand-edited surface must not
 // crash the form).
 export interface DetectedProvider {
-  // One of "claude" | "codex" | "ollama" | "omlx" | "api".
+  // Provider kinds from detect_providers (commonly one of "claude" | "codex" | "ollama" | "omlx" | "api";
+  // "appleFm" is also possible when Apple on-device is detected).
   kind: string;
   // Whether this provider can be used right now on this machine.
   available: boolean;
@@ -164,16 +166,16 @@ export interface DetectedProvider {
 // POSTs chat-completions to `<baseUrl>/chat/completions`. PRIVACY: `baseUrl` MUST be a
 // LOOPBACK http origin (http only) — Censor sends FILE CONTENT to it, so it must never leave
 // the device (enforced backend-side by validate_censor_local_ai + the client clamp).
-export type CensorAiProvider = "ollama" | "omlx";
+export type CensorAiProvider = "ollama" | "omlx" | "appleFm";
 
 export interface CensorLocalAi {
   provider: CensorAiProvider;
   // Loopback http base URL (http only). For "omlx" REQUIRED (e.g. http://localhost:8000/v1),
-  // stored normalized (no trailing slash). For "ollama" optional (defaults to the
-  // built-in loopback Ollama base).
+  // stored normalized (no trailing slash). For "ollama"/"appleFm" optional/unused (defaults to
+  // the built-in loopback Ollama model/provider defaults).
   baseUrl?: string;
-  // Model id/tag. For "omlx" REQUIRED; for "ollama" optional (defaults to the built-in
-  // Gemma tag).
+  // Model id/tag. For "omlx" REQUIRED; for "ollama"/"appleFm" optional (defaults to provider
+  // defaults).
   model?: string;
   // OLLAMA-ONLY user override for the Gemma model tag (camelCase, matching the Rust
   // `ollama_model`). When set it wins the runtime resolution chain outright. Owned by the

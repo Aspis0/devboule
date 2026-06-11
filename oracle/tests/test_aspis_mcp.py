@@ -5801,6 +5801,162 @@ class SpawnMiniCoderTests(unittest.TestCase):
         self.assertNotIn("old", ids)
 
 
+class VisualCheckTests(unittest.TestCase):
+    """The `visual_check` MCP tool: file-only bridge, bounded poll, camelCase shape."""
+
+    def _project_dir(self, tmp: str) -> Path:
+        root = Path(tmp)
+        projects = root / "projects"
+        projects.mkdir()
+        sample_project(projects)
+        return root
+
+    def _register_coder(self, root: Path, agent_id: str = "codex", role: str = "coder") -> str:
+        token = "test-launch-token"
+        (root / "projects" / ".aspis-agents.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "updatedAt": "2026-06-06T00:00:00+00:00",
+                    "sessions": [
+                        {
+                            "agentId": agent_id,
+                            "role": role,
+                            "status": "launch_pending",
+                            "currentProjectId": "scrna-seq",
+                            "lastSeenAt": "2026-06-06T00:00:00+00:00",
+                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                        }
+                    ],
+                    "claims": [],
+                    "events": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = handle_tool_call(
+            "agent_register",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "model": "codex",
+                "message": "coding",
+                "launch_token": token,
+            },
+            root=root,
+        )
+        return result["sessionToken"]
+
+    def _read_state(self, root: Path) -> dict:
+        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+
+    def test_visual_check_in_tool_schema_and_allowed_for_agents(self):
+        from oracle.server import aspis_mcp
+        from oracle.server import mcp_handler
+
+        self.assertIn("visual_check", {tool["name"] for tool in aspis_mcp.TOOLS})
+        self.assertIn("visual_check", {tool["name"] for tool in mcp_handler.TOOLS})
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
+        self.assertIn("visual_check", coder["allowedTools"])
+        self.assertIn("visual_check", verifier["allowedTools"])
+
+    def test_writes_pending_directive_with_exact_camel_case_keys_and_caps_focus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.VISUAL_CHECK_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "visual_check",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "html_path": "dist/page.html",
+                        "focus": "x" * 800,
+                        "session_token": token,
+                    },
+                    root=root,
+            )
+            self.assertIn("directiveId", out)
+            self.assertIn("did not start", out["error"])
+            directives = self._read_state(root)["visualCheckDirectives"]
+            self.assertEqual(len(directives), 1)
+            d = directives[0]
+            self.assertEqual(d["id"], out["directiveId"])
+            self.assertEqual(d["parentAgentId"], "codex")
+            self.assertEqual(d["htmlPath"], "dist/page.html")
+            self.assertEqual(d["status"], "failed")
+            self.assertLessEqual(len(d["focus"]), 501)
+            self.assertEqual(d["resultPath"], f"{out['directiveId']}.json")
+            self.assertNotIn("html_path", d)
+            self.assertNotIn("parent_agent_id", d)
+
+    def test_visual_check_poll_returns_critique_without_holding_lock(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            done = {"status": "done", "critique": "Button text overflows on mobile."}
+
+            def executor():
+                from oracle.server.aspis_mcp import (
+                    AGENTS_STATE_FILE,
+                    file_lock,
+                    read_agents_state,
+                    write_agents_state,
+                )
+
+                projects_dir = root / "projects"
+                lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+                for _ in range(200):
+                    with file_lock(lock):
+                        state = read_agents_state(projects_dir)
+                        ds = state.get("visualCheckDirectives", [])
+                        if ds:
+                            ds[0]["status"] = "done"
+                            ds[0]["result"] = done
+                            write_agents_state(projects_dir, state)
+                            return
+                    time.sleep(0.02)
+
+            t = threading.Thread(target=executor)
+            t.start()
+            try:
+                with patch("oracle.server.aspis_mcp.VISUAL_CHECK_POLL_INTERVAL_SECS", 0.02):
+                    out = handle_tool_call(
+                        "visual_check",
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "html_path": "dist/page.html",
+                            "session_token": token,
+                        },
+                        root=root,
+                    )
+            finally:
+                t.join()
+            self.assertEqual(out["critique"], "Button text overflows on mobile.")
+
+    def test_cap_visual_check_directives_evicts_oldest_terminal_keeps_pending(self):
+        from oracle.server.aspis_mcp import MAX_VISUAL_CHECK_DIRECTIVES, cap_visual_check_directives
+
+        directives = [
+            {"id": "old", "status": "done", "createdAt": "2026-06-06T00:00:01Z"},
+            {"id": "active", "status": "pending", "createdAt": "2026-06-06T00:00:02Z"},
+        ]
+        for i in range(MAX_VISUAL_CHECK_DIRECTIVES):
+            directives.append(
+                {"id": f"v{i}", "status": "failed", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+            )
+        capped = cap_visual_check_directives(directives)
+        self.assertLessEqual(len(capped), MAX_VISUAL_CHECK_DIRECTIVES)
+        ids = {d["id"] for d in capped}
+        self.assertIn("active", ids)
+        self.assertNotIn("old", ids)
+
+
 class RequestGitPushTests(unittest.TestCase):
     """GH-P4: the `request_git_push` MCP tool — gating, request write (camelCase
     parity with the Rust git_push.rs), the needs_user bell, the bounded verdict poll,

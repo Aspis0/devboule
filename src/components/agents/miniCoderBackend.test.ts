@@ -83,6 +83,21 @@ describe("validateMiniBackend", () => {
     expect(withModel.value).toEqual({ kind: "codex", model: "gpt-5-codex" });
   });
 
+  it("appleFm accepts optional model and preserves only kind/model", () => {
+    const bare = validateMiniBackend({ kind: "appleFm", model: "", command: "dropped", baseUrl: "dropped" });
+    expect(bare.ok).toBe(true);
+    expect(bare.value).toEqual({ kind: "appleFm" });
+
+    const withModel = validateMiniBackend({
+      kind: "appleFm",
+      model: "apple-default",
+      command: "dropped",
+      baseUrl: "dropped",
+    });
+    expect(withModel.ok).toBe(true);
+    expect(withModel.value).toEqual({ kind: "appleFm", model: "apple-default" });
+  });
+
   it("rejects a model with whitespace or shell metacharacters", () => {
     for (const bad of ["qwen coder", "model;rm", "$(evil)", "bad model"]) {
       expect(
@@ -103,8 +118,14 @@ describe("validateMiniBackend", () => {
     ).toBeTruthy();
   });
 
-  it("exposes exactly the four backend kinds", () => {
-    expect([...MINI_BACKEND_KINDS]).toEqual(["ollama", "api", "codex", "omlx"]);
+  it("exposes all backend kinds", () => {
+    expect([...MINI_BACKEND_KINDS]).toEqual([
+      "ollama",
+      "api",
+      "codex",
+      "omlx",
+      "appleFm",
+    ]);
   });
 
   // -- oMLX parity with the Rust validator --------------------------------

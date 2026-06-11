@@ -43,6 +43,8 @@ export interface ShouldNotifyDeps {
   now: () => number;
 }
 
+export type NotificationDecision = "fire" | "inactive" | "duplicate" | "capped";
+
 /**
  * Decide whether to fire an OS notification for `session`.
  *
@@ -57,16 +59,16 @@ export interface ShouldNotifyDeps {
  * but does NOT clear the recorded `since` here — leave-tracking (pruning departed
  * agents) is the watcher's job, since shouldNotify only sees one session at a time.
  */
-export function shouldNotify(
+export function notificationDecision(
   session: AgentSession,
   deps: ShouldNotifyDeps,
-): boolean {
+): NotificationDecision {
   const needs = session.needsUser;
   const since = needs?.since?.trim();
-  if (!needs || !since) return false;
+  if (!needs || !since) return "inactive";
 
   const recorded = deps.prevSinceByAgent.get(session.agentId);
-  if (recorded === since) return false;
+  if (recorded === since) return "duplicate";
 
   const nowMs = deps.now();
   // Prune fire timestamps older than the rolling 60s window, then enforce the cap.
@@ -78,10 +80,37 @@ export function shouldNotify(
   if (deps.recentFiresMs.length >= NOTIFICATION_PER_MINUTE_CAP) {
     // Capped: do NOT record the since, so once the window frees up a still-open
     // (unchanged-since) request can finally fire instead of being lost forever.
-    return false;
+    return "capped";
   }
 
   deps.prevSinceByAgent.set(session.agentId, since);
+  deps.recentFiresMs.push(nowMs);
+  return "fire";
+}
+
+export function shouldNotify(
+  session: AgentSession,
+  deps: ShouldNotifyDeps,
+): boolean {
+  return notificationDecision(session, deps) === "fire";
+}
+
+export function msUntilNotificationWindowFrees(
+  recentFiresMs: number[],
+  nowMs: number,
+): number {
+  const oldest = Math.min(...recentFiresMs);
+  if (!Number.isFinite(oldest)) return 0;
+  return Math.max(0, oldest + ONE_MINUTE_MS - nowMs + 1);
+}
+
+export function reserveNotificationSlot(deps: ShouldNotifyDeps): boolean {
+  const nowMs = deps.now();
+  const cutoff = nowMs - ONE_MINUTE_MS;
+  for (let i = deps.recentFiresMs.length - 1; i >= 0; i -= 1) {
+    if (deps.recentFiresMs[i] < cutoff) deps.recentFiresMs.splice(i, 1);
+  }
+  if (deps.recentFiresMs.length >= NOTIFICATION_PER_MINUTE_CAP) return false;
   deps.recentFiresMs.push(nowMs);
   return true;
 }
@@ -118,6 +147,28 @@ export function buildNotificationBody(session: AgentSession): string {
     : base;
 }
 
+export function buildSummaryNotificationBody(count: number): string {
+  const safeCount = Math.max(1, Math.floor(count));
+  return `${safeCount} agents need you`;
+}
+
+export function isTerminalOutcomeSession(session: AgentSession): boolean {
+  if (session.host !== "app") return false;
+  return isTerminalOutcomeStatus(session.status);
+}
+
+export function isTerminalOutcomeStatus(status: string | null | undefined): boolean {
+  const normalized = (status ?? "").toLowerCase();
+  return normalized === "done" || normalized === "failed" || normalized === "timeout";
+}
+
+export function buildOutcomeNotificationBody(session: AgentSession): string {
+  const agentId = stripSpoofChars(session.agentId);
+  const status = stripSpoofChars(session.status).toLowerCase();
+  const label = status === "done" ? "done" : "failed";
+  return `${agentId}: ${label}`;
+}
+
 /**
  * Thin Tauri-plugin wrapper: send ONE OS notification per session in `sessions`.
  *
@@ -136,6 +187,45 @@ export async function notifyAgentsNeedYou(
   isCancelled: () => boolean = () => false,
 ): Promise<void> {
   if (sessions.length === 0) return;
+  await notifyPlain(
+    sessions.map((session) => ({
+      title: "Agent needs you",
+      body: buildNotificationBody(session),
+    })),
+    isCancelled,
+  );
+}
+
+export async function notifyAgentsSummary(
+  count: number,
+  isCancelled: () => boolean = () => false,
+): Promise<void> {
+  if (count <= 0) return;
+  await notifyPlain(
+    [{ title: "Agents need you", body: buildSummaryNotificationBody(count) }],
+    isCancelled,
+  );
+}
+
+export async function notifyAgentOutcomes(
+  sessions: AgentSession[],
+  isCancelled: () => boolean = () => false,
+): Promise<void> {
+  if (sessions.length === 0) return;
+  await notifyPlain(
+    sessions.map((session) => ({
+      title: "Agent finished",
+      body: buildOutcomeNotificationBody(session),
+    })),
+    isCancelled,
+  );
+}
+
+async function notifyPlain(
+  notifications: { title: string; body: string }[],
+  isCancelled: () => boolean,
+): Promise<void> {
+  if (notifications.length === 0) return;
   try {
     const plugin = await import("@tauri-apps/plugin-notification");
     let granted = await plugin.isPermissionGranted();
@@ -147,12 +237,9 @@ export async function notifyAgentsNeedYou(
     // The permission prompt may have resolved long after the watcher was torn
     // down; bail before emitting any stale toast.
     if (isCancelled()) return;
-    for (const session of sessions) {
+    for (const notification of notifications) {
       if (isCancelled()) return;
-      plugin.sendNotification({
-        title: "Agent needs you",
-        body: buildNotificationBody(session),
-      });
+      plugin.sendNotification(notification);
     }
   } catch (error) {
     // Plugin missing, not in Tauri, or OS notification subsystem failed: the
@@ -178,9 +265,19 @@ export async function notifyAgentsNeedYou(
 // cycle can cleanly restart it.
 let watcherActive = false;
 
+export interface AttentionWatcherDeps extends Partial<ShouldNotifyDeps> {
+  loadPrevSinceByAgent?: () => Promise<Record<string, string>>;
+  savePrevSinceByAgent?: (value: Record<string, string>) => Promise<void>;
+  notifyNeeds?: typeof notifyAgentsNeedYou;
+  notifySummary?: typeof notifyAgentsSummary;
+  notifyOutcomes?: typeof notifyAgentOutcomes;
+  setTimeoutFn?: typeof setTimeout;
+  clearTimeoutFn?: typeof clearTimeout;
+}
+
 export function startAttentionWatcher(
   store: AgentAttentionStore,
-  deps?: Partial<ShouldNotifyDeps>,
+  deps?: AttentionWatcherDeps,
 ): () => void {
   if (watcherActive) {
     // Already watching (e.g. StrictMode's second invocation): do nothing and
@@ -191,12 +288,58 @@ export function startAttentionWatcher(
   const prevSinceByAgent = deps?.prevSinceByAgent ?? new Map<string, string>();
   const recentFiresMs = deps?.recentFiresMs ?? [];
   const now = deps?.now ?? (() => Date.now());
+  const setTimeoutFn = deps?.setTimeoutFn ?? setTimeout;
+  const clearTimeoutFn = deps?.clearTimeoutFn ?? clearTimeout;
+  const loadPrevSinceByAgent =
+    deps?.loadPrevSinceByAgent ?? defaultLoadPrevSinceByAgent;
+  const savePrevSinceByAgent =
+    deps?.savePrevSinceByAgent ?? defaultSavePrevSinceByAgent;
+  const notifyNeeds = deps?.notifyNeeds ?? notifyAgentsNeedYou;
+  const notifySummary = deps?.notifySummary ?? notifyAgentsSummary;
+  const notifyOutcomes = deps?.notifyOutcomes ?? notifyAgentOutcomes;
   // Flipped by teardown: an in-flight notifyAgentsNeedYou (whose OS permission
   // prompt may still be pending) checks this before sending so a toast cannot
   // fire after the watcher is gone (e.g. the app locked mid-prompt).
   let cancelled = false;
+  let ready = false;
+  let pendingSessions = store.getState().sessions;
+  let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  let summaryTimer: ReturnType<typeof setTimeout> | null = null;
+  const suppressedNeedsAgents = new Set<string>();
+  const previousStatusByAgent = new Map<string, string>();
+
+  const snapshotPrevSince = () => Object.fromEntries(prevSinceByAgent.entries());
+
+  const schedulePersist = () => {
+    if (cancelled) return;
+    if (persistTimer) clearTimeoutFn(persistTimer);
+    persistTimer = setTimeoutFn(() => {
+      persistTimer = null;
+      void savePrevSinceByAgent(snapshotPrevSince()).catch(() => {});
+    }, 300);
+  };
+
+  const scheduleSummary = () => {
+    if (summaryTimer || suppressedNeedsAgents.size === 0 || cancelled) return;
+    const delay = msUntilNotificationWindowFrees(recentFiresMs, now());
+    summaryTimer = setTimeoutFn(() => {
+      summaryTimer = null;
+      if (cancelled || suppressedNeedsAgents.size === 0) return;
+      const count = suppressedNeedsAgents.size;
+      if (!reserveNotificationSlot({ prevSinceByAgent, recentFiresMs, now })) {
+        scheduleSummary();
+        return;
+      }
+      suppressedNeedsAgents.clear();
+      void notifySummary(count, () => cancelled);
+    }, delay);
+  };
 
   const handle = (sessions: AgentSession[]): void => {
+    if (!ready) {
+      pendingSessions = sessions;
+      return;
+    }
     const attention = attentionSessions(sessions, now());
     // Notify only for sessions actually flagged needsUser (stale/lost ring the
     // in-app bell but are NOT an OS toast — they're a recovery hint, not a
@@ -205,8 +348,17 @@ export function startAttentionWatcher(
 
     const toFire: AgentSession[] = [];
     for (const session of needsUser) {
-      if (shouldNotify(session, { prevSinceByAgent, recentFiresMs, now })) {
+      const decision = notificationDecision(session, {
+        prevSinceByAgent,
+        recentFiresMs,
+        now,
+      });
+      if (decision === "fire") {
         toFire.push(session);
+        schedulePersist();
+      } else if (decision === "capped") {
+        suppressedNeedsAgents.add(session.agentId);
+        scheduleSummary();
       }
     }
 
@@ -216,20 +368,88 @@ export function startAttentionWatcher(
     // an unchanged timestamp would be silently suppressed.
     const stillNeeds = new Set(needsUser.map((s) => s.agentId));
     for (const agentId of [...prevSinceByAgent.keys()]) {
-      if (!stillNeeds.has(agentId)) prevSinceByAgent.delete(agentId);
+      if (!stillNeeds.has(agentId)) {
+        prevSinceByAgent.delete(agentId);
+        schedulePersist();
+      }
     }
 
-    if (toFire.length > 0) void notifyAgentsNeedYou(toFire, () => cancelled);
+    if (toFire.length > 0) void notifyNeeds(toFire, () => cancelled);
+
+    const outcomeToFire: AgentSession[] = [];
+    for (const session of sessions) {
+      const previous = previousStatusByAgent.get(session.agentId);
+      if (
+        previous !== undefined &&
+        !isTerminalOutcomeStatus(previous) &&
+        isTerminalOutcomeSession(session)
+      ) {
+        if (reserveNotificationSlot({ prevSinceByAgent, recentFiresMs, now })) {
+          outcomeToFire.push(session);
+        }
+      }
+      previousStatusByAgent.set(session.agentId, session.status);
+    }
+    const liveIds = new Set(sessions.map((s) => s.agentId));
+    for (const agentId of [...previousStatusByAgent.keys()]) {
+      if (!liveIds.has(agentId)) previousStatusByAgent.delete(agentId);
+    }
+    if (outcomeToFire.length > 0) {
+      void notifyOutcomes(outcomeToFire, () => cancelled);
+    }
   };
 
+  void loadPrevSinceByAgent()
+    .then((record) => {
+      if (cancelled) return;
+      for (const [agentId, since] of Object.entries(record)) {
+        if (typeof agentId === "string" && typeof since === "string" && since.trim()) {
+          prevSinceByAgent.set(agentId, since);
+        }
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (cancelled) return;
+      ready = true;
+      handle(pendingSessions);
+    });
+
   // Fire once for the current snapshot, then on every change.
-  handle(store.getState().sessions);
   const unsubscribe = store.subscribe((state) => handle(state.sessions));
   // Teardown clears the singleton guard so a later unmount→remount (e.g. lock
   // then unlock) can start a fresh watcher.
   return () => {
     cancelled = true;
+    if (persistTimer) clearTimeoutFn(persistTimer);
+    if (summaryTimer) clearTimeoutFn(summaryTimer);
+    void savePrevSinceByAgent(snapshotPrevSince()).catch(() => {});
     unsubscribe();
     watcherActive = false;
   };
+}
+
+async function defaultLoadPrevSinceByAgent(): Promise<Record<string, string>> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const state = await invoke<{ prevSinceByAgent?: Record<string, string> }>(
+      "read_agent_notification_state",
+    );
+    return state.prevSinceByAgent ?? {};
+  } catch {
+    return {};
+  }
+}
+
+async function defaultSavePrevSinceByAgent(
+  value: Record<string, string>,
+): Promise<void> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("write_agent_notification_state", {
+      state: { prevSinceByAgent: value },
+    });
+  } catch {
+    // In-browser dev and locked/unsupported runtimes keep the in-memory guard.
+  }
 }

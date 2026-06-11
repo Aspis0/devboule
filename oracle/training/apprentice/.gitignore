@@ -1,0 +1,8 @@
+# Generated apprentice artifacts
+/data/
+/logs/
+/adapters/
+/qwen3-27b-day0-mlx/
+
+# Local benchmark scratch
+/gold_standard*.jsonl

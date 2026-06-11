@@ -29,6 +29,8 @@
 //! are metadata GETs (`/api/tags`, `/v1/models`).
 
 use std::ffi::OsString;
+#[cfg(target_os = "macos")]
+use std::io::Read;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -47,6 +49,8 @@ const OMLX_MODELS_URL: &str = "http://127.0.0.1:8000/v1/models";
 /// port that accepts the TCP connection but never answers; 1.5s is generous for a loopback
 /// metadata GET while keeping the whole `detect_providers` call snappy.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+#[cfg(target_os = "macos")]
+const CLI_HELP_PROBE_MAX_BYTES: usize = 64 * 1024;
 
 /// Resolve the user's home directory cross-platform. Mirrors
 /// [`super::cli_agents`]'s `user_home` (`USERPROFILE` on Windows, `HOME` on Unix/macOS); a
@@ -388,8 +392,101 @@ async fn probe_get(client: &reqwest::Client, url: &str) -> Option<String> {
     String::from_utf8(bytes.to_vec()).ok()
 }
 
-/// Detect every supported provider on this machine. Always returns one entry per kind in a
-/// stable order (`claude, codex, ollama, omlx, api`). Probes are bounded + failure-isolated.
+fn looks_like_apple_fm_help(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("foundation model")
+        && (lower.contains("fm respond")
+            || lower.contains("fm chat")
+            || lower.contains("fm schema")
+            || lower.contains("apple"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_probe_pipe<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+) -> std::thread::JoinHandle<Option<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut limited = reader.by_ref().take((CLI_HELP_PROBE_MAX_BYTES + 1) as u64);
+        limited.read_to_end(&mut out).ok()?;
+        if out.len() > CLI_HELP_PROBE_MAX_BYTES {
+            return None;
+        }
+        Some(out)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn apple_fm_help_probe_matches(program: &std::path::Path) -> bool {
+    let mut child = match std::process::Command::new(program)
+        .arg("--help")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("PATH", augmented_path())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => return false,
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => return false,
+    };
+    let stdout_thread = read_probe_pipe(stdout);
+    let stderr_thread = read_probe_pipe(stderr);
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() >= PROBE_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(_) => return false,
+        }
+    }
+
+    let mut bytes = Vec::new();
+    if let Ok(Some(stdout)) = stdout_thread.join() {
+        bytes.extend(stdout);
+    }
+    if let Ok(Some(stderr)) = stderr_thread.join() {
+        bytes.extend(stderr);
+    }
+    let output = String::from_utf8_lossy(&bytes);
+    looks_like_apple_fm_help(&output)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_apple_fm() -> Option<DetectedProvider> {
+    Some(match resolve_program("fm") {
+        Some(program) if apple_fm_help_probe_matches(&program) => DetectedProvider {
+            kind: "appleFm".into(),
+            available: true,
+            detail: Some("cli".into()),
+            models: Vec::new(),
+        },
+        Some(_) | None => DetectedProvider::unavailable("appleFm"),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_apple_fm() -> Option<DetectedProvider> {
+    None
+}
+
+/// Detect every supported provider on this machine. Always returns entries in a stable order
+/// (`claude, codex, ollama, omlx, appleFm on macOS only, api`). Probes are bounded +
+/// failure-isolated.
 pub async fn detect_all_providers() -> Vec<DetectedProvider> {
     let client = probe_client();
 
@@ -465,7 +562,12 @@ pub async fn detect_all_providers() -> Vec<DetectedProvider> {
         models: Vec::new(),
     };
 
-    vec![claude, codex, ollama, omlx, api]
+    let mut providers = vec![claude, codex, ollama, omlx];
+    if let Some(apple_fm) = detect_apple_fm() {
+        providers.push(apple_fm);
+    }
+    providers.push(api);
+    providers
 }
 
 /// The Tauri command wrapper. No auth gate: this returns ONLY non-secret machine
@@ -811,5 +913,23 @@ mod tests {
         let p = DetectedProvider::unavailable("codex");
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(json, r#"{"kind":"codex","available":false,"models":[]}"#);
+    }
+
+    #[test]
+    fn apple_fm_help_marker_requires_apple_foundation_model_cli_text() {
+        assert!(looks_like_apple_fm_help(
+            "Usage: fm respond\nApple Foundation Models on-device CLI\n"
+        ));
+        assert!(looks_like_apple_fm_help(
+            "fm schema\nFoundation Model framework tools\n"
+        ));
+        assert!(!looks_like_apple_fm_help("fast file manager\nusage: fm <path>\n"));
+        assert!(!looks_like_apple_fm_help("respond to terminal prompts\n"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn apple_fm_detection_is_not_offered_on_non_macos() {
+        assert!(detect_apple_fm().is_none());
     }
 }

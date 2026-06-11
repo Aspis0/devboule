@@ -293,6 +293,61 @@ fn confined_preview_png(canonical_root: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+pub(crate) async fn open_preview_html(
+    app: &tauri::AppHandle,
+    html: &str,
+    title: &str,
+) -> Result<(), String> {
+    let init_script = build_init_script(html)?;
+
+    if let Some(existing) = app.get_webview_window(PREVIEW_WINDOW_LABEL) {
+        if let Err(e) = existing.close() {
+            eprintln!("[design-preview] could not close existing preview window: {e}");
+        }
+        let deadline = Instant::now() + PREVIEW_CLOSE_POLL_BUDGET;
+        while app.get_webview_window(PREVIEW_WINDOW_LABEL).is_some() {
+            if Instant::now() >= deadline {
+                return Err(
+                    "the previous preview window did not close in time — try again".to_string(),
+                );
+            }
+            tokio::time::sleep(PREVIEW_CLOSE_POLL_STEP).await;
+        }
+    }
+
+    WebviewWindowBuilder::new(
+        app,
+        PREVIEW_WINDOW_LABEL,
+        WebviewUrl::App(PREVIEW_WINDOW_URL.into()),
+    )
+    .title(title)
+    .inner_size(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+    .initialization_script(&init_script)
+    .build()
+    .map_err(|_| "could not open the preview window".to_string())?;
+
+    Ok(())
+}
+
+pub(crate) async fn capture_preview_png_bytes(app: &tauri::AppHandle) -> Result<Vec<u8>, String> {
+    let _capture_guard =
+        PreviewCaptureGuard::acquire().ok_or_else(|| "a capture is already in progress".to_string())?;
+    let window = app
+        .get_webview_window(PREVIEW_WINDOW_LABEL)
+        .ok_or_else(|| PREVIEW_NOT_OPEN_ERR.to_string())?;
+    let png = capture_webview_png(&window).await?;
+    if png.len() as u64 > MAX_CAPTURE_PNG_BYTES {
+        return Err("captured image is too large".to_string());
+    }
+    Ok(png)
+}
+
+pub(crate) fn close_preview_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(PREVIEW_WINDOW_LABEL) {
+        let _ = window.close();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Atomic write (sibling temp + rename) — mirrors design.rs's atomic_write, for BYTES.
 // ---------------------------------------------------------------------------
@@ -359,46 +414,7 @@ pub async fn design_preview_open(
     let html = std::fs::read_to_string(&export_path)
         .map_err(|_| "could not read the export file".to_string())?;
 
-    let init_script = build_init_script(&html)?;
-
-    // Refresh semantics: if a preview window is already open, close it first so the new
-    // build loads the latest HTML cleanly (an init script only runs on a fresh load).
-    // close() is ASYNC — the teardown happens on the main event loop, so the window may
-    // still be registered for a few ms AFTER this call. Rebuilding too early fails with
-    // "label exists"; we poll get_webview_window until it is gone (bounded budget) before
-    // building. The poll sleeps via the async runtime so we never block a reactor thread.
-    if let Some(existing) = app.get_webview_window(PREVIEW_WINDOW_LABEL) {
-        // A close failure should not abort the refresh; log to the process log only and
-        // continue — the poll below will give the teardown time, and the builder will
-        // surface a real "already exists" error if the old window truly lingers.
-        if let Err(e) = existing.close() {
-            eprintln!("[design-preview] could not close existing preview window: {e}");
-        }
-        // Wait for the label to free up. On budget exhaustion return a clean Err rather
-        // than letting the builder fail with an opaque "already exists".
-        let deadline = Instant::now() + PREVIEW_CLOSE_POLL_BUDGET;
-        while app.get_webview_window(PREVIEW_WINDOW_LABEL).is_some() {
-            if Instant::now() >= deadline {
-                return Err(
-                    "the previous preview window did not close in time — try again".to_string(),
-                );
-            }
-            tokio::time::sleep(PREVIEW_CLOSE_POLL_STEP).await;
-        }
-    }
-
-    WebviewWindowBuilder::new(
-        &app,
-        PREVIEW_WINDOW_LABEL,
-        WebviewUrl::App(PREVIEW_WINDOW_URL.into()),
-    )
-    .title("Design preview")
-    .inner_size(PREVIEW_WIDTH, PREVIEW_HEIGHT)
-    .initialization_script(&init_script)
-    .build()
-    .map_err(|_| "could not open the preview window".to_string())?;
-
-    Ok(())
+    open_preview_html(&app, &html, "Design preview").await
 }
 
 // ---------------------------------------------------------------------------
@@ -423,22 +439,10 @@ pub async fn design_preview_capture(
     working_folder_path: String,
 ) -> Result<PreviewCaptureResult, String> {
     state.ensure_unlocked()?;
-    // V12: refuse a second concurrent capture. Held for the whole command (across the
-    // capture .await and the atomic write); released on Drop on every exit path.
-    let _capture_guard =
-        PreviewCaptureGuard::acquire().ok_or_else(|| "a capture is already in progress".to_string())?;
     let canonical = canonical_working_folder(&working_folder_path)?;
     let target = confined_preview_png(&canonical)?;
 
-    let window = app
-        .get_webview_window(PREVIEW_WINDOW_LABEL)
-        .ok_or_else(|| PREVIEW_NOT_OPEN_ERR.to_string())?;
-
-    let png = capture_webview_png(&window).await?;
-
-    if png.len() as u64 > MAX_CAPTURE_PNG_BYTES {
-        return Err("captured image is too large".to_string());
-    }
+    let png = capture_preview_png_bytes(&app).await?;
     atomic_write_bytes(&target, &png)?;
 
     Ok(PreviewCaptureResult {
@@ -684,7 +688,8 @@ pub async fn design_visual_critique(
 
     // Build the Ollama client from the SAME config Censor uses (loopback-clamped base +
     // resolved model). The vision request adds an `images:[b64]` field to /api/generate.
-    let client = build_gemma_client(&local_ai);
+    let client = build_gemma_client(&local_ai)
+        .map_err(|_| "the local visual critique is unavailable".to_string())?;
     // The generate is BLOCKING loopback IO — run it off the async reactor.
     let raw = tauri::async_runtime::spawn_blocking(move || {
         client.generate_with_images(&prompt, &[b64])

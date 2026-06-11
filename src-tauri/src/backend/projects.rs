@@ -1041,6 +1041,16 @@ fn prepare_or_launch_project_agent(
         Some(handoff) => Some(validate_design_handoff(handoff, &root_path)?),
         None => None,
     };
+    if input.workflow_run.is_some() && role != "coder" {
+        return Err("Saved workflows must be launched as coder agents.".into());
+    }
+    let workflow_addendum = match input.workflow_run.as_ref() {
+        Some(workflow) => Some(crate::backend::saved_workflows::validate_and_build_workflow_addendum(
+            &root_path,
+            workflow,
+        )?),
+        None => None,
+    };
     let agent_id = clean_optional(input.agent_id.as_deref())
         .unwrap_or_else(|| format!("{}-{}", role, Utc::now().timestamp_millis()));
     let task_id = clean_optional(input.task_id.as_deref());
@@ -1062,6 +1072,7 @@ fn prepare_or_launch_project_agent(
         // Phase D: the validated design bundle folder (canonical, confined). `None`
         // for every non-handoff launch keeps the prompt byte-for-byte unchanged.
         design_handoff_folder.as_deref(),
+        workflow_addendum.as_deref(),
     );
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
@@ -2146,6 +2157,7 @@ fn project_agent_prompt(
     // interpolated from it is the bundle's path RELATIVE to `root_path` — caller-controlled
     // free text never reaches the prompt.
     design_handoff_folder: Option<&Path>,
+    workflow_addendum: Option<&str>,
 ) -> String {
     // Phase B merge: the coder PLANS and CODES — it absorbs the former
     // orchestrator's plan/coordinate mandate (claim tasks, create follow-ups,
@@ -2291,11 +2303,13 @@ Provider mutation tools require management_project_id, task_id and evidence from
 {mini_coder_addendum}\
 {git_push_addendum}\
 {design_handoff_addendum}\
+{workflow_addendum}\
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.\n",
         project_id = project.metadata.id,
         project_title = project.metadata.title,
         root_path = root_path.to_string_lossy(),
         launch_token = launch_token,
+        workflow_addendum = workflow_addendum.unwrap_or(""),
     )
 }
 
@@ -7668,6 +7682,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             None,
+            None,
         );
 
         assert!(prompt.contains("Working root: C:\\Users\\gualt\\Desktop\\aspis bio"));
@@ -7690,6 +7705,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             Some("opus"),
             false,
+            None,
             None,
         );
         assert!(hinted.contains("model=\"opus\""));
@@ -7741,6 +7757,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             None,
+            None,
         );
         assert!(
             prompt.contains("censor_findings(project_id, file=<files you just touched>)"),
@@ -7781,6 +7798,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
             None,
         );
         assert!(
@@ -7831,6 +7849,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
             None,
         );
         assert!(
@@ -7884,6 +7903,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             None,
+            None,
         );
         assert!(
             prompt.contains("commit freely"),
@@ -7931,6 +7951,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             None,
+            None,
         );
         assert!(
             !prompt.contains("aborted_by_human"),
@@ -7963,6 +7984,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
             None,
         );
         assert!(
@@ -8000,6 +8022,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             None,
+            None,
         );
         assert!(
             !plain.contains("residual ledger"),
@@ -8020,6 +8043,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             true,
+            None,
             None,
         );
         assert!(
@@ -8204,6 +8228,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             Some(design.as_path()),
+            None,
         );
 
         // The addendum is present and cites the RELATIVE bundle path (forward slashes),
@@ -8254,6 +8279,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             None,
+            None,
         );
         assert!(
             !plain.contains("a design bundle has been saved"),
@@ -8272,6 +8298,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             Some(root.as_path()),
+            None,
         );
         assert!(
             !verifier.contains("a design bundle has been saved"),

@@ -374,9 +374,15 @@ fn run_loop(
             // result (probed once at `censor_start_watch`). The client is built regardless
             // so the ctx is cheap to construct each pass; when `available` is false the
             // orchestrator never calls `generate` (see `run_gemma`).
-            let gemma_client = gemma::build_gemma_client(&local_ai);
-            let gemma_ctx: Option<GemmaCtx<'_>> = Some(GemmaCtx {
-                client: &*gemma_client as &dyn gemma::GemmaClient,
+            let gemma_client = match gemma::build_gemma_client(&local_ai) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    eprintln!("censor gemma: {e}");
+                    None
+                }
+            };
+            let gemma_ctx: Option<GemmaCtx<'_>> = gemma_client.as_deref().map(|client| GemmaCtx {
+                client,
                 available: gemma_available,
             });
             loop {

@@ -28,6 +28,7 @@
 
 use super::runners::{cap, redact_secrets, RawFinding};
 use super::schema::{Category, Severity};
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -166,6 +167,8 @@ const BODY_CAP: usize = 1_000;
 pub enum CensorAiProvider {
     Ollama,
     Omlx,
+    #[serde(rename = "appleFm")]
+    AppleFm,
 }
 
 /// The parsed `censorLocalAi` config. PRIVACY: for the oMLX provider, `base_url` is a
@@ -214,6 +217,7 @@ impl CensorLocalAi {
             (Some(b), _) => b.clone(),
             (None, CensorAiProvider::Ollama) => OLLAMA_BASE.to_string(),
             (None, CensorAiProvider::Omlx) => OMLX_DEFAULT_BASE.to_string(),
+            (None, CensorAiProvider::AppleFm) => String::new(),
         }
     }
 
@@ -221,7 +225,11 @@ impl CensorLocalAi {
     /// has no built-in model, so a validated oMLX config always carries one; the fallback
     /// to [`GEMMA_MODEL`] only ever applies to the Ollama provider.
     pub fn effective_model(&self) -> String {
-        self.model.clone().unwrap_or_else(|| GEMMA_MODEL.to_string())
+        match (&self.model, self.provider) {
+            (Some(model), _) => model.clone(),
+            (None, CensorAiProvider::AppleFm) => String::new(),
+            (None, _) => GEMMA_MODEL.to_string(),
+        }
     }
 }
 
@@ -315,6 +323,31 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                 model: Some(model.to_string()),
                 // oMLX uses `model`; the Ollama-only override is dropped so an oMLX config
                 // never carries a stray `ollamaModel` (it would never be read).
+                ollama_model: None,
+            })
+        }
+        CensorAiProvider::AppleFm => {
+            if !model.is_empty() {
+                if model.len() > CENSOR_OMLX_MODEL_MAX_LEN {
+                    return Err(format!(
+                        "Apple on-device model must be at most {CENSOR_OMLX_MODEL_MAX_LEN} characters."
+                    ));
+                }
+                if !is_valid_omlx_model(model) {
+                    return Err(
+                        "Apple on-device model must be a bare tag (letters, digits, . _ : / -)."
+                            .into(),
+                    );
+                }
+            }
+            Ok(CensorLocalAi {
+                provider: CensorAiProvider::AppleFm,
+                base_url: None,
+                model: if model.is_empty() {
+                    None
+                } else {
+                    Some(model.to_string())
+                },
                 ollama_model: None,
             })
         }
@@ -670,6 +703,148 @@ impl OmlxClient {
             generate_timeout,
             probe_timeout,
         }
+    }
+}
+
+fn apple_fm_respond_args(model: Option<&str>) -> Vec<String> {
+    let mut args = vec!["respond".to_string()];
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args
+}
+
+fn read_capped_thread<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+    cap: usize,
+) -> std::thread::JoinHandle<Result<Vec<u8>, GemmaError>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut limited = reader.by_ref().take((cap + 1) as u64);
+        limited
+            .read_to_end(&mut out)
+            .map_err(|_| GemmaError::Decode)?;
+        if out.len() > cap {
+            return Err(GemmaError::Decode);
+        }
+        Ok(out)
+    })
+}
+
+fn write_stdin_thread(
+    mut stdin: std::process::ChildStdin,
+    prompt: Vec<u8>,
+) -> std::thread::JoinHandle<Result<(), GemmaError>> {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        stdin
+            .write_all(&prompt)
+            .map_err(|_| GemmaError::Transport)?;
+        Ok(())
+    })
+}
+
+fn run_apple_fm_respond_process(
+    program: &Path,
+    args: &[String],
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, GemmaError> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("PATH", crate::backend::provider_detect::augmented_path());
+
+    let mut child = cmd.spawn().map_err(|_| GemmaError::Transport)?;
+    let stdout = child.stdout.take().ok_or(GemmaError::Transport)?;
+    let stderr = child.stderr.take().ok_or(GemmaError::Transport)?;
+    let stdin = child.stdin.take().ok_or(GemmaError::Transport)?;
+
+    let stdout_thread = read_capped_thread(stdout, RESPONSE_BODY_CAP);
+    let stderr_thread = read_capped_thread(stderr, 16 * 1024);
+    let stdin_thread = write_stdin_thread(stdin, prompt.as_bytes().to_vec());
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().map_err(|_| GemmaError::Transport)? {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdin_thread.join();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(GemmaError::Timeout);
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let stdin_result = stdin_thread
+        .join()
+        .map_err(|_| GemmaError::Transport)?;
+    let stdout_result = stdout_thread
+        .join()
+        .map_err(|_| GemmaError::Decode)?;
+    let _ = stderr_thread.join();
+
+    if !status.success() {
+        return Err(GemmaError::Status(status.code().unwrap_or(1) as u16));
+    }
+    stdin_result?;
+    let stdout_bytes = stdout_result?;
+    String::from_utf8(stdout_bytes).map_err(|_| GemmaError::Decode)
+}
+
+#[cfg(target_os = "macos")]
+pub struct AppleFmClient {
+    model: Option<String>,
+    generate_timeout: Duration,
+}
+
+#[cfg(target_os = "macos")]
+impl AppleFmClient {
+    pub(crate) fn with_config(model: Option<&str>, generate_timeout: Duration) -> Self {
+        Self {
+            model: model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
+            generate_timeout,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl GemmaClient for AppleFmClient {
+    fn probe(&self) -> bool {
+        crate::backend::provider_detect::resolve_program("fm").is_some()
+    }
+
+    fn generate(&self, prompt: &str) -> Result<String, GemmaError> {
+        let program = crate::backend::provider_detect::resolve_program("fm")
+            .ok_or(GemmaError::Transport)?;
+        run_apple_fm_respond_process(
+            &program,
+            &apple_fm_respond_args(self.model.as_deref()),
+            prompt,
+            self.generate_timeout,
+        )
+    }
+
+    fn provider_label(&self) -> &'static str {
+        "appleFm"
+    }
+
+    fn model_label(&self) -> String {
+        self.model.clone().unwrap_or_else(|| "default".to_string())
+    }
+
+    fn cache_identity(&self) -> String {
+        format!("appleFm||{}", self.model.as_deref().unwrap_or(""))
     }
 }
 
@@ -1076,27 +1251,34 @@ fn tag_names(body: &serde_json::Value) -> Vec<String> {
 /// `read_censor_local_ai`), so the base is already validated loopback; the client
 /// constructor re-clamps a non-loopback base as defense in depth. The base/model are
 /// NEVER logged here — provider identity only (see [`GemmaClient::provider_label`]).
-pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Box<dyn GemmaClient> {
+pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Result<Box<dyn GemmaClient>, String> {
     let base = cfg.effective_base();
     match cfg.provider {
         // The Ollama client takes the CONFIGURED override (`ollama_model`, may be `None`)
         // and resolves the effective tag itself via the [`resolve_gemma_model`] chain over
         // the live `/api/tags` list — so an existing install that only pulled `gemma4:e2b`
         // keeps its tier after the default bumped to `gemma4:e4b`.
-        CensorAiProvider::Ollama => Box::new(OllamaClient::with_config(
+        CensorAiProvider::Ollama => Ok(Box::new(OllamaClient::with_config(
             &base,
             cfg.ollama_model.as_deref(),
             GEMMA_GENERATE_TIMEOUT,
             GEMMA_PROBE_TIMEOUT,
-        )),
+        ))),
         // oMLX has no `/api/tags` equivalent; its model is REQUIRED + validated, so the
         // configured-or-default `effective_model` is used verbatim (no e2b fallback).
-        CensorAiProvider::Omlx => Box::new(OmlxClient::with_config(
+        CensorAiProvider::Omlx => Ok(Box::new(OmlxClient::with_config(
             &base,
             &cfg.effective_model(),
             GEMMA_GENERATE_TIMEOUT,
             GEMMA_PROBE_TIMEOUT,
-        )),
+        ))),
+        #[cfg(target_os = "macos")]
+        CensorAiProvider::AppleFm => Ok(Box::new(AppleFmClient::with_config(
+            cfg.model.as_deref(),
+            GEMMA_GENERATE_TIMEOUT,
+        ))),
+        #[cfg(not(target_os = "macos"))]
+        CensorAiProvider::AppleFm => Err("Apple on-device requires macOS 27+.".to_string()),
     }
 }
 
@@ -1394,8 +1576,13 @@ pub(crate) fn cap_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const APPLE_FM_DEADLOCK_CANDIDATE_ENV: &str = "ASPIS_TEST_APPLE_FM_DEADLOCK_CANDIDATE";
+    const APPLE_FM_DEADLOCK_STUB_ENV: &str = "ASPIS_TEST_APPLE_FM_DEADLOCK_STUB";
 
     fn det(line: u32, title: &str) -> RawFinding {
         RawFinding {
@@ -1441,6 +1628,96 @@ mod tests {
         fn model_label(&self) -> String {
             "stub-model".to_string()
         }
+    }
+
+    #[test]
+    fn apple_fm_generate_does_not_deadlock_when_child_emits_before_reading_large_prompt() {
+        if std::env::var_os(APPLE_FM_DEADLOCK_CANDIDATE_ENV).is_some()
+            || std::env::var_os(APPLE_FM_DEADLOCK_STUB_ENV).is_some()
+        {
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test executable");
+        let mut child = Command::new(exe)
+            .arg("apple_fm_deadlock_candidate_child")
+            .arg("--nocapture")
+            .env(APPLE_FM_DEADLOCK_CANDIDATE_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn candidate child");
+
+        let start = Instant::now();
+        loop {
+            if let Some(_status) = child.try_wait().expect("poll candidate") {
+                let output = child.wait_with_output().expect("collect candidate");
+                assert!(
+                    output.status.success(),
+                    "candidate failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("collect timed-out candidate");
+                panic!(
+                    "appleFm process runner deadlocked on large stdin + early stdout\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn apple_fm_deadlock_candidate_child() {
+        if std::env::var_os(APPLE_FM_DEADLOCK_CANDIDATE_ENV).is_none() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("test executable");
+        let prompt = "p".repeat(160 * 1024);
+        std::env::set_var(APPLE_FM_DEADLOCK_STUB_ENV, "1");
+        let args = vec![
+            "apple_fm_deadlock_stub_child".to_string(),
+            "--nocapture".to_string(),
+        ];
+        let output = run_apple_fm_respond_process(
+            &exe,
+            &args,
+            &prompt,
+            Duration::from_secs(5),
+        )
+        .expect("large prompt should not deadlock");
+        assert!(
+            output.contains("stub saw 163840 bytes"),
+            "stub output missing stdin length: {output}"
+        );
+    }
+
+    #[test]
+    fn apple_fm_deadlock_stub_child() {
+        if std::env::var_os(APPLE_FM_DEADLOCK_STUB_ENV).is_none() {
+            return;
+        }
+        use std::io::{Read, Write};
+
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&vec![b'x'; 192 * 1024])
+            .expect("write early stdout");
+        stdout.write_all(b"\nSTUB_READY\n").expect("write marker");
+        stdout.flush().expect("flush early stdout");
+
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .expect("read prompt stdin");
+        println!("stub saw {} bytes", input.len());
+        std::process::exit(0);
     }
 
     // ---- build_prompt ----
@@ -2410,6 +2687,70 @@ mod tests {
         assert!(jm.contains("\"ollamaModel\":\"gemma4:e4b\""), "{jm}");
         let back_m: CensorLocalAi = serde_json::from_str(&jm).unwrap();
         assert_eq!(back_m, with_model);
+
+        // appleFm uses explicit camelCase discriminator and still omits absent fields.
+        let apple = CensorLocalAi {
+            provider: CensorAiProvider::AppleFm,
+            base_url: None,
+            model: Some("apple-default".into()),
+            ollama_model: None,
+        };
+        let aj = serde_json::to_string(&apple).unwrap();
+        assert!(aj.contains("\"provider\":\"appleFm\""), "{aj}");
+        assert!(!aj.contains("baseUrl"), "{aj}");
+        let back_a: CensorLocalAi = serde_json::from_str(&aj).unwrap();
+        assert_eq!(back_a, apple);
+    }
+
+    #[test]
+    fn validate_censor_local_ai_applefm_keeps_optional_model_and_drops_unused() {
+        let valid = validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::AppleFm,
+            base_url: Some("http://evil.example".into()),
+            model: Some("  apple-model:v1  ".into()),
+            ollama_model: Some("gemma4:e4b".into()),
+        })
+        .unwrap();
+        assert_eq!(valid.provider, CensorAiProvider::AppleFm);
+        assert_eq!(valid.model.as_deref(), Some("apple-model:v1"));
+        assert!(valid.base_url.is_none());
+        assert!(valid.ollama_model.is_none());
+
+        let bad = validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::AppleFm,
+            base_url: None,
+            model: Some("bad model".into()),
+            ollama_model: None,
+        });
+        assert!(bad.is_err(), "appleFm model must use bare-token validation");
+    }
+
+    #[test]
+    fn apple_fm_respond_args_use_fixed_command_and_never_prompt_text() {
+        let args = apple_fm_respond_args(Some("apple-default"));
+        assert_eq!(args, vec!["respond", "--model", "apple-default"]);
+        let joined = args.join(" ");
+        assert!(!joined.contains("TOP_SECRET_PROMPT"));
+
+        let default_args = apple_fm_respond_args(None);
+        assert_eq!(default_args, vec!["respond"]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn build_gemma_client_applefm_non_macos_clean_error() {
+        let cfg = validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::AppleFm,
+            base_url: None,
+            model: None,
+            ollama_model: None,
+        })
+        .unwrap();
+        let err = match build_gemma_client(&cfg) {
+            Ok(_) => panic!("appleFm must not build on non-macOS"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "Apple on-device requires macOS 27+.");
     }
 
     #[test]
@@ -2559,7 +2900,7 @@ mod tests {
             ollama_model: Some("gemma4:e4b".into()),
         })
         .unwrap();
-        let client = build_gemma_client(&cfg);
+        let client = build_gemma_client(&cfg).unwrap();
         assert_eq!(client.provider_label(), "ollama");
         assert_eq!(client.model_label(), "gemma4:e4b");
     }
@@ -2597,7 +2938,8 @@ mod tests {
                 ollama_model: Some("llama3:8b".into()),
             })
             .unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(custom.model_label(), "llama3:8b");
         assert_eq!(custom.provider_label(), "ollama");
     }
@@ -2606,7 +2948,7 @@ mod tests {
     fn build_gemma_client_default_config_is_ollama() {
         // The default (a config with no `censorLocalAi`) resolves to the Ollama client —
         // byte-identical provider to the previous hardcoded OllamaClient::new().
-        let client = build_gemma_client(&CensorLocalAi::default());
+        let client = build_gemma_client(&CensorLocalAi::default()).unwrap();
         assert_eq!(client.provider_label(), "ollama");
     }
 
@@ -2617,7 +2959,7 @@ mod tests {
         let cfg = CensorLocalAi::default();
         assert_eq!(cfg.effective_base(), OLLAMA_BASE);
         assert_eq!(cfg.effective_model(), GEMMA_MODEL);
-        let client = build_gemma_client(&cfg);
+        let client = build_gemma_client(&cfg).unwrap();
         assert_eq!(client.provider_label(), "ollama");
     }
 
@@ -2631,7 +2973,7 @@ mod tests {
             ollama_model: None,
         })
         .unwrap();
-        let client = build_gemma_client(&cfg);
+        let client = build_gemma_client(&cfg).unwrap();
         assert_eq!(client.provider_label(), "omlx");
     }
 
@@ -2652,8 +2994,8 @@ mod tests {
             })
             .unwrap(),
         ] {
-            let probe_client = build_gemma_client(&cfg);
-            let worker_client = build_gemma_client(&cfg);
+            let probe_client = build_gemma_client(&cfg).unwrap();
+            let worker_client = build_gemma_client(&cfg).unwrap();
             assert_eq!(
                 probe_client.provider_label(),
                 worker_client.provider_label(),
@@ -2673,7 +3015,7 @@ mod tests {
             ollama_model: None,
         })
         .unwrap();
-        let client = build_gemma_client(&cfg);
+        let client = build_gemma_client(&cfg).unwrap();
         assert_eq!(client.provider_label(), "ollama");
     }
 

@@ -359,7 +359,7 @@ pub fn censor_start_watch(
     // fine pass and read by Phase E). A loopback round-trip — never on the per-file
     // path. If unavailable the tier is disabled and the engine degrades to
     // deterministic-only. Done BEFORE taking the watch lock (it is blocking IO).
-    let probe_client = gemma::build_gemma_client(&local_ai);
+    let probe_client = gemma::build_gemma_client(&local_ai)?;
     let gemma_available = censor.ensure_gemma_probed(&*probe_client);
 
     // Build the new watcher BEFORE taking the lock (notify setup is blocking IO).
@@ -523,13 +523,19 @@ fn run_review_now_oneshot(
     // oMLX). One snapshot per one-shot run = probe and generate use the SAME provider.
     // `read_censor_local_ai` is fail-safe (missing/invalid ⇒ Ollama default).
     let local_ai = crate::backend::projects::read_censor_local_ai(app);
-    let gemma_client = gemma::build_gemma_client(&local_ai);
-    let gemma_available = match app.try_state::<CensorState>() {
-        Some(state) => state.ensure_gemma_probed(&*gemma_client),
-        None => false,
+    let gemma_client = match gemma::build_gemma_client(&local_ai) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            eprintln!("censor gemma: {e}");
+            None
+        }
     };
-    let gemma_ctx = Some(GemmaCtx {
-        client: &*gemma_client as &dyn gemma::GemmaClient,
+    let gemma_available = match (app.try_state::<CensorState>(), gemma_client.as_deref()) {
+        (Some(state), Some(client)) => state.ensure_gemma_probed(client),
+        _ => false,
+    };
+    let gemma_ctx = gemma_client.as_deref().map(|client| GemmaCtx {
+        client,
         available: gemma_available,
     });
     // WARNING F: pass the SHARED "keep running" flag straight through as the

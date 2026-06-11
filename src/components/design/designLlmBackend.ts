@@ -112,7 +112,7 @@ export interface DesignBackendDraft {
 export interface DesignBackendValidation {
   ok: boolean;
   // Field-keyed inline messages; absent key == that field is valid.
-  errors: Partial<Record<"model" | "command" | "baseUrl" | "effort" | "timeoutSecs", string>>;
+  errors: Partial<Record<"kind" | "model" | "command" | "baseUrl" | "effort" | "timeoutSecs", string>>;
   // The normalized backend when ok (only the fields the kind uses are kept).
   value: DesignLlmBackend | null;
 }
@@ -176,6 +176,14 @@ export function validateDesignBackend(
     };
   }
 
+  if ((draft.kind as string) === "appleFm") {
+    return {
+      ok: false,
+      errors: { kind: "Apple on-device is not supported for Design LLM." },
+      value: null,
+    };
+  }
+
   // DesignBackendDraft is structurally a MiniBackendDraft (the remaining kinds are equal),
   // so this is a safe widening for the shared validator.
   const miniDraft: MiniBackendDraft = {
@@ -189,7 +197,7 @@ export function validateDesignBackend(
   // same kind union). Re-map explicitly so the public type is DesignLlmBackend, not a
   // structural alias of the mini-coder type.
   const baseValue: DesignLlmBackend | null = result.value
-    ? remapValue(result.value)
+    ? remapValue(result.value as MiniCoderBackend & { kind: Exclude<MiniCoderBackend["kind"], "appleFm"> })
     : null;
   const knobs = applyEffortAndTimeout(draft, baseValue);
   return {
@@ -201,7 +209,7 @@ export function validateDesignBackend(
 
 // Re-map a normalized MiniCoderBackend onto the DesignLlmBackend shape. They are
 // structurally identical; this preserves only the fields the kind kept (no churn).
-function remapValue(v: MiniCoderBackend): DesignLlmBackend {
+function remapValue(v: MiniCoderBackend & { kind: Exclude<MiniCoderBackend["kind"], "appleFm"> }): DesignLlmBackend {
   const out: DesignLlmBackend = { kind: v.kind };
   if (v.model !== undefined) out.model = v.model;
   if (v.command !== undefined) out.command = v.command;

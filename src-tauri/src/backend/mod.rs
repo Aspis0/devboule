@@ -1,6 +1,7 @@
 pub mod agent_pty;
 pub mod api_fuzz;
 pub mod agents;
+pub mod agent_notifications;
 pub mod auth;
 pub mod censor;
 pub mod cli_agents;
@@ -24,8 +25,10 @@ pub mod projects;
 pub mod provider_detect;
 pub mod providers;
 pub mod roles;
+pub mod saved_workflows;
 pub mod state;
 pub mod token_usage;
 pub mod training_export;
 pub mod vault;
+pub mod visual_check;
 pub mod workspace;
