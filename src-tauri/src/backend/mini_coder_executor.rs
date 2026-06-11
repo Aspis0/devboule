@@ -574,12 +574,12 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
     // 1) Locked READ snapshot, then work entirely off the clone (lock released).
     let snapshot = agents::read_agent_live_state_snapshot(app)?;
     let directives = snapshot.mini_coder_directives.clone();
-    let visual_directives = snapshot.visual_check_directives.clone();
-    if directives.is_empty() && visual_directives.is_empty() {
+    let has_visual = !snapshot.visual_check_directives.is_empty();
+    if directives.is_empty() && !has_visual {
         return Ok(()); // EARLY EXIT: nothing to do, cheapest idle path.
     }
-    if !visual_directives.is_empty() {
-        run_visual_check_pass(app, &snapshot, &visual_directives);
+    if has_visual {
+        run_visual_check_pass(app, &snapshot);
     }
     if directives.is_empty() {
         return Ok(());
@@ -774,18 +774,30 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn run_visual_check_pass(
-    app: &AppHandle,
-    snapshot: &crate::backend::model::AgentLiveState,
-    directives: &[crate::backend::visual_check::VisualCheckDirective],
-) {
+fn run_visual_check_pass(app: &AppHandle, snapshot: &crate::backend::model::AgentLiveState) {
+    // One pass instant for BOTH the timeout plan and the claim stamp (they describe the same
+    // scan tick).
     let now = Utc::now().to_rfc3339();
-    for directive in directives.iter().filter(|d| {
-        crate::backend::visual_check::claimed_timed_out(d, &now, VISUAL_CHECK_TIMEOUT_SECS)
-    }) {
-        let id = directive.id.clone();
-        let _ = agents::mutate_agent_live_state(app, |state| {
-            transition_visual_directive(state, &id, |d| {
+
+    // MINOR (FIX 3): evict timed-out directives AND claim the next Pending in ONE locked
+    // mutation. Previously these were TWO separate mutate_agent_live_state calls (evict, then
+    // claim) with a TOCTOU window between them — only safe because the claim re-checked status.
+    // Recomputing the PURE `visual_pass_plan` on the LIVE state INSIDE the lock makes the
+    // eviction set and the claim gate consistent with the exact state we mutate, closing the
+    // window. The closure returns the claimed directive CLONED FROM LIVE STATE (not just its
+    // id) so the spawn — which must run OUTSIDE the lock — never consults the stale snapshot:
+    // a directive appended between the snapshot read and this lock would be claimed here but
+    // absent from the snapshot, and an id-only return would orphan it as Running. BLOCKER 2
+    // property preserved: the plan gates "anything still Running?" on the POST-eviction view,
+    // so a directive timed out THIS pass never starves a Pending claim in the same pass.
+    let claimed = agents::mutate_agent_live_state(app, |state| {
+        let (timed_out_ids, claimable_pending_id) = crate::backend::visual_check::visual_pass_plan(
+            &state.visual_check_directives,
+            &now,
+            VISUAL_CHECK_TIMEOUT_SECS,
+        );
+        for id in &timed_out_ids {
+            transition_visual_directive(state, id, |d| {
                 crate::backend::visual_check::apply_result(
                     d,
                     crate::backend::visual_check::VisualCheckOutcome::timeout(
@@ -793,43 +805,32 @@ fn run_visual_check_pass(
                     ),
                 )
             });
-            cap_pass(state);
+        }
+        let claimed = claimable_pending_id.and_then(|candidate_id| {
+            let d = state
+                .visual_check_directives
+                .iter_mut()
+                .find(|d| d.id == candidate_id)?;
+            if d.status != crate::backend::visual_check::VisualCheckStatus::Pending {
+                return None;
+            }
+            match crate::backend::visual_check::apply_claim(d, now.clone()) {
+                Ok(next) => {
+                    *d = next;
+                    Some(d.clone())
+                }
+                Err(_) => None,
+            }
         });
-    }
+        cap_pass(state);
+        claimed
+    });
 
-    if directives.iter().any(|d| d.status == crate::backend::visual_check::VisualCheckStatus::Running) {
-        return;
-    }
-    let Some(candidate) = directives
-        .iter()
-        .find(|d| d.status == crate::backend::visual_check::VisualCheckStatus::Pending)
-        .cloned()
-    else {
+    let Ok(Some(candidate)) = claimed else {
         return;
     };
     let parent_project = snapshot_parent_project(snapshot, &candidate.parent_agent_id)
         .filter(|p| !p.trim().is_empty());
-    let claimed_at = Utc::now().to_rfc3339();
-    let id = candidate.id.clone();
-    let claimed = agents::mutate_agent_live_state(app, |state| {
-        let Some(d) = state.visual_check_directives.iter_mut().find(|d| d.id == id) else {
-            return false;
-        };
-        if d.status != crate::backend::visual_check::VisualCheckStatus::Pending {
-            return false;
-        }
-        match crate::backend::visual_check::apply_claim(d, claimed_at.clone()) {
-            Ok(next) => {
-                *d = next;
-                cap_pass(state);
-                true
-            }
-            Err(_) => false,
-        }
-    });
-    if !matches!(claimed, Ok(true)) {
-        return;
-    }
     let Some(project_id) = parent_project else {
         finish_visual_check(
             app,
@@ -1615,32 +1616,11 @@ fn real_censor_verdict(
             }
         }
     }
-    if let Some((html_rel, critique)) = visual_advisory_for_html(app, root, &rel_files) {
-        if let Some(finding) = mini_coder::visual_advisory_finding(&html_rel, &critique) {
-            out.push(finding);
-        }
-    }
+    // MAJOR 3: the synchronous visual advisory was removed from the verdict path. It blocked
+    // the VerdictInflightGuard 0.5–30s per HTML-touching task and hijacked the user's design-
+    // preview window. The sanctioned path is the `visual_check` MCP tool the mini-coder agent
+    // is instructed to call from its own loop (async, not on the blocking verdict thread).
     out
-}
-
-fn visual_advisory_for_html(
-    app: &AppHandle,
-    root: &Path,
-    rel_files: &[String],
-) -> Option<(String, String)> {
-    let rel = crate::backend::visual_check::select_self_contained_html(root, rel_files)?;
-    let directive = crate::backend::visual_check::VisualCheckDirective {
-        id: "mini-coder-verdict-visual".into(),
-        parent_agent_id: String::new(),
-        html_path: rel.clone(),
-        focus: Some("Advisory Censor pass: report visible UI defects only. This finding is informational and must not block alone.".into()),
-        ..crate::backend::visual_check::VisualCheckDirective::default()
-    };
-    let outcome = crate::backend::visual_check::execute_visual_check(app.clone(), root, &directive);
-    if outcome.status != crate::backend::visual_check::VisualCheckStatus::Done {
-        return None;
-    }
-    outcome.critique.map(|critique| (rel, critique))
 }
 
 /// PURE decision: the terminal `MiniCoderOutcome` a finished mini's directive should

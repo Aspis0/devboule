@@ -142,6 +142,50 @@ pub fn claimed_timed_out(
     now.signed_duration_since(claimed).num_seconds() >= timeout_secs
 }
 
+/// PURE plan for one visual_check scan pass. Computes, over a directive snapshot:
+///   1. `timed_out_ids` — every Running directive whose claim has exceeded `timeout_secs`
+///      (these are evicted to Timeout in the locked mutation).
+///   2. `claimable_pending_id` — the first Pending directive that MAY be claimed THIS pass,
+///      which is `Some` ONLY when no Running directive REMAINS after the timed-out ones are
+///      evicted (one concurrent capture at a time).
+///
+/// The key correctness property (BLOCKER 2 regression): the "is anything still Running?"
+/// gate is evaluated on the POST-eviction view — a directive that times out in this pass
+/// must NOT keep a Pending directive from being claimed in the SAME pass.
+pub fn visual_pass_plan(
+    directives: &[VisualCheckDirective],
+    now_rfc3339: &str,
+    timeout_secs: i64,
+) -> (Vec<String>, Option<String>) {
+    let timed_out: std::collections::HashSet<&str> = directives
+        .iter()
+        .filter(|d| claimed_timed_out(d, now_rfc3339, timeout_secs))
+        .map(|d| d.id.as_str())
+        .collect();
+
+    // A directive is still Running AFTER eviction iff it is Running and NOT timed out.
+    let still_running = directives.iter().any(|d| {
+        d.status == VisualCheckStatus::Running && !timed_out.contains(d.id.as_str())
+    });
+
+    let claimable_pending_id = if still_running {
+        None
+    } else {
+        directives
+            .iter()
+            .find(|d| d.status == VisualCheckStatus::Pending)
+            .map(|d| d.id.clone())
+    };
+
+    let timed_out_ids = directives
+        .iter()
+        .filter(|d| timed_out.contains(d.id.as_str()))
+        .map(|d| d.id.clone())
+        .collect();
+
+    (timed_out_ids, claimable_pending_id)
+}
+
 pub fn cap_directives(mut directives: Vec<VisualCheckDirective>) -> Vec<VisualCheckDirective> {
     if directives.len() <= MAX_VISUAL_CHECK_DIRECTIVES {
         return directives;
@@ -226,58 +270,19 @@ pub fn resolve_html_artifact(project_root: &Path, html_path: &str) -> Result<Pat
     Ok(canonical_target)
 }
 
-pub fn html_looks_self_contained(markup: &str) -> bool {
-    let lower = markup.to_ascii_lowercase();
-    for attr in ["src=", "href="] {
-        let mut rest = lower.as_str();
-        while let Some(pos) = rest.find(attr) {
-            rest = &rest[pos + attr.len()..];
-            let value = rest.trim_start();
-            let value = value
-                .strip_prefix('"')
-                .or_else(|| value.strip_prefix('\''))
-                .unwrap_or(value);
-            if !(value.starts_with("data:")
-                || value.starts_with('#')
-                || value.starts_with("mailto:")
-                || value.starts_with("tel:"))
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-pub fn select_self_contained_html(project_root: &Path, files: &[String]) -> Option<String> {
-    for rel in files {
-        if crate::backend::censor::ledger::validate_rel_path(rel).is_err() {
-            continue;
-        }
-        let path = match resolve_html_artifact(project_root, rel) {
-            Ok(path) => path,
-            Err(_) => continue,
-        };
-        let Ok(markup) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        if html_looks_self_contained(&markup) {
-            return Some(rel.replace('\\', "/"));
-        }
-    }
-    None
-}
-
 pub fn critique_png_with_client(
     client: &dyn GemmaClient,
     png_bytes: &[u8],
     focus: Option<&str>,
 ) -> Result<String, String> {
-    if png_bytes.is_empty() || png_bytes.len() as u64 > VISUAL_CHECK_PNG_MAX_BYTES {
+    if png_bytes.is_empty() {
+        return Err("captured image is empty".to_string());
+    }
+    if png_bytes.len() as u64 > VISUAL_CHECK_PNG_MAX_BYTES {
         return Err("captured image is too large".to_string());
     }
     let prompt = build_visual_check_prompt(focus);
-    let encoded = base64_encode(png_bytes);
+    let encoded = crate::backend::util::base64_encode(png_bytes);
     let raw = client
         .generate_with_images(&prompt, &[encoded])
         .map_err(|e| match e {
@@ -316,9 +321,22 @@ fn execute_visual_check_inner(
     let html = std::fs::read_to_string(&html_path).map_err(|_| "could not read html file".to_string())?;
     let focus = directive.focus.as_deref();
     let png = tauri::async_runtime::block_on(async {
-        crate::backend::design_preview::open_preview_html(&app, &html, "Visual check").await?;
+        // BLOCKER 1: hold the window chokepoint guard across the WHOLE open→settle→capture→
+        // close cycle, so no concurrent user-open or other visual_check cycle can rebuild the
+        // window mid-flight or capture this cycle's HTML. The guard is acquired inside
+        // open_preview_html and released when `_guard` drops at the end of this async block.
+        let _guard = crate::backend::design_preview::open_preview_html(
+            &app,
+            &html,
+            "Visual check",
+            crate::backend::design_preview::PreviewOpener::VisualCheck,
+        )
+        .await?;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let png = crate::backend::design_preview::capture_preview_png_bytes(&app).await;
+        // MAJOR 4: best-effort close on EVERY path after the open succeeded — including when
+        // the capture failed — so a failed cycle never leaks an open preview window. (The
+        // guard itself still drops here regardless.)
         crate::backend::design_preview::close_preview_window(&app);
         png
     })
@@ -334,31 +352,6 @@ fn execute_visual_check_inner(
     let client = crate::backend::censor::gemma::build_gemma_client(&local_ai)
         .map_err(|_| "no vision provider available".to_string())?;
     critique_png_with_client(client.as_ref(), &png, focus)
-}
-
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((triple >> 6) & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(triple & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -391,30 +384,6 @@ mod tests {
         assert!(resolve_html_artifact(&root, "../escape.html").is_err());
         assert!(resolve_html_artifact(&root, "dist/page.txt").is_err());
         assert!(resolve_html_artifact(&root, "dist/missing.html").is_err());
-    }
-
-    #[test]
-    fn self_contained_html_selector_accepts_inline_and_rejects_asset_refs() {
-        let root = temp_root("visual-check-self-contained");
-        std::fs::create_dir_all(root.join("dist")).unwrap();
-        std::fs::write(
-            root.join("dist").join("asset.html"),
-            r#"<html><img src="logo.png"></html>"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("dist").join("inline.html"),
-            r##"<html><a href="#top">Top</a><img src="data:image/png;base64,AA=="></html>"##,
-        )
-        .unwrap();
-
-        assert!(!html_looks_self_contained(r#"<script src="app.js"></script>"#));
-        assert!(html_looks_self_contained(r##"<a href="#x">x</a><img src="data:image/png;base64,AA==">"##));
-        let selected = select_self_contained_html(
-            &root,
-            &["dist/asset.html".into(), "dist/inline.html".into()],
-        );
-        assert_eq!(selected.as_deref(), Some("dist/inline.html"));
     }
 
     #[test]
@@ -539,6 +508,62 @@ mod tests {
         let ids: std::collections::HashSet<_> = capped.iter().map(|d| d.id.as_str()).collect();
         assert!(ids.contains("active"));
         assert!(!ids.contains("old"));
+    }
+
+    #[test]
+    fn visual_pass_plan_lets_a_pending_claim_when_the_only_running_times_out() {
+        // BLOCKER 2 regression: a Running directive whose claim has aged past the timeout is
+        // evicted THIS pass; with no other Running directive, a Pending must become claimable
+        // in the SAME pass (not starved a full scan interval). The pre-fix gate evaluated
+        // "anything Running?" on the pre-eviction snapshot, where the timed-out directive
+        // still counted → the Pending was wrongly withheld.
+        let stale_running = VisualCheckDirective {
+            id: "stale".into(),
+            status: VisualCheckStatus::Running,
+            created_at: "2026-06-06T00:00:00Z".into(),
+            claimed_at: Some("2026-06-06T00:00:00Z".into()),
+            ..VisualCheckDirective::default()
+        };
+        let pending = VisualCheckDirective {
+            id: "next".into(),
+            status: VisualCheckStatus::Pending,
+            created_at: "2026-06-06T00:00:05Z".into(),
+            ..VisualCheckDirective::default()
+        };
+        let directives = vec![stale_running, pending];
+        // 3 minutes later the 120s claim has timed out.
+        let (timed_out, claimable) =
+            visual_pass_plan(&directives, "2026-06-06T00:03:00Z", 120);
+        assert_eq!(timed_out, vec!["stale".to_string()], "the stale Running is evicted");
+        assert_eq!(
+            claimable.as_deref(),
+            Some("next"),
+            "the Pending must be claimable in the SAME pass the stale Running times out"
+        );
+    }
+
+    #[test]
+    fn visual_pass_plan_withholds_pending_while_a_fresh_running_remains() {
+        // A still-fresh Running directive (claim not aged past the timeout) blocks any new
+        // claim — only one capture runs at a time.
+        let fresh_running = VisualCheckDirective {
+            id: "fresh".into(),
+            status: VisualCheckStatus::Running,
+            created_at: "2026-06-06T00:02:50Z".into(),
+            claimed_at: Some("2026-06-06T00:02:50Z".into()),
+            ..VisualCheckDirective::default()
+        };
+        let pending = VisualCheckDirective {
+            id: "next".into(),
+            status: VisualCheckStatus::Pending,
+            created_at: "2026-06-06T00:02:55Z".into(),
+            ..VisualCheckDirective::default()
+        };
+        let directives = vec![fresh_running, pending];
+        let (timed_out, claimable) =
+            visual_pass_plan(&directives, "2026-06-06T00:03:00Z", 120);
+        assert!(timed_out.is_empty(), "a fresh Running is not evicted");
+        assert_eq!(claimable, None, "no Pending may be claimed while one is Running");
     }
 
     fn temp_root(label: &str) -> std::path::PathBuf {

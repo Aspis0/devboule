@@ -294,6 +294,45 @@ describe("startAttentionWatcher singleton guard (#4)", () => {
     expect(sendNotificationMock).not.toHaveBeenCalled();
     teardown();
   });
+
+  it("does NOT consume a notification slot for a terminal outcome after teardown (#MINOR4)", async () => {
+    // MINOR 4 regression: reserveNotificationSlot mutates the rolling recentFiresMs budget.
+    // If the watcher is torn down (cancelled) before the outcome toast actually fires, the
+    // slot would be wasted. The handle() pass must skip the reservation when cancelled.
+    sendNotificationMock.mockClear();
+    permissionPromise = Promise.resolve(true);
+    const { store, listeners } = mockStore();
+    const notifyOutcomes = vi.fn(
+      async (_sessions: AgentSession[], _isCancelled?: () => boolean) => {},
+    );
+    const teardown = startAttentionWatcher(store, {
+      loadPrevSinceByAgent: async () => ({}),
+      savePrevSinceByAgent: async () => {},
+      notifyOutcomes,
+    });
+    await flushAsync();
+    // Capture the live listener so we can drive a handle() pass AFTER teardown removes it
+    // from the store's subscriber set (simulating a pass racing an in-flight teardown).
+    const listener = [...listeners][0];
+    expect(listener).toBeDefined();
+    // Seed a non-terminal previous status for the agent while still live.
+    listener?.({
+      sessions: [
+        session({ agentId: "workflow-x", host: "app", status: "wip" }),
+      ],
+    });
+    notifyOutcomes.mockClear();
+    // Tear down (sets cancelled = true), then drive a terminal transition through the
+    // retained listener: the cancelled guard must prevent any slot reservation / toast.
+    teardown();
+    listener?.({
+      sessions: [
+        session({ agentId: "workflow-x", host: "app", status: "done" }),
+      ],
+    });
+    await flushAsync();
+    expect(notifyOutcomes).not.toHaveBeenCalled();
+  });
 });
 
 describe("buildNotificationBody", () => {

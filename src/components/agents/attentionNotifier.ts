@@ -153,6 +153,9 @@ export function buildSummaryNotificationBody(count: number): string {
 }
 
 export function isTerminalOutcomeSession(session: AgentSession): boolean {
+  // Only app-hosted PTY agents get an OS "finished" toast: their terminal lives inside the
+  // app and the user cannot see it end. CLI-hosted agents run in their own terminal window
+  // where the outcome is already visible, so a toast would be redundant noise.
   if (session.host !== "app") return false;
   return isTerminalOutcomeStatus(session.status);
 }
@@ -336,6 +339,10 @@ export function startAttentionWatcher(
   };
 
   const handle = (sessions: AgentSession[]): void => {
+    // A torn-down watcher does NOTHING: a late store emission (or a queued
+    // microtask) must not mutate previousStatusByAgent / prevSinceByAgent or
+    // consume a per-minute slot in the needs-you / outcome paths after teardown.
+    if (cancelled) return;
     if (!ready) {
       pendingSessions = sessions;
       return;
@@ -382,7 +389,13 @@ export function startAttentionWatcher(
       if (
         previous !== undefined &&
         !isTerminalOutcomeStatus(previous) &&
-        isTerminalOutcomeSession(session)
+        isTerminalOutcomeSession(session) &&
+        // Final cancellation gate BEFORE consuming a rate-limit slot: the watcher may have
+        // been torn down earlier in this same handle() pass (e.g. a needs-you notify path
+        // flipped nothing, but a concurrent teardown set `cancelled`). reserveNotificationSlot
+        // mutates recentFiresMs, so consuming a slot for a toast that will never fire would
+        // waste a slot from the rolling per-minute budget. Skip the reservation if cancelled.
+        !cancelled
       ) {
         if (reserveNotificationSlot({ prevSinceByAgent, recentFiresMs, now })) {
           outcomeToFire.push(session);

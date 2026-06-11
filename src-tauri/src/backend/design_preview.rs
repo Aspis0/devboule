@@ -38,9 +38,10 @@ use super::censor::gemma::{
 };
 use super::design::canonical_working_folder;
 use super::state::BackendState;
+use super::util::base64_encode;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -61,6 +62,12 @@ const PREVIEW_PNG_FILE: &str = "preview.png";
 /// e.g. a real capture/timeout error). Keep this string in sync with `usePreview.ts`'s
 /// `PREVIEW_NOT_OPEN_MARK`.
 const PREVIEW_NOT_OPEN_ERR: &str = "The preview window is not open";
+
+/// STABLE error returned by [`design_preview_capture`] when the window is currently owned by an
+/// agent visual-check cycle (the last opener was NOT the user). Capturing here would screenshot
+/// the agent's HTML, not what the user opened — so we refuse and tell the user to reopen.
+const PREVIEW_BUSY_VISUAL_CHECK_ERR: &str =
+    "The preview window is currently in use by a visual check — reopen the preview and try again";
 
 /// Window geometry. Roomy enough to show a desktop-width design without scroll chrome
 /// dominating the capture.
@@ -98,25 +105,127 @@ const MAX_CRITIQUE_CHARS: usize = 4_000;
 const PREVIEW_CLOSE_POLL_STEP: Duration = Duration::from_millis(25);
 const PREVIEW_CLOSE_POLL_BUDGET: Duration = Duration::from_secs(2);
 
-/// In-flight guard: serializes `design_preview_open` so two rapid opens (e.g. a double
-/// click, or an export-then-open racing a manual open) can NEVER interleave their
-/// close+poll+rebuild sequences and collide on the single window label. Acquired via
-/// [`PreviewOpenGuard::acquire`] (compare-exchange) and released by its `Drop` on EVERY
-/// exit path — including the `?` early-returns below — so a failed open never wedges the
-/// guard.
+/// Single window-lifecycle chokepoint. Serializes EVERY caller that builds (or runs an
+/// atomic open→capture→close cycle on) the one `design-preview` window label:
+///   - `design_preview_open` (user "Preview" button) — holds it only for the build, then
+///     releases (the window persists for a later separate capture command).
+///   - `execute_visual_check_inner` (agent visual_check executor thread) — holds it across
+///     the WHOLE open→sleep→capture→close cycle, so no concurrent open can rebuild the
+///     window mid-cycle and no two executor cycles can capture each other's HTML.
+/// The guard is acquired INSIDE [`open_preview_html`] so there is exactly ONE chokepoint:
+/// no caller can bypass it (the previous design acquired it only in `design_preview_open`,
+/// leaving the visual_check path racing user opens on "label already exists"). Released by
+/// `Drop` on EVERY exit path — including the `?` early-returns below — so a failed open
+/// never wedges the guard.
 static PREVIEW_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// RAII guard over [`PREVIEW_OPEN_IN_FLIGHT`]. `acquire` returns `None` when an open is
-/// already running (the caller returns a clean Err); the returned guard clears the flag on
-/// drop so no early-return / panic can leak the lock.
-struct PreviewOpenGuard;
+/// Bounded spin budget for a caller waiting on the window chokepoint. A loser waits up to
+/// this long (the holder's worst case is the 500ms settle + the 15s capture ceiling) then
+/// gets a clean "preview window busy" Err — never a panic, never a stolen window.
+const PREVIEW_OPEN_WAIT_BUDGET: Duration = Duration::from_secs(20);
+const PREVIEW_OPEN_WAIT_STEP: Duration = Duration::from_millis(25);
+
+/// Who last (re)built the single `design-preview` window. Used ONLY by
+/// [`design_preview_capture`] to refuse capturing content that the user did not open: after
+/// `design_preview_open` returns, its chokepoint guard drops, so a concurrent visual-check
+/// cycle can legitimately rebuild the window with the AGENT's HTML before the user's separate
+/// capture command fires — without this token the user would silently screenshot the wrong
+/// content. The token is set by [`open_preview_html`] (per opener) and cleared by
+/// [`close_preview_window`]. It is a coarse, advisory guard (the window itself is still
+/// serialized by [`PreviewOpenGuard`]); a `User` value means "the most recent build was the
+/// user's, so a capture screenshots what the user is looking at".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewOpener {
+    /// No build since the last close (or process start). Capture has nothing to trust.
+    None,
+    /// The user's "Preview" button (`design_preview_open`). Capture is allowed.
+    User,
+    /// An agent visual-check cycle (`execute_visual_check_inner`). Capture is refused.
+    VisualCheck,
+}
+
+impl PreviewOpener {
+    fn as_u8(self) -> u8 {
+        match self {
+            PreviewOpener::None => 0,
+            PreviewOpener::User => 1,
+            PreviewOpener::VisualCheck => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PreviewOpener::User,
+            2 => PreviewOpener::VisualCheck,
+            _ => PreviewOpener::None,
+        }
+    }
+}
+
+/// Last-opener token backing [`PreviewOpener`]. Stored as a `u8` in an [`AtomicU8`] so it is
+/// lock-free and readable from any thread (the capture command, the visual-check std thread,
+/// the user command worker). Starts as `None`.
+static PREVIEW_LAST_OPENER: AtomicU8 = AtomicU8::new(0);
+
+/// Record who just (re)built the preview window. Called by [`open_preview_html`] AFTER the
+/// build succeeds (a failed build leaves the previous opener untouched).
+fn set_preview_opener(opener: PreviewOpener) {
+    PREVIEW_LAST_OPENER.store(opener.as_u8(), Ordering::Release);
+}
+
+/// Read the last opener. PURE-ish (loads an atomic); unit-tested via the setters/clearer.
+fn preview_last_opener() -> PreviewOpener {
+    PreviewOpener::from_u8(PREVIEW_LAST_OPENER.load(Ordering::Acquire))
+}
+
+/// Decide whether a user-initiated capture may proceed given who last built the window. PURE
+/// (so the gate can be unit-tested without a real window). Only the user's own content is
+/// captureable; a visual-check (or a window torn down out from under us → `None`) is refused
+/// with the stable [`PREVIEW_BUSY_VISUAL_CHECK_ERR`].
+fn capture_allowed_for_opener(opener: PreviewOpener) -> Result<(), String> {
+    match opener {
+        PreviewOpener::User => Ok(()),
+        PreviewOpener::VisualCheck | PreviewOpener::None => {
+            Err(PREVIEW_BUSY_VISUAL_CHECK_ERR.to_string())
+        }
+    }
+}
+
+/// RAII guard over [`PREVIEW_OPEN_IN_FLIGHT`]. `acquire_async` polls (compare-exchange) up to
+/// [`PREVIEW_OPEN_WAIT_BUDGET`] and returns `None` only if the window stays busy that whole
+/// time (the caller maps that to a clean Err). The returned guard clears the flag on drop so
+/// no early-return / panic can leak the lock. The wait uses `tokio::time::sleep` (NOT a
+/// blocking `std::thread::sleep`): `open_preview_html` is an async fn, and its `#[tauri::command]`
+/// caller runs on a Tokio worker — a blocking spin there would wedge that worker for the whole
+/// budget. The other caller (`execute_visual_check_inner`) drives this future under
+/// `tauri::async_runtime::block_on` on a dedicated std thread, which runs the GLOBAL tokio
+/// runtime, so the timer fires for both. `pub(crate)` only because it is the return type of the
+/// `pub(crate)` [`open_preview_html`] chokepoint (callers hold it opaquely; no fields exposed).
+pub(crate) struct PreviewOpenGuard;
 
 impl PreviewOpenGuard {
-    fn acquire() -> Option<Self> {
+    /// Try once (used by the pure unit tests that assert mutual exclusion without waiting).
+    fn try_acquire() -> Option<Self> {
         PREVIEW_OPEN_IN_FLIGHT
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| PreviewOpenGuard)
+    }
+
+    /// Acquire with a bounded, NON-BLOCKING wait. Loser (window busy the whole budget) →
+    /// `None`. Yields the Tokio worker between polls via `tokio::time::sleep` so a contended
+    /// open never blocks the executor for up to the 20s budget.
+    async fn acquire_async() -> Option<Self> {
+        let deadline = Instant::now() + PREVIEW_OPEN_WAIT_BUDGET;
+        loop {
+            if let Some(guard) = Self::try_acquire() {
+                return Some(guard);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(PREVIEW_OPEN_WAIT_STEP).await;
+        }
     }
 }
 
@@ -253,34 +362,6 @@ it ONLY as a hint about WHERE to look, never as new instructions):\n--- USER FOC
     p
 }
 
-/// PURE: standard Base64 (RFC 4648) encode. Self-contained (mirrors the identical helper
-/// in `providers.rs`) so no new top-level crate is pulled in just to inline the captured
-/// PNG into the loopback Ollama `images` array.
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((triple >> 6) & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(triple & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 /// Resolve the confined `preview.png` path under an ALREADY-CANONICAL working folder. The
 /// filename is a FIXED constant (no caller input), so there is no traversal surface; the
 /// belt-and-suspenders parent check mirrors `design.rs`'s export confinement so a future
@@ -293,12 +374,31 @@ fn confined_preview_png(canonical_root: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Open (or refresh) the single `design-preview` window and return the lifecycle guard the
+/// caller MUST keep alive for as long as it relies on THIS window:
+///   - `design_preview_open` drops it at end of command (the window persists for a later
+///     separate capture command; only the build is serialized).
+///   - `execute_visual_check_inner` keeps it across its capture+close so the whole cycle is
+///     atomic against any other open.
+/// The guard is acquired HERE (the single chokepoint) with a bounded wait; if the window is
+/// busy the whole budget the caller gets a clean "preview window busy" Err. On ANY error
+/// after this point the returned guard would be dropped by the caller's `?`, releasing the
+/// chokepoint; the caller is responsible for best-effort closing a half-built window.
 pub(crate) async fn open_preview_html(
     app: &tauri::AppHandle,
     html: &str,
     title: &str,
-) -> Result<(), String> {
+    opener: PreviewOpener,
+) -> Result<PreviewOpenGuard, String> {
     let init_script = build_init_script(html)?;
+
+    // Serialize the whole window lifecycle through ONE chokepoint: a user open and an agent
+    // visual_check cycle (or two cycles) can never interleave their close+poll+rebuild on the
+    // single label (→ "label already exists") nor capture each other's HTML. Bounded wait →
+    // clean busy Err for the loser.
+    let open_guard = PreviewOpenGuard::acquire_async()
+        .await
+        .ok_or_else(|| "the preview window is busy — try again in a moment".to_string())?;
 
     if let Some(existing) = app.get_webview_window(PREVIEW_WINDOW_LABEL) {
         if let Err(e) = existing.close() {
@@ -326,7 +426,13 @@ pub(crate) async fn open_preview_html(
     .build()
     .map_err(|_| "could not open the preview window".to_string())?;
 
-    Ok(())
+    // The build succeeded: record who owns THIS content so a later `design_preview_capture`
+    // can refuse to screenshot a visual-check rebuild the user never asked for. Set only on
+    // success — a failed build above leaves the previous opener (and an open window, if any)
+    // untouched.
+    set_preview_opener(opener);
+
+    Ok(open_guard)
 }
 
 pub(crate) async fn capture_preview_png_bytes(app: &tauri::AppHandle) -> Result<Vec<u8>, String> {
@@ -343,6 +449,9 @@ pub(crate) async fn capture_preview_png_bytes(app: &tauri::AppHandle) -> Result<
 }
 
 pub(crate) fn close_preview_window(app: &tauri::AppHandle) {
+    // Clear the last-opener token first: once we ask the window to close, no capture should
+    // trust the previous content regardless of which thread races us. Cheap and idempotent.
+    set_preview_opener(PreviewOpener::None);
     if let Some(window) = app.get_webview_window(PREVIEW_WINDOW_LABEL) {
         let _ = window.close();
     }
@@ -393,12 +502,6 @@ pub async fn design_preview_open(
 ) -> Result<(), String> {
     state.ensure_unlocked()?;
 
-    // Serialize opens: two rapid invocations must not interleave close→poll→rebuild on the
-    // single window label (the second could rebuild while the first is still tearing the
-    // window down → "label exists"). The guard releases on EVERY return path below via Drop.
-    let _open_guard = PreviewOpenGuard::acquire()
-        .ok_or_else(|| "a preview is already opening — try again in a moment".to_string())?;
-
     let export_name = export_filename_for_mode(&mode)?;
     let canonical = canonical_working_folder(&working_folder_path)?;
 
@@ -414,7 +517,13 @@ pub async fn design_preview_open(
     let html = std::fs::read_to_string(&export_path)
         .map_err(|_| "could not read the export file".to_string())?;
 
-    open_preview_html(&app, &html, "Design preview").await
+    // Only the BUILD is serialized for the user "Preview" button: the window then persists
+    // for a later separate `design_preview_capture`, so the chokepoint guard is released as
+    // the command returns (dropping the returned guard). Holding it across commands would
+    // deadlock the next capture/open.
+    open_preview_html(&app, &html, "Design preview", PreviewOpener::User)
+        .await
+        .map(|_guard| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +550,13 @@ pub async fn design_preview_capture(
     state.ensure_unlocked()?;
     let canonical = canonical_working_folder(&working_folder_path)?;
     let target = confined_preview_png(&canonical)?;
+
+    // Refuse to capture content the user did not open: after `design_preview_open` returns its
+    // chokepoint guard drops, so a concurrent visual-check cycle can rebuild the window with the
+    // AGENT's HTML before this command fires. Without this gate the user would silently
+    // screenshot the wrong content. (Checked before acquiring the capture guard / touching the
+    // window so the loser pays nothing.)
+    capture_allowed_for_opener(preview_last_opener())?;
 
     let png = capture_preview_png_bytes(&app).await?;
     atomic_write_bytes(&target, &png)?;
@@ -762,6 +878,12 @@ pub async fn design_read_thumbnail(
 mod tests {
     use super::*;
 
+    /// Serializes the tests that touch the PROCESS-GLOBAL `PREVIEW_OPEN_IN_FLIGHT` flag.
+    /// Without it, `cargo test`'s parallel runner can interleave two guard tests and one
+    /// observes the other's held flag (a false "acquire should succeed" failure). Held for
+    /// the whole body of each such test so the global flag is theirs exclusively.
+    static OPEN_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // ---- mode → export filename resolution -------------------------------
 
     #[test]
@@ -868,21 +990,6 @@ mod tests {
         assert!(prompt.contains("focus on the header"));
     }
 
-    // ---- base64 ----------------------------------------------------------
-
-    #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        // A PNG magic header round-trips byte-exactly.
-        assert_eq!(base64_encode(&[0x89, 0x50, 0x4E, 0x47]), "iVBORw==");
-    }
-
     // ---- preview.png path confinement ------------------------------------
 
     #[test]
@@ -897,26 +1004,73 @@ mod tests {
 
     #[test]
     fn preview_open_guard_is_exclusive_and_releases_on_drop() {
+        let _serial = OPEN_GUARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // NOTE: this exercises the PURE in-flight guard (the close→poll loop needs a live
         // AppHandle/event-loop and is verified live, not here). The guard is the part that
         // keeps two rapid opens from interleaving their close+rebuild on the one label.
         //
         // Fresh state (other tests must leave it released). First acquire succeeds.
-        let g1 = PreviewOpenGuard::acquire().expect("first acquire should succeed");
+        // NOTE: we use `try_acquire` (single CAS, no wait) here — the public `acquire`
+        // spins for a 20s budget, which would hang this exclusion assertion.
+        let g1 = PreviewOpenGuard::try_acquire().expect("first acquire should succeed");
         // While held, a second acquire is refused (would map to a clean Err in the command).
         assert!(
-            PreviewOpenGuard::acquire().is_none(),
+            PreviewOpenGuard::try_acquire().is_none(),
             "a second concurrent acquire must be refused while one is held"
         );
         // Dropping the first releases the flag…
         drop(g1);
         // …so a subsequent acquire succeeds again (no leak on the previous owner's exit).
-        let g2 = PreviewOpenGuard::acquire().expect("acquire after drop should succeed");
+        let g2 = PreviewOpenGuard::try_acquire().expect("acquire after drop should succeed");
         drop(g2);
         // And the static is back to released for any later test.
         assert!(
             !PREVIEW_OPEN_IN_FLIGHT.load(Ordering::Acquire),
             "guard must leave the flag released"
+        );
+    }
+
+    #[test]
+    fn concurrent_opens_serialize_loser_waits_then_proceeds() {
+        let _serial = OPEN_GUARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // BLOCKER 1 regression: two callers contend for the single window chokepoint. The
+        // first holds it (simulating an in-flight open→capture→close cycle); the second's
+        // `acquire()` must NOT collide (the old design would let it reach the window builder
+        // → "label already exists") — instead it WAITS and only proceeds after the holder
+        // releases. We prove "loser waits then proceeds" deterministically: the loser cannot
+        // acquire until the holder drops, and then it does.
+        let holder = PreviewOpenGuard::try_acquire().expect("holder acquires the chokepoint");
+        let release_at = Instant::now() + Duration::from_millis(120);
+        let waiter = std::thread::spawn(move || {
+            // Bounded-wait acquire is now ASYNC (it `tokio::time::sleep`s between polls so a
+            // contended open never blocks its Tokio worker). Drive it on a dedicated
+            // current-thread runtime WITH the timer enabled — this mirrors how
+            // `execute_visual_check_inner` runs it under `block_on`, and keeps the test
+            // deterministic: the future polls until the holder releases, then succeeds.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("current-thread runtime with timer");
+            let g = rt.block_on(PreviewOpenGuard::acquire_async());
+            (Instant::now(), g.is_some())
+        });
+        // While we hold it, the waiter is parked (a `try_acquire` here also fails).
+        assert!(
+            PreviewOpenGuard::try_acquire().is_none(),
+            "a second caller must never grab the chokepoint while it is held"
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        drop(holder); // release → the waiter's spin observes the free flag and proceeds.
+        let (acquired_at, acquired) = waiter.join().expect("waiter thread joins");
+        assert!(acquired, "the loser must eventually acquire (it waits, never errors)");
+        assert!(
+            acquired_at >= release_at,
+            "the loser must not acquire before the holder released"
+        );
+        // Leave the flag released for any later test.
+        assert!(
+            !PREVIEW_OPEN_IN_FLIGHT.load(Ordering::Acquire),
+            "the chokepoint must be released after both guards drop"
         );
     }
 
@@ -939,6 +1093,58 @@ mod tests {
             !PREVIEW_CAPTURE_IN_FLIGHT.load(Ordering::Acquire),
             "capture guard must leave the flag released"
         );
+    }
+
+    // ---- last-opener gate (FIX 2): user-only capture ---------------------
+
+    #[test]
+    fn capture_gate_allows_only_user_opener() {
+        // PURE gate logic (no real window): only a user-built window is captureable.
+        assert!(
+            capture_allowed_for_opener(PreviewOpener::User).is_ok(),
+            "a user-opened preview must be captureable"
+        );
+        for refused in [PreviewOpener::VisualCheck, PreviewOpener::None] {
+            let err = capture_allowed_for_opener(refused)
+                .expect_err("a non-user opener must refuse capture");
+            assert_eq!(
+                err, PREVIEW_BUSY_VISUAL_CHECK_ERR,
+                "refusal must use the stable busy error"
+            );
+        }
+    }
+
+    #[test]
+    fn last_opener_token_set_and_cleared() {
+        // Touches the PROCESS-GLOBAL opener token → serialize with the same lock the open-guard
+        // tests use, and restore to None on exit so later tests see a clean slate.
+        let _serial = OPEN_GUARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // open-as-visual-check then a user capture attempt → clean refusal.
+        set_preview_opener(PreviewOpener::VisualCheck);
+        assert_eq!(preview_last_opener(), PreviewOpener::VisualCheck);
+        assert_eq!(
+            capture_allowed_for_opener(preview_last_opener()).unwrap_err(),
+            PREVIEW_BUSY_VISUAL_CHECK_ERR,
+            "a visual-check-owned window must refuse the user's capture"
+        );
+
+        // open-as-user → capture proceeds.
+        set_preview_opener(PreviewOpener::User);
+        assert_eq!(preview_last_opener(), PreviewOpener::User);
+        assert!(
+            capture_allowed_for_opener(preview_last_opener()).is_ok(),
+            "a user-owned window must allow capture"
+        );
+
+        // The u8 <-> enum mapping round-trips (defends the atomic encoding).
+        for o in [PreviewOpener::None, PreviewOpener::User, PreviewOpener::VisualCheck] {
+            assert_eq!(PreviewOpener::from_u8(o.as_u8()), o);
+        }
+
+        // Restore clean state for any later test.
+        set_preview_opener(PreviewOpener::None);
+        assert_eq!(preview_last_opener(), PreviewOpener::None);
     }
 
     // ---- capabilities: the preview window gets NO permissions ------------

@@ -562,8 +562,16 @@ pub async fn detect_all_providers() -> Vec<DetectedProvider> {
         models: Vec::new(),
     };
 
+    // `detect_apple_fm` spawns `fm --help` and polls `try_wait` for up to ~1.5s on macOS —
+    // synchronous, blocking work. Run it off the async reactor via spawn_blocking so it can
+    // never stall a Tokio worker. On non-macOS it is a no-op returning None; the join still
+    // resolves cheaply. A join failure (task panicked) degrades to "not detected".
+    let apple_fm = tauri::async_runtime::spawn_blocking(detect_apple_fm)
+        .await
+        .unwrap_or(None);
+
     let mut providers = vec![claude, codex, ollama, omlx];
-    if let Some(apple_fm) = detect_apple_fm() {
+    if let Some(apple_fm) = apple_fm {
         providers.push(apple_fm);
     }
     providers.push(api);

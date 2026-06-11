@@ -708,7 +708,9 @@ pub fn blocking_censor_findings(findings: &[EscalationFinding]) -> Vec<Escalatio
 
 pub const VISUAL_ADVISORY_TITLE_MAX_CHARS: usize = 500;
 
-pub fn visual_advisory_finding(file: &str, critique: &str) -> Option<EscalationFinding> {
+/// Injection point for visual findings arriving via the MCP `visual_check` path: turns a
+/// local vision critique into an `info`/`visual` advisory `EscalationFinding`.
+pub(crate) fn visual_advisory_finding(file: &str, critique: &str) -> Option<EscalationFinding> {
     let trimmed = critique.trim();
     if trimmed.is_empty() {
         return None;

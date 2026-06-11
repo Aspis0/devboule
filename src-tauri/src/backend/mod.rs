@@ -29,6 +29,7 @@ pub mod saved_workflows;
 pub mod state;
 pub mod token_usage;
 pub mod training_export;
+pub mod util;
 pub mod vault;
 pub mod visual_check;
 pub mod workspace;
