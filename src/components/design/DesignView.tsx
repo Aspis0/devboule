@@ -26,6 +26,7 @@ import type {
   DesignOracleStatus,
 } from "../../types/design";
 import type { DesignLlmBackend } from "../../types/config";
+import type { ProjectSummary } from "../../types/backend";
 import { AssistantPanel } from "./panel/AssistantPanel";
 import { useAssistantMessages } from "./panel/useAssistantMessages";
 import type { AssistantMessage } from "./panel/types";
@@ -74,6 +75,8 @@ import { sha256Hex } from "./contract/sha256";
 import { DesignMdEditor } from "./contract/DesignMdEditor";
 import { exportCode, type ExportMode } from "./export/exportCode";
 import { TopBar } from "./shell/TopBar";
+import { HandoffModal } from "./shell/HandoffModal";
+import { useHandoff } from "./shell/useHandoff";
 import { Toast } from "./shell/Toast";
 import { useSaveState } from "./shell/useSaveState";
 import { usePreview } from "./preview/usePreview";
@@ -321,6 +324,27 @@ export function DesignView() {
   // The id of the assistant card for the CURRENT in-flight run, patched by the
   // done-effect / self-repair. Carried through repair so one card spans the loop.
   const activeMsgRef = useRef<number | null>(null);
+
+  // Phase D — the management-plane projects (id, title, rootPath) the hand-off
+  // dispatch can target. Loaded lazily when the modal opens (cheap list_projects), so
+  // a design session that never hands off pays nothing. Empty in non-Tauri tests.
+  const [handoffProjects, setHandoffProjects] = useState<ProjectSummary[]>([]);
+  // Surfaced in the hand-off modal near the project selector when list_projects fails:
+  // without it the selector silently shows no projects and the user cannot tell whether
+  // the repo genuinely has none or the load errored (Fix 6).
+  const [handoffProjectsError, setHandoffProjectsError] = useState<string | null>(null);
+  const loadHandoffProjects = useCallback(async () => {
+    if (!tauri) return;
+    try {
+      const list = await invokeBackendCommand<ProjectSummary[]>("list_projects");
+      setHandoffProjects(list ?? []);
+      setHandoffProjectsError(null);
+    } catch {
+      // The packaging steps still run; but the dispatch selector would otherwise show no
+      // projects with no explanation. Surface a hint so the user can recover.
+      setHandoffProjectsError("Could not load projects — close and reopen.");
+    }
+  }, [tauri]);
 
   // The current global design-LLM backend (for the composer's model chip + popover).
   // Fetched on mount and refreshed after any save from the popover.
@@ -1009,11 +1033,17 @@ export function DesignView() {
     [loadFolder],
   );
 
-  const runConsolidate = useCallback(async () => {
+  // Consolidate the whole design project to disk. Returns TRUE on a successful save,
+  // FALSE on any failure (no folder or backend error). The hand-off packaging flow
+  // relies on this boolean to HARD-STOP the save step on a failed write (BLOCKER): a
+  // swallowed save error must not mark the step done and let a stale bundle dispatch.
+  // Toolbar/SaveMenu callers ignore the result (best-effort save with on-screen status),
+  // matching the existing `void runConsolidate()` call sites.
+  const runConsolidate = useCallback(async (): Promise<boolean> => {
     const folderPath = folderRef.current.trim();
     if (!folderPath) {
       setError("Choose a working folder first.");
-      return;
+      return false;
     }
     setBusy("save");
     setError(null);
@@ -1026,8 +1056,10 @@ export function DesignView() {
       });
       setStatus("Consolidated the whole project to disk.");
       showToast("Saved to working folder");
+      return true;
     } catch (e) {
       setError(String(e));
+      return false;
     } finally {
       endSaving();
       setBusy(null);
@@ -1141,6 +1173,38 @@ export function DesignView() {
     rememberThumbnail,
     onToast: showToast,
   });
+
+  // Phase D — the "Save & hand off to agents" flow. The hook owns the phase machine
+  // (packaging -> dispatch -> done), the per-step rows, the project/client selection,
+  // the SINGLE launch_project_agent_terminal dispatch (host "app", role "coder", a
+  // designHandoff payload), and the Work-mode deep-link out. DesignView only supplies
+  // the real callbacks + the app project list; the modal below is presentational.
+  const handoff = useHandoff({
+    workingFolderPath: folder,
+    projects: handoffProjects,
+    backendKind: backend?.kind ?? null,
+    runConsolidate,
+    runExport,
+    invoke: invokeBackendCommand,
+    onOpenTerminal: (projectId) => {
+      // Deep-link to the project's Work-mode terminal via the same pendingTab format
+      // ProjectsView consumes (parseWorkTab -> work:<projectId>). The launched agent
+      // appears in that project's Work-mode agent list. Degrades to no-op if the app
+      // context is absent (tests without AppProvider).
+      requestView?.("projects", `work:${projectId}`);
+    },
+  });
+
+  // Open the hand-off modal: kick off the project load AND open in the same tick. The
+  // load is ASYNCHRONOUS (fire-and-forget) — it does NOT populate the selector before
+  // openHandoff runs, so openHandoff's own preselection may see an empty/stale list. That
+  // is fine: when the list lands it updates `handoffProjects`, the hook re-renders, and
+  // its preselect effect fills the still-null selection (without overriding a user pick).
+  // So the selection settles once the list arrives, a render or two after open.
+  const openHandoff = useCallback(() => {
+    void loadHandoffProjects();
+    handoff.openHandoff();
+  }, [loadHandoffProjects, handoff]);
 
   // Visual check (assist-head icon-button): push a user-style chip + a working card,
   // run the capture→critique flow, then patch the card to done (the critique text) or
@@ -2118,6 +2182,7 @@ export function DesignView() {
           runExport={(mode) => void runExport(mode)}
           exportTokens={() => void exportTokens()}
           onConsolidate={() => void runConsolidate()}
+          onHandoff={openHandoff}
           onPreview={() => void preview.openPreview("absolute")}
           previewing={preview.opening}
         />
@@ -2264,6 +2329,30 @@ export function DesignView() {
         saveError={contractEditor?.saveError}
         onSave={onContractSave}
         onSkip={onContractSkip}
+      />
+
+      <HandoffModal
+        open={handoff.open}
+        workingFolderPath={folder}
+        phase={handoff.phase}
+        steps={handoff.steps}
+        flow={handoff.flow}
+        projects={handoff.projects}
+        projectsError={handoffProjectsError}
+        selectedProjectId={handoff.selectedProjectId}
+        client={handoff.client}
+        agentId={handoff.agentId}
+        errorStage={handoff.errorStage}
+        errorMessage={handoff.errorMessage}
+        dispatching={handoff.dispatching}
+        canDispatch={handoff.canDispatch}
+        closable={handoff.closable}
+        onClose={handoff.close}
+        onSelectProject={handoff.selectProject}
+        onSelectClient={handoff.selectClient}
+        onRetryPackaging={handoff.runPackaging}
+        onDispatch={handoff.dispatch}
+        onOpenTerminal={handoff.openTerminal}
       />
 
       <Toast msg={toast} onDismiss={() => setToast(null)} />

@@ -1,7 +1,7 @@
 // SaveMenuPopover — the split-button's extra menu (prototype's SaveMenuPopover,
 // `.save-pop`). Row 1 re-runs the consolidate save; row 2 ("Save & hand off") is the
-// Phase-D agent dispatch — DISABLED here with a "Coming soon" title (Phase D wires
-// it). The NEW badge mirrors the prototype.
+// Phase-D agent dispatch — now ENABLED (opens HandoffModal). The NEW badge mirrors the
+// prototype.
 
 import { Save, Cpu } from "lucide-react";
 import { Popover } from "./Popover";
@@ -9,9 +9,11 @@ import { Popover } from "./Popover";
 export interface SaveMenuPopoverProps {
   open: boolean;
   onClose: () => void;
-  /** No project open / a save in flight disables the consolidate row. */
+  /** No project open / a save in flight disables the consolidate AND hand-off rows. */
   disabled: boolean;
   onSave: () => void;
+  /** Open the Phase-D hand-off modal. */
+  onHandoff: () => void;
 }
 
 export function SaveMenuPopover({
@@ -19,6 +21,7 @@ export function SaveMenuPopover({
   onClose,
   disabled,
   onSave,
+  onHandoff,
 }: SaveMenuPopoverProps) {
   return (
     <Popover open={open} onClose={onClose} className="right save-pop">
@@ -51,9 +54,13 @@ export function SaveMenuPopover({
       <button
         type="button"
         className="pop-row agents"
-        disabled
-        title="Coming soon"
-        aria-label="Save and hand off to coding agents (coming soon)"
+        disabled={disabled}
+        title="Package the design and dispatch a coding agent"
+        aria-label="Save and hand off to coding agents"
+        onClick={() => {
+          onClose();
+          onHandoff();
+        }}
       >
         <span className="agents-ic">
           <Cpu size={16} />

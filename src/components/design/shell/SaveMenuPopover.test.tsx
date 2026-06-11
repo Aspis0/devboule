@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // SaveMenuPopover tests: "Save to repo" runs onSave + closes; the "Save & hand off"
-// agents row is DISABLED (Phase D) with a "Coming soon" affordance.
+// agents row is now ENABLED (Phase D) and opens the hand-off modal via onHandoff.
 
 import { describe, it, expect, vi } from "vitest";
 import { act, createElement } from "react";
@@ -24,7 +24,13 @@ describe("SaveMenuPopover", () => {
   it("Save to repo runs onSave and closes", () => {
     const onSave = vi.fn();
     const onClose = vi.fn();
-    const c = render({ open: true, onClose, disabled: false, onSave });
+    const c = render({
+      open: true,
+      onClose,
+      disabled: false,
+      onSave,
+      onHandoff: vi.fn(),
+    });
     const save = Array.from(c.querySelectorAll("button")).find((b) =>
       b.textContent?.trim().startsWith("Save to repo"),
     ) as HTMLButtonElement;
@@ -33,20 +39,39 @@ describe("SaveMenuPopover", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it("the hand-off (agents) row is disabled with a 'Coming soon' title", () => {
-    const c = render({ open: true, onClose: vi.fn(), disabled: false, onSave: vi.fn() });
+  it("the hand-off (agents) row is enabled and opens the modal (keeps the NEW badge)", () => {
+    const onHandoff = vi.fn();
+    const onClose = vi.fn();
+    const c = render({
+      open: true,
+      onClose,
+      disabled: false,
+      onSave: vi.fn(),
+      onHandoff,
+    });
     const agents = c.querySelector(".pop-row.agents") as HTMLButtonElement;
     expect(agents).toBeTruthy();
-    expect(agents.disabled).toBe(true);
-    expect(agents.getAttribute("title")).toBe("Coming soon");
+    expect(agents.disabled).toBe(false);
     expect(c.querySelector(".new-badge")?.textContent).toBe("NEW");
+    act(() => agents.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(onHandoff).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalled();
   });
 
-  it("disables Save to repo when disabled", () => {
-    const c = render({ open: true, onClose: vi.fn(), disabled: true, onSave: vi.fn() });
+  it("disables BOTH rows when disabled (no project open / save in flight)", () => {
+    const onHandoff = vi.fn();
+    const c = render({
+      open: true,
+      onClose: vi.fn(),
+      disabled: true,
+      onSave: vi.fn(),
+      onHandoff,
+    });
     const save = Array.from(c.querySelectorAll("button")).find((b) =>
       b.textContent?.trim().startsWith("Save to repo"),
     ) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
+    const agents = c.querySelector(".pop-row.agents") as HTMLButtonElement;
+    expect(agents.disabled).toBe(true);
   });
 });

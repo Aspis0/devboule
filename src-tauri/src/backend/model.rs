@@ -507,6 +507,20 @@ pub struct ProjectMetadataPatch {
     pub expected_revision: String,
 }
 
+/// Phase D — the design "Save & hand off to agents" payload. Carries the design
+/// working folder (a `.devboule-design/<project>` bundle: design.md, manifest.json,
+/// components/, tokens.json, exports, preview.png) the launched coder must implement.
+/// `working_folder_path` is the ONLY field and is validated server-side
+/// (canonicalized, must exist, be a dir, contain `project.json`, and live UNDER the
+/// target project's root_path) before any of it reaches the launch prompt — so no
+/// caller-controlled free text ever enters the prompt addendum. camelCase over IPC
+/// like its siblings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignHandoffInput {
+    pub working_folder_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectAgentLaunchInput {
@@ -539,6 +553,14 @@ pub struct ProjectAgentLaunchInput {
     /// per-step Censor addendum is unconditional). camelCase over IPC.
     #[serde(default)]
     pub censor_review: Option<bool>,
+    /// Phase D: when `Some`, this is a design "Save & hand off" dispatch — the coder's
+    /// launch prompt gains a FIXED-WORDING addendum that points it at the validated
+    /// design bundle and instructs it to implement that design (respecting design.md as
+    /// the contract). Optional and lenient: `None` leaves every existing launch's prompt
+    /// byte-for-byte unchanged, so SpawnPanel and the current TS invokes (which send no
+    /// `designHandoff`) keep their behavior with zero regression. camelCase over IPC.
+    #[serde(default)]
+    pub design_handoff: Option<DesignHandoffInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

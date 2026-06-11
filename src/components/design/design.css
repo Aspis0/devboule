@@ -723,6 +723,27 @@
 .dsgn .ho-foot-note.ok .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px color-mix(in oklab, var(--green), white 80%); }
 .dsgn .handoff .spin { display: inline-grid; place-items: center; animation: dsgnRot 1s linear infinite; color: var(--accent); }
 
+/* Phase D — hand-off dispatch controls (project + agent-CLI pickers) + error row. */
+.dsgn .ho-dispatch { display: flex; gap: 12px; padding: 14px 22px 4px; }
+.dsgn .ho-field { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.dsgn .ho-field-l { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.dsgn .ho-select {
+  width: 100%; padding: 8px 10px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--surface, #fff);
+  font-size: 13px; color: var(--ink); outline: none;
+}
+.dsgn .ho-select:focus { border-color: var(--accent-mid); }
+.dsgn .ho-field-err { font-size: 11px; color: var(--danger, #b3261e); }
+.dsgn .ho-error {
+  display: flex; align-items: center; gap: 10px; margin: 12px 22px 0;
+  padding: 9px 12px; border-radius: 10px;
+  border: 1px solid color-mix(in oklab, var(--danger, #b3261e), white 60%);
+  background: color-mix(in oklab, var(--danger, #b3261e), white 88%);
+  font-size: 12.5px; color: var(--danger, #b3261e);
+}
+.dsgn .ho-error span { flex: 1; min-width: 0; }
+.dsgn .ho-error .btn { flex: none; }
+
 /* ============ Design contract editor (design.md) ============ */
 .dsgn .handoff.dsgn-contract { width: 720px; display: flex; flex-direction: column; max-height: calc(100vh - 80px); }
 .dsgn .dc-presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 0 22px 14px; }

@@ -5,7 +5,8 @@ use super::agents::{
 };
 use super::fs_replace::replace_file_with_backup;
 use super::model::{
-    ProjectAgentLaunchInput, ProjectAgentLaunchResult, ProjectCreateInput, ProjectDetail,
+    DesignHandoffInput, ProjectAgentLaunchInput, ProjectAgentLaunchResult, ProjectCreateInput,
+    ProjectDetail,
     ProjectGitCommandResult, ProjectGitRepoCandidate, ProjectGitStatus, ProjectLinkedResource,
     ProjectLiveResourceStatus, ProjectLiveStatus, ProjectMetadata, ProjectMetadataPatch,
     ProjectMilestone, ProjectNote, ProjectNoteInput, ProjectStateBlock, ProjectSummary,
@@ -1032,6 +1033,14 @@ fn prepare_or_launch_project_agent(
     // host, so it normalizes to "external" = zero behavior change.
     let host = normalize_agent_host(input.host.as_deref());
     let root_path = resolve_project_agent_root(&project)?;
+    // Phase D — when this is a design "Save & hand off" dispatch, validate the bundle
+    // folder against the canonical project root BEFORE building the prompt. A rejection
+    // (missing/not-a-dir/no project.json/outside-root/symlink-escape) aborts the launch
+    // with a clean error and records nothing. `None` keeps every other launch unchanged.
+    let design_handoff_folder = match input.design_handoff.as_ref() {
+        Some(handoff) => Some(validate_design_handoff(handoff, &root_path)?),
+        None => None,
+    };
     let agent_id = clean_optional(input.agent_id.as_deref())
         .unwrap_or_else(|| format!("{}-{}", role, Utc::now().timestamp_millis()));
     let task_id = clean_optional(input.task_id.as_deref());
@@ -1050,6 +1059,9 @@ fn prepare_or_launch_project_agent(
         // launched with `censorReview: true` (the "Run final review" button).
         // `unwrap_or(false)` keeps every other launch's prompt unchanged.
         input.censor_review.unwrap_or(false),
+        // Phase D: the validated design bundle folder (canonical, confined). `None`
+        // for every non-handoff launch keeps the prompt byte-for-byte unchanged.
+        design_handoff_folder.as_deref(),
     );
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
@@ -1706,6 +1718,74 @@ fn yaml_double_quote_inner(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Phase D — validate a design "Save & hand off" payload against a project's already
+/// canonicalized agent `root`. Returns the CANONICAL design working folder on success.
+///
+/// Confinement (mirrors design.rs / the clone-confinement idioms): the folder is
+/// canonicalized through the SAME helper the design slice uses (`canonical_working_folder`
+/// — collapses `.`/`..`/symlinks and asserts it is a real directory), then we assert it
+/// holds a `project.json` (the design-bundle marker) and that the canonical folder is
+/// UNDER the canonical project root. Because BOTH paths are fully canonicalized before the
+/// `starts_with` prefix check, a symlinked design folder pointing off-root is rejected the
+/// same way design.rs rejects symlink escapes — the link is resolved away first, so the
+/// real target must still live under root.
+///
+/// Error posture matches the sibling launch errors: short, stable labels with no absolute
+/// FS paths in the wire text (the underlying unreadable-path detail stays in the design
+/// helper's process log only). NO field of the input other than this validated path is
+/// ever used, so nothing caller-controlled flows into the prompt addendum.
+fn validate_design_handoff(
+    handoff: &DesignHandoffInput,
+    root: &Path,
+) -> Result<PathBuf, String> {
+    // Canonicalize via the design slice's confinement helper (exists + is a dir, with
+    // `.`/`..`/symlinks resolved). It already returns a clean short label on failure.
+    let folder = crate::backend::design::canonical_working_folder(&handoff.working_folder_path)?;
+    // The design-bundle marker file MUST be present (this is an EXISTING design project,
+    // not an arbitrary directory). `project.json` has no traversal surface (fixed name).
+    if !folder.join("project.json").is_file() {
+        return Err("design working folder is not a design project (no project.json)".to_string());
+    }
+    // Confinement: the canonical design folder must live under the canonical project root.
+    // `root` is already canonicalized by resolve_project_agent_root (via
+    // validate_project_root_for_save). Equality is allowed (a bundle AT the root) but the
+    // normal case is a `.devboule-design/<name>` subfolder.
+    if !folder.starts_with(root) {
+        return Err("design working folder is not inside the project root".to_string());
+    }
+    Ok(folder)
+}
+
+/// Compute the design folder's path RELATIVE to the project root for the prompt addendum,
+/// falling back to the folder's own name if (defensively) the strip fails. Both inputs are
+/// already canonicalized + confinement-checked, so the strip normally succeeds; the
+/// fallback never yields an absolute path. Slashes are normalized to `/` so the addendum
+/// reads the same on Windows and macOS.
+fn design_handoff_relative_label(folder: &Path, root: &Path) -> String {
+    let rel = folder
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.to_path_buf())
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| folder.file_name().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("design"));
+    let normalized = rel.to_string_lossy().replace('\\', "/");
+    sanitize_handoff_label(&normalized)
+}
+
+/// Sanitize a path label BEFORE it is interpolated into the coder prompt addendum:
+/// drop ASCII control chars (0x00-0x1F and DEL 0x7F) so a crafted folder name cannot
+/// inject newlines / control sequences into the prompt, and cap the result at 200 chars
+/// (truncated on a char boundary) to bound prompt growth. The inputs are already
+/// canonicalized + confinement-checked, so this is defense-in-depth.
+fn sanitize_handoff_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
+}
+
 fn resolve_project_agent_root(project: &ParsedProject) -> Result<PathBuf, String> {
     if let Some(root) = project.metadata.root_path.as_deref() {
         return validate_project_root_for_save(Some(root))?
@@ -2059,6 +2139,13 @@ fn project_agent_prompt(
     // false keeps the verifier prompt byte-for-byte unchanged for every other
     // launch, preserving back-compat.
     censor_review: bool,
+    // Phase D: when `Some`, this launch is a design "Save & hand off" dispatch and the
+    // path is the CANONICAL, confinement-validated design bundle folder. It gates the
+    // design-handoff addendum below (coder gets it; verifier never does). `None` keeps the
+    // prompt byte-for-byte unchanged for every other launch (back-compat). The ONLY thing
+    // interpolated from it is the bundle's path RELATIVE to `root_path` — caller-controlled
+    // free text never reaches the prompt.
+    design_handoff_folder: Option<&Path>,
 ) -> String {
     // Phase B merge: the coder PLANS and CODES — it absorbs the former
     // orchestrator's plan/coordinate mandate (claim tasks, create follow-ups,
@@ -2145,6 +2232,24 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
         }
         _ => "",
     };
+    // Phase D — design "Save & hand off" addendum (coder only). FIXED wording: the ONLY
+    // variable is the bundle's path RELATIVE to the working root (computed from two
+    // already-canonicalized, confinement-checked paths; the validated path is the sole
+    // interpolation, no caller free text). It names the bundle's expected inventory as
+    // "may include" (some files are optional — preview.png only exists after a capture),
+    // tells the coder to IMPLEMENT the design respecting design.md as the design contract,
+    // and leaves mini-coder delegation to the coder's own judgment. Plain instruction text
+    // — no token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
+    // never gets it (it does not implement). `None` => "" keeps the prompt unchanged.
+    let design_handoff_addendum = match (role, design_handoff_folder) {
+        ("coder", Some(folder)) => {
+            let rel = design_handoff_relative_label(folder, root_path);
+            format!(
+                "Design hand-off: a design bundle has been saved in this repo at {rel} (relative to your working root). It may include design.md, manifest.json, components/, tokens.json, export-absolute.html, export-flow.html and preview.png. Implement this design in the codebase, respecting design.md as the design contract. Decide for yourself whether to delegate parts of the implementation to mini-coders.\n"
+            )
+        }
+        _ => String::new(),
+    };
     let task_line = task_id
         .map(|value| format!("Preferred task_id: {value}\n"))
         .unwrap_or_default();
@@ -2185,6 +2290,7 @@ Provider mutation tools require management_project_id, task_id and evidence from
 {censor_addendum}\
 {mini_coder_addendum}\
 {git_push_addendum}\
+{design_handoff_addendum}\
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.\n",
         project_id = project.metadata.id,
         project_title = project.metadata.title,
@@ -7561,6 +7667,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
 
         assert!(prompt.contains("Working root: C:\\Users\\gualt\\Desktop\\aspis bio"));
@@ -7583,6 +7690,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             Some("opus"),
             false,
+            None,
         );
         assert!(hinted.contains("model=\"opus\""));
         assert!(!hinted.contains("model=\"<your model>\""));
@@ -7632,6 +7740,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             prompt.contains("censor_findings(project_id, file=<files you just touched>)"),
@@ -7672,6 +7781,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             prompt.contains("aborted_by_human"),
@@ -7721,6 +7831,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             prompt.contains("spawn_mini_coder(task, files"),
@@ -7772,6 +7883,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             prompt.contains("commit freely"),
@@ -7818,6 +7930,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             !prompt.contains("aborted_by_human"),
@@ -7850,6 +7963,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             !prompt.contains("NEVER run a raw `git push`"),
@@ -7885,6 +7999,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
         );
         assert!(
             !plain.contains("residual ledger"),
@@ -7905,6 +8020,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             true,
+            None,
         );
         assert!(
             final_review.contains("censor_findings(project_id) for the residual ledger"),
@@ -7952,6 +8068,215 @@ updated_at: 2026-05-28T00:00:00Z
         )
         .expect("launch input with censorReview must parse");
         assert_eq!(with.censor_review, Some(true));
+
+        // Phase D: a legacy payload that omits BOTH censorReview AND designHandoff
+        // (every existing SpawnPanel / TS caller) still parses, and design_handoff
+        // defaults to None — proving zero caller regression.
+        let legacy: ProjectAgentLaunchInput =
+            serde_json::from_str(r#"{"projectId":"p","role":"coder","client":"claude"}"#)
+                .expect("legacy launch input without designHandoff must parse");
+        assert!(legacy.design_handoff.is_none());
+        assert_eq!(legacy.censor_review, None);
+
+        // A design "Save & hand off" payload carries designHandoff.workingFolderPath
+        // (camelCase) and parses into the typed struct.
+        let handoff: ProjectAgentLaunchInput = serde_json::from_str(
+            r#"{"projectId":"p","role":"coder","client":"claude","host":"app","designHandoff":{"workingFolderPath":"C:\\repo\\.devboule-design\\landing"}}"#,
+        )
+        .expect("launch input with designHandoff must parse");
+        assert_eq!(
+            handoff
+                .design_handoff
+                .as_ref()
+                .map(|h| h.working_folder_path.as_str()),
+            Some("C:\\repo\\.devboule-design\\landing")
+        );
+    }
+
+    // Build a unique temp project root + a confined design bundle under it for the
+    // design-handoff validation/prompt tests. Returns (canonical_root, design_folder).
+    // The bundle is `<root>/.devboule-design/landing` with a `project.json` marker —
+    // the minimal shape validate_design_handoff requires. Caller cleans up via
+    // remove_dir_all on the parent of root (the per-test unique base) if desired; tests
+    // here leave the temp tree (mirrors the existing clone/design tests' posture).
+    #[cfg(test)]
+    fn design_handoff_fixture() -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "aspis-design-handoff-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&base).expect("mkdir base");
+        let root = base.canonicalize().expect("canonical root");
+        let design = root.join(".devboule-design").join("landing");
+        fs::create_dir_all(&design).expect("mkdir design bundle");
+        fs::write(design.join("project.json"), "{}").expect("write project.json marker");
+        (root, design)
+    }
+
+    #[test]
+    fn validate_design_handoff_accepts_a_confined_bundle() {
+        let (root, design) = design_handoff_fixture();
+        let input = DesignHandoffInput {
+            working_folder_path: design.to_string_lossy().into_owned(),
+        };
+        let resolved = validate_design_handoff(&input, &root).expect("confined bundle is valid");
+        assert_eq!(resolved, design.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn validate_design_handoff_rejects_missing_folder() {
+        let (root, _design) = design_handoff_fixture();
+        let input = DesignHandoffInput {
+            working_folder_path: root
+                .join(".devboule-design")
+                .join("does-not-exist")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let err = validate_design_handoff(&input, &root).expect_err("missing folder rejected");
+        assert!(err.contains("does not exist") || err.contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn validate_design_handoff_rejects_folder_without_project_json() {
+        let (root, _design) = design_handoff_fixture();
+        let bare = root.join(".devboule-design").join("bare");
+        fs::create_dir_all(&bare).expect("mkdir bare");
+        let input = DesignHandoffInput {
+            working_folder_path: bare.to_string_lossy().into_owned(),
+        };
+        let err =
+            validate_design_handoff(&input, &root).expect_err("no project.json => rejected");
+        assert!(err.contains("project.json"), "{err}");
+    }
+
+    #[test]
+    fn validate_design_handoff_rejects_a_folder_outside_root() {
+        let (root, _design) = design_handoff_fixture();
+        // A SEPARATE temp root (a real, existing design bundle) that is NOT under root.
+        let (_other_root, outside) = design_handoff_fixture();
+        let input = DesignHandoffInput {
+            working_folder_path: outside.to_string_lossy().into_owned(),
+        };
+        let err =
+            validate_design_handoff(&input, &root).expect_err("outside-root bundle rejected");
+        assert!(err.contains("inside the project root"), "{err}");
+    }
+
+    #[test]
+    fn validate_design_handoff_rejects_traversal_escape() {
+        let (root, design) = design_handoff_fixture();
+        // A `..`-laden path that canonicalizes OUTSIDE the root. Even though the raw
+        // string starts under `design`, canonicalization collapses the `..` segments to
+        // the parent temp dir's parent, which is not under root.
+        let traversal = design
+            .join("..")
+            .join("..")
+            .join("..")
+            .to_string_lossy()
+            .into_owned();
+        let input = DesignHandoffInput {
+            working_folder_path: traversal,
+        };
+        // Either it canonicalizes outside root (containment error) or the parent has no
+        // project.json — both are clean rejections, never an Ok.
+        let err = validate_design_handoff(&input, &root).expect_err("traversal escape rejected");
+        assert!(
+            err.contains("inside the project root") || err.contains("project.json"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn coder_prompt_carries_design_handoff_addendum_with_relative_path() {
+        let (root, design) = design_handoff_fixture();
+        let mut project = censor_prompt_test_project();
+        project.metadata.root_path = Some(root.to_string_lossy().into_owned());
+
+        let prompt = project_agent_prompt(
+            &project,
+            "coder",
+            "coder-1",
+            None,
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            Some(design.as_path()),
+        );
+
+        // The addendum is present and cites the RELATIVE bundle path (forward slashes),
+        // not an absolute path.
+        assert!(
+            prompt.contains("a design bundle has been saved in this repo at .devboule-design/landing"),
+            "addendum must cite the relative bundle path: {prompt}"
+        );
+        assert!(
+            prompt.contains("respecting design.md as the design contract"),
+            "addendum must name design.md as the design contract"
+        );
+        assert!(
+            prompt.contains("It may include design.md, manifest.json, components/, tokens.json, export-absolute.html, export-flow.html and preview.png."),
+            "addendum must list the expected inventory as 'may include'"
+        );
+        assert!(
+            prompt.contains("delegate parts of the implementation to mini-coders"),
+            "addendum must leave mini-coder delegation to the coder"
+        );
+        // The relative label, not the absolute working-folder path, is interpolated.
+        let abs = design.to_string_lossy().replace('\\', "/");
+        let addendum_line = prompt
+            .lines()
+            .find(|l| l.contains("a design bundle has been saved"))
+            .expect("addendum line present");
+        assert!(
+            !addendum_line.contains(&abs),
+            "addendum must NOT leak the absolute bundle path: {addendum_line}"
+        );
+        // No token leaks into the addendum line.
+        assert!(!addendum_line.contains("test-launch-token"));
+    }
+
+    #[test]
+    fn prompt_has_no_design_handoff_addendum_without_a_bundle() {
+        let project = censor_prompt_test_project();
+        let root = PathBuf::from(project.metadata.root_path.clone().unwrap());
+        // A coder launch with NO design bundle must be byte-for-byte free of the
+        // design-handoff addendum (back-compat for every normal SpawnPanel launch).
+        let plain = project_agent_prompt(
+            &project,
+            "coder",
+            "coder-1",
+            None,
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            None,
+        );
+        assert!(
+            !plain.contains("a design bundle has been saved"),
+            "no addendum may appear without design_handoff"
+        );
+
+        // And a VERIFIER never gets the addendum even when a bundle is passed (it does
+        // not implement designs).
+        let verifier = project_agent_prompt(
+            &project,
+            "verifier",
+            "verifier-1",
+            None,
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            Some(root.as_path()),
+        );
+        assert!(
+            !verifier.contains("a design bundle has been saved"),
+            "verifier must never get the design-handoff addendum"
+        );
     }
 
     #[test]
@@ -9488,5 +9813,35 @@ updated_at: 2026-05-28T00:00:00Z
             1,
             "config_write_lock must allow at most one writer in the critical section"
         );
+    }
+
+    #[test]
+    fn design_handoff_label_strips_control_chars_and_caps_length() {
+        // A crafted relative folder name with an embedded newline + a 300-char run. The
+        // label feeds straight into the coder prompt addendum, so it must carry NO control
+        // chars (no prompt injection via \n) and be bounded (<= 200 chars).
+        let root = Path::new("/repo");
+        let mut name = String::from("inject\nme");
+        name.push_str(&"a".repeat(300));
+        let folder = root.join(&name);
+
+        let label = design_handoff_relative_label(&folder, root);
+
+        assert!(
+            !label.chars().any(|c| c.is_control()),
+            "label must contain no control chars, got {label:?}"
+        );
+        assert!(
+            !label.contains('\n'),
+            "label must not contain a newline, got {label:?}"
+        );
+        assert!(
+            label.chars().count() <= 200,
+            "label must be capped at 200 chars, got {}",
+            label.chars().count()
+        );
+        // The leading literal survives (minus the stripped \n) so the addendum still
+        // points at a meaningful path.
+        assert!(label.starts_with("injectme"), "got {label:?}");
     }
 }

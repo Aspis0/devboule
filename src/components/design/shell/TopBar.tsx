@@ -80,6 +80,8 @@ export interface TopBarProps {
   runExport: (mode: ExportMode) => void;
   exportTokens: () => void;
   onConsolidate: () => void;
+  /** Open the Phase-D "Save & hand off to agents" modal. */
+  onHandoff: () => void;
 
   // ---- preview ----
   /** Open the read-only preview window (absolute layout). */
@@ -126,6 +128,7 @@ export function TopBar(props: TopBarProps) {
     runExport,
     exportTokens,
     onConsolidate,
+    onHandoff,
     onPreview,
     previewing,
   } = props;
@@ -319,6 +322,7 @@ export function TopBar(props: TopBarProps) {
             onClose={() => setSaveOpen(false)}
             disabled={saving || !projectOpen}
             onSave={onConsolidate}
+            onHandoff={onHandoff}
           />
         </div>
 
