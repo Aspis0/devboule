@@ -91,4 +91,20 @@ describe("buildRepairPrompt", () => {
     const b = buildRepairPrompt("x", outcome(0, ["FOSTER_PARENTED_ROOT"]), "ctx");
     expect(a).toBe(b);
   });
+
+  it("carries the design contract into the repair prompt", () => {
+    const p = buildRepairPrompt(
+      "x",
+      outcome(0),
+      "",
+      "# Rules\nPrimary is #4f46e5.",
+    );
+    expect(p).toContain("DESIGN CONTRACT (project file, follow its rules):");
+    expect(p).toContain("Primary is #4f46e5.");
+  });
+
+  it("omits the contract block when no contract is given", () => {
+    const p = buildRepairPrompt("x", outcome(0), "");
+    expect(p).not.toContain("DESIGN CONTRACT");
+  });
 });

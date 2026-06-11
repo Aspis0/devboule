@@ -154,6 +154,26 @@ describe("ProjectPopover", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it("renders the Design contract row only when onEditContract is provided", () => {
+    const noRow = render(baseProps({ onEditContract: undefined }));
+    expect(
+      Array.from(noRow.querySelectorAll("button")).some((b) =>
+        b.textContent?.trim().startsWith("Design contract"),
+      ),
+    ).toBe(false);
+
+    const onEditContract = vi.fn();
+    const onClose = vi.fn();
+    const withRow = render(baseProps({ onEditContract, onClose }));
+    const row = Array.from(withRow.querySelectorAll("button")).find((b) =>
+      b.textContent?.trim().startsWith("Design contract"),
+    ) as HTMLButtonElement;
+    expect(row).toBeTruthy();
+    act(() => row.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(onEditContract).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalled();
+  });
+
   it("uses a thumbnail image when present, else a color block", () => {
     const c = render(
       baseProps({

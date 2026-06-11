@@ -99,9 +99,18 @@ vi.mock("./canvas/DesignCanvas", () => ({
 let DesignView: typeof import("./DesignView").DesignView;
 let rerender: (() => void) | null = null;
 
+// Default backend stub: design.md PRESENT (a curated contract already exists), so the
+// Phase-C seed flow stashes it for injection and does NOT open the editor or probe
+// Oracle during load. Tests that exercise the seed/editor flow override this per-test.
+const DEFAULT_DESIGN_MD = "# Existing contract\nFollow the house style.";
+function defaultInvoke(command: string): unknown {
+  if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
+  return undefined;
+}
+
 beforeEach(async () => {
   invokeSpy.mockClear();
-  invokeSpy.mockImplementation(async () => undefined);
+  invokeSpy.mockImplementation(async (command: string) => defaultInvoke(command));
   streamCtl.state = { text: "", status: "idle", error: null };
   streamCtl.starts = [];
   streamCtl.notify = null;
@@ -167,7 +176,8 @@ async function pickFolder(container: HTMLElement, value: string) {
   await act(async () => {
     pickBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     // Flush the deep async chain: dynamic import -> open() -> loadFolder ->
-    // seedTokens (oracle probe + token write) -> remember -> oracle status.
+    // seedContract (read design.md -> stash, or probe + open editor) -> remember ->
+    // oracle status.
     for (let i = 0; i < 12; i++) await Promise.resolve();
   });
 }
@@ -270,6 +280,7 @@ describe("DesignView — BLOCKER 3: reload restores structural recovery", () => 
       },
     };
     invokeSpy.mockImplementation(async (command: string) => {
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_load_project") return loaded;
       return undefined;
     });
@@ -347,6 +358,8 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     const calls: { command: string; args?: Record<string, unknown> }[] = [];
     invokeSpy.mockImplementation(async (command: string, args) => {
       calls.push({ command, args });
+      // design.md PRESENT -> no seed-probe contaminates the grounding oracle calls.
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_oracle_context") {
         return [
           { fileSource: "src/Button.tsx", score: 0.9, text: "GROUNDING_SNIPPET_XYZ" },
@@ -384,6 +397,9 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     const calls: string[] = [];
     invokeSpy.mockImplementation(async (command: string) => {
       calls.push(command);
+      // design.md PRESENT -> seeding does NOT probe Oracle; the ONLY oracle call this
+      // test could see would be a (forbidden) generate-time pre-fetch for the CLI.
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "get_design_llm_backend") return { kind: "claude" };
       if (command === "design_oracle_context") {
         return [
@@ -454,6 +470,7 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
   it("appends a metadata-only audit line after a generation", async () => {
     const appends: Record<string, unknown>[] = [];
     invokeSpy.mockImplementation(async (command: string, args) => {
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_oracle_context") return [];
       if (command === "get_design_llm_backend") return { kind: "ollama" };
       if (command === "design_append_generation_log") {
@@ -489,6 +506,7 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
 
   it("generates without grounding when Oracle fails (graceful degrade)", async () => {
     invokeSpy.mockImplementation(async (command: string) => {
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_oracle_context") throw new Error("oracle down");
       if (command === "get_design_llm_backend") return { kind: "ollama" };
       return undefined;
@@ -508,6 +526,7 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
   it("exports code via design_write_export with the chosen mode filename", async () => {
     const exports: Record<string, unknown>[] = [];
     invokeSpy.mockImplementation(async (command: string, args) => {
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_write_export") exports.push(args!);
       return undefined;
     });
@@ -549,6 +568,7 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     };
     const exports: Record<string, unknown>[] = [];
     invokeSpy.mockImplementation(async (command: string, args) => {
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_load_project") return loaded;
       if (command === "design_write_export") exports.push(args!);
       return undefined;
@@ -571,14 +591,12 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
     expect(html).toContain("safe");
   });
 
-  it("WARNING 3+5: load awaits a path-free token seed (tokens.json leaks no file paths)", async () => {
+  it("WARNING 3+5 (Phase C): missing design.md opens the contract editor; nothing is written until Save/Skip, and no file paths leak into tokens.json", async () => {
     const writes: Record<string, unknown>[] = [];
     let oracleQueried = false;
-    let writeAfterLoad = false;
-    let loadReturned = false;
+    let designMdRead = false;
     invokeSpy.mockImplementation(async (command: string, args) => {
       if (command === "design_load_project") {
-        loadReturned = true;
         return {
           meta: {
             schemaVersion: 1,
@@ -593,37 +611,57 @@ describe("DesignView — STEP 4: Oracle grounding + audit log wiring", () => {
           components: {},
         } as DesignProject;
       }
+      if (command === "design_read_design_md") {
+        designMdRead = true;
+        return null; // MISSING -> the seed flow probes Oracle + opens the editor.
+      }
       if (command === "design_oracle_context") {
         oracleQueried = true;
-        // Oracle returns chunks carrying SENSITIVE target file paths.
+        // Oracle returns chunks carrying SENSITIVE target file paths + real tokens.
         return [
-          { fileSource: "src/theme/tokens.ts", score: 0.9, text: "secret" },
-          { fileSource: "src/design/palette.scss", score: 0.8, text: "secret" },
+          {
+            fileSource: "src/theme/tokens.ts",
+            score: 0.9,
+            text: ":root { --brand: #4f46e5; }",
+          },
+          { fileSource: "src/design/palette.scss", score: 0.8, text: "$ink: #0f172a;" },
         ];
       }
-      if (command === "design_write_tokens") {
-        // The seed write must come AFTER load resolved (awaited inside runLoad).
-        writeAfterLoad = loadReturned;
-        writes.push(args!);
+      if (command === "design_write_tokens" || command === "design_write_design_md") {
+        writes.push({ command, args });
       }
       return undefined;
     });
 
     const { container } = render();
-    // "Open working folder…" picks the path and loads it (running the token seed).
     await setFolder(container, "C:/target/.aspis-design/landing");
 
-    // The seed ran (Oracle probed) and persisted within the awaited load flow.
+    // The seed read design.md, found it missing, and probed Oracle.
+    expect(designMdRead).toBe(true);
     expect(oracleQueried).toBe(true);
-    expect(writes.length).toBe(1);
-    expect(writeAfterLoad).toBe(true);
-    // The persisted tokens.json carries NO target file paths (WARNING 3).
-    const tokensJson = String(writes[0].tokensJson);
+    // The contract editor is OPEN, prefilled with a draft — and NOTHING was written yet.
+    expect(container.querySelector("[data-testid=design-md-editor]")).toBeTruthy();
+    expect(writes.length).toBe(0);
+
+    // Skip writes the legacy clean tokens stub (and never design.md). No paths leak.
+    const skip = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Skip",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      skip.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector("[data-testid=design-md-editor]")).toBeFalsy();
+    const tokenWrites = writes.filter((w) => w.command === "design_write_tokens");
+    expect(tokenWrites.length).toBe(1);
+    const tokensJson = String((tokenWrites[0].args as Record<string, unknown>).tokensJson);
     expect(tokensJson).not.toContain("src/theme/tokens.ts");
     expect(tokensJson).not.toContain("src/design/palette.scss");
-    expect(tokensJson).not.toContain("Seeded from");
-    // It is a clean (empty) DTCG stub.
     expect(JSON.parse(tokensJson)).toEqual({});
+    // Skip NEVER writes design.md.
+    expect(writes.some((w) => w.command === "design_write_design_md")).toBe(false);
   });
 });
 
@@ -837,6 +875,7 @@ describe("DesignView — WARNING 4: persistNode serializes node then manifest", 
   it("writes design_write_node BEFORE design_write_manifest for an edit", async () => {
     const order: string[] = [];
     invokeSpy.mockImplementation(async (command: string) => {
+      if (command === "design_read_design_md") return DEFAULT_DESIGN_MD;
       if (command === "design_write_node" || command === "design_write_manifest") {
         order.push(command);
       }

@@ -10,7 +10,7 @@
 // open project's working-folder path all come from props so the same source of
 // truth drives both this popover and persistence.
 
-import { Palette, Folder, Check, Pencil, Trash2, X } from "lucide-react";
+import { Palette, Folder, Check, Pencil, Trash2, X, FileText } from "lucide-react";
 import type { DesignProjectEntry } from "../../../types/design";
 import { Popover } from "./Popover";
 import { thumbColorFromId } from "./format";
@@ -36,6 +36,9 @@ export interface ProjectPopoverProps {
   /** Footer actions: pick a folder + create, or pick a folder + load. */
   onNewProject: () => void;
   onOpenFolder: () => void;
+  /** Open the design.md contract editor for the open project. Undefined -> the row is
+   * hidden (no project is open). */
+  onEditContract?: () => void;
 }
 
 export function ProjectPopover({
@@ -54,6 +57,7 @@ export function ProjectPopover({
   openEntry,
   onNewProject,
   onOpenFolder,
+  onEditContract,
 }: ProjectPopoverProps) {
   return (
     <Popover open={open} onClose={onClose} className="left">
@@ -190,6 +194,29 @@ export function ProjectPopover({
         })}
       </div>
       <div className="pop-sep" />
+      {onEditContract ? (
+        <button
+          type="button"
+          className="pop-row"
+          disabled={busy}
+          onClick={() => {
+            onClose();
+            onEditContract();
+          }}
+        >
+          <span
+            style={{
+              color: "var(--accent)",
+              display: "grid",
+              placeItems: "center",
+              width: 30,
+            }}
+          >
+            <FileText size={16} />
+          </span>
+          <b style={{ fontWeight: 600 }}>Design contract…</b>
+        </button>
+      ) : null}
       <button
         type="button"
         className="pop-row"

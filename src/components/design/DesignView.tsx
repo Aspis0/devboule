@@ -60,7 +60,15 @@ import {
   buildGroundingBlock,
   type DesignContextChunk,
 } from "./generation/grounding";
-import { tokenNamesForPrompt, type DtcgDocument } from "./engine/tokens";
+import {
+  tokenNamesForPrompt,
+  isValidTokensDoc,
+  type DtcgDocument,
+} from "./engine/tokens";
+import { extractTokensFromChunks } from "./contract/extractTokens";
+import { buildDesignMdDraft, clampDesignMd } from "./contract/designMd";
+import { sha256Hex } from "./contract/sha256";
+import { DesignMdEditor } from "./contract/DesignMdEditor";
 import { exportCode, type ExportMode } from "./export/exportCode";
 import { TopBar } from "./shell/TopBar";
 import { Toast } from "./shell/Toast";
@@ -94,6 +102,28 @@ const CLI_BACKEND_KINDS = new Set(["claude", "codex", "api"]);
 
 function isCliBackend(backendKind: string): boolean {
   return CLI_BACKEND_KINDS.has(backendKind);
+}
+
+/** Normalize a folder path for a lenient registry lookup: trim, unify separators, drop a
+ * trailing separator, and lowercase (Windows FS is case-insensitive; the stored path is
+ * server-canonicalized and may differ from the raw picked path only in these ways). PURE. */
+function normFolderKey(path: string): string {
+  return path
+    .trim()
+    .replace(/[\\/]+/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+/** Find the APPROVED contract hash recorded for `folderPath` in the registry list, if
+ * any. Matches the stored (canonicalized) path leniently against the raw folder. PURE. */
+function findRecordedSha(
+  entries: DesignProjectEntry[],
+  folderPath: string,
+): string | undefined {
+  const key = normFolderKey(folderPath);
+  const hit = entries.find((e) => normFolderKey(e.workingFolderPath) === key);
+  return hit?.contractSha;
 }
 
 /** Build the hardcoded demo project (deterministic, no clock fields used for
@@ -332,6 +362,45 @@ export function DesignView() {
   const tokensRef = useRef<DtcgDocument>(tokens);
   tokensRef.current = tokens;
 
+  // The project's design.md contract, stashed in memory for prompt injection. It is
+  // populated from design_read_design_md on load (when present) or after the user
+  // Saves the contract editor. Injected (clamped to 16 KiB) into EVERY prompt — see
+  // the trust note at the prompt build sites + in generation/prompt.ts. Empty = no
+  // contract; nothing is injected. NEVER written to from a render path; only the
+  // editor's explicit Save updates it.
+  const contractRef = useRef<string>("");
+
+  // Fix 4: a monotonically-increasing SEED EPOCH. Bumped at the START of every
+  // loadFolder / createInFolder. seedContract() captures the epoch it began under and
+  // re-checks it before EVERY state-applying step (setContractEditor / contractRef stash
+  // / token stub), so a slow async seed for project A that resolves AFTER the user has
+  // switched to project B can never apply A's draft/contract over B's session.
+  const seedEpochRef = useRef(0);
+
+  // Fix 3: live mirror of the recent-projects registry so seedContract can look up the
+  // APPROVED contract hash for the current folder at call time (no stale closure).
+  const recentRef = useRef<DesignProjectEntry[]>(recent);
+  recentRef.current = recent;
+
+  // Contract editor (DesignMdEditor) modal state. `null` = closed. `draftTokens` are
+  // written alongside design.md on Save when the draft came from token extraction;
+  // a preset the user picks inside the editor supplies its own tokens instead.
+  //
+  // `fromSeedFlow` (Fix 2): true ONLY when the editor was opened by the post-create/open
+  // SEED flow. Skip writes the clean empty tokens.json ONLY in that case — a MANUAL open
+  // (or the provenance-review path) must NEVER clobber an existing tokens.json on Skip.
+  // `notice` (Fix 3): an optional banner shown when the editor opened to REVIEW a contract
+  // that changed outside the editor (hash mismatch) before it can be used.
+  // `saveError` (Fix 5): an inline error surfaced when a Save write FAILED so the editor
+  // stays open with the user's content intact for a retry.
+  const [contractEditor, setContractEditor] = useState<{
+    initialContent: string;
+    draftTokens?: DtcgDocument;
+    fromSeedFlow: boolean;
+    notice?: string;
+    saveError?: string;
+  } | null>(null);
+
   // Compact Oracle grounding status for the topbar chip + popover head label. Fetched
   // best-effort after a load (and refreshed by the popover when it opens). The chip
   // label reads from this; the popover re-fetches its own deeper stats on open.
@@ -356,7 +425,10 @@ export function DesignView() {
     agentic: boolean;
   }
 
-  // Bounded self-repair (Phase 2.5 Tier 1) state for a FULL generation.
+  // Bounded self-repair (Phase 2.5 Tier 1) state for a FULL generation. Fix 8: the
+  // design.md contract is NO LONGER stored here — launchRepair reads the LIVE
+  // `contractRef.current` at repair time so a contract Save between the initial generate
+  // and the repair is honoured (and a contract that became UNINJECTED is not resurrected).
   interface RepairState {
     instruction: string;
     context: string;
@@ -440,30 +512,259 @@ export function DesignView() {
     };
   }, [flushManifest]);
 
-  // Best-effort seed of the W3C DTCG token document from the TARGET via Oracle.
-  // WARNING 3: we MUST NOT persist Oracle-derived target FILE PATHS into tokens.json.
-  const seedTokens = useCallback(async () => {
+  // Upsert this project into the recent-projects registry. Declared early (before the
+  // seed/save flows that call it) to avoid a TDZ in their dependency arrays.
+  // `contractSha` (Fix 3): supplied ONLY by the contract Save path to RECORD the approved
+  // hash. Omitted on load/create remembers — the backend upsert PRESERVES any existing
+  // recorded hash when `contractSha` is absent (never wipes it on a plain reopen).
+  const rememberProject = useCallback(
+    async (workingFolderPath: string, name: string, contractSha?: string) => {
+      if (!tauri || !workingFolderPath.trim()) return;
+      try {
+        const list = await invokeBackendCommand<DesignProjectEntry[]>(
+          "design_registry_remember",
+          {
+            entry: {
+              id: "",
+              name,
+              workingFolderPath: workingFolderPath.trim(),
+              createdAt: "",
+              updatedAt: "",
+              lastOpenedAt: "",
+              ...(contractSha ? { contractSha } : {}),
+            },
+          },
+        );
+        setRecent(list ?? []);
+      } catch {
+        // Non-fatal: remembering is a convenience.
+      }
+    },
+    [tauri],
+  );
+
+  // Persist a clean (empty) DTCG token stub. PRESERVES the legacy guarantee that the
+  // seed flow always leaves a valid tokens.json behind when the user provides no
+  // contract (Skip): a target with no extractable tokens still gets a tokens.json.
+  // WARNING 3: the stub carries NO Oracle-derived file paths.
+  const writeCleanTokenStub = useCallback(async () => {
     const folderPath = folderRef.current.trim();
+    setTokens({});
+    if (!folderPath || !tauri) return;
+    await invokeBackendCommand("design_write_tokens", {
+      workingFolderPath: folderPath,
+      tokensJson: JSON.stringify({}, null, 2),
+    }).catch(() => {
+      // Non-fatal: tokens persistence failing must not break load.
+    });
+  }, [tauri]);
+
+  // Seed flow (Phase C). State machine, run after create/open:
+  //   (i)  read design.md -> PRESENT: re-hash it and check provenance (Fix 3):
+  //          - hash MATCHES the recorded approved hash -> stash for injection, no editor.
+  //          - MISMATCH or NO recorded hash -> do NOT stash/inject; open the editor
+  //            prefilled with the on-disk content + a REVIEW notice. Save re-approves;
+  //            Skip leaves design.md on disk but UNINJECTED for the session.
+  //   (ii) MISSING -> probe Oracle for design signal:
+  //          - chunks found -> extract REAL tokens + build a REVIEW-FIRST draft, open
+  //            the editor prefilled (Save writes design.md AND the extracted tokens).
+  //          - no chunks    -> open the editor with an empty draft (preset-picker mode).
+  // NOTHING here writes design.md or tokens.json — only the editor's explicit Save (or
+  // the Skip-fallback clean stub) writes. WARNING 3 preserved: the draft (which may
+  // quote target source) is shown to the user and only persisted on Save.
+  //
+  // Fix 4: every state-applying step is gated on the SEED EPOCH captured at entry, so a
+  // slow seed for project A that resolves after a switch to B cannot apply A's result.
+  const seedContract = useCallback(async () => {
+    const epoch = seedEpochRef.current;
+    const stale = () => seedEpochRef.current !== epoch;
+    const folderPath = folderRef.current.trim();
+    contractRef.current = "";
+    setContractEditor(null);
     if (!folderPath || !tauri) {
       setTokens({});
       return;
     }
-    const doc: DtcgDocument = {};
+
+    // (i) Existing contract: re-hash + provenance check before any injection.
+    let existing: string | null = null;
     try {
-      await invokeBackendCommand<DesignContextChunk[]>("design_oracle_context", {
-        workingFolderPath: folderPath,
-        query: "design tokens palette colors typography spacing theme",
-        limit: 8,
-      });
+      existing = await invokeBackendCommand<string | null>(
+        "design_read_design_md",
+        { workingFolderPath: folderPath },
+      );
     } catch {
-      // Non-fatal: degrade to the empty document already in `doc`.
+      existing = null;
     }
-    setTokens(doc);
-    await invokeBackendCommand("design_write_tokens", {
-      workingFolderPath: folderPath,
-      tokensJson: JSON.stringify(doc, null, 2),
-    }).catch(() => {
-      // Non-fatal: tokens persistence failing must not break load.
+    if (stale()) return;
+    if (typeof existing === "string" && existing.trim().length > 0) {
+      const onDiskHash = await sha256Hex(existing);
+      if (stale()) return;
+      const recordedHash = findRecordedSha(recentRef.current, folderPath);
+      if (recordedHash && recordedHash === onDiskHash) {
+        // Approved + unchanged: stash for injection, skip the editor.
+        contractRef.current = existing;
+      } else {
+        // Out-of-band change (or never approved): open the editor to REVIEW. Do NOT
+        // stash — nothing is injected until the user Saves (re-approves). This is NOT a
+        // seed flow, so Skip must not touch tokens.json.
+        setContractEditor({
+          initialContent: existing,
+          draftTokens: undefined,
+          fromSeedFlow: false,
+          notice:
+            "This contract changed outside the editor — review before it is used.",
+        });
+      }
+      return;
+    }
+
+    // (ii) Missing: probe Oracle for a draft. The probe NEVER throws fatally.
+    let chunks: DesignContextChunk[] = [];
+    try {
+      chunks =
+        (await invokeBackendCommand<DesignContextChunk[]>("design_oracle_context", {
+          workingFolderPath: folderPath,
+          query: "design tokens palette colors typography spacing theme",
+          limit: 8,
+        })) ?? [];
+    } catch {
+      chunks = [];
+    }
+    if (stale()) return;
+
+    if (chunks.length > 0) {
+      const extracted = extractTokensFromChunks(chunks);
+      const draft = buildDesignMdDraft(chunks, extracted);
+      const hasTokens = Object.keys(extracted).length > 0;
+      setContractEditor({
+        initialContent: draft,
+        draftTokens: hasTokens ? extracted : undefined,
+        fromSeedFlow: true,
+      });
+    } else {
+      // No grounding signal: open the editor in preset-picker mode (empty draft).
+      setContractEditor({
+        initialContent: "",
+        draftTokens: undefined,
+        fromSeedFlow: true,
+      });
+    }
+  }, [tauri]);
+
+  // Contract editor SAVE: the ONLY path that writes design.md / tokens.json from the
+  // editor. Fix 5: the design.md write happens FIRST and, on failure, the editor stays
+  // OPEN with an inline error and NEITHER the in-memory stash NOR the approved registry
+  // hash is updated (no data loss, no false provenance). Only after a successful write
+  // (or for empty content, which clears the contract) do we stash, record the approved
+  // SHA-256 (Fix 3), persist tokens, and close.
+  const onContractSave = useCallback(
+    async (content: string, tokensDoc: DtcgDocument | undefined) => {
+      const folderPath = folderRef.current.trim();
+      const trimmed = content.trim();
+      const hasContract = trimmed.length > 0;
+
+      // 1) Persist design.md FIRST when there is content. On failure: keep the editor
+      //    open with the error, do not touch contractRef/hash. The user can retry Save.
+      if (folderPath && tauri && hasContract) {
+        try {
+          await invokeBackendCommand("design_write_design_md", {
+            workingFolderPath: folderPath,
+            content,
+          });
+        } catch (e) {
+          setContractEditor((prev) =>
+            prev ? { ...prev, saveError: String(e) } : prev,
+          );
+          return; // editor STAYS open; no optimistic stash/hash update.
+        }
+      }
+
+      // 2) Write succeeded (or there is no content). NOW adopt the contract for this
+      //    session — empty content CLEARS the stash.
+      contractRef.current = hasContract ? trimmed : "";
+
+      // 3) Record the approved hash so a later load injects this contract without a
+      //    review prompt (Fix 3). Hash the EXACT saved string (what reload reads back).
+      //    Only when we actually wrote a non-empty contract to a real folder.
+      if (folderPath && tauri && hasContract) {
+        try {
+          const sha = await sha256Hex(content);
+          await rememberProject(folderPath, projectRef.current.meta.name, sha);
+        } catch {
+          // Non-fatal: a missing recorded hash only means the NEXT load re-prompts a
+          // review — it never corrupts data or injects an unapproved contract.
+        }
+      }
+
+      // 4) Persist accompanying tokens (extracted draft or chosen preset).
+      if (tokensDoc && isValidTokensDoc(tokensDoc)) {
+        setTokens(tokensDoc);
+        if (folderPath && tauri) {
+          await invokeBackendCommand("design_write_tokens", {
+            workingFolderPath: folderPath,
+            tokensJson: JSON.stringify(tokensDoc, null, 2),
+          }).catch((e) => setError(String(e)));
+        }
+      }
+      setContractEditor(null);
+    },
+    [tauri, rememberProject],
+  );
+
+  // Contract editor SKIP: writes NOTHING to design.md. Fix 2: the clean empty
+  // tokens.json fallback is written ONLY when the editor was opened by the SEED flow
+  // (a brand-new project with no contract yet). A MANUAL open, or the provenance-review
+  // path, must NEVER clobber the project's existing tokens.json on Skip.
+  const onContractSkip = useCallback(() => {
+    const fromSeedFlow = contractEditor?.fromSeedFlow ?? false;
+    setContractEditor(null);
+    if (fromSeedFlow) void writeCleanTokenStub();
+  }, [contractEditor, writeCleanTokenStub]);
+
+  // Manual entry point (ProjectPopover "Design contract…" row): load the current
+  // design.md into the editor for editing, or build a fresh draft from Oracle when
+  // none exists. Unlike the seed flow, Skip here does NOT touch tokens.json.
+  const openContractEditor = useCallback(async () => {
+    const folderPath = folderRef.current.trim();
+    if (!folderPath || !tauri) return;
+    let existing: string | null = null;
+    try {
+      existing = await invokeBackendCommand<string | null>(
+        "design_read_design_md",
+        { workingFolderPath: folderPath },
+      );
+    } catch {
+      existing = null;
+    }
+    if (typeof existing === "string" && existing.trim().length > 0) {
+      // Manual open of an existing contract: NOT a seed flow (Skip must not write the
+      // token stub). This is the user's own action so no provenance review is needed.
+      setContractEditor({
+        initialContent: existing,
+        draftTokens: undefined,
+        fromSeedFlow: false,
+      });
+      return;
+    }
+    let chunks: DesignContextChunk[] = [];
+    try {
+      chunks =
+        (await invokeBackendCommand<DesignContextChunk[]>("design_oracle_context", {
+          workingFolderPath: folderPath,
+          query: "design tokens palette colors typography spacing theme",
+          limit: 8,
+        })) ?? [];
+    } catch {
+      chunks = [];
+    }
+    const extracted = chunks.length > 0 ? extractTokensFromChunks(chunks) : {};
+    const draft =
+      chunks.length > 0 ? buildDesignMdDraft(chunks, extracted) : "";
+    setContractEditor({
+      initialContent: draft,
+      draftTokens: Object.keys(extracted).length > 0 ? extracted : undefined,
+      fromSeedFlow: false,
     });
   }, [tauri]);
 
@@ -529,31 +830,6 @@ export function DesignView() {
     };
   }, [tauri]);
 
-  const rememberProject = useCallback(
-    async (workingFolderPath: string, name: string) => {
-      if (!tauri || !workingFolderPath.trim()) return;
-      try {
-        const list = await invokeBackendCommand<DesignProjectEntry[]>(
-          "design_registry_remember",
-          {
-            entry: {
-              id: "",
-              name,
-              workingFolderPath: workingFolderPath.trim(),
-              createdAt: "",
-              updatedAt: "",
-              lastOpenedAt: "",
-            },
-          },
-        );
-        setRecent(list ?? []);
-      } catch {
-        // Non-fatal: remembering is a convenience.
-      }
-    },
-    [tauri],
-  );
-
   // Create a project in the given folder (seeds the demo nodes, saves, remembers).
   // Shared by the ProjectPopover "New project…" row (which picks a folder first).
   const createInFolder = useCallback(
@@ -563,6 +839,9 @@ export function DesignView() {
         setError("Choose a working folder first.");
         return;
       }
+      // Fix 4: open a new seed epoch so a still-running seed from a previous project
+      // cannot apply its result over this one.
+      seedEpochRef.current += 1;
       setBusy("create");
       setError(null);
       setStatus(null);
@@ -590,6 +869,9 @@ export function DesignView() {
         setStatus("Created and seeded the project on disk.");
         showToast("Project created in the working folder");
         await rememberProject(path, seeded.meta.name);
+        // A brand-new project has no design.md -> the seed flow opens the contract
+        // editor (preset-picker or an extracted draft) so the user curates one.
+        await seedContract();
         await refreshOracleStatus();
       } catch (e) {
         setError(String(e));
@@ -597,7 +879,7 @@ export function DesignView() {
         setBusy(null);
       }
     },
-    [rememberProject, setHistoryValue, showToast, refreshOracleStatus],
+    [rememberProject, setHistoryValue, showToast, seedContract, refreshOracleStatus],
   );
 
   // Core load flow shared by the picker and the recent-projects list.
@@ -608,11 +890,14 @@ export function DesignView() {
         setError("Choose a working folder first.");
         return;
       }
+      // Fix 4: open a new seed epoch so a still-running seed from a previous project
+      // cannot apply its result over this load.
+      seedEpochRef.current += 1;
       setBusy("load");
       setError(null);
       setStatus(null);
       setFolder(folderPath);
-      // Update the live folder ref SYNCHRONOUSLY too: seedTokens / refreshOracleStatus
+      // Update the live folder ref SYNCHRONOUSLY too: seedContract / refreshOracleStatus
       // (awaited below) read `folderRef.current`, but the React render that mirrors
       // `folder` into the ref hasn't run yet in this chained flow (pick -> load),
       // so without this they would see a stale/empty path and skip the seed.
@@ -633,7 +918,7 @@ export function DesignView() {
             ? `Loaded with ${loaded.warnings.length} warning(s).`
             : "Loaded from disk.",
         );
-        await seedTokens();
+        await seedContract();
         await rememberProject(folderPath, loaded.meta.name);
         await refreshOracleStatus();
       } catch (e) {
@@ -646,7 +931,7 @@ export function DesignView() {
         setBusy(null);
       }
     },
-    [seedTokens, rememberProject, setHistoryValue, refreshOracleStatus],
+    [seedContract, rememberProject, setHistoryValue, refreshOracleStatus],
   );
 
   // ProjectPopover footer actions: pick a folder, then create / load it.
@@ -1013,7 +1298,16 @@ export function DesignView() {
           sources: cli ? undefined : sources,
         });
 
-        const fullPrompt = buildGeneratePrompt(instruction, { context });
+        // TRUST (B4 sibling rule): the design.md contract is injected for ALL
+        // providers — INCLUDING CLI ones that get no pre-fetched grounding block —
+        // because it is USER-CURATED (only ever written via the contract editor's
+        // explicit Save), unlike raw Oracle chunk text. Clamped to 16 KiB and fenced
+        // as data in the prompt builder. Empty stash -> nothing injected.
+        const designContract = clampDesignMd(contractRef.current);
+        const fullPrompt = buildGeneratePrompt(instruction, {
+          context,
+          designContract,
+        });
         repairRef.current = { instruction, context, attempts: 0 };
         consumedRef.current = false;
         pendingRunRef.current = {
@@ -1067,6 +1361,10 @@ export function DesignView() {
         state.instruction,
         { committedNodeCount, remainingViolations },
         repairContext,
+        // Fix 8: read the LIVE contract at repair time (clamped), not a value snapshotted
+        // at generate start. The contract is carried into the repair for ALL providers
+        // (user-curated, same trust class as the instruction — see runGenerate's note).
+        clampDesignMd(contractRef.current),
       );
       if (repaired === null) return false;
 
@@ -1131,7 +1429,10 @@ export function DesignView() {
         const backendKind = await readBackendKind();
         const cli = isCliBackend(backendKind);
         patchMessage(msgId, { agentic: cli });
-        const editPrompt = buildEditPrompt(current, instruction);
+        // The design contract grounds edits too (all providers — user-curated, clamped).
+        const editPrompt = buildEditPrompt(current, instruction, {
+          designContract: clampDesignMd(contractRef.current),
+        });
         consumedRef.current = false;
         pendingRunRef.current = {
           mode: "edit",
@@ -1500,6 +1801,7 @@ export function DesignView() {
           openEntry={openEntry}
           onNewProject={() => void onNewProject()}
           onOpenFolder={() => void onOpenFolder()}
+          onEditContract={projectOpen ? () => void openContractEditor() : undefined}
           oracleStatus={oracleStatus}
           tokens={tokens}
           invoke={invokeBackendCommand}
@@ -1629,6 +1931,16 @@ export function DesignView() {
           />
         </div>
       </div>
+
+      <DesignMdEditor
+        open={contractEditor !== null}
+        initialContent={contractEditor?.initialContent ?? ""}
+        draftTokens={contractEditor?.draftTokens}
+        notice={contractEditor?.notice}
+        saveError={contractEditor?.saveError}
+        onSave={onContractSave}
+        onSkip={onContractSkip}
+      />
 
       <Toast msg={toast} onDismiss={() => setToast(null)} />
     </div>

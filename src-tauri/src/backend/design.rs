@@ -1474,6 +1474,14 @@ pub struct DesignProjectEntry {
     pub last_opened_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<String>,
+    /// SHA-256 (lowercase hex) of the design.md content the user last APPROVED in the
+    /// contract editor. Provenance gate: on load we re-hash the on-disk design.md and
+    /// only inject it into prompts when it matches this recorded value (an agent that
+    /// edited the folder's design.md out-of-band produces a mismatch, forcing a review).
+    /// Absent on legacy entries / projects with no approved contract. camelCase
+    /// `contractSha` over IPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_sha: Option<String>,
 }
 
 /// Canonicalize a working folder path into a STABLE dedupe key. When the path exists we
@@ -1608,6 +1616,13 @@ mod registry_ops {
             existing.updated_at = incoming.updated_at;
             existing.last_opened_at = incoming.last_opened_at;
             existing.thumbnail_path = incoming.thumbnail_path;
+            // contract_sha is only OVERWRITTEN when the incoming remember carries one
+            // (i.e. the user just Saved/approved a contract). A plain load/create remember
+            // omits it (None) and MUST NOT wipe a previously approved hash — otherwise an
+            // approved contract would be forgotten on the very next open and re-prompt.
+            if incoming.contract_sha.is_some() {
+                existing.contract_sha = incoming.contract_sha;
+            }
             // Keep the existing canonical-ish stored path; do not churn it. (id +
             // createdAt are identity and intentionally untouched.)
         } else {
@@ -1735,6 +1750,9 @@ pub fn design_registry_remember(
         updated_at: now.clone(),
         last_opened_at: now,
         thumbnail_path: entry.thumbnail_path.clone(),
+        // Carried through verbatim: None on a load/create remember (preserves any existing
+        // recorded hash via upsert), Some(hex) when the user just approved a contract.
+        contract_sha: entry.contract_sha.clone(),
     };
     registry_ops::upsert(&mut entries, incoming, &incoming_key, &|p| {
         registry_dedupe_key(p)
@@ -2836,6 +2854,7 @@ mod tests {
             updated_at: last_opened.to_string(),
             last_opened_at: last_opened.to_string(),
             thumbnail_path: None,
+            contract_sha: None,
         }
     }
 
@@ -2867,6 +2886,64 @@ mod tests {
         // Mutable fields updated.
         assert_eq!(entries[0].name, "New");
         assert_eq!(entries[0].last_opened_at, "2022-02-02T00:00:00Z");
+    }
+
+    #[test]
+    fn registry_entry_contract_sha_serde_round_trip() {
+        // Some(hex) serializes as camelCase `contractSha` and round-trips.
+        let mut e = entry("p1", "Landing", "/a/landing", "2021-01-01T00:00:00Z");
+        e.contract_sha = Some("abc123".to_string());
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"contractSha\":\"abc123\""), "got {json}");
+        let back: DesignProjectEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+
+        // None is OMITTED from the wire (skip_serializing_if).
+        let e_none = entry("p2", "X", "/a/x", "2021-01-01T00:00:00Z");
+        let json_none = serde_json::to_string(&e_none).unwrap();
+        assert!(!json_none.contains("contractSha"), "None must be omitted: {json_none}");
+    }
+
+    #[test]
+    fn registry_entry_legacy_without_contract_sha_parses() {
+        // An OLD config entry (pre-Fix-3) has no contractSha key — it must still parse,
+        // defaulting the field to None.
+        let legacy = r#"{
+            "id": "p1",
+            "name": "Landing",
+            "workingFolderPath": "/a/landing",
+            "createdAt": "2020-01-01T00:00:00Z",
+            "updatedAt": "2021-01-01T00:00:00Z",
+            "lastOpenedAt": "2021-01-01T00:00:00Z"
+        }"#;
+        let parsed: DesignProjectEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.contract_sha, None);
+        assert_eq!(parsed.id, "p1");
+    }
+
+    #[test]
+    fn registry_upsert_carries_and_preserves_contract_sha() {
+        // Insert an entry that already has an approved hash.
+        let mut e = entry("p1", "Landing", "/a/landing", "2021-01-01T00:00:00Z");
+        e.contract_sha = Some("oldhash".to_string());
+        let mut entries = vec![e];
+
+        // A plain load/create remember (contract_sha = None) MUST NOT wipe the hash.
+        let load = entry("p1b", "Landing", "/a/landing", "2022-01-01T00:00:00Z");
+        registry_ops::upsert(&mut entries, load, &lexical_key("/a/landing"), &lexical_key);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].contract_sha.as_deref(),
+            Some("oldhash"),
+            "load remember (None) must preserve the recorded hash"
+        );
+
+        // A contract-Save remember (Some) OVERWRITES it.
+        let mut save = entry("p1c", "Landing", "/a/landing", "2023-01-01T00:00:00Z");
+        save.contract_sha = Some("newhash".to_string());
+        registry_ops::upsert(&mut entries, save, &lexical_key("/a/landing"), &lexical_key);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].contract_sha.as_deref(), Some("newhash"));
     }
 
     #[test]

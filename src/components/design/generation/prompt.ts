@@ -11,8 +11,70 @@
 // cleanly and needs no positional neutralization, so we still spell out the
 // rules. PURE (no DOM, no clock, no random): snapshot-tested.
 
-/** The contract revision. Bump on ANY wording change to the system prompt. */
-export const DESIGN_PROMPT_VERSION = 1;
+/** The contract revision. Bump on ANY wording change to the system prompt OR to how
+ * the injected blocks (context / design contract) are framed.
+ * v2 (Phase C): adds the optional `DESIGN CONTRACT` block built from the project's
+ * design.md (injected for ALL providers, including CLI — see the trust note below). */
+export const DESIGN_PROMPT_VERSION = 2;
+
+/** The fence sentinels around the injected contract DATA block. The opening sentinel
+ * is `<<<` + the token; the closing sentinel is the bare token alone on its own line. */
+const CONTRACT_FENCE_TOKEN = "DESIGN_CONTRACT";
+const CONTRACT_FENCE_OPEN = `<<<${CONTRACT_FENCE_TOKEN}`;
+
+/**
+ * Neutralize any line of the contract body that could be read by a downstream parser
+ * (or a steerable CLI model) as the fence boundary, so untrusted-but-user-curated
+ * content can never BREAK OUT of the `<<<DESIGN_CONTRACT … DESIGN_CONTRACT` fence.
+ *
+ * A line is dangerous when, after trimming leading whitespace, it STARTS WITH the bare
+ * `DESIGN_CONTRACT` token (this also covers a line equal to it, and the opening
+ * `<<<DESIGN_CONTRACT` sentinel via the explicit `<<<` check). We defang it by prefixing
+ * a visible, deterministic guard marker `· ` (U+00B7 MIDDLE DOT + space) so the line no
+ * longer begins with the sentinel and is obviously an inert, escaped data line. We do
+ * NOT mutate the token mid-line (only the boundary-significant leading position matters).
+ */
+function neutralizeFence(body: string): string {
+  return body
+    .split("\n")
+    .map((line) => {
+      const lead = line.replace(/^\s+/, "");
+      if (lead.startsWith(CONTRACT_FENCE_OPEN) || lead.startsWith(CONTRACT_FENCE_TOKEN)) {
+        return `· ${line}`;
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+/**
+ * Frame the project's design.md as a clearly-fenced DATA block placed BEFORE the user
+ * instruction. PURE. Returns [] when there is no contract.
+ *
+ * TRUST: design.md is injected into EVERY prompt, including CLI providers (claude/
+ * codex) which otherwise receive NO pre-fetched Oracle grounding (B4). This is safe
+ * ONLY because design.md is USER-CURATED: the seed draft (which may quote target
+ * source) is always shown in the contract editor and written to disk ONLY on an
+ * explicit Save, so by the time it reaches here it is the same trust class as the
+ * user's own instruction. The caller clamps it to 16 KiB before passing it in. We
+ * fence it as data and label it a project file the model should FOLLOW (rules), not
+ * obey as new system instructions.
+ *
+ * FENCE SAFETY: the body is run through {@link neutralizeFence} so a bare
+ * `DESIGN_CONTRACT` (or `<<<DESIGN_CONTRACT`) line in the content cannot close/reopen
+ * the fence early — exactly ONE opening and ONE closing sentinel ever bound the block.
+ */
+function designContractBlock(contract: string | undefined): string[] {
+  const c = (contract ?? "").trim();
+  if (c.length === 0) return [];
+  return [
+    "DESIGN CONTRACT (project file, follow its rules):",
+    CONTRACT_FENCE_OPEN,
+    neutralizeFence(c),
+    CONTRACT_FENCE_TOKEN,
+    "",
+  ];
+}
 
 /**
  * The versioned system prompt encoding the LOCKED contract. Output is UI markup
@@ -58,6 +120,18 @@ export interface GeneratePromptOptions {
    * Oracle grounding is wired in a later step.
    */
   context?: string;
+  /**
+   * The project's design.md contract (already clamped to 16 KiB by the caller).
+   * Injected as a fenced DATA block before the instruction for ALL providers — see
+   * {@link designContractBlock} for the trust rationale.
+   */
+  designContract?: string;
+}
+
+/** Options accepted by the single-node edit prompt builder. */
+export interface EditPromptOptions {
+  /** The project's design.md contract (clamped). Same injection as generate. */
+  designContract?: string;
 }
 
 /**
@@ -70,6 +144,7 @@ export function buildGeneratePrompt(
   opts: GeneratePromptOptions = {},
 ): string {
   const parts = [DESIGN_SYSTEM_PROMPT_V1, ""];
+  parts.push(...designContractBlock(opts.designContract));
   const context = (opts.context ?? "").trim();
   if (context.length > 0) {
     parts.push("CONTEXT (use to stay coherent with the product):");
@@ -89,10 +164,12 @@ export function buildGeneratePrompt(
 export function buildEditPrompt(
   nodeMarkup: string,
   userInstruction: string,
+  opts: EditPromptOptions = {},
 ): string {
   return [
     DESIGN_SYSTEM_PROMPT_V1,
     "",
+    ...designContractBlock(opts.designContract),
     "EDIT — here is ONE existing component. Return the SAME single element with",
     "its data-node-id PRESERVED, applying this change:",
     userInstruction.trim(),

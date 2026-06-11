@@ -65,6 +65,9 @@ export interface TopBarProps {
   openEntry: (entry: DesignProjectEntry) => void;
   onNewProject: () => void;
   onOpenFolder: () => void;
+  /** Open the design.md contract editor for the current project. Undefined disables
+   * the row (no project open). */
+  onEditContract?: () => void;
 
   // ---- oracle popover ----
   oracleStatus?: DesignOracleStatus;
@@ -108,6 +111,7 @@ export function TopBar(props: TopBarProps) {
     openEntry,
     onNewProject,
     onOpenFolder,
+    onEditContract,
     oracleStatus,
     tokens,
     invoke,
@@ -163,6 +167,7 @@ export function TopBar(props: TopBarProps) {
             openEntry={openEntry}
             onNewProject={onNewProject}
             onOpenFolder={onOpenFolder}
+            onEditContract={onEditContract}
           />
         </div>
         {projectOpen && (

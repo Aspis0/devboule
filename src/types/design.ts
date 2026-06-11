@@ -112,6 +112,15 @@ export interface DesignProjectEntry {
   updatedAt: string;
   lastOpenedAt: string;
   thumbnailPath?: string;
+  /**
+   * SHA-256 (lowercase hex) of the design.md content the user last APPROVED in the
+   * contract editor. Provenance gate (Fix 3): on load the on-disk design.md is re-hashed
+   * and only INJECTED into prompts when it matches this value — an out-of-band (agent)
+   * edit produces a mismatch and forces a review. Absent on legacy entries / projects
+   * with no approved contract. Mirrors the Rust `contract_sha` (omitted on the wire when
+   * `None`).
+   */
+  contractSha?: string;
 }
 
 /**

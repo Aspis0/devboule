@@ -1,0 +1,35 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildDesignMdDraft > snapshots the draft on a fixture 1`] = `
+"# Design contract (draft)
+
+> Drafted automatically from your target codebase. REVIEW BEFORE SAVE — edit or
+> replace anything below; nothing is written until you click Save.
+
+## Palette
+- \`#4f46e5\` — color.brand
+- \`#0f172a\` — color.ink
+- \`#ffffff\` — color.color-3
+
+## Typography
+- Inter — typography.font-1
+
+## Spacing
+- Scale: \`16px\`
+
+## Radii
+- \`8px\`
+
+## Reference snippets (from the target — for context only)
+
+**src/tokens.css**
+\`\`\`
+:root { --brand: #4f46e5; --ink: #0f172a; --space-md: 16px; --radius-card: 8px; }
+\`\`\`
+
+**src/Button.tsx**
+\`\`\`
+const Button = styled.button\`color:#fff;font-family:Inter,sans-serif\`;
+\`\`\`
+"
+`;

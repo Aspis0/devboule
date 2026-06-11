@@ -50,15 +50,16 @@ export function shouldSelfRepair(
 
 /**
  * Build the corrected generation prompt for a repair attempt: the original user
- * instruction, the same grounding context, PLUS a targeted correction block built
- * from the observed violation codes. Returns null when there is nothing actionable
- * (no recognized violations AND the canvas wasn't empty — the caller shouldn't even
- * have asked). PURE.
+ * instruction, the same grounding context, the SAME design contract, PLUS a targeted
+ * correction block built from the observed violation codes. Returns null when there is
+ * nothing actionable (no recognized violations AND the canvas wasn't empty — the caller
+ * shouldn't even have asked). PURE.
  */
 export function buildRepairPrompt(
   userInstruction: string,
   outcome: RepairableOutcome,
   context: string,
+  designContract?: string,
 ): string | null {
   // When nothing was produced but no specific violation was captured (e.g. the
   // model returned only prose), fall back to an EMPTY-style correction so the retry
@@ -76,5 +77,10 @@ export function buildRepairPrompt(
   const mergedContext = context.trim().length > 0
     ? `${context.trim()}\n\n${repair}`
     : repair;
-  return buildGeneratePrompt(userInstruction, { context: mergedContext });
+  // The design contract is carried into the repair prompt too, so a corrected pass
+  // is still bound by the project's rules (same injection as the original generate).
+  return buildGeneratePrompt(userInstruction, {
+    context: mergedContext,
+    designContract,
+  });
 }
