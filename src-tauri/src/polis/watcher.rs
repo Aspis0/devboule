@@ -545,7 +545,6 @@ fn rescan_and_emit(
 /// form. Cost (~1 MB serialize + hash) is trivial next to the spurious full re-diff
 /// of every building a needless re-emit would cause on the frontend.
 pub(crate) fn city_signature(city: &crate::polis::model::CityState) -> u64 {
-    use std::hash::{Hash, Hasher};
     let mut probe = city.clone();
     // Zero out the two PER-SCAN-VOLATILE fields so a re-scan that produced the
     // SAME city is recognized as unchanged:
@@ -561,9 +560,17 @@ pub(crate) fn city_signature(city: &crate::polis::model::CityState) -> u64 {
         b.last_modified = String::new();
     }
     let bytes = serde_json::to_vec(&probe).unwrap_or_default();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+    // FNV-1a over the serialized bytes — the same byte-stable pattern as
+    // scanner::stable_hash. `DefaultHasher` (SipHash with a per-process RANDOM seed)
+    // works today only because `last_sig` is process-local; switch to a seed-free
+    // hash so the signature is reproducible across processes (one persistence away
+    // from a real bug otherwise).
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in &bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// FIX 1: the load-bearing publish predicate, factored out so the store/emit

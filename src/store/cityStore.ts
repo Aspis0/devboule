@@ -716,6 +716,11 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
         usingFixture: false,
         loading: false,
       });
+      // Seed the live-update signature with the freshly-classified city (mirror
+      // loadFolder). Without this, lastAppliedCitySig still holds the PRE-reclassify
+      // city, so the next watcher/poll event carrying THIS city is treated as a
+      // change and spuriously re-applies/rebuilds the scene.
+      lastAppliedCitySig = citySignature(res.city).sig;
       return { changed: res.changed, status: res.status };
     } catch (e) {
       if (seq !== requestSeq)
@@ -765,6 +770,10 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
       // onto the existing scene: the OLD era's buildings rubble OUT and the new
       // monument appears at its margin (no full teardown/recenter). loading stays
       // true through the re-scan below so the spinner covers the whole transition.
+      // FORCE the apply: clear the dedupe signature so applyLiveUpdate cannot skip
+      // it. On an empty project the reset city can hash identically to what's shown,
+      // and a silent skip would leave the OLD era's scene on screen.
+      lastAppliedCitySig = null;
       get().applyLiveUpdate(resetCity);
 
       // 2) Re-scan the SAME folder to grow the new era's city, and funnel it
@@ -776,6 +785,10 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
         const city = await scanFolder(folder);
         if (seq !== requestSeq)
           return { ok: true, status: `New era “${era}” begun.` };
+        // FORCE the apply too: if the re-scanned city happens to hash identically
+        // to the reset city just applied (e.g. an empty project), a silent skip
+        // would strand the UI on the reset/monument-only city.
+        lastAppliedCitySig = null;
         get().applyLiveUpdate(city);
         set({ loading: false });
         // Restart the live fs-watcher on the folder (best-effort, Tauri-only).

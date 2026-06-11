@@ -351,3 +351,52 @@ describe("applyLiveUpdate skip-if-unchanged", () => {
     expect(afterChanged.liveCity?.seq).toBe((seqFirst ?? 0) + 1);
   });
 });
+
+// REGRESSION (FIX 1): reclassifyFeatures sets cityState directly. It must ALSO
+// seed lastAppliedCitySig with the returned city (mirror loadFolder) — otherwise
+// the dedupe signature still holds the PRE-reclassify city, and the very next
+// watcher/poll event carrying the freshly-classified city is treated as a change
+// and spuriously re-applies/rebuilds the scene. We assert the seeding indirectly:
+// after a reclassify, an applyLiveUpdate of a city IDENTICAL to the classified
+// one (volatile fields aside) is DROPPED (no liveCity seq bump).
+describe("reclassifyFeatures seeds the live-update signature (FIX 1)", () => {
+  it("drops a following identical live update after reclassify", async () => {
+    const s = useCityStore.getState();
+    useCityStore.setState({ selectedFolder: "C:/p" });
+
+    const classified = mkCity("classified");
+    const promise = s.reclassifyFeatures();
+    // The reclassify enqueued a polis_reclassify_features invoke; resolve it with
+    // the classified city wrapped in the command's response envelope.
+    const idx = pending.findIndex(
+      (d) => d.command === "polis_reclassify_features",
+    );
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const d = pending.splice(idx, 1)[0];
+    // The mock's resolve is typed CityState; the command actually returns an
+    // envelope. Resolve with the envelope (the store reads .city/.changed/.status).
+    (d.resolve as unknown as (v: unknown) => void)({
+      city: classified,
+      changed: true,
+      status: "ok",
+    });
+    await flush();
+    await promise;
+    expect(useCityStore.getState().cityState).toBe(classified);
+
+    // Now a live event carrying the SAME classified city (only volatile fields
+    // differ) must be DROPPED — proving lastAppliedCitySig was seeded by the
+    // reclassify. Without the fix the signature would still be null/stale and the
+    // update would apply (cityState would change identity, liveCity would gain a
+    // seq).
+    const before = useCityStore.getState();
+    const seqBefore = before.liveCity?.seq;
+    const identical = mkCity("classified");
+    identical.generatedAt = "2026-06-10T12:00:00Z";
+    identical.buildings[0].lastModified = "2026-06-10T12:00:00Z";
+    s.applyLiveUpdate(identical);
+    const after = useCityStore.getState();
+    expect(after.cityState).toBe(classified); // untouched
+    expect(after.liveCity?.seq).toBe(seqBefore); // no spurious re-apply
+  });
+});

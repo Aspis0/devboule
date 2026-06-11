@@ -465,8 +465,17 @@ pub(crate) fn generate_city_state_with_metrics(
     // on-disk store INSIDE the lock and applies ONLY scanner-owned fields onto it, so
     // a concurrently-written dossier / merges / overrides / extensions / era is fully
     // preserved (no residual race — load+save are serialized under the lock).
-    // Best-effort: a meta write failure must not fail the scan.
-    let _ = MetaStore::with_write_lock(project_path, |disk| meta.apply_scanner_owned_onto(disk));
+    // Best-effort: a meta write failure must not fail the scan, but it MUST be
+    // observable. This save persists `layout_version` (among the scanner-owned
+    // fields); if it silently fails, the next scan sees a stale/absent version and
+    // full-repacks the layout — and EVERY subsequent scan repeats that (permanent,
+    // invisible churn). Surface the error to the diagnostic log so the churn is
+    // diagnosable, while keeping the scan itself non-fatal.
+    if let Err(e) =
+        MetaStore::with_write_lock(project_path, |disk| meta.apply_scanner_owned_onto(disk))
+    {
+        crate::polis::commands::polis_debug_append(&format!("META SAVE FAILED: {e}"));
+    }
 
     // Reflect the REAL packed extent (footprint-aware layout makes the map much
     // larger than the legacy `grid_size_for(n)` formula); covers the packed bbox.
@@ -2444,35 +2453,51 @@ fn split_oversized_features(by_path: &mut BTreeMap<String, FeatureAssignment>) {
     // (the top-level spine is depth 1, `a/b` is depth 2, ...).
     let depth_of = |id: &str| id.split('/').filter(|s| !s.is_empty()).count();
 
+    // PERF (400k target): build a reverse index `feature_id -> member paths` ONCE,
+    // instead of re-scanning the entire `by_path` BTreeMap for every worklist group
+    // (the old cost was O(splits × N)). The index holds ONLY directory-spine members
+    // (the only ones that can descend — splits keep `feature_source == DIRECTORY`,
+    // so a re-keyed member stays eligible). `by_path` is a BTreeMap, so iterating it
+    // yields paths in sorted order; each `Vec<String>` therefore lists its members
+    // in ascending path order, preserving the exact deterministic iteration the old
+    // full-scan relied on. The index is maintained INCREMENTALLY as splits re-key
+    // members, so it stays the single source of truth for the worklist.
+    let mut members_by_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (path, a) in by_path.iter() {
+        if a.feature_source == feature_source::DIRECTORY && !a.feature_id.is_empty() {
+            members_by_id
+                .entry(a.feature_id.clone())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+
     // Worklist of candidate group ids to (re)examine. Seed with every distinct
-    // directory-spine feature id currently present (sorted for determinism).
-    let mut worklist: BTreeSet<String> = by_path
-        .values()
-        .filter(|a| a.feature_source == feature_source::DIRECTORY && !a.feature_id.is_empty())
-        .map(|a| a.feature_id.clone())
-        .collect();
+    // directory-spine feature id currently present (sorted for determinism). Drive
+    // it from the reverse index's keys — identical set to the old `by_path` scan.
+    let mut worklist: BTreeSet<String> = members_by_id.keys().cloned().collect();
 
     while let Some(group_id) = worklist.iter().next().cloned() {
         worklist.remove(&group_id);
         let depth = depth_of(&group_id);
 
-        // Members of this group that are directory-spine assignments (only those
-        // can descend). Collected as (path, deeper_segment_opt) over the sorted
-        // BTreeMap, so the decision is order-independent anyway.
-        let mut members: Vec<(String, Option<String>)> = Vec::new();
-        for (path, a) in by_path.iter() {
-            if a.feature_id == group_id && a.feature_source == feature_source::DIRECTORY {
-                let segs = spine_segments(path);
-                // The next segment BELOW the group's current depth, if any.
-                let deeper = segs.get(depth).cloned();
-                members.push((path.clone(), deeper));
-            }
-        }
+        // Members of this group, looked up in O(1)+|group| from the reverse index
+        // (no full `by_path` scan). The Vec is already in ascending path order.
+        let group_paths = match members_by_id.get(&group_id) {
+            Some(v) => v,
+            None => continue,
+        };
 
         // Only split when over the cap AND at least one file can descend.
-        if members.len() <= MAX_DISTRICT_BUILDINGS {
+        if group_paths.len() <= MAX_DISTRICT_BUILDINGS {
             continue;
         }
+        // Compute each member's deeper segment (the next segment BELOW the group's
+        // current depth, if any), preserving the sorted-path order of the index.
+        let members: Vec<(String, Option<String>)> = group_paths
+            .iter()
+            .map(|path| (path.clone(), spine_segments(path).get(depth).cloned()))
+            .collect();
         if !members.iter().any(|(_, d)| d.is_some()) {
             // Over the cap but NO deeper level anywhere: leave whole (the
             // breakdown log will show the big district honestly).
@@ -2482,8 +2507,10 @@ fn split_oversized_features(by_path: &mut BTreeMap<String, FeatureAssignment>) {
         // Re-key each file with a deeper segment to `"<group_id>/<segment>"`;
         // files with no deeper segment STAY in the parent id. Record the new
         // child ids so they can be re-examined (a child still over the cap with
-        // its own deeper level must split again).
+        // its own deeper level must split again). Maintain the reverse index in
+        // lockstep: a moved member leaves the parent's list and joins the child's.
         let mut new_children: BTreeSet<String> = BTreeSet::new();
+        let mut retained_parent: Vec<String> = Vec::new();
         for (path, deeper) in members {
             if let Some(seg) = deeper {
                 let child_id = format!("{group_id}/{seg}");
@@ -2495,12 +2522,20 @@ fn split_oversized_features(by_path: &mut BTreeMap<String, FeatureAssignment>) {
                     // spine: the split is re-derived from sizes each scan, so the
                     // witness must keep comparing the structural top-level spine.
                 }
+                // Append to the child's index list. Members are visited in ascending
+                // path order, so each child list is built in sorted order too.
+                members_by_id.entry(child_id.clone()).or_default().push(path);
                 new_children.insert(child_id);
+            } else {
+                // Stays in the parent id — keep it in the parent's index list.
+                retained_parent.push(path);
             }
         }
-        // The parent id may still be over the cap (the files that stayed), but it
-        // has no deeper level for those files by construction, so re-adding it
-        // would loop without progress — only the new children can split further.
+        // Replace the parent's index list with just the files that stayed (the
+        // moved ones are now under their child ids). The parent id may still be
+        // over the cap, but it has no deeper level for those files by construction,
+        // so re-adding it would loop without progress — only children can split.
+        members_by_id.insert(group_id, retained_parent);
         for c in new_children {
             worklist.insert(c);
         }
@@ -2525,16 +2560,31 @@ fn kind_for_feature_id(id: &str) -> FeatureKind {
 ///
 /// SPLIT-AWARE: an adaptive-split deep id is the full slug PATH
 /// (`"aspis-lab/rna-seq"`), kept globally unique so same-named children under
-/// different parents never collide. The LABEL, however, is the LAST path segment
-/// humanized (`"rna-seq"` -> `"Rna Seq"`) — the district reads as its own area,
-/// not the whole path. The full path stays the id (and the dossier can show it).
+/// different parents never collide. The LABEL DISAMBIGUATES with ONE parent level:
+/// a leaf alone is ambiguous in the sidebar (`"p1/core"` and `"p2/core"` would both
+/// read "Core"), so a slash-bearing id is labelled `"<Parent> / <Leaf>"` using only
+/// the IMMEDIATE parent segment (`"aspis-lab/rna-seq"` -> `"Aspis Lab / Rna Seq"`;
+/// `"a/b/c"` -> `"B / C"`). A flat id (no slash) stays the single humanized segment
+/// (`"rna-seq"` -> `"Rna Seq"`). The full path stays the id (and the dossier can
+/// show it). F2 (Oracle) may replace this with a richer human name.
 ///
 /// Always called with a NON-empty registry key: an empty dir-spine is mapped to
 /// `ROOT_FEATURE_ID` ("root") before it ever reaches the registry (see
 /// `assign_features`), so `""` never arrives here.
 pub(crate) fn feature_label_for_key(key: &str) -> String {
-    let last = key.rsplit('/').next().unwrap_or(key);
-    crate::polis::model::title_case_slug(last)
+    use crate::polis::model::title_case_slug;
+    // Take the last two NON-EMPTY segments (immediate parent + leaf). A flat key
+    // yields just the leaf; a deep key yields exactly one parent level for context.
+    let mut segs = key.rsplit('/').filter(|s| !s.is_empty());
+    let leaf = match segs.next() {
+        Some(l) => l,
+        // Degenerate (e.g. all slashes): fall back to humanizing the raw key.
+        None => return title_case_slug(key),
+    };
+    match segs.next() {
+        Some(parent) => format!("{} / {}", title_case_slug(parent), title_case_slug(leaf)),
+        None => title_case_slug(leaf),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3085,6 +3135,15 @@ fn road_cap_for(building_count: usize) -> usize {
 /// (semantic/infrastructure are documented future work), and the ranking signals
 /// (`weight`, endpoint degree) are universal, so any future road kind is ranked on
 /// the same footing rather than silently bypassing the budget.
+///
+/// KNOWN INTERACTION (deferred): the cap is NOT meta-graph-aware. At cap-firing
+/// scale (very large cities) the ranking keys above — weight DESC, endpoint-degree
+/// DESC — can preferentially DROP low-weight INTER-district edges (cross-cutting
+/// links between separate areas tend to be thin), starving A2's district-coupling
+/// graph of exactly the edges that express coupling. The fix is a two-pass quota:
+/// reserve the budget for inter-district edges FIRST, then fill the remainder with
+/// intra-district edges by the same ranking. It is DELIBERATELY DEFERRED here (the
+/// coupling graph degrades gracefully today; this only bites at extreme scale).
 fn cap_roads(roads: &mut Vec<Road>, building_count: usize) -> usize {
     let original = roads.len();
     let cap = road_cap_for(building_count);
@@ -5678,9 +5737,11 @@ mod tests {
         assert_eq!(feat_count(&r, "aspis-lab"), 0, "coarse parent fully drained");
         assert_eq!(feat_count(&r, "aspis-lab/rna-seq"), half);
         assert_eq!(feat_count(&r, "aspis-lab/scrna-seq"), half);
-        // Registry has the deep ids with last-segment labels, Domain kind.
+        // Registry has the deep ids with disambiguated "<Parent> / <Leaf>" labels
+        // (FIX 4c: one parent level so same-named children stay distinguishable),
+        // Domain kind.
         let reg: BTreeMap<&str, &Feature> = r.features.iter().map(|f| (f.id.as_str(), f)).collect();
-        assert_eq!(reg["aspis-lab/rna-seq"].label, "Rna Seq");
+        assert_eq!(reg["aspis-lab/rna-seq"].label, "Aspis Lab / Rna Seq");
         assert_eq!(reg["aspis-lab/rna-seq"].kind, FeatureKind::Domain);
         assert!(!reg.contains_key("aspis-lab"), "drained parent not in registry");
     }
@@ -5995,13 +6056,14 @@ mod tests {
             city.districts.iter().map(|d| d.district_id.as_str()).collect();
         assert!(district_ids.contains("aspis-lab/rna-seq"));
         assert!(district_ids.contains("aspis-lab/scrna-seq"));
-        // Deep district label is the LAST segment, humanized.
+        // Deep district label disambiguates with one parent level (FIX 4c):
+        // "<Parent> / <Leaf>" so it's distinct from any same-named child elsewhere.
         let rna = city
             .districts
             .iter()
             .find(|d| d.district_id == "aspis-lab/rna-seq")
             .unwrap();
-        assert_eq!(rna.name, "Rna Seq");
+        assert_eq!(rna.name, "Aspis Lab / Rna Seq");
 
         // Persisted: the deep id + the stamped layout version survive.
         let meta = MetaStore::load(&tree.root);
@@ -9709,6 +9771,26 @@ import { cdn } from 'https://cdn.example.com/x';
             out.by_path["src/auth/a.ts"].feature_source,
             FEATURE_SOURCE_ORACLE
         );
+    }
+
+    #[test]
+    fn feature_label_disambiguates_split_ids_with_one_parent_level() {
+        // FIX 4c: a flat id humanizes its single segment.
+        assert_eq!(feature_label_for_key("rna-seq"), "Rna Seq");
+        assert_eq!(feature_label_for_key("object-store"), "Object Store");
+        assert_eq!(feature_label_for_key(COMMONS_FEATURE_ID), "Commons");
+        // A split-derived id labels as "<Parent> / <Leaf>" using ONE parent level,
+        // so "p1/core" and "p2/core" stay distinguishable in the sidebar.
+        assert_eq!(feature_label_for_key("aspis-lab/rna-seq"), "Aspis Lab / Rna Seq");
+        assert_eq!(feature_label_for_key("p1/core"), "P1 / Core");
+        assert_eq!(feature_label_for_key("p2/core"), "P2 / Core");
+        assert_ne!(
+            feature_label_for_key("p1/core"),
+            feature_label_for_key("p2/core"),
+            "same leaf under different parents must read distinctly"
+        );
+        // Three-or-more levels still use exactly ONE parent: "a/b/c" -> "B / C".
+        assert_eq!(feature_label_for_key("a/b/c"), "B / C");
     }
 
     #[test]

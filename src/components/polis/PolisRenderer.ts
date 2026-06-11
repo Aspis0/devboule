@@ -2547,6 +2547,10 @@ export class PolisRenderer {
     // read `node.building` at fire time, so the new Building must be live before
     // anything else in this method can run (or a tap mid-update would still resolve
     // the stale snapshot). The remaining node fields are refreshed below.
+    // Keep the OLD snapshot so the atlas-miss catch can restore it: if we re-throw
+    // with the visuals still the OLD building, `node.building` must point at the OLD
+    // building too — otherwise the inspector would open with NEW data over OLD art.
+    const prev = node.building;
     node.building = b;
 
     const profile = getProfile(b.purpose);
@@ -2569,7 +2573,10 @@ export class PolisRenderer {
       // Atlas threw on a MISS: destroy our freshly-built parts (the atlas never
       // reached its own destroy) so they don't leak. The EXISTING node is left
       // untouched — its old dynamics/textures are still valid — and we re-throw so
-      // the caller's per-node handler logs+skips this diff entry.
+      // the caller's per-node handler logs+skips this diff entry. Restore the OLD
+      // building snapshot we re-pointed at the top: the visuals are still the OLD
+      // building, so node.building must match (else the inspector shows NEW data).
+      node.building = prev;
       this.disposeBuiltParts(built);
       throw err;
     }
@@ -2968,7 +2975,9 @@ export class PolisRenderer {
       .removeChildren()
       .forEach((c) => c.destroy({ children: true }));
     this.roadMinorLayer = null;
-    this.layers.shadows.removeChildren().forEach((c) => c.destroy());
+    this.layers.shadows
+      .removeChildren()
+      .forEach((c) => c.destroy({ children: true }));
     this.selectionRing.clear();
     this.selectionRing.visible = false;
     this.lastScale = -1;
