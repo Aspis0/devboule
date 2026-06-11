@@ -25,6 +25,11 @@ import type {
   ExternalService,
 } from "../../types/city";
 import { PolisRenderer, type BuildProgress } from "./PolisRenderer";
+import {
+  profileFor,
+  type RenderProfile,
+  type HardwareInfo,
+} from "./renderProfile";
 import type {
   CensorFindingsPayload,
   GemmaStatus,
@@ -84,17 +89,50 @@ function polisDebug(line: string): void {
   }
 }
 
+/**
+ * B2c — fetch the host hardware ONCE (the `detect_hardware` Tauri command) and
+ * derive the render profile, FAIL-SOFT: any error (no Tauri context, command
+ * missing, probe failure) degrades to `profileFor(null)` — the safe MIDDLE tier.
+ * The dynamic AppContext import mirrors the proven `invokeBackendCommand` path used
+ * elsewhere in Polis (a static import would pull React context into this PIXI
+ * bootstrap). Returns the chosen profile AND the raw hardware (the latter only for
+ * the renderer's one-line PROFILE debug log).
+ */
+async function detectRenderProfile(): Promise<{
+  profile: RenderProfile;
+  hardware: HardwareInfo | null;
+}> {
+  try {
+    const { invokeBackendCommand } = await import("../../context/AppContext");
+    const hw = await invokeBackendCommand<HardwareInfo>("detect_hardware");
+    return { profile: profileFor(hw), hardware: hw };
+  } catch {
+    // No Tauri / probe failed → safe default (middle tier).
+    return { profile: profileFor(null), hardware: null };
+  }
+}
+
 export async function createPolis(
   host: HTMLElement,
   opts: CreatePolisOptions = {},
 ): Promise<PolisHandle> {
+  // B2c — pick the hardware-adaptive render profile BEFORE app.init so its
+  // `antialias` flag can be applied to the WebGL context. Fail-soft to the middle
+  // tier; never blocks the mount on a hardware-probe error.
+  const { profile, hardware } = await detectRenderProfile();
+  polisDebug(
+    `createPolis: render profile tier=${profile.tier} ` +
+      `gpu=${hardware?.gpuName ?? "unknown"} kind=${hardware?.gpuKind ?? "unknown"}`,
+  );
+
   const app = new Application();
   polisDebug(
     `createPolis: app.init start (host ${host.clientWidth}x${host.clientHeight}, dpr=${window.devicePixelRatio})`,
   );
   await app.init({
     background: opts.background ?? 0xf4f0e6,
-    antialias: true,
+    // B2c — antialias is profile-gated: off on lean/minimal tiers to save fill-rate.
+    antialias: profile.antialias,
     resolution: window.devicePixelRatio || 1,
     autoDensity: true,
     resizeTo: host,
@@ -133,13 +171,20 @@ export async function createPolis(
   // The viewport itself is the root container the renderer attaches layers to.
   app.stage.addChild(viewport as unknown as Container);
 
-  const renderer = new PolisRenderer(app, viewport, {
-    onSelectBuilding: opts.onSelectBuilding,
-    onHoverBuilding: opts.onHoverBuilding,
-    onSelectAgent: opts.onSelectAgent,
-    onSelectConnection: opts.onSelectConnection,
-    onSelectExternalService: opts.onSelectExternalService,
-  });
+  const renderer = new PolisRenderer(
+    app,
+    viewport,
+    {
+      onSelectBuilding: opts.onSelectBuilding,
+      onHoverBuilding: opts.onHoverBuilding,
+      onSelectAgent: opts.onSelectAgent,
+      onSelectConnection: opts.onSelectConnection,
+      onSelectExternalService: opts.onSelectExternalService,
+    },
+    // B2c — thread the chosen profile (+ raw hardware for the PROFILE debug line).
+    profile,
+    hardware,
+  );
 
   // Drive per-frame agent animation.
   const animTick = (ticker: { deltaMS: number }) => renderer.update(ticker.deltaMS);

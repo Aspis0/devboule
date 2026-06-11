@@ -129,11 +129,28 @@ interface Walker {
 type Resolve = (fileId: string) => IsoPoint | null;
 type FindRoute = (fromFileId: string, toFileId: string) => IsoPoint[] | null;
 
-/** Desired ambient crowd size for a city with `nodeCount` road-connected nodes. */
-export function desiredAmbientCount(nodeCount: number): number {
+/**
+ * Desired ambient crowd size for a city with `nodeCount` road-connected nodes.
+ *
+ * B2c: an optional `maxWalkers` (the hardware render profile's cap) LOWERS the
+ * ceiling below the default {@link MAX_AMBIENT} on a weaker tier — the effective
+ * cap is `min(MAX_AMBIENT, maxWalkers)`. The MIN floor is also clamped to that cap
+ * so a minimal tier asking for (say) 6 is never overridden back up to the default
+ * floor. Omitted/non-finite → the historical {@link MAX_AMBIENT} ceiling.
+ */
+export function desiredAmbientCount(
+  nodeCount: number,
+  maxWalkers?: number,
+): number {
   if (nodeCount <= 0) return 0;
+  const cap =
+    typeof maxWalkers === "number" && Number.isFinite(maxWalkers)
+      ? Math.max(0, Math.min(MAX_AMBIENT, Math.floor(maxWalkers)))
+      : MAX_AMBIENT;
   const scaled = Math.floor(nodeCount * AMBIENT_PER_NODE);
-  return Math.max(MIN_AMBIENT, Math.min(MAX_AMBIENT, scaled));
+  // Floor never exceeds the cap (a tight cap wins over MIN_AMBIENT).
+  const floor = Math.min(MIN_AMBIENT, cap);
+  return Math.max(floor, Math.min(cap, scaled));
 }
 
 /** The minimal walker shape {@link pickNearestIdle} needs — a structural subset

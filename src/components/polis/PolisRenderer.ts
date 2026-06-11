@@ -88,23 +88,29 @@ import { buildingChanged, worstSinSeverity } from "./diffCity";
 import { StepClock } from "./effects";
 import { GrowthFx, Scaffold, Disaster, Investigation } from "./growthEffects";
 import { sliceBatches, DEFAULT_BUILD_BATCH } from "./chunk";
+import {
+  orderBuildQueue,
+  priorityFromKeys,
+  expandChunkRing,
+  type BuildQueueItem,
+} from "./buildQueue";
+import { profileFor, type RenderProfile, type HardwareInfo } from "./renderProfile";
 
 const CHUNK_SIZE = 8; // tiles per chunk side
 
-// LOD zoom thresholds.
-const LOD_LABELS = 0.6;
-// HYSTERESIS for the label LOD (the only band that ALLOCATES on each crossing — a
-// Text per building, ~879 on a large city). A single threshold makes zoom that
-// oscillates around 0.6 thrash: create-all / destroy-all every frame the scale
-// wobbles across the line. A dead-band fixes that: labels are CREATED only at/above
-// LOD_LABELS_IN and DESTROYED only below LOD_LABELS_OUT; between the two the current
-// label state is held (no alloc, no free). LOD_LABELS stays the seed threshold used
-// when a node is first built (attachBuildingDynamics) — the IN/OUT pair gates only
-// the live zoom transitions in updateCulling.
-const LOD_LABELS_IN = 0.62; // create labels at/above this zoom
-const LOD_LABELS_OUT = 0.58; // destroy labels below this zoom
-const LOD_DETAILS = 0.4;
-const LOD_AGENTS = 0.35;
+// LOD zoom thresholds for LABELS / DETAILS / AGENTS are now HARDWARE-ADAPTIVE
+// (Phase B2c): the renderer holds per-instance fields (`lodLabelsIn`,
+// `lodLabelsOut`, `lodDetails`, `lodAgents`) seeded from the chosen RenderProfile,
+// and the LOD pass + the build prioritization read THOSE. The canonical RICH-tier
+// values (the historical 0.62/0.58/0.4/0.35 — and the safe `null`-profile default)
+// live in `renderProfile.ts` (the `RICH`/`LEAN` tiers). The HYSTERESIS rationale
+// for the label IN/OUT dead-band (the only band that ALLOCATES a Text per building
+// on each crossing — ~879 on a large city — so a single threshold thrashes
+// create-all/destroy-all when zoom wobbles across the line) still governs the
+// `lodLabelsIn`/`lodLabelsOut` pair in `updateCulling`.
+//
+// The DISASTER / EXTERNAL / LIVERY / ROAD-MINOR bands below are NOT profile-gated
+// (they gate cheap, allocation-free toggles), so they remain fixed module constants.
 // On-map DISASTER overlay (burning buildings with urban sins). Disasters MATTER,
 // so they read a touch sooner than fine facade detail — but they are still hidden
 // in the far overview (same band as agents/outposts) so a zoomed-out city isn't a
@@ -205,11 +211,23 @@ export interface PolisRendererCallbacks {
 
 /** Progress of the chunked city build. `done`/`total` are building counts;
  *  `phase` is "building" while batches are still being added and "done" once the
- *  whole scene (buildings + agents + camera) is in place. */
+ *  whole scene (buildings + agents + camera) is in place.
+ *
+ *  B2b (ADDITIVE): `visibleDone`/`visibleTotal` track the VIEWPORT-PRIORITY subset
+ *  — the buildings in the viewport + preload-ring chunks that build FIRST. When
+ *  `visibleTotal > 0` and `visibleDone >= visibleTotal`, the city the camera can
+ *  see is placed and the map is effectively interactive even though the background
+ *  fill of distant chunks continues. Optional so existing consumers that read only
+ *  `done`/`total`/`phase` are unaffected. */
 export interface BuildProgress {
   done: number;
   total: number;
   phase: "building" | "done";
+  /** Count of priority (viewport+ring) buildings placed so far. */
+  visibleDone?: number;
+  /** Total priority (viewport+ring) buildings for this build. 0 when the build was
+   *  not viewport-prioritized (empty viewport / headless). */
+  visibleTotal?: number;
 }
 
 interface BuildingNode {
@@ -415,9 +433,11 @@ export class PolisRenderer {
   // destroyed, killing the ~1MB/building retained-Graphics heap. The cache warms
   // naturally as the build loop places the first building of each variant. Owned
   // by the renderer; released in destroy(). dpr-aware, capped resolution.
-  private buildingAtlas = new BuildingTextureAtlas(
-    typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1,
-  );
+  // B2c — the atlas resolution is the device pixel ratio CAPPED by the profile's
+  // `atlasResolutionCap` (min(dpr, cap)). A lean/minimal tier caps at 1 (no HiDPI
+  // super-sampling) to bound texture memory. Assigned in the constructor (after the
+  // profile is chosen) — see below.
+  private buildingAtlas!: BuildingTextureAtlas;
   private chunks = new Map<string, Chunk>();
   // Polis terrain frame (sea/rivers/shores/bridges) chunks. Parented into the
   // terrain layer (BELOW buildings, correct water-under-buildings draw order),
@@ -439,6 +459,21 @@ export class PolisRenderer {
   private cullTick: (() => void) | null = null;
   private lastScale = -1;
 
+  // B2c — HARDWARE-ADAPTIVE render profile. Chosen ONCE (constructor) from the
+  // detected hardware; defaults to the safe MIDDLE tier when no profile is passed
+  // (a null-hw renderer). The LOD bands below are SEEDED from it (and from the rich
+  // module constants when absent), so the LOD pass + the build prioritization read
+  // per-instance values that scale to the host. Never reassigned after construction
+  // (a hardware change would require a remount).
+  private profile: RenderProfile;
+  // LOD zoom thresholds for THIS renderer instance (seeded from `profile`, falling
+  // back to the rich-tier module constants). Replace the constants at every live
+  // LOD decision so a lean/minimal box reveals labels/detail/agents later.
+  private lodLabelsIn: number;
+  private lodLabelsOut: number;
+  private lodDetails: number;
+  private lodAgents: number;
+
   // CHUNKED BUILD state. The heavy work in setCityState is constructing one
   // procedural kit per building; for a large city that single synchronous loop
   // froze the UI thread for minutes. We now build buildings in batches across
@@ -454,6 +489,36 @@ export class PolisRenderer {
   // progress — otherwise a multi-second fallback rebuild shows no "Generating…"
   // overlay. Cleared on destroy.
   private lastOnProgress: ((p: BuildProgress) => void) | undefined = undefined;
+
+  // B2b — ON-DEMAND (viewport-prioritized) BUILD state. The chunked build no longer
+  // places buildings in pure depth order: the chunks the viewport (+ a profile
+  // preload ring) can see build FIRST (depth-sorted within), the rest fill in by
+  // distance. `buildState` holds the in-flight ordering so a camera move DURING the
+  // background fill can re-sort the REMAINING (unplaced) tail without restarting the
+  // build or touching placed chunks. Null when no build is in flight.
+  //   - `sorted`: the depth-sorted buildings (source array; `order` indexes into it).
+  //   - `chunkXY`: per-source-index chunk grid coords (parallel to `sorted`).
+  //   - `order`: build order = indices into `sorted`. The tail `[cursor, total)` is
+  //              the not-yet-placed remainder a reprioritization re-sorts.
+  //   - `cursor`: how many of `order` have been placed (the head is immutable).
+  //   - `preloadRing`: the profile's ring, captured for reprioritization.
+  private buildState: {
+    sorted: Building[];
+    chunkXY: { cx: number; cy: number }[];
+    order: number[];
+    cursor: number;
+    preloadRing: number;
+    // FIX 2 — the size of the CURRENT priority (visible) set: the count of items
+    // at the HEAD of `order` that are in the priority chunks. Stored here (not a
+    // build-local) because reprioritizeRemaining() re-sorts the tail toward a NEW
+    // viewport and so the head's visible count CHANGES; progress callbacks read
+    // this so visibleDone/visibleTotal always describe the CURRENT visible set.
+    visibleTotal: number;
+  } | null = null;
+  // B2b — debounced camera-move reprioritization handle (a setTimeout id). A pan/
+  // zoom burst during the background fill coalesces to ONE re-sort of the remaining
+  // queue. Null when none is pending. Cleared on cancel/destroy.
+  private reprioritizeTimer: ReturnType<typeof setTimeout> | null = null;
 
   // MUTATION STATE MACHINE (BLOCKER C). The scene's building/road/agent
   // structures may be mutated by exactly ONE of two paths at a time:
@@ -511,10 +576,37 @@ export class PolisRenderer {
     app: Application,
     viewport: Viewport,
     callbacks: PolisRendererCallbacks = {},
+    profile?: RenderProfile,
+    hardware?: HardwareInfo | null,
   ) {
     this.app = app;
     this.viewport = viewport;
     this.callbacks = callbacks;
+
+    // B2c — adopt the chosen render profile (or the safe MIDDLE default when none
+    // is supplied: `profileFor(null)` returns the lean tier). Seed the per-instance
+    // LOD bands from it so the LOD pass + build prioritization scale to the host.
+    this.profile = profile ?? profileFor(null);
+    this.lodLabelsIn = this.profile.lodLabelsIn;
+    this.lodLabelsOut = this.profile.lodLabelsOut;
+    this.lodDetails = this.profile.lodDetails;
+    this.lodAgents = this.profile.lodAgents;
+    // Building atlas: device pixel ratio capped by the profile (min(dpr, cap)). A
+    // lean/minimal tier caps at 1 — no HiDPI super-sampling, bounded texture heap.
+    const dpr =
+      typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    this.buildingAtlas = new BuildingTextureAtlas(
+      Math.min(dpr, this.profile.atlasResolutionCap),
+    );
+    // Record the chosen profile ONCE so live verification can read the tier from
+    // the Phase-0 debug log (`PROFILE gpu=<name> kind=<kind> tier=<…>`).
+    this.debugLog(
+      `PROFILE gpu=${hardware?.gpuName ?? "unknown"} kind=${hardware?.gpuKind ?? "unknown"}` +
+        ` tier=${this.profile.tier} labelsIn=${this.lodLabelsIn}` +
+        ` details=${this.lodDetails} agents=${this.lodAgents}` +
+        ` preloadRing=${this.profile.preloadRing} atlasCap=${this.profile.atlasResolutionCap}` +
+        ` aa=${this.profile.antialias} maxWalkers=${this.profile.maxAmbientWalkers}`,
+    );
 
     // Attach layers to the viewport in z-order.
     for (const layer of Object.values(this.layers)) {
@@ -614,6 +706,12 @@ export class PolisRenderer {
     // pinch/animate). Subscribing to both covers every camera change.
     this.onViewportChanged = () => {
       this.cullDirty = true;
+      // B2b — if a chunked build is still filling in the background, a camera move
+      // RE-PRIORITIZES the not-yet-placed remainder so the chunks the user just
+      // panned/zoomed to build next. Debounced (a pan/zoom burst coalesces to one
+      // re-sort); never restarts the build or re-places built chunks. Cheap no-op
+      // when no build is in flight (`buildState` null).
+      if (this.buildState) this.scheduleReprioritize();
     };
     this.viewport.on("moved", this.onViewportChanged);
     this.viewport.on("zoomed", this.onViewportChanged);
@@ -673,6 +771,19 @@ export class PolisRenderer {
     // FIX 6: remember the latest progress callback so a later applyCityDiff
     // FALLBACK rebuild can reuse it (it calls setCityState with no callback).
     this.lastOnProgress = onProgress;
+    // B2b CAMERA-YANK GUARD: capture the first-ever-build witness BEFORE the
+    // teardown below. `lastCity` is the only robust witness: it is set ONLY in
+    // finalize() (a completed build) and is nulled by clearScene() — so it is
+    // null on the very first build AND would *also* read null AFTER the
+    // clearScene() on line below, which is exactly why we must read it HERE,
+    // before cancelBuild()/clearScene() run. `buildingNodes.size` is NOT a valid
+    // witness: clearScene() empties it too, so it is 0 on a fallback rebuild as
+    // well as a first build. When this is a FALLBACK rebuild (a live watcher diff
+    // that hit the in-flight-build / no-baseline path and re-entered here),
+    // `lastCity` is non-null from the prior completed build, so we SKIP the
+    // synchronous camera pre-fit and keep the user's current pan/zoom. The
+    // priority chunks then derive from the CURRENT (user) viewport — correct.
+    const isFirstBuild = this.lastCity === null;
     // Cancel any in-flight chunked build and start a fresh one (latest wins).
     this.cancelBuild();
     this.clearScene();
@@ -705,7 +816,8 @@ export class PolisRenderer {
     this.lastTerrainSig = PolisRenderer.terrainSignature(city.terrain);
 
     // z-sort buildings by depth ONCE so nearer buildings draw on top of farther
-    // ones; the batched loop then adds them in this stable order.
+    // ones; the batched loop then adds them in this stable (depth) order — within
+    // each priority bucket the B2b ordering below preserves exactly this order.
     const sorted = [...city.buildings].sort(
       (a, b) =>
         depthKey(a.coords.x, a.coords.y) - depthKey(b.coords.x, b.coords.y),
@@ -715,7 +827,56 @@ export class PolisRenderer {
     // Capture this build's token; if it changes mid-flight (a newer build or
     // destroy) the loop self-cancels without touching the newer scene.
     const token = ++this.buildToken;
+
+    // B2b — VIEWPORT-PRIORITIZED BUILD ORDER. On the FIRST-EVER build, pre-fit the
+    // camera to the city's extent FIRST so the priority region reflects the FINAL
+    // framing (the camera is still at its mount default — without this pre-fit the
+    // "visible" chunks would be whatever the default camera happened to show, not
+    // the city the user is about to see). On a FALLBACK rebuild (a live diff that
+    // re-entered setCityState) we must NOT pre-fit: that would YANK the user's
+    // current pan/zoom mid-session. We keep the user's camera and let the priority
+    // chunks derive from the CURRENT viewport — exactly the right region to build
+    // first. Then order the depth-sorted buildings so the viewport + preload-ring
+    // chunks build first (depth-stable within), the rest by distance. Time-to-
+    // visible now scales with the VIEWPORT, not the whole city.
+    if (isFirstBuild) this.fitCameraToBuildings(sorted);
+    const ring = this.profile.preloadRing;
+    // Per-source-index chunk grid coords (parallel to `sorted`) + the candidate
+    // chunk-key set the buildings occupy (input to the pure priority computation;
+    // `this.chunks` is empty pre-build, so we derive candidates from the buildings).
+    const chunkXY = sorted.map((b) => ({
+      cx: Math.floor(b.coords.x / CHUNK_SIZE),
+      cy: Math.floor(b.coords.y / CHUNK_SIZE),
+    }));
+    const candidateKeys = new Set(chunkXY.map((c) => `${c.cx},${c.cy}`));
+    const { keys: priorityKeys, center } = this.viewportPriorityChunks(
+      candidateKeys,
+      ring,
+    );
+    const isPriority = priorityFromKeys(priorityKeys);
+    const order = orderBuildQueue(chunkXY as BuildQueueItem[], isPriority, center);
+    // The viewport-priority subset count: every priority item is the HEAD of
+    // `order`, so `visibleDone = min(cursor, visibleTotal)` tracks the visible city.
+    let visibleTotal = 0;
+    for (const c of chunkXY) if (isPriority(c.cx, c.cy)) visibleTotal++;
+
+    // Stash the in-flight ordering so a camera move mid-fill can reprioritize the
+    // not-yet-placed tail (see scheduleReprioritize). cursor starts at 0. FIX 2 —
+    // `visibleTotal` lives in buildState so a reprioritization can recompute it.
+    this.buildState = {
+      sorted,
+      chunkXY,
+      order,
+      cursor: 0,
+      preloadRing: ring,
+      visibleTotal,
+    };
+
     const batches = sliceBatches(total, DEFAULT_BUILD_BATCH);
+    this.debugLog(
+      `BUILD ORDER total=${total} visible=${visibleTotal} ring=${ring} ` +
+        `priorityChunks=${priorityKeys.size}`,
+    );
 
     // Finalize once all building batches are placed: agents reference buildings
     // by fileId (resolved to iso here), the ambient crowd follows the road
@@ -750,10 +911,28 @@ export class PolisRenderer {
         // Force a cull/LOD pass on the next tick for the freshly built scene.
         this.cullDirty = true;
         this.lastCity = city;
-        onProgress?.({ done: total, total, phase: "done" });
+        // FIX 2 — report the CURRENT visible total (a mid-build reprioritization
+        // may have changed it); fall back to the initial value if buildState was
+        // already cleared. At "done" the whole build is placed, so visibleDone
+        // equals the full visible set.
+        const vTotal = this.buildState?.visibleTotal ?? visibleTotal;
+        onProgress?.({
+          done: total,
+          total,
+          phase: "done",
+          visibleDone: vTotal,
+          visibleTotal: vTotal,
+        });
         this.debugLog(`BUILD DONE placed=${this.buildingNodes.size}/${total}`);
       } finally {
         this.buildRaf = null;
+        // B2b — the build is over; drop the in-flight ordering + any pending
+        // reprioritization so a stray timer can't re-sort a settled scene.
+        this.buildState = null;
+        if (this.reprioritizeTimer !== null) {
+          clearTimeout(this.reprioritizeTimer);
+          this.reprioritizeTimer = null;
+        }
         // Build complete: the scene is fully placed and settled — back to idle so
         // a subsequent live diff can mutate in place (not fall back to a rebuild).
         this.mutationState = "idle";
@@ -776,17 +955,24 @@ export class PolisRenderer {
       // Bow out if a newer build started or the renderer was destroyed; the new
       // build's clearScene() owns teardown of this build's partial scene.
       if (this.destroyed || token !== this.buildToken) return;
+      const state = this.buildState;
+      if (!state) return; // defensive: cancelled out from under us
       const { start, end } = batches[i];
-      for (let j = start; j < end; j++) {
+      // B2b — place buildings in the PRIORITIZED `order` (indices into `sorted`),
+      // not in raw depth order. A mid-build reprioritization re-sorts the tail
+      // `[cursor, total)` of `order` in place, so we always read the LATEST order;
+      // `cursor` is advanced past every placed index so a re-sort never re-places.
+      for (let k = start; k < end; k++) {
+        const srcIdx = state.order[k];
+        const b = state.sorted[srcIdx];
         // ROBUSTNESS: a single malformed building (e.g. an unusual file ingested
         // from a non-source dir) must NEVER kill the whole chunked build. Without
         // this guard a throw here escaped the rAF callback, the loop died, finalize()
         // never ran, and the ENTIRE map rendered grey (0 buildings placed) while the
         // React/DOM chrome kept working. Skip + log the offending node and carry on.
         try {
-          this.createBuildingNode(sorted[j]);
+          this.createBuildingNode(b);
         } catch (err) {
-          const b = sorted[j];
           console.error(
             `[polis] createBuildingNode failed for fileId=${b?.fileId ?? "?"} ` +
               `purpose=${b?.purpose ?? "?"} — skipped:`,
@@ -797,11 +983,37 @@ export class PolisRenderer {
               `purpose=${b?.purpose ?? "?"} err=${String((err as Error)?.message ?? err)}`,
           );
         }
+        // Advance the cursor as each index is placed so the immutable HEAD of
+        // `order` (already built) is never re-sorted by a reprioritization. FIX 5 —
+        // the cursor advances even when createBuildingNode threw and was caught
+        // above, so `cursor` (and thus visibleDone) counts ATTEMPTED, not strictly
+        // PLACED, buildings. This is accepted: progress = "attempted", and PolisView
+        // ignores visibleDone/visibleTotal (they drive only the debugLog + an
+        // optional overlay hint). Counting attempts keeps the cursor monotonic and
+        // guarantees a skipped node can never wedge progress short of total.
+        state.cursor = k + 1;
       }
       i += 1;
-      this.debugLog(`batch ${i}/${batches.length} placed=${this.buildingNodes.size}`);
+      // FIX 2 — read the CURRENT visible total from buildState (a mid-build
+      // reprioritization re-sorts the tail toward a NEW viewport and recomputes
+      // state.visibleTotal, so the build-local seed is stale after that). Priority
+      // items are the HEAD of `order`, so the count placed so far is
+      // min(cursor, visibleTotal): "the visible city" completes once cursor reaches
+      // visibleTotal, BEFORE the whole build (cursor reaches total).
+      const stateVisibleTotal = state.visibleTotal;
+      const visibleDone = Math.min(state.cursor, stateVisibleTotal);
+      this.debugLog(
+        `batch ${i}/${batches.length} placed=${this.buildingNodes.size} ` +
+          `visible=${visibleDone}/${stateVisibleTotal}`,
+      );
       if (i < batches.length) {
-        onProgress?.({ done: batches[i - 1].end, total, phase: "building" });
+        onProgress?.({
+          done: batches[i - 1].end,
+          total,
+          phase: "building",
+          visibleDone,
+          visibleTotal: stateVisibleTotal,
+        });
         this.buildRaf = requestAnimationFrame(runBatch);
       } else {
         finalize();
@@ -820,6 +1032,13 @@ export class PolisRenderer {
     if (this.buildRaf !== null) {
       cancelAnimationFrame(this.buildRaf);
       this.buildRaf = null;
+    }
+    // B2b — drop the in-flight build ordering + any pending reprioritization so a
+    // queued re-sort can't touch the next build's (or a torn-down) state.
+    this.buildState = null;
+    if (this.reprioritizeTimer !== null) {
+      clearTimeout(this.reprioritizeTimer);
+      this.reprioritizeTimer = null;
     }
     // No build is in flight anymore. The caller either kicks off a fresh build
     // (which sets "building" again) or tears the scene down (destroy) — either
@@ -1344,7 +1563,11 @@ export class PolisRenderer {
       nodeWeights,
       forumNodeIds,
     );
-    this.ambientLayer.setCount(desiredAmbientCount(nodeIds.length));
+    // B2c — cap the decorative crowd by the hardware profile (a lean/minimal tier
+    // renders fewer walkers). The city-size derivation still applies under the cap.
+    this.ambientLayer.setCount(
+      desiredAmbientCount(nodeIds.length, this.profile.maxAmbientWalkers),
+    );
   }
 
   /** Center + fit the viewport on the current content. */
@@ -1364,6 +1587,44 @@ export class PolisRenderer {
       maxX = Math.max(maxX, node.iso.x);
       maxY = Math.max(maxY, node.iso.y);
     }
+    this.fitCameraToIsoBounds(minX, minY, maxX, maxY);
+  }
+
+  /**
+   * B2b — pre-fit the camera to a building set's ISO extent BEFORE the chunked
+   * build runs, so the viewport already sits at its final framing and the build
+   * prioritization can compute the truly-visible chunks. Computes the iso anchor of
+   * each building directly from its grid coords (the SAME `cartToIso(coords)` the
+   * node uses) — `buildingNodes` is empty pre-build. No-op for an empty set (the
+   * empty-city path keeps the default camera). The final `recenter()` in finalize
+   * re-fits from the placed nodes for exactness; this match means the pre-fit and
+   * the final fit agree, so the camera does not jump when the build completes.
+   */
+  private fitCameraToBuildings(buildings: readonly Building[]): void {
+    if (buildings.length === 0) return;
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+    for (const b of buildings) {
+      const iso = cartToIso(b.coords.x, b.coords.y);
+      minX = Math.min(minX, iso.x);
+      minY = Math.min(minY, iso.y);
+      maxX = Math.max(maxX, iso.x);
+      maxY = Math.max(maxY, iso.y);
+    }
+    this.fitCameraToIsoBounds(minX, minY, maxX, maxY);
+  }
+
+  /** Shared camera fit from an ISO-space bounding box (used by both `recenter` and
+   *  the B2b pre-fit). Same framing policy: 120px margin, zoom clamped to [0.85,
+   *  1.6] for a legible first impression. */
+  private fitCameraToIsoBounds(
+    minX: number,
+    minY: number,
+    maxX: number,
+    maxY: number,
+  ): void {
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
     // Tighter framing margin (was 240) so the fit doesn't pad the town into a
@@ -1376,6 +1637,147 @@ export class PolisRenderer {
     const fit = Math.min(this.viewport.findFit(w, h), 1.6);
     this.viewport.setZoom(Math.max(0.85, fit), true);
     this.viewport.moveCenter(cx, cy);
+  }
+
+  /**
+   * B2b — the priority (first-pass) chunk KEYS + the center chunk for the CURRENT
+   * viewport, over a CANDIDATE set of chunk keys. PURE w.r.t. the scene: it does
+   * NOT read `this.chunks` (which is EMPTY at the start of a build, before any
+   * building is placed) — instead the caller passes every chunk key the build's
+   * buildings occupy, and we test each candidate chunk's iso bounds (via the pure
+   * `computeChunkBounds`) against the visible world rectangle. So the same helper
+   * works both for the INITIAL ordering (pre-build) and a mid-build
+   * reprioritization. The base intersecting set is expanded by `ring` chunks (the
+   * profile preload ring). The center chunk (distance origin for the remainder) is
+   * whichever candidate chunk's bounds contain the viewport-center world point,
+   * falling back to the chunk nearest that point.
+   */
+  private viewportPriorityChunks(
+    candidateKeys: Iterable<string>,
+    ring: number,
+  ): { keys: Set<string>; center: { cx: number; cy: number } } {
+    const left = this.viewport.left;
+    const top = this.viewport.top;
+    const w = Math.max(0, this.viewport.worldScreenWidth);
+    const h = Math.max(0, this.viewport.worldScreenHeight);
+    const viewRect = new Rectangle(left, top, w, h);
+    const ccx = left + w / 2;
+    const ccy = top + h / 2;
+
+    const base = new Set<string>();
+    // FIX 3 — track the two center candidates INDEPENDENTLY so the nearest-fallback
+    // is robust: `nearestCenter` is the true nearest across ALL candidate chunks
+    // (tracked UNCONDITIONALLY — the old code stopped nearest tracking after the
+    // first containing chunk was found, so the distance-sort center could land on a
+    // far chunk with big padded bounds); `containCenter` is the FIRST chunk whose
+    // bounds contain the view center. The containing chunk wins when one exists,
+    // otherwise the true nearest does.
+    let nearestCenter: { cx: number; cy: number } = { cx: 0, cy: 0 };
+    let containCenter: { cx: number; cy: number } | null = null;
+    let nearestDist = Infinity;
+
+    for (const key of candidateKeys) {
+      const bounds = this.computeChunkBounds(key);
+      if (viewRect.intersects(bounds)) base.add(key);
+      const comma = key.indexOf(",");
+      const cx = Number(key.slice(0, comma));
+      const cy = Number(key.slice(comma + 1));
+      // Nearest tracking is UNCONDITIONAL — every candidate updates it, so the
+      // fallback is the genuine nearest chunk-center, not whatever happened to be
+      // seen before the first containing chunk.
+      const bcx = bounds.x + bounds.width / 2;
+      const bcy = bounds.y + bounds.height / 2;
+      const d = (bcx - ccx) ** 2 + (bcy - ccy) ** 2;
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearestCenter = { cx, cy };
+      }
+      // The FIRST chunk whose bounds contain the view center wins the contains race
+      // (a robust fallback when the center falls in a gap, e.g. over water, uses
+      // nearestCenter instead).
+      if (containCenter === null && bounds.contains(ccx, ccy)) {
+        containCenter = { cx, cy };
+      }
+    }
+
+    return {
+      keys: expandChunkRing(base, ring),
+      center: containCenter ?? nearestCenter,
+    };
+  }
+
+  /** B2b — debounce window (ms) for a camera-move reprioritization during the
+   *  background fill. A pan/zoom burst coalesces to ONE re-sort of the remaining
+   *  queue, so we never re-order on every intermediate `moved` event. */
+  private static readonly REPRIORITIZE_DEBOUNCE_MS = 80;
+
+  /** B2b — schedule (debounced) a reprioritization of the in-flight build's
+   *  remaining queue against the CURRENT viewport. Coalesces a burst of camera
+   *  events into one re-sort. Safe to call when no build is in flight (it still
+   *  arms a timer that no-ops on fire because `buildState` is null by then). */
+  private scheduleReprioritize(): void {
+    if (this.reprioritizeTimer !== null) clearTimeout(this.reprioritizeTimer);
+    this.reprioritizeTimer = setTimeout(() => {
+      this.reprioritizeTimer = null;
+      this.reprioritizeRemaining();
+    }, PolisRenderer.REPRIORITIZE_DEBOUNCE_MS);
+  }
+
+  /**
+   * B2b — re-sort the NOT-YET-PLACED tail of the in-flight build order against the
+   * current viewport, so a pan/zoom mid-fill makes the newly-visible chunks build
+   * next. PRESERVES the immutable head `[0, cursor)` (already-placed buildings are
+   * never re-placed); only the remainder `[cursor, total)` is re-ordered, by the
+   * SAME pure `orderBuildQueue` over the tail's chunk coords. No PIXI mutation, no
+   * rebuild — just an array re-sort the next batch reads. No-op when no build is in
+   * flight or the tail is empty.
+   */
+  private reprioritizeRemaining(): void {
+    const state = this.buildState;
+    if (!state) return;
+    const { order, cursor, chunkXY, preloadRing } = state;
+    if (cursor >= order.length) return; // nothing left to reorder
+
+    // The tail's source indices (the buildings still to place).
+    const tail = order.slice(cursor);
+    // Candidate chunk keys = the chunks the REMAINING buildings occupy (the placed
+    // head is irrelevant to where we go next).
+    const candidateKeys = new Set(
+      tail.map((idx) => `${chunkXY[idx].cx},${chunkXY[idx].cy}`),
+    );
+    const { keys: priorityKeys, center } = this.viewportPriorityChunks(
+      candidateKeys,
+      preloadRing,
+    );
+    const isPriority = priorityFromKeys(priorityKeys);
+    // Order the tail's chunk coords (keep tail's own ordering stable within a
+    // bucket so depth order is preserved), then map the LOCAL ordering back to the
+    // tail's source indices and splice them in after the immutable head.
+    const localOrder = orderBuildQueue(
+      tail.map((idx) => chunkXY[idx]) as BuildQueueItem[],
+      isPriority,
+      center,
+    );
+    for (let k = 0; k < localOrder.length; k++) {
+      order[cursor + k] = tail[localOrder[k]];
+    }
+    // FIX 2 — the head is now a DIFFERENT priority set (the new viewport's), so
+    // the old visibleTotal lies. Recompute: the already-placed head [0, cursor)
+    // stays (visibleDone is clamped to cursor anyway), plus the count of tail
+    // items that fall in the NEW priority chunks — those are exactly the items
+    // orderBuildQueue floated to the head of the re-sorted tail. Progress
+    // callbacks read state.visibleTotal, so they now report the CURRENT visible
+    // set instead of the stale initial one.
+    let tailVisible = 0;
+    for (const idx of tail) {
+      const c = chunkXY[idx];
+      if (isPriority(c.cx, c.cy)) tailVisible++;
+    }
+    state.visibleTotal = cursor + tailVisible;
+    this.debugLog(
+      `REPRIORITIZE cursor=${cursor}/${order.length} ` +
+        `priorityChunks=${priorityKeys.size} visibleTotal=${state.visibleTotal}`,
+    );
   }
 
   setSelected(fileId: string | null): void {
@@ -2081,10 +2483,12 @@ export class PolisRenderer {
       anims.push(investigation);
     }
 
-    // Filename label LAST (topmost). LAZY: below LOD_LABELS no Text is created, so
-    // a far view of a huge city retains zero label glyphs (LOD pass attaches it).
+    // Filename label LAST (topmost). LAZY: below the profile's label-IN threshold no
+    // Text is created, so a far view of a huge city retains zero label glyphs (the
+    // LOD pass attaches it on zoom-in). Seeded from the per-instance `lodLabelsIn`
+    // (B2c) so a node built while zoomed in agrees with the cull pass's create gate.
     let label: Text | null = null;
-    if (this.viewport.scale.x >= LOD_LABELS) {
+    if (this.viewport.scale.x >= this.lodLabelsIn) {
       label = this.makeLabel(b, built.depth);
       container.addChild(label);
     }
@@ -2351,9 +2755,9 @@ export class PolisRenderer {
       // threshold, `destroyLabels` only below the OUT threshold; between OUT and IN
       // neither fires, so the existing label state is HELD and zoom oscillating
       // around the band stops thrashing ~879 Text allocs/frees per crossing.
-      const createLabels = scale >= LOD_LABELS_IN;
-      const destroyLabels = scale < LOD_LABELS_OUT;
-      const showDetails = scale >= LOD_DETAILS;
+      const createLabels = scale >= this.lodLabelsIn;
+      const destroyLabels = scale < this.lodLabelsOut;
+      const showDetails = scale >= this.lodDetails;
       const showLivery = scale >= LOD_LIVERY;
       const showDisaster = scale >= LOD_DISASTER;
       for (const node of this.buildingNodes.values()) {
@@ -2392,8 +2796,8 @@ export class PolisRenderer {
       // Road LOD: reveal/fade the faint minor-lane layer by zoom (trunks always
       // shown). Allocation-free — toggles the prebuilt sub-container only.
       this.applyRoadLod(scale);
-      this.agentLayer.setLodVisible(scale >= LOD_AGENTS);
-      this.ambientLayer.setLodVisible(scale >= LOD_AGENTS);
+      this.agentLayer.setLodVisible(scale >= this.lodAgents);
+      this.ambientLayer.setLodVisible(scale >= this.lodAgents);
       // Trade-route porters are ZOOM-IN ONLY: shown/animated only at/above
       // TRADE_LOD_ZOOM (~0.45, above the agent/ambient band). Below it the whole
       // layer is hidden and roads render exactly as they do today (no zoom-out

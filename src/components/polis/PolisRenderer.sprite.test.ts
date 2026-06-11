@@ -66,6 +66,14 @@ function makeFakeRenderer() {
 
   set("layers", { shadows, buildings, ui });
   set("viewport", { scale: { x: 1 } });
+  // B2c — the LOD bands are now per-instance fields (seeded from the render profile
+  // in the real constructor, which Object.create skips). Seed the RICH-tier values
+  // (the historical 0.62/0.58/0.4/0.35) so the attach-on-demand label gate +
+  // updateCulling read real thresholds instead of `undefined`.
+  set("lodLabelsIn", 0.62);
+  set("lodLabelsOut", 0.58);
+  set("lodDetails", 0.4);
+  set("lodAgents", 0.35);
   set("app", { renderer: { generateTexture: () => new Texture() } });
   set("buildingAtlas", new BuildingTextureAtlas(1));
   set("buildingNodes", new Map());
