@@ -304,15 +304,19 @@ export function useHandoff(args: UseHandoffArgs): UseHandoff {
         // 3) Ensure design.md exists. Missing is NON-blocking (a warning row): agents
         //    can still infer style, so the flow continues.
         safePatch("contract", { status: "running" });
-        let contract = "";
+        // V4: design_read_design_md returns Rust `Option<String>` → `null` when there is
+        // no design.md (or it is empty). It is NOT always a string, so we type the invoke
+        // as `string | null` and guard the typeof before `.trim()` — a null return must
+        // surface the non-blocking "No design contract" warning row, never crash packaging.
+        let contract: string | null = null;
         try {
-          contract = await invoke<string>("design_read_design_md", {
+          contract = await invoke<string | null>("design_read_design_md", {
             workingFolderPath: folder,
           });
         } catch {
-          contract = "";
+          contract = null;
         }
-        if (contract.trim().length > 0) {
+        if (typeof contract === "string" && contract.trim().length > 0) {
           safePatch("contract", { status: "done" });
         } else {
           safePatch("contract", {

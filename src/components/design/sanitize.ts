@@ -133,6 +133,15 @@ const SAFE_CSS_URL_RE = /^(?:data:image\/|#)/i;
 // containment.
 const DANGEROUS_POSITION_RE =
   /position\s*:\s*(?:fixed|sticky)(?:\s*!\s*important)?\s*;?/gi;
+// V2: `filter` / `-webkit-filter` / `backdrop-filter` / `-webkit-backdrop-filter`. A
+// filter (e.g. `blur(40px)`, `drop-shadow(...)`) is NOT clipped by the host's
+// `overflow:hidden` — it bleeds visually past the node-card boundary and can smear/blur
+// the surrounding canvas, the same containment-escape class as `position:fixed`. Strip the
+// whole declaration. The value never contains a `;` (that separates declarations), so
+// `[^;]*` safely consumes the value including its `()` and commas. `transform`/`zoom` are
+// deliberately KEPT — those are clipped by the `.node-card` host's overflow.
+const DANGEROUS_FILTER_RE =
+  /(?:-webkit-)?(?:backdrop-)?filter\s*:[^;]*;?/gi;
 // CSS `expression(...)` (legacy IE dynamic-property XSS); kill it wholesale.
 const CSS_EXPRESSION_RE = /expression\s*\(/gi;
 
@@ -146,6 +155,8 @@ function sanitizeStyleValue(value: string): string {
     return SAFE_CSS_URL_RE.test(t) ? `url(${t})` : "url(about:blank)";
   });
   out = out.replace(DANGEROUS_POSITION_RE, "");
+  // V2: strip filter/backdrop-filter declarations (they bleed past overflow:hidden).
+  out = out.replace(DANGEROUS_FILTER_RE, "");
   // After url() rewriting any residual `expression(` is dead, but strip it too so
   // the literal token never survives into the output.
   out = out.replace(CSS_EXPRESSION_RE, "(");

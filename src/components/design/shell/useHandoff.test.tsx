@@ -210,6 +210,31 @@ describe("useHandoff packaging", () => {
     h.unmount();
   });
 
+  it("V4: tolerates a null design.md (Option::None) as a warning, not a crash", async () => {
+    // design_read_design_md returns Rust Option<String> → null when there is no
+    // design.md. The old `invoke<string>` typing + `.trim()` crashed on null, failing
+    // the whole packaging. It must instead show the non-blocking warning row and continue.
+    const invoke = vi.fn(async (cmd: string) => {
+      if (cmd === "design_read_design_md") return null; // Option::None over IPC
+      if (cmd === "design_preview_capture") return { path: "preview.png" };
+      return {};
+    });
+    const { args } = makeArgs({
+      invoke: invoke as unknown as UseHandoffArgs["invoke"],
+    });
+    const h = renderUseHandoff(args);
+    act(() => h.current.openHandoff());
+    await flush();
+
+    const contract = h.current.steps.find((s) => s.id === "contract");
+    expect(contract?.status).toBe("warn");
+    expect(contract?.detail).toContain("infer style");
+    // No error stage: packaging continued past the contract step to dispatch.
+    expect(h.current.phase).toBe("dispatch");
+    expect(h.current.errorStage).toBeNull();
+    h.unmount();
+  });
+
   it("skips (non-blocking) when the preview capture fails and still reaches dispatch", async () => {
     const invoke = vi.fn(async (cmd: string) => {
       if (cmd === "design_read_design_md") return "# Contract";

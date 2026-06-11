@@ -160,6 +160,14 @@ export function buildGeneratePrompt(
  * Build the SINGLE-NODE EDIT prompt: the model is handed ONLY the one node's
  * current markup and must return the ONE element back, preserving its
  * data-node-id. PURE.
+ *
+ * B4 EXEMPTION: `nodeMarkup` is embedded verbatim for ALL providers, including the
+ * CLI/agentic ones the B4 gate otherwise denies pre-fetched grounding. This is intentional
+ * and NOT a gate violation: the B4 gate bars only UN-REVIEWED TARGET TEXT (raw Oracle chunk
+ * text a CLI provider could be prompt-injected by). The node markup is the user's own canvas
+ * working material — visible/editable on the canvas, the same trust class as the approved
+ * design.md contract — not retrieved untrusted source. The caller (DesignView.onEditNode)
+ * documents the same exemption at the call site.
  */
 export function buildEditPrompt(
   nodeMarkup: string,

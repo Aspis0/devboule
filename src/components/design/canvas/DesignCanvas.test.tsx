@@ -121,6 +121,55 @@ describe("DesignCanvas — rendering", () => {
     act(() => root.unmount());
   });
 
+  it("V3: a nested data-node-id in markup is NOT a top-level host (no measurement clobber)", () => {
+    // Node "b"'s markup embeds the data-node-id of SIBLING "a". The sanitize chokepoint
+    // re-allows data-node-id when its value matches the id charset, so the nested attribute
+    // survives into the DOM. The measuredH effect must scope to `:scope > [data-node-id]`
+    // (the top-level .node-host divs only) so the nested attribute can never clobber "a"'s
+    // measurement with the inner element's height.
+    const project = baseProject({
+      meta: {
+        ...baseProject().meta,
+        nodeOrder: ["a", "b"],
+      },
+      manifest: {
+        schemaVersion: 1,
+        nodes: {
+          a: { x: 0, y: 0, z: 1, w: 200, h: "auto", kind: "html" },
+          b: { x: 0, y: 300, z: 2, w: 200, h: "auto", kind: "html" },
+        },
+      },
+      components: {
+        a: "<p>node a</p>",
+        // Hostile markup: embeds a sibling's data-node-id.
+        b: '<div data-node-id="a"><p>nested impostor</p></div>',
+      },
+    });
+    const { container, root } = mount(project);
+    const world = container.querySelector(".canvas-world") as HTMLElement;
+    expect(world).toBeTruthy();
+
+    // The nested attribute survives sanitization (proves the hazard is real)…
+    const nested = container.querySelector(
+      '.node-content [data-node-id="a"]',
+    ) as HTMLElement;
+    expect(nested).toBeTruthy();
+
+    // …but the SCOPED selector the measure loop uses sees ONLY the two top-level hosts,
+    // each exactly once — so "a" maps to the host div, never the nested impostor.
+    const scoped = world.querySelectorAll<HTMLElement>(":scope > [data-node-id]");
+    const ids = Array.from(scoped).map((el) => el.getAttribute("data-node-id"));
+    expect(ids).toEqual(["a", "b"]);
+    // The matched "a" element is the host (a direct child of world), not the nested div.
+    const hostA = Array.from(scoped).find(
+      (el) => el.getAttribute("data-node-id") === "a",
+    ) as HTMLElement;
+    expect(hostA.parentElement).toBe(world);
+    expect(hostA.classList.contains("node-host")).toBe(true);
+    expect(hostA).not.toBe(nested);
+    act(() => root.unmount());
+  });
+
   it("does NOT render a hidden node", () => {
     const project = baseProject({
       meta: {

@@ -126,6 +126,34 @@ impl Drop for PreviewOpenGuard {
     }
 }
 
+/// V12 in-flight guard: serializes `design_preview_capture`. Two concurrent captures
+/// (e.g. a double-click on the capture button, or an auto-capture racing a manual one)
+/// would both kick off a WebView2 `CapturePreview` and both atomically write `preview.png`,
+/// interleaving the screenshot of the SAME window and racing the temp+rename. Mirrors the
+/// open guard: the second concurrent call gets a clean Err and the flag clears on Drop on
+/// EVERY exit path (including the `?` early-returns and the `.await` points below).
+static PREVIEW_CAPTURE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard over [`PREVIEW_CAPTURE_IN_FLIGHT`]. `acquire` returns `None` when a capture is
+/// already running; the returned guard clears the flag on drop so no early-return / panic /
+/// dropped future can leak the lock.
+struct PreviewCaptureGuard;
+
+impl PreviewCaptureGuard {
+    fn acquire() -> Option<Self> {
+        PREVIEW_CAPTURE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| PreviewCaptureGuard)
+    }
+}
+
+impl Drop for PreviewCaptureGuard {
+    fn drop(&mut self) {
+        PREVIEW_CAPTURE_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // On-the-wire structs (camelCase over IPC)
 // ---------------------------------------------------------------------------
@@ -395,6 +423,10 @@ pub async fn design_preview_capture(
     working_folder_path: String,
 ) -> Result<PreviewCaptureResult, String> {
     state.ensure_unlocked()?;
+    // V12: refuse a second concurrent capture. Held for the whole command (across the
+    // capture .await and the atomic write); released on Drop on every exit path.
+    let _capture_guard =
+        PreviewCaptureGuard::acquire().ok_or_else(|| "a capture is already in progress".to_string())?;
     let canonical = canonical_working_folder(&working_folder_path)?;
     let target = confined_preview_png(&canonical)?;
 
@@ -880,6 +912,27 @@ mod tests {
         assert!(
             !PREVIEW_OPEN_IN_FLIGHT.load(Ordering::Acquire),
             "guard must leave the flag released"
+        );
+    }
+
+    #[test]
+    fn v12_preview_capture_guard_is_exclusive_and_releases_on_drop() {
+        // V12: the capture guard serializes design_preview_capture. First acquire succeeds.
+        let g1 = PreviewCaptureGuard::acquire().expect("first acquire should succeed");
+        // While held, a second concurrent acquire is refused → the command returns the
+        // clean "a capture is already in progress" Err.
+        assert!(
+            PreviewCaptureGuard::acquire().is_none(),
+            "a second concurrent capture must be refused while one is held"
+        );
+        // Dropping the first releases the flag…
+        drop(g1);
+        // …so a subsequent acquire succeeds again (no leak on the previous owner's exit).
+        let g2 = PreviewCaptureGuard::acquire().expect("acquire after drop should succeed");
+        drop(g2);
+        assert!(
+            !PREVIEW_CAPTURE_IN_FLIGHT.load(Ordering::Acquire),
+            "capture guard must leave the flag released"
         );
     }
 

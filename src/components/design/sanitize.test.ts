@@ -185,6 +185,36 @@ describe("sanitizeNodeMarkup — neutralizes XSS", () => {
     expect(out).toContain("position:absolute");
   });
 
+  it("V2: strips filter / -webkit-filter (bleeds past overflow:hidden)", () => {
+    const out = clean('<div style="filter:blur(40px);color:#333">x</div>');
+    expect(out).not.toMatch(/filter\s*:/i);
+    // The benign sibling declaration survives.
+    expect(out).toContain("color:#333");
+    const webkit = clean('<div style="-webkit-filter: drop-shadow(0 0 30px red)">x</div>');
+    expect(webkit).not.toMatch(/filter\s*:/i);
+  });
+
+  it("V2: strips backdrop-filter (same bleed class)", () => {
+    const out = clean('<div style="backdrop-filter: blur(20px) saturate(2)">x</div>');
+    expect(out).not.toMatch(/backdrop-filter\s*:/i);
+    expect(out).not.toMatch(/[^-]filter\s*:/i);
+    const webkit = clean('<div style="-webkit-backdrop-filter:blur(10px)">x</div>');
+    expect(webkit).not.toMatch(/backdrop-filter\s*:/i);
+  });
+
+  it("V2: tolerates whitespace/!important on filter and still strips it", () => {
+    const out = clean('<div style="filter : blur(8px) !important ; color:#333">x</div>');
+    expect(out).not.toMatch(/filter\s*:/i);
+    expect(out).toContain("color:#333");
+  });
+
+  it("V2: preserves transform (clipped by the host card, not stripped)", () => {
+    // jsdom lowercases the function name (translateX → translatex); the point is that the
+    // transform declaration SURVIVES (only filters bleed past the host's overflow:hidden).
+    const out = clean('<div style="transform:translateX(20px) scale(1.2)">x</div>');
+    expect(out).toMatch(/transform\s*:\s*translatex\(20px\) scale\(1\.2\)/i);
+  });
+
   it("kills CSS expression() (legacy IE dynamic-property XSS)", () => {
     const out = clean('<div style="width:expression(alert(1))">x</div>');
     expect(out).not.toContain("expression(");

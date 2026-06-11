@@ -238,6 +238,45 @@ describe("Phase C — existing design.md (APPROVED provenance)", () => {
     expect(lastPrompt).toContain("Primary color is #4f46e5.");
   });
 
+  it("V10: a DELAYED registry list (cold-load race) still finds the recorded hash, no editor", async () => {
+    // Cold-load race: the project load + seedContract run BEFORE the mount-time
+    // design_registry_list has resolved. seedContract must AWAIT the in-flight registry
+    // promise before its recorded-hash lookup; otherwise the approved contract is
+    // mis-flagged as an out-of-band change and a needless review editor pops up.
+    const contract = "# House rules\nPrimary color is #4f46e5.";
+    const recent = [await approvedEntry("C:/proj", contract)];
+    invokeSpy.mockImplementation(async (command: string) => {
+      if (command === "design_registry_list") {
+        // Resolve LATE (a macrotask) — after the load/seed has already begun, so the seed's
+        // recorded-hash lookup would miss it without the V10 await.
+        await new Promise((r) => setTimeout(r, 0));
+        return recent;
+      }
+      if (command === "design_load_project") return EMPTY_PROJECT;
+      if (command === "design_read_design_md") return contract;
+      if (command === "get_design_llm_backend") return { kind: "ollama" };
+      if (command === "design_oracle_context") return [];
+      return undefined;
+    });
+
+    const { container } = render();
+    // NOTE: intentionally NO settleMount() here — pick the folder while the registry list
+    // is still in flight, reproducing the cold-load ordering.
+    await pickFolder(container, "C:/proj");
+    // Let the delayed registry list + the awaited seed settle.
+    await settleMount();
+
+    // The approved contract was matched (recorded hash present in time) → injected, NO
+    // review editor.
+    expect(editor(container)).toBeFalsy();
+
+    typePrompt(container, "a hero");
+    await clickGenerate(container);
+    const lastPrompt = streamCtl.starts[streamCtl.starts.length - 1];
+    expect(lastPrompt).toContain("DESIGN CONTRACT (project file, follow its rules):");
+    expect(lastPrompt).toContain("Primary color is #4f46e5.");
+  });
+
   it("NO recorded hash -> opens a REVIEW editor, prompt has NO contract until Save (Fix 3)", async () => {
     const contract = "# House rules\nPrimary color is #4f46e5.";
     invokeSpy.mockImplementation(async (command: string) => {

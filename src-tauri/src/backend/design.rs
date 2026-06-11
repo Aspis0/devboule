@@ -1469,7 +1469,13 @@ const MAX_REGISTRY_NAME_LEN: usize = 200;
 /// with `removeFiles=true` deletes ONLY these (each path re-confined under the
 /// canonical working folder), never the working folder itself nor any unknown file —
 /// so removing a registry entry can never delete the user's own files.
-const DESIGN_TOP_LEVEL_FILES: &[&str] = &[PROJECT_FILE, MANIFEST_FILE, TOKENS_FILE, GENERATIONS_FILE];
+/// V8 (privacy): `design.md` (the approved contract) and `preview.png` (a rendered
+/// screenshot of the design) are ALSO design artifacts we author. `removeFiles=true` must
+/// delete them too, otherwise unregistering a project leaves the user's contract text and
+/// a rendered preview on disk. `"preview.png"` mirrors `design_preview::PREVIEW_PNG_FILE`
+/// (kept as a literal here to avoid a cross-module `pub` widening just for the name).
+const DESIGN_TOP_LEVEL_FILES: &[&str] =
+    &[PROJECT_FILE, MANIFEST_FILE, TOKENS_FILE, GENERATIONS_FILE, DESIGN_MD_FILE, "preview.png"];
 
 /// One design-project registry entry. METADATA ONLY (camelCase over IPC). Mirrors the
 /// TS `DesignProjectEntry`. `workingFolderPath` is the dedupe key (canonicalized).
@@ -1494,16 +1500,47 @@ pub struct DesignProjectEntry {
     pub contract_sha: Option<String>,
 }
 
+/// V1: strip the Windows extended-length (`\\?\`) verbatim prefix that
+/// `fs::canonicalize` emits on Windows so the stored/compared path is the plain
+/// user-facing form. Without this, registry entries persist as `\\?\C:\...` and
+/// `\\?\UNC\server\share\...`, which (a) leak an unfamiliar prefix into the
+/// contract-provenance UI and (b) fail to compare against any non-prefixed
+/// representation of the same folder. Two forms are handled:
+///   - `\\?\UNC\server\share\...` → `\\server\share\...`
+///   - `\\?\C:\...`               → `C:\...`
+/// Any other input (including already-plain paths and POSIX paths) is returned
+/// unchanged. Hand-rolled (no `dunce` dependency) and unit-tested below.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share\...` → `\\server\share\...`
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        // `\\?\C:\...` → `C:\...` (also covers `\\?\Volume{GUID}\...` etc.)
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// Canonicalize a working folder path into a STABLE dedupe key. When the path exists we
 /// canonicalize it (collapsing `.`/`..`/symlinks + normalizing case/separators on
 /// Windows). When it does NOT exist (e.g. a remembered folder that was later deleted)
 /// canonicalize would fail, so we fall back to a lexical normalization (trim) so the
 /// entry can still be matched/removed. The key is only used for equality, never for IO.
+///
+/// V1 migration semantics: this re-canonicalizes the STORED path at every compare. A
+/// legacy entry persisted with a `\\?\` prefix (before the storage-side strip below
+/// existed) still canonicalizes here to the SAME stripped key as a freshly-stored entry,
+/// because `fs::canonicalize` accepts a verbatim path and returns a verbatim path that we
+/// then strip — both the old prefixed value and a new plain value converge to one key. So
+/// dedupe/remove still match legacy entries without a data migration.
 fn registry_dedupe_key(working_folder_path: &str) -> String {
     let trimmed = working_folder_path.trim();
     match fs::canonicalize(trimmed) {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => trimmed.to_string(),
+        Ok(p) => strip_verbatim_prefix(&p.to_string_lossy()),
+        // Fallback path may itself carry a legacy `\\?\` prefix (non-existent folder that
+        // was stored prefixed) — strip it so the key is consistent with the canonical path.
+        Err(_) => strip_verbatim_prefix(trimmed),
     }
 }
 
@@ -1511,11 +1548,12 @@ fn registry_dedupe_key(working_folder_path: &str) -> String {
 /// input when the folder exists/is readable so two representations of the same
 /// folder persist identically (and therefore dedupe to one entry); falls back to
 /// the trimmed input when canonicalization fails (e.g. the folder isn't present
-/// yet — the entry is still recorded with the user-supplied path).
+/// yet — the entry is still recorded with the user-supplied path). V1: the verbatim
+/// `\\?\` prefix is stripped so the stored value is the plain user-facing path.
 fn canonicalize_for_storage(trimmed_path: &str) -> String {
     match fs::canonicalize(trimmed_path) {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => trimmed_path.to_string(),
+        Ok(p) => strip_verbatim_prefix(&p.to_string_lossy()),
+        Err(_) => strip_verbatim_prefix(trimmed_path),
     }
 }
 
@@ -3003,7 +3041,9 @@ mod tests {
         let s2 = canonicalize_for_storage(&with_dot.to_string_lossy());
         let s3 = canonicalize_for_storage(&with_trailing);
 
-        assert_eq!(s1, real.to_string_lossy());
+        // On Windows `real` carries the `\\?\` verbatim prefix that storage now strips,
+        // so compare against the stripped form (no-op on POSIX).
+        assert_eq!(s1, strip_verbatim_prefix(&real.to_string_lossy()));
         assert_eq!(s1, s2, "`.` segment must normalize to the same stored path");
         assert_eq!(s1, s3, "trailing slash must normalize to the same stored path");
         // And the dedupe KEY computed from each stored path matches too.
@@ -3013,10 +3053,47 @@ mod tests {
 
     #[test]
     fn w7_canonicalize_for_storage_falls_back_when_missing() {
-        // A non-existent path is stored as the trimmed input (entry still recorded).
+        // A non-existent path is stored as the trimmed input (entry still recorded). The
+        // missing temp path has no verbatim prefix so the strip is a no-op here.
         let missing = tmp_dir().join("does-not-exist");
         let s = canonicalize_for_storage(&missing.to_string_lossy());
-        assert_eq!(s, missing.to_string_lossy());
+        assert_eq!(s, strip_verbatim_prefix(&missing.to_string_lossy()));
+    }
+
+    #[test]
+    fn v1_strip_verbatim_prefix_handles_both_forms() {
+        // Drive letter verbatim form → plain path.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Users\me\proj"),
+            r"C:\Users\me\proj"
+        );
+        // UNC verbatim form → plain UNC path.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
+    }
+
+    #[test]
+    fn v1_strip_verbatim_prefix_leaves_plain_unchanged() {
+        // Already-plain Windows path, plain UNC path, and a POSIX path are untouched.
+        assert_eq!(strip_verbatim_prefix(r"C:\Users\me\proj"), r"C:\Users\me\proj");
+        assert_eq!(strip_verbatim_prefix(r"\\server\share\proj"), r"\\server\share\proj");
+        assert_eq!(strip_verbatim_prefix("/home/me/proj"), "/home/me/proj");
+        assert_eq!(strip_verbatim_prefix(""), "");
+    }
+
+    #[test]
+    fn v1_legacy_prefixed_entry_dedupes_to_stripped_key() {
+        // V1 migration semantics: a registry entry persisted BEFORE this fix carries the
+        // `\\?\` prefix. Its dedupe key (computed lazily from the stored string) must
+        // equal the key of the same folder stored in the new plain form — proving legacy
+        // entries still match without a data migration. We assert this on the lexical
+        // fallback branch (non-existent path) so the test is deterministic cross-platform.
+        let legacy = r"\\?\C:\Users\me\proj";
+        let plain = r"C:\Users\me\proj";
+        // Neither exists, so registry_dedupe_key takes the strip-on-fallback branch.
+        assert_eq!(registry_dedupe_key(legacy), registry_dedupe_key(plain));
     }
 
     #[test]
@@ -3127,6 +3204,10 @@ mod tests {
         fs::write(canonical.join(TOKENS_FILE), "{}").unwrap();
         fs::write(canonical.join(GENERATIONS_FILE), "x\n").unwrap();
         fs::write(canonical.join("export-absolute.html"), "<html>").unwrap();
+        // V8: design.md (the approved contract) and preview.png (a rendered screenshot)
+        // are privacy-sensitive design artifacts that removeFiles must also delete.
+        fs::write(canonical.join(DESIGN_MD_FILE), "# contract").unwrap();
+        fs::write(canonical.join("preview.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
         let comp = canonical.join(COMPONENTS_DIR).join("hero.html");
         fs::write(&comp, "<div>").unwrap();
         // A USER file we must NEVER delete.
@@ -3143,12 +3224,33 @@ mod tests {
         assert!(!canonical.join(TOKENS_FILE).exists());
         assert!(!canonical.join(GENERATIONS_FILE).exists());
         assert!(!canonical.join("export-absolute.html").exists());
+        // V8: contract + preview deleted.
+        assert!(!canonical.join(DESIGN_MD_FILE).exists(), "V8: design.md must be deleted");
+        assert!(!canonical.join("preview.png").exists(), "V8: preview.png must be deleted");
         assert!(!canonical.join(COMPONENTS_DIR).exists());
         // The working folder ROOT survives.
         assert!(canonical.is_dir());
         // User files survive.
         assert!(user_file.exists(), "must not delete the user's README.md");
         assert!(user_html.exists(), "must not delete a non-export index.html");
+    }
+
+    #[test]
+    fn v8_delete_tolerates_absent_design_md_and_preview() {
+        // V8: removing a project whose folder never had a design.md / preview.png (or any
+        // artifact) must be a clean no-op — absent files are tolerated, never an error.
+        let base = tmp_dir();
+        let wf = base.join("empty-proj");
+        fs::create_dir_all(&wf).unwrap();
+        let canonical = canonical_working_folder(&wf.to_string_lossy()).unwrap();
+
+        // No artifacts written at all.
+        delete_known_design_files(&canonical);
+
+        // The folder survives and nothing crashed.
+        assert!(canonical.is_dir());
+        assert!(!canonical.join(DESIGN_MD_FILE).exists());
+        assert!(!canonical.join("preview.png").exists());
     }
 
     #[test]

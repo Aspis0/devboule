@@ -417,13 +417,22 @@ export function DesignCanvas({
   }, []);
 
   // --- measure rendered heights after every render ---------------------------
+  // V3: scope the measurement to the TOP-LEVEL `.node-host` divs only (the DIRECT
+  // children of `world` that carry `data-node-id`). A plain descendant
+  // `querySelectorAll("[data-node-id]")` is RECURSIVE: untrusted node markup that embeds a
+  // `data-node-id` of a SIBLING (or any id) would be matched too and clobber that id's real
+  // measuredH with the inner element's height. The `:scope > [data-node-id]` selector
+  // matches only the host divs (rendered directly under `world` with the attribute), so a
+  // nested attribute inside a node's content can never corrupt another node's measurement.
   useEffect(() => {
     const world = worldRef.current;
     if (!world) return;
-    world.querySelectorAll<HTMLElement>("[data-node-id]").forEach((el) => {
-      const id = el.getAttribute("data-node-id");
-      if (id) measuredH.current[id] = el.offsetHeight;
-    });
+    world
+      .querySelectorAll<HTMLElement>(":scope > [data-node-id]")
+      .forEach((el) => {
+        const id = el.getAttribute("data-node-id");
+        if (id) measuredH.current[id] = el.offsetHeight;
+      });
   });
 
   // --- keyboard: delete / z-order / esc --------------------------------------

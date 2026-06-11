@@ -107,6 +107,30 @@ describe("tokenNamesForPrompt", () => {
     const doc = { color: { $type: "color", brand: { $value: "#000" } } };
     expect(tokenNamesForPrompt(doc)).toEqual(["color.brand"]);
   });
+
+  it("V11: strips ASCII control chars from emitted token names", () => {
+    // A hostile/garbled target may have control chars (NUL, ESC, DEL) in its keys.
+    const doc = {
+      ["co\x1blor"]: { ["bra\x00nd"]: { $value: "#000", $type: "color" } },
+      ["spac\x7fing"]: { sm: { $value: "4px", $type: "dimension" } },
+    };
+    const names = tokenNamesForPrompt(doc);
+    // Names are control-char free and reflect the stripped segments.
+    expect(names).toEqual(["color.brand", "spacing.sm"]);
+    for (const n of names) {
+      // eslint-disable-next-line no-control-regex
+      expect(n).not.toMatch(/[\x00-\x1f\x7f]/);
+    }
+  });
+
+  it("V11: skips a leaf whose whole name becomes empty after stripping", () => {
+    // A token key that is ENTIRELY control chars collapses to "" → no blank name emitted.
+    const doc = {
+      ["\x00\x01"]: { $value: "#000", $type: "color" },
+      keep: { $value: "#fff", $type: "color" },
+    };
+    expect(tokenNamesForPrompt(doc)).toEqual(["keep"]);
+  });
 });
 
 describe("resolveToken", () => {

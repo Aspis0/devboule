@@ -111,12 +111,30 @@ function isCliBackend(backendKind: string): boolean {
   return CLI_BACKEND_KINDS.has(backendKind);
 }
 
-/** Normalize a folder path for a lenient registry lookup: trim, unify separators, drop a
- * trailing separator, and lowercase (Windows FS is case-insensitive; the stored path is
- * server-canonicalized and may differ from the raw picked path only in these ways). PURE. */
-function normFolderKey(path: string): string {
-  return path
-    .trim()
+/** V1: strip the Windows extended-length (`\\?\`) verbatim prefix that `fs::canonicalize`
+ * historically wrote into stored registry paths. The Rust side now strips this at write
+ * time, but registry entries persisted BEFORE that fix may still carry the prefix; this
+ * TS-side strip (defense in depth) makes `findRecordedSha` still match those legacy
+ * entries. Mirrors `strip_verbatim_prefix` in design.rs:
+ *   `\\?\UNC\server\share\...` → `\\server\share\...`
+ *   `\\?\C:\...`               → `C:\...`
+ * MUST run BEFORE the separator collapse below (which would otherwise mangle `\\?\`). PURE. */
+function stripVerbatimPrefix(path: string): string {
+  if (path.startsWith("\\\\?\\UNC\\")) {
+    return "\\\\" + path.slice("\\\\?\\UNC\\".length);
+  }
+  if (path.startsWith("\\\\?\\")) {
+    return path.slice("\\\\?\\".length);
+  }
+  return path;
+}
+
+/** Normalize a folder path for a lenient registry lookup: strip the verbatim prefix, trim,
+ * unify separators, drop a trailing separator, and lowercase (Windows FS is case-
+ * insensitive; the stored path is server-canonicalized and may differ from the raw picked
+ * path only in these ways). PURE. */
+export function normFolderKey(path: string): string {
+  return stripVerbatimPrefix(path.trim())
     .replace(/[\\/]+/g, "/")
     .replace(/\/+$/, "")
     .toLowerCase();
@@ -417,6 +435,14 @@ export function DesignView() {
   const recentRef = useRef<DesignProjectEntry[]>(recent);
   recentRef.current = recent;
 
+  // V10: the in-flight initial registry-list load. On a COLD start (deep-link straight into
+  // a project) seedContract's findRecordedSha can run BEFORE the mount-time
+  // design_registry_list effect has populated recentRef — the approved contract would then
+  // be mis-detected as "changed out of band" and pop the review editor. seedContract awaits
+  // this promise (epoch guard intact) so the recorded hash is present before the lookup. It
+  // resolves (never rejects) once the list has settled into `recent`.
+  const registryReadyRef = useRef<Promise<void> | null>(null);
+
   // Contract editor (DesignMdEditor) modal state. `null` = closed. `draftTokens` are
   // written alongside design.md on Save when the draft came from token extraction;
   // a preset the user picks inside the editor supplies its own tokens instead.
@@ -480,6 +506,12 @@ export function DesignView() {
   >(null);
   const consumedRef = useRef(false);
 
+  // V5c: re-entry guard for runConsolidate. A whole-project save is a single in-flight
+  // operation; a second concurrent call (double-click Save, or Save racing the hand-off
+  // packaging step) would issue two design_save_project writes against the same folder.
+  // The ref claims the slot synchronously; the second caller returns false immediately.
+  const consolidatingRef = useRef(false);
+
   // W3: re-entry guard for the async PREPARE window of a start.
   const preparingRef = useRef(false);
   const [preparing, setPreparing] = useState(false);
@@ -497,6 +529,13 @@ export function DesignView() {
   // Live project ref for the throttled writer (never captures a stale project).
   const projectRef = useRef(project);
   projectRef.current = project;
+
+  // V7: a live mirror of `panelBusy` (preparing || streaming || spotBusy) read by the
+  // window-level undo/redo keydown handler. The handler is a stable listener whose closure
+  // must NOT capture a stale `panelBusy` value; a ref kept in sync (below, once panelBusy is
+  // computed) lets the handler early-return while a generation/edit/Spot-Edit chain is live
+  // so Ctrl+Z/Y cannot mutate the project (applySnapshot + persist) mid-stream.
+  const panelBusyRef = useRef(false);
 
   // Live folder ref: `flushManifest` reads the folder at CALL time, not at
   // closure-capture time.
@@ -635,6 +674,14 @@ export function DesignView() {
     if (typeof existing === "string" && existing.trim().length > 0) {
       const onDiskHash = await sha256Hex(existing);
       if (stale()) return;
+      // V10: ensure the initial registry list has settled before the recorded-hash lookup.
+      // On a cold start the mount-time load may still be in flight; awaiting it (then the
+      // epoch re-check below) prevents a recorded contract from being mis-flagged as an
+      // out-of-band change just because recentRef hadn't been populated yet.
+      if (registryReadyRef.current) {
+        await registryReadyRef.current;
+        if (stale()) return;
+      }
       const recordedHash = findRecordedSha(recentRef.current, folderPath);
       if (recordedHash && recordedHash === onDiskHash) {
         // Approved + unchanged: stash for injection, skip the editor.
@@ -849,13 +896,22 @@ export function DesignView() {
   useEffect(() => {
     if (!tauri) return;
     let cancelled = false;
-    void (async () => {
+    // V10: expose this load as a promise seedContract can await so a cold-start project load
+    // sees the recorded contract hash. Resolves on success OR failure (the recent list is a
+    // convenience — a failed load must not block the seed forever).
+    registryReadyRef.current = (async () => {
       try {
         const list = await invokeBackendCommand<DesignProjectEntry[]>(
           "design_registry_list",
           {},
         );
-        if (!cancelled) setRecent(list ?? []);
+        if (!cancelled) {
+          // V10: update the REF synchronously (not only the state) so a seedContract that
+          // awaited this promise reads the fresh list immediately, without waiting for the
+          // setRecent-driven re-render to mirror it into recentRef on commit.
+          recentRef.current = list ?? [];
+          setRecent(list ?? []);
+        }
       } catch {
         // Non-fatal: the recent list is a convenience; leave it empty.
       }
@@ -1045,6 +1101,20 @@ export function DesignView() {
       setError("Choose a working folder first.");
       return false;
     }
+    // V5c: re-entry guard — a consolidate already in flight wins; the second call returns
+    // false without issuing a duplicate design_save_project write.
+    if (consolidatingRef.current) return false;
+    consolidatingRef.current = true;
+    // V5b: cancel any throttled drag-commit manifest write and drop its pending payload
+    // BEFORE we snapshot+save the whole project (mirrors persistProject). Otherwise the
+    // queued writeTimer could fire AFTER this save and overwrite the freshly-consolidated
+    // manifest on disk with the older, throttled manifest (stale-manifest overwrite).
+    if (writeTimer.current !== null) {
+      clearTimeout(writeTimer.current);
+      writeTimer.current = null;
+    }
+    pendingManifest.current = null;
+    setPendingDirty(false);
     setBusy("save");
     setError(null);
     setStatus(null);
@@ -1063,6 +1133,8 @@ export function DesignView() {
     } finally {
       endSaving();
       setBusy(null);
+      // V5c: release the re-entry guard on EVERY exit path (success or error).
+      consolidatingRef.current = false;
     }
   }, [beginSaving, endSaving, showToast]);
 
@@ -1324,6 +1396,12 @@ export function DesignView() {
       if (tag === "input" || tag === "textarea" || target?.isContentEditable) {
         return;
       }
+      // V7: ignore undo/redo while a generation/edit/Spot-Edit chain is live. Mutating the
+      // project (applySnapshot + persist) mid-stream races the in-flight pipeline writing
+      // into the SAME project — it can drop/duplicate the streamed node, clobber the manifest,
+      // or persist a half-applied tree. We read the live `panelBusyRef` (not a captured state)
+      // so this stable listener never sees a stale value.
+      if (panelBusyRef.current) return;
       const key = e.key.toLowerCase();
       if (key === "z" && !e.shiftKey) {
         e.preventDefault();
@@ -1348,6 +1426,14 @@ export function DesignView() {
       pendingManifest.current = null;
       setPendingDirty(false);
       // WARNING 4: SERIALIZE the two writes — node markup FIRST, then the manifest.
+      // V6 (ACCEPTED RISK): these are TWO separate Rust commands (design_write_node then
+      // design_write_manifest), not one atomic operation. A runConsolidate that interleaves
+      // between them (it clears the same writeTimer/pendingManifest, but these awaits are
+      // already in flight) could observe a node file written without its matching manifest
+      // entry yet — a brief, self-healing inconsistency: the next save/seed reconciles it,
+      // and the node markup on disk is never lost. Closing the window fully would require a
+      // single combined `design_write_node_and_manifest` Rust command + its tauri::command
+      // registration (out of scope here — lib.rs is off-limits), so it is deferred.
       beginSaving();
       void (async () => {
         try {
@@ -1589,6 +1675,14 @@ export function DesignView() {
         const backendKind = await readBackendKind();
         const cli = isCliBackend(backendKind);
         patchMessage(msgId, { agentic: cli });
+        // B4 EXEMPTION: `current` is the node's EXISTING canvas markup, embedded in the edit
+        // prompt for ALL providers (including CLI/agentic ones). This is NOT a B4 violation:
+        // the B4 gate bars only UN-REVIEWED TARGET TEXT (raw Oracle chunk text that a CLI
+        // provider could be steered by). Node markup is the user's own canvas working
+        // material — visible and editable in the canvas, the same trust class as the
+        // user-approved design.md contract — not fetched, untrusted target source. So it is
+        // safe to send agentically; the gate's concern (prompt-injection via un-reviewed
+        // retrieved code) does not apply here.
         // The design contract grounds edits too (all providers — user-curated, clamped).
         const editPrompt = buildEditPrompt(current, instruction, {
           designContract: clampDesignMd(contractRef.current),
@@ -2054,6 +2148,10 @@ export function DesignView() {
   // two runs where no single stream is live: a composer send in that gap would inject
   // a generate/edit run that interleaves with — and hijacks — the chain's stream slot.
   const panelBusy = preparing || streaming || spotBusy;
+  // V7: mirror panelBusy into the ref the undo/redo keydown listener reads. Assigned during
+  // render (cheap, idempotent) so the window-level handler always sees the current value
+  // without re-subscribing the listener on every busy-state flip.
+  panelBusyRef.current = panelBusy;
 
   // The display name of the node selected for edit (the composer's context chip). Node
   // ids are the user-facing label in this module.

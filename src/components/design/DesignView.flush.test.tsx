@@ -123,6 +123,67 @@ describe("DesignView — throttled manifest flush targets the CURRENT folder", (
     );
   });
 
+  it("V5b: runConsolidate cancels a throttled manifest write (no stale overwrite)", async () => {
+    const { container } = render();
+    await setFolder(container, "C:/proj");
+
+    // Commit a manifest — schedules a throttled design_write_manifest.
+    const commit = container.querySelector("[data-testid=commit]") as HTMLButtonElement;
+    act(() => commit.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+
+    // Run a full consolidate (Save to repo) BEFORE the throttle fires. It must clear the
+    // pending timer so the queued (now stale) manifest write can never fire afterwards and
+    // overwrite the freshly-consolidated project on disk.
+    const saveBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Save to repo"),
+    ) as HTMLButtonElement;
+    await act(async () => {
+      saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Let the (now-cancelled) throttle window elapse.
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+
+    // The whole-project consolidate ran exactly once…
+    const saveCalls = invokeSpy.mock.calls.filter(
+      (c) => c[0] === "design_save_project",
+    );
+    expect(saveCalls).toHaveLength(1);
+    // …and NO throttled manifest write fired after it (the stale-manifest overwrite).
+    const manifestCalls = invokeSpy.mock.calls.filter(
+      (c) => c[0] === "design_write_manifest",
+    );
+    expect(manifestCalls).toHaveLength(0);
+  });
+
+  it("V5c: a second concurrent runConsolidate is a no-op (single save write)", async () => {
+    const { container } = render();
+    await setFolder(container, "C:/proj");
+
+    const saveBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Save to repo"),
+    ) as HTMLButtonElement;
+
+    // Two rapid Save clicks in the SAME tick, before the first save's promise settles. The
+    // re-entry guard must make the second a no-op → exactly one design_save_project.
+    await act(async () => {
+      saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const saveCalls = invokeSpy.mock.calls.filter(
+      (c) => c[0] === "design_save_project",
+    );
+    expect(saveCalls).toHaveLength(1);
+  });
+
   it("flushes the pending manifest on unmount to the current folder", async () => {
     const { container, root } = render();
     await setFolder(container, "C:/live");
