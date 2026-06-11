@@ -164,6 +164,82 @@ export function tokenNamesForPrompt(doc: unknown): string[] {
   return names;
 }
 
+/** A color token surfaced to the UI: its dotted name + its resolved CSS color
+ *  string. Produced by {@link colorTokens}. */
+export interface ColorTokenSwatch {
+  name: string;
+  value: string;
+}
+
+/** Max color swatches surfaced to the content-edit toolbar (a compact palette, not
+ *  the whole token corpus). Bounds the toolbar width. */
+const MAX_COLOR_SWATCHES = 6;
+
+/**
+ * A CONSERVATIVE CSS color shape. A color token's `$value` is applied as an inline
+ * style (`el.style.color = value`) by the CE swatch, so a value like
+ * `"red; position: fixed"` or `"url(javascript:x)"` could inject extra declarations or
+ * a URL. The browser's CSS parser would reject most of that, but we never want to feed
+ * such a value to the style API at all. We accept ONLY: hex (#RGB/#RGBA/#RRGGBB/#RRGGBBAA),
+ * the functional forms rgb/rgba/hsl/hsla/oklch/oklab/lab/lch/color(...) with no `;` or
+ * `{}` inside, or a bare CSS named color ([a-z]{2,20}). Anything else is filtered out.
+ */
+const CSS_COLOR_RE =
+  /^(?:#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})|(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)\([^;{}]*\)|[a-z]{2,20})$/i;
+
+/** True when `value` is a safe, conservative CSS color string (see {@link CSS_COLOR_RE}). */
+export function isSafeCssColor(value: string): boolean {
+  const v = value.trim();
+  // Reject control chars / declaration or block separators outright (defense in depth —
+  // the functional-form branch already forbids `;{}` inside the parens).
+  if (/[;{}<>]/.test(v)) return false;
+  return CSS_COLOR_RE.test(v);
+}
+
+/**
+ * Extract the COLOR token leaves from a DTCG document as `{ name, value }` pairs in
+ * stable (depth-first, key-sorted) order, capped at {@link MAX_COLOR_SWATCHES}. A
+ * token counts as a color when its `$type === "color"` AND its `$value` is a
+ * non-empty string (a composite/object color value is skipped — we only surface
+ * scalar CSS colors a swatch can apply). PURE. An invalid/empty document yields `[]`
+ * so the caller can fall back to a neutral default palette.
+ */
+export function colorTokens(doc: unknown): ColorTokenSwatch[] {
+  if (!isObject(doc)) return [];
+  const out: ColorTokenSwatch[] = [];
+  const MAX_DEPTH = 16;
+  const walk = (node: Record<string, unknown>, path: string, depth: number) => {
+    if (depth > MAX_DEPTH || out.length >= MAX_COLOR_SWATCHES) return;
+    const keys = Object.keys(node)
+      .filter((k) => !k.startsWith("$"))
+      .sort();
+    for (const key of keys) {
+      if (out.length >= MAX_COLOR_SWATCHES) return;
+      const value = node[key];
+      if (!isObject(value)) continue;
+      const childPath = path ? `${path}.${key}` : key;
+      if (isDtcgToken(value)) {
+        const tok = value as DtcgToken;
+        if (
+          tok.$type === "color" &&
+          typeof tok.$value === "string" &&
+          tok.$value.trim().length > 0 &&
+          // The value is applied as an inline style by the CE swatch — only surface a
+          // conservative, well-formed CSS color (filters injection like
+          // "red; position: fixed" or "url(javascript:x)").
+          isSafeCssColor(tok.$value)
+        ) {
+          out.push({ name: childPath, value: tok.$value.trim() });
+        }
+      } else {
+        walk(value, childPath, depth + 1);
+      }
+    }
+  };
+  walk(doc as Record<string, unknown>, "", 0);
+  return out;
+}
+
 /**
  * Resolve a DTCG token reference of the form `{group.token}` to its `$value`
  * within `doc`. Returns the input unchanged if it is not a reference or the path is

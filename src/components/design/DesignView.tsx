@@ -33,6 +33,8 @@ import "@fontsource-variable/instrument-sans";
 import "@fontsource-variable/source-serif-4";
 import "./design.css";
 import { DesignCanvas } from "./canvas/DesignCanvas";
+import { polygonIntersectsRect } from "./canvas/spotEditGeometry";
+import type { NodeRect, Point } from "../../types/design";
 import {
   createHistory,
   push as pushHistory,
@@ -45,6 +47,7 @@ import { useDesignStream } from "./useDesignStream";
 import {
   applyEdit,
   applyGeneration,
+  applyNodeId,
   type ShapeMap,
   type GenerationResult,
 } from "./generation/pipeline";
@@ -204,6 +207,13 @@ function snapshotOf(project: DesignProject): DesignSnapshot {
     nodeOrder: project.meta.nodeOrder,
   };
 }
+
+/** Fixed prompt prefix for a user-described Spot Edit region edit. Module scope — it is
+ *  a constant, not per-render state. */
+const SPOT_PREFIX = "Spot edit (region selection): ";
+/** Fixed instruction when a Spot Edit region prompt is empty (auto-detect mode). */
+const SPOT_AUTODETECT =
+  "Fix off-token colors, contrast and spacing inconsistencies in this section; return the same element.";
 
 export function DesignView() {
   const [project, setProject] = useState<DesignProject>(() => buildDemoProject());
@@ -1470,6 +1480,216 @@ export function DesignView() {
     [selectedId, pushMessage, patchMessage, startStream, readBackendKind, beginPrepare, endPrepare],
   );
 
+  // --- content-edit (CE) commit ---------------------------------------------
+  // The canvas serialized an edited node's content root (helper classes/attrs already
+  // stripped) and hands us the RAW markup. We RE-SANITIZE it (the chokepoint — CE
+  // edited live DOM, an injected onerror/class must not survive), re-stamp the node
+  // id onto the root (a reorder/delete could have changed which element is first),
+  // refresh the sanitizer kind + structural shape, push history, and persist via the
+  // EXISTING node-persist path (node markup first, then manifest) — identical to the
+  // single-node edit pipeline's apply branch.
+  const onNodeMarkupCommit = useCallback(
+    (nodeId: string, rawSerialized: string) => {
+      const prev = projectRef.current;
+      const placement = prev.manifest.nodes[nodeId];
+      if (!placement) return; // node vanished — nothing to commit (CE already aborts)
+      // A node is a SINGLE top-level element, but CE can leave MULTIPLE roots behind
+      // (e.g. the user deleted the wrapping element, hoisting its children to the top
+      // level). `applyNodeId` only stamps + keeps `body.firstElementChild`, so the 2nd+
+      // roots would be SILENTLY DROPPED. Detect >1 root and wrap them in one `<div>` so
+      // all the content is preserved under a single re-anchorable root.
+      const roots = parseTopLevelNodes(rawSerialized);
+      const serialized =
+        roots.length > 1 ? `<div>${rawSerialized}</div>` : rawSerialized;
+      // Stamp the id onto the (now single) top-level element, then sanitize (chokepoint).
+      const markup = sanitizeNodeMarkup(applyNodeId(serialized, nodeId));
+      if (markup.length === 0) return; // empty/garbage serialization — ignore
+      // No-op check: compare NORMALIZED forms (both run through applyNodeId+sanitize) so
+      // a pure click (or cosmetic whitespace/attr-order drift from the serializer) does
+      // not push history or write to disk. Comparing raw `markup` against the stored
+      // string directly was fragile — the stored value is already normalized, but a
+      // freshly-stored node and a re-serialized identical edit could differ only in
+      // normalization, causing spurious churn.
+      const prevNormalized = sanitizeNodeMarkup(
+        applyNodeId(prev.components[nodeId] ?? "", nodeId),
+      );
+      if (markup === prevNormalized) return; // no net change
+
+      // Refresh kind + shape from the committed markup (an edit may swap html<->svg).
+      const reparsed = parseTopLevelNodes(markup);
+      const kind = reparsed.length > 0 && reparsed[0].tag === "svg" ? "svg" : "html";
+
+      const next: DesignProject = {
+        ...prev,
+        manifest: {
+          ...prev.manifest,
+          nodes: {
+            ...prev.manifest.nodes,
+            [nodeId]: { ...placement, kind },
+          },
+        },
+        components: { ...prev.components, [nodeId]: markup },
+      };
+
+      onBeginChange(); // snapshot BEFORE applying so undo restores the pre-CE markup
+      setProject(next);
+      if (reparsed.length > 0) {
+        shapesRef.current = { ...shapesRef.current, [nodeId]: reparsed[0] };
+      }
+      persistNode(next, nodeId);
+      setStatus(`Updated node "${nodeId}" (content edit).`);
+    },
+    [onBeginChange, persistNode],
+  );
+
+  // Seed the composer with a node's CE "Ask AI" context: select the node (so a send
+  // routes to its edit round-trip) + prefill the draft + focus the composer.
+  const onSeedComposer = useCallback(
+    ({ nodeId, tag }: { nodeId: string; tag: string }) => {
+      if (!projectRef.current.manifest.nodes[nodeId]) return;
+      setSelectedId(nodeId);
+      setDraft(tag ? `Update this ${tag} element: ` : "");
+      setFocusSignal((v) => v + 1);
+    },
+    [],
+  );
+
+  // --- Spot Edit: sequential per-node edit chain ----------------------------
+  // True while the Spot Edit chain is running (drives the region shimmer + locks
+  // re-entry). A chain runs the EXISTING `runEdit` ONE node at a time: each next run
+  // starts only after the previous stream reaches a terminal transition (the W3
+  // single-stream invariant — never two streams at once). A Stop cancels the chain.
+  const [spotBusy, setSpotBusy] = useState(false);
+  const spotChainRef = useRef<{ queue: string[]; prompt: string } | null>(null);
+
+  // Set when a microtask advance is already scheduled, so one terminal transition
+  // schedules exactly one advance even if multiple effects observe it.
+  const spotAdvanceScheduledRef = useRef(false);
+
+  // Start the next node in the chain, or finish (clear busy) when the queue is empty.
+  const advanceSpotChain = useCallback(() => {
+    spotAdvanceScheduledRef.current = false;
+    const chain = spotChainRef.current;
+    if (!chain) return;
+    // Re-check the single-stream invariant at advance time: if a run is still owed or
+    // a prepare is in flight, defer one more microtask (the done-effect may not have
+    // consumed yet). Never start a second stream concurrently (W3).
+    if (pendingRunRef.current !== null || preparingRef.current) {
+      if (!spotAdvanceScheduledRef.current) {
+        spotAdvanceScheduledRef.current = true;
+        queueMicrotask(advanceSpotChainRef.current);
+      }
+      return;
+    }
+    // Skip ids that vanished since the chain was planned (a prior run could remove one).
+    let nextId: string | undefined;
+    while (chain.queue.length > 0) {
+      const candidate = chain.queue.shift() as string;
+      if (projectRef.current.manifest.nodes[candidate]) {
+        nextId = candidate;
+        break;
+      }
+    }
+    if (!nextId) {
+      spotChainRef.current = null;
+      setSpotBusy(false);
+      return;
+    }
+    const instruction =
+      chain.prompt.length > 0 ? SPOT_PREFIX + chain.prompt : SPOT_AUTODETECT;
+    void runEdit(instruction, nextId);
+  }, [runEdit]);
+
+  // Live ref to advanceSpotChain so a deferred re-schedule never captures a stale one.
+  const advanceSpotChainRef = useRef(advanceSpotChain);
+  advanceSpotChainRef.current = advanceSpotChain;
+
+  // Compute hit nodes for a polygon region and start the sequential chain. Hit-test:
+  // each VISIBLE node's manifest rect vs. the polygon (`polygonIntersectsRect`).
+  // NOTE: measured rendered heights live in the canvas, not here, so an `"auto"`-height
+  // node uses a nominal 200px fallback for its rect height (rect-vs-bbox fallback —
+  // matches the prototype's `measuredH || 200`). Fixed numeric heights are exact.
+  const onRegionAnalyze = useCallback(
+    (polygonWorldPts: Point[], prompt: string) => {
+      if (spotChainRef.current) return; // a chain is already running
+      const p = projectRef.current;
+      const rects: NodeRect[] = Object.entries(p.manifest.nodes)
+        .filter(([, pl]) => !pl.hidden)
+        .map(([id, pl]) => ({
+          id,
+          x: pl.x,
+          y: pl.y,
+          w: pl.w,
+          h: typeof pl.h === "number" ? pl.h : 200,
+          z: pl.z,
+        }));
+      const hits = rects
+        .filter((r) => polygonIntersectsRect(polygonWorldPts, r))
+        .map((r) => r.id);
+
+      if (hits.length === 0) {
+        showToast("No sections in the region");
+        return;
+      }
+
+      // One user message framing the batch; each per-node runEdit appends its own
+      // assistant card (the existing edit cards do this naturally).
+      pushMessage({
+        role: "user",
+        text: prompt.length > 0 ? prompt : "Auto-detect issues in the selected area",
+        ctx: `Spot Edit · ${hits.length} section${hits.length === 1 ? "" : "s"}`,
+      });
+
+      spotChainRef.current = { queue: [...hits], prompt };
+      setSpotBusy(true);
+      advanceSpotChain();
+    },
+    [advanceSpotChain, pushMessage, showToast],
+  );
+
+  // Drive the chain forward on each terminal stream transition. The pipeline
+  // done-effect / cancel-error effect run on these same statuses and finalize the
+  // current run FIRST (they null pendingRunRef / patch the card); this effect then
+  // advances. A `cancelled` terminal ABORTS the whole chain (a Stop cancels it).
+  // Guarded so it only acts while a chain is active and the run is fully consumed.
+  useEffect(() => {
+    if (!spotChainRef.current) return;
+    if (streamStatus === "cancelled") {
+      spotChainRef.current = null;
+      // Clear any pending advance flag: a microtask advance may have been scheduled by
+      // a prior `done`/`error` and not yet run. Leaving it `true` would make the NEXT
+      // chain's first terminal transition skip its own scheduling (it sees the flag set
+      // from this aborted chain) and stall — the stale-schedule stall.
+      spotAdvanceScheduledRef.current = false;
+      setSpotBusy(false);
+      return;
+    }
+    if (streamStatus === "done" || streamStatus === "error") {
+      // Defer to a microtask so the pipeline done-effect / cancel-error effect (which
+      // consume the run: null pendingRunRef, patch the card, persist) run FIRST. The
+      // advance re-checks the single-stream invariant before starting the next node.
+      if (!spotAdvanceScheduledRef.current) {
+        spotAdvanceScheduledRef.current = true;
+        queueMicrotask(advanceSpotChainRef.current);
+      }
+    }
+  }, [streamStatus]);
+
+  // Stop from the composer. Must reliably abort a running Spot Edit chain EVEN in the
+  // inter-node gap (no live stream): if the cancel only hit `cancelGeneration` and no
+  // stream is currently streaming, the chain would survive and the next queued node
+  // would still fire. So tear the chain down synchronously FIRST (null the queue, clear
+  // the schedule flag + busy), THEN cancel any active stream. The chain-drive effect's
+  // `cancelled` branch is a no-op once `spotChainRef` is already null, so no double-free.
+  const onStop = useCallback(() => {
+    if (spotChainRef.current) {
+      spotChainRef.current = null;
+      spotAdvanceScheduledRef.current = false;
+      setSpotBusy(false);
+    }
+    cancelGeneration();
+  }, [cancelGeneration]);
+
   // Apply the pipeline exactly once when a stream completes.
   useEffect(() => {
     if (
@@ -1679,8 +1899,11 @@ export function DesignView() {
   const projectOpen = folder.trim().length > 0;
   const streaming = streamStatus === "streaming";
   // The composer/panel is "busy" while either the async prepare window OR the stream
-  // itself is live — mirroring the temp panel's disable condition exactly.
-  const panelBusy = preparing || streaming;
+  // itself is live — mirroring the temp panel's disable condition exactly. ALSO busy
+  // for the WHOLE Spot Edit chain (`spotBusy`), including the inter-node gap between
+  // two runs where no single stream is live: a composer send in that gap would inject
+  // a generate/edit run that interleaves with — and hijacks — the chain's stream slot.
+  const panelBusy = preparing || streaming || spotBusy;
 
   // The display name of the node selected for edit (the composer's context chip). Node
   // ids are the user-facing label in this module.
@@ -1822,6 +2045,11 @@ export function DesignView() {
                   onSelect={setSelectedId}
                   selectedId={selectedId}
                   onBeginChange={onBeginChange}
+                  tokens={tokens}
+                  onNodeMarkupCommit={onNodeMarkupCommit}
+                  onRegionAnalyze={onRegionAnalyze}
+                  spotBusy={spotBusy}
+                  onSeedComposer={onSeedComposer}
                 />
                 {Object.keys(project.manifest.nodes).length === 0 ? (
                   <div className="canvas-empty">
@@ -1858,6 +2086,11 @@ export function DesignView() {
                   onSelect={setSelectedId}
                   selectedId={selectedId}
                   onBeginChange={onBeginChange}
+                  tokens={tokens}
+                  onNodeMarkupCommit={onNodeMarkupCommit}
+                  onRegionAnalyze={onRegionAnalyze}
+                  spotBusy={spotBusy}
+                  onSeedComposer={onSeedComposer}
                 />
                 <div className="canvas-empty">
                   <div className="ce-card">
@@ -1918,7 +2151,7 @@ export function DesignView() {
             onSuggest={onSuggest}
             onRerun={onRerun}
             onLocate={onLocate}
-            onStop={cancelGeneration}
+            onStop={onStop}
             busy={panelBusy}
             backend={backend}
             onSaveBackend={saveBackend}

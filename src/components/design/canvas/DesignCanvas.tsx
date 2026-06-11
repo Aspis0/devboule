@@ -51,6 +51,12 @@ import { NodeContent } from "./NodeContent";
 import { LayersPanel } from "./LayersPanel";
 import { ZoomPill } from "./ZoomPill";
 import { ToolPill } from "./ToolPill";
+import { ContentToolbar, type SwatchTarget } from "./ContentToolbar";
+import { SpotEdit, type SpotEditHandle } from "./SpotEdit";
+import { cleanSerialize, elHasText, startInlineTextEdit } from "./contentEdit";
+import { colorTokens, type DtcgDocument } from "../engine/tokens";
+import { sanitizeNodeMarkup } from "../sanitize";
+import type { Point } from "../../../types/design";
 import { Inspector } from "../Inspector";
 import { Sparkles, Wand2 } from "lucide-react";
 
@@ -74,6 +80,29 @@ export interface DesignCanvasProps {
   generatingIds?: Set<string>;
   /** Optional action for the empty-state button (wired in a later phase). */
   onEmptyAction?: () => void;
+  /** The project's DTCG tokens — color leaves feed the CE toolbar swatches. */
+  tokens?: DtcgDocument;
+  /**
+   * CONTENT-EDIT COMMIT. Fired when CE mode exits with a real change to a node's
+   * inner markup: the canvas passes the RAW serialized markup (helper classes/attrs
+   * stripped, but NOT sanitized). The parent MUST re-sanitize via `sanitizeNodeMarkup`
+   * and run the node-persist path. Absent -> CE mode is disabled (double-click is a
+   * no-op), so the existing manifest-only test mock keeps working unchanged.
+   */
+  onNodeMarkupCommit?: (nodeId: string, rawSerialized: string) => void;
+  /**
+   * SPOT EDIT. Fired when the user runs Analyze on a drawn region: the canvas passes
+   * the polygon (WORLD coords) + the prompt. The parent picks hit nodes and runs the
+   * edit chain. Absent -> the Spot Edit tool is hidden.
+   */
+  onRegionAnalyze?: (polygonWorldPts: Point[], prompt: string) => void;
+  /** True while a Spot Edit analyze chain runs — keeps the region shimmer on. */
+  spotBusy?: boolean;
+  /**
+   * Seed the assistant composer with an edit context (the "Ask AI" button in the CE
+   * toolbar). Optional — when absent the button just exits CE.
+   */
+  onSeedComposer?: (ctx: { nodeId: string; tag: string }) => void;
 }
 
 /** The grid for snapping, from the project meta (px). */
@@ -99,14 +128,49 @@ export function DesignCanvas({
   onBeginChange,
   generatingIds,
   onEmptyAction,
+  tokens,
+  onNodeMarkupCommit,
+  onRegionAnalyze,
+  spotBusy = false,
+  onSeedComposer,
 }: DesignCanvasProps) {
   const [zoom, setZoom] = useState(0.85);
   const [pan, setPan] = useState<Pan>({ x: 40, y: 24 });
   const [guides, setGuides] = useState<DragGuide[]>([]);
 
+  // Tool: "move" (select/drag) or "ai" (Spot Edit region). Spot Edit is only
+  // available when the parent wired `onRegionAnalyze`.
+  const [tool, setTool] = useState<"move" | "ai">("move");
+  const ceEnabled = !!onNodeMarkupCommit;
+  const spotEnabled = !!onRegionAnalyze;
+
+  // --- content-edit (CE) mode state -----------------------------------------
+  // `ceNodeId`: the node currently in CE (dashed ring, drag disabled). `ceEl`: the
+  // selected inner element. `ceVer`: bumped to reposition the toolbar (select / pan /
+  // zoom / reorder / recolor / inline-edit end).
+  const [ceNodeId, setCeNodeId] = useState<string | null>(null);
+  const [ceEl, setCeEl] = useState<HTMLElement | null>(null);
+  const [ceVer, setCeVer] = useState(0);
+  // The live CE content root (`.node-content`) so commit can serialize it.
+  const ceContentRef = useRef<HTMLDivElement | null>(null);
+  // Live mirror of the CE element so the keydown listener (Delete) reads it without
+  // re-subscribing on every selection.
+  const ceElRef = useRef<HTMLElement | null>(null);
+  ceElRef.current = ceEl;
+  const ceNodeIdRef = useRef<string | null>(null);
+  ceNodeIdRef.current = ceNodeId;
+  // Teardown handle for an in-flight inline text edit (so we can force-end it on exit).
+  const inlineEditCancelRef = useRef<(() => void) | null>(null);
+  // The stored markup of the CE node AT THE MOMENT CE was entered. If the stored markup
+  // changes underneath CE (a generation/edit/undo replaced the node's content WITHOUT
+  // removing the node), the external update wins and CE exits SILENTLY — committing the
+  // now-stale serialized DOM would clobber the fresh content. null when not in CE.
+  const ceEntryMarkupRef = useRef<string | null>(null);
+
   const wrapRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
+  const spotRef = useRef<SpotEditHandle>(null);
 
   // Live refs so the long-lived wheel/pointer/keyboard listeners never capture a
   // stale closure (zoom/pan/project/selection change between renders).
@@ -163,6 +227,128 @@ export function DesignCanvas({
     },
     [onSelect],
   );
+
+  // --- content-edit (CE) mode -----------------------------------------------
+
+  // Exit CE mode. Force-ends any in-flight inline edit, serializes the content root,
+  // and — when the markup actually changed — hands the RAW serialized markup UP for
+  // re-sanitization + persistence. Always clears CE state. `silent` skips the commit
+  // (used when the node vanished out from under CE — nothing valid to persist).
+  const exitCe = useCallback(
+    (silent = false) => {
+      // End any open inline text edit first so its contenteditable attrs are gone
+      // before we serialize (cleanSerialize also strips them, but this fires onDone).
+      if (inlineEditCancelRef.current) {
+        inlineEditCancelRef.current();
+        inlineEditCancelRef.current = null;
+      }
+      const nodeId = ceNodeIdRef.current;
+      const root = ceContentRef.current;
+      if (!silent && nodeId && root && onNodeMarkupCommit) {
+        // Only commit when this node still exists AND the serialized markup differs
+        // from what is on file (avoid a churn commit + history push for a pure click).
+        const live = projectRef.current.manifest.nodes[nodeId];
+        if (live) {
+          const raw = cleanSerialize(root);
+          const current = projectRef.current.components[nodeId] ?? "";
+          if (raw !== current) onNodeMarkupCommit(nodeId, raw);
+        }
+      }
+      if (ceElRef.current) ceElRef.current.classList.remove("ce-sel");
+      // Sweep any lingering `ce-hover` from descendants: a pointer can leave the content
+      // root WITHOUT firing mouseout (e.g. CE exits while hovered, or the toolbar steals
+      // focus), leaving a stale hover ring on the next CE entry / the persisted DOM.
+      if (root) {
+        root
+          .querySelectorAll<HTMLElement>(".ce-hover")
+          .forEach((el) => el.classList.remove("ce-hover"));
+      }
+      ceContentRef.current = null;
+      ceEntryMarkupRef.current = null;
+      setCeEl(null);
+      setCeNodeId(null);
+    },
+    [onNodeMarkupCommit],
+  );
+
+  // Select an inner element within the CE content root (the prototype's ceSelect).
+  const ceSelect = useCallback((target: HTMLElement, container: HTMLElement) => {
+    if (target === container) return; // clicking the bare root selects nothing
+    if (ceElRef.current && ceElRef.current !== target) {
+      ceElRef.current.classList.remove("ce-sel");
+    }
+    target.classList.add("ce-sel");
+    setCeEl(target);
+    setCeVer((v) => v + 1);
+  }, []);
+
+  // Begin inline text editing on a CE element (double-click text / toolbar button).
+  const ceStartText = useCallback((el: HTMLElement) => {
+    if (!elHasText(el)) return;
+    // Cancel any prior inline edit before starting a new one.
+    if (inlineEditCancelRef.current) inlineEditCancelRef.current();
+    inlineEditCancelRef.current = startInlineTextEdit(el, () => {
+      inlineEditCancelRef.current = null;
+      setCeVer((v) => v + 1);
+    });
+  }, []);
+
+  // Enter CE mode for a node (double-click a node in Move tool).
+  const enterCe = useCallback(
+    (id: string) => {
+      if (!ceEnabled) return;
+      selectNode(id);
+      // Snapshot the stored markup so the abort guard can detect an external content
+      // change (generation/undo) landing on THIS node while it's being edited.
+      ceEntryMarkupRef.current = projectRef.current.components[id] ?? "";
+      setCeNodeId(id);
+      setCeEl(null);
+      setCeVer((v) => v + 1);
+    },
+    [ceEnabled, selectNode],
+  );
+
+  // Color swatch applied to the selected CE element (text color or background fill).
+  // This mutates the LIVE DOM directly; the change is serialized + committed on exit.
+  const onCeColor = useCallback((value: string, target: SwatchTarget) => {
+    const el = ceElRef.current;
+    if (!el) return;
+    if (target === "fill") el.style.background = value;
+    else el.style.color = value;
+    setCeVer((v) => v + 1);
+  }, []);
+
+  // Reorder the selected CE element among its siblings (live DOM move).
+  const onCeMove = useCallback((dir: "up" | "down") => {
+    const el = ceElRef.current;
+    if (!el) return;
+    const parent = el.parentElement;
+    if (!parent) return;
+    if (dir === "up" && el.previousElementSibling) {
+      parent.insertBefore(el, el.previousElementSibling);
+    } else if (dir === "down" && el.nextElementSibling) {
+      parent.insertBefore(el.nextElementSibling, el);
+    }
+    setCeVer((v) => v + 1);
+  }, []);
+
+  // Remove the selected CE element (toolbar trash / Delete key).
+  const onCeRemove = useCallback(() => {
+    const el = ceElRef.current;
+    if (!el) return;
+    el.remove();
+    setCeEl(null);
+    setCeVer((v) => v + 1);
+  }, []);
+
+  // "Ask AI": seed the composer with this element's context, then exit CE (committing).
+  const onCeAskAi = useCallback(() => {
+    const el = ceElRef.current;
+    const nodeId = ceNodeIdRef.current;
+    const tag = el ? el.tagName.toLowerCase() : "";
+    exitCe();
+    if (nodeId) onSeedComposer?.({ nodeId, tag });
+  }, [exitCe, onSeedComposer]);
 
   // --- structural ops (delete / duplicate / hidden) --------------------------
 
@@ -252,8 +438,24 @@ export function DesignCanvas({
       ) {
         return;
       }
+      // CE mode owns the keyboard: Esc commits+exits, Delete removes the selected
+      // inner element (prototype parity), and z-order/node-delete are suppressed.
+      if (ceNodeIdRef.current) {
+        if (e.key === "Escape") {
+          exitCe();
+        } else if (e.key === "Delete" || e.key === "Backspace") {
+          if (ceElRef.current) onCeRemove();
+        }
+        return;
+      }
       const sel = selectedRef.current;
       if (e.key === "Escape") {
+        // Spot Edit: Esc cancels the region / leaves the tool before clearing selection.
+        if (spotRef.current?.hasRegion() || tool === "ai") {
+          spotRef.current?.cancel();
+          setTool("move");
+          return;
+        }
         selectNode(null);
         return;
       }
@@ -268,7 +470,29 @@ export function DesignCanvas({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectNode, commitManifest, deleteNode]);
+  }, [selectNode, commitManifest, deleteNode, exitCe, onCeRemove, tool]);
+
+  // CE ABORT: if the node in CE mode vanishes from the manifest (a generation, an
+  // undo/redo, or a self-repair replaced it), exit CE SILENTLY — there is nothing
+  // valid left to serialize/commit, and the stale `.node-content` ref would point at
+  // a detached DOM tree. (A normal exit would try to commit against a missing node.)
+  //
+  // ALSO abort silently if the node still exists but its STORED markup changed out from
+  // under CE (a generation/edit/undo landed on THIS same node): the external content is
+  // already re-rendered into the live `.node-content`, so the user's in-flight DOM edits
+  // are gone — committing the serialized DOM now would either re-clobber the fresh
+  // content with stale edits or persist a mix. The external update wins; CE just exits.
+  useEffect(() => {
+    if (!ceNodeId) return;
+    if (!project.manifest.nodes[ceNodeId]) {
+      exitCe(true);
+      return;
+    }
+    const entry = ceEntryMarkupRef.current;
+    if (entry !== null && (project.components[ceNodeId] ?? "") !== entry) {
+      exitCe(true);
+    }
+  }, [project.manifest.nodes, project.components, ceNodeId, exitCe]);
 
   // --- drag / resize ---------------------------------------------------------
 
@@ -482,19 +706,57 @@ export function DesignCanvas({
   const totalNodeCount = Object.keys(project.manifest.nodes).length;
   const dotSize = 22 * zoom;
 
+  // Color-token swatches for the CE toolbar (recomputed only when tokens change).
+  const ceSwatches = useMemo(() => colorTokens(tokens ?? {}), [tokens]);
+
+  // Tool switches. Move clears any in-progress region; Spot Edit drops node selection
+  // and commits/exits any CE session (prototype parity).
+  const onSelectMove = useCallback(() => {
+    setTool("move");
+    spotRef.current?.cancel();
+  }, []);
+  const onSelectAi = useCallback(() => {
+    setTool("ai");
+    selectNode(null);
+    if (ceNodeIdRef.current) exitCe();
+  }, [selectNode, exitCe]);
+
+  // Run analysis: hand the polygon (world coords) + prompt UP, then leave the tool
+  // (the parent starts the sequential edit chain). The region is cleared here so the
+  // chain runs without a lingering overlay (prototype keeps it shimmering via busy;
+  // we clear immediately because the canvas has no per-run completion signal — the
+  // parent owns `spotBusy` over its OWN nodes' generating shimmer instead).
+  const onSpotAnalyze = useCallback(
+    (polygonWorldPts: Point[], prompt: string) => {
+      onRegionAnalyze?.(polygonWorldPts, prompt);
+      spotRef.current?.cancel();
+      setTool("move");
+    },
+    [onRegionAnalyze],
+  );
+
   return (
     <div className="canvas-wrap" ref={wrapRef}>
       <div
         ref={viewportRef}
         className="canvas-viewport"
-        data-tool="move"
+        data-tool={tool}
         style={{
           backgroundImage:
             "radial-gradient(circle, #DDD1BE 1px, transparent 1px)",
           backgroundSize: `${dotSize}px ${dotSize}px`,
           backgroundPosition: `${pan.x}px ${pan.y}px`,
         }}
-        onPointerDown={() => selectNode(null)}
+        onPointerDown={(e) => {
+          // Spot Edit: an empty-viewport press starts drawing a region (over nodes too).
+          if (tool === "ai") {
+            spotRef.current?.startDraw(e.clientX, e.clientY);
+            return;
+          }
+          // Click outside any node commits + exits CE before clearing selection.
+          if (ceNodeIdRef.current) exitCe();
+          selectNode(null);
+        }}
       >
         <div
           ref={worldRef}
@@ -513,24 +775,51 @@ export function DesignCanvas({
             const rawMarkup = project.components[id] ?? "";
             const heightStyle =
               typeof node.h === "number" ? { height: node.h } : {};
+            const inCe = id === ceNodeId;
             return (
               <div
                 key={id}
                 data-node-id={id}
-                className={"node-host" + (id === selectedId ? " sel" : "")}
+                className={
+                  "node-host" +
+                  (id === selectedId && tool !== "ai" ? " sel" : "") +
+                  (inCe ? " content" : "")
+                }
                 style={{
                   left: node.x,
                   top: node.y,
                   width: node.w,
                   zIndex: node.z,
-                  cursor: "grab",
+                  cursor: inCe ? "default" : "grab",
                   ...heightStyle,
                 }}
-                onPointerDown={(e) => beginDrag(id, "move", e)}
+                onPointerDown={(e) => {
+                  // Spot Edit: let the press bubble to the viewport so the region can
+                  // be drawn OVER nodes (prototype parity).
+                  if (tool === "ai") return;
+                  // In CE: swallow the press so it neither starts a node drag nor
+                  // bubbles to the viewport's commit-and-exit handler.
+                  if (inCe) {
+                    e.stopPropagation();
+                    return;
+                  }
+                  // A press on a DIFFERENT node while in CE commits + exits first.
+                  if (ceNodeIdRef.current) exitCe();
+                  beginDrag(id, "move", e);
+                }}
+                onDoubleClick={(e) => {
+                  if (tool === "ai") return;
+                  if (!inCe && ceEnabled) {
+                    e.stopPropagation();
+                    enterCe(id);
+                  }
+                }}
               >
                 <div className="node-tag">
-                  {node.name ?? id}
-                  <span className="kind">{node.kind.toUpperCase()}</span>
+                  {inCe
+                    ? `${node.name ?? id} · editing content — Esc to finish`
+                    : node.name ?? id}
+                  {!inCe && <span className="kind">{node.kind.toUpperCase()}</span>}
                 </div>
                 <div
                   className="node-card"
@@ -539,7 +828,48 @@ export function DesignCanvas({
                     boxShadow: node.flat ? "none" : undefined,
                   }}
                 >
-                  <NodeContent markup={rawMarkup} generating={generating} />
+                  {inCe ? (
+                    // CE: render sanitized markup into a content root we OWN (ref'd for
+                    // serialize-on-commit) and attach the element select/hover/inline
+                    // handlers. We deliberately re-run sanitize here (NodeContent's
+                    // chokepoint) — CE only edits the LIVE DOM, never the stored string.
+                    <div
+                      className="node-content"
+                      ref={(el) => {
+                        ceContentRef.current = el;
+                      }}
+                      dangerouslySetInnerHTML={{
+                        __html: sanitizeNodeMarkup(rawMarkup),
+                      }}
+                      onMouseOver={(e) => {
+                        const t = e.target as HTMLElement;
+                        if (
+                          t !== e.currentTarget &&
+                          !t.isContentEditable
+                        ) {
+                          t.classList.add("ce-hover");
+                        }
+                      }}
+                      onMouseOut={(e) => {
+                        (e.target as HTMLElement).classList.remove("ce-hover");
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        ceSelect(
+                          e.target as HTMLElement,
+                          e.currentTarget as HTMLElement,
+                        );
+                      }}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        const t = e.target as HTMLElement;
+                        ceSelect(t, e.currentTarget as HTMLElement);
+                        ceStartText(t);
+                      }}
+                    />
+                  ) : (
+                    <NodeContent markup={rawMarkup} generating={generating} />
+                  )}
                 </div>
                 {generating && (
                   <div
@@ -550,7 +880,10 @@ export function DesignCanvas({
                 <div className="node-ring" style={{ borderRadius: radius + 3 }} />
                 <div
                   className="node-handle"
-                  onPointerDown={(e) => beginDrag(id, "resize", e)}
+                  onPointerDown={(e) => {
+                    if (tool === "ai" || inCe) return;
+                    beginDrag(id, "resize", e);
+                  }}
                 />
               </div>
             );
@@ -597,11 +930,45 @@ export function DesignCanvas({
         </div>
       )}
 
-      <ToolPill />
+      <ToolPill
+        tool={tool}
+        onSelectMove={onSelectMove}
+        onSelectAi={spotEnabled ? onSelectAi : onSelectMove}
+      />
+
+      {/* Spot Edit overlay — present only when the tool is active or a region exists.
+          It owns its region state; the canvas calls startDraw via spotRef. */}
+      {spotEnabled && (
+        <SpotEdit
+          ref={spotRef}
+          pan={pan}
+          zoom={zoom}
+          viewportRef={viewportRef}
+          worldRef={worldRef}
+          wrapRef={wrapRef}
+          busy={spotBusy}
+          onAnalyze={onSpotAnalyze}
+        />
+      )}
+
+      {/* Content-edit toolbar — floats over the selected inner element in CE mode. */}
+      {ceEl && ceNodeId && (
+        <ContentToolbar
+          el={ceEl}
+          wrapEl={wrapRef.current}
+          version={ceVer}
+          swatches={ceSwatches}
+          onEditText={() => ceStartText(ceEl)}
+          onColor={onCeColor}
+          onMove={onCeMove}
+          onRemove={onCeRemove}
+          onAskAi={onCeAskAi}
+        />
+      )}
 
       <Inspector
         project={project}
-        selectedId={selectedId}
+        selectedId={tool === "ai" ? null : selectedId}
         onManifestChange={commitManifest}
         onProjectChange={commitProject}
         onSelect={selectNode}

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   EMPTY_TOKENS,
+  colorTokens,
   isDtcgToken,
   isValidTokensDoc,
   resolveToken,
@@ -150,5 +151,70 @@ describe("resolveToken", () => {
     expect(resolveToken("{shadow.nan}", doc)).toBe("{shadow.nan}");
     expect(resolveToken("{shadow.arr}", doc)).toBe("{shadow.arr}");
     expect(resolveToken("{shadow.bool}", doc)).toBe("{shadow.bool}");
+  });
+});
+
+describe("colorTokens", () => {
+  it("extracts {name,value} for color leaves only, in stable sorted order", () => {
+    expect(colorTokens(sample)).toEqual([
+      { name: "color.brand", value: "#c2410c" },
+      { name: "color.surface", value: "#fff7ed" },
+    ]);
+  });
+
+  it("ignores non-color and non-string/composite color values", () => {
+    const doc = {
+      color: {
+        ok: { $value: "#abcdef", $type: "color" },
+        composite: { $value: { ref: "x" }, $type: "color" }, // object -> skipped
+        empty: { $value: "   ", $type: "color" }, // blank -> skipped
+        mistyped: { $value: "#000", $type: "dimension" }, // wrong type -> skipped
+      },
+    } as unknown as DtcgDocument;
+    expect(colorTokens(doc)).toEqual([
+      { name: "color.ok", value: "#abcdef" },
+    ]);
+  });
+
+  it("caps at 6 swatches", () => {
+    const colors: Record<string, unknown> = {};
+    for (let i = 0; i < 10; i++) {
+      colors["c" + i] = { $value: `#00000${i}`, $type: "color" };
+    }
+    const doc = { color: colors } as unknown as DtcgDocument;
+    expect(colorTokens(doc)).toHaveLength(6);
+  });
+
+  it("returns [] for an empty/invalid document", () => {
+    expect(colorTokens({})).toEqual([]);
+    expect(colorTokens(null)).toEqual([]);
+    expect(colorTokens("nope")).toEqual([]);
+  });
+
+  it("filters out values that are not a conservative CSS color (injection attempts)", () => {
+    const doc = {
+      color: {
+        ok: { $value: "#abcdef", $type: "color" },
+        fn: { $value: "rgba(1, 2, 3, 0.5)", $type: "color" },
+        modern: { $value: "oklch(0.7 0.1 200)", $type: "color" },
+        named: { $value: "rebeccapurple", $type: "color" },
+        declInject: { $value: "red; position: fixed", $type: "color" }, // dropped
+        urlInject: { $value: "url(javascript:x)", $type: "color" }, // dropped
+        braceInject: { $value: "red}body{display:none", $type: "color" }, // dropped
+      },
+    } as unknown as DtcgDocument;
+    expect(colorTokens(doc)).toEqual([
+      { name: "color.fn", value: "rgba(1, 2, 3, 0.5)" },
+      { name: "color.modern", value: "oklch(0.7 0.1 200)" },
+      { name: "color.named", value: "rebeccapurple" },
+      { name: "color.ok", value: "#abcdef" },
+    ]);
+  });
+
+  it("trims and surfaces a well-formed color with surrounding whitespace", () => {
+    const doc = {
+      color: { x: { $value: "  #fff  ", $type: "color" } },
+    } as unknown as DtcgDocument;
+    expect(colorTokens(doc)).toEqual([{ name: "color.x", value: "#fff" }]);
   });
 });
