@@ -26,6 +26,7 @@
 pub mod bandit;
 pub mod cargo_audit;
 pub mod cargo_check;
+pub mod cargo_deny;
 pub mod cargo_fmt;
 pub mod clippy;
 pub mod eslint;
@@ -127,6 +128,7 @@ pub enum RunnerId {
     Clippy,
     CargoCheck,
     CargoAudit,
+    CargoDeny,
     CargoFmt,
     Tsc,
     Eslint,
@@ -161,6 +163,7 @@ impl RunnerId {
             RunnerId::Clippy
             | RunnerId::CargoCheck
             | RunnerId::CargoAudit
+            | RunnerId::CargoDeny
             | RunnerId::CargoFmt
             | RunnerId::Tsc
             | RunnerId::Knip
@@ -187,6 +190,8 @@ impl RunnerId {
     pub fn program(self) -> &'static str {
         match self {
             RunnerId::Clippy | RunnerId::CargoCheck | RunnerId::CargoAudit | RunnerId::CargoFmt => "cargo",
+            // cargo-deny ships as its own binary (a cargo subcommand shim).
+            RunnerId::CargoDeny => "cargo-deny",
             RunnerId::Tsc => "tsc",
             RunnerId::Eslint => "eslint",
             RunnerId::Knip => "knip",
@@ -248,6 +253,7 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
             out.push(RunnerId::Clippy);
             out.push(RunnerId::CargoCheck);
             out.push(RunnerId::CargoAudit);
+            out.push(RunnerId::CargoDeny);
             out.push(RunnerId::CargoFmt);
         }
         FileLang::Ts if kinds.contains(&ProjectKind::Node) => {
@@ -427,6 +433,34 @@ pub fn run_capture_with_timeout(
     root: &Path,
     timeout: Duration,
 ) -> Option<String> {
+    run_capture_stream_with_timeout(program, args, root, timeout, false)
+}
+
+/// Like [`run_capture_with_timeout`] but captures STDERR (draining stdout):
+/// some tools (cargo-deny) emit their line-delimited JSON diagnostics there.
+/// OPT-IN per runner that needs it — every cap, kill and privacy rule of the
+/// stdout path applies unchanged (captured bytes go to the caller's PURE
+/// parser; they are never logged).
+pub fn run_capture_stderr_with_timeout(
+    program: &str,
+    args: &[&str],
+    root: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    run_capture_stream_with_timeout(program, args, root, timeout, true)
+}
+
+/// Stream-parametric core: `capture_stderr` selects which pipe feeds the
+/// capped reader; the OTHER pipe is drained to a sink (full-pipe deadlock
+/// guard). Variable names below keep the historical stdout-centric names —
+/// "stdout_handle" is "the captured stream's handle".
+fn run_capture_stream_with_timeout(
+    program: &str,
+    args: &[&str],
+    root: &Path,
+    timeout: Duration,
+    capture_stderr: bool,
+) -> Option<String> {
     let mut cmd = build_command(program);
     cmd.args(args)
         .current_dir(root)
@@ -456,13 +490,24 @@ pub fn run_capture_with_timeout(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     let overran_flag = Arc::new(AtomicBool::new(false));
-    let stdout_handle = child.stdout.take().map(|mut pipe| {
+    let capture_src: Option<Box<dyn Read + Send>> = if capture_stderr {
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)
+    } else {
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)
+    };
+    let drain_src: Option<Box<dyn Read + Send>> = if capture_stderr {
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>)
+    } else {
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)
+    };
+    let stdout_handle = capture_src.map(|mut pipe| {
         let flag = Arc::clone(&overran_flag);
         std::thread::spawn(move || read_capped(&mut pipe, MAX_STDOUT_BYTES, &flag))
     });
-    // Drain stderr to /dev/null so a tool that floods stderr can't deadlock on a
-    // full pipe. Contents are discarded (privacy: stderr can echo matched values).
-    let stderr_handle = child.stderr.take().map(|mut pipe| {
+    // Drain the OTHER stream to /dev/null so a tool that floods it can't
+    // deadlock on a full pipe. Contents are discarded (privacy: either stream
+    // can echo matched values).
+    let stderr_handle = drain_src.map(|mut pipe| {
         std::thread::spawn(move || {
             let mut sink = std::io::sink();
             let _ = std::io::copy(&mut pipe, &mut sink);
@@ -527,13 +572,15 @@ pub fn run_capture_with_timeout(
     }
     if overran {
         eprintln!(
-            "censor: runner '{program}' stdout exceeded {} bytes at {} (overrun)",
+            "censor: runner '{program}' {} exceeded {} bytes at {} (overrun)",
+            if capture_stderr { "stderr" } else { "stdout" },
             MAX_STDOUT_BYTES,
             root.display()
         );
         return None;
     }
 
+    // "stdout" here = the CAPTURED stream (stderr when capture_stderr).
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let success = status.map(|s| s.success()).unwrap_or(false);
     if stdout.is_empty() && !success {
