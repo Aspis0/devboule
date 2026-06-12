@@ -57,8 +57,53 @@ fn resolve_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Str
         if cwd_path.exists() {
             return Ok(cwd_path);
         }
+        // Nothing found anywhere: bootstrap a minimal default at the CWD so a fresh
+        // checkout (config.json is per-machine and untracked) gets a working app with
+        // zero manual setup. NEVER create in the resource dir (read-only in a packaged
+        // build); CWD only. If the CWD is not writable, fall through to the original
+        // not-found error so callers still fail cleanly.
+        if let Ok(path) = bootstrap_default_config(&cwd) {
+            return Ok(path);
+        }
     }
     Err("config.json not found in resource dir, parent of CWD, or CWD".into())
+}
+
+/// Create a minimal default `config.json` (`{}`) in `dir` and return its path.
+///
+/// `{}` is the smallest content every config reader accepts: the design registry,
+/// custom-agent-clients, mini-coder/censor RMW writers and the roles trust anchor all
+/// treat a missing key as "unset" and only require the top-level value to be a JSON
+/// object; agents.rs uses mere existence of the file as an app-root marker. This matches
+/// the `"{}"` fixtures already used in the agents.rs management-root tests.
+///
+/// The write is atomic (temp + rename, reusing `replace_file_with_backup` exactly as
+/// `design.rs` does); since the target does not exist no backup is ever taken. Returns
+/// `Err` (never panics) when `dir` is not writable so the caller can fall back.
+fn bootstrap_default_config(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use backend::fs_replace::replace_file_with_backup;
+    use backend::projects::config_write_lock;
+    use chrono::Utc;
+
+    let path = dir.join("config.json");
+    // Serialize against every other config.json writer (Settings RMW savers, design
+    // registry) so the bootstrap write and a concurrent save can never race over the
+    // same temp+rename idiom. Neither caller (`setup()` nor `resolve_config_path`) holds
+    // this lock, so acquiring it here cannot recurse/deadlock (std Mutex is non-reentrant).
+    let _config_guard = config_write_lock()
+        .lock()
+        .map_err(|_| "Config write lock is poisoned.".to_string())?;
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let temp_path = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup_path = path.with_extension(format!("json.{suffix}.bak"));
+    fs::write(&temp_path, "{}\n")
+        .map_err(|e| format!("Could not write a default config.json in {}: {e}", dir.display()))?;
+    replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")?;
+    Ok(path)
 }
 
 fn require_config_auth(state: &BackendState) -> Result<(), String> {
@@ -96,6 +141,85 @@ mod tests {
         assert!(validate_external_url("http://dash.cloudflare.com").is_err());
         assert!(validate_external_url("https://evil.example").is_err());
         assert!(validate_external_url("https://user:pass@dash.cloudflare.com").is_err());
+    }
+
+    fn bootstrap_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-config-bootstrap-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bootstrap_creates_a_valid_default_config_when_missing() {
+        let dir = bootstrap_tmp_dir("missing");
+        let path = bootstrap_default_config(&dir).expect("bootstrap should create the config");
+        assert_eq!(path, dir.join("config.json"));
+        assert!(path.exists(), "the default config.json must exist on disk");
+        let content = fs::read_to_string(&path).unwrap();
+        // Must parse as a JSON object (every reader requires `value.is_object()`).
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(value.is_object(), "default config must be a JSON object");
+        assert!(
+            value.as_object().unwrap().is_empty(),
+            "default config must be the empty object {{}}"
+        );
+        // No temp/backup artifacts left behind by the atomic write.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.json")
+            .collect();
+        assert!(leftovers.is_empty(), "no temp/backup files: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_helper_is_idempotent_for_byte_content() {
+        // The locate function only calls bootstrap when no config exists anywhere, but
+        // verify the helper itself writes byte-identical content so an accidental second
+        // call on an already-default file is a no-op in practice. A second call DOES
+        // overwrite (the helper takes no backup of the empty `{}` it would re-create),
+        // so the second run exercises the temp+rename idiom over an existing target —
+        // assert it leaves NO *.tmp / *.bak artifacts behind.
+        let dir = bootstrap_tmp_dir("existing");
+        let first = bootstrap_default_config(&dir).unwrap();
+        let first_bytes = fs::read(&first).unwrap();
+        let second = bootstrap_default_config(&dir).unwrap();
+        let second_bytes = fs::read(&second).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first_bytes, second_bytes,
+            "re-bootstrapping the default must be byte-identical"
+        );
+        // No transient temp/backup artifacts left behind by the second (overwriting) run.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no *.tmp / *.bak artifacts after re-bootstrap: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_errors_cleanly_when_dir_is_not_writable() {
+        // Seam test: a non-existent parent directory makes the temp write fail, exercising
+        // the same Err path an unwritable dir would (Windows read-only dirs don't reliably
+        // block file creation, so we drive the logic through a missing-dir seam instead).
+        let missing = bootstrap_tmp_dir("unwritable").join("does-not-exist");
+        let res = bootstrap_default_config(&missing);
+        assert!(res.is_err(), "bootstrap into a missing dir must Err, not panic");
+        let _ = fs::remove_dir_all(missing.parent().unwrap());
     }
 }
 
@@ -196,6 +320,24 @@ pub fn run() {
                     .expect("release: app_data_dir required for Oracle data root");
                 oracle::python_oracle::set_oracle_data_root(&dir);
             }
+            // Bootstrap the per-machine `config.json` EAGERLY, before any projects-dir
+            // resolution below. On a fresh checkout config.json is untracked and absent;
+            // `resolve_projects_dir` / `resolve_management_root` treat a config-bearing
+            // cwd (or its parent) as the management root. If we waited for the first
+            // `get_config` to lazily bootstrap it, this `setup()` would resolve the
+            // projects dir to `<app_data>/projects` and `oracle_service::init` would
+            // publish `.oracle-server.json` there, while agents (resolving later, after
+            // the lazy bootstrap created cwd/config.json) would look in `cwd/projects` —
+            // so the Oracle would appear OFFLINE for the entire first session and only
+            // self-heal on restart. Resolving it here first makes both resolutions agree.
+            //
+            // We call `resolve_config_path` (not `bootstrap_default_config` directly) so
+            // an EXISTING config is found and returned untouched — only a genuine
+            // "nothing found anywhere" triggers the lazy bootstrap at the CWD. This is
+            // exactly the same search+bootstrap `get_config` would run, just pulled
+            // forward. Best-effort: if it Errs (e.g. unwritable CWD) we proceed exactly
+            // as before; the lazy path in `resolve_config_path` remains the safety net.
+            let _ = resolve_config_path(app.handle());
             // Record the projects dir for the resident-Oracle discovery file. The
             // resolution mirrors `backend::projects::projects_dir` (env override,
             // then a config-bearing cwd/parent, then the app data dir) so the
