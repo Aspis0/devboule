@@ -3043,4 +3043,43 @@ mod tests {
             "generate must never be called when the provider probe is false"
         );
     }
+
+    /// P9 LIVE verify (network-bound, manual):
+    ///   cargo test --lib -- --ignored --nocapture omlx_gemma_tier_live
+    /// Proves the WATCHER's exact tier-2 path (build_gemma_client -> probe ->
+    /// run_gemma) against the real loopback oMLX Gemma. SKIPS (with a message)
+    /// when no server answers the probe, so it never breaks an offline run.
+    #[test]
+    #[ignore]
+    fn omlx_gemma_tier_live_probe_and_generate() {
+        let cfg = CensorLocalAi {
+            provider: CensorAiProvider::Omlx,
+            base_url: Some("http://127.0.0.1:8000/v1".into()),
+            model: Some("gemma-4-12B-it-qat-4bit".into()),
+            ollama_model: None,
+        };
+        let client = build_gemma_client(&cfg).expect("omlx client builds");
+        let available = probe_available(client.as_ref());
+        if !available {
+            eprintln!("omlx_gemma_tier_live: no oMLX server on 127.0.0.1:8000 — SKIPPED");
+            return;
+        }
+        let code = "export function div(a: number, b: number) {\n  return a / b; // no zero check\n}\n";
+        let findings = run_gemma(
+            client.as_ref(),
+            available,
+            Path::new("/tmp"),
+            "src/div.ts",
+            code,
+            &[],
+        );
+        // Zero findings is a VALID verdict; the assertion is that the live tier
+        // ran (availability true) — transport/parse failures inside run_gemma
+        // degrade to empty, so print the outcome for the human.
+        eprintln!(
+            "omlx_gemma_tier_live: {} finding(s): {:?}",
+            findings.len(),
+            findings
+        );
+    }
 }

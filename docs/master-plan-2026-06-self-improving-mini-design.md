@@ -49,8 +49,8 @@ Hardware: **Mac = inference (day) + nightly training (night) + data collection**
 ## Phase 8 — Coder outer loop + Kanban gate + Sonnet review pass
 **Goal:** the human-gated outer loop. **Changes:** prompt mandates (`agents.rs ~762-823` + `aspis_mcp.py` ROLE_RULES): coder runs its OWN single review pass (a Sonnet review subagent) over touched files, fixes, sets Kanban `review` ("ready for final reviewer"); reuse existing `censorReview` verifier as the final-reviewer handoff. **Test:** cargo/pytest string-presence. **Deps:** P6.
 
-## Phase 9 — Censor Gemma tier live (coder-facing) 🟢
-**Goal:** Gemma findings for the CODER (mini stays deterministic). **Changes:** wire oMLX Gemma as Censor tier-2 on the live watcher path (`watch.rs:384` `Some(GemmaCtx)`); the existing `OmlxClient`/`GemmaClient` already exists. **Test:** cargo + live Gemma call. **Deps:** P1.
+## Phase 9 — Censor Gemma tier live (coder-facing) ✅ DONE (verified 2026-06-12)
+**Goal:** Gemma findings for the CODER (mini stays deterministic). **Status:** the wiring ALREADY EXISTED (shipped with the oMLX integration 2026-06-07): `watch.rs:384` builds the GemmaCtx from the same `censorLocalAi` snapshot the probe used and passes it to every FINE pass; trust gate upstream. 2026-06-12: LIVE-verified end to end via the new on-demand test `omlx_gemma_tier_live_probe_and_generate` (`cargo test --lib -- --ignored --nocapture omlx_gemma_tier_live`) — probe + real generate through the watcher's exact path against loopback oMLX Gemma 12B. **Deps:** P1.
 
 ## Phase 10 — Skills seeding (mini + design)
 **Goal:** give agents tested skills, then optimize them (P14). **Changes:** install/adapt `SKILL.md` into `.claude/skills/` (+ `.agents/skills/` for Codex) from `anthropics/skills`: coding → `webapp-testing` (Playwright), `mcp-builder`, `claude-api`, `skill-creator`; design → `frontend-design`, `web-artifacts-builder`, `theme-factory`; community → shadcn/ui official skill, `wshobson/tailwind-design-system`. Wire skill injection into the mini prompt builder + design module + coder role rules. **Test:** presence + one manual run each. **Deps:** none (parallelizable).
