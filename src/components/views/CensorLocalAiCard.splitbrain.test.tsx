@@ -18,7 +18,13 @@ import type { AppConfig } from "../../types/config";
 
 let currentConfig: unknown;
 const refreshConfig = vi.fn(async () => undefined);
-const invokeMock = vi.fn(async (_name: string, _args?: unknown) => null);
+const invokeMock = vi.fn(async (name: string, _args?: unknown) =>
+  // The card now runs provider detection on mount (model datalist); keep it
+  // inert and EXCLUDE it from save-call assertions via saveCalls() below.
+  name === "detect_providers" ? [] : null,
+);
+const saveCalls = () =>
+  invokeMock.mock.calls.filter(([name]) => name === "set_censor_local_ai");
 
 vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (name: string, args?: unknown) => invokeMock(name, args),
@@ -76,8 +82,8 @@ describe("CensorLocalAiCard split-brain preservation", () => {
       saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    expect(invokeMock).toHaveBeenCalledTimes(1);
-    const [name, args] = invokeMock.mock.calls[0];
+    expect(saveCalls()).toHaveLength(1);
+    const [name, args] = saveCalls()[0];
     expect(name).toBe("set_censor_local_ai");
     const cfg = (args as { config: Record<string, unknown> }).config;
     expect(cfg.provider).toBe("ollama");
@@ -101,8 +107,8 @@ describe("CensorLocalAiCard split-brain preservation", () => {
       saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    expect(invokeMock).toHaveBeenCalledTimes(1);
-    const cfg = (invokeMock.mock.calls[0][1] as { config: Record<string, unknown> }).config;
+    expect(saveCalls()).toHaveLength(1);
+    const cfg = (saveCalls()[0][1] as { config: Record<string, unknown> }).config;
     expect(cfg.provider).toBe("appleFm");
     expect(cfg).toEqual({ provider: "appleFm", model: "mlx-community/gemma" });
     expect(cfg).not.toHaveProperty("baseUrl");
@@ -127,7 +133,7 @@ describe("CensorLocalAiCard split-brain preservation", () => {
     await act(async () => {
       saveBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    const cfg = (invokeMock.mock.calls[0][1] as { config: Record<string, unknown> })
+    const cfg = (saveCalls()[0][1] as { config: Record<string, unknown> })
       .config;
     expect(cfg.provider).toBe("ollama");
     expect("ollamaModel" in cfg).toBe(false);

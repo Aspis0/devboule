@@ -17,7 +17,12 @@ import {
   MINI_COMMAND_MAX_LENGTH,
   MINI_BASE_URL_MAX_LENGTH,
 } from "../agents/miniCoderBackend";
+import {
+  buildProviderStatusMap,
+  type ProviderStatusMap,
+} from "../design/designProviderDetection";
 import type {
+  DetectedProvider,
   MiniCoderBackend,
   MiniCoderBackendKind,
 } from "../../types/config";
@@ -58,6 +63,31 @@ export function MiniCoderBackendCard() {
 
   const [kind, setKind] = useState<MiniCoderBackendKind>(current?.kind ?? "codex");
   const [model, setModel] = useState(current?.model ?? "");
+  const [detected, setDetected] = useState<DetectedProvider[] | null>(null);
+  const detectId = useRef(0);
+  const runDetect = useCallback(async () => {
+    const id = detectId.current + 1;
+    detectId.current = id;
+    try {
+      const result = await invokeBackendCommand<DetectedProvider[]>("detect_providers");
+      if (mountedRef.current && detectId.current === id) {
+        setDetected(Array.isArray(result) ? result : []);
+      }
+    } catch {
+      // Degrade silently to a free-text input.
+    }
+  }, []);
+  useEffect(() => {
+    void runDetect();
+  }, [runDetect]);
+  const statusMap: ProviderStatusMap = useMemo(
+    () => buildProviderStatusMap(detected),
+    [detected],
+  );
+  const detectedModels = useMemo(
+    () => (kind === "ollama" || kind === "omlx" ? statusMap[kind].models : []),
+    [kind, statusMap],
+  );
   const [command, setCommand] = useState(current?.command ?? "");
   // oMLX base URL draft field. The selector + input land in oMLX-P3; tracked here now
   // so the shared draft type-checks and a saved omlx config round-trips into the form.
@@ -223,8 +253,16 @@ export function MiniCoderBackendCard() {
               onChange={(event) => setModel(event.target.value)}
               placeholder={kind === "appleFm" ? "default" : kind === "codex" ? "gpt-5-codex" : "qwen2.5-coder"}
               maxLength={MINI_MODEL_MAX_LENGTH}
+              list={detectedModels.length ? "mini-coder-detected-models" : undefined}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             />
+            {detectedModels.length ? (
+              <datalist id="mini-coder-detected-models">
+                {detectedModels.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            ) : null}
             {showModelError && (
               <span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
                 {validation.errors.model}

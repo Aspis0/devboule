@@ -65,7 +65,7 @@ pub(crate) fn install_in_progress() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OracleRuntimeSetup {
-    /// A usable Python 3.9+ interpreter (venv or system) was found.
+    /// A usable Python 3.10+ interpreter (venv or system) was found.
     pub python_found: bool,
     /// True while the runtime probe could not reach a definitive verdict because
     /// the machine was busy (a probe timed out or failed to spawn transiently).
@@ -174,7 +174,10 @@ pub fn resolve_oracle_python() -> String {
             return trimmed.to_string();
         }
     }
-    default_python_command().to_string()
+    // Version-gated system detection (cached); only if NOTHING >= 3.10 exists do
+    // we degrade to the legacy bare default (whose failure mode is at least a
+    // clear "no such interpreter" rather than a 3.9 syntax-error traceback).
+    cached_system_python().unwrap_or_else(|| default_python_command().to_string())
 }
 
 /// FAIL-CLOSED variant of [`resolve_oracle_python`] for SPAWNING the resident
@@ -209,6 +212,26 @@ fn default_python_command() -> &'static str {
     } else {
         "python3"
     }
+}
+
+/// Pure seam for the fallback: a detection is usable as a `Command::new`
+/// program only when it is `Found` with a single-token argv.
+fn system_python_program(detection: PythonDetection) -> Option<String> {
+    match detection {
+        PythonDetection::Found { argv, .. } if argv.len() == 1 => Some(argv[0].clone()),
+        _ => None,
+    }
+}
+
+/// Best usable SYSTEM interpreter (version-gated detection, >= 3.10), cached
+/// for the process lifetime so `resolve_oracle_python` stays cheap per request.
+/// Without this, the bare-`python3` fallback can land on the macOS Xcode CLT
+/// Python 3.9, which cannot parse the oracle package at all.
+fn cached_system_python() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| system_python_program(detect_system_python()))
+        .clone()
 }
 
 // --- system python detection (only needed to CREATE the venv) ---------------
@@ -267,16 +290,16 @@ fn run_capture(
 }
 
 /// Outcome of probing ONE interpreter candidate. The crucial distinction is
-/// between a probe that RAN and proved the candidate is not Python ≥3.9
+/// between a probe that RAN and proved the candidate is not Python ≥3.10
 /// (`NotPython`) and a probe that could not produce a trustworthy answer because
 /// the machine was busy — it timed out or the spawn failed transiently
 /// (`Inconclusive`). The latter must NOT be reported to the user as "no Python
 /// installed", only as "still checking".
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeOutcome {
-    /// Ran successfully and parsed a Python ≥3.9 version banner.
+    /// Ran successfully and parsed a Python ≥3.10 version banner.
     Found(String),
-    /// Ran to completion but is not a usable Python ≥3.9 (non-zero exit, old
+    /// Ran to completion but is not a usable Python ≥3.10 (non-zero exit, old
     /// version, or unparseable banner). A definitive negative.
     NotPython,
     /// No trustworthy answer: the probe timed out or the process could not be
@@ -294,7 +317,7 @@ enum PythonDetection {
         argv: Vec<String>,
         version: String,
     },
-    /// Every candidate RAN and none is Python ≥3.9 — a definitive negative.
+    /// Every candidate RAN and none is Python ≥3.10 — a definitive negative.
     NotFound,
     /// No candidate was `Found` and at least one was `Inconclusive` (timed
     /// out / busy). The genuine answer is unknown; retry later.
@@ -342,7 +365,9 @@ fn classify_python_detection(candidates: Vec<(Vec<String>, ProbeOutcome)>) -> Py
     }
 }
 
-/// Parse a `Python 3.x.y` version banner and require >= 3.9.
+/// Parse a `Python 3.x.y` version banner and require >= 3.10 (the runtime deps
+/// — torch / sentence-transformers / lancedb — do not install on 3.9, which is
+/// what the macOS Xcode CLT `python3` ships).
 fn parse_python_version(text: &str) -> Option<String> {
     let token = text
         .split_whitespace()
@@ -350,7 +375,7 @@ fn parse_python_version(text: &str) -> Option<String> {
     let mut parts = token.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-    if major > 3 || (major == 3 && minor >= 9) {
+    if major > 3 || (major == 3 && minor >= 10) {
         Some(token.to_string())
     } else {
         None
@@ -359,7 +384,7 @@ fn parse_python_version(text: &str) -> Option<String> {
 
 /// Probe one interpreter argv and classify the result into the tri-state. A
 /// timeout or spawn failure (machine busy) yields `Inconclusive`; a clean run
-/// that is not Python ≥3.9 yields `NotPython`.
+/// that is not Python ≥3.10 yields `NotPython`.
 fn probe_python_outcome(argv: &[String]) -> ProbeOutcome {
     if argv.is_empty() {
         return ProbeOutcome::NotPython;
@@ -495,7 +520,7 @@ pub fn oracle_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
                 let check = warmup_check(&argv, root);
                 (true, false, Some(argv.join(" ")), Some(version), check)
             }
-            // The probe RAN and found no Python ≥3.9 — a definitive negative.
+            // The probe RAN and found no Python ≥3.10 — a definitive negative.
             PythonDetection::NotFound => (false, false, None, None, None),
             // The probe timed out / could not spawn (machine busy). NOT a
             // definitive negative: surface a soft "still checking" status so the
@@ -522,9 +547,9 @@ pub fn oracle_runtime_setup_status(root: &Path) -> OracleRuntimeSetup {
             "Still checking the local runtime (first startup can be slow on a busy machine). Retry in a moment.".to_string(),
         );
     } else if !python_found {
-        // HARD path: detection actually RAN and found no Python ≥3.9.
+        // HARD path: detection actually RAN and found no Python ≥3.10.
         messages.push(
-            "No Python 3.9+ interpreter found. Install Python 3 to enable local Oracle retrieval."
+            "No Python 3.10+ interpreter found. Install Python 3.10+ to enable local Oracle retrieval."
                 .to_string(),
         );
     } else if !deps_ready {
@@ -651,7 +676,7 @@ pub fn run_oracle_runtime_bootstrap(
             PythonDetection::Found { argv, version } => (argv, version),
             PythonDetection::NotFound => {
                 return Err(
-                    "No Python 3.9+ interpreter found. Install Python 3 and retry.".to_string(),
+                    "No Python 3.10+ interpreter found. Install Python 3.10+ and retry.".to_string(),
                 )
             }
             // Detection couldn't reach a verdict (machine busy / probe timed
@@ -751,9 +776,12 @@ mod tests {
             Some("3.11.4".to_string())
         );
         assert_eq!(
-            parse_python_version("Python 3.9.0"),
-            Some("3.9.0".to_string())
+            parse_python_version("Python 3.10.0"),
+            Some("3.10.0".to_string())
         );
+        // 3.9 is the macOS Xcode CLT python: too old for the runtime deps
+        // (torch/sentence-transformers/lancedb need >= 3.10) — must be rejected.
+        assert_eq!(parse_python_version("Python 3.9.0"), None);
     }
 
     #[test]
@@ -761,6 +789,29 @@ mod tests {
         assert_eq!(parse_python_version("Python 3.8.10"), None);
         assert_eq!(parse_python_version("Python 2.7.18"), None);
         assert_eq!(parse_python_version("not a version"), None);
+    }
+
+    /// The system-python fallback must only accept a detection whose argv is a
+    /// SINGLE token (a bare program for `Command::new`); the Windows `py -3`
+    /// two-token launcher is install-only. Pure over the detection enum.
+    #[test]
+    fn system_python_program_filters_detection() {
+        assert_eq!(
+            system_python_program(PythonDetection::Found {
+                argv: vec!["/opt/homebrew/bin/python3".to_string()],
+                version: "3.12.0".to_string(),
+            }),
+            Some("/opt/homebrew/bin/python3".to_string())
+        );
+        assert_eq!(
+            system_python_program(PythonDetection::Found {
+                argv: vec!["py".to_string(), "-3".to_string()],
+                version: "3.12.0".to_string(),
+            }),
+            None
+        );
+        assert_eq!(system_python_program(PythonDetection::NotFound), None);
+        assert_eq!(system_python_program(PythonDetection::Inconclusive), None);
     }
 
     #[test]
@@ -809,7 +860,7 @@ mod tests {
 
     #[test]
     fn detection_notfound_only_when_all_ran_and_none_python() {
-        // Every candidate ran and none is Python ≥3.9 → definitive NotFound.
+        // Every candidate ran and none is Python ≥3.10 → definitive NotFound.
         let detection = classify_python_detection(vec![
             (vec!["python".into()], ProbeOutcome::NotPython),
             (vec!["python3".into()], ProbeOutcome::NotPython),
@@ -857,7 +908,7 @@ mod tests {
         if checking {
             message = "Still checking the local runtime (first startup can be slow on a busy machine). Retry in a moment.".to_string();
         } else if !python_found {
-            message = "No Python 3.9+ interpreter found. Install Python 3 to enable local Oracle retrieval.".to_string();
+            message = "No Python 3.10+ interpreter found. Install Python 3.10+ to enable local Oracle retrieval.".to_string();
         }
         assert!(message.contains("Still checking"));
         assert!(!message.contains("Install Python 3"));

@@ -35,10 +35,15 @@ import {
   CENSOR_MODEL_MAX_LENGTH,
   CENSOR_BASE_URL_MAX_LENGTH,
 } from "../projects/censorLocalAi";
+import {
+  buildProviderStatusMap,
+  type ProviderStatusMap,
+} from "../design/designProviderDetection";
 import type {
   CensorAiProvider,
   CensorLocalAi,
   CustomAgentClient,
+  DetectedProvider,
 } from "../../types/config";
 import type {
   WorkspaceClassificationEntry,
@@ -956,6 +961,31 @@ export function CensorLocalAiCard() {
   const [ollamaModel, setOllamaModel] = useState(
     seedCensorString((current as { ollamaModel?: unknown } | null)?.ollamaModel),
   );
+  const [detected, setDetected] = useState<DetectedProvider[] | null>(null);
+  const detectId = useRef(0);
+  const runDetect = useCallback(async () => {
+    const id = detectId.current + 1;
+    detectId.current = id;
+    try {
+      const result = await invokeBackendCommand<DetectedProvider[]>("detect_providers");
+      if (mountedRef.current && detectId.current === id) {
+        setDetected(Array.isArray(result) ? result : []);
+      }
+    } catch {
+      // Degrade silently to a free-text input.
+    }
+  }, []);
+  useEffect(() => {
+    void runDetect();
+  }, [runDetect]);
+  const statusMap: ProviderStatusMap = useMemo(
+    () => buildProviderStatusMap(detected),
+    [detected],
+  );
+  const detectedModels = useMemo(
+    () => (provider === "ollama" || provider === "omlx" ? statusMap[provider].models : []),
+    [provider, statusMap],
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedTick, setSavedTick] = useState(false);
@@ -1085,8 +1115,16 @@ export function CensorLocalAiCard() {
               onChange={(event) => setModel(event.target.value)}
               placeholder={provider === "appleFm" ? "default" : "mlx-community/gemma"}
               maxLength={CENSOR_MODEL_MAX_LENGTH}
+              list={detectedModels.length ? "censor-detected-models" : undefined}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             />
+            {detectedModels.length ? (
+              <datalist id="censor-detected-models">
+                {detectedModels.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            ) : null}
             {showModelError && (
               <span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
                 {validation.errors.model}
@@ -1101,8 +1139,16 @@ export function CensorLocalAiCard() {
               onChange={(event) => setOllamaModel(event.target.value)}
               placeholder="gemma4:e4b"
               maxLength={CENSOR_MODEL_MAX_LENGTH}
+              list={detectedModels.length ? "censor-ollama-detected-models" : undefined}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             />
+            {detectedModels.length ? (
+              <datalist id="censor-ollama-detected-models">
+                {detectedModels.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            ) : null}
             <span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
               Blank uses the default gemma4:e4b (auto-falls back to e2b).
             </span>
