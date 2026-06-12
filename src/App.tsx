@@ -238,7 +238,9 @@ function AppShell() {
 function App() {
   return (
     <AppProvider>
-      <AppShell />
+      <ErrorBoundary label="App">
+        <AppShell />
+      </ErrorBoundary>
     </AppProvider>
   );
 }

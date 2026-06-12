@@ -45,8 +45,8 @@ export function LockedScreen({
             void onUnlock();
           }}
           disabled={unlockDisabled}
-          data-help-title="Windows Hello unlock protects the Aspis Bio control app."
-          data-help-lines="This app can store cloud tokens, launch agents, and operate real infrastructure, so entry should require local Windows authentication.|Windows Hello can use PIN, face, or fingerprint depending on your Windows setup.|If camera unlock loops or fails, PIN is the safer fallback path until the Hello issue is fixed.|Unlock does not start cloud writes by itself; it only opens the management dashboard."
+          data-help-title="Device unlock protects the Aspis Bio control app."
+          data-help-lines="This app can store cloud tokens, launch agents, and operate real infrastructure, so entry should require local device authentication.|Unlock uses Windows Hello on Windows and Touch ID on macOS — PIN, face, or fingerprint depending on your setup.|If biometric unlock loops or fails, the system PIN/password is the safer fallback path.|Unlock does not start cloud writes by itself; it only opens the management dashboard."
           className="inline-flex items-center gap-2.5 px-6 py-3 rounded-2xl
                      bg-terracotta text-white text-[14px] font-medium
                      hover:bg-terracotta-500 active:bg-terracotta-600
@@ -56,22 +56,22 @@ export function LockedScreen({
         >
           <Fingerprint className="w-5 h-5" />
           {isLoading
-            ? "Waiting for Windows Hello..."
+            ? "Waiting for device authentication..."
             : unlockRetryBlocked
               ? "Retry in a moment"
             : !desktopRuntimeAvailable
-              ? "Open Windows app"
+              ? "Open the desktop app"
               : helloUnavailable
-              ? "Windows Hello unavailable"
-              : "Unlock with Windows Hello"}
+              ? "Device authentication unavailable"
+              : "Unlock"}
         </button>
 
         {(error || !desktopRuntimeAvailable || helloUnavailable) && (
           <p className="max-w-sm text-[12px] leading-5 text-coral-dark mt-4">
             {error ||
               (!desktopRuntimeAvailable
-                ? "Browser preview cannot access Tauri or Windows Hello. Launch Aspis Management as the Windows desktop app."
-                : "Set up Windows Hello PIN, face, or fingerprint in Windows Settings before using this app.")}
+                ? "Browser preview cannot access Tauri or device authentication. Launch Aspis Management as the desktop app."
+                : "Set up device authentication (Windows Hello or Touch ID) in your system settings before using this app.")}
           </p>
         )}
 

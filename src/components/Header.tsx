@@ -373,7 +373,7 @@ export function Header() {
         <button
           onClick={lock}
           data-help-title="This locks the app again."
-          data-help-lines="Locking hides the dashboard behind Windows Hello.|It does not stop background provider data already loaded in memory.|Use it before leaving the PC unattended.|Unlock again with PIN, camera, or fingerprint depending on Windows Hello."
+          data-help-lines="Locking hides the dashboard behind device authentication (Windows Hello or Touch ID).|It does not stop background provider data already loaded in memory.|Use it before leaving the computer unattended.|Unlock again with PIN, face, or fingerprint depending on your system setup."
           className="p-2.5 rounded-2xl hover:bg-cream-100 transition-colors"
           title="Lock app"
         >

@@ -380,21 +380,31 @@ export async function invokeBackendCommand<T>(
 ): Promise<T> {
   if (!isTauriRuntime()) {
     throw new Error(
-      "Aspis Management must be opened from the Windows app to use Windows Hello.",
+      "Aspis Management must be opened as the desktop app to use device authentication.",
     );
   }
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(command, args);
 }
 
+// Normalize raw config to prevent shell crashes from bootstrapped/invalid configs (e.g. {}).
+// Exported for the regression test (the macOS white-screen bug: `{}` config →
+// `config.navigation.some` threw in Sidebar with no shell error boundary).
+export function normalizeConfig(raw: unknown): AppConfig {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return EMPTY_CONFIG;
+  }
+  return { ...EMPTY_CONFIG, ...(raw as Partial<AppConfig>) };
+}
+
 async function fetchConfig(): Promise<AppConfig> {
   try {
     const result = await invokeBackendCommand<{ raw: AppConfig }>("get_config");
-    return result.raw;
+    return normalizeConfig(result.raw);
   } catch (e) {
     if (isTauriRuntime()) throw e;
     const resp = await fetch("/config.json");
-    if (resp.ok) return (await resp.json()) as AppConfig;
+    if (resp.ok) return normalizeConfig(await resp.json());
     throw e;
   }
 }
@@ -2228,7 +2238,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setError(null);
     try {
       if (!isDesktopRuntime) {
-        throw new Error("Open the Windows desktop app to use Windows Hello.");
+        throw new Error("Open the desktop app to use device authentication.");
       }
       const next = await invokeBackendCommand<AuthState>("request_unlock", {
         reason: "Unlock Aspis Management",
@@ -2240,12 +2250,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       applyAuthState(next);
       if (next.locked) {
         startUnlockRetryCooldown();
-        setError("Windows Hello did not unlock the app.");
+        setError("Device authentication did not unlock the app.");
       }
     } catch (e) {
       setIsLocked(true);
       startUnlockRetryCooldown();
-      setError(e instanceof Error ? e.message : "Windows Hello unlock failed.");
+      setError(e instanceof Error ? e.message : "Device authentication failed.");
     } finally {
       unlockInFlightRef.current = false;
       setIsLoading(false);
