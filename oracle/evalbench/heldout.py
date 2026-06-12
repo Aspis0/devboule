@@ -12,13 +12,26 @@ NOT integrated here.
 DATA-QUALITY NOTE (live smoke 2026-06-12): pair records whose "task" field is a
 short TITLE (the early hand-exported pairs) score ~0 by construction — the model
 never saw the real emit-edits contract. The frozen held-out slice should come
-from the LIVE P7 rail (directive_result records carry the full task text), or
-from pairs whose "task" embeds the complete prompt of record.
+from the LIVE P7 rail, BUT the raw rail records (directive_result /
+write_preimages / write_fix_pair) lack the rejected/chosen fields this harness
+requires — they need a JOIN step into 4-field pair records first (future
+`eval_pair` emitter). Pointing the harness at a raw pairs.jsonl yields total=0
+with everything in skippedMalformed (a warning is printed).
+
+SCOPE (max-recall review): these gates measure OUTPUT FORMAT COMPLIANCE only —
+they cannot tell a semantically better edit from a worse one, and `chosen` /
+`rejected` are schema-validation fields, never compared against the output.
+A strictlyImproves verdict means "better-formatted", nothing more.
+
+Loopback-only: base_url is pinned to 127.0.0.1/localhost/::1 (fail-closed, like
+vault.rs and answerer.py) — pair tasks embed real source code and must never be
+POSTed off-machine.
 """
 
 import argparse
 import json
 import re
+import sys
 import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional
@@ -32,17 +45,34 @@ def strip_fences(output: str) -> str:
     if match:
         return match.group(1).strip()
     if cleaned.startswith('```'):
-        cleaned = cleaned.strip('`').strip()
-        if cleaned.startswith('json'):
-            cleaned = cleaned[4:].strip()
+        # PREFIX-only removal (review fix): str.strip('`') would also eat
+        # backticks embedded at the END of the content.
+        cleaned = re.sub(r'^`{3}\w*\n?', '', cleaned).strip()
+        if cleaned.endswith('```'):
+            cleaned = cleaned[:-3].strip()
     return cleaned
 
 
+def extract_edits(parsed: Any) -> Optional[List[Any]]:
+    """Normalize the two REAL output shapes to an edit list.
+
+    The live P4/P6 write contract is a WRAPPER OBJECT
+    {"status": ..., "edits": [...], ...}; bare arrays are the legacy/manual
+    form. Anything else -> None. (Review fix: the first skeleton only accepted
+    bare arrays — a model perfectly following the live contract scored 0.)
+    """
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get('edits'), list):
+        return parsed['edits']
+    return None
+
+
 def score_json_array(output: str) -> bool:
-    """Parse output as a JSON list after stripping markdown fences."""
+    """Parse output as an edit list (bare array OR live wrapper object)."""
     try:
         parsed = json.loads(strip_fences(output))
-        return isinstance(parsed, list)
+        return extract_edits(parsed) is not None
     except (json.JSONDecodeError, ValueError):
         return False
 
@@ -51,7 +81,11 @@ def score_edit_schema(edits: Any) -> bool:
     """Check if edits is a list of objects with required keys."""
     if not isinstance(edits, list):
         return False
-    
+    # Review fix (BLOCKER): an EMPTY list must fail — a no-op model emitting []
+    # for every task would otherwise score acceptRate=1.0 and win promotion.
+    if not edits:
+        return False
+
     required_keys = {'path', 'oldString', 'newString'}
     snake_keys = {'path', 'old_string', 'new_string'}
     
@@ -88,10 +122,11 @@ def score_output(output: str) -> Dict[str, Any]:
     schema_score = False
     no_fences_score = score_no_fences(output)
     
-    # Try to parse for schema check (same stripper as score_json_array).
+    # Try to parse for schema check (same stripper + shape normalizer).
     try:
         parsed = json.loads(strip_fences(output))
-        schema_score = score_edit_schema(parsed)
+        edits = extract_edits(parsed)
+        schema_score = score_edit_schema(edits) if edits is not None else False
     except (json.JSONDecodeError, ValueError):
         schema_score = False
         
@@ -103,6 +138,24 @@ def score_output(output: str) -> Dict[str, Any]:
     }
 
 
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # review fix: never .read() unbounded
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def require_loopback(base_url: str) -> None:
+    """Fail-closed loopback pin (mirrors vault.rs / answerer.py): pair tasks
+    embed real source code and must never be POSTed off-machine."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"Invalid base_url: {base_url}")
+    if (parsed.hostname or "").lower() not in LOOPBACK_HOSTS:
+        raise ValueError(
+            f"base_url must stay on loopback (127.0.0.1/localhost/::1), got: {base_url}"
+        )
+
+
 def replay_task(
     base_url: str,
     model: str,
@@ -111,6 +164,7 @@ def replay_task(
     enable_thinking: bool = False
 ) -> str:
     """POST to OpenAI-compatible endpoint and return message content."""
+    require_loopback(base_url)
     url = f"{base_url}/chat/completions"
     
     payload = {
@@ -135,17 +189,31 @@ def replay_task(
     
     try:
         with urllib.request.urlopen(req, timeout=timeout_secs) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            
+            result = json.loads(response.read(MAX_RESPONSE_BYTES).decode('utf-8'))
+
             # Extract content from response
             if 'choices' in result and len(result['choices']) > 0:
                 message = result['choices'][0].get('message', {})
                 content = message.get('content', '')
-                if content is None:
-                    raise RuntimeError("Empty content in response")
+                if not content:
+                    # Review fix: `content: null` (thinking-mode shape) AND
+                    # empty strings both raise — a silent empty would be
+                    # indistinguishable from "model failed every gate".
+                    has_reasoning = bool(message.get('reasoning_content'))
+                    raise RuntimeError(
+                        "Empty content in response"
+                        + (" (reasoning_content present — thinking-mode shape; "
+                           "the final answer never landed in content)" if has_reasoning else "")
+                    )
                 return content
             else:
                 raise RuntimeError("No choices in response")
+    except urllib.error.HTTPError as e:
+        # Review fix: keep the (capped) error body — "model not found" vs
+        # "context length exceeded" is the difference between a config bug
+        # and a data bug.
+        body = e.read(2048).decode('utf-8', errors='replace')
+        raise RuntimeError(f"HTTP {e.code}: {e.reason} — {body}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Transport error: {e}")
     except (json.JSONDecodeError, KeyError, IndexError) as e:
@@ -157,9 +225,11 @@ def run_heldout(
     base_url: str,
     model: str,
     limit: Optional[int] = None,
-    enable_thinking: bool = False
+    enable_thinking: bool = False,
+    timeout_secs: int = 300
 ) -> Dict[str, Any]:
     """Load pairs, replay each, score, and return results."""
+    require_loopback(base_url)
     # Load pairs
     pairs = []
     skipped_malformed = 0
@@ -200,6 +270,7 @@ def run_heldout(
                 base_url=base_url,
                 model=model,
                 task_prompt=task_prompt,
+                timeout_secs=timeout_secs,
                 enable_thinking=enable_thinking
             )
             scores = score_output(output)
@@ -213,7 +284,10 @@ def run_heldout(
             }
 
         result_entry = {
-            'task': task_prompt,
+            # Truncated provenance (review fix): the FULL task text embeds real
+            # source code; the pairs file already holds it — the results dump
+            # must not become a second plaintext copy.
+            'task': task_prompt[:160],
             'scores': scores
         }
         if error is not None:
@@ -224,6 +298,16 @@ def run_heldout(
             passed += 1
     
     total = len(results)
+    if total == 0 and skipped_malformed > 0:
+        # Review fix: a RAW P7 rail file (directive_result/write_preimages/
+        # write_fix_pair records) has none of the 4 required pair fields — every
+        # line lands here. Say so instead of returning a silent zero.
+        print(
+            f"WARNING: 0 usable pairs, {skipped_malformed} lines skipped — this "
+            "looks like a raw P7 rail file; it needs the join step into "
+            "{task, model, rejected, chosen} pair records first.",
+            file=sys.stderr,
+        )
     accept_rate = passed / total if total > 0 else 0.0
     
     return {
@@ -261,22 +345,36 @@ def main():
     parser.add_argument('--base-url', required=True, help='Base URL of the model endpoint')
     parser.add_argument('--model', required=True, help='Model name')
     parser.add_argument('--limit', type=int, default=None, help='Limit number of pairs')
-    parser.add_argument('--thinking', action='store_true', help='Enable thinking for qwen models')
+    parser.add_argument('--thinking', action='store_true', help='Enable thinking (Qwen-family models only)')
+    parser.add_argument('--timeout', type=int, default=300, help='Per-replay timeout in seconds')
     parser.add_argument('--out', type=str, default=None, help='Output JSON file path')
-    
+
     args = parser.parse_args()
-    
+
+    if args.thinking and 'qwen' not in args.model.lower():
+        print(
+            "WARNING: --thinking only affects Qwen-family models (chat_template_kwargs "
+            f"is model-name gated); '{args.model}' will ignore it.",
+            file=sys.stderr,
+        )
+
     result = run_heldout(
         pairs_path=args.pairs,
         base_url=args.base_url,
         model=args.model,
         limit=args.limit,
-        enable_thinking=args.thinking
+        enable_thinking=args.thinking,
+        timeout_secs=args.timeout
     )
-    
+
     if args.out:
-        with open(args.out, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2)
+        try:
+            with open(args.out, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2)
+        except OSError as e:
+            # Review fix: a long run's results must never be lost to a bad path.
+            print(f"WARNING: could not write {args.out}: {e}; dumping to stdout.", file=sys.stderr)
+            print(json.dumps(result, indent=2))
     else:
         print(json.dumps(result, indent=2))
 

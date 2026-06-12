@@ -256,7 +256,7 @@ ROLE_RULES = [
             "Delega a spawn_mini_coder solo sub-task economici e meccanici (boilerplate, bulk read->summary, edit semplici, docstring, test); pre-carica il contesto necessario; ragiona tu; RIVEDI l'output del mini come bozza prima di usarlo.",
             "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\").",
             "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), rifai il file TU STESSO: il rail di training ha gia' catturato il fallimento, quindi NON rilanciare ciecamente il mini sullo stesso file.",
-            "Prima di mettere un task in review: fai girare UN SOLO pass di review tuo (un subagente Sonnet) sui file che hai toccato, fixa i finding, POI sposta il task a review con una nota 'ready for final reviewer'. Il verdetto FINALE resta del verifier (handoff censorReview), mai del tuo pass.",
+            "Prima di mettere un task in review: fai girare UN SOLO pass di review tuo (un subagente Sonnet) sui file che hai toccato, fixa i finding, POI sposta il task a review con una nota 'ready for final reviewer'. Il verdetto FINALE resta del verifier (il pass finale censorReview si lancia dall'app, NON parte da solo quando metti review), mai del tuo pass.",
             "Quando produci o revisioni un artifact HTML self-contained e serve feedback visuale, chiama visual_check(html_path, focus?) e tratta la critique come evidenza advisory.",
         ],
         "contract": [

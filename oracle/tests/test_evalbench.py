@@ -40,6 +40,29 @@ class ScorerTests(unittest.TestCase):
         self.assertFalse(score_edit_schema("not a list"))
         self.assertFalse(score_edit_schema(["not an object"]))
 
+    def test_empty_edit_list_fails_the_gate(self):
+        # Review BLOCKER: a no-op model emitting [] for every task must NOT
+        # score acceptRate=1.0 and win promotion.
+        self.assertFalse(score_edit_schema([]))
+        self.assertFalse(score_output("[]")["pass"])
+
+    def test_live_wrapper_object_contract_is_accepted(self):
+        # The REAL P4/P6 write contract is a wrapper object, not a bare array.
+        wrapped = json.dumps(
+            {
+                "status": "done",
+                "output": "did it",
+                "edits": [{"path": "src/a.rs", "oldString": "x", "newString": "y"}],
+                "filesTouched": ["src/a.rs"],
+            }
+        )
+        scores = score_output(wrapped)
+        self.assertTrue(scores["json"], "wrapper object must parse as edits")
+        self.assertTrue(scores["schema"])
+        self.assertTrue(scores["pass"])
+        # A wrapper with EMPTY edits still fails (no-op trap).
+        self.assertFalse(score_output(json.dumps({"status": "done", "edits": []}))["pass"])
+
     def test_score_output_pass_requires_all_three(self):
         good = score_output(GOOD)
         self.assertTrue(good["pass"])
@@ -104,9 +127,20 @@ class RunHeldoutTests(unittest.TestCase):
             with patch(
                 "oracle.evalbench.heldout.replay_task", return_value=GOOD
             ) as mock_replay:
-                out = run_heldout(path, "u", "m", limit=2)
+                out = run_heldout(path, "http://127.0.0.1:8000/v1", "m", limit=2)
             self.assertEqual(out["total"], 2)
             self.assertEqual(mock_replay.call_count, 2)
+
+
+class LoopbackTests(unittest.TestCase):
+    def test_run_heldout_refuses_non_loopback_base_url(self):
+        # Fail-closed posture (mirrors vault.rs/answerer.py): pair tasks embed
+        # real source code — never POSTed off-machine.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "pairs.jsonl"
+            p.write_text("", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                run_heldout(str(p), "https://api.example.com/v1", "m")
 
 
 class CompareTests(unittest.TestCase):

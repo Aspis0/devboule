@@ -3046,9 +3046,13 @@ mod tests {
 
     /// P9 LIVE verify (network-bound, manual):
     ///   cargo test --lib -- --ignored --nocapture omlx_gemma_tier_live
-    /// Proves the WATCHER's exact tier-2 path (build_gemma_client -> probe ->
-    /// run_gemma) against the real loopback oMLX Gemma. SKIPS (with a message)
-    /// when no server answers the probe, so it never breaks an offline run.
+    /// Proves the tier-2 CLIENT path (build_gemma_client -> probe -> a real
+    /// generate) against loopback oMLX Gemma. Scope honesty: the watcher
+    /// additionally builds file context from the real project root (here /tmp
+    /// has no src/div.ts, so the prompt goes contextless), and run_gemma
+    /// degrades parse/transport errors to empty findings — so "0 findings"
+    /// proves the call RAN, not that the verdict pipeline is correct. SKIPS
+    /// (with a message) when no server answers, so offline runs never break.
     #[test]
     #[ignore]
     fn omlx_gemma_tier_live_probe_and_generate() {

@@ -813,7 +813,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 // (bilingual by design — English here, Italian in the Python
                 // ROLE_RULES). One pass, not a loop; the verifier keeps the
                 // final verdict via the censorReview handoff.
-                "Before moving a task to review: run ONE review pass of your own (a Sonnet review subagent) over the files you touched, fix the findings, THEN set the task to review with a 'ready for final reviewer' note. The FINAL verdict stays with the verifier (censorReview handoff) — never your own pass.",
+                "Before moving a task to review: run ONE review pass of your own (a Sonnet review subagent) over the files you touched, fix the findings, THEN set the task to review with a 'ready for final reviewer' note. The FINAL verdict stays with the verifier (the censorReview final pass, triggered from the app UI — it does NOT fire automatically when you set review) — never your own pass.",
                 "When you produce or review a self-contained HTML artifact and need visual feedback, call visual_check(html_path, focus?) and treat the returned critique as advisory evidence.",
             ]
             .into_iter()
