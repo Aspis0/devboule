@@ -1144,6 +1144,16 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // The terminal outcome (P5 killRequested-WINS). Computed off the lock.
     let outcome = finalize_outcome(directive);
 
+    // P4: apply a write directive's emitted edits BEFORE the gate decision, so
+    // the deterministic Censor below lints the tree the edits produced. The
+    // root derivation mirrors finalize_finished_mini_with (scratch parent).
+    let apply_root: Option<PathBuf> = directive
+        .scratch_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| Path::new(p).parent().map(|r| r.to_path_buf()));
+    let outcome = apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
+
     // The gate (linters) is needed ONLY for a clean, un-killed `done` on a TRUSTED tree.
     let needs_gate =
         outcome.status == MiniCoderStatus::Done && !directive.kill_requested && trusted;
@@ -1684,6 +1694,197 @@ fn real_censor_verdict(
 /// Otherwise (the normal EOF path): read the result from the PERSISTED scratch root
 /// (BLOCKER 3) and resolve to done/needs_clarification, or `failed` when the file is
 /// missing/invalid. A missing/empty persisted scratch path is itself a `failed`.
+/// P4 (review F1): lexical rel-path normalization shared by the emitted-edit
+/// paths AND the allowlist: drops empty and "." segments after `\` -> `/`
+/// normalization, so cosmetic variants cannot cause spurious allowlist misses.
+/// Purely lexical — `validate_rel_path` separately rejects `..`/absolute/drive
+/// forms, so dropping segments can never RE-ADMIT a rejected shape.
+fn normalize_edit_rel(path: &str) -> String {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// P4: hard cap on emitted edits per result (runaway-model-proof).
+const MAX_MINI_EDITS: usize = 40;
+/// P4: the plan's N<=10 cap on the ordered file-set allowlist of a write directive.
+const MAX_MINI_ALLOWLIST_FILES: usize = 10;
+
+/// P4: validate and apply the mini's emitted edits inside `project_root`,
+/// bounded by the directive's ordered file-set allowlist. The model NEVER
+/// touches disk — this is the only writer, so every guard lives here:
+///   - rel-path hygiene via `validate_rel_path` (rejects `..`, absolute, drive
+///     prefixes, `-`-leading components);
+///   - allowlist containment by EXACT byte match after `\` -> `/` normalization
+///     (deliberate for APFS: a case-variant alias of an allowlisted file is
+///     rejected on EVERY platform, so macOS and Linux CI agree);
+///   - symlink escape: an existing target must canonicalize INSIDE the
+///     canonical root; a created file's PARENT must already exist and
+///     canonicalize inside the root (no implicit directory creation);
+///   - exact-match anchors: a non-empty `old_string` must occur EXACTLY ONCE
+///     in the file's CURRENT working text (prior edits of the same batch
+///     included); an empty `old_string` means CREATE with `new_string` as the
+///     full content, valid only when the file does not exist yet;
+///   - per-call ATOMICITY against MODEL errors: pass 1 validates every edit
+///     against an in-memory copy, so any validation failure -> Err with
+///     NOTHING written. A pass-2 OS-level write error (disk full, perms) can
+///     still leave earlier files flushed — that partial state is reported in
+///     the Err and surfaces as a `failed` outcome for the coder to inspect.
+/// `pre_write(rel)` runs once per touched file just before its flush so the
+/// caller can snapshot the pre-image (training rail). Residual TOCTOU between
+/// the passes is accepted: the threat model is the MODEL's output, not a
+/// concurrent local attacker.
+fn apply_emitted_edits(
+    project_root: &Path,
+    allowlist: &[String],
+    edits: &[mini_coder::MiniEdit],
+    mut pre_write: impl FnMut(&str),
+) -> Result<Vec<String>, String> {
+    if edits.is_empty() {
+        return Ok(Vec::new());
+    }
+    if edits.len() > MAX_MINI_EDITS {
+        return Err(format!(
+            "too many edits: {} (cap {MAX_MINI_EDITS})",
+            edits.len()
+        ));
+    }
+    if allowlist.is_empty() || allowlist.len() > MAX_MINI_ALLOWLIST_FILES {
+        return Err(format!(
+            "write directives need an allowlist of 1..={MAX_MINI_ALLOWLIST_FILES} files, got {}",
+            allowlist.len()
+        ));
+    }
+    let canon_root = std::fs::canonicalize(project_root)
+        .map_err(|e| format!("project root does not canonicalize: {e}"))?;
+    // P4 (review F1): BOTH sides go through the same lexical normalizer, or a
+    // cosmetic variant on either side ("./src/a.rs" in the directive vs
+    // "src/a.rs" emitted, or vice versa) silently fails the whole write.
+    let allowed: std::collections::BTreeSet<String> =
+        allowlist.iter().map(|f| normalize_edit_rel(f)).collect();
+
+    // PASS 1 — validate in memory; nothing touches disk until every edit of
+    // every file checks out.
+    let mut contents: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (i, edit) in edits.iter().enumerate() {
+        let rel = normalize_edit_rel(&edit.path);
+        if rel.is_empty() {
+            return Err(format!("edit {i}: empty path"));
+        }
+        super::censor::ledger::validate_rel_path(&rel).map_err(|e| format!("edit {i}: {e}"))?;
+        if !allowed.contains(&rel) {
+            return Err(format!("edit {i}: {rel} is not in the directive allowlist"));
+        }
+        let abs = canon_root.join(&rel);
+        if !contents.contains_key(&rel) {
+            if edit.old_string.is_empty() {
+                // CREATE: must not exist (symlink_metadata also catches a
+                // dangling symlink squatting on the name), parent must already
+                // exist and resolve inside the root.
+                if abs.symlink_metadata().is_ok() {
+                    return Err(format!(
+                        "edit {i}: {rel} already exists (empty oldString means create)"
+                    ));
+                }
+                let parent = abs
+                    .parent()
+                    .ok_or_else(|| format!("edit {i}: {rel} has no parent directory"))?;
+                let canon_parent = std::fs::canonicalize(parent)
+                    .map_err(|_| format!("edit {i}: parent directory of {rel} does not exist"))?;
+                if !canon_parent.starts_with(&canon_root) {
+                    return Err(format!("edit {i}: {rel} escapes the project root"));
+                }
+                contents.insert(rel.clone(), edit.new_string.clone());
+                order.push(rel.clone());
+                continue;
+            }
+            let canon_target = std::fs::canonicalize(&abs)
+                .map_err(|_| format!("edit {i}: {rel} does not exist"))?;
+            if !canon_target.starts_with(&canon_root) {
+                return Err(format!("edit {i}: {rel} escapes the project root"));
+            }
+            let text = std::fs::read_to_string(&canon_target)
+                .map_err(|e| format!("edit {i}: cannot read {rel}: {e}"))?;
+            contents.insert(rel.clone(), text);
+            order.push(rel.clone());
+        } else if edit.old_string.is_empty() {
+            // A second empty-oldString edit on a file this batch already
+            // created or loaded is always invalid.
+            return Err(format!(
+                "edit {i}: duplicate create for {rel} (empty oldString)"
+            ));
+        }
+        let text = contents.get_mut(&rel).expect("inserted above");
+        let n = text.matches(&edit.old_string).count();
+        if n != 1 {
+            return Err(format!(
+                "edit {i}: oldString matches {n} times in {rel} (need exactly 1)"
+            ));
+        }
+        *text = text.replacen(&edit.old_string, &edit.new_string, 1);
+    }
+
+    // PASS 2 — flush, one write per touched file, pre-image hook first.
+    for rel in &order {
+        pre_write(rel);
+        let abs = canon_root.join(rel);
+        std::fs::write(&abs, contents[rel].as_bytes())
+            .map_err(|e| format!("write {rel}: {e}"))?;
+    }
+    Ok(order)
+}
+
+/// P4: consume a finished mini's emitted edits. Returns the outcome to stamp:
+///   - no edits -> unchanged;
+///   - edits on a NON-write directive, or on a non-`done` outcome -> edits are
+///     DROPPED (the model is untrusted; only a write directive's clean done may
+///     touch disk) and the outcome passes through;
+///   - write + done -> validate + apply via `apply_emitted_edits`; on success
+///     `files_touched` becomes the APPLIED set (ground truth — the verdict gate
+///     lints what actually changed, not what the model claims) and the edit
+///     bodies are cleared; on failure the done converts to a synthesized
+///     `failed` carrying the per-edit error (atomicity means nothing was
+///     written, so there is no half-applied tree to lint).
+/// Pre-images of every touched file land in the training blob store first.
+fn apply_write_directive_edits(
+    project_root: Option<&Path>,
+    directive: &MiniCoderDirective,
+    mut outcome: MiniCoderOutcome,
+) -> MiniCoderOutcome {
+    if outcome.edits.is_empty() {
+        // P4 (review F6): a write directive that emitted NO edits changed
+        // NOTHING — zero the model-claimed files_touched, or the verdict gate
+        // would lint (and spuriously retry on) files the mini never touched.
+        if directive.write && outcome.status == MiniCoderStatus::Done {
+            outcome.files_touched = Vec::new();
+        }
+        return outcome;
+    }
+    if !directive.write || outcome.status != MiniCoderStatus::Done {
+        outcome.edits = Vec::new();
+        return outcome;
+    }
+    let Some(root) = project_root else {
+        return MiniCoderOutcome::failed(
+            "write directive finished without a resolvable project root".to_string(),
+        );
+    };
+    let edits = std::mem::take(&mut outcome.edits);
+    match apply_emitted_edits(root, &directive.files, &edits, |rel| {
+        let _ = crate::backend::training_export::snapshot_blob(root, &root.join(rel));
+    }) {
+        Ok(applied) => {
+            outcome.files_touched = applied;
+            outcome
+        }
+        Err(e) => MiniCoderOutcome::failed(format!("emitted edits rejected: {e}")),
+    }
+}
+
 fn finalize_outcome(directive: &MiniCoderDirective) -> MiniCoderOutcome {
     if directive.kill_requested {
         return MiniCoderOutcome::aborted("stopped by human (Stop button)");
@@ -2232,14 +2433,32 @@ front-loaded above; do not attempt to call tools, browse, or fetch more context.
         }
     }
 
-    // Result contract.
+    // Result contract. P4: a WRITE directive asks for structured edits that the
+    // executor validates (allowlist, exact-match anchors) and applies — the
+    // model never touches disk on the HTTP backends.
     prompt.push_str("RESULT (your FINAL action):\n");
-    prompt.push_str(
-        "Report your result as a SINGLE JSON object with this schema:\n\
+    if directive.write {
+        prompt.push_str(
+            "Report your result as a SINGLE JSON object with this schema:\n\
+{\"status\":\"done\"|\"needs_clarification\", \"output\":\"short summary\", \
+\"edits\":[{\"path\":\"rel/path\",\"oldString\":\"...\",\"newString\":\"...\"},...], \
+\"filesTouched\":[\"path\",...], \"question\":\"...only if needs_clarification...\", \
+\"partial\":\"...optional...\"}\n\
+EDITS CONTRACT (the app applies your edits — you never write files yourself):\n\
+- filesTouched is informational only: the app derives the REAL touched list from your applied edits.\n\
+- oldString: copied BYTE-FOR-BYTE from the file contents above; it must occur EXACTLY ONCE in that file.\n\
+- An EMPTY oldString means: CREATE the file with newString as its full content.\n\
+- Every path must be one of the FILE SCOPE paths above; any other path is rejected and the whole result fails.\n\
+- Emit edits in apply order: a later edit must anchor against the text as changed by earlier edits.\n",
+        );
+    } else {
+        prompt.push_str(
+            "Report your result as a SINGLE JSON object with this schema:\n\
 {\"status\":\"done\"|\"needs_clarification\", \"output\":\"short summary\", \
 \"filesTouched\":[\"path\",...], \"question\":\"...only if needs_clarification...\", \
 \"partial\":\"...optional...\"}\n",
-    );
+        );
+    }
     if backend_can_write_file {
         prompt.push_str("WRITE this JSON object to the file at:\n");
         prompt.push_str(&result_path_display);
@@ -3338,6 +3557,7 @@ mod tests {
             task: "docstring foo()".into(),
             files: vec!["src/a.rs".into()],
             backend: None,
+            write: false,
             allow_oracle: false,
             kill_requested: false,
             result_path: format!("{id}.json"),
@@ -3709,6 +3929,322 @@ mod tests {
         assert_eq!(mini.role, "coder", "ungranted mini keeps the status quo");
         assert!(mini.launch_token_hash.is_none());
         assert!(mini.launch_token_issued_at.is_none());
+    }
+
+    fn p4_edit(path: &str, old: &str, new: &str) -> mini_coder::MiniEdit {
+        mini_coder::MiniEdit {
+            path: path.into(),
+            old_string: old.into(),
+            new_string: new.into(),
+        }
+    }
+
+    fn p4_temp_project(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aspis-p4a-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp project dir");
+        dir
+    }
+
+    #[test]
+    fn apply_edits_happy_path_in_order_with_ground_truth_and_preimage_hook() {
+        let root = p4_temp_project("happy");
+        std::fs::write(root.join("a.txt"), "alpha beta\n").unwrap();
+        let allow = vec!["a.txt".to_string(), "new.txt".to_string()];
+        let edits = vec![
+            p4_edit("a.txt", "alpha", "ALPHA"),
+            p4_edit("new.txt", "", "created\n"),
+            p4_edit("a.txt", "beta", "BETA"),
+        ];
+        let mut pre: Vec<String> = Vec::new();
+        let applied =
+            apply_emitted_edits(&root, &allow, &edits, |rel| pre.push(rel.to_string()))
+                .expect("happy path applies");
+        // Ground truth: first-touch order, deduped.
+        assert_eq!(applied, vec!["a.txt".to_string(), "new.txt".to_string()]);
+        // The pre-image hook fired once per touched file, in flush order.
+        assert_eq!(pre, applied);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "ALPHA BETA\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "created\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn apply_edits_atomic_nothing_written_on_late_anchor_failure() {
+        let root = p4_temp_project("atomic");
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        let allow = vec!["a.txt".to_string()];
+        let edits = vec![
+            p4_edit("a.txt", "alpha", "ALPHA"),
+            p4_edit("a.txt", "NO-SUCH-ANCHOR", "x"),
+        ];
+        let err = apply_emitted_edits(&root, &allow, &edits, |_| {}).unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        // Pass-1 failed -> pass-2 never ran -> the file is byte-identical.
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn apply_edits_rejects_allowlist_miss_traversal_and_case_variant() {
+        let root = p4_temp_project("allow");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let allow = vec!["main.rs".to_string()];
+        for bad in ["other.rs", "../main.rs", "/etc/hosts", "Main.RS"] {
+            let err = apply_emitted_edits(
+                &root,
+                &allow,
+                &[p4_edit(bad, "fn", "FN")],
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("edit 0"),
+                "path {bad} must be rejected, got: {err}"
+            );
+        }
+        // Untouched.
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_edits_rejects_symlink_escape() {
+        let root = p4_temp_project("symlink");
+        let outside = std::env::temp_dir().join(format!("aspis-p4a-outside-{}", std::process::id()));
+        std::fs::write(&outside, "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link.txt")).unwrap();
+        let err = apply_emitted_edits(
+            &root,
+            &["link.txt".to_string()],
+            &[p4_edit("link.txt", "outside", "INSIDE")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("escapes the project root"), "wrong error: {err}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&outside).ok();
+    }
+
+    #[test]
+    fn apply_edits_create_rules_and_caps() {
+        let root = p4_temp_project("create");
+        std::fs::write(root.join("a.txt"), "x\n").unwrap();
+        // Create over an existing file is rejected.
+        let err = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", "", "clobber")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("already exists"), "wrong error: {err}");
+        // Create inside a missing directory is rejected (no implicit mkdir).
+        let err = apply_emitted_edits(
+            &root,
+            &["newdir/f.txt".to_string()],
+            &[p4_edit("newdir/f.txt", "", "content")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("does not exist"), "wrong error: {err}");
+        // Duplicate create in one batch is rejected.
+        let err = apply_emitted_edits(
+            &root,
+            &["b.txt".to_string()],
+            &[p4_edit("b.txt", "", "one"), p4_edit("b.txt", "", "two")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate create"), "wrong error: {err}");
+        // Caps: empty edits is a no-op Ok; >40 edits and an oversized allowlist reject.
+        assert_eq!(
+            apply_emitted_edits(&root, &["a.txt".to_string()], &[], |_| {}).unwrap(),
+            Vec::<String>::new()
+        );
+        let many: Vec<_> = (0..41).map(|_| p4_edit("a.txt", "x", "y")).collect();
+        let err = apply_emitted_edits(&root, &["a.txt".to_string()], &many, |_| {}).unwrap_err();
+        assert!(err.contains("too many edits"), "wrong error: {err}");
+        let wide: Vec<String> = (0..11).map(|i| format!("f{i}.txt")).collect();
+        let err = apply_emitted_edits(&root, &wide, &[p4_edit("f0.txt", "", "c")], |_| {})
+            .unwrap_err();
+        assert!(err.contains("1..=10"), "wrong error: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn p4_write_directive(files: &[&str]) -> MiniCoderDirective {
+        let mut d = p4_directive(false);
+        d.write = true;
+        d.files = files.iter().map(|s| s.to_string()).collect();
+        d
+    }
+
+    fn p4_done_with_edits(edits: Vec<mini_coder::MiniEdit>) -> MiniCoderOutcome {
+        MiniCoderOutcome::done(mini_coder::MiniCoderResult {
+            status: "done".into(),
+            output: Some("did it".into()),
+            files_touched: vec!["lie.txt".into()],
+            edits,
+            question: None,
+            partial: None,
+        })
+    }
+
+    #[test]
+    fn write_apply_ground_truths_files_touched_and_clears_edits() {
+        let root = p4_temp_project("wapply");
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        let d = p4_write_directive(&["a.txt"]);
+        let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
+        let out = apply_write_directive_edits(Some(&root), &d, outcome);
+        assert_eq!(out.status, MiniCoderStatus::Done);
+        // The mini CLAIMED lie.txt; ground truth is what was actually applied.
+        assert_eq!(out.files_touched, vec!["a.txt".to_string()]);
+        assert!(out.edits.is_empty(), "edit bodies must not persist");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "ALPHA\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_apply_failure_converts_done_to_failed() {
+        let root = p4_temp_project("wfail");
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        let d = p4_write_directive(&["a.txt"]);
+        let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "missing-anchor", "x")]);
+        let out = apply_write_directive_edits(Some(&root), &d, outcome);
+        assert_eq!(out.status, MiniCoderStatus::Failed);
+        assert!(
+            out.error.as_deref().unwrap_or("").contains("emitted edits rejected"),
+            "error missing: {:?}",
+            out.error
+        );
+        // Atomicity: the failed apply wrote nothing.
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn non_write_directive_drops_edits_without_touching_disk() {
+        let root = p4_temp_project("wdrop");
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        // p4_directive(false) has write=false and files [src/a.rs, src/b.rs].
+        let d = p4_directive(false);
+        let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
+        let out = apply_write_directive_edits(Some(&root), &d, outcome);
+        assert_eq!(out.status, MiniCoderStatus::Done);
+        assert!(out.edits.is_empty(), "untrusted edits must be dropped");
+        // The model's claim passes through untouched on the no-write path...
+        assert_eq!(out.files_touched, vec!["lie.txt".to_string()]);
+        // ...and the disk was never touched.
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_apply_without_root_fails_closed() {
+        let d = p4_write_directive(&["a.txt"]);
+        let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
+        let out = apply_write_directive_edits(None, &d, outcome);
+        assert_eq!(out.status, MiniCoderStatus::Failed);
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("without a resolvable project root"),
+            "error missing: {:?}",
+            out.error
+        );
+    }
+
+    #[test]
+    fn apply_edits_rejects_existing_file_outside_allowlist() {
+        // Review F4: the older allowlist-miss tests used files that do not
+        // exist, so the canonicalize guard masked the allowlist check. This
+        // pins the allowlist itself: the target EXISTS but is not listed.
+        let root = p4_temp_project("allowpin");
+        std::fs::write(root.join("listed.txt"), "x\n").unwrap();
+        std::fs::write(root.join("present.txt"), "y\n").unwrap();
+        let err = apply_emitted_edits(
+            &root,
+            &["listed.txt".to_string()],
+            &[p4_edit("present.txt", "y", "z")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not in the directive allowlist"),
+            "must fail ON THE ALLOWLIST, got: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("present.txt")).unwrap(), "y\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn apply_edits_cross_file_atomicity() {
+        // Review F5: a pass-1 failure on the SECOND file must leave the FIRST
+        // file (whose edit validated fine) untouched on disk.
+        let root = p4_temp_project("crossatomic");
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta\n").unwrap();
+        let allow = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let edits = vec![
+            p4_edit("a.txt", "alpha", "ALPHA"),
+            p4_edit("b.txt", "NO-SUCH-ANCHOR", "x"),
+        ];
+        let err = apply_emitted_edits(&root, &allow, &edits, |_| {}).unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "beta\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn apply_edits_normalizes_cosmetic_path_variants_on_both_sides() {
+        // Review F1: "./src/a.rs" in the directive vs "src/a.rs" emitted (and
+        // vice versa) must MATCH — both sides share the lexical normalizer.
+        let root = p4_temp_project("norm");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "one\n").unwrap();
+        // Dotted allowlist, clean emitted path.
+        let applied = apply_emitted_edits(
+            &root,
+            &["./src/a.rs".to_string()],
+            &[p4_edit("src/a.rs", "one", "two")],
+            |_| {},
+        )
+        .expect("dotted allowlist must match clean path");
+        assert_eq!(applied, vec!["src/a.rs".to_string()]);
+        // Clean allowlist, dotted+doubled emitted path.
+        let applied = apply_emitted_edits(
+            &root,
+            &["src/a.rs".to_string()],
+            &[p4_edit("./src//a.rs", "two", "three")],
+            |_| {},
+        )
+        .expect("dotted emitted path must match clean allowlist");
+        assert_eq!(applied, vec!["src/a.rs".to_string()]);
+        assert_eq!(std::fs::read_to_string(root.join("src/a.rs")).unwrap(), "three\n");
+        // An empty path is rejected outright.
+        let err = apply_emitted_edits(
+            &root,
+            &["src/a.rs".to_string()],
+            &[p4_edit("", "three", "x")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("empty path"), "wrong error: {err}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn empty_state() -> crate::backend::model::AgentLiveState {
@@ -4752,6 +5288,7 @@ mod tests {
             task: "add a docstring to foo()".into(),
             files: vec!["src/a.rs".into(), "src/b.rs".into()],
             backend: None,
+            write: false,
             allow_oracle,
             kill_requested: false,
             result_path: "d1.json".into(),

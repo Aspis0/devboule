@@ -389,6 +389,7 @@ TOOLS = [
             "files": {"type": "array", "items": {"type": "string"}},
             "backend": {"type": "string", "default": ""},
             "allow_oracle": {"type": "boolean", "default": False},
+            "write": {"type": "boolean", "default": False},
             "session_token": {"type": "string"},
         },
     },
@@ -4322,6 +4323,12 @@ def dispatch_spawn_mini_coder(
     # NO-CHURN: only emit allowOracle when true (matches the Rust serde skip).
     if allow_oracle:
         directive["allowOracle"] = True
+    # P4 NO-CHURN: only emit write when true (matches the Rust serde skip). A
+    # write directive's mini EMITS structured edits that the Rust executor
+    # validates against `files` and applies — the model never touches disk.
+    # STRICT boolean (review F7): a truthy non-bool ("true", 1) is NOT a grant.
+    if args.get("write") is True:
+        directive["write"] = True
 
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
@@ -6116,6 +6123,7 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         files: list,
         backend: str = "",
         allow_oracle: bool = False,
+        write: bool = False,
         session_token: str = "",
     ) -> dict:
         """Coder-only: delegate a cheap, well-scoped sub-task to a one-shot mini-coder
@@ -6142,6 +6150,7 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
                 "files": files,
                 "backend": backend,
                 "allow_oracle": allow_oracle,
+                "write": write,
                 "session_token": session_token,
             },
         )

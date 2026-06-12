@@ -5239,8 +5239,9 @@ class SpawnMiniCoderTests(unittest.TestCase):
             self.assertEqual(d["files"], ["src/a.rs", "src/b.rs"])
             self.assertEqual(d["resultPath"], f"{out['directiveId']}.json")
             self.assertIn("createdAt", d)
-            # NO-CHURN: allowOracle/backend omitted when not set; snake_case never leaks.
+            # NO-CHURN: allowOracle/write/backend omitted when not set; snake_case never leaks.
             self.assertNotIn("allowOracle", d)
+            self.assertNotIn("write", d)
             self.assertNotIn("backend", d)
             self.assertNotIn("parent_agent_id", d)
             # FIX 3: the poll deadline fired with NO executor, so the directive was
@@ -5264,6 +5265,7 @@ class SpawnMiniCoderTests(unittest.TestCase):
                         "files": ["src/a.rs"],
                         "backend": "ollama",
                         "allow_oracle": True,
+                        "write": True,
                         "session_token": token,
                     },
                     root=root,
@@ -5271,6 +5273,8 @@ class SpawnMiniCoderTests(unittest.TestCase):
             d = self._read_state(root)["miniCoderDirectives"][0]
             self.assertEqual(d["backend"], "ollama")
             self.assertTrue(d["allowOracle"])
+            # P4: the write marker rides the directive for the Rust executor.
+            self.assertIs(d["write"], True)
 
     def test_rejects_empty_task(self):
         with tempfile.TemporaryDirectory() as tmp:

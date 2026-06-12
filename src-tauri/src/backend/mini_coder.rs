@@ -159,6 +159,23 @@ impl MiniCoderStatus {
 /// executor and the mini never writes them. Read leniently: every field defaults,
 /// so a partial object (e.g. just `{"status":"done"}`) still parses; a malformed
 /// or missing file is handled by `read_result_file` (-> `failed`), never a panic.
+/// P4: one structured edit the mini EMITS instead of touching disk. Exact-match
+/// contract: `old_string` must occur EXACTLY ONCE in the target file (the
+/// executor rejects 0 or >1 matches); an EMPTY `old_string` means "create the
+/// file with `new_string` as its full content". `path` is project-root-relative
+/// and must name a file in the directive's allowlist — the executor enforces
+/// all of this in `apply_emitted_edits`, the model is never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MiniEdit {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub old_string: String,
+    #[serde(default)]
+    pub new_string: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniCoderResult {
@@ -171,6 +188,10 @@ pub struct MiniCoderResult {
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files_touched: Vec<String>,
+    /// P4: structured edits for a WRITE directive. Applied (after validation)
+    /// by the executor; cleared before the outcome is persisted to state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<MiniEdit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +248,11 @@ pub struct MiniCoderOutcome {
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files_touched: Vec<String>,
+    /// P4: the emitted edits, carried from the result file to the apply step in
+    /// finalize. The apply step CLEARS this before the outcome is stamped onto
+    /// the directive, so edit bodies never bloat the persisted agent state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<MiniEdit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,6 +275,7 @@ impl MiniCoderOutcome {
             status: MiniCoderStatus::Done,
             output: result.output,
             files_touched: result.files_touched,
+            edits: result.edits,
             question: None,
             partial: result.partial,
             error: None,
@@ -263,6 +290,9 @@ impl MiniCoderOutcome {
             status: MiniCoderStatus::NeedsClarification,
             output: result.output,
             files_touched: result.files_touched,
+            // P4: a needs_clarification result never applies edits — only a
+            // clean `done` may touch disk, so any emitted edits are dropped.
+            edits: Vec::new(),
             question: result.question,
             partial: result.partial,
             error: None,
@@ -278,6 +308,7 @@ impl MiniCoderOutcome {
             status: MiniCoderStatus::Escalated,
             output: None,
             files_touched,
+            edits: Vec::new(),
             question: None,
             partial: None,
             error: Some(format!(
@@ -350,6 +381,11 @@ pub struct MiniCoderDirective {
     pub task: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// P4: a WRITE directive — the mini is expected to EMIT structured edits
+    /// (HTTP backends) that the executor validates against `files` and applies.
+    /// NO-CHURN: omitted when false, like `allow_oracle` below.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub write: bool,
     /// Backend override (ollama|api|codex); None -> the global configured backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -645,6 +681,7 @@ pub fn build_retry_directive(
         task,
         files,
         backend: predecessor.backend.clone(),
+        write: predecessor.write,
         allow_oracle: predecessor.allow_oracle,
         kill_requested: false,
         result_path: result_path.into(),
@@ -1777,6 +1814,7 @@ mod tests {
             id: id.into(),
             parent_agent_id: "coder-1".into(),
             status,
+            write: false,
             task: "docstring foo()".into(),
             files: vec!["src/a.rs".into()],
             backend: None,
@@ -1804,6 +1842,7 @@ mod tests {
             parent_agent_id: "coder-1".into(),
             status: MiniCoderStatus::Running,
             task: "t".into(),
+            write: false,
             files: vec!["src/a.rs".into()],
             backend: Some("ollama".into()),
             allow_oracle: true,

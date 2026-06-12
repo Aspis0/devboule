@@ -740,6 +740,7 @@ mod tests {
             status: MiniCoderStatus::Running,
             task: String::new(),
             files: vec![],
+            write: false,
             backend: None,
             allow_oracle: false,
             kill_requested: false,
