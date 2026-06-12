@@ -1446,6 +1446,40 @@ class OraclePhase2Test(unittest.TestCase):
             self.assertNotEqual(missing_key_answer["answer_source"], "llm")
             self.assertIn("API key", missing_key_answer.get("fallback_reason", ""))
 
+    def test_local_llm_providers_are_loopback_only_and_keyless(self):
+        # omlx/ollama run on this machine: allowlisted, keyless, and FAIL-CLOSED
+        # pinned to loopback (a non-loopback base_url raises — a "local" provider
+        # pointing off-machine would exfiltrate code).
+        from oracle.server.answerer import (
+            OraclePrivacyGateError,
+            normalize_llm_config,
+            validate_remote_llm_config,
+        )
+
+        cfg = normalize_llm_config({"provider": "omlx", "model": "qwen"})
+        self.assertEqual(cfg["base_url"], "http://127.0.0.1:8000/v1/chat/completions")
+        validate_remote_llm_config(cfg)  # keyless local config is valid
+
+        cfg = normalize_llm_config({"provider": "ollama", "model": "qwen"})
+        self.assertEqual(cfg["base_url"], "http://127.0.0.1:11434/v1/chat/completions")
+        validate_remote_llm_config(cfg)
+
+        with self.assertRaises(OraclePrivacyGateError):
+            validate_remote_llm_config(
+                normalize_llm_config(
+                    {
+                        "provider": "omlx",
+                        "model": "m",
+                        "base_url": "http://evil.example.com:8000/v1",
+                    }
+                )
+            )
+        # Remote providers still require a key (unchanged).
+        with self.assertRaises(RuntimeError):
+            validate_remote_llm_config(
+                normalize_llm_config({"provider": "scaleway", "model": "m"})
+            )
+
     def test_non_allowlisted_provider_raises_fail_closed_not_extractive(self):
         # A non-allowlisted provider is a PRIVACY violation and must RAISE the
         # fail-closed exception — never be silently degraded to an extractive

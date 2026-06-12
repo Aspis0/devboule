@@ -708,14 +708,20 @@ pub fn oracle_llm_settings_status() -> Result<OracleLlmSettingsStatus, String> {
     let provider_api_key_configured =
         settings.remote_enabled && read_llm_provider_token(&settings.provider)?.is_some();
     let api_key_configured = dedicated_api_key_configured || provider_api_key_configured;
-    let status = if settings.remote_enabled && !api_key_configured {
+    // LOCAL providers are keyless by design: never nag "missing_api_key".
+    let is_local_provider = matches!(settings.provider.as_str(), "omlx" | "ollama");
+    let status = if is_local_provider {
+        "configured"
+    } else if settings.remote_enabled && !api_key_configured {
         "missing_api_key"
     } else if settings.remote_enabled {
         "configured"
     } else {
         "local"
     };
-    let message = if settings.remote_enabled && !api_key_configured {
+    let message = if is_local_provider {
+        Some("Local loopback provider — keyless; prompts never leave this machine.".into())
+    } else if settings.remote_enabled && !api_key_configured {
         Some("Remote Oracle LLM API key is not configured.".into())
     } else if provider_api_key_configured && !dedicated_api_key_configured {
         Some(format!(
@@ -754,13 +760,15 @@ fn llm_provider_label(provider: &str) -> &'static str {
         "scaleway" => "Scaleway",
         "infomaniak" => "Infomaniak",
         "mistral" => "Mistral",
+        "omlx" => "oMLX (local)",
+        "ollama" => "Ollama (local)",
         _ => "selected",
     }
 }
 
 fn sanitize_oracle_llm_settings(settings: &OracleLlmSettings) -> Result<OracleLlmSettings, String> {
     let provider = settings.provider.trim().to_ascii_lowercase();
-    let allowed = ["scaleway", "infomaniak", "mistral"];
+    let allowed = ["scaleway", "infomaniak", "mistral", "omlx", "ollama"];
     if !allowed.contains(&provider.as_str()) {
         return Err("Oracle LLM provider is not allowlisted.".into());
     }
@@ -786,6 +794,24 @@ fn sanitize_llm_base_url(provider: &str, base_url: Option<&str>) -> Result<Optio
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
+            if matches!(provider, "omlx" | "ollama") {
+                // LOCAL providers: loopback-only, http allowed (no TLS on
+                // 127.0.0.1), credentials/placeholders still rejected.
+                let lower = value.to_ascii_lowercase();
+                let loopback = ["http://127.0.0.1", "https://127.0.0.1", "http://localhost", "https://localhost", "http://[::1]", "https://[::1]"]
+                    .iter()
+                    .any(|prefix| {
+                        lower.strip_prefix(prefix).is_some_and(|rest| {
+                            rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
+                        })
+                    });
+                if !loopback || value.contains('@') || value.contains('<') || value.contains('>') {
+                    return Err(
+                        "Local Oracle LLM base URL must stay on loopback (127.0.0.1).".to_string(),
+                    );
+                }
+                return Ok(value.to_string());
+            }
             if !value.starts_with("https://")
                 || value.contains('@')
                 || value.contains('<')
@@ -1494,17 +1520,42 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_ollama_provider() {
-        // The local Ollama chat path was removed: "ollama" is no longer an
-        // allowlisted provider and must be rejected (answers are API-only).
+    fn sanitize_accepts_local_providers_loopback_only() {
+        // LOCAL providers are back (2026-06-12, loopback-only): omlx/ollama are
+        // allowlisted, a None base_url is fine (the python answerer fills the
+        // loopback default), a loopback http URL is accepted, and any
+        // non-loopback URL is rejected fail-closed.
         let settings = OracleLlmSettings {
             provider: "ollama".into(),
             model: "qwen3.5:4b".into(),
             base_url: None,
             remote_enabled: true,
         };
+        assert!(sanitize_oracle_llm_settings(&settings).is_ok());
 
-        assert!(sanitize_oracle_llm_settings(&settings).is_err());
+        let loopback = OracleLlmSettings {
+            provider: "omlx".into(),
+            model: "qwen".into(),
+            base_url: Some("http://127.0.0.1:8000/v1".into()),
+            remote_enabled: true,
+        };
+        assert!(sanitize_oracle_llm_settings(&loopback).is_ok());
+
+        let off_machine = OracleLlmSettings {
+            provider: "omlx".into(),
+            model: "qwen".into(),
+            base_url: Some("http://evil.example.com:8000/v1".into()),
+            remote_enabled: true,
+        };
+        assert!(sanitize_oracle_llm_settings(&off_machine).is_err());
+
+        let localhost_https = OracleLlmSettings {
+            provider: "ollama".into(),
+            model: "qwen".into(),
+            base_url: Some("http://localhost:11434/v1".into()),
+            remote_enabled: true,
+        };
+        assert!(sanitize_oracle_llm_settings(&localhost_https).is_ok());
     }
 
     #[test]

@@ -170,11 +170,16 @@ def answer_with_llm_config(query: str, prompt: str, context: list[dict], config:
     # an extractive, retrieval-only answer so the user still gets grounded context
     # with a clear reason (per plan: "no key -> extractive answers"). There is no
     # LLM-to-LLM fallback and no ZDR/GDPR gate.
-    if not config.get("api_key") or not config.get("model"):
+    needs_key = str(config.get("provider") or "").strip().lower() not in LOCAL_LLM_PROVIDERS
+    if (needs_key and not config.get("api_key")) or not config.get("model"):
         answer = extractive_answer(
             query,
             context,
-            reason="Remote Oracle LLM API key is not configured.",
+            reason=(
+                "Remote Oracle LLM API key is not configured."
+                if needs_key and not config.get("api_key")
+                else "Oracle LLM model is not configured."
+            ),
         )
         answer["llm_provider"] = config.get("provider", "")
         answer["llm_model"] = config.get("model", "")
@@ -330,14 +335,16 @@ def generate_with_openai_compatible(prompt: str, config: dict) -> str:
         body["reasoning_effort"] = "none"
     else:
         body["response_format"] = {"type": "json_object"}
+    headers = {
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://aspis-bio.com",
+        "X-Title": "Aspis Management Oracle",
+    }
+    if config.get("api_key"):
+        headers["Authorization"] = f"Bearer {config['api_key']}"
     response = httpx.post(
         chat_completions_url(config["base_url"]),
-        headers={
-            "Authorization": f"Bearer {config['api_key']}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://aspis-bio.com",
-            "X-Title": "Aspis Management Oracle",
-        },
+        headers=headers,
         json=body,
         timeout=60,
     )
@@ -359,12 +366,13 @@ def normalize_llm_config(config: dict | None = None) -> dict:
     # provider must be a remote one; validate_remote_llm_config (called by the
     # consumers of this config) rejects anything outside the remote allowlist
     # (scaleway / infomaniak / mistral) instead of silently going local.
-    if provider not in {"scaleway", "infomaniak", "mistral"}:
+    if provider not in {"scaleway", "infomaniak", "mistral"} | LOCAL_LLM_PROVIDERS:
         # FAIL-CLOSED: a non-allowlisted provider RAISES (never degraded). This is
         # the ONLY privacy gate that remains — the ZDR/GDPR gates were removed.
         raise OraclePrivacyGateError(
             f"Oracle LLM provider {provider!r} is not allowlisted; "
-            "answers are API-only (scaleway / infomaniak / mistral)."
+            "allowed: scaleway / infomaniak / mistral (remote, keyed) and "
+            "omlx / ollama (local, loopback-only)."
         )
     model = str(source.get("model") or os.getenv("ORACLE_LLM_MODEL", LLM_MODEL)).strip()
 
@@ -380,6 +388,10 @@ def normalize_llm_config(config: dict | None = None) -> dict:
 
 
 def default_base_url(provider: str) -> str:
+    if provider == "omlx":
+        return "http://127.0.0.1:8000/v1/chat/completions"
+    if provider == "ollama":
+        return "http://127.0.0.1:11434/v1/chat/completions"
     if provider == "scaleway":
         return "https://api.scaleway.ai/v1/chat/completions"
     if provider == "infomaniak":
@@ -389,6 +401,12 @@ def default_base_url(provider: str) -> str:
     return ""
 
 
+# Providers that run ON THIS MACHINE over loopback (no API key, no data egress).
+# Kept separate from the remote allowlist so the validators can branch:
+# remote = HTTPS + pinned host + key; local = loopback-pinned + keyless.
+LOCAL_LLM_PROVIDERS = {"omlx", "ollama"}
+
+
 def enforce_remote_llm_provider_allowlist(config: dict) -> None:
     # PRIVACY FAIL-CLOSED: a non-allowlisted provider is never allowed to proceed
     # and must NOT be silently degraded — sending Aspis Bio code/text to an
@@ -396,8 +414,8 @@ def enforce_remote_llm_provider_allowlist(config: dict) -> None:
     # this; only missing credentials are recoverable. The ZDR/GDPR gates were
     # removed; the provider allowlist is the sole remaining gate.
     provider = str(config.get("provider") or "").strip().lower()
-    if provider not in {"scaleway", "infomaniak", "mistral"}:
-        raise OraclePrivacyGateError("Remote Oracle LLM provider is not allowlisted.")
+    if provider not in {"scaleway", "infomaniak", "mistral"} | LOCAL_LLM_PROVIDERS:
+        raise OraclePrivacyGateError("Oracle LLM provider is not allowlisted.")
 
 
 def validate_remote_llm_config(config: dict) -> None:
@@ -405,6 +423,21 @@ def validate_remote_llm_config(config: dict) -> None:
     # first (fail-closed), then the recoverable credential/endpoint checks.
     enforce_remote_llm_provider_allowlist(config)
     provider = str(config.get("provider") or "").strip().lower()
+    if provider in LOCAL_LLM_PROVIDERS:
+        # LOCAL providers (omlx/ollama): no API key, but FAIL-CLOSED loopback
+        # pinning — file context rides the prompt, so the endpoint must be
+        # provably on this machine.
+        if not config.get("model"):
+            raise RuntimeError("Local Oracle LLM requires a model name.")
+        local_url = chat_completions_url(str(config.get("base_url") or ""))
+        local_parsed = urlparse(local_url)
+        if local_parsed.scheme not in {"http", "https"} or not local_parsed.netloc:
+            raise RuntimeError("Local Oracle LLM base URL is invalid.")
+        if (local_parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+            raise OraclePrivacyGateError(
+                "Local Oracle LLM endpoints must stay on loopback (127.0.0.1)."
+            )
+        return
     if not config.get("api_key"):
         raise RuntimeError("Remote Oracle LLM requires an API key saved in Aspis Management.")
     if not config.get("model"):

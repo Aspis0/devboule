@@ -32,24 +32,32 @@ const providerLabels: Record<string, string> = {
   scaleway: "Scaleway EU",
   infomaniak: "Infomaniak Swiss",
   mistral: "Mistral direct",
+  omlx: "oMLX (local)",
+  ollama: "Ollama (local)",
 };
 
 const defaultModels: Record<string, string> = {
   scaleway: "voxtral-small-24b-2507",
   infomaniak: "google/gemma-4-31B-it",
   mistral: "mistral-small-latest",
+  omlx: "",
+  ollama: "",
 };
 
 const defaultBaseUrls: Record<string, string> = {
   scaleway: "https://api.scaleway.ai/v1/chat/completions",
   infomaniak: "https://api.infomaniak.com/2/ai/108646/openai/v1/chat/completions",
   mistral: "https://api.mistral.ai/v1/chat/completions",
+  omlx: "http://127.0.0.1:8000/v1/chat/completions",
+  ollama: "http://127.0.0.1:11434/v1/chat/completions",
 };
 
 const providerPrivacyNotes: Record<string, string> = {
   scaleway: "EU-hosted Generative APIs. Reuses the saved Scaleway token if no dedicated Oracle key is saved.",
   infomaniak: "Swiss-hosted AI Services. Default product id 108646 is the saved Gemma 4 31B endpoint.",
   mistral: "GDPR/API no-training provider. Use only with an account policy acceptable for your retention requirements.",
+  omlx: "Runs fully on this machine over loopback — prompts and retrieved code never leave it. No API key.",
+  ollama: "Runs fully on this machine over loopback — prompts and retrieved code never leave it. No API key.",
 };
 
 const modelHints: Record<string, string> = {
@@ -58,6 +66,8 @@ const modelHints: Record<string, string> = {
   infomaniak:
     "Reliable default: google/gemma-4-31B-it. Nemotron was cheaper but slower and weaker in our smoke test.",
   mistral: "Cheap default: mistral-small-latest. Stronger coding: devstral-small-latest.",
+  omlx: "Enter an installed oMLX model id (e.g. the one your mini-coder uses).",
+  ollama: "Enter a pulled Ollama tag (e.g. qwen2.5-coder).",
 };
 
 // The Oracle answer-model / API-key form, relocated here from the Oracle page in
@@ -142,7 +152,11 @@ export function OracleAnswerSettingsCard() {
   const usesScalewayProviderToken =
     llmForm.remoteEnabled && llmForm.provider === "scaleway" && scalewayProviderTokenConfigured;
   const baseUrlRequired = llmForm.remoteEnabled && llmForm.provider === "infomaniak";
+  // LOCAL providers (loopback) are keyless by design: configured as soon as a
+  // model is set — the API-key checks below only gate the remote providers.
+  const isLocalProvider = llmForm.provider === "omlx" || llmForm.provider === "ollama";
   const llmConfigured =
+    isLocalProvider ||
     !llmForm.remoteEnabled ||
     usesScalewayProviderToken ||
     (!llmKeyScopeChanged && oracleLlmSettings?.apiKeyConfigured) ||
@@ -172,7 +186,7 @@ export function OracleAnswerSettingsCard() {
 
   const changeProvider = (provider: string) => {
     resetSaveFeedback();
-    // Remote providers only (local Ollama chat path removed).
+    // Remote (keyed) or local loopback (keyless) providers; the maps drive both.
     setLlmForm((prev) => ({
       ...prev,
       provider,
@@ -247,7 +261,7 @@ export function OracleAnswerSettingsCard() {
               value={selectedProvider}
               onChange={(event) => changeProvider(event.target.value)}
               data-help-title="This chooses who writes Oracle answers."
-              data-help-lines="Answers are API-only: Scaleway, Infomaniak, and Mistral are the only allowed remote providers.|Retrieval still runs locally.|Changing provider does not send a question yet.|Without an API key, Oracle returns retrieval-only answers."
+              data-help-lines="Remote providers: Scaleway, Infomaniak, Mistral (API key required). Local providers: oMLX and Ollama on this machine, loopback-only, no key.|Retrieval always runs locally.|Changing provider does not send a question yet.|Apple on-device (Foundation Models) arrives with macOS 27.|Without a key, remote providers return retrieval-only answers."
               className="mt-1 w-full rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-terracotta-200"
             >
               {providerEntries.map(([value, label]) => (
@@ -291,6 +305,7 @@ export function OracleAnswerSettingsCard() {
                   className="mt-1 w-full rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-terracotta-200"
                 />
               </label>
+              {!isLocalProvider && (
               <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
                 API key
                 <input
@@ -321,6 +336,7 @@ export function OracleAnswerSettingsCard() {
                   </span>
                 )}
               </label>
+              )}
             </>
           )}
         </div>
