@@ -5276,6 +5276,40 @@ class SpawnMiniCoderTests(unittest.TestCase):
             # P4: the write marker rides the directive for the Rust executor.
             self.assertIs(d["write"], True)
 
+    def test_write_allowlist_is_capped_at_ten_files(self):
+        # Max-recall: the Rust apply enforces 1..=10 files for write directives;
+        # python fails FAST (before the mini burns a run). 10 passes, 11 raises.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            files11 = [f"src/f{i}.rs" for i in range(11)]
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "bulk write",
+                        "files": files11,
+                        "write": True,
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            # The same 11 files WITHOUT write are still fine (read scope).
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "bulk read",
+                        "files": files11,
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+
     def test_rejects_empty_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)

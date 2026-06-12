@@ -2040,6 +2040,12 @@ fn upsert_mini_session(
 ) {
     let timestamp_now = Utc::now().to_rfc3339();
     if let Some(session) = state.sessions.iter_mut().find(|s| s.agent_id == agent_id) {
+        if session.status == "done" {
+            // Max-recall fix: a terminal session is never resurrected — a late
+            // post-spawn re-upsert racing a fast finalize must not flip a closed
+            // mini back to "active" in the rail.
+            return;
+        }
         session.status = "active".into();
         session.parent_agent_id = Some(parent_agent_id.to_string());
         if let Some(hash) = oracle_token_hash {
@@ -2098,6 +2104,10 @@ fn upsert_mini_session(
 fn close_mini_session(state: &mut crate::backend::model::AgentLiveState, agent_id: &str) {
     if let Some(session) = state.sessions.iter_mut().find(|s| s.agent_id == agent_id) {
         session.status = "done".into();
+        // Max-recall hygiene: a closed mini's launch-token hash is dead weight
+        // (the raw token dies with the prompt file) — don't retain it.
+        session.launch_token_hash = None;
+        session.launch_token_issued_at = None;
     }
 }
 
@@ -2290,9 +2300,10 @@ fn spawn_one_shot_mini(
         &result_target,
         oracle_access.as_ref(),
     );
-    // P6 thinking split: a censor-driven FIX pass (attempt > 0) runs with
-    // model thinking ON — reasoning about a finding is the use case; the
-    // initial write stays OFF (mechanical, fully specified emit-edits).
+    // P6 thinking split: ANY retry (attempt > 0) runs with model thinking ON —
+    // reasoning about feedback is the use case; the initial pass stays OFF
+    // (mechanical, fully specified). Consumed ONLY by the oMLX body builders
+    // (Qwen-gated); codex/ollama/api commands are byte-identical either way.
     let fix_pass_thinking = directive.attempt > 0;
     let MiniCommandBuild {
         prompt_file,
@@ -5944,9 +5955,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn build_mini_command_drops_mcp_roots_entirely() {
-        // MINOR 9 at the public boundary: even the public build_mini_command, given
-        // McpRoots, must produce a script with no MCP grant (mcp_roots is inert).
+    fn build_mini_command_wires_mcp_when_roots_present_windows() {
+        // MINOR 9 → P3 at the public boundary: given McpRoots, the public
+        // build_mini_command now WIRES the narrow MCP grant (server-side "mini"
+        // role narrowing); without roots there are no MCP flags at all.
         let root = std::env::temp_dir();
         let result_target = root.join("d1.json");
         let b = backend(MiniCoderBackendKind::Codex, None, None);
@@ -5957,11 +5969,20 @@ mod tests {
             projects_dir: PathBuf::from("C:/mgmt/projects"),
         };
         let build =
-            build_mini_command(&b, &root, &result_target, &prompt, Some(&roots)).unwrap();
+            build_mini_command(&b, &root, &result_target, &prompt, Some(&roots), false).unwrap();
+        let script = argv_strings(&build.command).pop().unwrap();
+        assert!(
+            script.contains("mcp_servers.aspis-management.command"),
+            "granted mini must wire the MCP flags: {script}"
+        );
+        super::super::projects::remove_restricted_temp_file(&build.prompt_file.unwrap());
+
+        let build =
+            build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
         let script = argv_strings(&build.command).pop().unwrap();
         assert!(
             !script.contains("mcp_servers"),
-            "mcp_roots must be inert: {script}"
+            "ungranted mini must carry no MCP flags: {script}"
         );
         super::super::projects::remove_restricted_temp_file(&build.prompt_file.unwrap());
     }
@@ -6325,7 +6346,7 @@ mod tests {
         let directive = p4_directive(false);
         let prompt = build_mini_prompt(&b, &directive, &root, &result_target, None);
         let build =
-            build_mini_command(&b, &root, &result_target, &prompt, None).unwrap();
+            build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
         let prompt_file = build.prompt_file.expect("a prompt file is created");
         let joined = argv_strings(&build.command).join(" ");
         // The full prompt body (the task text) must NOT be on argv.

@@ -4328,6 +4328,14 @@ def dispatch_spawn_mini_coder(
     # validates against `files` and applies — the model never touches disk.
     # STRICT boolean (review F7): a truthy non-bool ("true", 1) is NOT a grant.
     if args.get("write") is True:
+        # Max-recall fix: the Rust apply enforces a 1..=10 allowlist for write
+        # directives (MAX_MINI_ALLOWLIST_FILES) — failing here is cheap, failing
+        # there wastes a full mini run. Keep the two caps in sync.
+        if len(files) > 10:
+            raise McpError(
+                "Write directives allow at most 10 files in the allowlist "
+                f"(got {len(files)}). Split the task."
+            )
         directive["write"] = True
 
     with file_lock(state_lock):

@@ -413,6 +413,40 @@ pub fn lock_for_path_test_hook(path: &Path) -> Arc<Mutex<()>> {
 // ---------------------------------------------------------------------------
 
 /// `<root>/.aspis-training`.
+/// Max-recall PRIVACY fix: filenames whose CONTENT must never land in the
+/// training blob store, even when a coder legitimately allowlists them for a
+/// write (a .env edit is a valid task; copying its secrets into
+/// .aspis-training is not). Conservative name/extension match — broad globs
+/// like *token* would swallow tokenizer.rs.
+fn is_sensitive_blob_name(file_abs: &Path) -> bool {
+    let name = file_abs
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name == ".env"
+        || name.starts_with(".env.")
+        || name == ".npmrc"
+        || name == ".pypirc"
+        || name == ".netrc"
+        || name == "credentials"
+        || name == "credentials.json"
+        || name == "secrets.json"
+        || name == "secrets.yaml"
+        || name == "secrets.yml"
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+    {
+        return true;
+    }
+    matches!(
+        std::path::Path::new(&name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref(),
+        Some("pem") | Some("key") | Some("p12") | Some("pfx") | Some("keystore") | Some("jks")
+    )
+}
+
 fn training_dir(root: &Path) -> PathBuf {
     root.join(".aspis-training")
 }
@@ -439,6 +473,11 @@ fn ensure_training_dir(root: &Path) -> std::io::Result<PathBuf> {
 /// cap, or binary (NUL-byte heuristic). Deduped: if the blob already exists the
 /// hash is returned WITHOUT rewriting.
 pub fn snapshot_blob(root: &Path, file_abs: &Path) -> Option<String> {
+    // PRIVACY: sensitive files never enter the blob store (see
+    // is_sensitive_blob_name) — the rail records the touch, never the content.
+    if is_sensitive_blob_name(file_abs) {
+        return None;
+    }
     snapshot_blob_capped(root, file_abs, BLOB_CAP_BYTES)
 }
 
@@ -714,8 +753,17 @@ fn record_directive_result_capped(
     // P7: a WRITE chain leaf landing CLEAN at attempt > 0 is a complete
     // {rejected, chosen} trajectory — emit the join marker. rejected = the
     // leaf's `write_preimages` blobs (attempt N-1's output); chosen = the
-    // adjacent directive_result's post-fix blobs.
-    if directive.write && directive.attempt > 0 && outcome.status == MiniCoderStatus::Done {
+    // adjacent directive_result's post-fix blobs. Max-recall fixes: a clean
+    // fix pass that emitted NO edits (files_touched zeroed) is a VACUOUS pair
+    // — skip it. JOINER CONTRACT: write_preimages records without a matching
+    // write_fix_pair (escalated/failed chains) are orphans BY DESIGN, and blob
+    // coverage is best-effort per file (size/binary caps) — the offline joiner
+    // must tolerate both.
+    if directive.write
+        && directive.attempt > 0
+        && outcome.status == MiniCoderStatus::Done
+        && !outcome.files_touched.is_empty()
+    {
         let pair = serde_json::json!({
             "type": "write_fix_pair",
             "ts": now_rfc3339(),
@@ -1359,6 +1407,45 @@ mod tests {
         assert_eq!(lines.len(), 1, "attempt 0 must not emit a pair marker");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&root2).ok();
+    }
+
+    #[test]
+    fn snapshot_blob_refuses_sensitive_filenames() {
+        // PRIVACY (max-recall): allowlisted-or-not, secret-bearing files never
+        // enter the blob store — the rail records the touch, never the content.
+        let root = tmp("sensitiveblob");
+        for name in [".env", ".env.local", "server.pem", "deploy.key", "id_rsa", "secrets.yaml"] {
+            let f = root.join(name);
+            std::fs::write(&f, b"API_KEY=sk-super-secret").unwrap();
+            assert!(
+                snapshot_blob(&root, &f).is_none(),
+                "{name} must never be snapshotted"
+            );
+        }
+        // A normal source file still snapshots (tokenizer.rs is NOT a token).
+        let ok = root.join("tokenizer.rs");
+        std::fs::write(&ok, b"fn t() {}").unwrap();
+        assert!(snapshot_blob(&root, &ok).is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_fix_pair_skipped_when_fix_pass_emitted_no_edits() {
+        // Max-recall: a clean fix pass with files_touched=[] (no edits emitted)
+        // is a VACUOUS trajectory — no join marker.
+        let root = tmp("fixpairvacuous");
+        let mut leaf = directive("dV-r1", "coderP");
+        leaf.write = true;
+        leaf.attempt = 1;
+        leaf.parent_directive_id = Some("dV".into());
+        let mut outcome = MiniCoderOutcome::default();
+        outcome.status = MiniCoderStatus::Done;
+        outcome.files_touched = Vec::new();
+        record_directive_result(&root, &leaf, &outcome);
+        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 1, "directive_result only — no vacuous pair marker");
+        assert_eq!(lines[0]["type"], "directive_result");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // -- WARNING 10: future-dated terminal directive not attributed --------
