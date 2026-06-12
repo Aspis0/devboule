@@ -26,6 +26,11 @@ A strictlyImproves verdict means "better-formatted", nothing more.
 Loopback-only: base_url is pinned to 127.0.0.1/localhost/::1 (fail-closed, like
 vault.rs and answerer.py) — pair tasks embed real source code and must never be
 POSTed off-machine.
+
+A/B GUIDANCE (max-recall): read editRate alongside acceptRate (a model that
+always asks a dummy clarification is compliant but useless), and segment by
+the per-result `attempt` field — retry-derived tasks carry accumulated censor
+feedback and measure a different capability than attempt-0 tasks.
 """
 
 import argparse
@@ -127,29 +132,53 @@ def is_compliant_clarification(parsed: Any) -> bool:
     )
 
 
+def score_paths_in_scope(edits: Any, files: Optional[List[str]]) -> bool:
+    """Max-recall fix: the contract REQUIRES edit paths to come from the FILE
+    SCOPE — without this check a model emitting arbitrary paths scores 1.0
+    here while failing every live apply. No scope recorded -> not enforceable
+    -> True (the empty-scope prompt already steers to needs_clarification)."""
+    if not files or not isinstance(edits, list):
+        return True
+    allowed = {str(f).strip() for f in files}
+    for edit in edits:
+        if isinstance(edit, dict) and str(edit.get('path') or '').strip() not in allowed:
+            return False
+    return True
+
+
 def score_output(output: str) -> Dict[str, Any]:
-    """Score the output against all deterministic gates."""
+    """Score the output against all deterministic gates. The extra `kind`
+    field exposes the COMPOSITION ("edits" | "clarification" | "fail") so the
+    A/B consumer can separate edit-producing passes from clarification passes
+    — a model that ALWAYS asks a dummy question is contract-compliant but
+    useless, and acceptRate alone cannot see that."""
     json_score = score_json_array(output)
     schema_score = False
     no_fences_score = score_no_fences(output)
     
     # Try to parse for schema check (same stripper + shape normalizer).
+    kind = 'fail'
     try:
         parsed = json.loads(strip_fences(output))
         if is_compliant_clarification(parsed):
             json_score = True
             schema_score = True
+            kind = 'clarification'
         else:
             edits = extract_edits(parsed)
             schema_score = score_edit_schema(edits) if edits is not None else False
+            if schema_score:
+                kind = 'edits'
     except (json.JSONDecodeError, ValueError):
         schema_score = False
-        
+
+    ok = json_score and schema_score and no_fences_score
     return {
         'json': json_score,
         'schema': schema_score,
         'noFences': no_fences_score,
-        'pass': json_score and schema_score and no_fences_score
+        'kind': kind if ok else 'fail',
+        'pass': ok
     }
 
 
@@ -197,10 +226,20 @@ def build_replay_prompt(task: str, files: Optional[List[str]] = None) -> str:
     `files` (the record's filesTouched) becomes a paths-only FILE SCOPE — the
     original file CONTENTS are not replayed, so a compliant model may well
     answer needs_clarification (which the gate accepts, see score_output)."""
-    scope = ""
     if files:
-        listed = "\n".join(f"- {f}" for f in files)
+        # Max-recall fix: paths come from rail records (validated at apply
+        # time), but embedded newlines would inject lines into the prompt —
+        # sanitize and drop empties, belt-and-braces.
+        cleaned = [f.replace("\n", "").replace("\r", "").strip() for f in files]
+        listed = "\n".join(f"- {f}" for f in cleaned if f)
         scope = f"FILE SCOPE (paths only; file contents not replayed):\n{listed}\n\n"
+    else:
+        # Max-recall fix: the contract references "FILE SCOPE paths above" —
+        # with no scope the reference would dangle and NO edit could comply.
+        scope = (
+            "FILE SCOPE: none recorded — if file edits are required, answer "
+            "needs_clarification.\n\n"
+        )
     return f"TASK:\n{task}\n\n{scope}{REPLAY_CONTRACT}"
 
 
@@ -294,7 +333,9 @@ def run_heldout(
                     # Two usable shapes: the 4-field manual pair, or the rail's
                     # direct `eval_pair` record (task + provenance, no join).
                     is_manual = all(k in pair for k in ['task', 'model', 'rejected', 'chosen'])
-                    is_eval = pair.get('type') == 'eval_pair' and str(pair.get('task') or '').strip()
+                    is_eval = pair.get('type') == 'eval_pair' and bool(
+                        str(pair.get('task') or '').strip()
+                    )
                     if not (is_manual or is_eval):
                         skipped_malformed += 1
                         continue
@@ -311,12 +352,13 @@ def run_heldout(
     results = []
     passed = 0
     
+    edits_passed = 0
+    clarifications = 0
     for pair in pairs:
         task_prompt = pair['task']
+        scope_files = pair.get('filesTouched') or None
         if wrap_contract:
-            task_prompt = build_replay_prompt(
-                pair['task'], pair.get('filesTouched') or None
-            )
+            task_prompt = build_replay_prompt(pair['task'], scope_files)
         error: Optional[str] = None
         try:
             # CANDIDATE model under test — never the pair's recorded model
@@ -330,6 +372,19 @@ def run_heldout(
                 enable_thinking=enable_thinking
             )
             scores = score_output(output)
+            # Max-recall fix: the contract binds edit paths to the FILE SCOPE;
+            # the gate must enforce it or off-scope edits score as passes.
+            if scores['kind'] == 'edits' and scope_files:
+                try:
+                    emitted = extract_edits(json.loads(strip_fences(output)))
+                except (json.JSONDecodeError, ValueError):
+                    emitted = None
+                if not score_paths_in_scope(emitted, scope_files):
+                    scores['kind'] = 'fail'
+                    scores['pass'] = False
+                    scores['scope'] = False
+                else:
+                    scores['scope'] = True
         except RuntimeError as e:
             error = str(e)
             scores = {
@@ -340,10 +395,11 @@ def run_heldout(
             }
 
         result_entry = {
-            # Truncated provenance (review fix): the FULL task text embeds real
-            # source code; the pairs file already holds it — the results dump
-            # must not become a second plaintext copy.
-            'task': task_prompt[:160],
+            # Truncated provenance (review fix): always the ORIGINAL task head
+            # (never the wrapped prompt — contract boilerplate buries it), and
+            # never the full text (the pairs file already holds it).
+            'task': pair['task'][:160],
+            'attempt': pair.get('attempt'),
             'scores': scores
         }
         if error is not None:
@@ -352,6 +408,10 @@ def run_heldout(
         
         if scores['pass']:
             passed += 1
+            if scores.get('kind') == 'clarification':
+                clarifications += 1
+            elif scores.get('kind') == 'edits':
+                edits_passed += 1
     
     total = len(results)
     if total == 0 and skipped_malformed > 0:
@@ -359,9 +419,10 @@ def run_heldout(
         # write_fix_pair records) has none of the 4 required pair fields — every
         # line lands here. Say so instead of returning a silent zero.
         print(
-            f"WARNING: 0 usable pairs, {skipped_malformed} lines skipped — this "
-            "looks like a raw P7 rail file; it needs the join step into "
-            "{task, model, rejected, chosen} pair records first.",
+            f"WARNING: 0 usable pairs, {skipped_malformed} lines skipped — no "
+            "line matched either usable shape: the 4-field manual pair "
+            "(task/model/rejected/chosen) or the rail eval_pair "
+            "(type='eval_pair' + non-empty task).",
             file=sys.stderr,
         )
     accept_rate = passed / total if total > 0 else 0.0
@@ -371,6 +432,10 @@ def run_heldout(
         'total': total,
         'passed': passed,
         'acceptRate': accept_rate,
+        # Composition (max-recall fix): acceptRate alone cannot tell an
+        # edit-producing model from one that always asks a dummy question.
+        'editRate': edits_passed / total if total > 0 else 0.0,
+        'clarificationRate': clarifications / total if total > 0 else 0.0,
         'results': results,
         'skippedMalformed': skipped_malformed
     }

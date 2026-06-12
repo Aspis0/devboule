@@ -780,8 +780,11 @@ fn record_directive_result_capped(
             );
         }
         // P15(b) bridge: an `eval_pair` the held-out harness consumes DIRECTLY
-        // (no offline join): the full coder task text is the replay prompt of
-        // record (it never embeds file bodies — no blob-denylist concern);
+        // (no offline join): the coder task text is the replay prompt of
+        // record. It never embeds file BODIES, though on retries the appended
+        // censor feedback can quote code-shaped Gemma finding titles — the
+        // same exposure directive_result.task already had (net-new: none).
+        // Capped like `output` so retry chains cannot grow records unbounded.
         // `model` is backend provenance (the kind label; the concrete model id
         // lives in app config, not on the directive).
         let eval_pair = serde_json::json!({
@@ -790,7 +793,7 @@ fn record_directive_result_capped(
             "rootId": super::mini_coder::chain_root_id(directive),
             "chosenDirectiveId": directive.id,
             "attempt": directive.attempt,
-            "task": directive.task,
+            "task": cap_chars(&directive.task, output_cap),
             "model": directive
                 .backend
                 .clone()

@@ -80,6 +80,13 @@ def _as_pairs_from_jsonl(pairs_jsonl: Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
         if isinstance(pair, dict):
+            # Max-recall guard: the live rail file mixes record types
+            # (directive_result / write_preimages / write_fix_pair / eval_pair)
+            # that are NOT ORPO pairs — an empty-prompt record would otherwise
+            # slip in as one garbage pair (single shared stable_id, embedding
+            # of "\n") and distort the cluster geometry.
+            if not str(pair.get("prompt", "") or "").strip():
+                continue
             out.append(pair)
     return out
 
