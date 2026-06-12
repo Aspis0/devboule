@@ -1,0 +1,627 @@
+// Work-mode full-screen IDE shell (Phase D). Rendered full-bleed by ProjectsView
+// when `workMode && currentProject`; the kanban / calendar / board chrome are
+// skipped. Layout:
+//   - Top bar: ← Board, project name, git status (from project.gitStatus) +
+//     [Commit]/[Push] wired to the new backend commands.
+//   - Left rail: ProjectWorkspaceAgentRail (the project's agents, selectable).
+//   - Center: the SELECTED agent's live terminal (AgentTerminalViewer, lazy
+//     chunk, KEYED by agentId so switching agents remounts cleanly) + a
+//     [drawer ▸] control opening AgentDetailDrawer for that agent.
+//   - Bottom dock: Censor (default placeholder) / Activity / Git tabs.
+//
+// CRITICAL: this component adds NO agent-state poller. It consumes the sessions /
+// claims / events ProjectsView already polls (passed as props). The terminal is
+// the SAME lazy AgentTerminalViewer the Agents room uses, mounted ONE at a time.
+
+import {
+  ArrowLeft,
+  GitBranch,
+  Minimize2,
+  OctagonX,
+  PanelRightOpen,
+} from "lucide-react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { invokeBackendCommand } from "../../context/AppContext";
+import { useNow } from "../../hooks/useNow";
+import type {
+  AgentClaim,
+  AgentEvent,
+  AgentRoleRule,
+  AgentSession,
+  ProjectDetail,
+} from "../../types/backend";
+import type { CustomAgentClient } from "../../types/config";
+import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
+import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
+import { AgentQuestionCard } from "./AgentQuestionCard";
+import { CensorPanel } from "./CensorPanel";
+import { PlanApprovalCard } from "./PlanApprovalCard";
+import { PlansDockTab } from "./PlansPanel";
+import { ProjectWorkspaceAgentRail } from "./ProjectWorkspaceAgentRail";
+import { PushApprovalCard } from "./PushApprovalCard";
+import {
+  DEFAULT_DOCK_TAB,
+  DOCK_TABS,
+  type DockTab,
+  compactWriteCall,
+  isMiniSession,
+  miniKillCall,
+  reconcileSelectedAgentId,
+  shouldShowCompact,
+  workspaceGitLine,
+} from "./projectWorkspaceModel";
+import { formatStamp } from "../agents/agentRowModel";
+import { TokenUsageBadge } from "../agents/TokenUsageBadge";
+import { useAgentTokenUsage } from "../agents/useAgentTokenUsage";
+import type { AgentTokenUsage } from "../../types/backend";
+
+// Same lazy xterm chunk the Agents room + ProjectsView board use; loaded once.
+const AgentTerminalViewer = lazy(() =>
+  import("../agents/AgentTerminalViewer").then((m) => ({
+    default: m.AgentTerminalViewer,
+  })),
+);
+
+export interface ProjectWorkspaceProps {
+  project: ProjectDetail;
+  /** Sessions for THIS project (sessionsByProject) — consumed, not re-polled. */
+  sessions: AgentSession[];
+  /** Open claims for this project (from the same board state). */
+  claims: AgentClaim[];
+  /** Recent events for this project (from the same board state). */
+  events: AgentEvent[];
+  /** agent_ids with a live app-hosted PTY (from the board's agent_pty_list).
+   *  Gates the center terminal: an agent without an app PTY (external/legacy) gets
+   *  a tidy explanatory state instead of the viewer's error banner. */
+  ptyAgents: Set<string>;
+  isBusy: boolean;
+  canLaunch: boolean;
+  launchMessage: string | null;
+  rules?: AgentRoleRule[];
+  customClients?: CustomAgentClient[];
+  onBack: () => void;
+  onLaunch: (input: SpawnLaunchInput) => void;
+  onCopyPrompt: (selection: SpawnSelection) => void;
+  onCommit: (message: string) => void;
+  onPush: () => void;
+  onPull: () => void;
+  /** Inline status message for the last commit/push/pull (success or git stderr). */
+  gitActionMessage: string | null;
+  gitActionError: boolean;
+  gitActionBusy: boolean;
+}
+
+export function ProjectWorkspace({
+  project,
+  sessions,
+  claims,
+  events,
+  ptyAgents,
+  isBusy,
+  canLaunch,
+  launchMessage,
+  rules = [],
+  customClients = [],
+  onBack,
+  onLaunch,
+  onCopyPrompt,
+  onCommit,
+  onPush,
+  onPull,
+  gitActionMessage,
+  gitActionError,
+  gitActionBusy,
+}: ProjectWorkspaceProps) {
+  const now = useNow();
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(() =>
+    reconcileSelectedAgentId(null, sessions),
+  );
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [dockTab, setDockTab] = useState<DockTab>(DEFAULT_DOCK_TAB);
+  const [launcherOpen, setLauncherOpen] = useState(false);
+  const [commitOpen, setCommitOpen] = useState(false);
+  const [commitMessage, setCommitMessage] = useState("");
+
+  // The previous sessions snapshot, so reconcile can tell whether a now-gone
+  // selection WAS a mini (and thus fall back to its parent, not the freshest).
+  const prevSessionsRef = useRef<AgentSession[]>(sessions);
+
+  // Reconcile the selection against the live session list every render-relevant
+  // change: keep a still-live selection, otherwise fall back — to the gone mini's
+  // PARENT when it was a mini and the parent survives, else the freshest survivor
+  // (or null). This prunes a dangling selection when the selected agent exits — no
+  // second poller, just a derive off the props ProjectsView feeds.
+  useEffect(() => {
+    // BLOCKER 2: capture the genuinely-prior snapshot, then update the ref to the new
+    // sessions BEFORE calling setSelectedAgentId. The setState updater runs LATER
+    // (async), so if we updated the ref after it, the updater would read the
+    // already-overwritten ref (prev === current) and a reaped mini would never fall
+    // back to its parent. Closing over the captured `prev` makes reconcile see the
+    // real prior list.
+    const prev = prevSessionsRef.current;
+    prevSessionsRef.current = sessions;
+    setSelectedAgentId((current) =>
+      reconcileSelectedAgentId(current, sessions, prev),
+    );
+  }, [sessions]);
+
+  const gitLine = useMemo(
+    () => workspaceGitLine(project.gitStatus),
+    [project.gitStatus],
+  );
+
+  const selectedSession = useMemo<AgentSession | null>(
+    () => sessions.find((s) => s.agentId === selectedAgentId) ?? null,
+    [sessions, selectedAgentId],
+  );
+
+  // MC-P5: the Stop (kill) safety brake is gated to a SELECTED mini session only —
+  // a mini is a session with a parentAgentId. A normal agent's stop is the existing
+  // external/stop_agent flow, NOT this 1-click brake.
+  const selectedIsMini = useMemo(
+    () => (selectedSession ? isMiniSession(selectedSession) : false),
+    [selectedSession],
+  );
+
+  // MC-P7: the Compact action is gated to a SELECTED session whose RESOLVED
+  // built-in client is exactly "claude" — `/compact` is a Claude Code slash
+  // command, meaningless to codex/powershell/ollama-mini/custom CLIs. It is an
+  // independent control from the mini Stop brake (Stop = mini-only safety kill;
+  // Compact = claude-only context hygiene); either, both, or neither may show
+  // depending on the selected session.
+  const selectedCanCompact = useMemo(
+    () => (selectedSession ? shouldShowCompact(selectedSession) : false),
+    [selectedSession],
+  );
+
+  // MC-P6: token/cost window for the SELECTED agent ONLY, on a slow lazy cadence
+  // (transcript reads are expensive — never per rail row, never on the 5s
+  // live-state tick). Degrades silently to a hidden badge on unavailable.
+  const tokenUsage = useAgentTokenUsage(selectedAgentId, {
+    fetchUsage: (agentId) =>
+      invokeBackendCommand<AgentTokenUsage>("get_agent_token_usage", {
+        agentId,
+      }),
+  });
+
+  // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
+  // two-step confirm): `mini_coder_kill` records killRequested THEN kills the PTY so
+  // the executor finalizes the mini as aborted_by_human and the parent coder is told
+  // to escalate. Best-effort; a failed invoke is swallowed (the executor's own
+  // timeout/parent-gone backstops still reap a runaway mini).
+  const stopMini = useCallback(() => {
+    if (!selectedSession) return;
+    const call = miniKillCall(selectedSession);
+    if (!call) return; // not a mini — no 1-click kill for a normal agent.
+    void invokeBackendCommand(call.command, call.args).catch(() => {
+      /* swallow — the executor backstops a runaway mini regardless */
+    });
+  }, [selectedSession]);
+
+  // MC-P7: run `/compact` in the selected Claude agent's terminal. Reuses the
+  // EXISTING `agent_pty_write` path (the same the reply bar uses) to write the
+  // fixed `/compact\n` literal — no new write path, no secret. Gated by
+  // `compactWriteCall` returning null for any non-claude session, so a stray call
+  // on a wrong client can never fire. Best-effort; a failed invoke is swallowed.
+  const compactSelected = useCallback(() => {
+    if (!selectedSession) return;
+    const call = compactWriteCall(selectedSession);
+    if (!call) return; // not a claude client — no Compact for it.
+    void invokeBackendCommand(call.command, call.args).catch(() => {
+      /* swallow — Compact is a convenience; a write failure is non-fatal */
+    });
+  }, [selectedSession]);
+
+  const submitCommit = () => {
+    const trimmed = commitMessage.trim();
+    if (!trimmed || gitActionBusy) return;
+    onCommit(trimmed);
+    setCommitMessage("");
+    setCommitOpen(false);
+  };
+
+  return (
+    <div className="flex w-full flex-col gap-4">
+      {/* ---- Top bar ---- */}
+      <div className="flex flex-col gap-2 rounded-2xl border border-cream-200 bg-white p-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex min-w-0 items-center gap-3">
+          <button
+            type="button"
+            onClick={onBack}
+            data-help-title="This returns to the project board."
+            data-help-lines="Work mode is a full-screen view of one project.|Going back keeps this project selected on the board.|The agents keep running; you are only changing the view.|Use the board to switch between projects."
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:text-terracotta"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" aria-hidden />
+            Board
+          </button>
+          <h2 className="truncate text-sm font-semibold text-cream-800">
+            {project.metadata.title}
+          </h2>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {gitLine.isGitRepo && (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-lg bg-cream-50 px-2.5 py-1 text-[11px] font-semibold text-cream-600"
+              title={gitLine.segments.join(" · ")}
+            >
+              <GitBranch className="h-3.5 w-3.5 text-cream-400" aria-hidden />
+              {gitLine.segments.join(" · ")}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={onPull}
+            disabled={!gitLine.isGitRepo || gitActionBusy}
+            data-help-title="This pulls the latest changes from origin (fast-forward only)."
+            data-help-lines="Pull downloads the current branch's new commits from origin and fast-forwards.|It never merges or rebases: if your branch has diverged, it stops and shows the git error.|Resolve a divergence yourself (commit/stash, then merge or rebase) before pulling again.|The working tree is left untouched when a fast-forward is not possible."
+            className="inline-flex items-center gap-1.5 rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 disabled:opacity-60"
+          >
+            Pull
+          </button>
+          <button
+            type="button"
+            onClick={() => setCommitOpen((open) => !open)}
+            disabled={!gitLine.isGitRepo || gitActionBusy}
+            data-help-title="This commits the tracked changes on the current branch."
+            data-help-lines="A commit records the modified, tracked files on the current branch only.|Untracked files are not swept in; stage them in your editor if needed.|Enter a short message describing the change.|The app never force-anything; on failure the git error is shown."
+            className="inline-flex items-center gap-1.5 rounded-lg bg-terracotta px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
+          >
+            Commit
+          </button>
+          <button
+            type="button"
+            onClick={onPush}
+            disabled={!gitLine.isGitRepo || gitActionBusy}
+            data-help-title="This pushes the current branch to origin."
+            data-help-lines="Push uploads the current branch's commits to the origin remote.|It never force-pushes, so it can only fast-forward the remote.|If there is no upstream or the push is rejected, the git error is shown.|Commit first if you have local changes you want to push."
+            className="inline-flex items-center gap-1.5 rounded-lg bg-teal px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
+          >
+            Push
+          </button>
+        </div>
+      </div>
+
+      {/* Commit message input (small, inline — no modal). */}
+      {commitOpen && (
+        <div className="flex flex-col gap-2 rounded-2xl border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
+          <input
+            value={commitMessage}
+            onChange={(e) => setCommitMessage(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submitCommit();
+            }}
+            placeholder="Commit message"
+            maxLength={2000}
+            autoFocus
+            className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+          />
+          <button
+            type="button"
+            onClick={submitCommit}
+            disabled={!commitMessage.trim() || gitActionBusy}
+            className="shrink-0 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+          >
+            Commit
+          </button>
+        </div>
+      )}
+
+      {/* Inline git action status (success or git stderr). */}
+      {gitActionMessage && (
+        <p
+          className={`rounded-lg px-3 py-2 text-[11px] font-semibold ${
+            gitActionError
+              ? "bg-coral/[0.06] text-coral-dark"
+              : "bg-sage/10 text-sage-dark"
+          }`}
+        >
+          {gitActionMessage}
+        </p>
+      )}
+
+      {/* GH-P4: agent push-approval gate — agents commit freely, the human approves
+          every push. Surfaces this project's pending request(s) with Approve/Deny. */}
+      <PushApprovalCard projectId={project.metadata.id} />
+
+      {/* Plan approval gate — surfaces pending plan-approval requests for the current
+          project. Rendered beside the push card; always visible when pending requests
+          exist, regardless of the active dock tab. */}
+      <PlanApprovalCard projectId={project.metadata.id} />
+
+      {/* ---- Main: rail + center terminal ---- */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
+        <ProjectWorkspaceAgentRail
+          sessions={sessions}
+          selectedAgentId={selectedAgentId}
+          onSelectAgent={setSelectedAgentId}
+          projectId={project.metadata.id}
+          projectTitle={project.metadata.title}
+          tasks={project.state.tasks}
+          projectActive={canLaunch}
+          isBusy={isBusy}
+          launchMessage={launchMessage}
+          rules={rules}
+          customClients={customClients}
+          onLaunch={onLaunch}
+          onCopyPrompt={onCopyPrompt}
+          launcherOpen={launcherOpen}
+          onToggleLauncher={() => setLauncherOpen((open) => !open)}
+        />
+
+        <section className="min-w-0">
+          {selectedSession ? (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-[12px] font-semibold text-cream-700">
+                    {selectedSession.agentId}
+                  </span>
+                  <TokenUsageBadge usage={tokenUsage} />
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {/* MC-P7: the Compact action — ONLY for a selected Claude agent
+                      (resolved client === "claude"). Runs `/compact` in the agent's
+                      terminal to shrink its context window. Independent of the mini
+                      Stop brake: a claude coder shows Compact (not Stop); a mini
+                      shows Stop (not Compact, unless it is itself a claude mini). */}
+                  {selectedCanCompact && (
+                    <button
+                      type="button"
+                      onClick={compactSelected}
+                      className="inline-flex items-center gap-1 rounded-2xl border border-teal bg-teal px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-teal/90"
+                      data-help-title="Runs /compact in this Claude agent to shrink its context."
+                      data-help-lines="Sends the /compact slash command to this Claude agent's terminal.|Claude Code summarizes the conversation so far, freeing context window so the agent can keep working longer.|Only Claude agents show this button — /compact is a Claude Code command.|It is a one-click convenience; you can also type /compact yourself in the reply bar."
+                    >
+                      <Minimize2 className="h-3 w-3" aria-hidden />
+                      Compact
+                    </button>
+                  )}
+                  {/* MC-P5: the Stop (kill) safety brake — ONLY for a selected mini.
+                      1-click (no two-step confirm): a human Stop is an immediate
+                      override. A non-mini agent never shows this; its stop is the
+                      existing stop_agent flow elsewhere. */}
+                  {selectedIsMini && (
+                    <button
+                      type="button"
+                      onClick={stopMini}
+                      className="inline-flex items-center gap-1 rounded-2xl border border-coral bg-coral px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-coral-dark"
+                      data-help-title="Stop this mini-coder now."
+                      data-help-lines="Immediately kills this mini-coder; the parent coder will be told it was aborted and must escalate to you.|This is a one-click safety brake — there is no confirm step.|Only mini-coders show this button; a normal agent is stopped from its own controls."
+                    >
+                      <OctagonX className="h-3 w-3" aria-hidden />
+                      Stop
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setDrawerOpen((open) => !open)}
+                    aria-expanded={drawerOpen}
+                    className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold ${
+                      drawerOpen
+                        ? "border-terracotta bg-terracotta/10 text-terracotta"
+                        : "border-cream-200 bg-white text-cream-600 hover:text-terracotta"
+                    }`}
+                  >
+                    <PanelRightOpen className="h-3 w-3" aria-hidden />
+                    drawer ▸
+                  </button>
+                </div>
+              </div>
+
+              {/* Mount the live terminal ONLY for an app-hosted agent (one with a
+                  live in-app PTY). Key by agentId so switching agents remounts the
+                  viewer cleanly; the lazy xterm chunk loads once and is reused. An
+                  external/legacy agent has no app PTY — show a tidy note instead of
+                  the viewer's snapshot-error banner. */}
+              {ptyAgents.has(selectedSession.agentId) ? (
+                <Suspense
+                  fallback={
+                    <div className="rounded-2xl border border-cream-200 bg-cream-50 px-3 py-10 text-center text-[11px] text-cream-400">
+                      Loading terminal…
+                    </div>
+                  }
+                >
+                  <AgentTerminalViewer
+                    key={selectedSession.agentId}
+                    agentId={selectedSession.agentId}
+                  />
+                </Suspense>
+              ) : (
+                <div className="flex h-72 items-center justify-center rounded-2xl border border-dashed border-cream-200 bg-cream-50 px-4 text-center text-[12px] text-cream-400">
+                  This agent runs in an external console — no in-app terminal to
+                  show. Use the drawer for its claims and events.
+                </div>
+              )}
+
+              {drawerOpen && (
+                <AgentDetailDrawer
+                  session={selectedSession}
+                  claims={claims}
+                  events={events}
+                  now={now}
+                />
+              )}
+
+              {/* Question card: shown when the selected agent is waiting for a
+                  human reply to a question it raised via ask_user / pendingQuestion. */}
+              <AgentQuestionCard session={selectedSession} />
+            </div>
+          ) : (
+            <div className="flex h-72 items-center justify-center rounded-2xl border border-dashed border-cream-200 bg-cream-50 text-center text-[12px] text-cream-400">
+              {sessions.length === 0
+                ? "No agent working this project. Use + Launch to spawn a coder or verifier."
+                : "Select an agent from the left to view its terminal."}
+            </div>
+          )}
+        </section>
+      </div>
+
+      {/* ---- Bottom dock ---- */}
+      <div className="rounded-2xl border border-cream-200 bg-white">
+        <div className="flex w-fit gap-1 border-b border-cream-200 p-1">
+          {DOCK_TABS.map((tab) => {
+            const active = dockTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setDockTab(tab.id)}
+                className={`rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+                  active
+                    ? "bg-terracotta text-white"
+                    : "text-cream-500 hover:bg-cream-50 hover:text-cream-700"
+                }`}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="p-4">
+          {dockTab === "censor" && (
+            <CensorPanel
+              projectId={project.metadata.id}
+              root={project.metadata.rootPath}
+              onLaunch={onLaunch}
+              isBusy={isBusy}
+              canLaunch={canLaunch}
+            />
+          )}
+
+          {dockTab === "activity" && (
+            <DockActivity claims={claims} events={events} />
+          )}
+
+          {dockTab === "git" && <DockGit project={project} />}
+
+          {dockTab === "plans" && (
+            <PlansDockTab projectId={project.metadata.id} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Activity tab: claims + recent events for this project ------------------
+// Reuses the same claim/event shapes ProjectsView already scopes to the project.
+
+function DockActivity({
+  claims,
+  events,
+}: {
+  claims: AgentClaim[];
+  events: AgentEvent[];
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+      <div>
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+          Open claims
+        </p>
+        {claims.length === 0 ? (
+          <p className="text-[11px] text-cream-400">No open claims.</p>
+        ) : (
+          <ul className="space-y-1">
+            {claims.map((claim) => (
+              <li
+                key={`${claim.projectId}:${claim.taskId}:${claim.agentId}:${claim.status}:${claim.updatedAt ?? claim.claimedAt}`}
+                className="rounded-md bg-cream-50 px-2 py-1"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate text-[11px] font-semibold text-cream-800">
+                    {claim.taskTitle ?? claim.taskId}
+                  </span>
+                  <span className="shrink-0 text-[9px] font-semibold text-cream-500">
+                    {claim.status}
+                  </span>
+                </div>
+                <p className="truncate text-[9px] text-cream-400">
+                  {claim.agentId} · {claim.role} · {formatStamp(claim.updatedAt)}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div>
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+          Recent events
+        </p>
+        {events.length === 0 ? (
+          <p className="text-[11px] text-cream-400">No recent events.</p>
+        ) : (
+          <ul className="space-y-1">
+            {events.map((event) => (
+              <li
+                key={event.id}
+                className="rounded-md bg-cream-50 px-2 py-1 text-[10px]"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-cream-600">
+                    {event.eventType}
+                  </span>
+                  <span className="text-cream-400">
+                    {formatStamp(event.timestamp)}
+                  </span>
+                </div>
+                <p className="break-words text-cream-500">{event.message}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---- Git tab: the gitStatus detail (branch, ahead/behind, counts, upstream) --
+
+function DockGit({ project }: { project: ProjectDetail }) {
+  const git = project.gitStatus;
+  if (!git.isGitRepo) {
+    return (
+      <p className="text-[11px] text-cream-400">
+        The project root is not inside a Git repository.
+      </p>
+    );
+  }
+  const rows: { label: string; value: string }[] = [
+    { label: "Branch", value: git.branch ?? "—" },
+    { label: "Upstream", value: git.upstream ?? "no upstream" },
+    { label: "Ahead / Behind", value: `↑${git.aheadCount} / ↓${git.behindCount}` },
+    { label: "Staged", value: String(git.stagedCount) },
+    { label: "Unstaged", value: String(git.unstagedCount) },
+    { label: "Untracked", value: String(git.untrackedCount) },
+    { label: "Dirty total", value: String(git.dirtyCount) },
+    { label: "Last commit", value: git.commit ?? "—" },
+  ];
+  return (
+    <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
+      {rows.map((row) => (
+        <div key={row.label} className="flex items-center justify-between gap-3">
+          <dt className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+            {row.label}
+          </dt>
+          <dd className="truncate font-mono text-[11px] text-cream-700">
+            {row.value}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+export default ProjectWorkspace;

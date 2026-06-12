@@ -10,8 +10,10 @@ Thumbs.db
 
 # Runtime state written by the app when run from this folder — agent sessions,
 # project briefs and their lock files. Never source, never published.
-projects/
-aspis/
+# Anchored to the repo root: an unanchored `projects/` also shadowed the REAL
+# source directory src/components/projects/ (it was never pushed).
+/projects/
+/aspis/
 
 # Local-only tool state and caches.
 .claude/
