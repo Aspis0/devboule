@@ -51,8 +51,10 @@ describe("CensorLocalAiCard", () => {
     expect(html).not.toContain("Base URL");
     expect(html).not.toContain("mlx-community/gemma");
     expect(html).not.toContain("Local OpenAI-compatible endpoint");
-    // Ollama shows the "no configuration needed" hint instead.
-    expect(html).toContain("no configuration needed");
+    // Ollama shows the model-tag override input instead (merged from the old
+    // CensorModelCard, 2026-06-12).
+    expect(html).toContain("Ollama model tag (optional)");
+    expect(html).toContain("gemma4:e4b");
   });
 
   it("shows Base URL + Model and the loopback caption for an omlx config (no API-key field)", () => {
@@ -102,8 +104,8 @@ describe("CensorLocalAiCard", () => {
     // indeterminate <select>, so the Ollama branch renders.
     currentConfig = { provider: "bogus" } as unknown as CensorLocalAi;
     const html = renderToStaticMarkup(<CensorLocalAiCard />);
-    // Ollama branch renders (its hint), and NO omlx-only fields leak in.
-    expect(html).toContain("no configuration needed");
+    // Ollama branch renders (its tag input), and NO omlx-only fields leak in.
+    expect(html).toContain("Ollama model tag (optional)");
     expect(html).not.toContain("Local OpenAI-compatible endpoint");
   });
 

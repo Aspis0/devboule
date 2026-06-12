@@ -376,10 +376,8 @@ export function WorkspaceView() {
       <CustomAgentClientsCard />
 
       {/* Phase 5: the Mini-coder and Design LLM backend cards moved to
-          Settings → Providers & Models and no longer render here. The Censor
-          provider card (Ollama vs local oMLX server) stays in the workspace. */}
-
-      <CensorLocalAiCard />
+          Settings → Providers & Models. The Censor provider card moved there
+          too (2026-06-12): users expect every provider picker in one tab. */}
 
       {error && (
         <div className="rounded-lg border border-coral/20 bg-coral/[0.04] px-4 py-3 text-[12px] font-medium text-coral-dark">
@@ -942,7 +940,7 @@ function inferIsAppleHostMac(): boolean | null {
   return null;
 }
 
-function CensorLocalAiCard() {
+export function CensorLocalAiCard() {
   const { config } = useAppContext();
   const { refreshConfig } = useAppActions();
   // Absent censorLocalAi == the Ollama default (today's behavior). This is the UNTYPED
@@ -955,6 +953,9 @@ function CensorLocalAiCard() {
   );
   const [baseUrl, setBaseUrl] = useState(seedCensorString(current?.baseUrl));
   const [model, setModel] = useState(seedCensorString(current?.model));
+  const [ollamaModel, setOllamaModel] = useState(
+    seedCensorString((current as { ollamaModel?: unknown } | null)?.ollamaModel),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedTick, setSavedTick] = useState(false);
@@ -973,20 +974,14 @@ function CensorLocalAiCard() {
     setProvider(seedCensorProvider(current?.provider));
     setBaseUrl(seedCensorString(current?.baseUrl));
     setModel(seedCensorString(current?.model));
-  }, [current?.provider, current?.baseUrl, current?.model]);
+    setOllamaModel(seedCensorString((current as { ollamaModel?: unknown } | null)?.ollamaModel));
+  }, [current?.provider, current?.baseUrl, current?.model, (current as { ollamaModel?: unknown } | null)?.ollamaModel]);
 
-  // The Ollama-only model override is owned by the CensorModelCard (Providers tab); this
-  // provider card has NO input for it, but it MUST round-trip the existing value so saving
-  // the provider never wipes the override (split-brain fix). Read it from the untyped config
-  // and pass it through validation/save unchanged. Coerce a non-string to "" (hand-edited
-  // config safety, same as the other seeds).
-  const existingOllamaModel = seedCensorString(
-    (current as { ollamaModel?: unknown } | null)?.ollamaModel,
-  );
-
+  // This card now OWNS the Ollama model-tag override (the separate CensorModelCard was
+  // merged into it 2026-06-12): the draft state above feeds validation/save directly.
   const validation = useMemo(
-    () => validateCensorLocalAi({ provider, baseUrl, model, ollamaModel: existingOllamaModel }),
-    [provider, baseUrl, model, existingOllamaModel],
+    () => validateCensorLocalAi({ provider, baseUrl, model, ollamaModel }),
+    [provider, baseUrl, model, ollamaModel],
   );
   const isAppleHostMac = useMemo(() => inferIsAppleHostMac(), []);
   const appleFmDisabled = provider === "appleFm" && isAppleHostMac === false;
@@ -1099,10 +1094,19 @@ function CensorLocalAiCard() {
             )}
           </label>
         ) : (
-          <p className="self-end text-[11px] leading-4 text-cream-400">
-            Ollama uses the built-in loopback endpoint and the default Gemma
-            model — no configuration needed.
-          </p>
+          <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+            Ollama model tag (optional)
+            <input
+              value={ollamaModel}
+              onChange={(event) => setOllamaModel(event.target.value)}
+              placeholder="gemma4:e4b"
+              maxLength={CENSOR_MODEL_MAX_LENGTH}
+              className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+            />
+            <span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
+              Blank uses the default gemma4:e4b (auto-falls back to e2b).
+            </span>
+          </label>
         )}
 
         {provider === "appleFm" ? (

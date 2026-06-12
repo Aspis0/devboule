@@ -29,8 +29,8 @@ vi.mock("../../context/AppContext", () => ({
 }));
 
 // Child cards mocked to markers so the tab test does not depend on their internals.
-vi.mock("./CensorModelCard", () => ({
-  CensorModelCard: () =>
+vi.mock("../views/WorkspaceView", () => ({
+  CensorLocalAiCard: () =>
     createElement("div", { "data-testid": "censor-model-card" }),
 }));
 vi.mock("./MiniCoderBackendCard", () => ({

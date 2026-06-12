@@ -14,10 +14,10 @@ import {
   type ProviderStatusMap,
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
-import { CensorModelCard } from "./CensorModelCard";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
+import { CensorLocalAiCard } from "../views/WorkspaceView";
 
 // Phase 5 — the "Providers & Models" tab: a single home for everything that picks
 // an AI provider/model. A top "Detected on this machine" strip (one
@@ -250,9 +250,9 @@ export function ProvidersModelsTab() {
 
       <RoleSection
         title="Censor model"
-        description="The local Gemma model Censor uses for its optional tier-2 code review."
+        description="Where Censor's tier-2 local review runs (Ollama, local oMLX, or Apple on-device) and which model it uses."
       >
-        <CensorModelCard />
+        <CensorLocalAiCard />
       </RoleSection>
 
       <RoleSection
