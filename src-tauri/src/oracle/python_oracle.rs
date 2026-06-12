@@ -1459,7 +1459,15 @@ fn build_oracle_server_command_with_package_root(
 ) -> Result<Command, String> {
     let package_root = package_root.ok_or_else(|| MISSING_PACKAGE_ROOT_ERROR.to_string())?;
     let session = oracle_http_session();
-    let python = super::oracle_setup::resolve_oracle_python();
+    // FAIL-CLOSED interpreter (resident-server respawn-loop fix): when the venv
+    // runtime is not installed, surface an explicit Err instead of spawning a
+    // doomed server on a bare system interpreter (it would crash instantly and
+    // drive the ~10s supervisor respawn loop).
+    let python = super::oracle_setup::resolve_oracle_runtime_python().ok_or_else(|| {
+        "Oracle Python runtime is not installed (oracle-data venv missing); \
+         refusing to spawn the resident server on a bare system interpreter."
+            .to_string()
+    })?;
     // Spawn with a verbatim-stripped cwd: when `root` carries the Windows `\\?\`
     // extended-length prefix, the server's `str(Path.cwd().resolve())` would echo
     // a `\\?\C:\…` string and the readiness root-compare would transiently
@@ -2880,6 +2888,10 @@ mod tests {
         assert_eq!(snapshot.node_count, 65);
     }
 
+    // Windows-only: `\\?\` verbatim prefixes only ever appear in roots produced
+    // by the Windows path APIs (the strip is documented as a no-op elsewhere),
+    // so the equivalence only holds where the host parser recognizes the prefix.
+    #[cfg(windows)]
     #[test]
     fn oracle_ready_path_compare_accepts_windows_verbatim_prefix() {
         assert_eq!(

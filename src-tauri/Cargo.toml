@@ -90,5 +90,7 @@ windows_capture = { package = "windows", version = "=0.61.3", features = ["Win32
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSString", "NSError"] }
-objc2-local-authentication = { version = "0.2", features = ["LAContext", "LAError"] }
+# "block2" unlocks evaluatePolicy_localizedReason_reply (the async reply-block
+# API used by backend/auth.rs verify_user).
+objc2-local-authentication = { version = "0.2", features = ["LAContext", "LAError", "block2"] }
 block2 = "0.5"

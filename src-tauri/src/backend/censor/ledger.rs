@@ -114,6 +114,19 @@ pub fn censor_dir(root: &Path) -> PathBuf {
 /// still used in error messages for diagnostics.
 pub fn validate_rel_path(rel: &str) -> io::Result<()> {
     let normalized = rel.replace('\\', "/");
+    // Windows drive paths (`C:\...`, `C:/...`, drive-relative `C:foo`) must be
+    // rejected on EVERY host OS, not just Windows: ledger rel paths are
+    // cross-platform, and on POSIX `C:` parses as a plain `Normal` component so
+    // the `Prefix` arm below never fires for them.
+    let mut head = normalized.bytes();
+    if let (Some(first), Some(b':')) = (head.next(), head.next()) {
+        if first.is_ascii_alphabetic() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("censor rel path must be relative, got absolute: {rel}"),
+            ));
+        }
+    }
     let path = Path::new(&normalized);
     for component in path.components() {
         match component {

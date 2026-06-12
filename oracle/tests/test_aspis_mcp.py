@@ -2635,7 +2635,11 @@ root_path: "{escaped_work_root}"
         self.assertEqual(result["allowed_file_ids"], ["oracle/server/aspis_mcp.py"])
 
     def test_oracle_paths_are_rooted_at_management_root(self):
-        root = Path("C:/tmp/Aspis Management")
+        # Resolve the literal so the expectation matches mcp_oracle_paths()'s
+        # resolved output on every OS: on Windows "C:/tmp/..." is already
+        # absolute (resolve is a no-op); on POSIX it is relative, so both
+        # sides must be anchored the same way before comparing.
+        root = Path("C:/tmp/Aspis Management").resolve()
         with patch.dict("os.environ", {}, clear=True):
             paths = mcp_oracle_paths(root / "projects")
 

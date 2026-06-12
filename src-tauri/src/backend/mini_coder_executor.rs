@@ -2695,6 +2695,43 @@ fn sh_single_quote_portable(value: &str) -> String {
 /// Kept uncfg'd (platform-agnostic) so it is unit-testable on the Windows dev host,
 /// like `build_macos_trap_preamble`. The inner heredoc uses the `OMLXEOF` delimiter so
 /// it never collides with the wrapper's own `PYEOF` heredoc.
+/// Python payload for [`build_omlx_run_macos`]'s heredoc, kept as a module-scope
+/// RAW string so its indentation survives verbatim. Inside a `format!` literal
+/// the `\n\` line continuations strip each following line's leading whitespace,
+/// which silently flattens the Python block structure and makes the script die
+/// with `IndentationError` at runtime (found on the first real macOS run).
+/// `@OMLX_KEY_FILE_ENV@` / `@OMLX_TIMEOUT_ENV@` / `@OMLX_TIMEOUT_DEFAULT@` are
+/// substituted by the builder.
+const OMLX_RUN_MACOS_PY: &str = r#"import os, json
+import urllib.request, urllib.error
+try:
+    with open(os.environ['MINI_PROMPT_FILE'], 'r', encoding='utf-8') as f:
+        prompt = f.read()
+    body = json.dumps({
+        'model': os.environ['OMLX_MODEL'],
+        'messages': [{'role': 'user', 'content': prompt}],
+        'stream': False,
+        'temperature': 0.1,
+    }).encode('utf-8')
+    req = urllib.request.Request(os.environ['OMLX_URL'], data=body, method='POST')
+    req.add_header('Content-Type', 'application/json')
+    key_path = os.environ.get('@OMLX_KEY_FILE_ENV@')
+    if key_path:
+        with open(key_path, 'r', encoding='utf-8') as kf:
+            token = kf.read().strip()
+        if token:
+            req.add_header('Authorization', 'Bearer ' + token)
+    timeout = int(os.environ.get('@OMLX_TIMEOUT_ENV@', '@OMLX_TIMEOUT_DEFAULT@'))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode('utf-8', 'replace'))
+    content = data['choices'][0]['message']['content']
+    if content is not None:
+        import sys
+        sys.stdout.write(content)
+except Exception:
+    pass
+"#;
+
 #[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
 fn build_omlx_run_macos(
     base_url: &str,
@@ -2721,42 +2758,17 @@ fn build_omlx_run_macos(
     // Export the base URL, model and prompt path for python (all via env, never argv).
     // `OMLX_MODEL` carries OUR validated bare tag; still passed via env for symmetry and
     // to keep argv empty.
+    let py = OMLX_RUN_MACOS_PY
+        .replace("@OMLX_KEY_FILE_ENV@", OMLX_KEY_FILE_ENV)
+        .replace("@OMLX_TIMEOUT_ENV@", OMLX_TIMEOUT_ENV)
+        .replace("@OMLX_TIMEOUT_DEFAULT@", &http_timeout.to_string());
     format!(
         "OMLX_URL={url_q}\nexport OMLX_URL\n\
 OMLX_MODEL={model_q}\nexport OMLX_MODEL\n\
 MINI_PROMPT_FILE={prompt_path_q}\nexport MINI_PROMPT_FILE\n\
 {OMLX_TIMEOUT_ENV}={http_timeout}\nexport {OMLX_TIMEOUT_ENV}\n\
 {key_export}\
-python3 - <<'OMLXEOF'\n\
-import os, json\n\
-import urllib.request, urllib.error\n\
-try:\n\
-    with open(os.environ['MINI_PROMPT_FILE'], 'r', encoding='utf-8') as f:\n\
-        prompt = f.read()\n\
-    body = json.dumps({{\n\
-        'model': os.environ['OMLX_MODEL'],\n\
-        'messages': [{{'role': 'user', 'content': prompt}}],\n\
-        'stream': False,\n\
-        'temperature': 0.1,\n\
-    }}).encode('utf-8')\n\
-    req = urllib.request.Request(os.environ['OMLX_URL'], data=body, method='POST')\n\
-    req.add_header('Content-Type', 'application/json')\n\
-    key_path = os.environ.get('{OMLX_KEY_FILE_ENV}')\n\
-    if key_path:\n\
-        with open(key_path, 'r', encoding='utf-8') as kf:\n\
-            token = kf.read().strip()\n\
-        if token:\n\
-            req.add_header('Authorization', 'Bearer ' + token)\n\
-    timeout = int(os.environ.get('{OMLX_TIMEOUT_ENV}', '{http_timeout}'))\n\
-    with urllib.request.urlopen(req, timeout=timeout) as resp:\n\
-        data = json.loads(resp.read().decode('utf-8', 'replace'))\n\
-    content = data['choices'][0]['message']['content']\n\
-    if content is not None:\n\
-        import sys\n\
-        sys.stdout.write(content)\n\
-except Exception:\n\
-    pass\n\
-OMLXEOF\n"
+python3 - <<'OMLXEOF'\n{py}OMLXEOF\n"
     )
 }
 
@@ -2936,48 +2948,56 @@ fn build_mini_command_impl(
 /// handled by the JSON grammar), so trailing prose `}` cannot downgrade a `done`.
 /// python3 ships on macOS dev setups (the Oracle runtime already requires python);
 /// the result/raw paths ride in env vars so nothing is on argv.
+/// Python payload for [`macos_stdout_to_result_wrapper`]'s heredoc, kept as a
+/// module-scope RAW string so its indentation survives verbatim (same
+/// `IndentationError` pitfall as [`OMLX_RUN_MACOS_PY`] — `\n\` continuations in
+/// a `format!` literal strip the next line's leading whitespace). `@MAX_BYTES@`
+/// is substituted by the wrapper.
+#[cfg(target_os = "macos")]
+const MACOS_RESULT_EXTRACTOR_PY: &str = r#"import os, re, json
+out = None
+try:
+    with open(os.environ['MINI_RAW_FILE'], 'rb') as f:
+        raw = f.read(@MAX_BYTES@).decode('utf-8', 'replace')
+    # MINOR 10: strip OSC/DCS/APC/PM/SOS payloads, then CSI escapes.
+    clean = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', raw)
+    clean = re.sub(r'\x1b[P_^X][^\x1b]*\x1b\\', '', clean)
+    clean = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', clean)
+    dec = json.JSONDecoder()
+    i = 0
+    n = len(clean)
+    while i < n and out is None:
+        if clean[i] != '{':
+            i += 1
+            continue
+        try:
+            obj, _end = dec.raw_decode(clean, i)
+            if isinstance(obj, dict) and obj.get('status') in ('done', 'needs_clarification'):
+                out = clean[i:_end]
+        except Exception:
+            pass
+        i += 1
+except Exception:
+    out = None
+try:
+    os.remove(os.environ['MINI_RAW_FILE'])
+except Exception:
+    pass
+if out is None:
+    out = json.dumps({'status': 'failed', 'output': 'mini backend produced no valid JSON result'})
+with open(os.environ['MINI_RESULT'], 'w', encoding='utf-8') as f:
+    f.write(out)
+"#;
+
 #[cfg(target_os = "macos")]
 fn macos_stdout_to_result_wrapper(run: &str, result_path: &str, raw_path: &str) -> String {
-    let max_bytes = super::mini_coder::MAX_RESULT_BYTES;
+    let py = MACOS_RESULT_EXTRACTOR_PY
+        .replace("@MAX_BYTES@", &super::mini_coder::MAX_RESULT_BYTES.to_string());
     format!(
         "MINI_RAW_FILE={raw_path}\nexport MINI_RAW_FILE\nMINI_RESULT={result_path}\nexport MINI_RESULT\n\
 # WARNING 7: redirect the backend's stdout to a temp FILE (not a shell var).\n\
 {{ {run} ; }} > \"$MINI_RAW_FILE\" 2>/dev/null || true\n\
-python3 - <<'PYEOF'\n\
-import os, re, json\n\
-out = None\n\
-try:\n\
-    with open(os.environ['MINI_RAW_FILE'], 'rb') as f:\n\
-        raw = f.read({max_bytes}).decode('utf-8', 'replace')\n\
-    # MINOR 10: strip OSC/DCS/APC/PM/SOS payloads, then CSI escapes.\n\
-    clean = re.sub(r'\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)', '', raw)\n\
-    clean = re.sub(r'\\x1b[P_^X][^\\x1b]*\\x1b\\\\', '', clean)\n\
-    clean = re.sub(r'\\x1b\\[[0-9;?]*[A-Za-z]', '', clean)\n\
-    dec = json.JSONDecoder()\n\
-    i = 0\n\
-    n = len(clean)\n\
-    while i < n and out is None:\n\
-        if clean[i] != '{{':\n\
-            i += 1\n\
-            continue\n\
-        try:\n\
-            obj, _end = dec.raw_decode(clean, i)\n\
-            if isinstance(obj, dict) and obj.get('status') in ('done', 'needs_clarification'):\n\
-                out = clean[i:_end]\n\
-        except Exception:\n\
-            pass\n\
-        i += 1\n\
-except Exception:\n\
-    out = None\n\
-try:\n\
-    os.remove(os.environ['MINI_RAW_FILE'])\n\
-except Exception:\n\
-    pass\n\
-if out is None:\n\
-    out = json.dumps({{'status': 'failed', 'output': 'mini backend produced no valid JSON result'}})\n\
-with open(os.environ['MINI_RESULT'], 'w', encoding='utf-8') as f:\n\
-    f.write(out)\n\
-PYEOF\n"
+python3 - <<'PYEOF'\n{py}PYEOF\n"
     )
 }
 
@@ -5795,12 +5815,14 @@ mod tests {
         let cmd =
             build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots)).unwrap();
         let script = macos_script(&cmd);
+        // Every arg is single-quoted by sh_single_quote_local (semantically
+        // identical for /bin/sh: 'exec' is still the literal word exec).
         assert!(
-            script.contains("codex exec"),
+            script.contains("| codex 'exec'"),
             "codex exec missing: {script}"
         );
         assert!(
-            script.contains("-m 'gpt-5-codex'"),
+            script.contains("'-m' 'gpt-5-codex'"),
             "model flag missing: {script}"
         );
         assert!(

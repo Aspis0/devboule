@@ -210,8 +210,17 @@ def _run_code(
             )
             return proc.returncode == 0, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or f"timeout:{exc.timeout}"
+            # CPython quirk: on POSIX, TimeoutExpired carries the partial
+            # output as raw bytes even when text=True (Windows re-reads it
+            # decoded), so normalize to str to keep the (bool, str, str)
+            # contract on every OS.
+            def _as_text(value: object) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return value or ""
+
+            stdout = _as_text(exc.stdout)
+            stderr = _as_text(exc.stderr) or f"timeout:{exc.timeout}"
             return False, stdout, stderr
 
 

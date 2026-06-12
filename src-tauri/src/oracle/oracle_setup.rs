@@ -177,6 +177,32 @@ pub fn resolve_oracle_python() -> String {
     default_python_command().to_string()
 }
 
+/// FAIL-CLOSED variant of [`resolve_oracle_python`] for SPAWNING the resident
+/// server: `Some` only when the managed venv runtime is fully installed (or an
+/// explicit `PYTHON` override is set), `None` when the runtime is missing. The
+/// resident-server spawn must NOT fall back to a bare system interpreter — that
+/// spawn is doomed (no installed deps), crashes instantly, and drives the ~10s
+/// supervisor respawn loop the fail-closed contract exists to prevent (see
+/// `build_oracle_server_command_propagates_runtime_missing_error`).
+pub fn resolve_oracle_runtime_python() -> Option<String> {
+    if let Some(data_root) = oracle_data_root() {
+        if venv_complete(&data_root) {
+            return Some(
+                venv_python(&oracle_venv_dir(&data_root))
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+    if let Ok(value) = std::env::var("PYTHON") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
 fn default_python_command() -> &'static str {
     if cfg!(windows) {
         "python"

@@ -85,7 +85,9 @@ pub fn hello_available() -> bool {
     let context = unsafe { LAContext::new() };
     // DeviceOwnerAuthentication allows Touch ID with a password fallback, so a Mac
     // without a fingerprint sensor still authenticates via the login password.
-    unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication, None) }
+    // objc2 maps the ObjC `canEvaluatePolicy:error:` BOOL + NSError** pair to a
+    // Result, so "available" is simply Ok(()).
+    unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }.is_ok()
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -369,9 +371,9 @@ pub fn verify_user(message: &str) -> Result<bool, String> {
         .name("aspis-macos-localauth".into())
         .spawn(move || -> Result<bool, String> {
             let context = unsafe { LAContext::new() };
-            if !unsafe {
-                context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication, None)
-            } {
+            if unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) }
+                .is_err()
+            {
                 return Err("Touch ID / device authentication is unavailable.".into());
             }
 
@@ -407,7 +409,12 @@ pub fn verify_user(_message: &str) -> Result<bool, String> {
     Err("Biometric unlock is only available on Windows and macOS.".into())
 }
 
-#[cfg(test)]
+// Every test in this module exercises the Windows Hello helpers
+// (`run_hello_call`, `run_hello_thread`, `parse_helper_bool_output`,
+// `helper_failure_message`, `verification_result_label`,
+// `UserConsentVerificationResult`), all of which are `#[cfg(target_os = "windows")]`.
+// Gate the whole module to Windows so the crate compiles on macOS/Linux.
+#[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
 

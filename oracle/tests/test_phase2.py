@@ -237,7 +237,7 @@ class OraclePhase2Test(unittest.TestCase):
 
     def test_chunk_index_is_resumable_and_returns_semantic_context(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             worker = root / "cloudflare" / "workers" / "biovision-worker.ts"
             scaleway = root / "src-tauri" / "src" / "backend" / "providers.rs"
             session = root / "codex-sessions" / "log.md"
@@ -522,7 +522,7 @@ class OraclePhase2Test(unittest.TestCase):
         # treated as stale (needs re-index) even when size+mtime are unchanged, so
         # the profile bump re-chunks every existing file at the new 2500 size.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source = root / "src" / "worker.ts"
             source.parent.mkdir(parents=True)
             source.write_text("export function worker() { return 'Cloudflare Worker'; }\n", encoding="utf-8")
@@ -2693,7 +2693,7 @@ class OracleVendoredEnvExclusionTest(unittest.TestCase):
 
     def test_collect_text_files_skips_vendored_env_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             # A vendored env: a package dir sits next to its pip install marker.
             # The marker dir has NO indexable text of its own beyond RECORD, but
             # the sibling package's library `.py` must be pruned too because the
@@ -2726,7 +2726,7 @@ class OracleVendoredEnvExclusionTest(unittest.TestCase):
         # The secret default-deny must keep firing independently of the vendored
         # filter: a token.txt outside any env is still dropped, and source is kept.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             secret = root / "config" / "token.txt"
             secret.parent.mkdir(parents=True)
             secret.write_text("ghp_deadbeef\n", encoding="utf-8")

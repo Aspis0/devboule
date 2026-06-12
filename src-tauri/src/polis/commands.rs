@@ -2166,14 +2166,29 @@ mod tests {
     #[test]
     fn projects_dir_is_parent_of_agent_state_file() {
         // The default-map-target resolution derives the projects dir from the
-        // `.aspis-agents.json` state path reported by get_agent_live_state.
-        let p = projects_dir_from_state_path(
-            r"C:\Users\gualt\Desktop\Aspis Management\projects\.aspis-agents.json",
-        );
-        assert_eq!(
-            p,
-            PathBuf::from(r"C:\Users\gualt\Desktop\Aspis Management\projects")
-        );
+        // `.aspis-agents.json` state path reported by get_agent_live_state. The
+        // state path always comes from the LOCAL OS at runtime, so each host is
+        // exercised with its own native separator/root form.
+        #[cfg(windows)]
+        {
+            let p = projects_dir_from_state_path(
+                r"C:\Users\gualt\Desktop\Aspis Management\projects\.aspis-agents.json",
+            );
+            assert_eq!(
+                p,
+                PathBuf::from(r"C:\Users\gualt\Desktop\Aspis Management\projects")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let p = projects_dir_from_state_path(
+                "/Users/gualt/Desktop/Aspis Management/projects/.aspis-agents.json",
+            );
+            assert_eq!(
+                p,
+                PathBuf::from("/Users/gualt/Desktop/Aspis Management/projects")
+            );
+        }
         // Empty / rootless input stays empty (caller falls back to "projects").
         assert_eq!(projects_dir_from_state_path(""), PathBuf::new());
     }

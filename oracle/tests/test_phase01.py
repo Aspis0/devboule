@@ -20,7 +20,7 @@ from oracle.store.sqlite_store import SQLiteStore
 class OraclePhase01Test(unittest.TestCase):
     def test_ingest_legacy_graph_populates_sqlite_and_vector_store(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             graph_path = self._write_graph(root)
             sqlite_path = root / "metadata.sqlite"
             vector_path = root / "vectors.json"
@@ -46,7 +46,7 @@ class OraclePhase01Test(unittest.TestCase):
 
     def test_reingest_replaces_stale_nodes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             graph_path = self._write_graph(root)
             sqlite_path = root / "metadata.sqlite"
             vector_path = root / "vectors.json"
@@ -87,7 +87,7 @@ class OraclePhase01Test(unittest.TestCase):
 
     def test_prune_excluded_chunks_removes_stale_node_cards_and_vectors(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / "keep.py").write_text("print('keep')\n", encoding="utf-8")
             sqlite_path = root / "metadata.sqlite"
             chunk_vector_path = root / "chunks.json"
@@ -129,7 +129,7 @@ class OraclePhase01Test(unittest.TestCase):
 
     def test_collect_text_files_excludes_baseline_copies(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / "src").mkdir()
             (root / "src" / "live.py").write_text("print('live')\n", encoding="utf-8")
             (root / "_baseline").mkdir()
@@ -142,7 +142,7 @@ class OraclePhase01Test(unittest.TestCase):
 
     def test_collect_text_files_respects_workspace_oracleignore(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / ".oracleignore").write_text(
                 "local-cache/\n**/node_modules/\n*.secret.txt\n",
                 encoding="utf-8",
@@ -161,7 +161,7 @@ class OraclePhase01Test(unittest.TestCase):
 
     def test_collect_text_files_rejects_secret_files_keeps_source_tokens(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / "src").mkdir()
             # Legitimate source named tokens.ts must survive (README carve-out).
             (root / "src" / "tokens.ts").write_text("export const A = 1;\n", encoding="utf-8")
@@ -205,7 +205,7 @@ class OraclePhase01Test(unittest.TestCase):
         # set on its own, with NO .oracleignore present. chunk_path_allowed reads
         # no ignore file, proving the security invariant is not user-droppable.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             self.assertFalse((root / ".oracleignore").exists())
             blocked = [
                 "token.txt",
@@ -244,7 +244,7 @@ class OraclePhase01Test(unittest.TestCase):
 
     def test_query_engine_exposes_phase1_routes_semantics(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             graph_path = self._write_graph(root)
             sqlite_path = root / "metadata.sqlite"
             vector_path = root / "vectors.json"
@@ -279,7 +279,7 @@ class OraclePhase01Test(unittest.TestCase):
         if not app_graph.exists():
             self.skipTest("app graph.json not available")
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             sqlite_path = root / "metadata.sqlite"
             vector_path = root / "vectors.json"
             ingest(
@@ -409,7 +409,7 @@ class OracleGitignoreSemanticsTest(unittest.TestCase):
         # `!build/keep.md` un-excludes that one file. Polis honors this; Oracle must
         # too, or a user's rescued path is kept on the map but lost from the index.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / ".oracleignore").write_text(
                 "build/\n!build/keep.md\n",
                 encoding="utf-8",
@@ -430,7 +430,7 @@ class OracleGitignoreSemanticsTest(unittest.TestCase):
         # The Rust scanner reads `.gitignore`; Oracle must too, or the map and the
         # index diverge. A `.gitignore` with `dist/` prunes `dist/x.js`.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / ".gitignore").write_text("dist/\n", encoding="utf-8")
             (root / "dist").mkdir()
             (root / "dist" / "x.js").write_text("export const x = 1;\n", encoding="utf-8")
@@ -445,7 +445,7 @@ class OracleGitignoreSemanticsTest(unittest.TestCase):
     def test_gitignore_negation_also_honored(self):
         # Negation semantics apply to `.gitignore` too, not only `.oracleignore`.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / ".gitignore").write_text("dist/\n!dist/keep.md\n", encoding="utf-8")
             (root / "dist").mkdir()
             (root / "dist" / "x.js").write_text("export const x = 1;\n", encoding="utf-8")
@@ -462,7 +462,7 @@ class OracleGitignoreSemanticsTest(unittest.TestCase):
         # the anchored pattern into a global name match. (A name NOT in the
         # built-in EXCLUDED_DIRS is used so this isolates the anchoring semantics.)
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / ".oracleignore").write_text("/legacy-out\n", encoding="utf-8")
             (root / "legacy-out").mkdir()
             (root / "legacy-out" / "old.py").write_text("print('old')\n", encoding="utf-8")
@@ -500,7 +500,7 @@ class OracleGitignoreSemanticsTest(unittest.TestCase):
         # (the per-directory second os.scandir is gone): if it did, the patched
         # version below would raise and fail the run.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             dist_info = root / "Orasis" / "numpy-1.26.4.dist-info"
             dist_info.mkdir(parents=True)
             (dist_info / "RECORD").write_text("numpy/__init__.py,,\n", encoding="utf-8")
