@@ -33,10 +33,17 @@ pub mod gitleaks;
 pub mod jscpd;
 pub mod knip;
 pub mod lizard;
+pub mod npm_audit;
+pub mod oxlint;
+pub mod pip_audit;
+pub mod pyright;
+pub mod prettier;
 pub mod ruff;
+pub mod ruff_format;
 pub mod semgrep;
 pub mod tsc;
 pub mod vulture;
+pub mod zizmor;
 
 use super::detect::{FileLang, ProjectKind};
 use super::schema::{Category, Disposition, Finding, ProvenanceEntry, Severity, Verdict};
@@ -124,13 +131,20 @@ pub enum RunnerId {
     Tsc,
     Eslint,
     Knip,
+    Prettier,
+    NpmAudit,
+    Oxlint,
     Ruff,
+    RuffFormat,
+    PipAudit,
+    Pyright,
     Bandit,
     Vulture,
     Gitleaks,
     Jscpd,
     Lizard,
     Semgrep,
+    Zizmor,
 }
 
 impl RunnerId {
@@ -151,14 +165,21 @@ impl RunnerId {
             | RunnerId::Tsc
             | RunnerId::Knip
             | RunnerId::Jscpd
-            | RunnerId::Gitleaks => Granularity::Coarse,
+            | RunnerId::Gitleaks
+            | RunnerId::NpmAudit
+            | RunnerId::PipAudit
+            | RunnerId::Zizmor => Granularity::Coarse,
             // Per-file linters/scanners (invoked with the changed file path).
             RunnerId::Eslint
+            | RunnerId::Prettier
             | RunnerId::Ruff
+            | RunnerId::RuffFormat
             | RunnerId::Bandit
             | RunnerId::Vulture
             | RunnerId::Lizard
-            | RunnerId::Semgrep => Granularity::Fine,
+            | RunnerId::Semgrep
+            | RunnerId::Oxlint
+            | RunnerId::Pyright => Granularity::Fine,
         }
     }
 
@@ -169,13 +190,20 @@ impl RunnerId {
             RunnerId::Tsc => "tsc",
             RunnerId::Eslint => "eslint",
             RunnerId::Knip => "knip",
+            RunnerId::Prettier => "prettier",
+            RunnerId::NpmAudit => "npm",
+            RunnerId::Oxlint => "oxlint",
             RunnerId::Ruff => "ruff",
+            RunnerId::PipAudit => "pip-audit",
+            RunnerId::Pyright => "pyright",
+            RunnerId::RuffFormat => "ruff",
             RunnerId::Bandit => "bandit",
             RunnerId::Vulture => "vulture",
             RunnerId::Gitleaks => "gitleaks",
             RunnerId::Jscpd => "jscpd",
             RunnerId::Lizard => "lizard",
             RunnerId::Semgrep => "semgrep",
+            RunnerId::Zizmor => "zizmor",
         }
     }
 }
@@ -190,12 +218,13 @@ pub struct RunTarget {
 }
 
 /// The cross-cutting runners that apply to EVERY file regardless of project kind
-/// or language: secret scanning, copy/paste, complexity, and semgrep patterns.
-const CROSS_CUTTING: [RunnerId; 4] = [
+/// or language: secret scanning, copy/paste, complexity, semgrep, and zizmor.
+const CROSS_CUTTING: [RunnerId; 5] = [
     RunnerId::Gitleaks,
     RunnerId::Jscpd,
     RunnerId::Lizard,
     RunnerId::Semgrep,
+    RunnerId::Zizmor,
 ];
 
 /// Decide which runners apply to a changed file, given the project's detected
@@ -225,9 +254,15 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
             out.push(RunnerId::Tsc);
             out.push(RunnerId::Eslint);
             out.push(RunnerId::Knip);
+            out.push(RunnerId::Prettier);
+            out.push(RunnerId::NpmAudit);
+            out.push(RunnerId::Oxlint);
         }
         FileLang::Py if kinds.contains(&ProjectKind::Python) => {
             out.push(RunnerId::Ruff);
+            out.push(RunnerId::RuffFormat);
+            out.push(RunnerId::PipAudit);
+            out.push(RunnerId::Pyright);
             out.push(RunnerId::Bandit);
             out.push(RunnerId::Vulture);
         }

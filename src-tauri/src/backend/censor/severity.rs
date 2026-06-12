@@ -88,6 +88,41 @@ pub fn severity_from_cargo_fmt() -> (Severity, Category) {
     (Severity::Low, Category::Style)
 }
 
+/// npm audit. npm uses low|moderate|high|critical; a dependency vulnerability
+/// is always Security. critical/high → High, moderate → Medium, low → Low,
+/// unknown → Medium.
+#[allow(dead_code)] // first caller is the A3 npm_audit runner.
+pub fn severity_from_npm_audit(sev: &str) -> (Severity, Category) {
+    let s = match sev.trim().to_ascii_lowercase().as_str() {
+        "critical" | "high" => Severity::High,
+        "moderate" => Severity::Medium,
+        "low" => Severity::Low,
+        _ => Severity::Medium,
+    };
+    (s, Category::Security)
+}
+
+/// zizmor. zizmor uses high|medium|low|informational; CI hardening findings
+/// are always Security. high → High, medium → Medium, low/informational → Low,
+/// unknown → Medium.
+#[allow(dead_code)] // first caller is the A3 zizmor runner.
+pub fn severity_from_zizmor(sev: &str) -> (Severity, Category) {
+    let s = match sev.trim().to_ascii_lowercase().as_str() {
+        "high" => Severity::High,
+        "medium" => Severity::Medium,
+        "low" | "informational" => Severity::Low,
+        _ => Severity::Medium,
+    };
+    (s, Category::Security)
+}
+
+/// Shared helper for style-only format checkers (ruff format, prettier).
+/// Formatting issues are Low severity, Style category.
+#[allow(dead_code)]
+pub fn severity_from_format_checker() -> (Severity, Category) {
+    (Severity::Low, Category::Style)
+}
+
 /// gitleaks (secret scanner). A leaked secret is always the most serious finding
 /// we surface: High Security.
 #[allow(dead_code)] // first caller is the A2 gitleaks runner.
@@ -137,6 +172,29 @@ pub fn severity_from_tsc(category: &str) -> (Severity, Category) {
         "warning" => Severity::Medium,
         "suggestion" | "message" | "info" => Severity::Low,
         _ => Severity::High,
+    };
+    (sev, Category::Correctness)
+}
+
+/// pyright (Python type checker). Maps JSON severity strings to our severity.
+#[allow(dead_code)] // first caller is the A3 pyright runner.
+pub fn severity_from_pyright(severity: &str) -> (Severity, Category) {
+    let sev = match severity.trim().to_ascii_lowercase().as_str() {
+        "error" => Severity::High,
+        "warning" => Severity::Medium,
+        "information" | "info" => Severity::Low,
+        _ => Severity::High,
+    };
+    (sev, Category::Correctness)
+}
+
+/// oxlint (Node linter). Maps message content to severity.
+#[allow(dead_code)] // first caller is the A3 oxlint runner.
+pub fn severity_from_oxlint(message: &str) -> (Severity, Category) {
+    let sev = if message.contains("[Error") {
+        Severity::High
+    } else {
+        Severity::Medium
     };
     (sev, Category::Correctness)
 }

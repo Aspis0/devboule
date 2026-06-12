@@ -84,7 +84,13 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
     if !crate::backend::projects::command_exists("vulture") {
         return Vec::new();
     }
-    let stdout = run_capture("vulture", &["--", &target.file_rel_path], root);
+    // DEMOTED 2026-06-12 (master plan P2): vulture is FP-prone on dynamic Python;
+    // only 100%-confidence findings are objective enough for the gate.
+    let stdout = run_capture(
+        "vulture",
+        &["--min-confidence", "100", "--", &target.file_rel_path],
+        root,
+    );
     match stdout {
         Some(s) => parse_vulture(&s),
         None => Vec::new(),

@@ -165,16 +165,23 @@ fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFind
         RunnerId::CargoCheck => runners::cargo_check::run(root),
         RunnerId::CargoAudit => runners::cargo_audit::run(root),
         RunnerId::CargoFmt => runners::cargo_fmt::run(root),
+        RunnerId::NpmAudit => runners::npm_audit::run(root),
+        RunnerId::Oxlint => runners::oxlint::run(root, target),
+        RunnerId::PipAudit => runners::pip_audit::run(root),
+        RunnerId::Pyright => runners::pyright::run(root, target),
         RunnerId::Tsc => runners::tsc::run(root),
         RunnerId::Knip => runners::knip::run(root),
         RunnerId::Jscpd => runners::jscpd::run(root),
         RunnerId::Gitleaks => runners::gitleaks::run(root),
         RunnerId::Eslint => runners::eslint::run(root, target),
+        RunnerId::Prettier => runners::prettier::run(root, target),
         RunnerId::Ruff => runners::ruff::run(root, target),
+        RunnerId::RuffFormat => runners::ruff_format::run(root, target),
         RunnerId::Bandit => runners::bandit::run(root, target),
         RunnerId::Vulture => runners::vulture::run(root, target),
         RunnerId::Lizard => runners::lizard::run(root, target),
         RunnerId::Semgrep => runners::semgrep::run(root, target),
+        RunnerId::Zizmor => runners::zizmor::run(root),
     }
 }
 
@@ -189,16 +196,23 @@ fn runner_source(id: RunnerId) -> &'static str {
         RunnerId::CargoCheck => "cargo-check",
         RunnerId::CargoAudit => "cargo-audit",
         RunnerId::CargoFmt => "cargo-fmt",
+        RunnerId::NpmAudit => "npm-audit",
+        RunnerId::Oxlint => "oxlint",
+        RunnerId::PipAudit => "pip-audit",
+        RunnerId::Pyright => "pyright",
         RunnerId::Tsc => "tsc",
         RunnerId::Knip => "knip",
         RunnerId::Jscpd => "jscpd",
         RunnerId::Gitleaks => "gitleaks",
         RunnerId::Eslint => "eslint",
+        RunnerId::Prettier => "prettier",
         RunnerId::Ruff => "ruff",
+        RunnerId::RuffFormat => "ruff-format",
         RunnerId::Bandit => "bandit",
         RunnerId::Vulture => "vulture",
         RunnerId::Lizard => "lizard",
         RunnerId::Semgrep => "semgrep",
+        RunnerId::Zizmor => "zizmor",
     }
 }
 
@@ -944,12 +958,13 @@ mod tests {
     #[test]
     fn coarse_runners_for_empty_kinds_is_only_cross_cutting_coarse() {
         let c = coarse_runners(&kinds(&[]));
-        // Only the cross-cutting COARSE runners (gitleaks, jscpd) survive.
+        // Only the cross-cutting COARSE runners (gitleaks, jscpd, zizmor) survive.
         assert!(c.contains(&RunnerId::Gitleaks));
         assert!(c.contains(&RunnerId::Jscpd));
+        assert!(c.contains(&RunnerId::Zizmor));
         assert!(!c.contains(&RunnerId::Clippy));
         assert!(!c.contains(&RunnerId::Tsc));
-        assert_eq!(c.len(), 2);
+        assert_eq!(c.len(), 3);
     }
 
     // ---- group_by_file ----

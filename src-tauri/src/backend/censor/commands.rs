@@ -1028,8 +1028,8 @@ mod tests {
         let kinds = std::collections::HashSet::new();
         let tools = detect_tools_with(&kinds, |_| true);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        // No project kind → no kind-specific runners, only the cross-cutting four.
-        assert_eq!(names, vec!["gitleaks", "jscpd", "lizard", "semgrep"]);
+        // No project kind → no kind-specific runners, only the cross-cutting set.
+        assert_eq!(names, vec!["gitleaks", "jscpd", "lizard", "semgrep", "zizmor"]);
     }
 
     // ---- WARNING 1 / N3: the one-time Gemma probe runs ONCE under concurrency ----

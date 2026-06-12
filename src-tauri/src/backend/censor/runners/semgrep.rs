@@ -126,7 +126,19 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
     // option. semgrep rule evaluation can be slow; allow a generous budget.
     let stdout = run_capture_with_timeout(
         "semgrep",
-        &["--json", "--quiet", "--", &target.file_rel_path],
+        // PINNED 2026-06-12 (master plan P2): broad/auto rulesets are ~42% FP and
+        // `--config auto` phones home. Pin the small curated `p/ci` pack and keep
+        // metrics off (privacy + determinism).
+        &[
+            "--json",
+            "--quiet",
+            "--config",
+            "p/ci",
+            "--metrics",
+            "off",
+            "--",
+            &target.file_rel_path,
+        ],
         root,
         Duration::from_secs(300),
     );

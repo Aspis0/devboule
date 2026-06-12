@@ -45,3 +45,7 @@ eras/
 # backend `dump_real_city_state` test. Dev-only; bundled into the gated
 # polis-dev chunk (POLIS_DEV=1). Must NOT be tracked or shipped.
 polis-dev-city.json
+
+# Local training rail (ORPO pairs, scribe data) — never commit
+.aspis-training/
+.aspis-mini/

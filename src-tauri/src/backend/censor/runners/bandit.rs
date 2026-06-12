@@ -82,7 +82,23 @@ pub fn run(root: &Path, target: &RunTarget) -> Vec<RawFinding> {
     if !crate::backend::projects::command_exists("bandit") {
         return Vec::new();
     }
-    let stdout = run_capture("bandit", &["-f", "json", "--", &target.file_rel_path], root);
+    // DEMOTED 2026-06-12 (master plan P2): bandit is FP-heavy (~15-42%) and would
+    // poison the ORPO labels as a broad gate. Hard-gate only HIGH severity at
+    // HIGH confidence; everything quieter is left to the coder-facing tiers.
+    let stdout = run_capture(
+        "bandit",
+        &[
+            "-f",
+            "json",
+            "--severity-level",
+            "high",
+            "--confidence-level",
+            "high",
+            "--",
+            &target.file_rel_path,
+        ],
+        root,
+    );
     match stdout {
         Some(s) => parse_bandit(&s, &target.file_rel_path),
         None => Vec::new(),
