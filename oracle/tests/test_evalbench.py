@@ -132,6 +132,102 @@ class RunHeldoutTests(unittest.TestCase):
             self.assertEqual(mock_replay.call_count, 2)
 
 
+class EvalPairBridgeTests(unittest.TestCase):
+    def test_loader_accepts_rail_eval_pair_records(self):
+        # P7->P15 bridge: the rail's eval_pair records are directly usable —
+        # no rejected/chosen join needed.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "pairs.jsonl"
+            p.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "eval_pair",
+                                "task": "fix the divide",
+                                "model": "omlx",
+                                "rootId": "d1",
+                                "attempt": 1,
+                            }
+                        ),
+                        json.dumps({"type": "write_fix_pair", "rootId": "d1"}),
+                        json.dumps({"type": "eval_pair", "task": "   "}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "oracle.evalbench.heldout.replay_task", return_value=GOOD
+            ) as mock_replay:
+                out = run_heldout(str(p), "http://127.0.0.1:8000/v1", "cand")
+            self.assertEqual(out["total"], 1, "only the well-formed eval_pair is usable")
+            self.assertEqual(out["skippedMalformed"], 2)
+            self.assertEqual(mock_replay.call_count, 1)
+
+    def test_wrap_contract_wraps_the_task_in_the_live_contract(self):
+        from oracle.evalbench.heldout import build_replay_prompt
+
+        wrapped = build_replay_prompt("do the thing")
+        self.assertTrue(wrapped.startswith("TASK:\ndo the thing"))
+        self.assertIn("EDITS CONTRACT", wrapped)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "pairs.jsonl"
+            p.write_text(
+                json.dumps({"type": "eval_pair", "task": "do the thing", "model": "m"}) + "\n",
+                encoding="utf-8",
+            )
+            seen = []
+
+            def spy(base_url, model, task_prompt, timeout_secs=300, enable_thinking=False):
+                seen.append(task_prompt)
+                return GOOD
+
+            with patch("oracle.evalbench.heldout.replay_task", side_effect=spy):
+                run_heldout(str(p), "http://127.0.0.1:8000/v1", "cand", wrap_contract=True)
+            self.assertIn("EDITS CONTRACT", seen[0])
+            self.assertIn("do the thing", seen[0])
+
+    def test_replay_contract_mirrors_the_rust_prompt_builder(self):
+        # ANTI-DRIFT (same spirit as the ROLE_RULES rust mirror): the key
+        # contract lines must exist verbatim in the Rust prompt builder.
+        from oracle.evalbench.heldout import REPLAY_CONTRACT
+
+        rust = (
+            Path(__file__).resolve().parents[2]
+            / "src-tauri/src/backend/mini_coder_executor.rs"
+        ).read_text(encoding="utf-8")
+        for anchor in [
+            "EDITS CONTRACT (the app applies your edits — you never write files yourself):",
+            "it must occur EXACTLY ONCE in that file.",
+            "An EMPTY oldString means: CREATE the file with newString as its full content.",
+            "Emit edits in apply order: a later edit must anchor against the text as changed by earlier edits.",
+        ]:
+            self.assertIn(anchor, REPLAY_CONTRACT)
+            self.assertIn(anchor, rust, f"contract line drifted from Rust: {anchor}")
+
+
+class ClarificationAndScopeTests(unittest.TestCase):
+    def test_compliant_needs_clarification_passes_the_gate(self):
+        # The live contract ALLOWS needs_clarification — a well-formed one must
+        # pass (punishing it rewards hallucinated edits over honest questions).
+        ok = json.dumps({"status": "needs_clarification", "question": "which file?"})
+        self.assertTrue(score_output(ok)["pass"])
+        # ...but only WITH a question.
+        bad = json.dumps({"status": "needs_clarification"})
+        self.assertFalse(score_output(bad)["pass"])
+
+    def test_replay_prompt_includes_paths_only_file_scope(self):
+        from oracle.evalbench.heldout import build_replay_prompt
+
+        wrapped = build_replay_prompt("t", ["src/a.rs", "src/b.rs"])
+        self.assertIn("FILE SCOPE (paths only", wrapped)
+        self.assertIn("- src/a.rs", wrapped)
+        # The contract TEXT itself mentions "FILE SCOPE paths above" — the
+        # assertion targets the section HEADER only.
+        self.assertNotIn("FILE SCOPE (paths only", build_replay_prompt("t"))
+
+
 class LoopbackTests(unittest.TestCase):
     def test_run_heldout_refuses_non_loopback_base_url(self):
         # Fail-closed posture (mirrors vault.rs/answerer.py): pair tasks embed

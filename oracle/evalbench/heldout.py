@@ -116,6 +116,17 @@ def score_no_fences(output: str) -> bool:
     return '```' not in output
 
 
+def is_compliant_clarification(parsed: Any) -> bool:
+    """A wrapper object reporting needs_clarification WITH a question is
+    contract-compliant output (the contract explicitly allows it) — punishing
+    it would reward models that hallucinate edits over ones that ask."""
+    return (
+        isinstance(parsed, dict)
+        and parsed.get('status') == 'needs_clarification'
+        and bool(str(parsed.get('question') or '').strip())
+    )
+
+
 def score_output(output: str) -> Dict[str, Any]:
     """Score the output against all deterministic gates."""
     json_score = score_json_array(output)
@@ -125,8 +136,12 @@ def score_output(output: str) -> Dict[str, Any]:
     # Try to parse for schema check (same stripper + shape normalizer).
     try:
         parsed = json.loads(strip_fences(output))
-        edits = extract_edits(parsed)
-        schema_score = score_edit_schema(edits) if edits is not None else False
+        if is_compliant_clarification(parsed):
+            json_score = True
+            schema_score = True
+        else:
+            edits = extract_edits(parsed)
+            schema_score = score_edit_schema(edits) if edits is not None else False
     except (json.JSONDecodeError, ValueError):
         schema_score = False
         
@@ -154,6 +169,39 @@ def require_loopback(base_url: str) -> None:
         raise ValueError(
             f"base_url must stay on loopback (127.0.0.1/localhost/::1), got: {base_url}"
         )
+
+
+# Mirrored VERBATIM (key lines) from the Rust write-directive prompt builder in
+# src-tauri/src/backend/mini_coder_executor.rs — a cross-language test pins the
+# anchor lines so the two cannot drift silently.
+REPLAY_CONTRACT = (
+    'Report your result as a SINGLE JSON object with this schema:\n'
+    '{"status":"done"|"needs_clarification", "output":"short summary", '
+    '"edits":[{"path":"rel/path","oldString":"...","newString":"..."},...], '
+    '"filesTouched":["path",...], "question":"...only if needs_clarification...", '
+    '"partial":"...optional..."}\n'
+    'EDITS CONTRACT (the app applies your edits — you never write files yourself):\n'
+    '- filesTouched is informational only: the app derives the REAL touched list from your applied edits.\n'
+    '- oldString: copied BYTE-FOR-BYTE from the file contents above; it must occur EXACTLY ONCE in that file.\n'
+    '- An EMPTY oldString means: CREATE the file with newString as its full content.\n'
+    '- Every path must be one of the FILE SCOPE paths above; any other path is rejected and the whole result fails.\n'
+    '- Emit edits in apply order: a later edit must anchor against the text as changed by earlier edits.\n'
+    'OUTPUT this JSON object to stdout and NOTHING ELSE (no prose, no code fences, no logs). '
+    'Output exactly one JSON object, then stop.\n'
+)
+
+
+def build_replay_prompt(task: str, files: Optional[List[str]] = None) -> str:
+    """Wrap a recorded task in the live emit-edits contract so the replay
+    measures compliance with the REAL output contract, not a bare task.
+    `files` (the record's filesTouched) becomes a paths-only FILE SCOPE — the
+    original file CONTENTS are not replayed, so a compliant model may well
+    answer needs_clarification (which the gate accepts, see score_output)."""
+    scope = ""
+    if files:
+        listed = "\n".join(f"- {f}" for f in files)
+        scope = f"FILE SCOPE (paths only; file contents not replayed):\n{listed}\n\n"
+    return f"TASK:\n{task}\n\n{scope}{REPLAY_CONTRACT}"
 
 
 def replay_task(
@@ -226,7 +274,8 @@ def run_heldout(
     model: str,
     limit: Optional[int] = None,
     enable_thinking: bool = False,
-    timeout_secs: int = 300
+    timeout_secs: int = 300,
+    wrap_contract: bool = False
 ) -> Dict[str, Any]:
     """Load pairs, replay each, score, and return results."""
     require_loopback(base_url)
@@ -242,8 +291,11 @@ def run_heldout(
                     continue
                 try:
                     pair = json.loads(line)
-                    # Validate required fields
-                    if not all(k in pair for k in ['task', 'model', 'rejected', 'chosen']):
+                    # Two usable shapes: the 4-field manual pair, or the rail's
+                    # direct `eval_pair` record (task + provenance, no join).
+                    is_manual = all(k in pair for k in ['task', 'model', 'rejected', 'chosen'])
+                    is_eval = pair.get('type') == 'eval_pair' and str(pair.get('task') or '').strip()
+                    if not (is_manual or is_eval):
                         skipped_malformed += 1
                         continue
                     pairs.append(pair)
@@ -261,6 +313,10 @@ def run_heldout(
     
     for pair in pairs:
         task_prompt = pair['task']
+        if wrap_contract:
+            task_prompt = build_replay_prompt(
+                pair['task'], pair.get('filesTouched') or None
+            )
         error: Optional[str] = None
         try:
             # CANDIDATE model under test — never the pair's recorded model
@@ -347,6 +403,8 @@ def main():
     parser.add_argument('--limit', type=int, default=None, help='Limit number of pairs')
     parser.add_argument('--thinking', action='store_true', help='Enable thinking (Qwen-family models only)')
     parser.add_argument('--timeout', type=int, default=300, help='Per-replay timeout in seconds')
+    parser.add_argument('--wrap-contract', action='store_true',
+                        help='Wrap each task in the live emit-edits contract before replay')
     parser.add_argument('--out', type=str, default=None, help='Output JSON file path')
 
     args = parser.parse_args()
@@ -364,7 +422,8 @@ def main():
         model=args.model,
         limit=args.limit,
         enable_thinking=args.thinking,
-        timeout_secs=args.timeout
+        timeout_secs=args.timeout,
+        wrap_contract=args.wrap_contract
     )
 
     if args.out:

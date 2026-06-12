@@ -779,6 +779,31 @@ fn record_directive_result_capped(
                 e
             );
         }
+        // P15(b) bridge: an `eval_pair` the held-out harness consumes DIRECTLY
+        // (no offline join): the full coder task text is the replay prompt of
+        // record (it never embeds file bodies — no blob-denylist concern);
+        // `model` is backend provenance (the kind label; the concrete model id
+        // lives in app config, not on the directive).
+        let eval_pair = serde_json::json!({
+            "type": "eval_pair",
+            "ts": now_rfc3339(),
+            "rootId": super::mini_coder::chain_root_id(directive),
+            "chosenDirectiveId": directive.id,
+            "attempt": directive.attempt,
+            "task": directive.task,
+            "model": directive
+                .backend
+                .clone()
+                .unwrap_or_else(|| "default-backend".to_string()),
+            "filesTouched": outcome.files_touched,
+        });
+        if let Err(e) = append_jsonl(&pairs_path, &eval_pair) {
+            eprintln!(
+                "training_export: eval_pair append failed at {}: {}",
+                pairs_path.display(),
+                e
+            );
+        }
     }
 }
 
@@ -1392,7 +1417,11 @@ mod tests {
         outcome.files_touched = vec!["src/a.rs".into()];
         record_directive_result(&root, &leaf, &outcome);
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
-        assert_eq!(lines.len(), 2, "directive_result + write_fix_pair");
+        assert_eq!(
+            lines.len(),
+            3,
+            "directive_result + write_fix_pair + eval_pair (P15b bridge)"
+        );
         assert_eq!(lines[1]["type"], "write_fix_pair");
         assert_eq!(lines[1]["rootId"], "dW");
         assert_eq!(lines[1]["chosenDirectiveId"], "dW-r1");
@@ -1446,6 +1475,42 @@ mod tests {
         assert_eq!(lines.len(), 1, "directive_result only — no vacuous pair marker");
         assert_eq!(lines[0]["type"], "directive_result");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn eval_pair_record_rides_the_clean_write_fix_leaf() {
+        // P15(b) bridge: the clean fix leaf emits BOTH the join marker AND a
+        // directly-consumable eval_pair (full task text + backend provenance).
+        let root = tmp("evalpair");
+        let mut leaf = directive("dE-r1", "coderP");
+        leaf.write = true;
+        leaf.attempt = 1;
+        leaf.parent_directive_id = Some("dE".into());
+        leaf.task = "fix the divide-by-zero in div()".into();
+        leaf.backend = Some("omlx".into());
+        let mut outcome = MiniCoderOutcome::default();
+        outcome.status = MiniCoderStatus::Done;
+        outcome.files_touched = vec!["src/div.ts".into()];
+        record_directive_result(&root, &leaf, &outcome);
+        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 3, "directive_result + write_fix_pair + eval_pair");
+        assert_eq!(lines[2]["type"], "eval_pair");
+        assert_eq!(lines[2]["rootId"], "dE");
+        assert_eq!(lines[2]["task"], "fix the divide-by-zero in div()");
+        assert_eq!(lines[2]["model"], "omlx");
+        assert_eq!(lines[2]["filesTouched"][0], "src/div.ts");
+
+        // No backend configured -> provenance fallback, never a missing field.
+        let root2 = tmp("evalpair2");
+        let mut nofb = directive("dF-r1", "coderP");
+        nofb.write = true;
+        nofb.attempt = 1;
+        nofb.task = "t".into();
+        record_directive_result(&root2, &nofb, &outcome);
+        let lines = read_lines(&training_dir(&root2).join("pairs.jsonl"));
+        assert_eq!(lines[2]["model"], "default-backend");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root2).ok();
     }
 
     // -- WARNING 10: future-dated terminal directive not attributed --------
