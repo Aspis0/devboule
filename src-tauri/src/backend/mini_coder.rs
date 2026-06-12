@@ -86,6 +86,18 @@ pub(crate) const MAX_RESULT_BYTES: u64 = 1 << 20; // 1 MiB
 /// mini attempts before `Escalated`.
 pub const MAX_MINI_RETRIES: u32 = 2;
 
+/// P6: retry budget by directive kind. A WRITE directive gets exactly ONE
+/// censor-driven fix pass (the master plan's bounded inner loop: write ->
+/// det-Censor -> fix once -> stop/escalate); non-write directives keep the
+/// historical MAX_MINI_RETRIES budget.
+pub fn max_mini_retries_for(directive: &MiniCoderDirective) -> u32 {
+    if directive.write {
+        1
+    } else {
+        MAX_MINI_RETRIES
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -823,8 +835,9 @@ pub fn verdict_gate_decision(
     if blocking_findings.is_empty() {
         return GateDecision::StampTerminal(outcome.clone());
     }
-    // Dirty. Retry if budget remains, else escalate.
-    if directive.attempt < MAX_MINI_RETRIES {
+    // Dirty. Retry if budget remains, else escalate (write directives: ONE
+    // fix pass — see max_mini_retries_for).
+    if directive.attempt < max_mini_retries_for(directive) {
         let feedback = summarize_findings_for_feedback(&high_findings);
         let retry = build_retry_directive(
             directive,
@@ -2856,6 +2869,57 @@ mod tests {
             }
             other => panic!("expected Escalate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gate_write_directive_escalates_after_one_fix_pass() {
+        // P6 bounded inner loop: a WRITE directive gets exactly ONE censor-driven
+        // fix pass — dirty at attempt 1 escalates (a non-write directive at the
+        // same attempt would still retry, pinned below).
+        let mut w = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        w.write = true;
+        w.attempt = 1; // the one allowed fix pass already ran
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["src/a.rs".into()],
+            ..Default::default()
+        });
+        let decision = verdict_gate_decision(
+            &w,
+            &outcome,
+            true,
+            vec![high_finding()],
+            "root-r2",
+            "root-r2.json",
+            "2026-06-06T00:00:10Z",
+        );
+        match decision {
+            GateDecision::Escalate(o) => {
+                assert_eq!(o.status, MiniCoderStatus::Escalated);
+                assert_eq!(o.escalation.expect("escalation").attempts, 2);
+            }
+            other => panic!("write directive must escalate after 1 fix pass, got {other:?}"),
+        }
+
+        // Same attempt, NON-write: the historical budget still allows a retry.
+        let mut nw = directive("root2", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        nw.attempt = 1;
+        let decision = verdict_gate_decision(
+            &nw,
+            &outcome,
+            true,
+            vec![high_finding()],
+            "root2-r2",
+            "root2-r2.json",
+            "2026-06-06T00:00:10Z",
+        );
+        assert!(
+            matches!(decision, GateDecision::AwaitingRetryWith { .. }),
+            "non-write at attempt 1 must still retry"
+        );
+        // And the retry of a write directive stays a write directive.
+        let retry = build_retry_directive(&w, &[], "feedback", "root-rX", "root-rX.json", "t");
+        assert!(retry.write, "fix passes must stay write passes");
     }
 
     #[test]

@@ -2280,11 +2280,22 @@ fn spawn_one_shot_mini(
         &result_target,
         oracle_access.as_ref(),
     );
+    // P6 thinking split: a censor-driven FIX pass (attempt > 0) runs with
+    // model thinking ON — reasoning about a finding is the use case; the
+    // initial write stays OFF (mechanical, fully specified emit-edits).
+    let fix_pass_thinking = directive.attempt > 0;
     let MiniCommandBuild {
         prompt_file,
         key_file,
         command,
-    } = build_mini_command(backend, project_root, &result_target, &prompt, mcp_roots)?;
+    } = build_mini_command(
+        backend,
+        project_root,
+        &result_target,
+        &prompt,
+        mcp_roots,
+        fix_pass_thinking,
+    )?;
     let sessions = match app.try_state::<crate::backend::agent_pty::AgentPtySessions>() {
         Some(s) => s,
         None => {
@@ -2561,6 +2572,8 @@ fn build_mini_command(
     result_target: &Path,
     prompt: &str,
     mcp_roots: Option<&McpRoots>,
+    // P6: thinking ON for fix passes (attempt > 0), OFF for initial writes.
+    fix_pass_thinking: bool,
 ) -> Result<MiniCommandBuild, String> {
     // The prompt goes to a restricted temp file (0600). It is NOT a secret, but
     // keeping it off argv matches the agent-launch contract and avoids argv-length
@@ -2593,6 +2606,7 @@ fn build_mini_command(
         &prompt_file,
         key_file.as_deref(),
         mcp_roots,
+        fix_pass_thinking,
     );
     match cmd {
         Ok(command) => Ok(MiniCommandBuild {
@@ -2630,6 +2644,7 @@ fn build_mini_command_impl(
     prompt_file: &Path,
     key_file: Option<&Path>,
     mcp_roots: Option<&McpRoots>,
+    fix_pass_thinking: bool,
 ) -> Result<CommandBuilder, String> {
     let prompt_path = ps_single_quote(&prompt_file.to_string_lossy());
     let result_path = ps_single_quote(&result_target.to_string_lossy());
@@ -2742,7 +2757,7 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
             // is NEVER on argv: it rides a 0600 file whose PATH is passed via env, read
             // inside the script, and removed in the `finally`.
             let key_env = key_file.map(|_| OMLX_KEY_FILE_ENV);
-            let run = build_omlx_run_windows(base_url, model, key_env);
+            let run = build_omlx_run_windows(base_url, model, key_env, fix_pass_thinking);
             windows_stdout_to_result_wrapper(&run, &result_path, &raw_path)
         }
         MiniCoderBackendKind::AppleFm => {
@@ -2822,7 +2837,14 @@ finally {{\n\
 /// pointed to by that env var and sends an `Authorization: Bearer <token>` header;
 /// when `None`, no auth header is emitted. The token never appears on argv.
 #[cfg(windows)]
-fn build_omlx_run_windows(base_url: &str, model: &str, key_env: Option<&str>) -> String {
+fn build_omlx_run_windows(
+    base_url: &str,
+    model: &str,
+    key_env: Option<&str>,
+    fix_pass_thinking: bool,
+) -> String {
+    // P6: $true on fix passes, $false on initial writes (Qwen-only, gated below).
+    let thinking_ps = if fix_pass_thinking { "$true" } else { "$false" };
     let model_q = ps_single_quote(model);
     let uri_q = ps_single_quote(&format!("{base_url}/chat/completions"));
     // F3: cap the HTTP request so a stalled oMLX server fails fast (Invoke-RestMethod
@@ -2857,7 +2879,7 @@ if ($env:{env}) {{\n\
 try {{\n\
 {header_block}\
 $bodyMap = @{{ model = {model_q}; messages = @(@{{ role = 'user'; content = $prompt }}); stream = $false; temperature = 0.1 }}\n\
-if ({model_q} -match 'qwen') {{ $bodyMap['chat_template_kwargs'] = @{{ enable_thinking = $false }} }}\n\
+if ({model_q} -match 'qwen') {{ $bodyMap['chat_template_kwargs'] = @{{ enable_thinking = {thinking_ps} }} }}\n\
 $body = $bodyMap | ConvertTo-Json -Depth 6 -Compress\n\
 $resp = Invoke-RestMethod -Method Post -Uri {uri_q} -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec {http_timeout}\n\
 $content = $resp.choices[0].message.content\n\
@@ -3043,7 +3065,7 @@ try:
         'temperature': 0.1,
     }
     if 'qwen' in model.lower():
-        body_dict['chat_template_kwargs'] = {'enable_thinking': False}
+        body_dict['chat_template_kwargs'] = {'enable_thinking': @OMLX_THINKING@}
     body = json.dumps(body_dict).encode('utf-8')
     req = urllib.request.Request(os.environ['OMLX_URL'], data=body, method='POST')
     req.add_header('Content-Type', 'application/json')
@@ -3070,6 +3092,7 @@ fn build_omlx_run_macos(
     model: &str,
     prompt_path_q: &str,
     has_key: bool,
+    fix_pass_thinking: bool,
 ) -> String {
     let url_q = sh_single_quote_portable(&format!("{base_url}/chat/completions"));
     let model_q = sh_single_quote_portable(model);
@@ -3093,7 +3116,12 @@ fn build_omlx_run_macos(
     let py = OMLX_RUN_MACOS_PY
         .replace("@OMLX_KEY_FILE_ENV@", OMLX_KEY_FILE_ENV)
         .replace("@OMLX_TIMEOUT_ENV@", OMLX_TIMEOUT_ENV)
-        .replace("@OMLX_TIMEOUT_DEFAULT@", &http_timeout.to_string());
+        .replace("@OMLX_TIMEOUT_DEFAULT@", &http_timeout.to_string())
+        // P6: True on fix passes, False on initial writes (Qwen-only, gated above).
+        .replace(
+            "@OMLX_THINKING@",
+            if fix_pass_thinking { "True" } else { "False" },
+        );
     format!(
         "OMLX_URL={url_q}\nexport OMLX_URL\n\
 OMLX_MODEL={model_q}\nexport OMLX_MODEL\n\
@@ -3122,6 +3150,7 @@ fn build_mini_command_impl(
     prompt_file: &Path,
     key_file: Option<&Path>,
     mcp_roots: Option<&McpRoots>,
+    fix_pass_thinking: bool,
 ) -> Result<CommandBuilder, String> {
     // WARNING 6: use `/bin/sh` UNCONDITIONALLY (do not read the unvalidated $SHELL).
     let prompt_path = sh_single_quote_local(&prompt_file.to_string_lossy());
@@ -3251,7 +3280,8 @@ fn build_mini_command_impl(
                 .ok_or_else(|| "omlx backend requires a base URL".to_string())?;
             // The prompt path, base URL (+ optional key file path) ride in ENV vars —
             // NEVER on argv. The token never leaves the 0600 file; python reads it.
-            let run = build_omlx_run_macos(base_url, model, &prompt_path, key_file.is_some());
+            let run =
+                build_omlx_run_macos(base_url, model, &prompt_path, key_file.is_some(), fix_pass_thinking);
             macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
         }
         MiniCoderBackendKind::AppleFm => {
@@ -3356,6 +3386,7 @@ fn build_mini_command_impl(
     _prompt_file: &Path,
     _key_file: Option<&Path>,
     _mcp_roots: Option<&McpRoots>,
+    _fix_pass_thinking: bool,
 ) -> Result<CommandBuilder, String> {
     if backend.kind == MiniCoderBackendKind::AppleFm {
         return Err("Apple on-device requires macOS 27+.".into());
@@ -5479,6 +5510,7 @@ mod tests {
             &prompt_file,
             None,
             Some(&roots),
+            false,
         )
         .expect("granted codex command builds");
         let with_line = format!("{with:?}");
@@ -5494,6 +5526,7 @@ mod tests {
             &prompt_file,
             None,
             None,
+            false,
         )
         .expect("ungranted codex command builds");
         let without_line = format!("{without:?}");
@@ -5532,7 +5565,7 @@ mod tests {
         let prompt_file = root.join("fake-prompt.txt");
         let b = backend(MiniCoderBackendKind::Codex, Some("gpt-5-codex"), None);
         // No mcp_roots -> no oracle grant flags.
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let argv = argv_strings(&cmd);
         assert_eq!(argv[0], "powershell.exe");
         let script = argv.last().unwrap();
@@ -5594,7 +5627,7 @@ mod tests {
         let prompt_file = root.join("p").join("fake-prompt.txt");
         let b = omlx_backend("qwen2.5-coder", "http://localhost:8000/v1");
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let argv = argv_strings(&cmd);
         assert_eq!(argv[0], "powershell.exe");
         let script = argv.last().unwrap();
@@ -5640,14 +5673,21 @@ mod tests {
             script.contains("temperature = 0.1") && script.contains("stream = $false"),
             "OpenAI envelope fields missing: {script}"
         );
-        // Qwen-family models get chat_template_kwargs.enable_thinking=false (runtime
-        // gate on the model name) or they burn the budget on a thinking trace.
+        // P6 thinking split: this command was built with fix_pass_thinking=false
+        // (an INITIAL write), so the Qwen-gated kwargs must say $false; a FIX
+        // pass flips it to $true (pinned separately below).
         assert!(
             script.contains("-match 'qwen'")
                 && script.contains("chat_template_kwargs")
                 && script.contains("enable_thinking = $false")
                 && script.contains("$body = $bodyMap | ConvertTo-Json -Depth 6 -Compress"),
             "Qwen-gated chat_template_kwargs missing from PS body: {script}"
+        );
+        // The fix-pass variant carries thinking ON.
+        let fix_run = build_omlx_run_windows("http://localhost:8000/v1", "qwen2.5-coder", None, true);
+        assert!(
+            fix_run.contains("enable_thinking = $true"),
+            "fix pass must enable thinking: {fix_run}"
         );
         // Extracts the model's content and writes it to stdout for the wrapper.
         assert!(
@@ -5694,7 +5734,7 @@ mod tests {
         let b = omlx_backend("m", "http://127.0.0.1:8000");
         // No key file passed (the default; omlx_api_key returns None today).
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let argv = argv_strings(&cmd);
         let script = argv.last().unwrap();
         // No auth header construction anywhere (no key configured).
@@ -5790,7 +5830,7 @@ mod tests {
         let result_target = root.join("d1.json");
         let prompt_file = root.join("p").join("fake-prompt.txt");
         let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let script = argv_strings(&cmd).pop().unwrap();
         // The prompt read is inside the try (the try opens before Get-Content).
         let try_idx = script.find("try {").expect("try block");
@@ -5839,7 +5879,7 @@ mod tests {
             Some("this_executable_does_not_exist_xyz"),
         );
         let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap();
         let script = argv_strings(&cmd).pop().unwrap();
         let _ = Command::new("powershell.exe")
             .args([
@@ -5880,7 +5920,7 @@ mod tests {
             projects_dir: PathBuf::from("C:/mgmt/projects"),
         };
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots)).unwrap();
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots), false).unwrap();
         let script = argv_strings(&cmd).pop().unwrap();
         assert!(
             !script.contains("mcp_servers"),
@@ -5949,7 +5989,7 @@ mod tests {
         let result_target = root.join("d1.json");
         let prompt_file = root.join("fake-prompt.txt");
         let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let script = argv_strings(&cmd).pop().unwrap();
         assert!(
             script.contains("ollama run 'qwen2.5-coder'"),
@@ -6003,7 +6043,7 @@ mod tests {
         // The user's CLI command. Any API key must come from the CLI's OWN env, not
         // from us — we never inject a key, so it can't be on argv.
         let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat --json"));
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let argv = argv_strings(&cmd);
         let script = argv.last().unwrap();
         // BLOCKER 1 / WARNING 5: the multi-word command is piped to WITHOUT the `&`
@@ -6112,7 +6152,7 @@ mod tests {
     fn omlx_macos_run_posts_via_python_urllib_json_dumps_env_only() {
         // prompt_path arrives sh-quoted (as the macOS arm passes it).
         let prompt_q = "'/tmp/aspis-agent-prompt-abc.d/p.txt'";
-        let run = build_omlx_run_macos("http://localhost:8000/v1", "qwen2.5-coder", prompt_q, false);
+        let run = build_omlx_run_macos("http://localhost:8000/v1", "qwen2.5-coder", prompt_q, false, false);
 
         // stdlib python3 + urllib, NO curl/jq.
         assert!(run.contains("python3 - <<'OMLXEOF'"), "must use a python3 heredoc: {run}");
@@ -6133,12 +6173,17 @@ mod tests {
             run.contains("'temperature': 0.1") && run.contains("'stream': False"),
             "OpenAI envelope fields missing: {run}"
         );
-        // Qwen-family models get chat_template_kwargs.enable_thinking=false (runtime
-        // gate on the model name) or they burn the budget on a thinking trace.
+        // P6 thinking split: built with fix_pass_thinking=false (INITIAL write)
+        // -> False; a FIX pass flips the substituted placeholder to True.
         assert!(
             run.contains("'qwen' in model.lower()")
                 && run.contains("body_dict['chat_template_kwargs'] = {'enable_thinking': False}"),
             "Qwen-gated chat_template_kwargs missing from python body: {run}"
+        );
+        let fix_run = build_omlx_run_macos("http://localhost:8000/v1", "qwen2.5-coder", prompt_q, false, true);
+        assert!(
+            fix_run.contains("{'enable_thinking': True}"),
+            "fix pass must enable thinking: {fix_run}"
         );
         // base URL + prompt path ride via ENV (never argv).
         assert!(
@@ -6200,7 +6245,7 @@ mod tests {
     #[test]
     fn omlx_macos_run_with_key_reads_env_file_and_sends_bearer() {
         let prompt_q = "'/tmp/p.d/p.txt'";
-        let run = build_omlx_run_macos("http://127.0.0.1:8000", "m", prompt_q, true);
+        let run = build_omlx_run_macos("http://127.0.0.1:8000", "m", prompt_q, true, false);
         // The key path rides env; python reads the FILE and sends a Bearer header.
         assert!(run.contains("export OMLX_KEY_FILE"), "key env must be exported when keyed: {run}");
         assert!(
@@ -6367,7 +6412,7 @@ mod tests {
         let command = format!("cmd /c type {}", json_file.to_string_lossy());
         let b = backend(MiniCoderBackendKind::Api, None, Some(command.as_str()));
         let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap();
         let script = argv_strings(&cmd).pop().unwrap();
 
         let status = Command::new("powershell.exe")
@@ -6417,7 +6462,7 @@ mod tests {
         // Port 1 on loopback: nothing listens -> immediate connection refused.
         let b = omlx_backend("any-model", "http://127.0.0.1:1");
         let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap();
         let script = argv_strings(&cmd).pop().unwrap();
 
         let status = Command::new("powershell.exe")
@@ -6464,7 +6509,7 @@ mod tests {
         let result_target = root.join("d1.json");
         let prompt_file = root.join("p.txt");
         let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat --json"));
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let script = macos_script(&cmd);
         assert!(
             script.contains("cat '") && script.contains("| mycli chat --json"),
@@ -6531,7 +6576,7 @@ mod tests {
         let prompt_file = prompt_dir.join("p.txt");
         let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
         let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap();
         let script = macos_script(&cmd);
         // The path VARIABLES are assigned first (whitespace-safe indirection), then the
         // trap references them via double-quoted `$_MINI_*` expansions on EXIT.
@@ -6580,7 +6625,7 @@ mod tests {
         );
         let b = backend(MiniCoderBackendKind::Api, None, Some(command.as_str()));
         let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap();
         let script = macos_script(&cmd);
         let status = Command::new("/bin/sh")
             .args(["-c", &script])
@@ -6619,7 +6664,7 @@ mod tests {
             projects_dir: PathBuf::from("/mgmt/projects"),
         };
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots)).unwrap();
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots), false).unwrap();
         let script = macos_script(&cmd);
         // Every arg is single-quoted by sh_single_quote_local (semantically
         // identical for /bin/sh: 'exec' is still the literal word exec).
@@ -6637,7 +6682,7 @@ mod tests {
         );
 
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap();
         let script = macos_script(&cmd);
         assert!(
             !script.contains("mcp_servers"),
