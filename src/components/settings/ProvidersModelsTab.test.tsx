@@ -64,6 +64,21 @@ async function mount() {
   });
 }
 
+// Host-platform stub: the component's `isAppleHost` reads the REAL
+// `navigator.platform`/`userAgent` (and jsdom embeds `process.platform` in its
+// default UA), so any test asserting the per-OS clamp must pin the host
+// explicitly or its outcome flips between Windows and macOS dev machines.
+function stubHostPlatform(platform: string, userAgent: string) {
+  Object.defineProperty(window.navigator, "platform", {
+    value: platform,
+    configurable: true,
+  });
+  Object.defineProperty(window.navigator, "userAgent", {
+    value: userAgent,
+    configurable: true,
+  });
+}
+
 beforeEach(() => {
   detectResult = [];
   detectCalls = 0;
@@ -73,6 +88,9 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  // Drop the per-test own-property stubs so the prototype getters return.
+  delete (window.navigator as { platform?: string }).platform;
+  delete (window.navigator as { userAgent?: string }).userAgent;
 });
 
 describe("ProvidersModelsTab", () => {
@@ -91,7 +109,8 @@ describe("ProvidersModelsTab", () => {
     expect(html).toContain("Codex");
   });
 
-  it("renders Apple on-device status when detected", async () => {
+  it("clamps a detected Apple on-device to unavailable on a non-Apple host", async () => {
+    stubHostPlatform("Win32", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
     detectResult = [
       {
         kind: "appleFm",
@@ -104,6 +123,22 @@ describe("ProvidersModelsTab", () => {
     const html = container.innerHTML;
     expect(html).toContain("Apple on-device (local model)");
     expect(html).toContain("not available on this OS");
+  });
+
+  it("shows a detected Apple on-device as running on a macOS host", async () => {
+    stubHostPlatform("MacIntel", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)");
+    detectResult = [
+      {
+        kind: "appleFm",
+        available: true,
+        detail: "configured",
+        models: ["default"],
+      },
+    ];
+    await mount();
+    const html = container.innerHTML;
+    expect(html).toContain("Apple on-device (local model)");
+    expect(html).toContain("running (1 model)");
   });
 
   it("renders all four per-role card sections", async () => {

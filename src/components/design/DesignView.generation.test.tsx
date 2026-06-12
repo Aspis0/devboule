@@ -119,8 +119,28 @@ beforeEach(async () => {
   ({ DesignView } = await import("./DesignView"));
 });
 
-afterEach(() => {
+// Every root mounted by render(), torn down in afterEach. Without the unmount,
+// DesignViews from earlier tests stay live in the shared jsdom document and
+// their pending timers (e.g. the 400ms manifest-write throttle) fire DURING
+// later tests against the SHARED invokeSpy — a load-dependent flake (surfaced
+// on macOS under a parallel full-suite run).
+let mountedRoots: Array<{ container: HTMLElement; root: Root }> = [];
+
+afterEach(async () => {
   rerender = null;
+  for (const { container, root } of mountedRoots.splice(0)) {
+    act(() => root.unmount());
+    container.remove();
+  }
+  // Drain async chains the unmount cannot cancel (seed/save pipelines awaiting
+  // crypto.subtle or invoke promises): let their late invoke calls land HERE,
+  // not inside the next test's window on the SHARED invokeSpy.
+  await act(async () => {
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      for (let j = 0; j < 20; j++) await Promise.resolve();
+    }
+  });
 });
 
 function render(): { container: HTMLElement; root: Root } {
@@ -134,6 +154,7 @@ function render(): { container: HTMLElement; root: Root } {
   // The mock notifies on `start`; re-render the tree so the new stream state is read.
   rerender = () => act(() => root.render(createElement(DesignView)));
   streamCtl.notify = rerender;
+  mountedRoots.push({ container, root });
   return { container, root };
 }
 
@@ -179,6 +200,13 @@ async function pickFolder(container: HTMLElement, value: string) {
     // seedContract (read design.md -> stash, or probe + open editor) -> remember ->
     // oracle status.
     for (let i = 0; i < 12; i++) await Promise.resolve();
+    // The seed flow may hash the existing contract via crypto.subtle
+    // (provenance compare), which lands on its own task schedule — yield a few
+    // macrotask turns so the editor state settles under a loaded parallel run.
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      for (let j = 0; j < 10; j++) await Promise.resolve();
+    }
   });
 }
 
