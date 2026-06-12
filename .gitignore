@@ -8,19 +8,25 @@ Thumbs.db
 .env
 .env.local
 
-# per-machine live config; the app bootstraps a default when missing
+# per-machine live config; the app bootstraps a default when missing.
+# Both anchored variants: the app writes next to its cwd — repo root on
+# Windows dev, src-tauri/ on macOS dev (`tauri dev` runs cargo from there).
 /config.json
+/src-tauri/config.json
 # transient artifacts of the atomic temp+rename config writers (lib.rs bootstrap and
 # every Settings/design saver share the idiom): a crash between fs::write and the rename
 # can orphan one of these next to config.json.
 /config.json.*.tmp
 /config.json.*.bak
+/src-tauri/config.json.*.tmp
+/src-tauri/config.json.*.bak
 
 # Runtime state written by the app when run from this folder — agent sessions,
 # project briefs and their lock files. Never source, never published.
 # Anchored to the repo root: an unanchored `projects/` also shadowed the REAL
 # source directory src/components/projects/ (it was never pushed).
 /projects/
+/src-tauri/projects/
 /aspis/
 
 # Local-only tool state and caches.

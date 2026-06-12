@@ -251,22 +251,48 @@ fn python_candidates() -> Vec<Vec<String>> {
         candidates.push(vec!["python".into()]);
         candidates.push(vec!["python3".into()]);
     } else {
-        candidates.push(vec!["python3".into()]);
+        for name in PYTHON_INTERPRETER_NAMES {
+            candidates.push(vec![(**name).into()]);
+        }
         candidates.push(vec!["python".into()]);
         // A macOS `.app` launched from Finder inherits a minimal PATH (often just
         // `/usr/bin:/bin`), so a bare `python3` may not resolve even when Python
         // is installed via Homebrew/pyenv. Probe the usual absolute locations.
-        for abs in [
-            "/opt/homebrew/bin/python3", // Apple Silicon Homebrew
-            "/usr/local/bin/python3",    // Intel Homebrew / python.org
-            "/usr/bin/python3",          // Xcode Command Line Tools
-        ] {
-            if Path::new(abs).exists() {
-                candidates.push(vec![abs.to_string()]);
+        candidates.extend(unix_absolute_python_candidates(&|p: &Path| p.exists()));
+    }
+    candidates
+}
+
+/// Interpreter names worth probing, newest first. The unversioned `python3`
+/// is NOT enough: Homebrew installs `python3.12` and only adds the
+/// unversioned symlink when the formula is linked, so on many machines the
+/// bare name resolves to the Xcode CLT 3.9 (too old for the runtime deps).
+const PYTHON_INTERPRETER_NAMES: &[&str] = &[
+    "python3",
+    "python3.13",
+    "python3.12",
+    "python3.11",
+    "python3.10",
+];
+
+/// Expand the well-known unix install dirs x interpreter names into absolute
+/// candidate argvs. Pure over the `exists` probe so tests can fake the
+/// filesystem.
+fn unix_absolute_python_candidates(exists: &dyn Fn(&Path) -> bool) -> Vec<Vec<String>> {
+    let mut found: Vec<Vec<String>> = Vec::new();
+    for dir in [
+        "/opt/homebrew/bin", // Apple Silicon Homebrew
+        "/usr/local/bin",    // Intel Homebrew / python.org
+        "/usr/bin",          // Xcode Command Line Tools
+    ] {
+        for name in PYTHON_INTERPRETER_NAMES {
+            let abs = format!("{dir}/{name}");
+            if exists(Path::new(&abs)) {
+                found.push(vec![abs]);
             }
         }
     }
-    candidates
+    found
 }
 
 fn run_capture(
@@ -789,6 +815,20 @@ mod tests {
         assert_eq!(parse_python_version("Python 3.8.10"), None);
         assert_eq!(parse_python_version("Python 2.7.18"), None);
         assert_eq!(parse_python_version("not a version"), None);
+    }
+
+    /// Homebrew can ship ONLY `python3.12` with NO unversioned `python3`
+    /// symlink — the absolute-path probe must find versioned names too, or
+    /// detection collapses onto the CLT 3.9. Pure over a fake filesystem.
+    #[test]
+    fn absolute_candidates_include_versioned_interpreters() {
+        let only_versioned = |p: &Path| p == Path::new("/opt/homebrew/bin/python3.12");
+        assert_eq!(
+            unix_absolute_python_candidates(&only_versioned),
+            vec![vec!["/opt/homebrew/bin/python3.12".to_string()]]
+        );
+        let nothing = |_: &Path| false;
+        assert!(unix_absolute_python_candidates(&nothing).is_empty());
     }
 
     /// The system-python fallback must only accept a detection whose argv is a

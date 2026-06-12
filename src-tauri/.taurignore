@@ -1,0 +1,7 @@
+# Runtime-state and generated files that live under src-tauri/ but must NOT
+# trigger the `tauri dev` watcher: the resident Oracle server writes
+# projects/.oracle-server.json on every spawn, which otherwise causes an
+# infinite rebuild -> app-restart -> server-respawn loop.
+config.json
+projects/
+gen/schemas/
