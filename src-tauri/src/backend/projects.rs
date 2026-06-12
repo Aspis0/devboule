@@ -3476,15 +3476,20 @@ fn macos_claude_launch_line(management_root: &Path, projects_dir: &Path) -> Stri
     )
 }
 
-// MINOR 9: the `codex_mcp_config_values` helper (which wired the FULL, mutation-
-// capable `aspis-management` MCP server into a mini-coder) was REMOVED. A one-shot
-// mini must never reach project-mutation / spawn_mini_coder / censor_dispose tools.
-// When a READ-ONLY, oracle_context-only scope is built, add a NEW narrow helper here
-// — do NOT resurrect the full-server grant. Interactive coders keep their own inline
-// `-c` flags in `codex_launch_script` / `macos_codex_launch_line`.
+// MINOR 9 → P3: the old full-server mini grant stayed removed; the read-only,
+// oracle_context-only scope now exists. The mini wires the SAME server via
+// `codex_mcp_config_args` above, and the narrowing is SERVER-side: the mini
+// registers as role "mini" (launch-token-bound), whose ROLE_ALLOWED_TOOLS is
+// {agent_register, oracle_context} — project-mutation / spawn_mini_coder /
+// censor_dispose are rejected at the MCP role gate, not hidden by config.
 
-fn codex_launch_script(root_path: &Path, management_root: &Path, projects_dir: &Path) -> String {
-    let root_s = root_path.to_string_lossy().into_owned();
+/// P3: the codex `-c mcp_servers.aspis-management.*` config tokens, UNQUOTED —
+/// each caller applies its own shell quoting (PowerShell vs `/bin/sh`). Shared
+/// by the FULL coder launch (`codex_launch_script`) and the read-only mini
+/// grant (mini_coder_executor): both wire the SAME server; the mini's scope is
+/// narrowed SERVER-side by its "mini" role (oracle_context only), never by the
+/// client config. Extracted so the two call sites cannot drift.
+pub(crate) fn codex_mcp_config_args(management_root: &Path, projects_dir: &Path) -> Vec<String> {
     let management_root_s = management_root.to_string_lossy().into_owned();
     let projects_dir_s = projects_dir.to_string_lossy().into_owned();
     let mcp_args = toml_array(&[
@@ -3495,9 +3500,7 @@ fn codex_launch_script(root_path: &Path, management_root: &Path, projects_dir: &
         "--projects-dir",
         &projects_dir_s,
     ]);
-    let args = vec![
-        "--cd".to_string(),
-        root_s,
+    vec![
         "-c".to_string(),
         format!(
             "mcp_servers.aspis-management.command={}",
@@ -3535,7 +3538,13 @@ fn codex_launch_script(root_path: &Path, management_root: &Path, projects_dir: &
             "mcp_servers.aspis-management.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
             toml_string("1")
         ),
-    ];
+    ]
+}
+
+fn codex_launch_script(root_path: &Path, management_root: &Path, projects_dir: &Path) -> String {
+    let root_s = root_path.to_string_lossy().into_owned();
+    let mut args = vec!["--cd".to_string(), root_s];
+    args.extend(codex_mcp_config_args(management_root, projects_dir));
     let args = args
         .iter()
         .map(|value| ps_single_quote(value))
@@ -5961,7 +5970,7 @@ fn now() -> String {
 /// guessable one is a security hole. If the OS CSPRNG fails we REFUSE to launch
 /// rather than derive a weak token from pid/time/stack pointer (which an attacker
 /// could reproduce). Callers must propagate the Err and abort the launch.
-fn generate_launch_token() -> Result<String, String> {
+pub(crate) fn generate_launch_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| {
         format!("Could not generate a secure launch token ({e}). Agent launch refused.")
@@ -5969,7 +5978,7 @@ fn generate_launch_token() -> Result<String, String> {
     Ok(hex::encode(bytes))
 }
 
-fn hash_launch_token(token: &str) -> String {
+pub(crate) fn hash_launch_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 

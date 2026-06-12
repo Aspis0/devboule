@@ -59,7 +59,9 @@ VALID_TASK_STATUSES = {"todo", "wip", "review", "blocked", "done"}
 # launchers and old `.aspis-agents.json` sessions still register/load — they
 # normalize to coder. "orchestrator" then becomes a DERIVED UI badge (shown when
 # a session currently has subagents), not a stored spawn role.
-VALID_ROLES = {"coder", "verifier"}
+# "mini" (P3) is the one-shot read-only sub-agent: oracle_context only, no
+# mutation tools — enforced by ROLE_ALLOWED_TOOLS via require_registered_role.
+VALID_ROLES = {"coder", "verifier", "mini"}
 ROLE_ALIASES = {"architect": "coder", "code": "coder", "orchestrator": "coder"}
 MAX_EVENTS = 300
 # FIX 6: hard caps so a long-lived `.aspis-agents.json` cannot grow without bound
@@ -303,6 +305,23 @@ ROLE_RULES = [
             "Dichiara il modello (`model`) ad agent_register.",
             "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
             "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+        ],
+    },
+    {
+        "role": "mini",
+        "summary": "Sub-agente one-shot in SOLA LETTURA: usa oracle_context per leggere il codebase, nient'altro.",
+        "allowedTools": [
+            "agent_register",
+            "oracle_context",
+        ],
+        "forbidden": [
+            "Non modifica codice, task, Kanban, provider o findings: NESSUN tool di mutazione.",
+            "Non spawna altri agenti, non manda agent_heartbeat (niente subagents, niente needs_user: il contatto umano e' del coder padre) e non chiama censor_*: e' una foglia one-shot.",
+            "Non legge o stampa token o segreti.",
+        ],
+        "contract": [
+            "Dichiara il modello (`model`) ad agent_register.",
+            "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
         ],
     },
 ]

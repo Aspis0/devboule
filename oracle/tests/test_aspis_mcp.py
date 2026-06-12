@@ -13,6 +13,7 @@ from oracle.server.aspis_mcp import (
     APP_VAULT_ACCOUNTS,
     MAX_CLAIMS,
     MAX_SESSIONS,
+    ROLE_ALLOWED_TOOLS,
     ROLE_RULES,
     VALID_ROLES,
     McpError,
@@ -51,6 +52,7 @@ from oracle.server.aspis_mcp import (
     normalize_subagents,
     oracle_allowed_file_ids,
     public_agents_state,
+    require_registered_role,
     sanitize_provider_error,
     scaleway_list_resources,
     scaleway_resource_action,
@@ -537,6 +539,131 @@ root_path: "{escaped_work_root}"
                     },
                     root=root,
                 )
+
+    def test_mini_role_is_oracle_context_only(self):
+        # P3: the mini's MCP scope is READ-ONLY — it may register and call
+        # oracle_context, and NOTHING else. Every mutation tool is rejected at
+        # the role gate, SERVER-side (the prompt is advisory; this is the wall).
+        self.assertEqual(
+            ROLE_ALLOWED_TOOLS["mini"], {"agent_register", "oracle_context"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "mini-1",
+                    "role": "mini",
+                    "model": "qwen",
+                    "message": "reading context",
+                },
+                root=root,
+            )
+            # The role gate passes for the ONE allowed read tool…
+            self.assertEqual(
+                require_registered_role(projects, "mini-1", "mini", "oracle_context"),
+                "mini",
+            )
+            # …and rejects every mutation/spawn/censor tool at the same gate.
+            for tool in (
+                "project_claim_task",
+                "project_update_status",
+                "project_append_note",
+                "spawn_mini_coder",
+                "censor_dispose",
+                "agent_heartbeat",
+            ):
+                with self.assertRaises(McpError):
+                    require_registered_role(projects, "mini-1", "mini", tool)
+
+    def test_mini_cannot_act_or_reregister_as_coder(self):
+        # P3 pinning: once registered as "mini", the stored role caps the agent.
+        # Acting as coder on a tool call hits the role-mismatch gate, and a
+        # re-register under the coder role is rejected against the stored session.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "mini-2",
+                    "role": "mini",
+                    "model": "qwen",
+                    "message": "reading context",
+                },
+                root=root,
+            )
+            # Tool call claiming the coder role -> role-mismatch rejection.
+            with self.assertRaises(McpError):
+                require_registered_role(projects, "mini-2", "coder", "oracle_context")
+            # Re-registration as coder -> rejected against the stored mini session.
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "agent_register",
+                    {
+                        "agent_id": "mini-2",
+                        "role": "coder",
+                        "model": "qwen",
+                        "message": "promoting myself",
+                    },
+                    root=root,
+                )
+
+    def test_mini_registration_is_launch_token_bound(self):
+        # P3 token binding: when the app pre-seeded the mini session with a
+        # launch-token HASH, agent_register REQUIRES the matching raw token —
+        # the unmanaged compat flag (set in setUp) never bypasses an existing
+        # hash. Missing and wrong tokens are rejected; the right one registers.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            token = "mini-launch-token"
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "mini-3",
+                                "role": "mini",
+                                "status": "active",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            base = {
+                "agent_id": "mini-3",
+                "role": "mini",
+                "model": "qwen",
+                "message": "reading context",
+            }
+            with self.assertRaises(McpError):
+                handle_tool_call("agent_register", dict(base), root=root)
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "agent_register", dict(base, launch_token="wrong"), root=root
+                )
+            # The matching token registers cleanly (no raise) as role "mini".
+            handle_tool_call(
+                "agent_register", dict(base, launch_token=token), root=root
+            )
 
     def test_coder_claim_moves_todo_task_to_wip_for_live_kanban(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3186,8 +3313,10 @@ class RoleMergeTests(unittest.TestCase):
     'orchestrator' survives only as a back-compat inbound alias that normalizes
     to coder, and the coder rule carries the folded planning mandate."""
 
-    def test_valid_roles_collapsed_to_coder_and_verifier(self):
-        self.assertEqual(VALID_ROLES, {"coder", "verifier"})
+    def test_valid_roles_are_coder_verifier_and_mini(self):
+        # Phase B collapsed the spawn roles to {coder, verifier}; P3 then added
+        # "mini" as the one-shot read-only leaf (oracle_context only).
+        self.assertEqual(VALID_ROLES, {"coder", "verifier", "mini"})
 
     def test_orchestrator_normalizes_to_coder(self):
         # Back-compat hinge: an inbound 'orchestrator' (old launchers, old
@@ -3210,9 +3339,9 @@ class RoleMergeTests(unittest.TestCase):
         with self.assertRaises(McpError):
             normalize_role("hacker")
 
-    def test_role_rules_keys_are_coder_and_verifier(self):
+    def test_role_rules_keys_are_coder_verifier_and_mini(self):
         roles = {rule["role"] for rule in ROLE_RULES}
-        self.assertEqual(roles, {"coder", "verifier"})
+        self.assertEqual(roles, {"coder", "verifier", "mini"})
 
     def test_coder_rule_carries_folded_planning_mandate(self):
         coder = next(rule for rule in ROLE_RULES if rule["role"] == "coder")
@@ -5003,6 +5132,12 @@ class CensorRoleMandateTests(unittest.TestCase):
 
     def test_both_roles_allow_censor_tools(self):
         for rule in ROLE_RULES:
+            if rule["role"] == "mini":
+                # P3: the mini is a read-only oracle leaf — censor adjudication
+                # stays a coder/verifier duty, so the mini gets NO censor tools.
+                self.assertNotIn("censor_findings", rule["allowedTools"])
+                self.assertNotIn("censor_dispose", rule["allowedTools"])
+                continue
             self.assertIn("censor_findings", rule["allowedTools"], rule["role"])
             self.assertIn("censor_dispose", rule["allowedTools"], rule["role"])
 

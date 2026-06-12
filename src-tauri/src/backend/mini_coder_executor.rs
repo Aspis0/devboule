@@ -1027,6 +1027,45 @@ fn claim_and_launch(
     } else {
         None
     };
+    // P3: a codex mini with the oracle grant registers over MCP as role "mini",
+    // launch-token-bound (the python side pins the stored role + token hash, so
+    // the mini cannot self-promote to coder). Mint the token HERE: the RAW token
+    // rides only inside the 0600 prompt file; only its HASH lands in the session
+    // ledger below. CSPRNG failure is fail-closed (FIX 5): refuse the launch.
+    let oracle_grant = if backend.kind == MiniCoderBackendKind::Codex && mcp_roots.is_some() {
+        match super::projects::generate_launch_token() {
+            Ok(token) => {
+                let hash = super::projects::hash_launch_token(&token);
+                Some((token, hash))
+            }
+            Err(e) => {
+                fail_launching(app, &directive_id, &format!("mini launch refused: {e}"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // P3 (review F1 BLOCKER): persist the granted session — role "mini" + the
+    // launch-token HASH — BEFORE the PTY spawn, or a fast mini can call
+    // agent_register before the hash is on disk and be rejected. The post-spawn
+    // locked write below re-upserts the same row (idempotent update branch).
+    if let Some((_, hash)) = oracle_grant.as_ref() {
+        let pre_started = Utc::now().to_rfc3339();
+        let pre_project = Some(project_id.clone());
+        let _ = agents::mutate_agent_live_state(app, |state| {
+            upsert_mini_session(
+                state,
+                &agent_id,
+                &directive.parent_agent_id,
+                pre_project.clone(),
+                &pre_started,
+                &backend_kind_label,
+                Some(hash.as_str()),
+            );
+        });
+    }
 
     if let Err(e) = spawn_one_shot_mini(
         app,
@@ -1037,7 +1076,15 @@ fn claim_and_launch(
         &backend,
         directive,
         mcp_roots.as_ref(),
+        oracle_grant.as_ref().map(|(token, _)| token.as_str()),
     ) {
+        // The pre-spawn session (if any) must not linger as a live "mini" row
+        // for a PTY that never existed.
+        if oracle_grant.is_some() {
+            let _ = agents::mutate_agent_live_state(app, |state| {
+                close_mini_session(state, &agent_id);
+            });
+        }
         fail_launching(app, &directive_id, &format!("mini spawn failed: {e}"));
         return;
     }
@@ -1068,6 +1115,7 @@ fn claim_and_launch(
             mini_project.clone(),
             &started_at,
             &backend_kind_label,
+            oracle_grant.as_ref().map(|(_, hash)| hash.as_str()),
         );
         cap_pass(state);
     });
@@ -1773,10 +1821,21 @@ fn upsert_mini_session(
     // The backend kind label (ollama/api/codex) recorded as the session client so
     // the rail's MINI chip reflects the real runtime, not the P2 "echo" placeholder.
     client: &str,
+    // P3: Some(hash) marks a read-only oracle grant: the session stores role
+    // "mini" + the launch-token HASH so MCP registration is token-bound and the
+    // stored role pins what the mini may register as. None = the status-quo
+    // "coder"-labelled, token-less mini session.
+    oracle_token_hash: Option<&str>,
 ) {
+    let timestamp_now = Utc::now().to_rfc3339();
     if let Some(session) = state.sessions.iter_mut().find(|s| s.agent_id == agent_id) {
         session.status = "active".into();
         session.parent_agent_id = Some(parent_agent_id.to_string());
+        if let Some(hash) = oracle_token_hash {
+            session.role = "mini".into();
+            session.launch_token_hash = Some(hash.to_string());
+            session.launch_token_issued_at = Some(timestamp_now.clone());
+        }
         // Keep the project link fresh on re-upsert too, but never CLEAR a previously
         // resolved project with a later None (a transient empty parent snapshot must
         // not drop the mini out of the rail mid-run).
@@ -1790,7 +1849,11 @@ fn upsert_mini_session(
     }
     state.sessions.push(crate::backend::model::AgentSession {
         agent_id: agent_id.to_string(),
-        role: "coder".into(),
+        role: if oracle_token_hash.is_some() {
+            "mini".into()
+        } else {
+            "coder".into()
+        },
         model: None,
         status: "active".into(),
         client: Some(client.to_string()),
@@ -1800,8 +1863,8 @@ fn upsert_mini_session(
         current_file_path: None,
         first_seen_at: Some(started_at.to_string()),
         last_seen_at: Some(started_at.to_string()),
-        launch_token_hash: None,
-        launch_token_issued_at: None,
+        launch_token_hash: oracle_token_hash.map(String::from),
+        launch_token_issued_at: oracle_token_hash.map(|_| timestamp_now.clone()),
         session_token_hash: None,
         session_token_issued_at: None,
         subagents: Vec::new(),
@@ -1963,10 +2026,9 @@ fn resolve_mcp_roots(app: &AppHandle) -> Option<McpRoots> {
 }
 
 /// The two roots a future read-only `oracle_context` MCP scope would be built from.
-/// MINOR 9: the fields are currently UNREAD — `build_mini_command` drops `mcp_roots`
-/// so a mini gets NO MCP grant today. Kept (plumbed) for the future narrow scope.
-// TODO: read these when wiring a READ-ONLY oracle_context-only MCP scope.
-#[allow(dead_code)]
+/// P3: consumed by the codex command arms — with the read-only oracle grant the
+/// shared `-c mcp_servers.*` tokens are built from these roots (server-side
+/// "mini"-role narrowing). Text-only backends ignore them.
 struct McpRoots {
     management_root: PathBuf,
     projects_dir: PathBuf,
@@ -1998,10 +2060,25 @@ fn spawn_one_shot_mini(
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
     mcp_roots: Option<&McpRoots>,
+    // P3: the RAW launch token for the read-only oracle grant (codex-only).
+    // `Some` implies `mcp_roots` is `Some` (both derive from the same gate).
+    oracle_token: Option<&str>,
 ) -> Result<(), String> {
     let result_target = scratch_root.join(result_rel_path.replace('\\', "/"));
+    // P3: the prompt advertises the oracle grant ONLY when the token exists; the
+    // token itself stays inside the 0600 prompt file (stdin delivery, never argv).
+    let oracle_access = oracle_token.map(|token| MiniOracleAccess {
+        agent_id,
+        launch_token: token,
+    });
     // Front-load the file scope + contents into the prompt (bounded per file).
-    let prompt = build_mini_prompt(backend, directive, project_root, &result_target);
+    let prompt = build_mini_prompt(
+        backend,
+        directive,
+        project_root,
+        &result_target,
+        oracle_access.as_ref(),
+    );
     let MiniCommandBuild {
         prompt_file,
         key_file,
@@ -2059,18 +2136,27 @@ const MAX_PROMPT_FILES: usize = 20;
 /// PURE w.r.t. spawning: it only READS the named files (bounded). Contains NO
 /// secret. The task + file contents are NOT secrets, but are still delivered over
 /// stdin (never argv) by `build_mini_command`.
+/// P3: the mini's MCP identity for the read-only oracle grant. The RAW launch
+/// token rides ONLY inside the 0600 prompt file (stdin delivery, never argv);
+/// the session ledger keeps just its hash.
+struct MiniOracleAccess<'a> {
+    agent_id: &'a str,
+    launch_token: &'a str,
+}
+
 fn build_mini_prompt(
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
     project_root: &Path,
     result_target: &Path,
+    oracle_access: Option<&MiniOracleAccess>,
 ) -> String {
     let backend_can_write_file = matches!(backend.kind, MiniCoderBackendKind::Codex);
-    // MINOR 9: a mini gets NO MCP/oracle grant (the full aspis-management server is
-    // mutation-capable; a one-shot helper must not reach it). It works PURELY from
-    // the front-loaded file scope below. `directive.allow_oracle` stays plumbed for a
-    // future read-only oracle scope but does NOT advertise any tool today.
-    let _ = directive.allow_oracle; // INERT — see build_mini_command's MINOR 9 doc.
+    // MINOR 9 → P3: `directive.allow_oracle` is consumed UPSTREAM (it gates
+    // resolve_mcp_roots, which gates the token mint, which gates `oracle_access`
+    // here) — this function only branches on the resolved access. One-time
+    // binding: python pops the launch-token hash after the first successful
+    // registration; the session token takes over per-call auth from there.
     let result_path_display = result_target.to_string_lossy();
 
     let mut prompt = String::new();
@@ -2122,12 +2208,29 @@ and exit; you cannot ask follow-up questions interactively.\n\n",
 - If the task is ambiguous or unsafe, do NOT guess: report needs_clarification.\n\n",
     );
 
-    // MINOR 9: the mini has NO tools/MCP. Tell it to work from the front-loaded
-    // context only (the file contents above) — do not promise an oracle it cannot use.
-    prompt.push_str(
-        "CONTEXT: You have NO external tools. Work ONLY from the file contents \
+    // MINOR 9 → P3: by default the mini has NO tools/MCP and works from the
+    // front-loaded context only. A codex mini holding the oracle grant instead
+    // gets exactly ONE read-only MCP tool — `oracle_context`, behind a
+    // launch-token-bound "mini" role the server enforces (every other tool is
+    // rejected at the MCP role gate, so this text is a usage manual, not a wall).
+    match oracle_access {
+        Some(access) if matches!(backend.kind, MiniCoderBackendKind::Codex) => {
+            prompt.push_str(&format!(
+                "CONTEXT TOOL (read-only): you have exactly ONE MCP tool: `oracle_context` on the `aspis-management` server.\n\
+FIRST call `agent_register` with {{\"agent_id\": \"{id}\", \"role\": \"mini\", \"model\": \"<your model name>\", \"message\": \"mini reading context\", \"launch_token\": \"{token}\"}}; it returns a `session_token`.\n\
+THEN, when the front-loaded files are NOT enough, call `oracle_context` with {{\"query\": \"<what you need>\", \"agent_id\": \"{id}\", \"role\": \"mini\", \"session_token\": \"<from agent_register>\"}}.\n\
+You have NO other tools: no mutation tools, no browsing, no other MCP servers; the FILE SCOPE above still bounds every change you report.\n\n",
+                id = access.agent_id,
+                token = access.launch_token,
+            ));
+        }
+        _ => {
+            prompt.push_str(
+                "CONTEXT: You have NO external tools. Work ONLY from the file contents \
 front-loaded above; do not attempt to call tools, browse, or fetch more context.\n\n",
-    );
+            );
+        }
+    }
 
     // Result contract.
     prompt.push_str("RESULT (your FINAL action):\n");
@@ -2216,14 +2319,13 @@ fn read_prompt_file(project_root: &Path, rel: &str) -> Option<String> {
 ///   - api: the configured CLI `command` (prompt over stdin). Same stdout->file
 ///     wrapper as ollama. The API key comes from the CLI's own ENV, never argv.
 ///
-/// MINOR 9 (security scope): we DELIBERATELY do NOT wire any MCP grant to a mini.
-/// The previous codex `-c mcp_servers.aspis-management...` grant pointed at the FULL
-/// `aspis-management` MCP server, which exposes mutation tools (project edits,
-/// `spawn_mini_coder`, `censor_dispose`) — far more than the read-only
-/// `oracle_context` a one-shot helper should ever have. Until a READ-ONLY,
-/// oracle_context-ONLY MCP scope exists, the mini works purely from the front-loaded
-/// prompt context. `mcp_roots` stays in the signature (plumbed) but is INERT.
-// TODO: wire a READ-ONLY oracle_context-only MCP scope before enabling the grant.
+/// MINOR 9 → P3 (security scope): the read-only scope now EXISTS. A codex mini
+/// whose directive granted the oracle gets the SAME `-c mcp_servers.*` tokens as
+/// full coders (shared builder, no drift), and the narrowing is SERVER-side: it
+/// can only register as role "mini" (launch-token-bound), whose allowed tools
+/// are {agent_register, oracle_context} — mutation tools are rejected at the
+/// MCP role gate. No grant, or any text-only backend ⇒ NO flags, front-loaded
+/// prompt context only (the MINOR 9 status quo, byte-identical).
 /// The result of [`build_mini_command`]: the launch command plus the restricted temp
 /// files the SPAWN caller must clean up on a spawn failure (the in-script cleanup never
 /// ran). Both paths are `Option` because the prompt file is always present once built but
@@ -2261,18 +2363,17 @@ fn build_mini_command(
         },
         None => None,
     };
-    // MINOR 9: the mini gets NO MCP grant. `mcp_roots` is intentionally dropped here
-    // (None passed down) so build_mini_command_impl wires NO `-c mcp_servers...`
-    // flags for ANY kind. Keep the binding referenced so the plumbing stays live for
-    // the future read-only scope without an unused-arg warning.
-    let _ = mcp_roots; // INERT — see the MINOR 9 doc comment above + the TODO.
+    // MINOR 9 → P3: the roots now flow through. Only the codex arms consume them
+    // (ollama/api/omlx are text-only and ignore the parameter), and the caller
+    // only resolves roots for `allow_oracle` codex directives, so a text-only or
+    // no-grant mini still builds a byte-identical command.
     let cmd = build_mini_command_impl(
         backend,
         project_root,
         result_target,
         &prompt_file,
         key_file.as_deref(),
-        None,
+        mcp_roots,
     );
     match cmd {
         Ok(command) => Ok(MiniCommandBuild {
@@ -2338,10 +2439,16 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
     let body = match backend.kind {
         MiniCoderBackendKind::Codex => {
             // codex exec: prompt piped over stdin (read from `-`), -m if set. The mini
-            // WRITES the result file itself. MINOR 9: minis get NO MCP grant (the
-            // `mcp_roots` arg is intentionally unused — see build_mini_command).
-            let _ = mcp_roots; // MINOR 9: inert until a read-only oracle scope exists.
+            // WRITES the result file itself. P3: with the oracle grant the shared
+            // `-c mcp_servers.*` tokens ride along (server-side "mini" role narrowing);
+            // no grant ⇒ no flags ⇒ byte-identical to the MINOR 9 status quo.
             let mut args: Vec<String> = vec!["exec".to_string()];
+            if let Some(roots) = mcp_roots {
+                args.extend(super::projects::codex_mcp_config_args(
+                    &roots.management_root,
+                    &roots.projects_dir,
+                ));
+            }
             if let Some(model) = backend.model.as_deref() {
                 if !model.trim().is_empty() {
                     args.push("-m".to_string());
@@ -2845,10 +2952,17 @@ fn build_mini_command_impl(
 
     let body = match backend.kind {
         MiniCoderBackendKind::Codex => {
-            // MINOR 9: minis get NO MCP grant (mcp_roots intentionally unused — see
-            // build_mini_command). codex writes the result file itself.
-            let _ = mcp_roots; // MINOR 9: inert until a read-only oracle scope exists.
+            // P3: with the read-only oracle grant the mini's codex gets the SAME
+            // aspis-management server as full coders via the shared token builder
+            // (no drift); narrowing is SERVER-side (role "mini"). No grant ⇒ no
+            // `-c` flags ⇒ byte-identical to the MINOR 9 status quo.
             let mut args: Vec<String> = vec!["exec".to_string()];
+            if let Some(roots) = mcp_roots {
+                args.extend(super::projects::codex_mcp_config_args(
+                    &roots.management_root,
+                    &roots.projects_dir,
+                ));
+            }
             if let Some(model) = backend.model.as_deref() {
                 if !model.trim().is_empty() {
                     args.push("-m".to_string());
@@ -3512,6 +3626,7 @@ mod tests {
             Some("p1".into()),
             "2026-06-06T00:00:00Z",
             "ollama",
+            None,
         );
         let mini = state
             .sessions
@@ -3532,6 +3647,7 @@ mod tests {
             None,
             "2026-06-06T00:01:00Z",
             "ollama",
+            None,
         );
         let mini = state
             .sessions
@@ -3543,6 +3659,56 @@ mod tests {
             Some("p1"),
             "transient None cleared the project"
         );
+    }
+
+    #[test]
+    fn upsert_mini_session_stores_mini_role_and_token_hash_when_granted() {
+        // P3: a granted mini's session pins role "mini" + the launch-token HASH,
+        // so MCP registration is token-bound and the stored role caps what the
+        // mini may register as. An ungranted mini keeps the status-quo row.
+        let mut state = empty_state();
+        upsert_mini_session(
+            &mut state,
+            "mini-g-1",
+            "coder-1",
+            Some("p1".into()),
+            "2026-06-12T00:00:00Z",
+            "codex",
+            Some("hash-0123456789abcdef0123456789abcdef"),
+        );
+        let mini = state
+            .sessions
+            .iter()
+            .find(|s| s.agent_id == "mini-g-1")
+            .expect("granted mini inserted");
+        assert_eq!(mini.role, "mini");
+        assert_eq!(
+            mini.launch_token_hash.as_deref(),
+            Some("hash-0123456789abcdef0123456789abcdef")
+        );
+        assert!(
+            mini.launch_token_issued_at.is_some(),
+            "issued_at must be stamped with the hash"
+        );
+
+        let mut state = empty_state();
+        upsert_mini_session(
+            &mut state,
+            "mini-u-1",
+            "coder-1",
+            Some("p1".into()),
+            "2026-06-12T00:00:00Z",
+            "ollama",
+            None,
+        );
+        let mini = state
+            .sessions
+            .iter()
+            .find(|s| s.agent_id == "mini-u-1")
+            .expect("ungranted mini inserted");
+        assert_eq!(mini.role, "coder", "ungranted mini keeps the status quo");
+        assert!(mini.launch_token_hash.is_none());
+        assert!(mini.launch_token_issued_at.is_none());
     }
 
     fn empty_state() -> crate::backend::model::AgentLiveState {
@@ -3859,6 +4025,7 @@ mod tests {
             Some("p1".into()),
             "2026-06-06T00:00:00Z",
             "ollama",
+            None,
         );
         assert_eq!(
             state
@@ -4645,7 +4812,7 @@ mod tests {
         let root = std::env::temp_dir();
         let result_target = root.join("d1.json");
         let codex = backend(MiniCoderBackendKind::Codex, None, None);
-        let prompt = build_mini_prompt(&codex, &p4_directive(false), &root, &result_target);
+        let prompt = build_mini_prompt(&codex, &p4_directive(false), &root, &result_target, None);
 
         // The task + the explicit file scope are embedded.
         assert!(prompt.contains("add a docstring to foo()"), "task missing");
@@ -4680,22 +4847,42 @@ mod tests {
     }
 
     #[test]
-    fn build_mini_prompt_never_advertises_oracle_minor9() {
-        // MINOR 9: a mini gets NO MCP/oracle grant for ANY kind, even codex with
-        // allow_oracle=true. The prompt must never advertise `oracle_context`; it must
-        // instead tell the mini it has NO tools and works from front-loaded context.
+    fn build_mini_prompt_oracle_grant_is_codex_only_p3() {
+        // P3 (supersedes the MINOR 9 pin): a codex mini WITH the oracle access
+        // advertises exactly ONE read-only tool (oracle_context) + the
+        // register-first contract carrying its launch token. Without access —
+        // or on a text-only backend even WITH access — the NO-tools contract
+        // stands, so the grant can never leak past the codex kind gate.
         let root = std::env::temp_dir();
         let result_target = root.join("d1.json");
+        let access = MiniOracleAccess {
+            agent_id: "mini-x-1",
+            launch_token: "tok-3f9a",
+        };
 
         let codex = backend(MiniCoderBackendKind::Codex, None, None);
-        let p = build_mini_prompt(&codex, &p4_directive(true), &root, &result_target);
-        assert!(
-            !p.contains("oracle_context"),
-            "mini must never advertise oracle (codex+allow)"
+        let p = build_mini_prompt(
+            &codex,
+            &p4_directive(true),
+            &root,
+            &result_target,
+            Some(&access),
         );
         assert!(
-            p.contains("You have NO external tools"),
-            "must tell the mini it has no tools"
+            p.contains("oracle_context"),
+            "granted codex must advertise oracle_context"
+        );
+        assert!(
+            p.contains("agent_register") && p.contains("\"role\": \"mini\""),
+            "register-first contract missing"
+        );
+        assert!(
+            p.contains("tok-3f9a") && p.contains("mini-x-1"),
+            "launch token / agent id missing from the grant text"
+        );
+        assert!(
+            !p.contains("You have NO external tools"),
+            "granted codex must not get the NO-tools contract"
         );
         // codex still WRITES the result file itself.
         assert!(
@@ -4703,22 +4890,79 @@ mod tests {
             "codex write instruction missing"
         );
 
-        let p = build_mini_prompt(&codex, &p4_directive(false), &root, &result_target);
+        // No access -> the NO-tools contract, even with allow_oracle on the directive.
+        let p = build_mini_prompt(&codex, &p4_directive(true), &root, &result_target, None);
         assert!(
             !p.contains("oracle_context"),
-            "no oracle when allow_oracle=false"
+            "no access must mean no oracle text"
+        );
+        assert!(
+            p.contains("You have NO external tools"),
+            "must tell the ungranted mini it has no tools"
         );
 
-        // ollama is text-only: no tool, and it must OUTPUT (not write a file).
+        // ollama is text-only: access is IGNORED (kind gate), and it must OUTPUT.
         let ollama = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-        let p = build_mini_prompt(&ollama, &p4_directive(true), &root, &result_target);
+        let p = build_mini_prompt(
+            &ollama,
+            &p4_directive(true),
+            &root,
+            &result_target,
+            Some(&access),
+        );
         assert!(
             !p.contains("oracle_context"),
-            "ollama (text-only) must never advertise oracle"
+            "ollama (text-only) must never advertise oracle, even with access"
         );
         assert!(
             p.contains("OUTPUT this JSON object to stdout"),
             "ollama must output, not write"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_mini_command_wires_mcp_flags_only_with_roots_p3() {
+        // P3: with roots the codex arm carries the shared `-c mcp_servers.*`
+        // tokens (server-side "mini"-role narrowing); without roots the command
+        // is byte-identical to the MINOR 9 status quo (no MCP flags at all).
+        let root = std::env::temp_dir();
+        let result_target = root.join("r.json");
+        let prompt_file = root.join("p.txt");
+        let codex = backend(MiniCoderBackendKind::Codex, None, None);
+        let roots = McpRoots {
+            management_root: root.clone(),
+            projects_dir: root.join("projects"),
+        };
+
+        let with = build_mini_command_impl(
+            &codex,
+            &root,
+            &result_target,
+            &prompt_file,
+            None,
+            Some(&roots),
+        )
+        .expect("granted codex command builds");
+        let with_line = format!("{with:?}");
+        assert!(
+            with_line.contains("mcp_servers.aspis-management.command"),
+            "granted codex must wire the MCP server flags"
+        );
+
+        let without = build_mini_command_impl(
+            &codex,
+            &root,
+            &result_target,
+            &prompt_file,
+            None,
+            None,
+        )
+        .expect("ungranted codex command builds");
+        let without_line = format!("{without:?}");
+        assert!(
+            !without_line.contains("mcp_servers"),
+            "ungranted codex must carry NO MCP flags"
         );
     }
 
@@ -5120,7 +5364,7 @@ mod tests {
         let result_target = root.join("d1.json");
         let b = backend(MiniCoderBackendKind::Codex, None, None);
         let directive = p4_directive(true); // allow_oracle = true
-        let prompt = build_mini_prompt(&b, &directive, &root, &result_target);
+        let prompt = build_mini_prompt(&b, &directive, &root, &result_target, None);
         let roots = McpRoots {
             management_root: PathBuf::from("C:/mgmt"),
             projects_dir: PathBuf::from("C:/mgmt/projects"),
@@ -5487,7 +5731,7 @@ mod tests {
         let result_target = root.join("d1.json");
         let b = backend(MiniCoderBackendKind::Codex, None, None);
         let directive = p4_directive(false);
-        let prompt = build_mini_prompt(&b, &directive, &root, &result_target);
+        let prompt = build_mini_prompt(&b, &directive, &root, &result_target, None);
         let build =
             build_mini_command(&b, &root, &result_target, &prompt, None).unwrap();
         let prompt_file = build.prompt_file.expect("a prompt file is created");
@@ -5824,8 +6068,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_codex_never_adds_mcp_flags() {
-        // MINOR 9 (macOS): no MCP grant even with roots supplied.
+    fn macos_codex_adds_mcp_flags_only_with_roots_p3() {
+        // MINOR 9 → P3 (macOS): WITH roots the codex mini now carries the shared
+        // `-c mcp_servers.*` tokens (read-only scope enforced SERVER-side by the
+        // "mini" role); WITHOUT roots the command stays byte-identical to the
+        // old no-grant status quo.
         let root = std::env::temp_dir();
         let result_target = root.join("d1.json");
         let prompt_file = root.join("p.txt");
@@ -5848,12 +6095,20 @@ mod tests {
             "model flag missing: {script}"
         );
         assert!(
+            script.contains("mcp_servers.aspis-management.command"),
+            "granted mini must carry the MCP server flags: {script}"
+        );
+
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None).unwrap();
+        let script = macos_script(&cmd);
+        assert!(
             !script.contains("mcp_servers"),
-            "mini must never get MCP: {script}"
+            "ungranted mini must never get MCP: {script}"
         );
         assert!(
-            !script.contains("-c "),
-            "mini must never get a -c flag: {script}"
+            !script.contains("'-c'"),
+            "ungranted mini must never get a -c flag: {script}"
         );
     }
 

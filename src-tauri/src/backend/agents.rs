@@ -904,6 +904,37 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
             // Phase 1: planning is coder-only; the verifier gets NO plan mandate.
             plan: Vec::new(),
         },
+        AgentRoleRule {
+            // P3: the mini is a one-shot READ-ONLY leaf — oracle_context only.
+            // No heartbeat/subagents/needs_user (the parent coder owns the human
+            // contact) and no censor/push/plan mandates. Mirrored in the Python
+            // ROLE_RULES "mini" entry; parity (list order included) is pinned by
+            // test_allowed_tools_match_rust_default_role_rules.
+            role: "mini".into(),
+            summary: "One-shot read-only sub-agent: reads the codebase via oracle_context, nothing else.".into(),
+            allowed_tools: vec!["agent_register", "oracle_context"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            forbidden: vec![
+                "No mutation tools: code, tasks, Kanban, providers and findings are off-limits.",
+                "No agent_heartbeat, no subagents, no needs_user escalation: the parent coder owns the human contact.",
+                "Never read or print tokens or secrets.",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            contract: vec![
+                "Dichiara il modello (`model`) ad agent_register.",
+                "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            censor: Vec::new(),
+            push: Vec::new(),
+            plan: Vec::new(),
+        },
     ]
 }
 
@@ -1786,11 +1817,12 @@ mod tests {
         let rules = default_role_rules();
         // Phase B merge: spawn roles collapse to {coder, verifier}; the
         // standalone orchestrator rule is GONE (its planning/coordination mandate
-        // folds into coder, which now PLANS and CODES).
-        assert_eq!(rules.len(), 2);
+        // folds into coder, which now PLANS and CODES). P3 later added the
+        // one-shot read-only "mini" leaf (oracle_context only).
+        assert_eq!(rules.len(), 3);
         let role_set: std::collections::BTreeSet<&str> =
             rules.iter().map(|rule| rule.role.as_str()).collect();
-        assert_eq!(role_set, ["coder", "verifier"].into_iter().collect());
+        assert_eq!(role_set, ["coder", "mini", "verifier"].into_iter().collect());
         assert!(!rules.iter().any(|rule| rule.role == "orchestrator"));
         // The coder absorbed the orchestrator's planning mandate.
         let coder = rules
@@ -2502,8 +2534,8 @@ mod tests {
     #[test]
     fn default_role_rules_carry_contract_for_all_roles() {
         let rules = default_role_rules();
-        // Phase B merge: two roles remain (coder, verifier).
-        assert_eq!(rules.len(), 2);
+        // Phase B merge collapsed to coder + verifier; P3 added the read-only mini.
+        assert_eq!(rules.len(), 3);
         for rule in &rules {
             assert!(
                 !rule.contract.is_empty(),
@@ -2528,9 +2560,21 @@ mod tests {
             "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
             "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
         ];
+        // P3: the mini is NOT on the shared 3-line contract — it has its own
+        // 2-line contract (model declaration + register-first), also mirrored
+        // byte-identically in the Python ROLE_RULES "mini" entry.
+        let expected_mini = [
+            "Dichiara il modello (`model`) ad agent_register.",
+            "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
+        ];
         for rule in default_role_rules() {
+            let want: &[&str] = if rule.role == "mini" {
+                &expected_mini
+            } else {
+                &expected
+            };
             assert_eq!(
-                rule.contract, expected,
+                rule.contract, want,
                 "role {} contract drifted from the Python mirror",
                 rule.role
             );
