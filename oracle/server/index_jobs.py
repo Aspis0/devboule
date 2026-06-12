@@ -62,16 +62,19 @@ def resolve_index_run_params(
 def resolve_min_free_gb(device: str | None, idle: bool) -> float:
     """Pick the between-batch free-system-RAM floor for the index loop.
 
-    On GPU/MPS the embedding model lives in VRAM / Apple unified memory, NOT in
-    system RAM — only the per-batch chunk text sits in RAM. The conservative
-    CPU floor (where the model DOES live in system RAM) is therefore wrong on
-    accelerators: it makes the index pause at ``paused_low_memory`` after a
-    single batch on a machine with little free system RAM. Use a low GPU floor
-    there. On CPU keep the existing behavior: a high floor when running
+    On CUDA the embedding model lives in a SEPARATE VRAM pool — only the
+    per-batch chunk text sits in system RAM, so the conservative CPU floor
+    would wrongly pause at ``paused_low_memory`` after a single batch on a
+    machine with little free system RAM. Use the low GPU floor there.
+
+    "mps" is Apple UNIFIED memory: the model and activations live in system
+    RAM (there is no separate VRAM pool), so the low CUDA floor disables the
+    backpressure exactly where it is needed most — treat it like CPU. On CPU
+    (and mps) keep the existing behavior: a high floor when running
     opportunistically (``idle``, so it defers on a busy machine) and the normal
     floor when the run was explicitly requested.
     """
-    if device in {"cuda", "mps"}:
+    if device == "cuda":
         return CHUNK_GPU_MIN_FREE_GB
     return max(CHUNK_MIN_FREE_GB, 8.0) if idle else CHUNK_MIN_FREE_GB
 

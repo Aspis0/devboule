@@ -1499,7 +1499,8 @@ def free_memory_gb() -> float:
             line_match = re.search(rf"^{name}:\s+(\d+)\.", result.stdout, re.MULTILINE)
             if line_match:
                 pages += int(line_match.group(1))
-        return round(pages * page_size / (1024 ** 3), 2)
+        vm_stat_gb = round(pages * page_size / (1024 ** 3), 2)
+        return darwin_effective_free_gb(vm_stat_gb, darwin_memory_pressure_level())
     try:
         with open("/proc/meminfo", encoding="utf-8") as handle:
             for line in handle:
@@ -1508,6 +1509,41 @@ def free_memory_gb() -> float:
     except OSError:
         pass
     return 0.0
+
+
+def darwin_memory_pressure_level() -> int | None:
+    """Read the kernel's own pressure verdict (1=normal, 2=warning, 4=critical).
+
+    ``None`` when the sysctl is missing or unreadable — callers then fall back
+    to the vm_stat estimate alone.
+    """
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def darwin_effective_free_gb(vm_stat_gb: float, pressure_level: int | None) -> float:
+    """vm_stat free+inactive+speculative+purgeable OVERSTATES availability under
+    load (observed: ~17GB "free" while swapping 30GB on a thrashing M1 Max).
+    When the kernel reports warning/critical pressure, report 0.0 so the index
+    loop pauses and ``wait_for_memory_recovery`` holds until pressure clears.
+    Pure over the parsed level so it is unit-testable.
+    """
+    if pressure_level is not None and pressure_level >= 2:
+        return 0.0
+    return vm_stat_gb
 
 
 def gpu_temperature_c() -> int | None:

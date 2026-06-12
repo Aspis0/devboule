@@ -2454,11 +2454,13 @@ class OraclePhase2Test(unittest.TestCase):
             )
         )
 
-    def test_resolve_min_free_gb_uses_low_floor_on_accelerators(self):
-        # GPU/MPS keep the model in VRAM/unified memory, so the system-RAM floor
-        # must be low (only covers per-batch chunk text). The CPU path keeps the
-        # conservative floor: high when idle (defer on a busy machine), the
-        # normal floor when actively requested.
+    def test_resolve_min_free_gb_uses_low_floor_only_on_cuda(self):
+        # Only CUDA keeps the model in a SEPARATE VRAM pool, so only CUDA gets
+        # the low system-RAM floor. "mps" is Apple unified memory — the model
+        # and activations live in system RAM, so it must keep the conservative
+        # CPU floors or the paused_low_memory backpressure never fires (this
+        # froze a 64GB M1 Max). CPU keeps the existing behavior: high floor
+        # when idle (defer on a busy machine), normal floor when requested.
         self.assertEqual(
             resolve_min_free_gb("cuda", idle=True), oracle_config.CHUNK_GPU_MIN_FREE_GB
         )
@@ -2466,8 +2468,12 @@ class OraclePhase2Test(unittest.TestCase):
             resolve_min_free_gb("cuda", idle=False), oracle_config.CHUNK_GPU_MIN_FREE_GB
         )
         self.assertEqual(
-            resolve_min_free_gb("mps", idle=True), oracle_config.CHUNK_GPU_MIN_FREE_GB
+            resolve_min_free_gb("mps", idle=True), max(oracle_config.CHUNK_MIN_FREE_GB, 8.0)
         )
+        self.assertEqual(
+            resolve_min_free_gb("mps", idle=False), oracle_config.CHUNK_MIN_FREE_GB
+        )
+
         self.assertEqual(
             resolve_min_free_gb("cpu", idle=True), max(oracle_config.CHUNK_MIN_FREE_GB, 8.0)
         )
@@ -2478,6 +2484,19 @@ class OraclePhase2Test(unittest.TestCase):
         self.assertEqual(
             resolve_min_free_gb(None, idle=False), oracle_config.CHUNK_MIN_FREE_GB
         )
+
+    def test_darwin_effective_free_gb_zeroes_under_memory_pressure(self):
+        # vm_stat's free+inactive+speculative+purgeable OVERSTATES availability
+        # under load (~17GB "free" while swapping 30GB). When the kernel itself
+        # reports memory pressure (level >= 2 = warning/critical), the index
+        # loop must see 0.0 and pause. Pure over the parsed level.
+        from oracle.ingestion.chunk_index import darwin_effective_free_gb
+
+        self.assertEqual(darwin_effective_free_gb(17.0, 2), 0.0)
+        self.assertEqual(darwin_effective_free_gb(17.0, 4), 0.0)
+        self.assertEqual(darwin_effective_free_gb(17.0, 1), 17.0)
+        # Unknown level (sysctl missing/unreadable): trust the vm_stat number.
+        self.assertEqual(darwin_effective_free_gb(17.0, None), 17.0)
 
     def test_choose_device_matrix_respects_override_and_vram_floor(self):
         threshold = oracle_config.MIN_GPU_FREE_GB
