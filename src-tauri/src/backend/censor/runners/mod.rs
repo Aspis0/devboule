@@ -26,6 +26,7 @@
 pub mod bandit;
 pub mod cargo_audit;
 pub mod cargo_check;
+pub mod cargo_fmt;
 pub mod clippy;
 pub mod eslint;
 pub mod gitleaks;
@@ -119,6 +120,7 @@ pub enum RunnerId {
     Clippy,
     CargoCheck,
     CargoAudit,
+    CargoFmt,
     Tsc,
     Eslint,
     Knip,
@@ -145,6 +147,7 @@ impl RunnerId {
             RunnerId::Clippy
             | RunnerId::CargoCheck
             | RunnerId::CargoAudit
+            | RunnerId::CargoFmt
             | RunnerId::Tsc
             | RunnerId::Knip
             | RunnerId::Jscpd
@@ -162,7 +165,7 @@ impl RunnerId {
     /// The tool's executable name, used for presence detection.
     pub fn program(self) -> &'static str {
         match self {
-            RunnerId::Clippy | RunnerId::CargoCheck | RunnerId::CargoAudit => "cargo",
+            RunnerId::Clippy | RunnerId::CargoCheck | RunnerId::CargoAudit | RunnerId::CargoFmt => "cargo",
             RunnerId::Tsc => "tsc",
             RunnerId::Eslint => "eslint",
             RunnerId::Knip => "knip",
@@ -216,6 +219,7 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
             out.push(RunnerId::Clippy);
             out.push(RunnerId::CargoCheck);
             out.push(RunnerId::CargoAudit);
+            out.push(RunnerId::CargoFmt);
         }
         FileLang::Ts if kinds.contains(&ProjectKind::Node) => {
             out.push(RunnerId::Tsc);

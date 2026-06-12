@@ -2530,7 +2530,9 @@ if ($env:{env}) {{\n\
         "& {{\n\
 try {{\n\
 {header_block}\
-$body = @{{ model = {model_q}; messages = @(@{{ role = 'user'; content = $prompt }}); stream = $false; temperature = 0.1 }} | ConvertTo-Json -Depth 6 -Compress\n\
+$bodyMap = @{{ model = {model_q}; messages = @(@{{ role = 'user'; content = $prompt }}); stream = $false; temperature = 0.1 }}\n\
+if ({model_q} -match 'qwen') {{ $bodyMap['chat_template_kwargs'] = @{{ enable_thinking = $false }} }}\n\
+$body = $bodyMap | ConvertTo-Json -Depth 6 -Compress\n\
 $resp = Invoke-RestMethod -Method Post -Uri {uri_q} -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec {http_timeout}\n\
 $content = $resp.choices[0].message.content\n\
 if ($null -ne $content) {{ Write-Output $content }}\n\
@@ -2707,12 +2709,16 @@ import urllib.request, urllib.error
 try:
     with open(os.environ['MINI_PROMPT_FILE'], 'r', encoding='utf-8') as f:
         prompt = f.read()
-    body = json.dumps({
-        'model': os.environ['OMLX_MODEL'],
+    model = os.environ['OMLX_MODEL']
+    body_dict = {
+        'model': model,
         'messages': [{'role': 'user', 'content': prompt}],
         'stream': False,
         'temperature': 0.1,
-    }).encode('utf-8')
+    }
+    if 'qwen' in model.lower():
+        body_dict['chat_template_kwargs'] = {'enable_thinking': False}
+    body = json.dumps(body_dict).encode('utf-8')
     req = urllib.request.Request(os.environ['OMLX_URL'], data=body, method='POST')
     req.add_header('Content-Type', 'application/json')
     key_path = os.environ.get('@OMLX_KEY_FILE_ENV@')
@@ -4853,6 +4859,15 @@ mod tests {
             script.contains("temperature = 0.1") && script.contains("stream = $false"),
             "OpenAI envelope fields missing: {script}"
         );
+        // Qwen-family models get chat_template_kwargs.enable_thinking=false (runtime
+        // gate on the model name) or they burn the budget on a thinking trace.
+        assert!(
+            script.contains("-match 'qwen'")
+                && script.contains("chat_template_kwargs")
+                && script.contains("enable_thinking = $false")
+                && script.contains("$body = $bodyMap | ConvertTo-Json -Depth 6 -Compress"),
+            "Qwen-gated chat_template_kwargs missing from PS body: {script}"
+        );
         // Extracts the model's content and writes it to stdout for the wrapper.
         assert!(
             script.contains("$resp.choices[0].message.content"),
@@ -5336,6 +5351,13 @@ mod tests {
         assert!(
             run.contains("'temperature': 0.1") && run.contains("'stream': False"),
             "OpenAI envelope fields missing: {run}"
+        );
+        // Qwen-family models get chat_template_kwargs.enable_thinking=false (runtime
+        // gate on the model name) or they burn the budget on a thinking trace.
+        assert!(
+            run.contains("'qwen' in model.lower()")
+                && run.contains("body_dict['chat_template_kwargs'] = {'enable_thinking': False}"),
+            "Qwen-gated chat_template_kwargs missing from python body: {run}"
         );
         // base URL + prompt path ride via ENV (never argv).
         assert!(

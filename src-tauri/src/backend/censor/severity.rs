@@ -81,6 +81,13 @@ pub fn severity_from_vulture() -> (Severity, Category) {
     (Severity::Low, Category::DeadCode)
 }
 
+/// cargo fmt (Rust formatting). Style-only check.
+/// Formatting issues are Low severity, Style category.
+#[allow(dead_code)] // first caller is the A3 cargo_fmt runner.
+pub fn severity_from_cargo_fmt() -> (Severity, Category) {
+    (Severity::Low, Category::Style)
+}
+
 /// gitleaks (secret scanner). A leaked secret is always the most serious finding
 /// we surface: High Security.
 #[allow(dead_code)] // first caller is the A2 gitleaks runner.
