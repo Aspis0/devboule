@@ -809,6 +809,11 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 // retries), the coder REDOES that file itself — the training rail already
                 // captured the failed attempts — and does NOT re-spawn the mini for it.
                 "If spawn_mini_coder returns status='escalated', REDO that file yourself (the mini's automatic retries failed Censor and the training rail captured them); do NOT re-spawn the mini for the same file.",
+                // P8: the coder's OWN review pass gates the Kanban review move
+                // (bilingual by design — English here, Italian in the Python
+                // ROLE_RULES). One pass, not a loop; the verifier keeps the
+                // final verdict via the censorReview handoff.
+                "Before moving a task to review: run ONE review pass of your own (a Sonnet review subagent) over the files you touched, fix the findings, THEN set the task to review with a 'ready for final reviewer' note. The FINAL verdict stays with the verifier (censorReview handoff) — never your own pass.",
                 "When you produce or review a self-contained HTML artifact and need visual feedback, call visual_check(html_path, focus?) and treat the returned critique as advisory evidence.",
             ]
             .into_iter()
@@ -2579,6 +2584,31 @@ mod tests {
                 rule.role
             );
         }
+    }
+
+    #[test]
+    fn coder_carries_p8_own_review_pass_mandate() {
+        // P8: the coder must run its OWN single Sonnet review pass before the
+        // Kanban review move; the verifier keeps the final verdict. Mirrored
+        // (bilingually) in the Python ROLE_RULES coder.forbidden.
+        let rules = default_role_rules();
+        let coder = rules.iter().find(|r| r.role == "coder").unwrap();
+        let blob = coder.forbidden.join(" ");
+        assert!(
+            blob.contains("Sonnet review subagent"),
+            "own-review-pass mandate missing from coder.forbidden"
+        );
+        assert!(
+            blob.contains("ready for final reviewer"),
+            "review handoff note missing"
+        );
+        assert!(
+            blob.contains("censorReview"),
+            "final-reviewer handoff reference missing"
+        );
+        // The verifier does NOT get the coder's pre-review mandate.
+        let verifier = rules.iter().find(|r| r.role == "verifier").unwrap();
+        assert!(!verifier.forbidden.join(" ").contains("Sonnet review subagent"));
     }
 
     #[test]

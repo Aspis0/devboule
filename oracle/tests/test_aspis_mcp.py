@@ -5141,6 +5141,17 @@ class CensorRoleMandateTests(unittest.TestCase):
             self.assertIn("censor_findings", rule["allowedTools"], rule["role"])
             self.assertIn("censor_dispose", rule["allowedTools"], rule["role"])
 
+    def test_coder_carries_p8_own_review_pass_mandate(self):
+        # P8: the coder runs its OWN single Sonnet review pass before moving a
+        # task to review; the verifier keeps the final verdict (censorReview).
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        blob = " ".join(coder["forbidden"])
+        self.assertIn("subagente Sonnet", blob)
+        self.assertIn("ready for final reviewer", blob)
+        self.assertIn("censorReview", blob)
+        verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
+        self.assertNotIn("subagente Sonnet", " ".join(verifier["forbidden"]))
+
     def test_coder_mandate_is_per_step(self):
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         blob = " ".join(coder["censor"]).lower()
