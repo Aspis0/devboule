@@ -1495,12 +1495,18 @@ def free_memory_gb() -> float:
         page_match = re.search(r"page size of (\d+) bytes", result.stdout)
         page_size = int(page_match.group(1)) if page_match else 4096
         pages = 0
+        free_only_pages = 0
         for name in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
             line_match = re.search(rf"^{name}:\s+(\d+)\.", result.stdout, re.MULTILINE)
             if line_match:
                 pages += int(line_match.group(1))
+                if name == "Pages free":
+                    free_only_pages = int(line_match.group(1))
         vm_stat_gb = round(pages * page_size / (1024 ** 3), 2)
-        return darwin_effective_free_gb(vm_stat_gb, darwin_memory_pressure_level())
+        free_only_gb = round(free_only_pages * page_size / (1024 ** 3), 2)
+        return darwin_effective_free_gb(
+            vm_stat_gb, free_only_gb, darwin_memory_pressure_level()
+        )
     try:
         with open("/proc/meminfo", encoding="utf-8") as handle:
             for line in handle:
@@ -1534,15 +1540,26 @@ def darwin_memory_pressure_level() -> int | None:
         return None
 
 
-def darwin_effective_free_gb(vm_stat_gb: float, pressure_level: int | None) -> float:
+def darwin_effective_free_gb(
+    vm_stat_gb: float, free_only_gb: float, pressure_level: int | None
+) -> float:
     """vm_stat free+inactive+speculative+purgeable OVERSTATES availability under
     load (observed: ~17GB "free" while swapping 30GB on a thrashing M1 Max).
-    When the kernel reports warning/critical pressure, report 0.0 so the index
-    loop pauses and ``wait_for_memory_recovery`` holds until pressure clears.
-    Pure over the parsed level so it is unit-testable.
+
+    LIVE FIX 2026-06-12: the kernel's pressure level is STICKY — it stayed at
+    2 (warning) with ~30GB genuinely free long after a thrash episode, which
+    zeroed the reading and froze indexing on a healthy machine. Discriminate:
+      - critical (>= 4): 0.0 — always pause;
+      - warning (2-3): trust only the genuinely FREE pages (during the real
+        thrash these were ~0 -> pause; on a recovered machine they are tens of
+        GB -> proceed);
+      - normal/unknown: the full vm_stat estimate.
+    Pure over the parsed values so it is unit-testable.
     """
-    if pressure_level is not None and pressure_level >= 2:
+    if pressure_level is not None and pressure_level >= 4:
         return 0.0
+    if pressure_level is not None and pressure_level >= 2:
+        return free_only_gb
     return vm_stat_gb
 
 

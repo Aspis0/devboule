@@ -2492,11 +2492,16 @@ class OraclePhase2Test(unittest.TestCase):
         # loop must see 0.0 and pause. Pure over the parsed level.
         from oracle.ingestion.chunk_index import darwin_effective_free_gb
 
-        self.assertEqual(darwin_effective_free_gb(17.0, 2), 0.0)
-        self.assertEqual(darwin_effective_free_gb(17.0, 4), 0.0)
-        self.assertEqual(darwin_effective_free_gb(17.0, 1), 17.0)
-        # Unknown level (sysctl missing/unreadable): trust the vm_stat number.
-        self.assertEqual(darwin_effective_free_gb(17.0, None), 17.0)
+        # critical -> hard pause.
+        self.assertEqual(darwin_effective_free_gb(17.0, 0.01, 4), 0.0)
+        # warning -> trust only the genuinely FREE pages: ~0 during a real
+        # thrash (pause), tens of GB on a recovered machine whose kernel level
+        # is still sticky at 2 (proceed) — the live false-freeze of 2026-06-12.
+        self.assertEqual(darwin_effective_free_gb(17.0, 0.01, 2), 0.01)
+        self.assertEqual(darwin_effective_free_gb(40.0, 24.6, 2), 24.6)
+        # normal / unknown -> the full vm_stat estimate.
+        self.assertEqual(darwin_effective_free_gb(17.0, 5.0, 1), 17.0)
+        self.assertEqual(darwin_effective_free_gb(17.0, 5.0, None), 17.0)
 
     def test_choose_device_matrix_respects_override_and_vram_floor(self):
         threshold = oracle_config.MIN_GPU_FREE_GB
