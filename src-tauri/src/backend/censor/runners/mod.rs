@@ -733,6 +733,7 @@ mod tests {
             RunnerId::Clippy,
             RunnerId::CargoCheck,
             RunnerId::CargoAudit,
+            RunnerId::CargoDeny,
             RunnerId::Tsc,
             RunnerId::Knip,
             RunnerId::Jscpd,

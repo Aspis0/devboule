@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use super::super::schema::Category;
 use super::super::severity::severity_from_cargo_deny;
 use super::{cap, redact_secrets, run_capture, run_capture_stderr_with_timeout, Granularity, RawFinding};
 use serde::Deserialize;
@@ -81,7 +80,6 @@ pub fn parse_cargo_deny(stderr: &str) -> Vec<RawFinding> {
                 return None;
             }
             let (severity, category) = severity_from_cargo_deny(&f.severity);
-            let _ = Category::Security; // category comes from the helper
             // PRIVACY: the message is free prose from the tool — redact
             // secret-shaped tokens, then cap.
             let safe_message = redact_secrets(&f.message);
@@ -96,10 +94,13 @@ pub fn parse_cargo_deny(stderr: &str) -> Vec<RawFinding> {
                     }
                 })
                 .filter(|k| !k.trim().is_empty());
-            let title = if f.code.is_empty() {
+            // The code is normally a short identifier (vulnerability/duplicate/…)
+            // but it arrives from untrusted JSON — redact like the message.
+            let safe_code = redact_secrets(&f.code);
+            let title = if safe_code.is_empty() {
                 "cargo-deny finding".to_string()
             } else {
-                format!("cargo-deny: {}", f.code)
+                format!("cargo-deny: {safe_code}")
             };
             let body = match krate {
                 Some(k) => cap(&format!("{safe_message} (dependency {k})"), 1000),
@@ -123,22 +124,52 @@ pub fn parse_cargo_deny(stderr: &str) -> Vec<RawFinding> {
 /// cheap and offline.
 pub fn run(root: &Path) -> Vec<RawFinding> {
     if run_capture("cargo-deny", &["--version"], root).is_none() {
-        eprintln!(
-            "censor: cargo-deny not installed — dependency policy scan skipped at {}",
-            root.display()
-        );
+        // Once per session (max-recall fix): the coarse pass fires every few
+        // seconds of activity — a per-pass line would flood the log.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "censor: cargo-deny not installed — dependency policy scan skipped at {}",
+                root.display()
+            );
+        }
         return Vec::new();
+    }
+    // Max-recall fixes:
+    //   --offline: a censor runner must never block the serialized worker on a
+    //     network advisory-DB fetch (and the runner posture is offline); the
+    //     user keeps the DB fresh with `cargo deny fetch`.
+    //   bans/sources only WITH a deny.toml: without one cargo-deny hard-errors
+    //     (silent false-clean) or FP-floods on default source policy.
+    let mut args: Vec<&str> = vec!["--offline", "--format", "json", "check", "advisories"];
+    if root.join("deny.toml").exists() {
+        args.push("bans");
+        args.push("sources");
     }
     let stderr = match run_capture_stderr_with_timeout(
         "cargo-deny",
-        &["--format", "json", "check", "advisories", "bans", "sources"],
+        &args,
         root,
         CARGO_DENY_TIMEOUT,
     ) {
         Some(s) => s,
         None => return Vec::new(),
     };
-    parse_cargo_deny(&stderr)
+    let findings = parse_cargo_deny(&stderr);
+    if findings.is_empty()
+        && !stderr.trim().is_empty()
+        && !stderr.contains("\"type\":\"diagnostic\"")
+    {
+        // The tool spoke but produced NO parseable diagnostics: likely a
+        // missing cached advisory DB (--offline) or a config error. Say so —
+        // a security scanner must never silently read as all-clear.
+        // Identity-only log (the text may echo project details).
+        eprintln!(
+            "censor: cargo-deny ran but produced no parseable diagnostics at {} — check `cargo deny fetch` / deny.toml",
+            root.display()
+        );
+    }
+    findings
 }
 
 #[cfg(test)]

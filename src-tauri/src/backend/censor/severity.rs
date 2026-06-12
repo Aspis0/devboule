@@ -102,14 +102,11 @@ pub fn severity_from_npm_audit(sev: &str) -> (Severity, Category) {
     (s, Category::Security)
 }
 
-/// zizmor. zizmor uses high|medium|low|informational; CI hardening findings
-/// are always Security. high → High, medium → Medium, low/informational → Low,
-/// unknown → Medium.
-#[allow(dead_code)] // first caller is the A3 zizmor runner.
 /// cargo-deny diagnostics. P2 ROLLOUT DISCIPLINE: advisory-first — `error`
 /// maps to Medium (NOT High) until the FP-rate on this repo is measured and
 /// the owner promotes it; everything else is Low. Always Security: the tool
 /// only speaks about the dependency graph (advisories, bans, sources).
+#[allow(dead_code)] // first caller is the cargo-deny runner.
 pub fn severity_from_cargo_deny(sev: &str) -> (Severity, Category) {
     match sev.to_ascii_lowercase().as_str() {
         "error" => (Severity::Medium, Category::Security),
@@ -117,6 +114,10 @@ pub fn severity_from_cargo_deny(sev: &str) -> (Severity, Category) {
     }
 }
 
+/// zizmor. zizmor uses high|medium|low|informational; CI hardening findings
+/// are always Security. high → High, medium → Medium, low/informational → Low,
+/// unknown → Medium.
+#[allow(dead_code)] // first caller is the A3 zizmor runner.
 pub fn severity_from_zizmor(sev: &str) -> (Severity, Category) {
     let s = match sev.trim().to_ascii_lowercase().as_str() {
         "high" => Severity::High,

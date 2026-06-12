@@ -942,6 +942,7 @@ mod tests {
         assert!(c.contains(&RunnerId::Clippy));
         assert!(c.contains(&RunnerId::CargoCheck));
         assert!(c.contains(&RunnerId::CargoAudit));
+        assert!(c.contains(&RunnerId::CargoDeny));
         // Node coarse.
         assert!(c.contains(&RunnerId::Tsc));
         assert!(c.contains(&RunnerId::Knip));
@@ -1011,6 +1012,9 @@ mod tests {
         assert_eq!(runner_source(RunnerId::Clippy), "clippy");
         assert_eq!(runner_source(RunnerId::CargoCheck), "cargo-check");
         assert_eq!(runner_source(RunnerId::CargoAudit), "cargo-audit");
+        // Must match parse_cargo_deny's RawFinding.source or the scoped merge
+        // stops clearing stale findings (zombie shard entries).
+        assert_eq!(runner_source(RunnerId::CargoDeny), "cargo-deny");
         assert_eq!(runner_source(RunnerId::Eslint), "eslint");
         assert_eq!(runner_source(RunnerId::Gitleaks), "gitleaks");
     }
