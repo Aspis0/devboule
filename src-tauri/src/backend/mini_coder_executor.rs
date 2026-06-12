@@ -1874,10 +1874,20 @@ fn apply_write_directive_edits(
         );
     };
     let edits = std::mem::take(&mut outcome.edits);
+    // P7: keep the pre-image hashes — for a fix pass they ARE the previous
+    // attempt's output, i.e. the "rejected" side of the ORPO pair.
+    let mut preimages: Vec<(String, String)> = Vec::new();
     match apply_emitted_edits(root, &directive.files, &edits, |rel| {
-        let _ = crate::backend::training_export::snapshot_blob(root, &root.join(rel));
+        if let Some(hash) =
+            crate::backend::training_export::snapshot_blob(root, &root.join(rel))
+        {
+            preimages.push((rel.to_string(), hash));
+        }
     }) {
         Ok(applied) => {
+            crate::backend::training_export::record_write_preimages(
+                root, directive, &preimages,
+            );
             outcome.files_touched = applied;
             outcome
         }

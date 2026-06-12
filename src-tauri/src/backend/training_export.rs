@@ -610,6 +610,40 @@ pub fn record_directive_result(
     record_directive_result_capped(root, directive, outcome, OUTPUT_CAP_CHARS)
 }
 
+/// P7: link a write directive's APPLY-time pre-images into the training rail.
+/// For attempt N these blobs are attempt N-1's OUTPUT (the "rejected" side of
+/// the ORPO pair when the chain later lands clean); for attempt 0 they are the
+/// human baseline. Fire-and-forget like every rail writer.
+pub fn record_write_preimages(
+    root: &Path,
+    directive: &MiniCoderDirective,
+    preimages: &[(String, String)],
+) {
+    if preimages.is_empty() {
+        return;
+    }
+    let pairs_path = training_dir(root).join("pairs.jsonl");
+    let mut blobs = serde_json::Map::new();
+    for (rel, hash) in preimages {
+        blobs.insert(rel.clone(), serde_json::Value::String(hash.clone()));
+    }
+    let rec = serde_json::json!({
+        "type": "write_preimages",
+        "ts": now_rfc3339(),
+        "directiveId": directive.id,
+        "rootId": super::mini_coder::chain_root_id(directive),
+        "attempt": directive.attempt,
+        "blobs": serde_json::Value::Object(blobs),
+    });
+    if let Err(e) = append_jsonl(&pairs_path, &rec) {
+        eprintln!(
+            "training_export: write_preimages append failed at {}: {}",
+            pairs_path.display(),
+            e
+        );
+    }
+}
+
 fn record_directive_result_capped(
     root: &Path,
     directive: &MiniCoderDirective,
@@ -675,6 +709,28 @@ fn record_directive_result_capped(
             pairs_path.display(),
             e
         );
+    }
+
+    // P7: a WRITE chain leaf landing CLEAN at attempt > 0 is a complete
+    // {rejected, chosen} trajectory — emit the join marker. rejected = the
+    // leaf's `write_preimages` blobs (attempt N-1's output); chosen = the
+    // adjacent directive_result's post-fix blobs.
+    if directive.write && directive.attempt > 0 && outcome.status == MiniCoderStatus::Done {
+        let pair = serde_json::json!({
+            "type": "write_fix_pair",
+            "ts": now_rfc3339(),
+            "rootId": super::mini_coder::chain_root_id(directive),
+            "chosenDirectiveId": directive.id,
+            "attempt": directive.attempt,
+            "filesTouched": outcome.files_touched,
+        });
+        if let Err(e) = append_jsonl(&pairs_path, &pair) {
+            eprintln!(
+                "training_export: write_fix_pair append failed at {}: {}",
+                pairs_path.display(),
+                e
+            );
+        }
     }
 }
 
@@ -1245,6 +1301,64 @@ mod tests {
         );
         std::fs::remove_file(&outside).ok();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- P7: ORPO write-chain linkage ---------------------------------------
+
+    #[test]
+    fn write_preimages_record_links_blobs_by_root_id() {
+        let root = tmp("preimages");
+        let mut d = directive("dR-r1", "coderP");
+        d.write = true;
+        d.attempt = 1;
+        d.parent_directive_id = Some("dR".into());
+        record_write_preimages(
+            &root,
+            &d,
+            &[("src/a.rs".to_string(), "abc123".to_string())],
+        );
+        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["type"], "write_preimages");
+        assert_eq!(lines[0]["rootId"], "dR");
+        assert_eq!(lines[0]["directiveId"], "dR-r1");
+        assert_eq!(lines[0]["attempt"], 1);
+        assert_eq!(lines[0]["blobs"]["src/a.rs"], "abc123");
+        // Empty pre-images are a no-op (no record churn).
+        record_write_preimages(&root, &d, &[]);
+        assert_eq!(read_lines(&training_dir(&root).join("pairs.jsonl")).len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_fix_pair_marker_only_for_clean_write_fix_leaf() {
+        // The join marker rides the terminal record ONLY when a WRITE chain
+        // lands CLEAN at attempt > 0 (a complete {rejected, chosen} trajectory).
+        let root = tmp("fixpair");
+        let mut leaf = directive("dW-r1", "coderP");
+        leaf.write = true;
+        leaf.attempt = 1;
+        leaf.parent_directive_id = Some("dW".into());
+        let mut outcome = MiniCoderOutcome::default();
+        outcome.status = MiniCoderStatus::Done;
+        outcome.files_touched = vec!["src/a.rs".into()];
+        record_directive_result(&root, &leaf, &outcome);
+        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 2, "directive_result + write_fix_pair");
+        assert_eq!(lines[1]["type"], "write_fix_pair");
+        assert_eq!(lines[1]["rootId"], "dW");
+        assert_eq!(lines[1]["chosenDirectiveId"], "dW-r1");
+        assert_eq!(lines[1]["filesTouched"][0], "src/a.rs");
+
+        // attempt 0 (no fix happened) -> NO marker.
+        let root2 = tmp("fixpair0");
+        let mut zero = directive("dZ", "coderP");
+        zero.write = true;
+        record_directive_result(&root2, &zero, &outcome);
+        let lines = read_lines(&training_dir(&root2).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 1, "attempt 0 must not emit a pair marker");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root2).ok();
     }
 
     // -- WARNING 10: future-dated terminal directive not attributed --------
