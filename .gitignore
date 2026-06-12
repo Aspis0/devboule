@@ -8,6 +8,14 @@ Thumbs.db
 .env
 .env.local
 
+# per-machine live config; the app bootstraps a default when missing
+/config.json
+# transient artifacts of the atomic temp+rename config writers (lib.rs bootstrap and
+# every Settings/design saver share the idiom): a crash between fs::write and the rename
+# can orphan one of these next to config.json.
+/config.json.*.tmp
+/config.json.*.bak
+
 # Runtime state written by the app when run from this folder — agent sessions,
 # project briefs and their lock files. Never source, never published.
 # Anchored to the repo root: an unanchored `projects/` also shadowed the REAL
