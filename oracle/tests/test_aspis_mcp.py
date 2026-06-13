@@ -665,6 +665,99 @@ root_path: "{escaped_work_root}"
                 "agent_register", dict(base, launch_token=token), root=root
             )
 
+    def test_mini_cannot_reregister_after_token_consumed_sec7(self):
+        # SEC#7 (EOD review): once the launch token is consumed (popped on the
+        # first successful register), a SECOND tokenless agent_register must be
+        # REJECTED — otherwise anyone who learns the agent_id can mint a fresh
+        # session token. Role stays "mini" regardless, but the one-shot binding
+        # must hold.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            token = "mini-once-token"
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "mini-7",
+                                "role": "mini",
+                                "status": "active",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            base = {"agent_id": "mini-7", "role": "mini", "model": "qwen", "message": "x"}
+            # First register with the right token: succeeds + consumes the hash.
+            handle_tool_call("agent_register", dict(base, launch_token=token), root=root)
+            # Second register, now tokenless: must be REJECTED (consumed).
+            with self.assertRaises(McpError):
+                handle_tool_call("agent_register", dict(base), root=root)
+
+    def test_mini_oracle_context_is_bound_to_its_project_sec9(self):
+        # SEC#9 (EOD review): the mini's read-only oracle grant is scoped to its
+        # SPAWNING project — a mini bound to project A asking oracle_context for
+        # project B must be rejected (cross-project corpus read), even though the
+        # role gate allows oracle_context.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            (projects / ".aspis-agents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updatedAt": "2026-06-12T00:00:00Z",
+                        "sessions": [
+                            {
+                                "agentId": "mini-9",
+                                "role": "mini",
+                                "status": "active",
+                                "lastSeenAt": "2026-06-12T00:00:00Z",
+                                "currentProjectId": "scrna-seq",
+                            }
+                        ],
+                        "claims": [],
+                        "events": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # A second REAL project the mini was NOT spawned for — so the only
+            # thing that can block the read is the mini-scope check (not a
+            # missing-project coincidence).
+            (projects / "other-proj.md").write_text(
+                "---\nid: other-proj\ntitle: Other\nstatus: active\n"
+                "updated_at: 2026-05-28T00:00:00Z\n---\n\n# Other\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "oracle_context",
+                    {
+                        "agent_id": "mini-9",
+                        "role": "mini",
+                        "query": "anything",
+                        "project_id": "other-proj",
+                    },
+                    root=root,
+                )
+            # Must fail for the SCOPE reason, not a downstream coincidence.
+            self.assertIn("project", str(ctx.exception).lower())
+            self.assertIn("mini", str(ctx.exception).lower())
+
     def test_coder_claim_moves_todo_task_to_wip_for_live_kanban(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

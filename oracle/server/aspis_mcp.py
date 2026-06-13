@@ -1210,6 +1210,31 @@ def ensure_oracle_index_ready(projects_dir: Path, args: dict[str, Any]) -> dict[
     return status
 
 
+def enforce_mini_oracle_project_scope(
+    projects_dir: Path, agent_id: str, role: str, args: dict[str, Any]
+) -> None:
+    """SEC#9: a "mini" role session may only read its OWN project's corpus. The
+    mini's currentProjectId is reliably set at spawn, so a project_id that
+    differs from it is a cross-project read — reject. Non-mini roles and an
+    empty/own project_id are unaffected."""
+    if role != "mini":
+        return
+    requested = str(args.get("project_id") or "").strip()
+    if not requested:
+        return
+    with file_lock(projects_dir / f"{AGENTS_STATE_FILE}.lock"):
+        state = read_agents_state(projects_dir)
+    session = next(
+        (s for s in state["sessions"] if s.get("agentId") == agent_id), None
+    )
+    own = str((session or {}).get("currentProjectId") or "").strip()
+    if requested != own:
+        raise McpError(
+            "A mini agent may only read its own project via oracle_context "
+            f"(scoped to {own or 'its spawning project'}, requested {requested})."
+        )
+
+
 def oracle_allowed_file_ids(projects_dir: Path, args: dict[str, Any]) -> set[str] | None:
     paths = mcp_oracle_paths(projects_dir)
     manifest_path = paths["root"] / "oracle-data" / "chunk-index-manifest.json"
@@ -1336,6 +1361,14 @@ def validate_launch_token_for_registration(
         return session
     if str(session.get("status") or "").strip().lower() == "launch_pending":
         raise McpError("Pending agent session is missing a launch token. Relaunch the agent from Aspis Management.")
+    # SEC#7: a session whose launch token was already CONSUMED cannot be
+    # re-registered tokenless — the one-shot launch credential is spent. (A
+    # session that never had a hash, i.e. pure unmanaged self-registration, has
+    # no launchConsumedAt and is unaffected.)
+    if str(session.get("launchConsumedAt") or "").strip():
+        raise McpError(
+            "Agent launch credential already consumed; relaunch the agent from Aspis Management to register again."
+        )
     return session
 
 
@@ -5389,6 +5422,12 @@ def handle_tool_call(
                 args.get("launch_token"),
             )
             if existing is not None:
+                # SEC#7: if a launch-token hash was present (managed launch), this
+                # register CONSUMES it — stamp launchConsumedAt so a later
+                # tokenless re-register is rejected (validate_launch_token_for_
+                # registration), not silently re-issued a fresh session token.
+                if str(existing.get("launchTokenHash") or "").strip():
+                    existing["launchConsumedAt"] = now()
                 existing.pop("launchTokenHash", None)
                 existing.pop("launchTokenIssuedAt", None)
             # A managed registration is one backed by an app-issued launch/session
@@ -5959,6 +5998,13 @@ def handle_tool_call(
         mcp_debug(projects_dir, "oracle_context begin")
         agent_id, role = require_agent_tool(projects_dir, args, name)
         mcp_debug(projects_dir, "oracle_context agent ok")
+        # SEC#9: the mini's read-only grant is SCOPED to its spawning project.
+        # Its session carries a reliable currentProjectId (set by the Rust
+        # upsert_mini_session at launch — unlike a coder, which only stamps it
+        # when it touches a project tool). A mini asking for a DIFFERENT
+        # project_id is a cross-project corpus read — reject it. An empty
+        # project_id is fine (defaults to the management root only).
+        enforce_mini_oracle_project_scope(projects_dir, agent_id, role, args)
         query = clean_text(args.get("query"), "Query", 2000)
         mcp_debug(projects_dir, "oracle_context index begin")
         audit_agent_read(projects_dir, state_lock, agent_id, role, "oracle_context", query, args.get("project_id") or None)
