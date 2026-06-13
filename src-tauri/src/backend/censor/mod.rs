@@ -9,6 +9,7 @@
 //! (`<sha256(fileRelPath)>.json`), each guarded by a `<shard>.lock` sidecar that
 //! interoperates with the Python MCP writer exactly like `.aspis-agents.json`.
 
+pub mod catalog;
 pub mod commands;
 pub mod detect;
 pub mod gemma;
