@@ -204,6 +204,9 @@ def require_loopback(base_url: str) -> None:
 # src-tauri/src/backend/mini_coder_executor.rs — a cross-language test pins the
 # anchor lines so the two cannot drift silently.
 REPLAY_CONTRACT = (
+    # Mirror the Rust prompt builder VERBATIM, including the RESULT preamble it
+    # pushes immediately before the schema (mini_coder_executor.rs).
+    'RESULT (your FINAL action):\n'
     'Report your result as a SINGLE JSON object with this schema:\n'
     '{"status":"done"|"needs_clarification", "output":"short summary", '
     '"edits":[{"path":"rel/path","oldString":"...","newString":"..."},...], '
@@ -252,7 +255,10 @@ def replay_task(
 ) -> str:
     """POST to OpenAI-compatible endpoint and return message content."""
     require_loopback(base_url)
-    url = f"{base_url}/chat/completions"
+    # Avoid a double suffix when the caller already passed a full chat URL
+    # (e.g. http://127.0.0.1:8000/v1/chat/completions).
+    trimmed = base_url.rstrip('/')
+    url = trimmed if trimmed.endswith('/chat/completions') else f"{trimmed}/chat/completions"
     
     payload = {
         'model': model,
@@ -356,7 +362,10 @@ def run_heldout(
     clarifications = 0
     for pair in pairs:
         task_prompt = pair['task']
-        scope_files = pair.get('filesTouched') or None
+        # Scope = the directive's full ALLOWLIST when recorded (a candidate that
+        # correctly edits MORE files than the training example did must not be
+        # false-failed); fall back to filesTouched for older records.
+        scope_files = pair.get('files') or pair.get('filesTouched') or None
         if wrap_contract:
             task_prompt = build_replay_prompt(pair['task'], scope_files)
         error: Optional[str] = None
@@ -374,7 +383,9 @@ def run_heldout(
             scores = score_output(output)
             # Max-recall fix: the contract binds edit paths to the FILE SCOPE;
             # the gate must enforce it or off-scope edits score as passes.
-            if scores['kind'] == 'edits' and scope_files:
+            if scores['pass'] and scope_files:
+                # Both edits AND clarification-with-stray-edits are scope-checked:
+                # a clarification carrying out-of-scope edits must not pass.
                 try:
                     emitted = extract_edits(json.loads(strip_fences(output)))
                 except (json.JSONDecodeError, ValueError):

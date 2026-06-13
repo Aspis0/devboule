@@ -198,6 +198,7 @@ class EvalPairBridgeTests(unittest.TestCase):
             / "src-tauri/src/backend/mini_coder_executor.rs"
         ).read_text(encoding="utf-8")
         for anchor in [
+            "RESULT (your FINAL action):",
             "Report your result as a SINGLE JSON object with this schema:",
             "EDITS CONTRACT (the app applies your edits — you never write files yourself):",
             "it must occur EXACTLY ONCE in that file.",
@@ -207,6 +208,97 @@ class EvalPairBridgeTests(unittest.TestCase):
         ]:
             self.assertIn(anchor, REPLAY_CONTRACT)
             self.assertIn(anchor, rust, f"contract line drifted from Rust: {anchor}")
+
+
+class HarnessEodFixTests(unittest.TestCase):
+    def test_replay_url_does_not_double_suffix(self):
+        # Max-recall: a base_url that already ends in /chat/completions must not
+        # become /chat/completions/chat/completions.
+        from unittest.mock import patch
+        import oracle.evalbench.heldout as hm
+
+        seen = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, *a):
+                return json.dumps(
+                    {"choices": [{"message": {"content": "[]"}}]}
+                ).encode()
+
+        def fake_urlopen(req, timeout=0):
+            seen["url"] = req.full_url
+            return FakeResp()
+
+        with patch.object(hm.urllib.request, "urlopen", fake_urlopen):
+            hm.replay_task(
+                "http://127.0.0.1:8000/v1/chat/completions", "m", "t"
+            )
+        self.assertEqual(
+            seen["url"], "http://127.0.0.1:8000/v1/chat/completions"
+        )
+        with patch.object(hm.urllib.request, "urlopen", fake_urlopen):
+            hm.replay_task("http://127.0.0.1:8000/v1", "m", "t")
+        self.assertEqual(
+            seen["url"], "http://127.0.0.1:8000/v1/chat/completions"
+        )
+
+    def test_replay_scope_prefers_the_allowlist_over_files_touched(self):
+        # A candidate editing a file in the ALLOWLIST but NOT in the smaller
+        # filesTouched subset must PASS (not be false-failed).
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "pairs.jsonl"
+            p.write_text(
+                json.dumps(
+                    {
+                        "type": "eval_pair",
+                        "task": "fix",
+                        "backend": "omlx",
+                        "files": ["src/a.rs", "src/b.rs"],
+                        "filesTouched": ["src/a.rs"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # Candidate edits src/b.rs — in the allowlist, NOT in filesTouched.
+            out = json.dumps(
+                {"status": "done", "edits": [{"path": "src/b.rs", "oldString": "x", "newString": "y"}]}
+            )
+            with patch("oracle.evalbench.heldout.replay_task", return_value=out):
+                res = run_heldout(str(p), "http://127.0.0.1:8000/v1", "cand", wrap_contract=True)
+            self.assertEqual(res["passed"], 1, "allowlisted-but-untouched file must pass")
+
+    def test_clarification_with_out_of_scope_edits_fails(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "pairs.jsonl"
+            p.write_text(
+                json.dumps(
+                    {"type": "eval_pair", "task": "t", "files": ["src/a.rs"]}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # A clarification that ALSO smuggles an out-of-scope edit must NOT pass.
+            out = json.dumps(
+                {
+                    "status": "needs_clarification",
+                    "question": "which?",
+                    "edits": [{"path": "/etc/passwd", "oldString": "x", "newString": "y"}],
+                }
+            )
+            with patch("oracle.evalbench.heldout.replay_task", return_value=out):
+                res = run_heldout(str(p), "http://127.0.0.1:8000/v1", "cand", wrap_contract=True)
+            self.assertEqual(res["passed"], 0, "clarification with rogue edits must fail scope")
 
 
 class ClarificationAndScopeTests(unittest.TestCase):

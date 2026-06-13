@@ -433,17 +433,31 @@ fn is_sensitive_blob_name(file_abs: &Path) -> bool {
         || name == "secrets.json"
         || name == "secrets.yaml"
         || name == "secrets.yml"
+        || name == "service_account.json"
+        || name == "application_default_credentials.json"
+        || name == "kubeconfig"
+        || name == "wrangler.toml"
+        || name == ".sops.yaml"
         || name.starts_with("id_rsa")
         || name.starts_with("id_ed25519")
+        || name.ends_with(".tfvars")
+        || name.ends_with(".tfvars.json")
     {
         return true;
     }
+    // Extension-based: keys, certs, and Apple signing keys (.p8).
     matches!(
         std::path::Path::new(&name)
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .as_deref(),
-        Some("pem") | Some("key") | Some("p12") | Some("pfx") | Some("keystore") | Some("jks")
+        Some("pem")
+            | Some("key")
+            | Some("p12")
+            | Some("pfx")
+            | Some("p8")
+            | Some("keystore")
+            | Some("jks")
     )
 }
 
@@ -794,10 +808,17 @@ fn record_directive_result_capped(
             "chosenDirectiveId": directive.id,
             "attempt": directive.attempt,
             "task": cap_chars(&directive.task, output_cap),
-            "model": directive
+            // `backend` is the KIND label (omlx/ollama/codex), provenance only —
+            // the concrete model id lives in app config, not on the directive.
+            "backend": directive
                 .backend
                 .clone()
                 .unwrap_or_else(|| "default-backend".to_string()),
+            // The full ALLOWLIST (what the mini WAS allowed to touch) — the eval
+            // harness scopes replay to this, so a candidate fixing more files
+            // than this leaf did is not false-failed. filesTouched is the subset
+            // actually applied.
+            "files": directive.files,
             "filesTouched": outcome.files_touched,
         });
         if let Err(e) = append_jsonl(&pairs_path, &eval_pair) {
@@ -1491,6 +1512,7 @@ mod tests {
         leaf.parent_directive_id = Some("dE".into());
         leaf.task = "fix the divide-by-zero in div()".into();
         leaf.backend = Some("omlx".into());
+        leaf.files = vec!["src/div.ts".into(), "src/helper.ts".into()];
         let mut outcome = MiniCoderOutcome::default();
         outcome.status = MiniCoderStatus::Done;
         outcome.files_touched = vec!["src/div.ts".into()];
@@ -1500,7 +1522,11 @@ mod tests {
         assert_eq!(lines[2]["type"], "eval_pair");
         assert_eq!(lines[2]["rootId"], "dE");
         assert_eq!(lines[2]["task"], "fix the divide-by-zero in div()");
-        assert_eq!(lines[2]["model"], "omlx");
+        // `backend` is the kind label (renamed from the misleading "model").
+        assert_eq!(lines[2]["backend"], "omlx");
+        // The full allowlist is recorded for replay scoping; filesTouched is the
+        // applied subset.
+        assert_eq!(lines[2]["files"][1], "src/helper.ts");
         assert_eq!(lines[2]["filesTouched"][0], "src/div.ts");
 
         // No backend configured -> provenance fallback, never a missing field.
@@ -1511,7 +1537,7 @@ mod tests {
         nofb.task = "t".into();
         record_directive_result(&root2, &nofb, &outcome);
         let lines = read_lines(&training_dir(&root2).join("pairs.jsonl"));
-        assert_eq!(lines[2]["model"], "default-backend");
+        assert_eq!(lines[2]["backend"], "default-backend");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&root2).ok();
     }
