@@ -62,8 +62,14 @@ import type {
 } from "../types/backend";
 import { toOracleError } from "../utils/oracleError";
 import { mapLegacyViewTarget } from "../utils/deepLink";
+import { installVisibilityLock } from "../utils/visibilityLock";
 
 const LIVE_SYNC_INTERVAL_MS = 60_000;
+// Auto-lock only after the window has stayed hidden this long — a brief hide
+// (Space switch, a window briefly covering it, the dev-rebuild flash) that
+// returns to visible before this elapses does NOT lock. Security intent kept:
+// walking away (staying hidden) still locks.
+const VISIBILITY_LOCK_GRACE_MS = 20_000;
 const SCALEWAY_ACTION_FOLLOWUP_DELAYS_MS = [5_000, 15_000, 30_000];
 
 const EMPTY_CONFIG: AppConfig = {
@@ -2445,14 +2451,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (isLocked || !isDesktopRuntime) return;
-    const lockWhenHidden = () => {
-      if (document.visibilityState === "hidden" && !unlockInFlightRef.current) {
-        void lock();
-      }
-    };
-    document.addEventListener("visibilitychange", lockWhenHidden);
-    return () =>
-      document.removeEventListener("visibilitychange", lockWhenHidden);
+    // Auto-lock when the window stays HIDDEN for a grace period — NOT instantly
+    // on every visibilitychange. The old instant lock fired on momentary macOS
+    // Space switches, a window briefly covered, and the dev-rebuild window
+    // flash, locking the user out constantly ("ogni tanto torna in lock").
+    return installVisibilityLock(() => {
+      if (!unlockInFlightRef.current) void lock();
+    }, VISIBILITY_LOCK_GRACE_MS);
   }, [isDesktopRuntime, isLocked, lock]);
 
   useEffect(
