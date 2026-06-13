@@ -215,7 +215,7 @@ export function AgentRow({
             type="button"
             onClick={() => onToggleTerminal(session.agentId)}
             data-help-title="This opens the agent's in-app terminal."
-            data-help-lines="The in-app terminal mirrors an app-hosted agent's live output.|The grid is read-only; use the reply bar to answer prompts.|Only agents launched inside the app (host=app) show this control.|Closing the panel detaches the viewer but does not stop the agent."
+            data-help-lines="The in-app terminal mirrors an app-hosted agent's live output.|You can type directly into the grid (e.g. /compact, /quit) or use the reply bar.|Only agents launched inside the app (host=app) show this control.|Closing the panel detaches the viewer but does not stop the agent."
             className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold ${
               terminalOpen
                 ? "border-terracotta bg-terracotta/10 text-terracotta"

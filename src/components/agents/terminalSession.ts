@@ -51,7 +51,7 @@ export interface TerminalSessionDeps {
   /** Create the xterm view bound to a host element. */
   createView: (
     host: HTMLElement,
-    opts: { onData: (data: string) => void },
+    opts: { onData: (data: string) => void; onCtrlC: () => void },
   ) => Promise<TerminalViewHandle>;
   /** The host element the view mounts into. */
   host: HTMLElement;
@@ -135,6 +135,9 @@ export class TerminalSession {
     try {
       view = await this.deps.createView(this.deps.host, {
         onData: (data) => this.handleViewData(data),
+        // #16: Ctrl+C typed in the grid arms/confirms the two-step SIGINT guard
+        // (createTerminalView swallows the raw key) — never a raw ETX bypass.
+        onCtrlC: () => this.requestCtrlC(),
       });
     } catch {
       if (!this.disposed) {
@@ -242,9 +245,9 @@ export class TerminalSession {
     this.deps.onExited?.();
   }
 
-  /** xterm wants to send bytes back (DSR reply with the grid read-only). Forward
-   *  to the pty. Never count automatic replies toward the write-fail banner only
-   *  if they fail transiently — but a hard, repeated failure still surfaces. */
+  /** xterm wants to send bytes back: the user's keystrokes/paste (#16 interactive
+   *  grid) and automatic replies (DSR). Forward to the pty. A hard, repeated write
+   *  failure still surfaces the banner; a single transient failure is swallowed. */
   private handleViewData(data: string): void {
     void this.writeToPty(data);
   }

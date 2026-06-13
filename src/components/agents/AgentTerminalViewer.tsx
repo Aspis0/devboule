@@ -1,7 +1,8 @@
 // In-app terminal viewer for an app-hosted agent PTY session.
 //
-// Renders a read-only xterm grid (the agent's live terminal) plus a deliberate
-// reply bar underneath. The non-trivial data flow — subscribe-before-snapshot
+// Renders an interactive xterm grid (#16: typed keystrokes flow to the PTY) plus
+// a reply bar underneath as a convenience for multi-line answers. The non-trivial
+// data flow — subscribe-before-snapshot
 // ordering, exited handling, ctrl-c two-step, debounced resize, write-failure
 // banner — lives in the headless `TerminalSession` controller (unit-tested in
 // node without a DOM); this component is the thin React shell that owns the host
@@ -165,7 +166,7 @@ export function AgentTerminalViewer({
     <div
       className="mt-3 overflow-hidden rounded-2xl border border-cream-200 bg-white"
       data-help-title="This is the agent's live in-app terminal."
-      data-help-lines="The grid mirrors the agent's terminal output; typing into it is ignored.|Pasting into the grid IS sent to the agent — handy for multi-line input like a stack trace or a path.|Use the reply bar to answer prompts (Enter, y/n, numbered choices, arrows, Esc).|Ctrl-C requires two clicks to avoid an accidental interrupt.|The terminal closes when the agent process exits."
+      data-help-lines="The grid is interactive — type directly into it (e.g. /compact, /quit) and your keystrokes go to the agent.|Pasting into the grid is also sent — handy for multi-line input like a stack trace or a path.|The reply bar below is a convenience for answering prompts (Enter, y/n, numbered choices, arrows, Esc).|Ctrl-C (button OR typed in the grid) requires two presses to avoid an accidental interrupt.|The terminal closes when the agent process exits."
     >
       {/* The xterm host. Fixed height so the grid has dimensions to fit into. */}
       <div
@@ -208,7 +209,7 @@ export function AgentTerminalViewer({
             placeholder="Type a reply for the agent…"
             className="min-w-0 flex-1 rounded-md border border-cream-200 bg-white px-2 py-1 font-mono text-[12px] text-cream-800 placeholder:text-cream-400 focus:border-terracotta focus:outline-none disabled:opacity-50"
             data-help-title="Send a typed reply to the agent terminal."
-            data-help-lines="The text is sent followed by Enter, as if typed at the prompt.|This is the only way to type into the otherwise read-only grid.|Use it for free-form answers the quick keys do not cover."
+            data-help-lines="The text is sent followed by Enter, as if typed at the prompt.|A convenience for multi-line answers — you can also type directly into the grid.|Use it for free-form answers the quick keys do not cover."
           />
           <button
             type="button"
