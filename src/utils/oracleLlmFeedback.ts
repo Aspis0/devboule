@@ -87,6 +87,11 @@ export function keyStatusHint(
   // No loaded settings yet, or remote answering off -> nothing meaningful to
   // say about a key.
   if (!status || !status.settings.remoteEnabled) return null;
+  // LOCAL providers (oMLX/Ollama) are KEYLESS — there is no key to report.
+  // Robust even if a stale saved config still has remoteEnabled=true.
+  if (status.settings.provider === "omlx" || status.settings.provider === "ollama") {
+    return null;
+  }
 
   if (status.apiKeyConfigured) {
     return { tone: "ok", label: "API key saved in the Windows vault" };

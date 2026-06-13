@@ -108,4 +108,16 @@ describe("keyStatusHint", () => {
       label: "No API key — remote answers are disabled (extractive only)",
     });
   });
+
+  it("never reports a key line for a LOCAL provider (oMLX/Ollama are keyless)", () => {
+    // Robust even when a stale saved config still has remoteEnabled=true (the
+    // old changeProvider bug): a local provider has no key to report.
+    for (const provider of ["omlx", "ollama"] as const) {
+      const status = baseStatus({
+        settings: baseSettings({ provider, remoteEnabled: true }),
+        apiKeyConfigured: false,
+      });
+      expect(keyStatusHint(status, false)).toBeNull();
+    }
+  });
 });

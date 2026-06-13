@@ -187,12 +187,15 @@ export function OracleAnswerSettingsCard() {
   const changeProvider = (provider: string) => {
     resetSaveFeedback();
     // Remote (keyed) or local loopback (keyless) providers; the maps drive both.
+    // A LOCAL provider is NOT remote answering — keep remoteEnabled false so the
+    // keyless state is correct (no "No API key" warning, no key gate on save).
+    const local = provider === "omlx" || provider === "ollama";
     setLlmForm((prev) => ({
       ...prev,
       provider,
       model: defaultModels[provider] || prev.model,
       baseUrl: defaultBaseUrls[provider] || null,
-      remoteEnabled: true,
+      remoteEnabled: !local,
     }));
   };
 

@@ -16,6 +16,13 @@ export function deriveProviderConfigured(
   secretStatuses: SecretStatus[] | undefined,
 ): boolean {
   if (oracleLlmSettings?.apiKeyConfigured) return true;
+  // LOCAL providers (oMLX/Ollama) are KEYLESS by design — the Rust vault
+  // encodes "usable" into `status` ("configured" for both a keyed remote AND a
+  // keyless local; "missing_api_key"/"local" otherwise). So a "configured"
+  // status means the answer provider is ready even with no API key — without
+  // this, selecting a local provider left the ask panel falsely "not
+  // configured" and refused questions.
+  if (oracleLlmSettings?.status === "configured") return true;
   return (secretStatuses ?? []).some(
     (s) => s.provider === "scaleway" && s.configured,
   );

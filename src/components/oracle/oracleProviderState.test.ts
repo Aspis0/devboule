@@ -32,6 +32,37 @@ function llm(apiKeyConfigured: boolean): OracleLlmSettingsStatus {
   };
 }
 
+function localLlm(
+  provider: "omlx" | "ollama",
+): OracleLlmSettingsStatus {
+  // What the Rust vault returns for a LOCAL provider: keyless, status
+  // "configured", a loopback base URL.
+  return {
+    settings: {
+      provider,
+      model: "Qwen3.6-35B-A3B-4bit-DWQ",
+      baseUrl: "http://127.0.0.1:8000/v1",
+      remoteEnabled: false,
+    },
+    apiKeyConfigured: false,
+    status: "configured",
+    message: "Local loopback provider — keyless; prompts never leave this machine.",
+  };
+}
+
+describe("deriveProviderConfigured — local providers are keyless (oMLX/Ollama)", () => {
+  it("oMLX local is configured WITHOUT an API key", () => {
+    expect(deriveProviderConfigured(localLlm("omlx"), [])).toBe(true);
+  });
+  it("Ollama local is configured WITHOUT an API key", () => {
+    expect(deriveProviderConfigured(localLlm("ollama"), undefined)).toBe(true);
+  });
+  it("a local provider whose backend status is NOT configured stays false", () => {
+    const notReady = { ...localLlm("omlx"), status: "local" };
+    expect(deriveProviderConfigured(notReady, [])).toBe(false);
+  });
+});
+
 describe("deriveProviderConfigured", () => {
   it("is configured when a dedicated Oracle API key is configured", () => {
     expect(deriveProviderConfigured(llm(true), [])).toBe(true);
