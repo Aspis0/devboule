@@ -115,9 +115,16 @@ export function OracleAdminPanel() {
   const oracleLoadSeqRef = useRef(0);
   const mountedRef = useRef(true);
 
-  // True when the index poll hit its time cap while the job was still active;
-  // surfaces a subtle "status may be stale" hint instead of polling forever.
+  // True when the index poll saw NO progress for INDEX_POLL_MAX_MS while the
+  // job was still active; surfaces a subtle "status may be stale" hint instead
+  // of polling forever. A genuinely advancing (but slow) job never trips it.
   const [indexPollStale, setIndexPollStale] = useState(false);
+  // Last observed indexed-file count + the time it last ADVANCED — the poll's
+  // stall detector resets on real progress so a slow first-index keeps polling.
+  const indexProgressRef = useRef<{ count: number; at: number }>({
+    count: -1,
+    at: 0,
+  });
 
   useEffect(() => {
     mountedRef.current = true;
@@ -291,6 +298,27 @@ export function OracleAdminPanel() {
     refreshOracleIndexStatus,
   ]);
 
+  // Reset the stall detector each time a job becomes active: progress is
+  // measured from the count at activation, the clock from now.
+  useEffect(() => {
+    if (jobActive) {
+      indexProgressRef.current = {
+        count: index?.indexedFiles ?? 0,
+        at: Date.now(),
+      };
+    }
+  }, [jobActive]);
+
+  // Whenever the indexed count ADVANCES, stamp the progress time and clear any
+  // stale hint — the job is alive, keep polling.
+  useEffect(() => {
+    const count = index?.indexedFiles ?? 0;
+    if (count !== indexProgressRef.current.count) {
+      indexProgressRef.current = { count, at: Date.now() };
+      setIndexPollStale(false);
+    }
+  }, [index?.indexedFiles]);
+
   // Poll index status while a job is queued/running so the progress bar advances;
   // stop as soon as it goes idle/error. Interval is cleaned up on unmount and
   // whenever the active flag flips (no leak, no stale closure on the callback).
@@ -302,16 +330,18 @@ export function OracleAdminPanel() {
     }
     setIndexPollStale(false);
     const intervalId = window.setInterval(() => {
+      // Stall cap: stop ONLY when the count has not advanced for the whole
+      // window (a slow-but-advancing first-index resets `at` via the progress
+      // effect above, so it keeps polling). A truly stuck job trips it.
+      if (Date.now() - indexProgressRef.current.at >= INDEX_POLL_MAX_MS) {
+        window.clearInterval(intervalId);
+        setIndexPollStale(true);
+        return;
+      }
       void refreshOracleIndexStatus();
     }, INDEX_POLL_MS);
-    // Hard cap so a job stuck in "running" cannot poll forever.
-    const capId = window.setTimeout(() => {
-      window.clearInterval(intervalId);
-      setIndexPollStale(true);
-    }, INDEX_POLL_MAX_MS);
     return () => {
       window.clearInterval(intervalId);
-      window.clearTimeout(capId);
     };
   }, [jobActive, refreshOracleIndexStatus]);
 

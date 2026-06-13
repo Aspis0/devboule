@@ -342,6 +342,54 @@ describe("OracleAdminPanel — index job-progress polling", () => {
     expect(refreshOracleIndexStatus.mock.calls.length).toBe(afterUnmount);
   });
 
+  it("keeps polling past the 5-min cap while the indexed count advances", async () => {
+    vi.useFakeTimers();
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 100,
+        expectedFiles: 2000,
+        pendingFiles: 1900,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root!: Root;
+    await act(async () => {
+      root = createRoot(container);
+      root.render(createElement(OracleAdminPanel));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const afterMount = refreshOracleIndexStatus.mock.calls.length;
+
+    // Advance ~6 minutes WHILE the count keeps advancing every 30s. The old
+    // fixed 5-min cap would have stopped polling at 300000ms; the progress
+    // reset must keep it alive.
+    for (let i = 0; i < 12; i += 1) {
+      (ctx.oracleIndexStatus as unknown as { index: { indexedFiles: number } }).index.indexedFiles += 50;
+      await act(async () => {
+        root.render(createElement(OracleAdminPanel));
+        await vi.advanceTimersByTimeAsync(30000);
+      });
+    }
+    // 6 minutes elapsed (> INDEX_POLL_MAX_MS); polling must still be firing.
+    const before = refreshOracleIndexStatus.mock.calls.length;
+    expect(before).toBeGreaterThan(afterMount);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(refreshOracleIndexStatus.mock.calls.length).toBeGreaterThan(before);
+
+    act(() => root.unmount());
+  });
+
   it("does NOT poll when no job is active", async () => {
     vi.useFakeTimers();
     ctx.oracleIndexStatus = {
