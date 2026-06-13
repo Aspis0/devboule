@@ -350,7 +350,7 @@ fn sum_usage_from_jsonl(body: &str) -> ParsedUsage {
 /// sum -> price. ANY missing step degrades to `unavailable`. Separated from the
 /// command so it can be tested by pointing `claude_projects_root` at a fixture (the
 /// command wires the real cwd resolution).
-fn usage_from_cwd(cwd: &str) -> AgentTokenUsage {
+fn usage_from_cwd(cwd: &str, launched_after: Option<std::time::SystemTime>) -> AgentTokenUsage {
     // Our mangling ("each non-alphanumeric -> '-'") was derived from ASCII paths and
     // may NOT match Claude Code's encoding of non-ASCII characters. A mismatch could
     // (rarely) resolve to a DIFFERENT project's transcript dir -> wrong tokens. Safe
@@ -368,6 +368,17 @@ fn usage_from_cwd(cwd: &str) -> AgentTokenUsage {
     let Some(jsonl) = newest_jsonl(&dir) else {
         return unavailable();
     };
+    // BUG #18: the dir is keyed by PROJECT cwd, so newest_jsonl can resolve to a
+    // DIFFERENT/earlier agent's session. Attribute the transcript to this agent
+    // ONLY when we can confirm it was last written AT/AFTER the agent launched.
+    // FAIL-CLOSED: a transcript older than the launch — OR one whose mtime we
+    // cannot read — is not borrowed; the badge degrades to unavailable.
+    if let Some(after) = launched_after {
+        match fs::metadata(&jsonl).and_then(|m| m.modified()) {
+            Ok(mtime) if mtime >= after => {}
+            _ => return unavailable(),
+        }
+    }
     let Some(body) = read_tail_bounded(&jsonl) else {
         return unavailable();
     };
@@ -456,7 +467,21 @@ pub fn get_agent_token_usage(
         Err(_) => return Ok(unavailable()),
     };
 
-    Ok(usage_from_cwd(&cwd))
+    // BUG #18: pass the agent's launch time so a transcript that predates this
+    // agent (an earlier/other session sharing the project dir) is not borrowed.
+    // Use ONLY launch_token_issued_at — a reliable launch anchor. first_seen_at is
+    // NOT used as a fallback: for an agent without a launch token (e.g. a mini) it
+    // can be re-stamped on reconnect to AFTER an in-progress transcript's last
+    // write and wrongly filter a live badge; absent anchor => no filter (review).
+    // `timestamp() >= 0` guards the chrono->SystemTime conversion, which panics on
+    // a pre-1970 instant (a corrupt/hand-edited state file): keep "never crashes".
+    let launched_after = session
+        .launch_token_issued_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .filter(|dt| dt.timestamp() >= 0)
+        .map(std::time::SystemTime::from);
+    Ok(usage_from_cwd(&cwd, launched_after))
 }
 
 #[cfg(test)]
@@ -561,7 +586,7 @@ mod tests {
     #[test]
     fn missing_transcript_dir_is_unavailable() {
         // A cwd whose mangled dir cannot exist under ~/.claude/projects -> unavailable.
-        let usage = usage_from_cwd(r"Z:\definitely\not\a\real\claude\project\dir-xyz-9999");
+        let usage = usage_from_cwd(r"Z:\definitely\not\a\real\claude\project\dir-xyz-9999", None);
         assert_eq!(usage.source, SOURCE_UNAVAILABLE);
         assert_eq!(usage.tokens.total, 0);
     }
@@ -572,7 +597,7 @@ mod tests {
         // our "non-alphanumeric -> '-'" rule may not match Claude Code's encoding of
         // non-ASCII, and a mismatched dir could resolve to a DIFFERENT project's
         // transcript -> wrong tokens. Safe degrade is unavailable.
-        let usage = usage_from_cwd(r"C:\Users\café\Desktop\Progetto");
+        let usage = usage_from_cwd(r"C:\Users\café\Desktop\Progetto", None);
         assert_eq!(usage.source, SOURCE_UNAVAILABLE);
         assert_eq!(usage.tokens.total, 0);
     }
@@ -618,7 +643,7 @@ mod tests {
         std::env::set_var("USERPROFILE", &home);
         std::env::set_var("HOME", &home);
 
-        let usage = usage_from_cwd(cwd);
+        let usage = usage_from_cwd(cwd, None);
 
         match prev_userprofile {
             Some(v) => std::env::set_var("USERPROFILE", v),
@@ -633,6 +658,64 @@ mod tests {
         assert_eq!(usage.source, SOURCE_UNAVAILABLE);
         assert_eq!(usage.tokens.total, 0);
         assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn ignores_a_transcript_written_before_the_agent_launched() {
+        // BUG #18: the transcript dir is keyed by PROJECT cwd, so newest_jsonl can
+        // resolve to a DIFFERENT or earlier agent's session. A transcript last
+        // written BEFORE this agent launched cannot be its work — the badge must not
+        // borrow another session's numbers; it degrades to unavailable.
+        let _guard = HOME_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cwd = r"C:\aspis\toktest\attribution-xyz";
+        let mangled = mangle_cwd_to_project_dir(cwd);
+        let home = std::env::temp_dir().join(format!(
+            "aspis-tokhome-attr-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let project_dir = home.join(".claude").join("projects").join(&mangled);
+        fs::create_dir_all(&project_dir).unwrap();
+        {
+            let mut f = File::create(project_dir.join("session.jsonl")).unwrap();
+            f.write_all(
+                br#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            )
+            .unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("HOME", &home);
+
+        // launched_after in the FUTURE: the just-written transcript predates it, so
+        // it cannot be this agent's -> unavailable (no borrowed numbers).
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let filtered = usage_from_cwd(cwd, Some(future));
+        // launched_after in the PAST: the transcript was written AFTER launch, so it
+        // IS this agent's -> attributed (exercises the filter-PASS branch).
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let recent = usage_from_cwd(cwd, Some(past));
+        // No launch time -> no filter -> the transcript is attributed normally.
+        let attributed = usage_from_cwd(cwd, None);
+
+        match prev_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(filtered.source, SOURCE_UNAVAILABLE);
+        assert_eq!(recent.source, SOURCE_CLAUDE_TRANSCRIPT);
+        assert_eq!(attributed.source, SOURCE_CLAUDE_TRANSCRIPT);
+        assert!(attributed.tokens.total > 0);
     }
 
     #[test]

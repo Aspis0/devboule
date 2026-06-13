@@ -223,7 +223,7 @@ export function AgentRow({
             }`}
           >
             <SquareTerminal className="h-3 w-3" aria-hidden />
-            {terminalOpen ? "Hide terminal" : "Terminal"}
+            {terminalOpen ? "Hide terminal" : "View terminal"}
           </button>
         )}
         {onViewInPolis && (
