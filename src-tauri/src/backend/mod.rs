@@ -21,6 +21,7 @@ pub mod mini_coder_executor;
 pub mod model;
 pub mod oracle_service;
 pub mod plan_approval;
+pub mod project_skill;
 pub mod projects;
 pub mod provider_detect;
 pub mod providers;
