@@ -40,3 +40,42 @@ live in OTHER files. There the deterministic gate is blind, the local model gues
 **Censor with MCP-Oracle tool-calling** (look up the cross-file context) is what catches the
 bug. That is the planned next step (Censor DEEP mode + cross-file samples) — and where Nemotron
 and Sonnet finally do real work.
+
+## Hard task: `model-tag-parser` (production-fair, B-calibrated)
+
+A genuinely hard, under-specified task (loose ticket; gold tests check only defensible
+production requirements: whitespace trim, trailing-`:`→`None` quant, last-`:`-for-quant so a
+`registry:port` host isn't mistaken for the quant, arity). Candidates saved in
+`candidates/model-tag-parser/`.
+
+**Write-time (B0), each model alone — they miss DIFFERENT things, none passes:**
+
+| writer | F2P | misses |
+|---|---|---|
+| Opus alone | ❌ 5/6 | the `registry:port` last-colon case (used `split_once`) |
+| MoE + thinking | ❌ 4/6 | whitespace trim, empty-quant→None (but GOT the Docker case) |
+| dense + thinking | ❌ ~4/6 | Docker, empty-quant (got whitespace) |
+| MoE, no thinking | ❌ compile | forgot `use serde::Serialize;` + a type annotation |
+
+**The headline result — a strong REVIEWER on a cheap WRITER beats a strong WRITER alone:**
+
+| pipeline | F2P | $ / task | time |
+|---|---|---|---|
+| **Opus alone** | ❌ FAIL (Docker) | $0.06 | 33s |
+| **local (dense write → gate → Nemotron CLEAN → Sonnet censor → dense fix)** | ✅ **PASS** | ~$0.01 | ~140s |
+
+Opus-the-writer missed the `registry:port` edge; Sonnet-as-CENSOR caught it (reviewing-mode
+finds what writing-mode misses, even at equal strength). The local loop won on quality + cost,
+**lost badly on speed**.
+
+**Speed findings (honest):**
+- The latency is dominated by THINKING token volume (~7000 tokens), NOT the model. MoE+thinking
+  (128s) ≈ dense+thinking — "MoE is fast" doesn't help because the thinking is the bottleneck.
+- Capping the token budget or instructing "reason briefly" does NOT shorten Qwen's thinking — it
+  just truncates the code (no usable output). So there is no cheap latency knob in thinking-mode.
+- Nemotron-4B as the local AI censor could NOT catch the subtle gaps even with a spec-aware,
+  trace-the-examples prompt + thinking — a model-capability ceiling, not a prompt problem
+  (a better prompt only raised precision: 10 noisy findings → CLEAN).
+- Practical shape: the local loop is an **async/background** coder (~2 min/task is fine there),
+  with the deterministic gate + Sonnet escalation for quality; dense = opt-in for strong Macs.
+  The real fast path to explore: thinking-OFF write (~18s) + a gate-error-driven fast fix.
