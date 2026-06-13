@@ -21,6 +21,7 @@ import {
   isRecentProjectSession,
   isWorkingClaim,
 } from "../../utils/agentClaims";
+import { sessionHealth } from "./agentLiveStatus";
 
 export type ProjectStageId =
   | "planned"
@@ -70,20 +71,26 @@ function sessionStatus(session: AgentSession) {
   return session.status.toLowerCase();
 }
 
-function isReviewProjectSession(session: AgentSession) {
-  return isRecentProjectSession(session) && sessionStatus(session) === "review";
-}
-
-function isBlockedProjectSession(session: AgentSession) {
+function isReviewProjectSession(session: AgentSession, now = Date.now()) {
   return (
-    isRecentProjectSession(session) && sessionStatus(session) === "blocked"
+    isRecentProjectSession(session, now) && sessionStatus(session) === "review"
   );
 }
 
-function isLaunchingProjectSession(session: AgentSession) {
+function isBlockedProjectSession(session: AgentSession, now = Date.now()) {
   return (
-    isRecentProjectSession(session) &&
-    sessionStatus(session) === "launch_pending"
+    isRecentProjectSession(session, now) && sessionStatus(session) === "blocked"
+  );
+}
+
+function isLaunchingProjectSession(session: AgentSession, now = Date.now()) {
+  // BUG #19: agree with the agent dot (sessionHealth) — a launch_pending that
+  // has gone stale (never registered within LAUNCH_PENDING_STALE_MS) no longer
+  // counts as "launching", so the project reverts to "planned" instead of
+  // hanging on "launching" for the full activity window.
+  return (
+    isRecentProjectSession(session, now) &&
+    sessionHealth(session, now) === "pending"
   );
 }
 
@@ -91,6 +98,7 @@ export function projectStage(
   project: ProjectSummary,
   claims: AgentClaim[],
   sessions: AgentSession[],
+  now = Date.now(),
 ): ProjectStageId {
   if (
     project.status === "done" ||
@@ -109,16 +117,16 @@ export function projectStage(
     (claim) => isOpenClaim(claim) && claim.status === "blocked",
   );
   const activeSessions = sessions.filter((session) =>
-    isActiveProjectSession(session),
+    isActiveProjectSession(session, now),
   );
   const reviewSessions = sessions.filter((session) =>
-    isReviewProjectSession(session),
+    isReviewProjectSession(session, now),
   );
   const blockedSessions = sessions.filter((session) =>
-    isBlockedProjectSession(session),
+    isBlockedProjectSession(session, now),
   );
   const launchingSessions = sessions.filter((session) =>
-    isLaunchingProjectSession(session),
+    isLaunchingProjectSession(session, now),
   );
   if (project.taskCounts.wip > 0 || activeSessions.length > 0) return "active";
   if (working.length > 0) return "active";
