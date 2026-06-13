@@ -274,11 +274,11 @@ def cmd_ingest(args):
     in_tok = args.in_tokens if args.in_tokens is not None else est_tokens(prompt_txt)
     out_tok = args.out_tokens if args.out_tokens is not None else est_tokens(text)
     res = {"text": text, "input_tokens": in_tok, "output_tokens": out_tok,
-           "model": args.stage, "estimated": args.in_tokens is None}
+           "model": args.stage, "estimated": args.in_tokens is None, "secs": args.secs or 0}
     (run_dir(args.id) / f"{args.stage}.result.json").write_text(
         json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     tag = "est" if res["estimated"] else "exact"
-    print(f"[ingest] {args.id} {args.stage}: in={in_tok} out={out_tok} ({tag}, {len(text)} chars)")
+    print(f"[ingest] {args.id} {args.stage}: in={in_tok} out={out_tok} secs={res['secs']} ({tag}, {len(text)} chars)")
 
 
 def cmd_finalize(args):
@@ -308,13 +308,15 @@ def cmd_finalize(args):
             st["candidate_B_final"] = fixed2 if st["fix2_accepted"] else cand
         # Record the sonnet stage in B for cost accounting.
         st["sonnet_stage"] = {"name": "sonnet_review", "kind": "cloud", "model": "sonnet",
-                              "input_tokens": sonnet["input_tokens"], "output_tokens": sonnet["output_tokens"]}
+                              "input_tokens": sonnet["input_tokens"], "output_tokens": sonnet["output_tokens"],
+                              "secs": sonnet.get("secs", 0)}
         # Pipeline A candidate.
         opus = cloud_result(tid, "opus")
         if opus:
             st["candidate_A"] = extract_code(opus["text"], task["entry_point"])
             st["opus_stage"] = {"name": "opus_solve", "kind": "cloud", "model": "opus",
-                                "input_tokens": opus["input_tokens"], "output_tokens": opus["output_tokens"]}
+                                "input_tokens": opus["input_tokens"], "output_tokens": opus["output_tokens"],
+                                "secs": opus.get("secs", 0)}
         # Score everything.
         st["score_B_after_local"] = score(task, st["candidate_B_after_local"])
         st["score_B_final"] = score(task, st["candidate_B_final"])
@@ -341,32 +343,35 @@ def collect_states():
 
 
 def compute(states, prices):
-    agg = {k: {"pass": 0, "n": 0, "in": 0, "out": 0, "cost": 0.0} for k in ("A", "B")}
+    agg = {k: {"pass": 0, "n": 0, "in": 0, "out": 0, "cost": 0.0, "secs": 0.0} for k in ("A", "B")}
     b_local_pass = b_local_n = 0
     rows = []
     for st in states:
         row = {"task_id": st["task_id"], "A": None, "B": None, "B_local": None,
-               "A_cost": 0.0, "B_cost": 0.0, "B_secs": 0.0}
+               "A_cost": 0.0, "B_cost": 0.0, "A_secs": 0.0, "B_secs": 0.0}
         if "score_A" in st and "opus_stage" in st:
             s = st["opus_stage"]
             agg["A"]["n"] += 1; agg["A"]["pass"] += int(st["score_A"]["passed"])
             agg["A"]["in"] += s["input_tokens"]; agg["A"]["out"] += s["output_tokens"]
             c = _cost(prices, "opus", s["input_tokens"], s["output_tokens"])
             agg["A"]["cost"] += c; row["A"] = st["score_A"]["passed"]; row["A_cost"] = c
+            sec = s.get("secs", 0) or 0
+            agg["A"]["secs"] += sec; row["A_secs"] = round(sec, 1)
         if "score_B_final" in st:
             agg["B"]["n"] += 1; agg["B"]["pass"] += int(st["score_B_final"]["passed"])
+            bsec = 0.0
             for s in st.get("stages_B", []):
                 model = "qwen" if s["model"] == QWEN else ("nemotron" if s["model"] == NEMOTRON else s["model"])
                 agg["B"]["in"] += s["input_tokens"]; agg["B"]["out"] += s["output_tokens"]
                 cc = _cost(prices, model, s["input_tokens"], s["output_tokens"])
-                agg["B"]["cost"] += cc; row["B_cost"] += cc; row["B_secs"] += s.get("secs", 0) or 0
+                agg["B"]["cost"] += cc; row["B_cost"] += cc; bsec += s.get("secs", 0) or 0
             if "sonnet_stage" in st:
                 s = st["sonnet_stage"]
                 agg["B"]["in"] += s["input_tokens"]; agg["B"]["out"] += s["output_tokens"]
                 cc = _cost(prices, "sonnet", s["input_tokens"], s["output_tokens"])
-                agg["B"]["cost"] += cc; row["B_cost"] += cc
+                agg["B"]["cost"] += cc; row["B_cost"] += cc; bsec += s.get("secs", 0) or 0
             row["B"] = st["score_B_final"]["passed"]
-            row["B_secs"] = round(row["B_secs"], 1)
+            row["B_secs"] = round(bsec, 1); agg["B"]["secs"] += bsec
             if "score_B_after_local" in st:
                 row["B_local"] = st["score_B_after_local"]["passed"]
                 b_local_pass += int(st["score_B_after_local"]["passed"]); b_local_n += 1
@@ -385,15 +390,20 @@ def cmd_report(args):
         return f"{100.0 * p / n:.1f}%" if n else "n/a"
 
     print("\n=== PIPELINE BENCHMARK (HumanEval) ===")
-    print(f"{'pipeline':<30}{'n':>4}{'pass@1':>9}{'in_tok':>10}{'out_tok':>10}{'$ total':>12}{'$ / task':>12}")
+    print(f"{'pipeline':<30}{'n':>4}{'pass@1':>9}{'$ / task':>11}{'s / task':>10}{'$ total':>11}{'tot s':>9}")
     for key, label in [("A", "A: opus (alone)"), ("B", "B: qwen>nemo>qwen>sonnet>qwen")]:
         a = agg[key]
         per = f"${a['cost']/a['n']:.4f}" if a["n"] else "n/a"
-        print(f"{label:<30}{a['n']:>4}{pct(a['pass'], a['n']):>9}{a['in']:>10}{a['out']:>10}"
-              f"{'$'+format(a['cost'],'.4f'):>12}{per:>12}")
+        sper = f"{a['secs']/a['n']:.1f}s" if a["n"] else "n/a"
+        print(f"{label:<30}{a['n']:>4}{pct(a['pass'], a['n']):>9}{per:>11}{sper:>10}"
+              f"{'$'+format(a['cost'],'.4f'):>11}{format(a['secs'],'.1f')+'s':>9}")
     print(f"\n(reference) B after local 3-stage only (no sonnet): pass@1 {pct(bl_pass, bl_n)} over {bl_n}")
     if agg["A"]["n"] and agg["B"]["cost"] > 0:
         print(f"cost ratio A/B: {agg['A']['cost'] / agg['B']['cost']:.1f}x   (B = cheaper local loop)")
+    if agg["A"]["secs"] > 0 and agg["B"]["secs"] > 0:
+        sr = agg["B"]["secs"] / agg["A"]["secs"]
+        faster, slower = ("A", "B") if sr > 1 else ("B", "A")
+        print(f"speed ratio B/A: {sr:.1f}x   ({slower} slower, {faster} faster)")
     if args.html:
         out = Path(args.html)
         out.write_text(render_html(agg, rows, prices, bl_pass, bl_n), encoding="utf-8")
@@ -410,6 +420,10 @@ def render_html(agg, rows, prices, bl_pass, bl_n):
     a_pass = pct(a["pass"], a["n"]); b_pass = pct(b["pass"], b["n"])
     a_per = f"${a['cost']/a['n']:.4f}" if a["n"] else "n/a"
     b_per = f"${b['cost']/b['n']:.5f}" if b["n"] else "n/a"
+    a_sper = f"{a['secs']/a['n']:.1f}s" if a["n"] else "n/a"
+    b_sper = f"{b['secs']/b['n']:.1f}s" if b["n"] else "n/a"
+    sratio = (b["secs"] / a["secs"]) if a["secs"] > 0 else 0
+    speed_txt = (f"{sratio:.1f}× slower" if sratio > 1 else f"{1 / sratio:.1f}× faster" if sratio else "n/a")
     n = max(a["n"], b["n"])
 
     def dot(v):
@@ -420,8 +434,8 @@ def render_html(agg, rows, prices, bl_pass, bl_n):
     grid = "".join(
         f'<tr><td class="tid">{r["task_id"]}</td>'
         f'<td>{dot(r["A"])}</td><td>{dot(r["B_local"])}</td><td>{dot(r["B"])}</td>'
-        f'<td class="num">${r["A_cost"]:.4f}</td><td class="num">${r["B_cost"]:.5f}</td>'
-        f'<td class="num">{r["B_secs"]}s</td></tr>'
+        f'<td class="num">${r["A_cost"]:.4f}</td><td class="num">{r["A_secs"]}s</td>'
+        f'<td class="num">${r["B_cost"]:.5f}</td><td class="num">{r["B_secs"]}s</td></tr>'
         for r in rows
     )
     winner = ("LOCAL LOOP" if (b["n"] and a["n"] and b["pass"] >= a["pass"] and ratio > 1)
@@ -462,33 +476,35 @@ code{{background:#0f1622;padding:1px 5px;border-radius:5px}}
 </style></head><body>
 <h1>🏁 Pipeline Race — Opus vs the Local Loop</h1>
 <p class="sub">HumanEval · {n} tasks · precision = pass@1 (hidden tests) · price = tokens × prices.json
-(cloud tokens estimated ~4 chars/token; local tokens exact)</p>
+· speed = wall-clock (cloud tokens via tiktoken cl100k proxy; local tokens + times exact)</p>
 <div class="lanes">
   <div class="lane a"><div class="tag">Pipeline A</div>
     <div class="name"><span class="a">●</span> Opus <span style="color:var(--mut)">(alone, high)</span></div>
     <div class="big">{a_pass}<small> pass@1</small></div>
     <div class="kv"><span>tasks</span><b>{a['n']}</b></div>
     <div class="kv"><span>tokens in / out</span><b>{a['in']:,} / {a['out']:,}</b></div>
-    <div class="kv"><span>total cost</span><b>${a['cost']:.4f}</b></div>
     <div class="kv"><span>cost / task</span><b>{a_per}</b></div>
+    <div class="kv"><span>avg time / task</span><b>{a_sper}</b></div>
+    <div class="kv"><span>total cost · time</span><b>${a['cost']:.4f} · {a['secs']:.0f}s</b></div>
   </div>
   <div class="lane b"><div class="tag">Pipeline B</div>
     <div class="name"><span class="b">●</span> Local Loop <span style="color:var(--mut)">qwen→nemo→qwen→sonnet→qwen</span></div>
     <div class="big">{b_pass}<small> pass@1</small></div>
     <div class="kv"><span>tasks</span><b>{b['n']}</b></div>
     <div class="kv"><span>tokens in / out</span><b>{b['in']:,} / {b['out']:,}</b></div>
-    <div class="kv"><span>total cost</span><b>${b['cost']:.4f}</b></div>
     <div class="kv"><span>cost / task</span><b>{b_per}</b></div>
+    <div class="kv"><span>avg time / task</span><b>{b_sper}</b></div>
+    <div class="kv"><span>total cost · time</span><b>${b['cost']:.4f} · {b['secs']:.0f}s</b></div>
   </div>
 </div>
 <div class="verdict"><span class="medal">🥇</span>
   <div>Cheapest path that matches precision: <b>{winner}</b>.
-  The local loop is <b>{ratio_txt}</b> cheaper than Opus-alone
-  (and Sonnet is the only cloud call in it; Opus never participates).<br>
+  The local loop is <b>{ratio_txt}</b> cheaper than Opus-alone but <b>{speed_txt}</b> per task
+  (Sonnet is the only cloud call in it; Opus never participates).<br>
   <span style="color:var(--mut)">Local loop precision before the Sonnet review (3 local stages only): {pct(bl_pass, bl_n)}.</span></div>
 </div>
 <table><thead><tr><th>task</th><th>A·opus</th><th>B·local-3</th><th>B·final</th>
-<th>A&nbsp;$</th><th>B&nbsp;$</th><th>B&nbsp;time</th></tr></thead>
+<th>A&nbsp;$</th><th>A&nbsp;time</th><th>B&nbsp;$</th><th>B&nbsp;time</th></tr></thead>
 <tbody>{grid}</tbody></table>
 <p class="foot">● green = passed · red = failed · grey = pending. <b>B·local-3</b> is the local loop
 BEFORE the Sonnet review (qwen→nemotron→qwen); <b>B·final</b> adds sonnet→qwen. Prices are editable in
@@ -506,6 +522,7 @@ def main():
     i.add_argument("--text-file", required=True)
     i.add_argument("--in", dest="in_tokens", type=int, default=None)
     i.add_argument("--out", dest="out_tokens", type=int, default=None)
+    i.add_argument("--secs", type=float, default=None, help="wall-clock seconds for this cloud stage")
     i.set_defaults(fn=cmd_ingest)
     f = sub.add_parser("finalize"); f.add_argument("--ids", nargs="+", required=True); f.set_defaults(fn=cmd_finalize)
     rep = sub.add_parser("report")
