@@ -1150,7 +1150,8 @@ export function CensorLocalAiCard() {
               </datalist>
             ) : null}
             <span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
-              Blank uses the default Nemotron-3-Nano-4B (falls back to gemma4:e4b).
+              Blank = censor off. Pick a model to enable it — recommended:
+              Nemotron-3-Nano-4B.
             </span>
           </label>
         )}

@@ -32,72 +32,37 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-/// The DEFAULT Ollama tag for the model we drive. Both `gemma4:e4b` and `gemma4:e2b`
-/// are real Ollama tags (`ollama.com/library/gemma4`, Apache-2.0, Gemma 4 released
-/// 2026-03-31). The default is the larger, higher-quality `e4b`.
-///
-/// RESOLUTION CHAIN (do NOT collapse this back to a single hardcoded tag — the chain is
-/// load-bearing for upgrade safety; see [`resolve_gemma_model`]):
-///   1. a user-configured `ollamaModel` (validated) wins outright — the user's explicit
-///      choice is honored even if it is not in the daemon's `/api/tags` list (so a tag
-///      they are about to pull is not silently overridden);
-///   2. else this default ([`GEMMA_MODEL`], the Nemotron-3-Nano-4B tag) IF it is present
-///      in `/api/tags`;
-///   3. else [`GEMMA_FALLBACK_MODEL`] (`gemma4:e4b`, the PREVIOUS default) if present —
-///      the UPGRADE-SAFETY case: an existing install that pulled the old Gemma default but
-///      not the new Nemotron keeps a working censor tier instead of silently losing it; it
-///      lets us migrate the default without forcing every old install to re-pull;
-///   4. else the default (neither present) — the generate call then fails/
-///      degrades exactly as today (unavailable tier, never a crash).
-///
-/// The Ollama client resolves this ONCE per session from the SAME `/api/tags` list its
-/// availability probe already fetches, so probe and generate never disagree.
-/// NOTE: the censor's local model is now **NVIDIA-Nemotron-3-Nano-4B** (chosen by the
-/// 2026-06 benchmark — `docs/censor-model-benchmark-2026-06.md`: it finds in-file
+/// The RECOMMENDED censor local model — a UI suggestion the user can pick, **NOT** an
+/// auto-default. OPT-IN (owner rule): the censor's local-AI tier runs ONLY a model the
+/// user EXPLICITLY configured; with nothing selected the tier is OFF (no censor at all).
+/// This is the model the 2026-06 benchmark recommends
+/// (`docs/censor-model-benchmark-2026-06.md`): NVIDIA-Nemotron-3-Nano-4B finds in-file
 /// semantic bugs deterministic tools miss AND, unlike the reasoning-distills, supports
-/// tool-calling for the cross-file DEEP mode). The `GEMMA_*` / `*_gemma` naming
-/// throughout this module is LEGACY (Gemma was the original local model); the symbols
-/// are model-agnostic — only the value changed.
+/// tool-calling for the cross-file DEEP mode.
+///
+/// The `GEMMA_*` / `*_gemma` naming throughout this module is LEGACY (Gemma was the
+/// original local model); the symbols are model-agnostic — only the value changed.
 pub const GEMMA_MODEL: &str = "hf.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M";
 
-/// The Ollama tag the resolution chain falls back to when the default ([`GEMMA_MODEL`])
-/// is absent but this older tag is present (step 3 above). Kept as a named constant so
-/// the resolver and its tests share one source of truth. Ollama-specific: the oMLX
-/// provider has no `/api/tags` equivalent and so never applies this fallback.
-pub const GEMMA_FALLBACK_MODEL: &str = "gemma4:e4b";
-
-/// PURE resolver for the Ollama-provider Gemma model tag (no IO; the caller passes the
-/// `/api/tags` names it already fetched in the availability probe). Implements the
-/// [`GEMMA_MODEL`] resolution chain:
-///   - `configured` is `Some(non-empty)` → use it verbatim (the user's explicit, already-
-///     validated choice wins even if absent from `available_tags` — they may be pulling
-///     it; we never silently override an explicit override);
-///   - else default [`GEMMA_MODEL`] if it is in `available_tags`;
-///   - else [`GEMMA_FALLBACK_MODEL`] if it is in `available_tags` (upgrade safety);
-///   - else [`GEMMA_MODEL`] (neither present — let the generate call degrade cleanly).
-///
-/// `configured` is expected pre-trimmed/validated (an empty/whitespace-only string is
-/// treated as absent, matching what [`validate_censor_local_ai`] would have normalized to
-/// `None`).
-pub fn resolve_gemma_model(configured: Option<&str>, available_tags: &[String]) -> String {
-    if let Some(c) = configured {
-        let c = c.trim();
-        if !c.is_empty() {
-            // The user's explicit choice wins outright (documented rule): we do NOT require
-            // it to be in `available_tags` — they may be mid-pull, and silently swapping in
-            // a different model would be more surprising than a clean degrade.
-            return c.to_string();
-        }
-    }
-    let has = |tag: &str| available_tags.iter().any(|t| t == tag);
-    if has(GEMMA_MODEL) {
-        GEMMA_MODEL.to_string()
-    } else if has(GEMMA_FALLBACK_MODEL) {
-        // UPGRADE SAFETY: e4b not pulled but the old e2b is — keep the Gemma tier alive.
-        GEMMA_FALLBACK_MODEL.to_string()
-    } else {
-        GEMMA_MODEL.to_string()
-    }
+/// PURE resolver for the Ollama-provider censor model tag (no IO). OPT-IN: returns the
+/// user's configured override verbatim (the explicit choice wins, honored even if not yet
+/// in `/api/tags` — they may be mid-pull), or `""` when nothing is configured. There is NO
+/// auto-default and NO fallback chain: an empty result means the tier is OFF (the probe
+/// finds no `/api/tags` entry equal to ""). `_available_tags` is unused (kept so the
+/// probe's call site is unchanged). `configured` is expected pre-trimmed/validated (an
+/// empty/whitespace-only string is treated as absent, like [`validate_censor_local_ai`]).
+pub fn resolve_gemma_model(configured: Option<&str>, _available_tags: &[String]) -> String {
+    // OPT-IN (owner rule): the censor runs ONLY the model the user EXPLICITLY configured —
+    // there is NO auto-default. An unconfigured censor resolves to "" (empty), which the
+    // probe treats as "tier off" (no `/api/tags` entry equals ""), so it simply does not
+    // run; the user must pick a model. [`GEMMA_MODEL`] is the RECOMMENDED suggestion shown
+    // in the UI, NOT an auto-default. `_available_tags` is no longer consulted (the
+    // default/fallback chain was removed) but kept so the probe's call site is unchanged.
+    configured
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 /// Loopback-only Ollama base URL. NEVER point this at a non-loopback host — the
@@ -231,11 +196,10 @@ impl CensorLocalAi {
     /// has no built-in model, so a validated oMLX config always carries one; the fallback
     /// to [`GEMMA_MODEL`] only ever applies to the Ollama provider.
     pub fn effective_model(&self) -> String {
-        match (&self.model, self.provider) {
-            (Some(model), _) => model.clone(),
-            (None, CensorAiProvider::AppleFm) => String::new(),
-            (None, _) => GEMMA_MODEL.to_string(),
-        }
+        // OPT-IN: no configured model → "" (no auto-default). For Ollama the actual tag is
+        // the `ollama_model` override resolved via `resolve_gemma_model`; this field is the
+        // oMLX/AppleFm model and is empty when unset, keeping the tier off.
+        self.model.clone().unwrap_or_default()
     }
 }
 
@@ -466,8 +430,8 @@ pub trait GemmaClient: Send + Sync {
     /// endpoint/content).
     fn provider_label(&self) -> &'static str;
 
-    /// The EFFECTIVE model tag this client drives (e.g. `"gemma4:e4b"` for the Ollama
-    /// default, or the configured oMLX model). Used ONLY alongside [`provider_label`] in
+    /// The EFFECTIVE model tag this client drives (the user-configured Ollama/oMLX model,
+    /// or `""` when none is configured — opt-in, tier off). Used ONLY alongside [`provider_label`] in
     /// the once-per-session available/unavailable log line so a failure can be triaged
     /// against the model ACTUALLY in use rather than the hardcoded [`GEMMA_MODEL`]
     /// constant. Returns an OWNED `String` because the Ollama client resolves its model at
@@ -1032,8 +996,8 @@ impl GemmaClient for OllamaClient {
             return false;
         };
         // Resolve over the just-fetched tags and memoize so generate()/model_label() reuse
-        // it. A configured override short-circuits (wins regardless of tags); the default
-        // path picks e4b → e2b (upgrade safety) → e4b.
+        // it. OPT-IN: a configured override is used (wins regardless of tags); with NO
+        // configured model the resolver returns "" and the next line reports unavailable.
         let resolved = resolve_gemma_model(self.configured_model.as_deref(), &tags);
         if let Ok(mut guard) = self.resolved_model.lock() {
             *guard = Some(resolved.clone());
@@ -1140,7 +1104,7 @@ impl GemmaClient for OllamaClient {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(GEMMA_MODEL)
+            .unwrap_or("")
             .to_string()
     }
 
@@ -1261,9 +1225,9 @@ pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Result<Box<dyn GemmaCli
     let base = cfg.effective_base();
     match cfg.provider {
         // The Ollama client takes the CONFIGURED override (`ollama_model`, may be `None`)
-        // and resolves the effective tag itself via the [`resolve_gemma_model`] chain over
-        // the live `/api/tags` list — so an existing install that only pulled `gemma4:e2b`
-        // keeps its tier after the default bumped to `gemma4:e4b`.
+        // and resolves the effective tag itself via [`resolve_gemma_model`]. OPT-IN: with
+        // no override it resolves to "" and the probe reports the tier unavailable (off),
+        // so an unconfigured censor never runs — the user must pick a model.
         CensorAiProvider::Ollama => Ok(Box::new(OllamaClient::with_config(
             &base,
             cfg.ollama_model.as_deref(),
@@ -1271,7 +1235,7 @@ pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Result<Box<dyn GemmaCli
             GEMMA_PROBE_TIMEOUT,
         ))),
         // oMLX has no `/api/tags` equivalent; its model is REQUIRED + validated, so the
-        // configured-or-default `effective_model` is used verbatim (no e2b fallback).
+        // configured `effective_model` is used verbatim (opt-in: no auto-default).
         CensorAiProvider::Omlx => Ok(Box::new(OmlxClient::with_config(
             &base,
             &cfg.effective_model(),
@@ -1935,8 +1899,7 @@ mod tests {
 
     #[test]
     fn resolve_gemma_model_configured_wins_outright() {
-        // A configured (valid) override is used verbatim, EVEN IF it is not in the tags
-        // (documented rule: the user's explicit choice wins; they may be mid-pull).
+        // A configured (valid) override is used verbatim, even if not yet in the tags.
         assert_eq!(
             resolve_gemma_model(Some("llama3:8b"), &["gemma4:e4b".to_string()]),
             "llama3:8b"
@@ -1946,50 +1909,28 @@ mod tests {
             "custom:tag",
             "configured wins even with an empty tag list"
         );
-        // Whitespace-only / empty configured is treated as absent (falls to the chain).
-        assert_eq!(
-            resolve_gemma_model(Some("   "), &[GEMMA_FALLBACK_MODEL.to_string()]),
-            GEMMA_FALLBACK_MODEL
-        );
     }
 
     #[test]
-    fn resolve_gemma_model_default_present_uses_nemotron() {
-        // No override + the default (Nemotron) present → the default.
-        assert_eq!(
-            resolve_gemma_model(
-                None,
-                &[GEMMA_MODEL.to_string(), GEMMA_FALLBACK_MODEL.to_string()]
-            ),
-            GEMMA_MODEL
-        );
+    fn resolve_gemma_model_unconfigured_is_empty_opt_in() {
+        // OPT-IN (owner rule): NO auto-default. With no configured model the resolver returns
+        // "" regardless of which tags are present (the probe treats "" as the tier being OFF
+        // — no `/api/tags` entry equals ""), so an unconfigured censor never runs. GEMMA_MODEL
+        // is the RECOMMENDED suggestion shown in the UI, not an auto-default.
+        assert_eq!(resolve_gemma_model(None, &[GEMMA_MODEL.to_string()]), "");
+        assert_eq!(resolve_gemma_model(None, &["gemma4:e4b".to_string()]), "");
+        assert_eq!(resolve_gemma_model(None, &[]), "");
+        // Whitespace-only configured is treated as absent → empty (tier off).
+        assert_eq!(resolve_gemma_model(Some("   "), &[GEMMA_MODEL.to_string()]), "");
+    }
+
+    #[test]
+    fn gemma_model_constant_is_the_recommended_nemotron() {
+        // The RECOMMENDED censor model (a UI suggestion, NOT an auto-default).
         assert_eq!(
             GEMMA_MODEL, "hf.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M",
-            "censor default is Nemotron-3-Nano-4B (docs/censor-model-benchmark-2026-06.md)"
+            "recommended censor model is Nemotron-3-Nano-4B (docs/censor-model-benchmark-2026-06.md)"
         );
-    }
-
-    #[test]
-    fn resolve_gemma_model_upgrade_safety_falls_back_to_gemma() {
-        // Upgrade safety: an old install pulled only the PREVIOUS default (gemma4:e4b) and
-        // not the new Nemotron default — the tier must NOT silently disappear; fall back to
-        // the present legacy model.
-        assert_eq!(
-            resolve_gemma_model(None, &[GEMMA_FALLBACK_MODEL.to_string()]),
-            GEMMA_FALLBACK_MODEL
-        );
-        assert_eq!(GEMMA_FALLBACK_MODEL, "gemma4:e4b");
-    }
-
-    #[test]
-    fn resolve_gemma_model_neither_present_defaults_to_nemotron() {
-        // Neither the default nor the fallback present → the default; the generate call then
-        // degrades cleanly (unavailable model), never a crash.
-        assert_eq!(
-            resolve_gemma_model(None, &["llama3:8b".to_string()]),
-            GEMMA_MODEL
-        );
-        assert_eq!(resolve_gemma_model(None, &[]), GEMMA_MODEL);
     }
 
     // ---- run_gemma ----
@@ -2435,7 +2376,8 @@ mod tests {
         .unwrap();
         assert_eq!(v.provider, CensorAiProvider::Ollama);
         assert_eq!(v.effective_base(), OLLAMA_BASE);
-        assert_eq!(v.effective_model(), GEMMA_MODEL);
+        // OPT-IN: ollama config with no model → effective_model is "" (tier off).
+        assert_eq!(v.effective_model(), "");
         // A loopback base + model for ollama is accepted and trimmed.
         let v2 = validate_censor_local_ai(&CensorLocalAi {
             provider: CensorAiProvider::Ollama,
@@ -2862,8 +2804,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(
-            resolved, GEMMA_MODEL,
-            "no override + empty memo must yield the pessimistic default"
+            resolved, "",
+            "OPT-IN: no override + empty memo yields \"\" (tier off, no auto-default)"
         );
         assert!(
             elapsed < Duration::from_secs(5),
@@ -2931,10 +2873,10 @@ mod tests {
 
     #[test]
     fn model_label_reports_effective_model_per_client() {
-        // F1: the log must surface the model ACTUALLY in use, not the GEMMA_MODEL constant.
-        // The default Ollama client drives GEMMA_MODEL; the oMLX client drives its
-        // configured model — `model_label` returns the right one for each.
-        assert_eq!(OllamaClient::new().model_label(), GEMMA_MODEL);
+        // F1: the log must surface the model ACTUALLY in use. OPT-IN: the default Ollama
+        // client has NO configured model, so its label is "" (tier off); the oMLX client
+        // drives its configured model — `model_label` returns the right one for each.
+        assert_eq!(OllamaClient::new().model_label(), "");
         assert_eq!(
             OmlxClient::new("http://localhost:8000/v1", "mlx-community/gemma").model_label(),
             "mlx-community/gemma"
@@ -2964,11 +2906,11 @@ mod tests {
 
     #[test]
     fn build_gemma_client_default_config_uses_ollama_base_and_model() {
-        // The default config's effective base/model are the Ollama defaults, so the built
-        // client points at the SAME loopback endpoint/model as before (no behavior change).
+        // OPT-IN: the default config has NO model (effective_model ""), so the tier is off
+        // until the user picks one; the base is still the Ollama loopback default.
         let cfg = CensorLocalAi::default();
         assert_eq!(cfg.effective_base(), OLLAMA_BASE);
-        assert_eq!(cfg.effective_model(), GEMMA_MODEL);
+        assert_eq!(cfg.effective_model(), "");
         let client = build_gemma_client(&cfg).unwrap();
         assert_eq!(client.provider_label(), "ollama");
     }
