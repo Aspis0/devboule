@@ -1017,6 +1017,17 @@ mod tests {
         assert_eq!(runner_source(RunnerId::CargoDeny), "cargo-deny");
         assert_eq!(runner_source(RunnerId::Eslint), "eslint");
         assert_eq!(runner_source(RunnerId::Gitleaks), "gitleaks");
+        // A5 (EOD review): the 8 other runners added in the same wave were
+        // unpinned — a runner_source rename without the matching parser
+        // RawFinding.source rename silently strands zombie shard findings.
+        assert_eq!(runner_source(RunnerId::CargoFmt), "cargo-fmt");
+        assert_eq!(runner_source(RunnerId::NpmAudit), "npm-audit");
+        assert_eq!(runner_source(RunnerId::Oxlint), "oxlint");
+        assert_eq!(runner_source(RunnerId::PipAudit), "pip-audit");
+        assert_eq!(runner_source(RunnerId::Pyright), "pyright");
+        assert_eq!(runner_source(RunnerId::Prettier), "prettier");
+        assert_eq!(runner_source(RunnerId::RuffFormat), "ruff-format");
+        assert_eq!(runner_source(RunnerId::Zizmor), "zizmor");
     }
 
     // ---- collect cores: tempdir, no tools installed → empty, no panic ----

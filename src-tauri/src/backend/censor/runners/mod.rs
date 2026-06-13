@@ -734,6 +734,10 @@ mod tests {
             RunnerId::CargoCheck,
             RunnerId::CargoAudit,
             RunnerId::CargoDeny,
+            RunnerId::CargoFmt,
+            RunnerId::NpmAudit,
+            RunnerId::PipAudit,
+            RunnerId::Zizmor,
             RunnerId::Tsc,
             RunnerId::Knip,
             RunnerId::Jscpd,
@@ -748,6 +752,10 @@ mod tests {
         // Per-file linters are Fine.
         for f in [
             RunnerId::Eslint,
+            RunnerId::Oxlint,
+            RunnerId::Prettier,
+            RunnerId::Pyright,
+            RunnerId::RuffFormat,
             RunnerId::Ruff,
             RunnerId::Bandit,
             RunnerId::Vulture,
