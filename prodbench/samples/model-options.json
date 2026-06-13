@@ -1,0 +1,17 @@
+{
+  "id": "censor-model-options",
+  "lang": "rust",
+  "kind": "additive-module",
+  "base_commit": "fef9a9d",
+  "produce_file": "src-tauri/src/backend/censor/model_options.rs",
+  "register": {
+    "file": "src-tauri/src/backend/censor/mod.rs",
+    "anchor": "pub mod orchestrator;",
+    "line": "pub mod model_options;"
+  },
+  "gold_test_file": "prodbench/samples/model-options/gold_tests.rs",
+  "gold_test_mod": "gold_tests",
+  "f2p_cmd": "cargo test --lib backend::censor::model_options::gold_tests",
+  "p2p_cmd": "cargo build --lib",
+  "prompt": "Add a new Rust module `src-tauri/src/backend/censor/model_options.rs` — the view-model for Devboule's OPT-IN local Censor model picker. The Censor's local AI tier is opt-in (the user selects a model); the multi-turn DEEP review mode is only available on tool-capable models. Implement EXACTLY:\n\n1. `use serde::Serialize;` and `use std::collections::HashMap;` and bring in the catalog: `use super::catalog::{recommended_censor_models, RecommendTier};`\n2. struct `ModelOption` (derive Debug, Clone, Serialize, PartialEq, Eq) with pub fields: `tag: &'static str`, `label: &'static str`, `tier: RecommendTier`, `installed: bool`, `deep_eligible: bool`.\n3. `pub fn censor_model_options(installed_tags: &[String], caps_by_tag: &HashMap<String, Vec<String>>) -> Vec<ModelOption>`: for EACH model from `recommended_censor_models()` in order, build a `ModelOption` where `installed` is true iff the model's `tag` is present in `installed_tags`, and `deep_eligible` is true iff the model is installed AND its runtime capabilities (`caps_by_tag.get(tag)`, e.g. from Ollama /api/show) contain the string \"tools\". A model that is tool-capable but NOT installed must have deep_eligible = false.\n\nIdiomatic, warning-free, no unwrap() in non-test code, doc comments on public items. You MAY include a #[cfg(test)] mod tests (it will be ignored by scoring). Return ONLY the full file content."
+}

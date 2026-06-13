@@ -52,9 +52,35 @@ def run_cmd(cmd, cwd):
     return p.returncode == 0, (p.stdout + p.stderr), round(time.time() - t0, 1)
 
 
+def _ensure_register(sample):
+    # Make sure the module registration line is present (a new module needs `pub mod x;` in
+    # mod.rs). Idempotent: already-present (e.g. a committed sample) is a no-op.
+    reg = sample.get("register")
+    if not reg:
+        return
+    f = ROOT / reg["file"]
+    txt = f.read_text(encoding="utf-8")
+    if reg["line"] in txt:
+        return
+    anchor = reg.get("anchor")
+    if anchor and anchor in txt:
+        txt = txt.replace(anchor, reg["line"] + "\n" + anchor, 1)
+    else:
+        txt = txt.rstrip() + "\n" + reg["line"] + "\n"
+    f.write_text(txt, encoding="utf-8")
+
+
 def _restore(sample):
-    subprocess.run(["git", "checkout", "--", sample["produce_file"]], cwd=ROOT,
-                   capture_output=True, text=True)
+    produce = sample["produce_file"]
+    tracked = subprocess.run(["git", "cat-file", "-e", f"HEAD:{produce}"], cwd=ROOT,
+                             capture_output=True).returncode == 0
+    if tracked:
+        subprocess.run(["git", "checkout", "--", produce], cwd=ROOT, capture_output=True)
+    else:
+        (ROOT / produce).unlink(missing_ok=True)
+    if sample.get("register"):
+        subprocess.run(["git", "checkout", "--", sample["register"]["file"]], cwd=ROOT,
+                       capture_output=True)
 
 
 def score_impl(sample, impl_text):
@@ -63,6 +89,7 @@ def score_impl(sample, impl_text):
     gold = (ROOT / sample["gold_test_file"]).read_text(encoding="utf-8")
     body = strip_candidate_tests(impl_text) + "\n" + gold
     try:
+        _ensure_register(sample)
         produce.write_text(body, encoding="utf-8")
         f2p_ok, f2p_out, f2p_s = run_cmd(sample["f2p_cmd"], SRC_TAURI)
         p2p_ok, _, p2p_s = (True, "", 0.0)
@@ -116,10 +143,10 @@ def cmd_report(args):
     recs = [json.loads(p.read_text()) for p in sorted(RESULTS.glob("*.json"))] if RESULTS.exists() else []
     if not recs:
         print("no results yet"); return
-    print(f"\n=== PRODBENCH ===")
-    print(f"{'sample':<20}{'pipeline':<14}{'F2P':>6}{'$ task':>10}{'pipe s':>9}{'cargo s':>9}")
+    print(f"\n=== PRODBENCH (build Devboule, score the builders) ===")
+    print(f"{'sample':<24}{'pipeline':<14}{'F2P':>6}{'$ task':>10}{'pipe s':>9}{'cargo s':>9}")
     for r in recs:
-        print(f"{r['sample']:<20}{r['pipeline']:<14}{('PASS' if r['f2p_pass'] else 'FAIL'):>6}"
+        print(f"{r['sample']:<24}{r['pipeline']:<14}{('PASS' if r['f2p_pass'] else 'FAIL'):>6}"
               f"{('$'+format(r['cost'],'.4f')) if r.get('cost') is not None else 'n/a':>10}"
               f"{(str(r['secs'])+'s') if r.get('secs') is not None else 'n/a':>9}"
               f"{str(r['f2p_secs'])+'s':>9}")

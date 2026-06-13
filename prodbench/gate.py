@@ -36,9 +36,11 @@ def rustfmt(src):
 
 def clippy_warnings(sample, impl):
     """Swap impl into the tree, run clippy, return warnings naming the produce_file. Restores."""
+    from prodbench import _ensure_register, _restore
     produce = ROOT / sample["produce_file"]
     fname = Path(sample["produce_file"]).name
     try:
+        _ensure_register(sample)
         produce.write_text(impl, encoding="utf-8")
         r = subprocess.run("cargo clippy --lib --message-format short 2>&1",
                            cwd=SRC_TAURI, shell=True, capture_output=True, text=True)
@@ -49,8 +51,7 @@ def clippy_warnings(sample, impl):
         return [l.strip() for l in r.stdout.splitlines()
                 if fname in l and "warning" in l and not any(d in l for d in dead)]
     finally:
-        subprocess.run(["git", "checkout", "--", sample["produce_file"]], cwd=ROOT,
-                       capture_output=True)
+        _restore(sample)
 
 
 def harvest(rejected, chosen, gate, fixes, sample_id):
