@@ -2626,9 +2626,9 @@ fn build_windows_agent_script(
         // is echoed; the script-level "prompt copied to clipboard" line follows.
         "Write-Host 'Aspis agent prompt is copied to clipboard.'".to_string()
     } else if client == "codex" {
-        codex_launch_script(root_path, management_root, projects_dir)
+        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir)
     } else if client == "claude" {
-        claude_launch_script(management_root, projects_dir)
+        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir)
     } else {
         executable.to_string()
     };
@@ -2846,9 +2846,9 @@ fn build_macos_agent_script(
         // clipboard and echoed above.
         String::new()
     } else if client == "codex" {
-        macos_codex_launch_line(root_path, management_root, projects_dir)
+        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir)
     } else if client == "claude" {
-        macos_claude_launch_line(management_root, projects_dir)
+        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir)
     } else {
         sh_single_quote(executable)
     };
@@ -3408,6 +3408,7 @@ fn shell_env_name(name: &str) -> String {
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
 fn macos_codex_launch_line(
+    python: &str,
     root_path: &Path,
     management_root: &Path,
     projects_dir: &Path,
@@ -3426,7 +3427,7 @@ fn macos_codex_launch_line(
     let config_args: Vec<String> = vec![
         format!(
             "mcp_servers.aspis-management.command={}",
-            toml_string("python")
+            toml_string(python)
         ),
         format!("mcp_servers.aspis-management.args={mcp_args}"),
         format!(
@@ -3468,8 +3469,8 @@ fn macos_codex_launch_line(
 /// `--mcp-config` and pipes the prompt over STDIN.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
-fn macos_claude_launch_line(management_root: &Path, projects_dir: &Path) -> String {
-    let config = mcp_client_config_json(management_root, projects_dir);
+fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path) -> String {
+    let config = mcp_client_config_json(python, management_root, projects_dir);
     format!(
         "printf '%s' \"$PROMPT\" | claude --mcp-config {}",
         sh_single_quote(&config)
@@ -3489,7 +3490,7 @@ fn macos_claude_launch_line(management_root: &Path, projects_dir: &Path) -> Stri
 /// grant (mini_coder_executor): both wire the SAME server; the mini's scope is
 /// narrowed SERVER-side by its "mini" role (oracle_context only), never by the
 /// client config. Extracted so the two call sites cannot drift.
-pub(crate) fn codex_mcp_config_args(management_root: &Path, projects_dir: &Path) -> Vec<String> {
+pub(crate) fn codex_mcp_config_args(python: &str, management_root: &Path, projects_dir: &Path) -> Vec<String> {
     let management_root_s = management_root.to_string_lossy().into_owned();
     let projects_dir_s = projects_dir.to_string_lossy().into_owned();
     let mcp_args = toml_array(&[
@@ -3504,7 +3505,7 @@ pub(crate) fn codex_mcp_config_args(management_root: &Path, projects_dir: &Path)
         "-c".to_string(),
         format!(
             "mcp_servers.aspis-management.command={}",
-            toml_string("python")
+            toml_string(python)
         ),
         "-c".to_string(),
         format!("mcp_servers.aspis-management.args={mcp_args}"),
@@ -3541,10 +3542,10 @@ pub(crate) fn codex_mcp_config_args(management_root: &Path, projects_dir: &Path)
     ]
 }
 
-fn codex_launch_script(root_path: &Path, management_root: &Path, projects_dir: &Path) -> String {
+fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let mut args = vec!["--cd".to_string(), root_s];
-    args.extend(codex_mcp_config_args(management_root, projects_dir));
+    args.extend(codex_mcp_config_args(python, management_root, projects_dir));
     let args = args
         .iter()
         .map(|value| ps_single_quote(value))
@@ -3564,8 +3565,8 @@ fn codex_launch_script(root_path: &Path, management_root: &Path, projects_dir: &
     format!("$codexArgs = @({args})\n$prompt | & codex @codexArgs")
 }
 
-fn claude_launch_script(management_root: &Path, projects_dir: &Path) -> String {
-    let config = mcp_client_config_json(management_root, projects_dir).replace("'@", "' @");
+fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path) -> String {
+    let config = mcp_client_config_json(python, management_root, projects_dir).replace("'@", "' @");
     // Deliver the prompt via STDIN, not as a trailing native argv (see
     // codex_launch_script for the full rationale): avoids PowerShell word-splitting
     // and `<`/`>` mangling, and keeps the embedded launch token off claude's
@@ -3577,11 +3578,11 @@ fn claude_launch_script(management_root: &Path, projects_dir: &Path) -> String {
     format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude --mcp-config $mcpConfig")
 }
 
-fn mcp_client_config_json(management_root: &Path, projects_dir: &Path) -> String {
+fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &Path) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {
             "aspis-management": {
-                "command": "python",
+                "command": python,
                 "args": [
                     "-m",
                     "oracle.server.aspis_mcp",
@@ -8349,8 +8350,8 @@ updated_at: 2026-05-28T00:00:00Z
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script(&root, &root, &projects);
-        let claude = mcp_client_config_json(&root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects);
+        let claude = mcp_client_config_json("python3", &root, &projects);
 
         assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
@@ -8359,11 +8360,54 @@ updated_at: 2026-05-28T00:00:00Z
     }
 
     #[test]
+    fn mcp_configs_use_resolved_interpreter_not_bare_python() {
+        // BUG #14: the MCP server command must be the RESOLVED Python interpreter
+        // (an absolute venv path, or a versioned `python3.x`), NOT bare `python`.
+        // A GUI app on macOS does not inherit the shell PATH, so a bare `python`
+        // is absent, the MCP server never starts, the agent can't `agent_register`,
+        // and it stalls in launch_pending. The interpreter is threaded in as a
+        // parameter so the launch path resolves it ONCE via resolve_oracle_python().
+        // These two builders are compiled on every platform.
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+        let python = "/opt/venv/bin/python3.11";
+
+        let claude_json = mcp_client_config_json(python, &root, &projects);
+        let codex_args = codex_mcp_config_args(python, &root, &projects).join(" ");
+
+        // The resolved interpreter is what actually runs the MCP server.
+        assert!(claude_json.contains("\"command\": \"/opt/venv/bin/python3.11\""));
+        assert!(codex_args.contains("/opt/venv/bin/python3.11"));
+
+        // And the broken bare `python` command is gone everywhere.
+        assert!(!claude_json.contains("\"command\": \"python\""));
+        assert!(!codex_args.contains("command=\"python\""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_launch_lines_use_resolved_interpreter_not_bare_python() {
+        // BUG #14, macOS launch lines (cfg-gated, so this test is too — otherwise
+        // the symbol is absent on Windows/Linux and the test module won't compile).
+        let root = PathBuf::from("/Users/me/Aspis Management");
+        let projects = root.join("projects");
+        let python = "/opt/venv/bin/python3.11";
+
+        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects);
+        let macos_claude = macos_claude_launch_line(python, &root, &projects);
+
+        assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
+        assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
+        assert!(!macos_codex.contains("command=\"python\""));
+        assert!(!macos_claude.contains("\"command\": \"python\""));
+    }
+
+    #[test]
     fn codex_launch_script_pipes_prompt_via_stdin_not_trailing_argv() {
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script(&root, &root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects);
 
         // The prompt must be piped into codex via STDIN so PowerShell never
         // word-splits it (which would mangle `<`/`>` and leak the launch token).
@@ -8378,7 +8422,7 @@ updated_at: 2026-05-28T00:00:00Z
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let claude = claude_launch_script(&root, &projects);
+        let claude = claude_launch_script("python3", &root, &projects);
 
         assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
         assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
@@ -8396,8 +8440,8 @@ updated_at: 2026-05-28T00:00:00Z
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script(&root, &root, &projects);
-        let claude = claude_launch_script(&root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects);
+        let claude = claude_launch_script("python3", &root, &projects);
 
         // The literal prompt text is never embedded in either launch script: it
         // is supplied at runtime through the `$prompt` variable piped over STDIN.

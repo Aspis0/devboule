@@ -2774,6 +2774,7 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
             let mut args: Vec<String> = vec!["exec".to_string()];
             if let Some(roots) = mcp_roots {
                 args.extend(super::projects::codex_mcp_config_args(
+                    &crate::oracle::oracle_setup::resolve_oracle_python(),
                     &roots.management_root,
                     &roots.projects_dir,
                 ));
@@ -3302,6 +3303,7 @@ fn build_mini_command_impl(
             let mut args: Vec<String> = vec!["exec".to_string()];
             if let Some(roots) = mcp_roots {
                 args.extend(super::projects::codex_mcp_config_args(
+                    &crate::oracle::oracle_setup::resolve_oracle_python(),
                     &roots.management_root,
                     &roots.projects_dir,
                 ));
