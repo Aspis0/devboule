@@ -14,7 +14,10 @@ import type {
   OracleIndexStatus,
   OracleIndexedFiles,
   OracleRuntime,
+  OracleRuntimeSetup,
 } from "../../types/backend";
+// First-open onboarding banner (exported for this UX test).
+import { OracleRuntimeSetupBanner } from "./OracleAdminPanel";
 
 // ---- AppContext mock ------------------------------------------------------
 // A single mutable bag of context values; each test sets the slice it needs
@@ -463,5 +466,54 @@ describe("OracleAdminPanel — vectorStore optional chain (regression)", () => {
     const { container } = await render();
     // The health strip backend cell should show "lancedb" (from chunkStore).
     expect(container.textContent).toContain("lancedb");
+  });
+});
+
+
+describe("OracleRuntimeSetupBanner — first-open onboarding", () => {
+  const notReady: OracleRuntimeSetup = {
+    pythonFound: true,
+    pythonCommand: "python3",
+    pythonVersion: "3.12.0",
+    venvReady: false,
+    depsReady: false,
+    embedderReady: false,
+    ready: false,
+    embedModel: "Qwen/Qwen3-Embedding-0.6B",
+    messages: [],
+  };
+
+  it("shows the required disk space and a one-click install for LanceDB + the Qwen embedder", async () => {
+    const onInstall = vi.fn();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root!: Root;
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        createElement(OracleRuntimeSetupBanner, {
+          setup: notReady,
+          installing: false,
+          error: null,
+          onInstall,
+          onRetry: vi.fn(),
+        }),
+      );
+    });
+    const text = container.textContent ?? "";
+    // Required disk space must be stated up front (download + installed deps).
+    expect(text).toMatch(/disk/i);
+    expect(text).toMatch(/GB/);
+    // The two installed pieces are named so the user knows what they get.
+    expect(text).toMatch(/LanceDB/);
+    expect(text).toMatch(/embedder|embedding/i);
+    // One-click install affordance.
+    const button = container.querySelector("button");
+    expect(button).not.toBeNull();
+    act(() => {
+      (button as HTMLButtonElement).click();
+    });
+    expect(onInstall).toHaveBeenCalledTimes(1);
+    act(() => root.unmount());
   });
 });

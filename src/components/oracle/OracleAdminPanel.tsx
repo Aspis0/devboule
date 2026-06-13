@@ -1220,7 +1220,12 @@ function Stat({
   );
 }
 
-function OracleRuntimeSetupBanner({
+/** Approx. free disk the installed retrieval runtime needs (venv + torch +
+ *  LanceDB + the embedder weights). Shown up front so first-run is no surprise.
+ */
+const ORACLE_RUNTIME_DISK_GB = 2;
+
+export function OracleRuntimeSetupBanner({
   setup,
   installing,
   error,
@@ -1272,12 +1277,25 @@ function OracleRuntimeSetupBanner({
               "First startup can be slow on a busy machine. We're still verifying the local Python runtime — no action needed yet."
             ) : (
               <>
-                Oracle search needs LanceDB and the{" "}
-                <span className="font-mono">{setup.embedModel}</span> model. This
-                is separate from the answer model — retrieval is always local.
+                Oracle search runs fully on your machine. One click installs{" "}
+                <span className="font-semibold">LanceDB</span> (the local vector
+                store) and the{" "}
+                <span className="font-mono">{setup.embedModel}</span> embedding
+                model — separate from the answer model, retrieval is always
+                local. First install downloads ~1–2 GB and needs about{" "}
+                <span className="font-semibold">
+                  {ORACLE_RUNTIME_DISK_GB} GB free disk
+                </span>
+                .
               </>
             )}
           </p>
+          {stage !== "checking" && (
+            <p className="mt-1 text-[10px] leading-4 text-cream-500">
+              Nothing leaves your machine; you can keep working while it
+              downloads.
+            </p>
+          )}
           <div className="mt-2 flex flex-wrap gap-2">
             {steps.map((step) => {
               const isPythonChecking = checking && step.label === "Python 3.9+";
@@ -1341,7 +1359,9 @@ function OracleRuntimeSetupBanner({
             data-help-lines="It creates a Python virtual environment, installs LanceDB and the embedder, and downloads the Qwen3 model.|It does not touch your repository or send anything remote.|It needs internet for the first download and a few GB of disk.|Re-running it repairs a partial install."
             className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {installing ? "Installing…" : "Install runtime"}
+            {installing
+              ? "Installing…"
+              : `Install runtime (~${ORACLE_RUNTIME_DISK_GB} GB)`}
           </button>
         )}
       </div>
