@@ -2485,6 +2485,25 @@ class OraclePhase2Test(unittest.TestCase):
             resolve_min_free_gb(None, idle=False), oracle_config.CHUNK_MIN_FREE_GB
         )
 
+    def test_adaptive_batch_files_scales_with_free_ram(self):
+        # Owner request: grow while RAM is plentiful, shrink before the floor
+        # pauses us, hold in between; cap 4x base, floor max(2, base//4).
+        from oracle.ingestion.chunk_index import adaptive_batch_files
+
+        base, floor = 16, 5.0
+        # plenty (>= 4x floor): doubles, capped at 4x base.
+        self.assertEqual(adaptive_batch_files(base, 16, 40.0, floor), 32)
+        self.assertEqual(adaptive_batch_files(base, 32, 40.0, floor), 64)
+        self.assertEqual(adaptive_batch_files(base, 64, 40.0, floor), 64)
+        # comfortable middle: holds.
+        self.assertEqual(adaptive_batch_files(base, 32, 15.0, floor), 32)
+        # tight (< 2x floor): halves, floored.
+        self.assertEqual(adaptive_batch_files(base, 32, 9.0, floor), 16)
+        self.assertEqual(adaptive_batch_files(base, 4, 9.0, floor), 4)
+        self.assertEqual(adaptive_batch_files(base, 2, 9.0, floor), 4)
+        # floor disabled: no signal, hold.
+        self.assertEqual(adaptive_batch_files(base, 24, 1.0, 0.0), 24)
+
     def test_darwin_effective_free_gb_zeroes_under_memory_pressure(self):
         # vm_stat's free+inactive+speculative+purgeable OVERSTATES availability
         # under load (~17GB "free" while swapping 30GB). When the kernel itself

@@ -745,6 +745,32 @@ def wait_for_gpu_cooldown(max_gpu_temp_c: int, progress: bool = False) -> int | 
     return temp_c
 
 
+def adaptive_batch_files(
+    base: int, current: int, free_gb: float, min_free_gb: float
+) -> int:
+    """Owner request (2026-06-12): scale the per-iteration FILE batch with the
+    same free-RAM reading the pause floor uses — grow while memory is
+    plentiful, shrink BEFORE the floor pauses us when it tightens.
+
+      - floor disabled (min_free_gb <= 0): no signal -> hold current;
+      - free >= 4x floor: double, capped at 4x base;
+      - free <  2x floor: halve, floored at max(2, base // 4);
+      - otherwise: hold.
+
+    Pure and stateless over its inputs so the policy is unit-testable; the
+    caller threads `current` between iterations.
+    """
+    if min_free_gb <= 0:
+        return max(1, current)
+    lo = max(2, base // 4)
+    hi = max(base, base * 4)
+    if free_gb >= 4 * min_free_gb:
+        return min(hi, max(1, current) * 2)
+    if free_gb < 2 * min_free_gb:
+        return max(lo, max(1, current) // 2)
+    return max(1, current)
+
+
 def wait_for_memory_recovery(min_free_gb: float, progress: bool = False) -> float:
     """Sleep-and-retry while free system RAM is below ``min_free_gb``.
 
@@ -842,8 +868,12 @@ def index_file_chunks(
     processed_files = 0
     processed_chunks = 0
     files_done_this_run = 0
-    file_batch_size = max(1, batch_files)
-    max_files_per_run = max_batches * file_batch_size if max_batches is not None else None
+    base_file_batch_size = max(1, batch_files)
+    file_batch_size = base_file_batch_size
+    # max_batches semantics stay anchored to the BASE size (a "batch" budget is
+    # sized in base units even while the adaptive controller grows/shrinks the
+    # actual per-iteration slice).
+    max_files_per_run = max_batches * base_file_batch_size if max_batches is not None else None
     chunk_batch_size = max(1, batch_chunks)
     chunk_char_budget = max(1, batch_chars)
 
@@ -851,6 +881,13 @@ def index_file_chunks(
     while pending_index < len(pending):
         if max_files_per_run is not None and files_done_this_run >= max_files_per_run:
             break
+        free_gb = free_memory_gb()
+        # Adaptive sizing (owner request): same reading the pause floor uses —
+        # grow the slice while RAM is plentiful, shrink it before the floor
+        # would pause us.
+        file_batch_size = adaptive_batch_files(
+            base_file_batch_size, file_batch_size, free_gb, min_free_gb
+        )
         remaining_files = (
             file_batch_size
             if max_files_per_run is None
@@ -859,7 +896,6 @@ def index_file_chunks(
         batch_paths = pending[pending_index : pending_index + remaining_files]
         if not batch_paths:
             break
-        free_gb = free_memory_gb()
         if min_free_gb > 0 and free_gb < min_free_gb:
             # WAIT-AND-RESUME (see the in-batch guard below): treat low RAM as
             # transient — sleep-and-retry, resume if it recovers, give up only on
