@@ -1210,10 +1210,12 @@ fn tag_names(body: &serde_json::Value) -> Vec<String> {
 /// single provider-selection point Censor uses at its probe + worker construction sites
 /// (oMLX-P5), so the probe and the worker that follows always agree on ONE provider when
 /// handed the SAME config snapshot:
-///   - [`CensorAiProvider::Ollama`] (the default — a config with no `censorLocalAi`
-///     resolves here) → an [`OllamaClient`] at the effective base/model. With the default
-///     config this is byte-identical to the previous hardcoded `OllamaClient::new()`
-///     (same [`OLLAMA_BASE`], [`GEMMA_MODEL`], and the default generate/probe timeouts).
+///   - [`CensorAiProvider::Ollama`] (the default provider when `censorLocalAi` is absent)
+///     → an [`OllamaClient`] at the effective base, taking the CONFIGURED model override.
+///     OPT-IN: with no override the model resolves to "" and the probe reports the tier
+///     off, so an unconfigured Ollama censor never runs — the user must pick a model
+///     (e.g. the recommended [`GEMMA_MODEL`]). Base + timeouts use [`OLLAMA_BASE`] / the
+///     default generate/probe timeouts.
 ///   - [`CensorAiProvider::Omlx`] → an [`OmlxClient`] at the effective base/model (the
 ///     base is loopback-clamped inside [`OmlxClient::with_config`], a privacy fail-safe).
 ///

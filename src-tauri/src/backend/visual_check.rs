@@ -275,6 +275,13 @@ pub fn critique_png_with_client(
     png_bytes: &[u8],
     focus: Option<&str>,
 ) -> Result<String, String> {
+    // OPT-IN guard: with no local model configured the client's model label is empty —
+    // bail BEFORE any network call so an unconfigured (off) censor never POSTs an
+    // empty-model request to the loopback endpoint. Mirrors the pre-capture provider gate
+    // in design_preview's local visual critique.
+    if client.model_label().trim().is_empty() {
+        return Err("no vision provider available".to_string());
+    }
     if png_bytes.is_empty() {
         return Err("captured image is empty".to_string());
     }
@@ -418,6 +425,39 @@ mod tests {
         }
 
         let err = critique_png_with_client(&NoVision, b"\x89PNG\r\n", None).unwrap_err();
+        assert_eq!(err, "no vision provider available");
+    }
+
+    #[test]
+    fn visual_critique_bails_before_any_call_when_model_unconfigured() {
+        // OPT-IN: an unconfigured censor has an empty model label. The vision pass must
+        // bail with "no vision provider available" BEFORE issuing any request — so a
+        // censor the user never enabled never POSTs (not even an empty-model loopback
+        // request). Both generate hooks panic to prove no call is made.
+        struct OffCensor;
+        impl GemmaClient for OffCensor {
+            fn probe(&self) -> bool {
+                false
+            }
+            fn generate(&self, _prompt: &str) -> Result<String, GemmaError> {
+                panic!("generate must not be called for an unconfigured (off) censor");
+            }
+            fn generate_with_images(
+                &self,
+                _prompt: &str,
+                _images_b64: &[String],
+            ) -> Result<String, GemmaError> {
+                panic!("generate_with_images must not be called for an unconfigured (off) censor");
+            }
+            fn provider_label(&self) -> &'static str {
+                "off"
+            }
+            fn model_label(&self) -> String {
+                String::new()
+            }
+        }
+
+        let err = critique_png_with_client(&OffCensor, b"\x89PNG\r\n", None).unwrap_err();
         assert_eq!(err, "no vision provider available");
     }
 
