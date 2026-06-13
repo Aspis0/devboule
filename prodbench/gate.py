@@ -54,6 +54,35 @@ def clippy_warnings(sample, impl):
         _restore(sample)
 
 
+# Curated, machine-applicable "elegance" lints clippy can auto-apply to elevate a candidate to
+# idiomatic Rust — DETERMINISTIC, so the resulting {before, after} pairs are decided by a
+# program, not a model/human. Grow this list as we find more (it is NOT the whole pedantic group,
+# which carries noisy/opinionated lints). map_unwrap_or: `.map(f).unwrap_or(false)` -> `is_some_and`.
+ELEVATE_LINTS = ["clippy::map_unwrap_or"]
+
+
+def clippy_elevate(sample, impl):
+    """Run `clippy --fix` with the curated ELEVATE_LINTS on the candidate in the tree and return
+    the elevated source. CLIPPY decides the fix (deterministic), not a model or a human — so a
+    changed result is a judge-free training pair. Restores every file clippy may have touched."""
+    from prodbench import _ensure_register, _restore
+    produce = ROOT / sample["produce_file"]
+    warn = " ".join(f"-W {l}" for l in ELEVATE_LINTS)
+    elevated = impl
+    try:
+        _ensure_register(sample)
+        produce.write_text(impl, encoding="utf-8")
+        subprocess.run(
+            f"cargo clippy --fix --lib --allow-dirty --allow-no-vcs -- -A clippy::all {warn}",
+            cwd=SRC_TAURI, shell=True, capture_output=True, text=True)
+        elevated = produce.read_text(encoding="utf-8")
+    finally:
+        # clippy --fix may touch any file with the lint; restore all tracked src, drop the new one.
+        subprocess.run(["git", "checkout", "--", "src-tauri/src"], cwd=ROOT, capture_output=True)
+        _restore(sample)
+    return elevated
+
+
 def harvest(rejected, chosen, gate, fixes, sample_id):
     RAIL.parent.mkdir(parents=True, exist_ok=True)
     rec = {"origin": "deterministic-gate", "sample": sample_id, "gate": gate,
@@ -67,7 +96,7 @@ def gate_rust(sample, impl_text, harvest_pairs=True):
     """Run the deterministic tier on a candidate impl. Returns the gated impl + a summary,
     and (by default) harvests every auto-fix as a judge-free training pair."""
     impl = strip_tests(impl_text)
-    out = {"pairs": 0, "fmt_changed": False, "clippy_warnings": []}
+    out = {"pairs": 0, "fmt_changed": False, "clippy_elevated": False, "clippy_warnings": []}
     fmt = rustfmt(impl)
     if fmt != impl:
         if harvest_pairs:
@@ -75,6 +104,13 @@ def gate_rust(sample, impl_text, harvest_pairs=True):
         out["fmt_changed"] = True
         out["pairs"] += 1
         impl = fmt
+    elevated = clippy_elevate(sample, impl)
+    if elevated != impl:
+        if harvest_pairs:
+            harvest(impl, elevated, "clippy", ", ".join(ELEVATE_LINTS), sample["id"])
+        out["clippy_elevated"] = True
+        out["pairs"] += 1
+        impl = elevated
     out["clippy_warnings"] = clippy_warnings(sample, impl)
     out["gated_impl"] = impl
     return out
@@ -86,6 +122,7 @@ def main():
     impl = Path(sys.argv[2]).read_text(encoding="utf-8")
     r = gate_rust(sample, impl)
     print(f"[gate] {sample['id']}: rustfmt changed={r['fmt_changed']} "
+          f"clippy_elevated={r['clippy_elevated']} "
           f"clippy_warnings={len(r['clippy_warnings'])} pairs_harvested={r['pairs']}")
     for w in r["clippy_warnings"][:12]:
         print("  clippy:", w)
