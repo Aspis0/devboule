@@ -1,0 +1,17 @@
+{
+  "id": "training-pairs-loader",
+  "lang": "rust",
+  "kind": "additive-module",
+  "base_commit": "85c6bfa",
+  "produce_file": "src-tauri/src/backend/training_pairs.rs",
+  "register": {
+    "file": "src-tauri/src/backend/mod.rs",
+    "anchor": "pub mod censor;",
+    "line": "pub mod training_pairs;"
+  },
+  "gold_test_file": "prodbench/samples/training-pairs/gold_tests.rs",
+  "gold_test_mod": "gold_tests",
+  "f2p_cmd": "cargo test --lib backend::training_pairs::gold_tests",
+  "p2p_cmd": "cargo build --lib",
+  "prompt": "Add a new Rust module `src-tauri/src/backend/training_pairs.rs` — the backend that reads Devboule's local self-improvement rail (the `.aspis-training/*.jsonl` files of {rejected, chosen} training pairs) so the app can display them. Implement EXACTLY:\n\n1. `use serde::{Deserialize, Serialize};` and `use std::path::Path;`\n2. struct `TrainingPair` (derive Debug, Clone, Serialize, Deserialize, PartialEq, Eq) with these pub String/bool fields, each `#[serde(default)]` so a JSONL line missing a key still parses: `origin: String`, `gate: String`, `rejected: String`, `chosen: String`, `scorer: String`, `judge_free: bool`.\n3. `pub fn load_training_pairs(dir: &Path) -> Vec<TrainingPair>`: read every file in `dir` whose name ends in `.jsonl`; for each, parse it line by line, deserializing each non-empty line with `serde_json::from_str::<TrainingPair>(line)` and KEEPING only the lines that parse (skip blank lines and any malformed/non-JSON line — never panic). Files that are not `*.jsonl` are ignored. A missing/unreadable directory yields an empty Vec (no panic). Return all parsed pairs.\n\nIdiomatic, warning-free, no unwrap()/expect() in non-test code (handle IO/parse errors by skipping), doc comments on public items. You MAY include a #[cfg(test)] mod tests (it will be ignored by scoring). Return ONLY the full file content."
+}
