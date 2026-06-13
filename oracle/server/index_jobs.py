@@ -103,10 +103,28 @@ class OracleIndexJobManager:
         # old one down first instead of orphaning it.
         self.watcher_mode: str | None = None
 
+    # Job statuses that mean "a worker is supposed to be running". If status()
+    # sees one of these but no live thread, the job is STALE (thread/process
+    # died between "running" and the terminal write) and is healed to terminal.
+    _ACTIVE_JOB_STATUSES = {"queued", "running"}
+
     def status(self, root: str | None = None) -> dict:
         index_root = default_index_root(root)
         with self.lock:
             job = dict(self.job) if self.job else {"status": "idle"}
+            thread_alive = bool(self.thread and self.thread.is_alive())
+            # SELF-HEAL a stale job: status claims active but no worker thread is
+            # alive (pkill, a dev-rebuild restart, or a thread that vanished
+            # without hitting its except). Report it terminal + persist it so the
+            # UI's jobActive flips false and "Index now" becomes clickable again
+            # instead of showing a frozen "indexing" with a dead button.
+            if job.get("status") in self._ACTIVE_JOB_STATUSES and not thread_alive:
+                job = {
+                    "status": "interrupted",
+                    "root": job.get("root", str(index_root)),
+                    "message": "The previous index job stopped (server restart or interruption). Click Index now to resume.",
+                }
+                self.job = dict(job)
             watcher_running = self.observer is not None
         # Surface the live sub-state to the UI in camelCase. `phase` is already a
         # single word; rename only the snake_case `phase_message`. The message is

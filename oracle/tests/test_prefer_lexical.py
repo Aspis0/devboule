@@ -122,5 +122,44 @@ class IndexingInProgressTest(unittest.TestCase):
         self.assertFalse(manager.indexing_in_progress())
 
 
+class StaleJobStatusTest(unittest.TestCase):
+    def test_status_self_heals_a_running_job_with_no_live_thread(self):
+        # The job thread (or its whole server process) can die — pkill, a
+        # rebuild restart — between "running" and the terminal write, leaving
+        # self.job stuck on "running". status() must report it as STALE so the
+        # UI un-disables "Index now" instead of showing a frozen "indexing".
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = OracleIndexJobManager()
+            manager.job = {"status": "running", "root": tmp}
+            manager.thread = None  # no live worker
+            out = manager.status(root=tmp)
+            self.assertNotIn(
+                out["job"]["status"], {"running", "queued"},
+                "a thread-less running job must not still read as active",
+            )
+            # …and it sticks (persisted as terminal, not re-reported running).
+            self.assertNotIn(manager.job["status"], {"running", "queued"})
+
+    def test_status_keeps_running_while_the_thread_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = OracleIndexJobManager()
+            release = threading.Event()
+            thread = threading.Thread(target=release.wait)
+            thread.start()
+            manager.thread = thread
+            manager.job = {"status": "running", "root": tmp}
+            try:
+                out = manager.status(root=tmp)
+                self.assertEqual(out["job"]["status"], "running")
+            finally:
+                release.set()
+                thread.join()
+
+    def test_status_idle_on_fresh_manager(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = OracleIndexJobManager()
+            self.assertEqual(manager.status(root=tmp)["job"]["status"], "idle")
+
+
 if __name__ == "__main__":
     unittest.main()
