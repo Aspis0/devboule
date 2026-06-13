@@ -1103,6 +1103,7 @@ fn prepare_or_launch_project_agent(
             &prompt,
             &management_root,
             &projects_path,
+            input.model.as_deref(),
             &provider_env,
         )?;
         if let Err(record_err) = record_agent_launch(
@@ -1145,6 +1146,7 @@ fn prepare_or_launch_project_agent(
             &prompt,
             &management_root,
             &projects_path,
+            input.model.as_deref(),
             &provider_env,
         )?;
         let prompt_file_label = spawned
@@ -2376,6 +2378,7 @@ fn spawn_agent_terminal(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<SpawnedAgent, String> {
     // A custom client runs an arbitrary, operator-configured command line, so there
@@ -2402,6 +2405,7 @@ fn spawn_agent_terminal(
         prompt,
         management_root,
         projects_dir,
+        model,
         provider_env,
     )
 }
@@ -2430,6 +2434,7 @@ fn spawn_agent_terminal_app(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<Option<String>, String> {
     let executable = if custom_command.is_some() {
@@ -2454,6 +2459,7 @@ fn spawn_agent_terminal_app(
         prompt,
         management_root,
         projects_dir,
+        model,
         provider_env,
     )
 }
@@ -2470,6 +2476,7 @@ fn spawn_agent_terminal_app_impl(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<Option<String>, String> {
     use portable_pty::CommandBuilder;
@@ -2483,6 +2490,7 @@ fn spawn_agent_terminal_app_impl(
         prompt,
         management_root,
         projects_dir,
+        model,
     )?;
 
     // PTY host: run powershell directly (NO conhost — the PTY IS the console). Same
@@ -2525,6 +2533,7 @@ fn spawn_agent_terminal_app_impl(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<Option<String>, String> {
     use portable_pty::CommandBuilder;
@@ -2538,6 +2547,7 @@ fn spawn_agent_terminal_app_impl(
         prompt,
         management_root,
         projects_dir,
+        model,
         provider_env,
     )?;
 
@@ -2575,6 +2585,7 @@ fn spawn_agent_terminal_app_impl(
     _prompt: &str,
     _management_root: &Path,
     _projects_dir: &Path,
+    _model: Option<&str>,
     _provider_env: &[AgentLaunchEnv],
 ) -> Result<Option<String>, String> {
     Err("App-hosted agent terminals are supported on Windows and macOS only.".into())
@@ -2606,6 +2617,7 @@ fn build_windows_agent_script(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
 ) -> Result<(PathBuf, String), String> {
     let is_custom = custom_command.is_some();
     let command_line = if let Some(command) = custom_command {
@@ -2626,9 +2638,9 @@ fn build_windows_agent_script(
         // is echoed; the script-level "prompt copied to clipboard" line follows.
         "Write-Host 'Aspis agent prompt is copied to clipboard.'".to_string()
     } else if client == "codex" {
-        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir)
+        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model)
     } else if client == "claude" {
-        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir)
+        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model)
     } else {
         executable.to_string()
     };
@@ -2738,6 +2750,7 @@ fn spawn_agent_terminal_impl(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<SpawnedAgent, String> {
     let (prompt_file, script) = build_windows_agent_script(
@@ -2749,6 +2762,7 @@ fn spawn_agent_terminal_impl(
         prompt,
         management_root,
         projects_dir,
+        model,
     )?;
     // Launch through conhost.exe so the agent always gets its OWN dedicated
     // CLASSIC console window (tagged with the unique title above), not a shared
@@ -2826,6 +2840,7 @@ fn build_macos_agent_script(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<(PathBuf, String), String> {
     // Same temp-file delivery contract as Windows: keep the launch-token-bearing
@@ -2846,9 +2861,9 @@ fn build_macos_agent_script(
         // clipboard and echoed above.
         String::new()
     } else if client == "codex" {
-        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir)
+        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model)
     } else if client == "claude" {
-        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir)
+        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model)
     } else {
         sh_single_quote(executable)
     };
@@ -2967,6 +2982,7 @@ fn spawn_agent_terminal_impl(
     prompt: &str,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
 ) -> Result<SpawnedAgent, String> {
     let (prompt_file, script) = build_macos_agent_script(
@@ -2978,6 +2994,7 @@ fn spawn_agent_terminal_impl(
         prompt,
         management_root,
         projects_dir,
+        model,
         provider_env,
     )?;
 
@@ -3032,6 +3049,7 @@ fn spawn_agent_terminal_impl(
     _prompt: &str,
     _management_root: &Path,
     _projects_dir: &Path,
+    _model: Option<&str>,
     _provider_env: &[AgentLaunchEnv],
 ) -> Result<SpawnedAgent, String> {
     Err("Agent terminal launch is supported on Windows and macOS only.".into())
@@ -3412,6 +3430,7 @@ fn macos_codex_launch_line(
     root_path: &Path,
     management_root: &Path,
     projects_dir: &Path,
+    model: Option<&str>,
 ) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let management_root_s = management_root.to_string_lossy().into_owned();
@@ -3457,6 +3476,10 @@ fn macos_codex_launch_line(
     ];
     let mut line = String::from("printf '%s' \"$PROMPT\" | codex --cd ");
     line.push_str(&sh_single_quote(&root_s));
+    if let Some(model) = model {
+        line.push_str(" -m ");
+        line.push_str(&sh_single_quote(model));
+    }
     for config in &config_args {
         line.push_str(" -c ");
         line.push_str(&sh_single_quote(config));
@@ -3469,10 +3492,15 @@ fn macos_codex_launch_line(
 /// `--mcp-config` and pipes the prompt over STDIN.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
-fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path) -> String {
+fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>) -> String {
     let config = mcp_client_config_json(python, management_root, projects_dir);
+    let model_flag = match model {
+        Some(model) => format!("--model {} ", sh_single_quote(model)),
+        None => String::new(),
+    };
     format!(
-        "printf '%s' \"$PROMPT\" | claude --mcp-config {}",
+        "printf '%s' \"$PROMPT\" | claude {}--mcp-config {}",
+        model_flag,
         sh_single_quote(&config)
     )
 }
@@ -3542,9 +3570,13 @@ pub(crate) fn codex_mcp_config_args(python: &str, management_root: &Path, projec
     ]
 }
 
-fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path) -> String {
+fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path, model: Option<&str>) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let mut args = vec!["--cd".to_string(), root_s];
+    if let Some(model) = model {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
     args.extend(codex_mcp_config_args(python, management_root, projects_dir));
     let args = args
         .iter()
@@ -3565,8 +3597,12 @@ fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, p
     format!("$codexArgs = @({args})\n$prompt | & codex @codexArgs")
 }
 
-fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path) -> String {
+fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>) -> String {
     let config = mcp_client_config_json(python, management_root, projects_dir).replace("'@", "' @");
+    let model_flag = match model {
+        Some(model) => format!("--model {} ", ps_single_quote(model)),
+        None => String::new(),
+    };
     // Deliver the prompt via STDIN, not as a trailing native argv (see
     // codex_launch_script for the full rationale): avoids PowerShell word-splitting
     // and `<`/`>` mangling, and keeps the embedded launch token off claude's
@@ -3575,7 +3611,7 @@ fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Pat
     // B1 INVARIANT: same as codex — the prompt/launch token is delivered over
     // STDIN and the clipboard ONLY; it is NEVER written to the PTY stream (no
     // `Write-Host $prompt`), so it cannot leak into the ConPTY snapshot/xterm.
-    format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude --mcp-config $mcpConfig")
+    format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig")
 }
 
 fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &Path) -> String {
@@ -8350,7 +8386,7 @@ updated_at: 2026-05-28T00:00:00Z
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None);
         let claude = mcp_client_config_json("python3", &root, &projects);
 
         assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
@@ -8393,8 +8429,8 @@ updated_at: 2026-05-28T00:00:00Z
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects);
-        let macos_claude = macos_claude_launch_line(python, &root, &projects);
+        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None);
+        let macos_claude = macos_claude_launch_line(python, &root, &projects, None);
 
         assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
         assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
@@ -8403,11 +8439,60 @@ updated_at: 2026-05-28T00:00:00Z
     }
 
     #[test]
+    fn launch_scripts_pass_selected_model_to_the_cli() {
+        // BUG #15: the model picked in the app was dropped — it only reached the
+        // prompt TEXT, never the CLI. The launch builders must emit `--model <m>`
+        // (claude) / `-m <m>` (codex) when a model is selected, and emit NOTHING
+        // model-related when None (so the CLI uses its own default). These two
+        // builders are compiled on every platform.
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+        let model = "test-model-xyz";
+
+        let codex_with = codex_launch_script("python3", &root, &root, &projects, Some(model));
+        let claude_with = claude_launch_script("python3", &root, &projects, Some(model));
+        let codex_none = codex_launch_script("python3", &root, &root, &projects, None);
+        let claude_none = claude_launch_script("python3", &root, &projects, None);
+
+        // Selected model reaches the CLI.
+        assert!(claude_with.contains("--model"));
+        assert!(claude_with.contains(model));
+        assert!(codex_with.contains(model));
+        assert!(codex_with.contains("'-m'")); // the codex flag itself (ps_single_quote'd)
+        // No model selected -> no model token injected (CLI default is used).
+        assert!(!claude_none.contains("--model"));
+        assert!(!claude_none.contains(model));
+        assert!(!codex_none.contains(model));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_launch_lines_pass_selected_model_to_the_cli() {
+        // BUG #15 on the macOS launch lines (cfg-gated, so this test is too).
+        let root = PathBuf::from("/Users/me/Aspis Management");
+        let projects = root.join("projects");
+        let model = "test-model-xyz";
+
+        let codex_with = macos_codex_launch_line("python3", &root, &root, &projects, Some(model));
+        let claude_with = macos_claude_launch_line("python3", &root, &projects, Some(model));
+        let codex_none = macos_codex_launch_line("python3", &root, &root, &projects, None);
+        let claude_none = macos_claude_launch_line("python3", &root, &projects, None);
+
+        assert!(claude_with.contains("--model"));
+        assert!(claude_with.contains(model));
+        assert!(codex_with.contains(model));
+        assert!(codex_with.contains(" -m ")); // the codex flag itself
+        assert!(!claude_none.contains("--model"));
+        assert!(!claude_none.contains(model));
+        assert!(!codex_none.contains(model));
+    }
+
+    #[test]
     fn codex_launch_script_pipes_prompt_via_stdin_not_trailing_argv() {
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None);
 
         // The prompt must be piped into codex via STDIN so PowerShell never
         // word-splits it (which would mangle `<`/`>` and leak the launch token).
@@ -8422,7 +8507,7 @@ updated_at: 2026-05-28T00:00:00Z
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let claude = claude_launch_script("python3", &root, &projects);
+        let claude = claude_launch_script("python3", &root, &projects, None);
 
         assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
         assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
@@ -8440,8 +8525,8 @@ updated_at: 2026-05-28T00:00:00Z
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects);
-        let claude = claude_launch_script("python3", &root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None);
+        let claude = claude_launch_script("python3", &root, &projects, None);
 
         // The literal prompt text is never embedded in either launch script: it
         // is supplied at runtime through the `$prompt` variable piped over STDIN.
@@ -8471,6 +8556,7 @@ updated_at: 2026-05-28T00:00:00Z
             "the-secret-prompt",
             &root,
             &projects,
+            None,
         )
         .expect("script builds");
         // The prompt is delivered to the user via the clipboard only.
@@ -8502,6 +8588,7 @@ updated_at: 2026-05-28T00:00:00Z
                 "the-secret-prompt",
                 &root,
                 &projects,
+                None,
             )
             .expect("script builds");
             assert!(
@@ -8540,6 +8627,7 @@ updated_at: 2026-05-28T00:00:00Z
             "the-secret-prompt",
             &root,
             &projects,
+            None,
         )
         .expect("script builds");
         // GIT_TERMINAL_PROMPT=0 → never block on an interactive credential prompt.
@@ -8730,6 +8818,7 @@ updated_at: 2026-05-28T00:00:00Z
             "the-secret-prompt",
             &root,
             &projects,
+            None,
             &[],
         )
         .expect("script builds");
@@ -8976,6 +9065,7 @@ updated_at: 2026-05-28T00:00:00Z
             "the-secret-prompt",
             &root,
             &projects,
+            None,
         )
         .expect("script builds");
 
@@ -9050,6 +9140,7 @@ updated_at: 2026-05-28T00:00:00Z
             "the-secret-prompt",
             &root,
             &projects,
+            None,
             &[],
         )
         .expect("script builds");
