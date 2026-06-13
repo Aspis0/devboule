@@ -41,24 +41,30 @@ use std::time::Duration;
 ///   1. a user-configured `ollamaModel` (validated) wins outright — the user's explicit
 ///      choice is honored even if it is not in the daemon's `/api/tags` list (so a tag
 ///      they are about to pull is not silently overridden);
-///   2. else this default ([`GEMMA_MODEL`] = `gemma4:e4b`) IF it is present in
-///      `/api/tags`;
-///   3. else [`GEMMA_FALLBACK_MODEL`] (`gemma4:e2b`) if e2b is present — this is the
-///      UPGRADE-SAFETY case: an existing install that only ever pulled `gemma4:e2b` keeps
-///      its Gemma tier instead of silently losing it when the default bumped to `e4b`;
-///      it lets us migrate the default without forcing every old install to re-pull;
-///   4. else the default `gemma4:e4b` (neither present) — the generate call then fails/
+///   2. else this default ([`GEMMA_MODEL`], the Nemotron-3-Nano-4B tag) IF it is present
+///      in `/api/tags`;
+///   3. else [`GEMMA_FALLBACK_MODEL`] (`gemma4:e4b`, the PREVIOUS default) if present —
+///      the UPGRADE-SAFETY case: an existing install that pulled the old Gemma default but
+///      not the new Nemotron keeps a working censor tier instead of silently losing it; it
+///      lets us migrate the default without forcing every old install to re-pull;
+///   4. else the default (neither present) — the generate call then fails/
 ///      degrades exactly as today (unavailable tier, never a crash).
 ///
 /// The Ollama client resolves this ONCE per session from the SAME `/api/tags` list its
 /// availability probe already fetches, so probe and generate never disagree.
-pub const GEMMA_MODEL: &str = "gemma4:e4b";
+/// NOTE: the censor's local model is now **NVIDIA-Nemotron-3-Nano-4B** (chosen by the
+/// 2026-06 benchmark — `docs/censor-model-benchmark-2026-06.md`: it finds in-file
+/// semantic bugs deterministic tools miss AND, unlike the reasoning-distills, supports
+/// tool-calling for the cross-file DEEP mode). The `GEMMA_*` / `*_gemma` naming
+/// throughout this module is LEGACY (Gemma was the original local model); the symbols
+/// are model-agnostic — only the value changed.
+pub const GEMMA_MODEL: &str = "hf.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M";
 
 /// The Ollama tag the resolution chain falls back to when the default ([`GEMMA_MODEL`])
 /// is absent but this older tag is present (step 3 above). Kept as a named constant so
 /// the resolver and its tests share one source of truth. Ollama-specific: the oMLX
 /// provider has no `/api/tags` equivalent and so never applies this fallback.
-pub const GEMMA_FALLBACK_MODEL: &str = "gemma4:e2b";
+pub const GEMMA_FALLBACK_MODEL: &str = "gemma4:e4b";
 
 /// PURE resolver for the Ollama-provider Gemma model tag (no IO; the caller passes the
 /// `/api/tags` names it already fetched in the availability probe). Implements the
@@ -1942,44 +1948,48 @@ mod tests {
         );
         // Whitespace-only / empty configured is treated as absent (falls to the chain).
         assert_eq!(
-            resolve_gemma_model(Some("   "), &["gemma4:e2b".to_string()]),
-            "gemma4:e2b"
+            resolve_gemma_model(Some("   "), &[GEMMA_FALLBACK_MODEL.to_string()]),
+            GEMMA_FALLBACK_MODEL
         );
     }
 
     #[test]
-    fn resolve_gemma_model_default_present_uses_e4b() {
-        // No override + e4b present → the new default.
+    fn resolve_gemma_model_default_present_uses_nemotron() {
+        // No override + the default (Nemotron) present → the default.
         assert_eq!(
             resolve_gemma_model(
                 None,
-                &["gemma4:e4b".to_string(), "gemma4:e2b".to_string()]
+                &[GEMMA_MODEL.to_string(), GEMMA_FALLBACK_MODEL.to_string()]
             ),
-            "gemma4:e4b"
+            GEMMA_MODEL
         );
-        assert_eq!(GEMMA_MODEL, "gemma4:e4b", "default bumped to e4b");
-    }
-
-    #[test]
-    fn resolve_gemma_model_upgrade_safety_falls_back_to_e2b() {
-        // THE upgrade-safety case: an old install pulled only e2b. After the default bumped
-        // to e4b, the tier must NOT silently disappear — fall back to the present e2b.
         assert_eq!(
-            resolve_gemma_model(None, &["gemma4:e2b".to_string()]),
-            "gemma4:e2b"
+            GEMMA_MODEL, "hf.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M",
+            "censor default is Nemotron-3-Nano-4B (docs/censor-model-benchmark-2026-06.md)"
         );
-        assert_eq!(GEMMA_FALLBACK_MODEL, "gemma4:e2b");
     }
 
     #[test]
-    fn resolve_gemma_model_neither_present_defaults_to_e4b() {
-        // Neither tag present (or no tags at all) → the default e4b; the generate call then
+    fn resolve_gemma_model_upgrade_safety_falls_back_to_gemma() {
+        // Upgrade safety: an old install pulled only the PREVIOUS default (gemma4:e4b) and
+        // not the new Nemotron default — the tier must NOT silently disappear; fall back to
+        // the present legacy model.
+        assert_eq!(
+            resolve_gemma_model(None, &[GEMMA_FALLBACK_MODEL.to_string()]),
+            GEMMA_FALLBACK_MODEL
+        );
+        assert_eq!(GEMMA_FALLBACK_MODEL, "gemma4:e4b");
+    }
+
+    #[test]
+    fn resolve_gemma_model_neither_present_defaults_to_nemotron() {
+        // Neither the default nor the fallback present → the default; the generate call then
         // degrades cleanly (unavailable model), never a crash.
         assert_eq!(
             resolve_gemma_model(None, &["llama3:8b".to_string()]),
-            "gemma4:e4b"
+            GEMMA_MODEL
         );
-        assert_eq!(resolve_gemma_model(None, &[]), "gemma4:e4b");
+        assert_eq!(resolve_gemma_model(None, &[]), GEMMA_MODEL);
     }
 
     // ---- run_gemma ----

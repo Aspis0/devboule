@@ -54,7 +54,7 @@ describe("CensorLocalAiCard", () => {
     // Ollama shows the model-tag override input instead (merged from the old
     // CensorModelCard, 2026-06-12).
     expect(html).toContain("Ollama model tag (optional)");
-    expect(html).toContain("gemma4:e4b");
+    expect(html).toContain("NVIDIA-Nemotron-3-Nano-4B");
   });
 
   it("shows Base URL + Model and the loopback caption for an omlx config (no API-key field)", () => {

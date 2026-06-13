@@ -1137,7 +1137,7 @@ export function CensorLocalAiCard() {
             <input
               value={ollamaModel}
               onChange={(event) => setOllamaModel(event.target.value)}
-              placeholder="gemma4:e4b"
+              placeholder="hf.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M"
               maxLength={CENSOR_MODEL_MAX_LENGTH}
               list={detectedModels.length ? "censor-ollama-detected-models" : undefined}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
@@ -1150,7 +1150,7 @@ export function CensorLocalAiCard() {
               </datalist>
             ) : null}
             <span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
-              Blank uses the default gemma4:e4b (auto-falls back to e2b).
+              Blank uses the default Nemotron-3-Nano-4B (falls back to gemma4:e4b).
             </span>
           </label>
         )}
