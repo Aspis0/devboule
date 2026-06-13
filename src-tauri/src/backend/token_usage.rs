@@ -473,8 +473,10 @@ pub fn get_agent_token_usage(
     // NOT used as a fallback: for an agent without a launch token (e.g. a mini) it
     // can be re-stamped on reconnect to AFTER an in-progress transcript's last
     // write and wrongly filter a live badge; absent anchor => no filter (review).
-    // `timestamp() >= 0` guards the chrono->SystemTime conversion, which panics on
-    // a pre-1970 instant (a corrupt/hand-edited state file): keep "never crashes".
+    // `timestamp() >= 0` rejects a nonsensical pre-epoch launch time (a corrupt /
+    // hand-edited state file) as "no valid anchor" — it drops to None, so the badge
+    // degrades to its pre-#18 best-effort attribution rather than trusting garbage,
+    // and we never feed a pre-1970 instant into the chrono->SystemTime conversion.
     let launched_after = session
         .launch_token_issued_at
         .as_deref()

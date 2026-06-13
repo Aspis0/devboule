@@ -38,6 +38,28 @@ describe("terminalKeyPolicy (#16 interactive grid, Ctrl+C guard)", () => {
     expect(onCtrlC).not.toHaveBeenCalled();
   });
 
+  it("does not intercept Ctrl+Shift+C (Linux/Windows terminal copy) — passes through", () => {
+    const onCtrlC = vi.fn();
+    expect(
+      terminalKeyPolicy(
+        { type: "keydown", ctrlKey: true, shiftKey: true, key: "C" },
+        onCtrlC,
+      ),
+    ).toBe(true);
+    expect(onCtrlC).not.toHaveBeenCalled();
+  });
+
+  it("does not intercept Ctrl+Alt/AltGr+C (EU layout character) — passes through", () => {
+    const onCtrlC = vi.fn();
+    expect(
+      terminalKeyPolicy(
+        { type: "keydown", ctrlKey: true, altKey: true, key: "c" },
+        onCtrlC,
+      ),
+    ).toBe(true);
+    expect(onCtrlC).not.toHaveBeenCalled();
+  });
+
   it("is robust when no Ctrl+C handler is supplied", () => {
     expect(terminalKeyPolicy({ type: "keydown", ctrlKey: true, key: "c" })).toBe(
       false,

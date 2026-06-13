@@ -109,12 +109,12 @@ export function projectStage(
   }
   if (project.status === "paused" || project.status === "archived")
     return "blocked";
-  const working = claims.filter((claim) => isWorkingClaim(claim));
+  const working = claims.filter((claim) => isWorkingClaim(claim, now));
   const reviewClaims = claims.filter(
-    (claim) => isOpenClaim(claim) && claim.status === "review",
+    (claim) => isOpenClaim(claim, now) && claim.status === "review",
   );
   const blockedClaims = claims.filter(
-    (claim) => isOpenClaim(claim) && claim.status === "blocked",
+    (claim) => isOpenClaim(claim, now) && claim.status === "blocked",
   );
   const activeSessions = sessions.filter((session) =>
     isActiveProjectSession(session, now),
