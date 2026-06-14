@@ -1283,6 +1283,13 @@ non-deterministic semantic smells that a linter or type checker CANNOT catch, su
 Do NOT report style, formatting, types, dead code, duplication, naming, performance, \
 or anything a linter or compiler already finds. If you are not confident, report \
 nothing. Prefer silence over a weak guess.\n\
+NO HALLUCINATIONS -- this is the rule that matters most. Before you report anything, \
+RE-READ the lines around it for a guard that ALREADY handles the case: an if/else, an \
+early return, a default, a try/catch, a ternary or match arm, a `!= -1`/null check. If \
+such a guard exists, it is NOT a finding. Report a smell ONLY when you can point to the \
+exact line AND the concrete input or code path that makes it go wrong; ban the words \
+might, could, may, possibly. A false positive is WORSE than a miss -- it sends the author \
+to break working code -- so when in doubt, output nothing.\n\
 Output ONLY a JSON array (no prose, no markdown fences) of objects with EXACTLY these \
 keys: {\"line\": <integer 1-based>, \"title\": <short string>, \"body\": <one-sentence \
 string>, \"severity\": one of \"high\" | \"medium\" | \"low\"}. If there is nothing to \

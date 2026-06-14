@@ -1,0 +1,60 @@
+{
+  "_comment": "Per-model CORRECT inference settings for the local-censor race. Sources: Qwen3 thinking = temp 0.6/top_p 0.95/top_k 20/min_p 0 (NEVER greedy); Gemma 4 = temp 1.0/top_p 0.95/top_k 64, reasoning in reasoning_content via <|channel>thought<channel|>; Devstral 2 = temp 0.15; Nemotron = 'detailed thinking on' system toggle. oMLX returns content (answer) + reasoning_content (thinking) separately; Ollama returns response + thinking. Unload: oMLX POST /v1/models/{id}/unload, Ollama keep_alive=0.",
+  "target": "prodbench/loop.py",
+  "omlx_base": "http://127.0.0.1:8002",
+  "ollama_base": "http://127.0.0.1:11434",
+  "per_model_timeout_s": 600,
+  "models": [
+    {
+      "name": "nemotron-4b",
+      "backend": "ollama",
+      "model": "hf.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M",
+      "thinking": true,
+      "system": "detailed thinking on",
+      "options": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "num_ctx": 32768, "num_predict": 12000}
+    },
+    {
+      "name": "devstral-2-24b",
+      "backend": "ollama",
+      "model": "hf.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF:Q6_K",
+      "thinking": false,
+      "system": "",
+      "options": {"temperature": 0.15, "top_p": 0.95, "num_ctx": 16384, "num_predict": 4000}
+    },
+    {
+      "name": "gemma-4-12b",
+      "backend": "omlx",
+      "model": "gemma-4-12B-it-qat-4bit",
+      "thinking": true,
+      "params": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_tokens": 16000}
+    },
+    {
+      "name": "gemma-4-26b-a4b",
+      "backend": "omlx",
+      "model": "gemma-4-26B-A4B-it-OptiQ-4bit",
+      "thinking": true,
+      "params": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_tokens": 16000}
+    },
+    {
+      "name": "qwen-moe-35b-a3b",
+      "backend": "omlx",
+      "model": "Qwen3.6-35B-A3B-4bit-DWQ",
+      "thinking": true,
+      "params": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "max_tokens": 24000}
+    },
+    {
+      "name": "gemma-4-31b",
+      "backend": "omlx",
+      "model": "gemma-4-31B-it-qat-4bit",
+      "thinking": true,
+      "params": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_tokens": 16000}
+    },
+    {
+      "name": "qwen-dense-27b",
+      "backend": "omlx",
+      "model": "Qwen3.6-27B-OptiQ-4bit",
+      "thinking": true,
+      "params": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "max_tokens": 24000}
+    }
+  ]
+}
