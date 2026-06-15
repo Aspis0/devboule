@@ -86,14 +86,74 @@ pub(crate) const MAX_RESULT_BYTES: u64 = 1 << 20; // 1 MiB
 /// mini attempts before `Escalated`.
 pub const MAX_MINI_RETRIES: u32 = 2;
 
-/// P6: retry budget by directive kind. A WRITE directive gets exactly ONE
-/// censor-driven fix pass (the master plan's bounded inner loop: write ->
-/// det-Censor -> fix once -> stop/escalate); non-write directives keep the
-/// historical MAX_MINI_RETRIES budget.
-pub fn max_mini_retries_for(directive: &MiniCoderDirective) -> u32 {
+/// B1 (agentic-iterative): retry budget for an `AgenticIterative` WRITE directive on a
+/// language WITH deterministic Tier-A coverage. The agentic loop is just the existing P6
+/// retry chain run for more rounds — each round re-emits edits, Rust applies them, the
+/// deterministic Censor verdict gates, and a dirty verdict appends the next round (up to
+/// this budget) before `Escalated`. Raising the budget IS the loop; nothing else changes.
+///
+/// VALUE = 2, justified against the POLL BUDGET (this is the load-bearing bound). The
+/// poll timeout is a HARD failure, NOT a soft "still in progress" signal: when the Python
+/// `spawn_mini_coder` poll (`MINI_CODER_POLL_TIMEOUT_SECS` in `oracle/server/aspis_mcp.py`)
+/// hits its 1800s cap it STAMPS the directive `status="timeout"` + a terminal `result` on
+/// disk (and returns that `timeout` outcome to the coder). Two consequences make this
+/// non-recoverable: (1) the coder acts on the terminal `timeout`; (2) the on-disk terminal
+/// stamp POISONS the still-live retry chain — the executor's later real `apply_result`
+/// sees a non-active (terminal) directive and is REFUSED (`apply_outcome` Err), so the real
+/// verdict is lost and the chain strands. The worst-case therefore MUST fit with headroom.
+///
+/// The chain runs `1 + budget` sequential attempts. Each attempt is gated by `plan_tick`:
+/// it first sits in `Launching` (capped at [`DEFAULT_LAUNCH_CAP_SECS`] = 60s) and then runs
+/// (capped at [`DEFAULT_WALL_CLOCK_CAP_SECS`] = 600s for attempt 0, [`DEFAULT_RETRY_WALL_CLOCK_CAP_SECS`]
+/// = 300s for every retry `attempt >= 1`). Launch precedes Run and is sequential, so the
+/// caps-only worst-case for a budget of N is:
+///   600 + N*300 + (N+1)*60 seconds.
+///     N = 2 -> 600 + 600 + 180  = 1380s  (420s headroom)
+///     N = 3 -> 600 + 900 + 240  = 1740s  (only 60s headroom)
+/// The earlier formula (`600 + N*300`) OMITTED the per-attempt launch caps and so
+/// understated the worst case. Beyond the caps, the deferred verdict thread runs the FINE
+/// linters AFTER the process exits, OUTSIDE the wall-clock caps (the directive is excluded
+/// from `plan_tick` while the verdict is in-flight); the Fine set includes semgrep (up to a
+/// ~300s ceiling) per inter-round gap in the pathological case. At N = 3 the caps-only 1740s
+/// leaves only 60s — a single slow verdict pass blows past 1800s and HARD-times-out the
+/// poll. At N = 2 the 420s headroom comfortably absorbs the per-round verdict passes (in
+/// practice the Fine pass on a <=10-file directive is seconds, not minutes).
+///
+/// We LOWER N to 2 rather than extend the shared, cross-language `MINI_CODER_POLL_TIMEOUT_SECS`
+/// constant for a (currently GPU-deferred) feature: keeping the Python poll contract
+/// untouched is the conservative choice, and 2 fix rounds already cover the vast majority of
+/// deterministic-Censor convergence. If a future need raises N back to >= 3, the Python poll
+/// constant MUST be extended in lockstep with a verdict-thread allowance (and the math above
+/// re-checked); the test `budget_max_agentic_fix_rounds_fits_the_python_poll_budget` pins it.
+pub const MAX_AGENTIC_FIX_ROUNDS: u32 = 2;
+
+/// P6/B1: retry budget by directive kind, language coverage, and write mode.
+///
+/// Budget table (the ONLY behavioral lever of agentic-iterative):
+///   * `write` + `AgenticIterative` + `covered`  -> [`MAX_AGENTIC_FIX_ROUNDS`] (the
+///     N-round loop: deterministic feedback exists, so iterating pays off).
+///   * `write` (any other case: `EmitEdits`, OR `AgenticIterative` with NO coverage)
+///     -> 1 (the master plan's bounded inner loop: write -> det-Censor -> fix once ->
+///     stop/escalate). `AgenticIterative` with no deterministic coverage falls back to
+///     this single pass — iterating without a per-round verdict buys nothing (B2).
+///   * non-write -> historical [`MAX_MINI_RETRIES`] (`covered` is irrelevant here).
+///
+/// `covered` is the caller-resolved "this directive touches >=1 file whose language has a
+/// language-SPECIFIC Tier-A runner" signal (computed in the impure executor from the
+/// directive's files + the project's detected kinds, so this stays pure/IO-free). It is
+/// consulted ONLY in the agentic+write branch; for every other directive the result is
+/// identical to the pre-B1 behavior regardless of `covered`, so the default emit-edits and
+/// the non-write paths stay byte-identical.
+pub fn max_mini_retries_for(directive: &MiniCoderDirective, covered: bool) -> u32 {
     if directive.write {
-        1
+        if directive.write_mode == WriteMode::AgenticIterative && covered {
+            MAX_AGENTIC_FIX_ROUNDS
+        } else {
+            // EmitEdits write, or agentic-but-uncovered (B2 fallback): one fix pass.
+            1
+        }
     } else {
+        // Non-write directive: the historical budget, unchanged. `covered` is ignored.
         MAX_MINI_RETRIES
     }
 }
@@ -844,10 +904,18 @@ pub enum GateDecision {
 /// * NOT a clean `done` (the outcome is needs_clarification/failed/timeout/aborted) OR
 ///   the project is NOT trusted (we never lint an untrusted tree) OR there are NO High
 ///   findings → `StampTerminal(outcome)` (today's behavior).
-/// * Clean `done`, trusted, dirty (High findings present), `attempt < MAX_MINI_RETRIES`
+/// * Clean `done`, trusted, dirty (High findings present), `attempt < budget`
 ///   → `AwaitingRetryWith { retry }` where `retry` is built by [`build_retry_directive`]
 ///   with the High findings summarized into its feedback.
-/// * Clean `done`, trusted, dirty, `attempt >= MAX_MINI_RETRIES` → `Escalate(escalated)`.
+/// * Clean `done`, trusted, dirty, `attempt >= budget` → `Escalate(escalated)`.
+///
+/// The retry `budget` is [`max_mini_retries_for`]`(directive, covered)`: 1 for an
+/// emit-edits (or agentic-but-uncovered) write, [`MAX_AGENTIC_FIX_ROUNDS`] for an
+/// agentic-iterative write on a covered language (the N-round loop — raising the budget IS
+/// the loop), [`MAX_MINI_RETRIES`] for a non-write directive. `covered` is the caller's
+/// "this directive's files include a language with deterministic Tier-A coverage" signal;
+/// it is consulted ONLY for the agentic+write case, so emit-edits/non-write decisions are
+/// byte-identical to before regardless of its value.
 ///
 /// `new_retry_id`/`retry_result_path`/`now` are supplied by the impure caller (fresh id,
 /// scratch-relative result path, RFC3339 clock) so this stays clock/IO-free.
@@ -855,6 +923,7 @@ pub fn verdict_gate_decision(
     directive: &MiniCoderDirective,
     outcome: &MiniCoderOutcome,
     trusted: bool,
+    covered: bool,
     high_findings: Vec<EscalationFinding>,
     new_retry_id: impl Into<String>,
     retry_result_path: impl Into<String>,
@@ -875,9 +944,11 @@ pub fn verdict_gate_decision(
     if blocking_findings.is_empty() {
         return GateDecision::StampTerminal(outcome.clone());
     }
-    // Dirty. Retry if budget remains, else escalate (write directives: ONE
-    // fix pass — see max_mini_retries_for).
-    if directive.attempt < max_mini_retries_for(directive) {
+    // Dirty. Retry if budget remains, else escalate. The budget depends on the
+    // directive kind + write mode + language coverage (see max_mini_retries_for):
+    // emit-edits/uncovered-agentic write -> 1; agentic-iterative write on a covered
+    // language -> MAX_AGENTIC_FIX_ROUNDS (the N-round loop); non-write -> MAX_MINI_RETRIES.
+    if directive.attempt < max_mini_retries_for(directive, covered) {
         let feedback = summarize_findings_for_feedback(&high_findings);
         let retry = build_retry_directive(
             directive,
@@ -2844,6 +2915,7 @@ mod tests {
             &d,
             &outcome,
             false,
+            false,
             vec![high_finding()],
             "root-r1",
             "root-r1.json",
@@ -2863,6 +2935,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            false,
             vec![],
             "root-r1",
             "root-r1.json",
@@ -2884,6 +2957,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            false,
             vec![visual],
             "root-r1",
             "root-r1.json",
@@ -2904,6 +2978,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            false,
             vec![high_finding()],
             "root-r1",
             "root-r1.json",
@@ -2936,6 +3011,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            false,
             vec![high_finding(), visual],
             "root-r1",
             "root-r1.json",
@@ -2963,6 +3039,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            false,
             vec![high_finding()],
             "root-r3",
             "root-r3.json",
@@ -2997,6 +3074,7 @@ mod tests {
             &w,
             &outcome,
             true,
+            false,
             vec![high_finding()],
             "root-r2",
             "root-r2.json",
@@ -3017,6 +3095,7 @@ mod tests {
             &nw,
             &outcome,
             true,
+            false,
             vec![high_finding()],
             "root2-r2",
             "root2-r2.json",
@@ -3041,12 +3120,199 @@ mod tests {
             &d,
             &failed,
             true,
+            false,
             vec![high_finding()],
             "x",
             "x.json",
             "t",
         );
         assert_eq!(decision, GateDecision::StampTerminal(failed));
+    }
+
+    // -- B1/B2: agentic-iterative budget table -------------------------------
+
+    #[test]
+    fn budget_table_covers_every_write_mode_x_coverage_case() {
+        // The ONLY behavioral lever of agentic-iterative is this budget. Pin the full table.
+        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+
+        // Non-write: always MAX_MINI_RETRIES; `covered` and write_mode are irrelevant.
+        d.write = false;
+        d.write_mode = WriteMode::EmitEdits;
+        assert_eq!(max_mini_retries_for(&d, false), MAX_MINI_RETRIES);
+        assert_eq!(max_mini_retries_for(&d, true), MAX_MINI_RETRIES);
+        d.write_mode = WriteMode::AgenticIterative; // write=false -> write_mode ignored
+        assert_eq!(max_mini_retries_for(&d, true), MAX_MINI_RETRIES);
+        assert_eq!(max_mini_retries_for(&d, false), MAX_MINI_RETRIES);
+
+        // EmitEdits write: always exactly 1 (covered must NOT change it — NO-CHURN).
+        d.write = true;
+        d.write_mode = WriteMode::EmitEdits;
+        assert_eq!(max_mini_retries_for(&d, false), 1);
+        assert_eq!(max_mini_retries_for(&d, true), 1, "covered must not affect emit-edits");
+
+        // AgenticIterative write + COVERED: the N-round loop.
+        d.write_mode = WriteMode::AgenticIterative;
+        assert_eq!(max_mini_retries_for(&d, true), MAX_AGENTIC_FIX_ROUNDS);
+        // AgenticIterative write + UNCOVERED: B2 fallback to a single fix pass.
+        assert_eq!(max_mini_retries_for(&d, false), 1);
+    }
+
+    #[test]
+    fn budget_max_agentic_fix_rounds_fits_the_python_poll_budget() {
+        // POLL-BUDGET INVARIANT (mirrors the doc on MAX_AGENTIC_FIX_ROUNDS): the worst-case
+        // chain runs `1 + budget` SEQUENTIAL attempts. Each attempt is capped by `plan_tick`
+        // in TWO consecutive phases: it sits in `Launching` (DEFAULT_LAUNCH_CAP_SECS) BEFORE
+        // it runs (DEFAULT_WALL_CLOCK_CAP_SECS for attempt 0, DEFAULT_RETRY_WALL_CLOCK_CAP_SECS
+        // for every retry). The previous formula omitted the (N+1) launch caps and so
+        // understated the worst case. The poll timeout is HARD (it stamps the directive
+        // terminal on disk + poisons the live retry chain — see the const doc), so the
+        // CORRECTED caps-only worst-case MUST fit STRICTLY inside the Python
+        // `MINI_CODER_POLL_TIMEOUT_SECS` (1800s) with headroom for the out-of-cap fine-verdict
+        // passes between rounds. A regression that raises the budget without extending the
+        // poll constant trips here.
+        const PYTHON_POLL_TIMEOUT_SECS: i64 = 1800; // oracle/server/aspis_mcp.py
+        let n = MAX_AGENTIC_FIX_ROUNDS as i64;
+        // attempt 0 runs at the fresh cap; the N retries at the shorter retry cap; EVERY one
+        // of the (N+1) attempts also pays its launch cap before running.
+        let worst_case = DEFAULT_WALL_CLOCK_CAP_SECS
+            + n * DEFAULT_RETRY_WALL_CLOCK_CAP_SECS
+            + (n + 1) * DEFAULT_LAUNCH_CAP_SECS;
+        assert_eq!(worst_case, 1380, "600 + 2*300 + 3*60 (caps-only, incl. launch caps)");
+        // Strictly under, with headroom: the deferred fine-verdict pass between rounds runs
+        // OUTSIDE these caps, so a thin margin (the old 1500s == 300s) is NOT enough — assert
+        // a generous slack (>= 300s) absorbs those out-of-cap passes.
+        assert!(
+            worst_case <= PYTHON_POLL_TIMEOUT_SECS - 300,
+            "agentic caps-only worst-case {worst_case}s must leave >=300s headroom under the \
+             {PYTHON_POLL_TIMEOUT_SECS}s poll budget for the out-of-cap fine-verdict passes; \
+             raising MAX_AGENTIC_FIX_ROUNDS requires extending MINI_CODER_POLL_TIMEOUT_SECS"
+        );
+    }
+
+    #[test]
+    fn gate_agentic_covered_loops_to_max_rounds_then_escalates() {
+        // An AgenticIterative+covered write that stays DIRTY appends a retry on every
+        // attempt 0..MAX_AGENTIC_FIX_ROUNDS, then escalates at the budget. Simulate the
+        // GateDecision/append loop with a STUBBED always-dirty verdict (no live model).
+        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        d.write = true;
+        d.write_mode = WriteMode::AgenticIterative;
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["src/a.rs".into()],
+            ..Default::default()
+        });
+
+        // attempts 0..(N-1) each get an AwaitingRetryWith (the loop keeps going).
+        for attempt in 0..MAX_AGENTIC_FIX_ROUNDS {
+            d.attempt = attempt;
+            let decision = verdict_gate_decision(
+                &d,
+                &outcome,
+                true,  // trusted
+                true,  // covered
+                vec![high_finding()],
+                format!("root-r{}", attempt + 1),
+                format!("root-r{}.json", attempt + 1),
+                "2026-06-06T00:00:10Z",
+            );
+            match decision {
+                GateDecision::AwaitingRetryWith { retry } => {
+                    assert_eq!(retry.attempt, attempt + 1);
+                    assert_eq!(retry.write_mode, WriteMode::AgenticIterative,
+                        "agentic fix rounds stay agentic");
+                    assert!(retry.write, "fix rounds stay write passes");
+                }
+                other => panic!("attempt {attempt}: expected AwaitingRetryWith, got {other:?}"),
+            }
+        }
+
+        // At the budget the chain is exhausted -> Escalate (attempts = budget + 1).
+        d.attempt = MAX_AGENTIC_FIX_ROUNDS;
+        let decision = verdict_gate_decision(
+            &d,
+            &outcome,
+            true,
+            true,
+            vec![high_finding()],
+            "root-rN",
+            "root-rN.json",
+            "2026-06-06T00:00:10Z",
+        );
+        match decision {
+            GateDecision::Escalate(o) => {
+                assert_eq!(o.status, MiniCoderStatus::Escalated);
+                assert_eq!(o.escalation.expect("escalation").attempts, MAX_AGENTIC_FIX_ROUNDS + 1);
+            }
+            other => panic!("expected Escalate at the budget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_agentic_uncovered_escalates_after_one_pass_like_emit_edits() {
+        // B2 fallback: an AgenticIterative write on an UNCOVERED language behaves exactly
+        // like emit-edits — ONE fix pass, then escalate. Dirty at attempt 1 -> Escalate.
+        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        d.write = true;
+        d.write_mode = WriteMode::AgenticIterative;
+        d.attempt = 1; // the single allowed fix pass already ran
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["notes.md".into()],
+            ..Default::default()
+        });
+        let decision = verdict_gate_decision(
+            &d,
+            &outcome,
+            true,
+            false, // UNCOVERED -> budget 1
+            vec![high_finding()],
+            "root-r2",
+            "root-r2.json",
+            "2026-06-06T00:00:10Z",
+        );
+        assert!(
+            matches!(decision, GateDecision::Escalate(_)),
+            "agentic+uncovered must escalate after one pass, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn gate_emit_edits_write_is_byte_identical_regardless_of_covered() {
+        // NO-CHURN guard: the default (emit-edits) write path produces the SAME decision
+        // whether `covered` is true or false (the budget fn ignores coverage for it). Pin
+        // both the retry-at-attempt-0 and the escalate-at-attempt-1 transitions.
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["src/a.rs".into()],
+            ..Default::default()
+        });
+        for &covered in &[false, true] {
+            // attempt 0, dirty -> AwaitingRetryWith (the one fix pass).
+            let mut d0 = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+            d0.write = true; // write_mode defaults to EmitEdits
+            let dec0 = verdict_gate_decision(
+                &d0, &outcome, true, covered, vec![high_finding()],
+                "root-r1", "root-r1.json", "2026-06-06T00:00:10Z",
+            );
+            assert!(
+                matches!(dec0, GateDecision::AwaitingRetryWith { .. }),
+                "emit-edits attempt 0 dirty must retry (covered={covered})"
+            );
+            // attempt 1, dirty -> Escalate (budget exhausted at 1).
+            let mut d1 = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+            d1.write = true;
+            d1.attempt = 1;
+            let dec1 = verdict_gate_decision(
+                &d1, &outcome, true, covered, vec![high_finding()],
+                "root-r2", "root-r2.json", "2026-06-06T00:00:10Z",
+            );
+            assert!(
+                matches!(dec1, GateDecision::Escalate(_)),
+                "emit-edits attempt 1 dirty must escalate (covered={covered})"
+            );
+        }
     }
 
     #[test]

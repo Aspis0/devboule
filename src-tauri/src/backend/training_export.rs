@@ -773,7 +773,15 @@ fn record_directive_result_capped(
     // write_fix_pair (escalated/failed chains) are orphans BY DESIGN, and blob
     // coverage is best-effort per file (size/binary caps) — the offline joiner
     // must tolerate both.
+    //
+    // B3: ONLY for `EmitEdits` directives. An `AgenticIterative` chain is a multi-round
+    // trajectory, NOT a clean two-point {rejected, chosen} preference pair — emitting one
+    // would pollute `pairs.jsonl`, whose ORPO signal must stay the clean emit-edits source.
+    // The `directive_result` line above is still recorded for every kind (so an agentic
+    // trajectory is observable for prodbench); only the paired {write_fix_pair, eval_pair}
+    // markers are withheld for agentic writes.
     if directive.write
+        && directive.write_mode == super::mini_coder::WriteMode::EmitEdits
         && directive.attempt > 0
         && outcome.status == MiniCoderStatus::Done
         && !outcome.files_touched.is_empty()
@@ -1542,6 +1550,57 @@ mod tests {
         assert_eq!(lines[2]["backend"], "default-backend");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&root2).ok();
+    }
+
+    // -- B3: ORPO pair gated on write_mode ----------------------------------
+
+    #[test]
+    fn b3_emit_edits_write_fix_leaf_still_emits_orpo_pair() {
+        // B3 control: an EMIT-EDITS write->fix->clean leaf (the historical case) still
+        // emits the full {directive_result, write_fix_pair, eval_pair} trio — the clean
+        // ORPO signal is preserved EXACTLY (this is the path B3 must not disturb).
+        let root = tmp("b3emit");
+        let mut leaf = directive("dEE-r1", "coderP");
+        leaf.write = true;
+        leaf.write_mode = WriteMode::EmitEdits;
+        leaf.attempt = 1;
+        leaf.parent_directive_id = Some("dEE".into());
+        let mut outcome = MiniCoderOutcome::default();
+        outcome.status = MiniCoderStatus::Done;
+        outcome.files_touched = vec!["src/a.rs".into()];
+        record_directive_result(&root, &leaf, &outcome);
+        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 3, "emit-edits leaf: directive_result + write_fix_pair + eval_pair");
+        assert_eq!(lines[1]["type"], "write_fix_pair");
+        assert_eq!(lines[2]["type"], "eval_pair");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn b3_agentic_write_fix_leaf_emits_no_orpo_pair() {
+        // B3: an AGENTIC-ITERATIVE write->fix->clean leaf — same shape that would emit a
+        // pair for emit-edits — must record ONLY the directive_result line. A multi-round
+        // agentic trajectory is NOT a clean {rejected, chosen} preference pair, so neither
+        // write_fix_pair nor eval_pair is emitted (keep pairs.jsonl the clean emit-edits ORPO
+        // source). The directive_result is still present (observable for prodbench).
+        let root = tmp("b3agentic");
+        let mut leaf = directive("dAG-r1", "coderP");
+        leaf.write = true;
+        leaf.write_mode = WriteMode::AgenticIterative;
+        leaf.attempt = 1;
+        leaf.parent_directive_id = Some("dAG".into());
+        let mut outcome = MiniCoderOutcome::default();
+        outcome.status = MiniCoderStatus::Done;
+        outcome.files_touched = vec!["src/a.rs".into()];
+        record_directive_result(&root, &leaf, &outcome);
+        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
+        assert_eq!(lines.len(), 1, "agentic leaf: directive_result ONLY, no ORPO pair");
+        assert_eq!(lines[0]["type"], "directive_result");
+        assert!(
+            lines.iter().all(|l| l["type"] != "write_fix_pair" && l["type"] != "eval_pair"),
+            "agentic trajectory must NOT pollute pairs.jsonl with ORPO pair markers"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // -- WARNING 10: future-dated terminal directive not attributed --------

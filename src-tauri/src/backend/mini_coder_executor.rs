@@ -49,7 +49,8 @@ use super::agents;
 use super::project_skill::{fenced_skill_block, read_project_skill};
 use super::mini_coder::{
     self, MiniCoderBackend, MiniCoderBackendKind, MiniCoderDirective, MiniCoderOutcome,
-    MiniCoderStatus, DEFAULT_LAUNCH_CAP_SECS, DEFAULT_WALL_CLOCK_CAP_SECS, MAX_DIRECTIVES,
+    MiniCoderStatus, WriteMode, DEFAULT_LAUNCH_CAP_SECS, DEFAULT_WALL_CLOCK_CAP_SECS,
+    MAX_DIRECTIVES,
 };
 #[cfg(windows)]
 use super::projects::ps_single_quote;
@@ -1373,6 +1374,57 @@ fn run_verdict_thread_body(
     // `_guard` drops here (or during unwind above) -> the in-flight id is released.
 }
 
+/// B2: does this directive touch at least one file in a language WITH deterministic
+/// Tier-A coverage that the PER-ROUND verdict actually exercises? "Covered" = the file's
+/// [`FileLang`] has a LANGUAGE-SPECIFIC **Fine-granularity** applicable runner — i.e.
+/// `applicable_runners(kinds, lang)` contributes MORE FINE runners than the cross-cutting
+/// set does.
+///
+/// WHY FINE ONLY (the load-bearing correction): the agentic loop's between-round feedback
+/// is produced by the deferred verdict thread (`spawn_verdict_thread` ->
+/// `run_fine_batch_no_rail`), which runs ONLY [`Granularity::Fine`] runners. The Coarse
+/// runners (clippy/cargo-check/cargo-audit/cargo-deny/cargo-fmt, tsc/knip, go vet, …) run
+/// asynchronously on the coarse debounce, NOT in the per-round gate, so they cannot inform
+/// a retry round. Counting ALL applicable runners would deem a language "covered" whose
+/// only language-specific tools are Coarse (e.g. RUST: every Rust runner is Coarse) — the
+/// agentic chain would then burn N rounds with NO useful Rust-specific per-round feedback
+/// (only the cross-cutting Fine runners fire), the real clippy/cargo-check errors surfacing
+/// only after the chain is already terminal. So we count Fine runners exclusively.
+///
+/// The cross-cutting FINE baseline is computed (not hardcoded) as the count of Fine runners
+/// for [`FileLang::Other`], which hits the `_ => {}` arm and so yields ONLY `CROSS_CUTTING`
+/// (today: Lizard + Semgrep are Fine, so the baseline is 2; the rest of CROSS_CUTTING is
+/// Coarse). NOTE: this baseline is the dynamically-computed cross-cutting FINE count — it is
+/// NOT zero. Any `lang` whose Fine count EXCEEDS that baseline added a language-specific
+/// FINE runner the per-round verdict can iterate against. Computing it from `FileLang::Other`
+/// avoids exporting the private `CROSS_CUTTING` const from the runners module.
+///
+/// Drives the agentic-iterative budget (B1/B2): an `AgenticIterative` write on a covered
+/// language gets the N-round loop; an uncovered one (incl. Rust — Coarse-only) falls back to
+/// a single fix pass (iterating without a per-round deterministic verdict buys nothing).
+/// Project kinds are detected ONCE; the baseline ONCE; then each file is classified by
+/// extension/name.
+fn directive_has_tier_a_coverage(root: &Path, files: &[String]) -> bool {
+    use crate::backend::censor::detect::{detect_project_kinds, FileLang};
+    use crate::backend::censor::runners::{applicable_runners, Granularity};
+    if files.is_empty() {
+        return false;
+    }
+    let kinds = detect_project_kinds(root);
+    let fine_count = |lang: FileLang| {
+        applicable_runners(&kinds, lang)
+            .iter()
+            .filter(|r| r.granularity() == Granularity::Fine)
+            .count()
+    };
+    // The cross-cutting-only FINE baseline: FileLang::Other gets no language-specific runner,
+    // so this is exactly the count of Fine runners inside CROSS_CUTTING (not zero).
+    let fine_baseline = fine_count(FileLang::Other);
+    files
+        .iter()
+        .any(|f| fine_count(FileLang::from_path(Path::new(f))) > fine_baseline)
+}
+
 /// P6 verdict gate APPLY + finalize. The terminal `outcome` and `trusted` flag are
 /// PRECOMPUTED by the caller ([`finalize_finished_mini`], WARNING 3: from ONE snapshot);
 /// `verdict_fn(project_root, files) -> Vec<EscalationFinding>` is the deterministic-Censor
@@ -1383,8 +1435,9 @@ fn run_verdict_thread_body(
 ///
 /// FLOW (all heavy work OUTSIDE the lock; the decision applied in ONE atomic mutate):
 ///  1. If the gate applies, collect High findings via `verdict_fn`.
-///  2. `verdict_gate_decision` turns (directive, outcome, trusted, high_findings) into a
-///     pure `GateDecision`.
+///  2. `verdict_gate_decision` turns (directive, outcome, trusted, covered, high_findings)
+///     into a pure `GateDecision`. `covered` (B2) is the agentic-iterative language-coverage
+///     signal — resolved here and consulted ONLY for an `AgenticIterative` write.
 ///  3. Apply the decision under ONE `mutate_agent_live_state`:
 ///       - StampTerminal: stamp the outcome (with the P5 live-kill re-check) + propagate.
 ///       - AwaitingRetryWith: `apply_awaiting_retry` + append the Pending retry (atomic).
@@ -1413,6 +1466,30 @@ fn finalize_finished_mini_with(
         }
     }
 
+    // 2b) B2 coverage: an `AgenticIterative` WRITE directive gets the N-round budget ONLY
+    //     when at least one of its files is in a language WITH deterministic Tier-A
+    //     coverage (iterating with no per-round verdict buys nothing). Resolved here, in
+    //     the impure layer (it scans the project tree), and threaded into the pure budget.
+    //     NO-CHURN + efficiency: computed ONLY for an agentic write that is ALSO a clean,
+    //     trusted, non-killed `done` — i.e. exactly the path where `verdict_gate_decision`
+    //     can actually consult the budget. The default emit-edits path, the non-write path,
+    //     and any non-Done/untrusted/killed agentic outcome never run `detect_project_kinds`
+    //     (those short-circuit to `StampTerminal` before the budget is read), so the hot
+    //     path adds NO new filesystem scan and `covered` stays an irrelevant `false`.
+    let covered = if directive.write
+        && directive.write_mode == WriteMode::AgenticIterative
+        && trusted
+        && outcome.status == MiniCoderStatus::Done
+        && !directive.kill_requested
+    {
+        project_root
+            .as_deref()
+            .map(|root| directive_has_tier_a_coverage(root, &directive.files))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     // 3) Pure decision.
     let now = Utc::now().to_rfc3339();
     let retry_id = format!("{}-r{}", mini_coder::chain_root_id(directive), directive.attempt + 1);
@@ -1421,6 +1498,7 @@ fn finalize_finished_mini_with(
         directive,
         &outcome,
         trusted,
+        covered,
         high_findings,
         &retry_id,
         &retry_result_path,
@@ -4449,6 +4527,52 @@ mod tests {
     }
 
     #[test]
+    fn coverage_counts_only_fine_runners_rust_uncovered_python_covered() {
+        // BLOCKER-2: "covered" must reflect what the PER-ROUND verdict (Fine pass) actually
+        // exercises, NOT all applicable runners. RUST's language-specific runners (clippy/
+        // cargo-check/cargo-audit/cargo-deny/cargo-fmt) are ALL Coarse, so a Rust file adds
+        // ZERO Fine runners over the cross-cutting Fine baseline -> NOT covered (budget 1, no
+        // per-round Rust feedback to iterate against). PYTHON's ruff/ruff-format/pyright/
+        // bandit/vulture are Fine -> covered (budget N). Both projects carry the matching
+        // manifest so `detect_project_kinds` recognizes the kind.
+        let rust_root = p4_temp_project("cov-rust");
+        std::fs::write(rust_root.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert!(
+            !directive_has_tier_a_coverage(&rust_root, &["src/a.rs".to_string()]),
+            "Rust is Coarse-only for its lang-specific runners -> must be UNCOVERED"
+        );
+        std::fs::remove_dir_all(&rust_root).ok();
+
+        let py_root = p4_temp_project("cov-python");
+        std::fs::write(py_root.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+        assert!(
+            directive_has_tier_a_coverage(&py_root, &["src/a.py".to_string()]),
+            "Python has Fine lang-specific runners (ruff/pyright/bandit/...) -> must be COVERED"
+        );
+        // A Rust file inside a Python project is still uncovered: it has NO Python Fine
+        // runner and Rust's own runners need the Rust kind (absent here) -> baseline only.
+        assert!(
+            !directive_has_tier_a_coverage(&py_root, &["src/a.rs".to_string()]),
+            "a .rs file in a Python-only project gets only cross-cutting runners -> UNCOVERED"
+        );
+        // Mixed directive: ANY covered file flips the whole directive to covered.
+        assert!(
+            directive_has_tier_a_coverage(&py_root, &["src/a.rs".to_string(), "src/b.py".to_string()]),
+            "a directive with >=1 covered (.py) file is COVERED even alongside an uncovered .rs"
+        );
+        std::fs::remove_dir_all(&py_root).ok();
+    }
+
+    #[test]
+    fn coverage_empty_files_is_uncovered() {
+        // Defensive: an empty file list can never be covered (matches the early return).
+        let root = p4_temp_project("cov-empty");
+        std::fs::write(root.join("pyproject.toml"), "[project]\n").unwrap();
+        assert!(!directive_has_tier_a_coverage(&root, &[]));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn apply_edits_rejects_allowlist_miss_traversal_and_case_variant() {
         let root = p4_temp_project("allow");
         std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
@@ -5548,6 +5672,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            false,
             findings,
             "root-r1",
             "root-r1.json",
