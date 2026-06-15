@@ -719,8 +719,15 @@ describe("dock", () => {
     expect(DOCK_TABS[0].id).toBe("censor");
   });
 
-  it("exposes the four tabs in order", () => {
-    expect(DOCK_TABS.map((t) => t.id)).toEqual(["censor", "activity", "git", "plans"]);
+  it("exposes the five tabs in order (Console is the structured activity timeline)", () => {
+    expect(DOCK_TABS.map((t) => t.id)).toEqual([
+      "censor",
+      "activity",
+      "git",
+      "plans",
+      "console",
+    ]);
+    expect(DOCK_TABS[DOCK_TABS.length - 1].label).toBe("Console");
   });
 });
 

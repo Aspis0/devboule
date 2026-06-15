@@ -40,6 +40,9 @@ import type {
 } from "../../types/backend";
 import type { CustomAgentClient } from "../../types/config";
 import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
+import { AgentConsole } from "../agents/AgentConsole";
+import { consoleRunCount } from "../agents/agentConsoleModel";
+import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { AgentQuestionCard } from "./AgentQuestionCard";
 import { CensorPanel } from "./CensorPanel";
@@ -191,6 +194,14 @@ export function ProjectWorkspace({
         agentId,
       }),
   });
+
+  // The structured Console timeline for the SELECTED agent. The hook degrades to
+  // the empty resting state until the Step B backend (mini_activity_snapshot +
+  // mini-activity://<agentId>) lands — no second poller, no GPU. Its `running`
+  // flag drives the spinner + run-count pill on the Console tab.
+  const consoleActivity = useAgentConsole(selectedAgentId);
+  const consoleRunning = Boolean(consoleActivity.running);
+  const consoleCount = consoleRunCount(consoleActivity);
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
   // two-step confirm): `mini_coder_kill` records killRequested THEN kills the PTY so
@@ -471,18 +482,40 @@ export function ProjectWorkspace({
         <div className="flex w-fit gap-1 border-b border-cream-200 p-1">
           {DOCK_TABS.map((tab) => {
             const active = dockTab === tab.id;
+            // The Console tab carries a run pill (spinner + count) while a mini run
+            // is active for the selected agent — mirroring the mock's tab badge.
+            const showConsoleRun = tab.id === "console" && consoleRunning;
             return (
               <button
                 key={tab.id}
                 type="button"
                 onClick={() => setDockTab(tab.id)}
-                className={`rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-colors ${
                   active
                     ? "bg-terracotta text-white"
                     : "text-cream-500 hover:bg-cream-50 hover:text-cream-700"
                 }`}
               >
                 {tab.label}
+                {showConsoleRun ? (
+                  <span
+                    className={`inline-flex items-center gap-1 rounded-full px-1.5 text-[10px] font-bold ${
+                      active
+                        ? "bg-white/20 text-white"
+                        : "bg-indigo/15 text-indigo-dark"
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 animate-spin rounded-full border-[1.6px] border-transparent motion-reduce:animate-none ${
+                        active
+                          ? "border-t-white"
+                          : "border-indigo-light border-t-indigo"
+                      }`}
+                      aria-hidden
+                    />
+                    {consoleCount}
+                  </span>
+                ) : null}
               </button>
             );
           })}
@@ -507,6 +540,17 @@ export function ProjectWorkspace({
 
           {dockTab === "plans" && (
             <PlansDockTab projectId={project.metadata.id} />
+          )}
+
+          {dockTab === "console" && (
+            // CONCRETE height (the mock's dock-body height) so BOTH the empty
+            // state's `flex-1 h-full justify-center` can actually center AND a long
+            // timeline scrolls inside the panel. A max-h/min-h pair leaves the
+            // flex child without a definite height, so the empty state pins to the
+            // top instead of centering.
+            <div className="flex h-[348px] flex-col overflow-y-auto">
+              <AgentConsole activity={consoleActivity} />
+            </div>
           )}
         </div>
       </div>
