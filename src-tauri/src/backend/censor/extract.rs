@@ -20,13 +20,13 @@
 //!      worse than letting a hallucination slip to the next tier, so anything that
 //!      is not a hard contradiction is KEPT.
 //!
-//! PRODUCT GENERALITY: the API is keyed on [`FileLang`]. Today only the Rust
-//! grammar is wired (DISCIPLINE: one grammar at a time, per the plan). Other
-//! languages degrade gracefully — [`extract_items`] returns an empty `Vec` and
-//! [`parse_file`] yields an empty identifier set, so symbol grounding is disabled
-//! for them (unknown != contradicted) while the universal line-range grounding
-//! still applies (it only needs the line count). tree-sitter is not OS-specific,
-//! so there is NO `cfg` gating here.
+//! PRODUCT GENERALITY: the API is keyed on [`FileLang`]. Wired grammars: Rust,
+//! TS/JS (the TSX grammar — broadest of the TS family, parses TS/JS/JSX/TSX), and
+//! Python. `FileLang::Other` degrades gracefully — [`extract_items`] returns an
+//! empty `Vec` and [`parse_file`] yields an empty identifier set, so symbol
+//! grounding is disabled for it (unknown != contradicted) while the universal
+//! line-range grounding still applies (it only needs the line count). tree-sitter
+//! is not OS-specific, so there is NO `cfg` gating here.
 //!
 //! DEAD-CODE NOTE: this module ships "dark". The public API is consumed by the
 //! Censor merge in a LATER workstream (C4 wires grounding into the live reviewer
@@ -107,11 +107,21 @@ pub enum Grounding {
 /// Names come from the item's declared identifier; an `impl` block (which has no
 /// declared name) is named by its implemented type (see [`rust_item_name`]).
 ///
-/// Other languages (`Ts`, `Py`, `Other`): return an empty `Vec` for now. The
-/// routing is scaffolded so additional grammars slot in later — see the per-`lang`
-/// match. This NEVER panics (a grammar/parse failure yields an empty `Vec`).
+/// TS/JS (`Ts`): parsed with `tree-sitter-typescript`'s TSX grammar; returns the
+/// top-level `function_declaration`, `generator_function_declaration`,
+/// `class_declaration`, `abstract_class_declaration`, `interface_declaration`,
+/// `type_alias_declaration`, `enum_declaration`, and `lexical_declaration` /
+/// `variable_declaration` whose initializer is an arrow/function (named by the bound
+/// variable), UNWRAPPING `export_statement` to its inner declaration.
 ///
-// TODO(C1 follow-up): add the JS/TS, Python, then C/C++/Kotlin/Go/HTML grammars.
+/// Python (`Py`): parsed with `tree-sitter-python`; returns the top-level
+/// `function_definition` and `class_definition`, UNWRAPPING `decorated_definition`.
+///
+/// `Other`: returns an empty `Vec`. This NEVER panics (a grammar/parse failure
+/// yields an empty `Vec`).
+///
+// TODO(C2/C3 follow-up): add the C/C++/Kotlin/Go/HTML grammars where a strong tool
+// and a clear review-unit set exist.
 ///
 /// Delegates to [`parse_file`] (the SINGLE parse path) and returns only its `items`,
 /// so a file is parsed by exactly one routine. A caller that needs items AND grounding
@@ -136,7 +146,23 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
                 identifiers,
             }
         }
-        FileLang::Ts | FileLang::Py | FileLang::Other => ParsedFile {
+        FileLang::Ts => {
+            let (items, identifiers) = parse_ts(source);
+            ParsedFile {
+                total_lines,
+                items,
+                identifiers,
+            }
+        }
+        FileLang::Py => {
+            let (items, identifiers) = parse_py(source);
+            ParsedFile {
+                total_lines,
+                items,
+                identifiers,
+            }
+        }
+        FileLang::Other => ParsedFile {
             total_lines,
             items: Vec::new(),
             identifiers: HashSet::new(),
@@ -459,6 +485,258 @@ fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
     parser.parse(source, None)
 }
 
+// ===========================================================================
+// TS/JS (TSX grammar)
+// ===========================================================================
+
+/// The TS/JS top-level item node kinds we treat as review units, as direct children
+/// of the `program` root (or the inner declaration of an `export_statement`, which we
+/// unwrap). The first group is named by a `name` field; the two variable-binding kinds
+/// (`lexical_declaration` for `let`/`const`, `variable_declaration` for `var`) are
+/// special-cased in [`ts_top_level_item`] because a top-level `const foo = () => {}`
+/// is a function in everything but grammar shape, and its name lives on the
+/// `variable_declarator`, not on the declaration node.
+const TS_ITEM_KINDS: [&str; 7] = [
+    "function_declaration",
+    "generator_function_declaration",
+    "class_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "type_alias_declaration",
+    "enum_declaration",
+];
+
+/// Build a [`ReviewItem`] from a top-level TS/JS node IF it is a review unit; else
+/// `None`. The node passed in is the (already export-unwrapped) declaration. Lines and
+/// names come from the SAME node we report (so the line range covers the declaration,
+/// not the `export` keyword); see [`ts_top_level_item`]'s caller for the unwrap. The
+/// row math SATURATES (`+1` on `u32::MAX` would wrap) — pathological for real source,
+/// but a wrapped tiny line number would corrupt grounding, so we clamp.
+fn ts_review_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> {
+    let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    let kind = node.kind();
+    let name = if TS_ITEM_KINDS.contains(&kind) {
+        // The declared identifier lives in the `name` field for every one of these.
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+    } else if kind == "lexical_declaration" || kind == "variable_declaration" {
+        // ONLY a binding whose initializer is an arrow/function is an item — a plain
+        // `const X = 1;` is data, not a review unit. Name = the bound variable.
+        ts_function_binding_name(node, bytes)?
+    } else {
+        return None;
+    };
+    Some(ReviewItem {
+        kind: kind.to_string(),
+        name,
+        start_line: to_line(node.start_position().row),
+        end_line: to_line(node.end_position().row),
+    })
+}
+
+/// For a `lexical_declaration`/`variable_declaration`, return `Some(Some(name))` when
+/// its FIRST `variable_declarator`'s `value` is an arrow or function expression (so the
+/// declaration is a function bound to a name), where `name` is the declarator's `name`
+/// field text; `Some(None)` if it is a function binding with no readable name; and
+/// `None` (filtering the whole declaration out as a review unit) when no declarator
+/// binds a function. We look at the first declarator: a multi-binding `const a = () =>
+/// {}, b = 1;` is rare and the first binding decides the unit's identity.
+fn ts_function_binding_name(
+    node: &tree_sitter::Node,
+    bytes: &[u8],
+) -> Option<Option<String>> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let value = match child.child_by_field_name("value") {
+            Some(v) => v,
+            None => continue,
+        };
+        if !matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "function" | "generator_function"
+        ) {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string());
+        return Some(name);
+    }
+    None
+}
+
+/// The TS/JS leaf node kinds that count as "an identifier present in the file" for
+/// symbol grounding. `identifier` covers variables/functions/calls/imports;
+/// `property_identifier` covers object keys, class members and method names;
+/// `type_identifier` covers classes/interfaces/type-aliases/enums and type
+/// references; `shorthand_property_identifier` covers `{ x }` object shorthand and its
+/// pattern form. Same conservative rule as Rust: collect every name a finding would
+/// plausibly cite so symbol grounding never false-drops a real finding.
+fn is_ts_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "property_identifier"
+            | "type_identifier"
+            | "shorthand_property_identifier"
+            | "shorthand_property_identifier_pattern"
+    )
+}
+
+/// Parse TS/JS `source` into `(items, identifiers)` — the SINGLE TS parse routine.
+/// Top-level items are the direct children of `program`, with `export_statement`
+/// UNWRAPPED to its inner `declaration` (so `export function f` reports the
+/// `function_declaration`, named `f`, with the export's line range collapsed onto the
+/// declaration). The identifier set is every identifier-like leaf in the whole tree
+/// (see [`is_ts_identifier_kind`]). A parse failure yields empty + empty (symbol
+/// grounding then disabled — fail-open, never a false drop).
+fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+    let tree = match parse_with(source, tree_sitter_typescript::LANGUAGE_TSX.into()) {
+        Some(t) => t,
+        None => return (Vec::new(), HashSet::new()),
+    };
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut items = Vec::new();
+    let mut top_cursor = root.walk();
+    for child in root.children(&mut top_cursor) {
+        // Unwrap `export ...` / `export default ...` to the declaration it carries; a
+        // re-export with no declaration (`export { x }`, `export * from ...`) has no
+        // `declaration` field, so it is skipped (not a review unit).
+        let decl = if child.kind() == "export_statement" {
+            match child.child_by_field_name("declaration") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            child
+        };
+        if let Some(item) = ts_review_item(&decl, bytes) {
+            items.push(item);
+        }
+    }
+
+    let identifiers = collect_identifiers(root, bytes, is_ts_identifier_kind);
+    (items, identifiers)
+}
+
+// ===========================================================================
+// Python
+// ===========================================================================
+
+/// The Python top-level item node kinds we treat as review units, as direct children
+/// of the `module` root (or the inner `definition` of a `decorated_definition`, which
+/// we unwrap). Both are named by a `name` field.
+const PY_ITEM_KINDS: [&str; 2] = ["function_definition", "class_definition"];
+
+/// Build a [`ReviewItem`] from a (already decorator-unwrapped) top-level Python node
+/// IF it is a review unit; else `None`. Name comes from the `name` field. Row math
+/// SATURATES (see [`ts_review_item`]).
+fn py_review_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> {
+    let kind = node.kind();
+    if !PY_ITEM_KINDS.contains(&kind) {
+        return None;
+    }
+    let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string());
+    Some(ReviewItem {
+        kind: kind.to_string(),
+        name,
+        start_line: to_line(node.start_position().row),
+        end_line: to_line(node.end_position().row),
+    })
+}
+
+/// Parse Python `source` into `(items, identifiers)` — the SINGLE Python parse routine.
+/// Top-level items are the direct children of `module`, with `decorated_definition`
+/// UNWRAPPED to its inner `definition` (so `@deco\ndef f` reports the
+/// `function_definition`, named `f`; the line range is taken from that inner node, i.e.
+/// the `def`/`class` line through the body). The identifier set is every `identifier`
+/// leaf in the whole tree. A parse failure yields empty + empty (fail-open).
+fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+    let tree = match parse_with(source, tree_sitter_python::LANGUAGE.into()) {
+        Some(t) => t,
+        None => return (Vec::new(), HashSet::new()),
+    };
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut items = Vec::new();
+    let mut top_cursor = root.walk();
+    for child in root.children(&mut top_cursor) {
+        // Unwrap `@deco\ndef/class` to the definition it decorates.
+        let def = if child.kind() == "decorated_definition" {
+            match child.child_by_field_name("definition") {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            child
+        };
+        if let Some(item) = py_review_item(&def, bytes) {
+            items.push(item);
+        }
+    }
+
+    let identifiers = collect_identifiers(root, bytes, |k| k == "identifier");
+    (items, identifiers)
+}
+
+// ===========================================================================
+// Shared grammar helpers
+// ===========================================================================
+
+/// Build a fresh parser for `language` and parse `source`. Returns `None` (never
+/// panics) if the language can't be set (an ABI mismatch would surface here) or the
+/// parse yields nothing. Parser construction is cheap (microseconds) and a fresh
+/// parser avoids any shared-state / thread concerns — same rationale as the Rust path.
+fn parse_with(source: &str, language: tree_sitter::Language) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    parser.parse(source, None)
+}
+
+/// Collect every identifier-like leaf in the tree rooted at `root`, by a pre-order DFS
+/// over an explicit stack (never recurses unbounded on a deep tree — mirrors the Rust
+/// walk in [`parse_rust`]). `is_ident_kind` decides which node kinds count for the
+/// language. Empty-text nodes are skipped. This is the language-agnostic body shared by
+/// the TS and Python paths; Rust keeps its own walk because it also folds in `lifetime`
+/// names with bespoke `'`-stripping.
+fn collect_identifiers(
+    root: tree_sitter::Node,
+    bytes: &[u8],
+    is_ident_kind: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    let mut identifiers = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if is_ident_kind(node.kind()) {
+            if let Ok(text) = node.utf8_text(bytes) {
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    identifiers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,11 +865,11 @@ macro_rules! noop { () => {}; }
     }
 
     #[test]
-    fn extract_items_non_rust_is_empty() {
-        // No grammar wired yet for these — graceful empty, never a panic.
-        assert!(extract_items(SNIPPET, FileLang::Ts).is_empty());
-        assert!(extract_items("def f(): pass", FileLang::Py).is_empty());
+    fn extract_items_other_lang_is_empty() {
+        // `Other` has no grammar — graceful empty, never a panic. (Ts/Py now DO
+        // produce items; see the dedicated TS/Python tests below.)
         assert!(extract_items("anything", FileLang::Other).is_empty());
+        assert!(extract_items(SNIPPET, FileLang::Other).is_empty());
     }
 
     #[test]
@@ -733,10 +1011,11 @@ macro_rules! noop { () => {}; }
 
     #[test]
     fn grounding_no_grammar_keeps_unknown_symbol_but_still_checks_line() {
-        // Python: no grammar wired → no identifiers → symbol grounding DISABLED
-        // (unknown != contradicted), but line-range grounding still applies.
-        let py = "def add(a, b):\n    return a + b\n"; // 2 content lines
-        let parsed = parse_file(py, FileLang::Py);
+        // `Other`: no grammar → no identifiers → symbol grounding DISABLED (unknown
+        // != contradicted), but line-range grounding still applies. (Ts/Py now HAVE
+        // grammars, so this invariant is exercised on the grammar-less `Other`.)
+        let src = "line one\nline two\n"; // 2 content lines
+        let parsed = parse_file(src, FileLang::Other);
         assert!(parsed.items.is_empty());
         assert!(parsed.identifiers.is_empty());
         // An unknown symbol is KEPT (we can't vouch, so we don't contradict).
@@ -885,5 +1164,263 @@ macro_rules! noop { () => {}; }
         let via_extract = extract_items(SNIPPET, FileLang::Rust);
         let via_parse = parse_file(SNIPPET, FileLang::Rust).items;
         assert_eq!(via_extract, via_parse);
+    }
+
+    // =======================================================================
+    // TS/JS (TSX grammar)
+    // =======================================================================
+
+    /// A TS snippet exercising every top-level review-unit kind plus a nested method
+    /// (which must NOT surface as a top-level item). Line numbers (1-based) annotated.
+    const TS_SNIPPET: &str = "\
+function foo() {
+  return 1;
+}
+
+class Bar {
+  method() {
+    return 2;
+  }
+}
+
+export function baz() {}
+
+const qux = () => {
+  return 3;
+};
+
+interface I {
+  x: number;
+}
+
+type T = string | number;
+";
+
+    #[test]
+    fn extract_items_ts_kinds_lines_and_names() {
+        let items = extract_items(TS_SNIPPET, FileLang::Ts);
+
+        // The top-level units: foo, Bar, baz, qux, I, T — exactly six. The nested
+        // `method` inside `Bar` is NOT a top-level item.
+        assert_eq!(items.len(), 6, "items: {items:?}");
+
+        let foo = item(&items, "function_declaration");
+        assert_eq!(foo.name.as_deref(), Some("foo"));
+        // `function foo() {` is line 1; closing `}` is line 3.
+        assert_eq!(foo.start_line, 1);
+        assert_eq!(foo.end_line, 3);
+
+        let bar = item(&items, "class_declaration");
+        assert_eq!(bar.name.as_deref(), Some("Bar"));
+        // `class Bar {` is line 5; closing `}` is line 9.
+        assert_eq!(bar.start_line, 5);
+        assert_eq!(bar.end_line, 9);
+
+        // `export function baz()` is unwrapped: the item is the `function_declaration`,
+        // named `baz`. The line range is the declaration's (line 11), NOT the export
+        // keyword on a separate line — here they coincide on line 11.
+        let baz = items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("baz"))
+            .expect("baz function present");
+        assert_eq!(baz.kind, "function_declaration");
+        assert_eq!(baz.start_line, 11);
+        assert_eq!(baz.end_line, 11);
+
+        // `const qux = () => {}` — an arrow bound to a name is a review unit, named by
+        // the binding. Its kind is the declaration node `lexical_declaration`.
+        let qux = item(&items, "lexical_declaration");
+        assert_eq!(qux.name.as_deref(), Some("qux"));
+        // `const qux = () => {` is line 13; closing `};` is line 15.
+        assert_eq!(qux.start_line, 13);
+        assert_eq!(qux.end_line, 15);
+
+        let iface = item(&items, "interface_declaration");
+        assert_eq!(iface.name.as_deref(), Some("I"));
+        assert_eq!(iface.start_line, 17);
+        assert_eq!(iface.end_line, 19);
+
+        let ty = item(&items, "type_alias_declaration");
+        assert_eq!(ty.name.as_deref(), Some("T"));
+        assert_eq!(ty.start_line, 21);
+        assert_eq!(ty.end_line, 21);
+
+        // The class method is NOT a separate top-level item: no item is named `method`.
+        assert!(
+            !items.iter().any(|i| i.name.as_deref() == Some("method")),
+            "nested method leaked as a top-level item: {items:?}"
+        );
+    }
+
+    #[test]
+    fn extract_items_ts_covers_more_kinds() {
+        // generator/abstract-class/enum and a non-function `const` (which is NOT an
+        // item — a plain data binding is not a review unit).
+        let src = "\
+function* gen() { yield 1; }
+abstract class Shape {}
+enum Color { Red, Green }
+const PI = 3.14;
+var legacy = function () {};
+";
+        let items = extract_items(src, FileLang::Ts);
+        let kinds: HashSet<&str> = items.iter().map(|i| i.kind.as_str()).collect();
+        for expected in [
+            "generator_function_declaration",
+            "abstract_class_declaration",
+            "enum_declaration",
+        ] {
+            assert!(kinds.contains(expected), "missing {expected} in {kinds:?}");
+        }
+        assert_eq!(
+            item(&items, "generator_function_declaration").name.as_deref(),
+            Some("gen")
+        );
+        assert_eq!(
+            item(&items, "abstract_class_declaration").name.as_deref(),
+            Some("Shape")
+        );
+        assert_eq!(item(&items, "enum_declaration").name.as_deref(), Some("Color"));
+        // `var legacy = function () {}` IS a function binding → an item named `legacy`.
+        let legacy = item(&items, "variable_declaration");
+        assert_eq!(legacy.name.as_deref(), Some("legacy"));
+        // `const PI = 3.14` is NOT a function binding → NOT a review unit.
+        assert!(
+            !items.iter().any(|i| i.name.as_deref() == Some("PI")),
+            "non-function const leaked as an item: {items:?}"
+        );
+    }
+
+    #[test]
+    fn extract_items_ts_empty_and_malformed_do_not_panic() {
+        assert!(extract_items("", FileLang::Ts).is_empty());
+        let _ = extract_items("function broken( {", FileLang::Ts);
+        let _ = extract_items("}}}{{{ not ts 流", FileLang::Ts);
+    }
+
+    #[test]
+    fn grounding_ts_keeps_present_symbol_drops_invented() {
+        let parsed = parse_file(TS_SNIPPET, FileLang::Ts);
+        // Symbol grounding is now active for TS (identifiers populated).
+        assert!(!parsed.identifiers.is_empty());
+        assert!(parsed.identifiers.contains("foo"));
+        // `Bar` (type_identifier) and `method` (property_identifier) are collected.
+        assert!(parsed.identifiers.contains("Bar"));
+        assert!(parsed.identifiers.contains("method"));
+        // A finding citing a present symbol → kept.
+        assert_eq!(grounds(&parsed, Some(1), Some("foo")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, None, Some("Bar.method")), Grounding::Kept);
+        // An invented symbol with the grammar present → dropped.
+        assert_eq!(
+            grounds(&parsed, Some(1), Some("totallyInvented")),
+            Grounding::DroppedUnknownSymbol
+        );
+    }
+
+    #[test]
+    fn grounding_ts_line_checks() {
+        let parsed = parse_file(TS_SNIPPET, FileLang::Ts);
+        // A line past EOF is dropped.
+        assert_eq!(
+            grounds(&parsed, Some(parsed.total_lines + 1), None),
+            Grounding::DroppedLineOutOfFile
+        );
+        // A valid in-file line BETWEEN items (the blank line 4) with no symbol → kept
+        // (in the file but outside an item is NOT a contradiction → no over-drop).
+        assert_eq!(grounds(&parsed, Some(4), None), Grounding::Kept);
+    }
+
+    // =======================================================================
+    // Python
+    // =======================================================================
+
+    /// A Python snippet: a top-level function, a class with a method (the method must
+    /// NOT be top-level), and a DECORATED function (which must be captured, unwrapped).
+    const PY_SNIPPET: &str = "\
+def foo():
+    return 1
+
+
+class Bar:
+    def method(self):
+        return 2
+
+
+@deco
+def decorated():
+    return 3
+";
+
+    #[test]
+    fn extract_items_py_kinds_lines_and_names() {
+        let items = extract_items(PY_SNIPPET, FileLang::Py);
+
+        // Three top-level units: foo, Bar, decorated. The class method is NOT one.
+        assert_eq!(items.len(), 3, "items: {items:?}");
+
+        let foo = item(&items, "function_definition");
+        assert_eq!(foo.name.as_deref(), Some("foo"));
+        // `def foo():` is line 1; body `return 1` is line 2.
+        assert_eq!(foo.start_line, 1);
+        assert_eq!(foo.end_line, 2);
+
+        let bar = item(&items, "class_definition");
+        assert_eq!(bar.name.as_deref(), Some("Bar"));
+        // `class Bar:` is line 5; the method body `return 2` ends on line 7.
+        assert_eq!(bar.start_line, 5);
+        assert_eq!(bar.end_line, 7);
+
+        // `@deco\ndef decorated():` — the `decorated_definition` is unwrapped to the
+        // inner `function_definition`, named `decorated`. The line range is the inner
+        // node's: `def decorated():` is line 11 through body line 12 (the `@deco`
+        // line 10 belongs to the decorator wrapper, not the unwrapped definition).
+        let decorated = items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("decorated"))
+            .expect("decorated function present");
+        assert_eq!(decorated.kind, "function_definition");
+        assert_eq!(decorated.start_line, 11);
+        assert_eq!(decorated.end_line, 12);
+
+        // The class method is NOT a separate top-level item.
+        assert!(
+            !items.iter().any(|i| i.name.as_deref() == Some("method")),
+            "nested method leaked as a top-level item: {items:?}"
+        );
+    }
+
+    #[test]
+    fn extract_items_py_empty_and_malformed_do_not_panic() {
+        assert!(extract_items("", FileLang::Py).is_empty());
+        let _ = extract_items("def broken(:", FileLang::Py);
+        let _ = extract_items("@@@ not python 流", FileLang::Py);
+    }
+
+    #[test]
+    fn grounding_py_keeps_present_symbol_drops_invented() {
+        let parsed = parse_file(PY_SNIPPET, FileLang::Py);
+        // Symbol grounding now active for Python.
+        assert!(!parsed.identifiers.is_empty());
+        assert!(parsed.identifiers.contains("foo"));
+        assert!(parsed.identifiers.contains("Bar"));
+        assert!(parsed.identifiers.contains("method"));
+        assert_eq!(grounds(&parsed, Some(1), Some("foo")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, None, Some("Bar.method")), Grounding::Kept);
+        assert_eq!(
+            grounds(&parsed, Some(1), Some("totally_invented")),
+            Grounding::DroppedUnknownSymbol
+        );
+    }
+
+    #[test]
+    fn grounding_py_line_checks() {
+        let parsed = parse_file(PY_SNIPPET, FileLang::Py);
+        // A line past EOF is dropped.
+        assert_eq!(
+            grounds(&parsed, Some(parsed.total_lines + 1), None),
+            Grounding::DroppedLineOutOfFile
+        );
+        // A valid in-file blank line BETWEEN items (line 3) with no symbol → kept.
+        assert_eq!(grounds(&parsed, Some(3), None), Grounding::Kept);
     }
 }

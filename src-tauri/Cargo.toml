@@ -67,14 +67,22 @@ portable-pty = "0.9"
 ignore = { version = "0.4", default-features = false }
 # tree-sitter — the Censor's deterministic multi-language substrate (Tier-A step 1
 # of the DETERMINISTIC SANDWICH): per-item AST extraction + finding grounding
-# (`censor/extract.rs`). NOT OS-specific, so NOT cfg-gated. ABI DISCIPLINE: a
-# grammar crate is compiled against ONE tree-sitter ABI line — `tree-sitter-rust`
-# 0.24.x requires `tree-sitter ^0.25` (its parser C is generated for the 0.25 ABI;
-# the 0.26 line is a different ABI and would fail at `set_language`). So pin the
-# runtime to 0.25 to match the grammar. One grammar for now (Rust); TS/JS/Python/
-# etc. grammar crates slot in later at the SAME 0.25 ABI.
+# (`censor/extract.rs`). NOT OS-specific, so NOT cfg-gated. ABI DISCIPLINE: each
+# grammar crate exposes a `LanguageFn` from `tree-sitter-language` (^0.1, the stable
+# ABI bridge) that `.into()`s to `tree_sitter::Language`; the grammar's direct
+# `tree-sitter` dep is only a DEV-dep, so the runtime ABI is mediated by
+# `tree-sitter-language`, NOT by a pinned tree-sitter version in the grammar. This is
+# why `tree-sitter-rust` 0.24.x (dev-dep `tree-sitter ^0.24`) and
+# `tree-sitter-typescript` 0.23.x (dev-dep `^0.24`) both link cleanly against the
+# single `tree-sitter` 0.25 runtime here — `cargo tree -i tree-sitter` must show ONE.
+# Grammars wired: Rust, TS/JS (the TSX grammar — the broadest of the TS family: it
+# parses TS, JS, JSX, TSX, which is what we need since `FileLang::Ts` does NOT carry
+# the exact extension and item-extraction + identifier-collection don't require a
+# dialect-precise parser), and Python.
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
 
 # Windows-only WinRT/Win32 bindings. All `use windows::` call sites in src/ are
 # `#[cfg(windows)]`-gated, so target-gate the crate too: it is never fetched or
