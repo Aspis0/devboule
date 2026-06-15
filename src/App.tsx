@@ -38,6 +38,15 @@ const DesignView = lazy(() =>
   })),
 );
 
+// Lazy-load the per-project Skills view (the SKILL.md editor + toggle + template
+// installer). It is its own async chunk to match the Design/Polis pattern and
+// keep it off the initial bundle.
+const SkillsView = lazy(() =>
+  import("./components/views/SkillsView").then((m) => ({
+    default: m.SkillsView,
+  })),
+);
+
 function ViewFallback() {
   return (
     <div className="flex items-center gap-2 text-[12px] font-medium text-cream-500">
@@ -202,6 +211,15 @@ function AppShell() {
           <ErrorBoundary label="Design">
             <Suspense fallback={<ViewFallback />}>
               <DesignView />
+            </Suspense>
+          </ErrorBoundary>
+        );
+      case "skills":
+        // Lazy Skills view in its own error boundary + Suspense (mirrors Design).
+        return (
+          <ErrorBoundary label="Skills">
+            <Suspense fallback={<ViewFallback />}>
+              <SkillsView />
             </Suspense>
           </ErrorBoundary>
         );

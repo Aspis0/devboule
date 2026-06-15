@@ -94,7 +94,11 @@ fn design_rwlock() -> &'static RwLock<()> {
 }
 
 /// Acquire the design WRITE guard (exclusive) for a read-modify-write command.
-fn design_write_guard() -> Result<std::sync::RwLockWriteGuard<'static, ()>, String> {
+///
+/// `pub(crate)` so the sibling `project_skill` module serializes its `.claude/skills/`
+/// writes (incl. the skills-state read-modify-write) against design writers through the
+/// SAME working-folder lock — one writer at a time per process, no lost toggle updates.
+pub(crate) fn design_write_guard() -> Result<std::sync::RwLockWriteGuard<'static, ()>, String> {
     design_rwlock()
         .write()
         .map_err(|_| "Design write lock is poisoned.".to_string())
@@ -400,7 +404,10 @@ fn write_suffix() -> String {
 
 /// Atomically write `contents` to `target` via temp + `replace_file_with_backup`. The
 /// caller must hold `design_write_lock`. `label` is used in error messages.
-fn atomic_write(target: &Path, contents: &str, label: &str) -> Result<(), String> {
+///
+/// `pub(crate)` so the sibling `project_skill` module persists `.claude/skills/` files
+/// through the SAME temp+atomic-rename path (no second, divergent write implementation).
+pub(crate) fn atomic_write(target: &Path, contents: &str, label: &str) -> Result<(), String> {
     let suffix = write_suffix();
     // Sibling temp/backup files (same dir as target) so the rename is intra-volume and
     // atomic on every OS. We append the suffix to the file name rather than swapping

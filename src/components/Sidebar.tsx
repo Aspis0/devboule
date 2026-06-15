@@ -14,6 +14,7 @@ import {
   MonitorSmartphone,
   Castle,
   Palette,
+  GraduationCap,
   Settings,
   type LucideIcon,
 } from "lucide-react";
@@ -36,6 +37,7 @@ const iconMap: Record<string, LucideIcon> = {
   MonitorSmartphone,
   Castle,
   Palette,
+  GraduationCap,
 };
 
 // The Polis isometric map nav entry. Injected by the Sidebar so it appears
@@ -46,6 +48,15 @@ const POLIS_NAV: NavItem = { id: "polis", label: "Polis", icon: "Castle" };
 // appears regardless of whether the backend config lists it yet.
 const DESIGN_NAV: NavItem = { id: "design", label: "Design", icon: "Palette" };
 
+// The per-project Skills view nav entry. Injected the same way as Design so it
+// appears regardless of whether the backend config lists it yet. Not in the
+// ADMIN_ONLY_VIEWS denylist (roles.ts), so navIdsForRole keeps it for both roles.
+const SKILLS_NAV: NavItem = {
+  id: "skills",
+  label: "Skills",
+  icon: "GraduationCap",
+};
+
 export function Sidebar() {
   const { config, activeView, roleStatus } = useAppContext();
   const { setActiveView } = useAppActions();
@@ -55,9 +66,12 @@ export function Sidebar() {
   const withPolis = config.navigation.some((n) => n.id === POLIS_NAV.id)
     ? config.navigation
     : [...config.navigation, POLIS_NAV];
-  const baseNavigation = withPolis.some((n) => n.id === DESIGN_NAV.id)
+  const withDesign = withPolis.some((n) => n.id === DESIGN_NAV.id)
     ? withPolis
     : [...withPolis, DESIGN_NAV];
+  const baseNavigation = withDesign.some((n) => n.id === SKILLS_NAV.id)
+    ? withDesign
+    : [...withDesign, SKILLS_NAV];
   // Filter by role (cosmetic — the backend enforces privileged commands). A
   // null/loading role defaults to the restricted collaborator set.
   const allowedIds = new Set(
