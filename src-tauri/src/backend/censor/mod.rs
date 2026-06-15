@@ -12,6 +12,7 @@
 pub mod catalog;
 pub mod commands;
 pub mod detect;
+pub mod extract;
 pub mod gemma;
 pub mod ledger;
 pub mod orchestrator;
