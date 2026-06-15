@@ -105,6 +105,26 @@ pub fn severity_from_go_vet() -> (Severity, Category) {
     (Severity::Medium, Category::Correctness)
 }
 
+/// cppcheck (C/C++ static analyzer). cppcheck emits a per-finding severity token
+/// (`error`/`warning`/`portability`/`performance`/`style`/`information`); we run the
+/// curated `--enable=warning` set, so only `error`/`warning` (plus the occasional
+/// `portability`/`performance` that ride along) reach us. P2 ROLLOUT DISCIPLINE:
+/// advisory-first — even an `error` token is CAPPED at Medium (NOT High) until the
+/// FP-rate on this repo is measured and the owner promotes it; `warning` → Medium too,
+/// `portability`/`performance` → Low, anything else → Low. Always Correctness (cppcheck
+/// is a correctness/bug analyzer, not a style or security tool — and the noisy `style`/
+/// `information` classes are disabled at the flag level so they never poison labels).
+#[allow(dead_code)] // first caller is the cppcheck runner.
+pub fn severity_from_cppcheck(sev: &str) -> (Severity, Category) {
+    let s = match sev.trim().to_ascii_lowercase().as_str() {
+        // Advisory cap: `error`/`warning` → Medium (NOT High) until FP-rate measured.
+        "error" | "warning" => Severity::Medium,
+        "portability" | "performance" => Severity::Low,
+        _ => Severity::Low,
+    };
+    (s, Category::Correctness)
+}
+
 /// npm audit. npm uses low|moderate|high|critical; a dependency vulnerability
 /// is always Security. critical/high → High, moderate → Medium, low → Low,
 /// unknown → Medium.
@@ -446,6 +466,37 @@ mod tests {
         assert_eq!(
             severity_from_go_vet(),
             (Severity::Medium, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn cppcheck_is_correctness_advisory_capped_at_medium() {
+        // Advisory-first: even an `error` token is capped at Medium (never High) until
+        // the FP-rate is measured. Always Correctness.
+        assert_eq!(
+            severity_from_cppcheck("error"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_cppcheck("warning"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_cppcheck("portability"),
+            (Severity::Low, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_cppcheck("performance"),
+            (Severity::Low, Category::Correctness)
+        );
+        // Case-insensitive; unknown/empty → Low (never crash, never escalate).
+        assert_eq!(
+            severity_from_cppcheck("ERROR"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_cppcheck("???"),
+            (Severity::Low, Category::Correctness)
         );
     }
 }

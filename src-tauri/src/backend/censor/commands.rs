@@ -660,6 +660,7 @@ fn detect_tools_with(
         FileLang::Ts,
         FileLang::Py,
         FileLang::Go,
+        FileLang::Cpp,
         FileLang::Other,
     ] {
         for runner in applicable_runners(kinds, lang) {
@@ -1045,6 +1046,26 @@ mod tests {
         let rust_tools = detect_tools_with(&rust, |_| true);
         let rust_names: Vec<&str> = rust_tools.iter().map(|t| t.name.as_str()).collect();
         assert!(!rust_names.contains(&"gofmt"), "gofmt leaked into a Rust project");
+    }
+
+    #[test]
+    fn detect_tools_includes_cppcheck_for_cpp_project() {
+        use super::super::detect::ProjectKind;
+        let mut kinds = std::collections::HashSet::new();
+        kinds.insert(ProjectKind::Cpp);
+        let tools = detect_tools_with(&kinds, |_| true);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // cppcheck appears for a C/C++ project.
+        assert!(names.contains(&"cppcheck"), "missing cppcheck in {names:?}");
+        // A non-C/C++ project does NOT surface cppcheck.
+        let mut rust = std::collections::HashSet::new();
+        rust.insert(ProjectKind::Rust);
+        let rust_tools = detect_tools_with(&rust, |_| true);
+        let rust_names: Vec<&str> = rust_tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !rust_names.contains(&"cppcheck"),
+            "cppcheck leaked into a Rust project"
+        );
     }
 
     #[test]

@@ -125,11 +125,21 @@ pub enum Grounding {
 /// the grammar exposes one (a `const`/`var` block has no single declaration-level name,
 /// so it is left `None`).
 ///
+/// C/C++ (`Cpp`): parsed with `tree-sitter-cpp` (a superset grammar that parses both C
+/// and C++); returns the top-level `function_definition`, `declaration` ONLY when it
+/// declares a function prototype (a plain variable declaration is skipped), and the
+/// `class_specifier` / `struct_specifier` / `enum_specifier` / `union_specifier` /
+/// `namespace_definition` type/namespace units — UNWRAPPING a `template_declaration` to
+/// its inner declaration. C++ declarators are deeply nested, so a function name is the
+/// leaf identifier found by descending through the declarator chain (best-effort —
+/// `None` if it can't be resolved); a class/struct/enum/union/namespace is named by its
+/// `name`/`type_identifier` field.
+///
 /// `Other`: returns an empty `Vec`. This NEVER panics (a grammar/parse failure
 /// yields an empty `Vec`).
 ///
-// TODO(C2/C3 follow-up): add the C/C++/Kotlin/HTML grammars where a strong tool
-// and a clear review-unit set exist.
+// TODO(C2/C3 follow-up): add the Kotlin/HTML grammars where a strong tool and a clear
+// review-unit set exist.
 ///
 /// Delegates to [`parse_file`] (the SINGLE parse path) and returns only its `items`,
 /// so a file is parsed by exactly one routine. A caller that needs items AND grounding
@@ -172,6 +182,14 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
         }
         FileLang::Go => {
             let (items, identifiers) = parse_go(source);
+            ParsedFile {
+                total_lines,
+                items,
+                identifiers,
+            }
+        }
+        FileLang::Cpp => {
+            let (items, identifiers) = parse_cpp(source);
             ParsedFile {
                 total_lines,
                 items,
@@ -817,6 +835,218 @@ fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, is_go_identifier_kind);
+    (items, identifiers)
+}
+
+// ===========================================================================
+// C / C++
+// ===========================================================================
+
+/// The C/C++ top-level item node kinds we treat as review units, as direct children
+/// of the `translation_unit` root (a `template_declaration` is UNWRAPPED to its inner
+/// declaration first — see [`cpp_unwrap_template`]). `function_definition` is a
+/// defined function/method; `declaration` is included ONLY when it declares a function
+/// prototype (a plain variable declaration is NOT a review unit — see
+/// [`cpp_declaration_is_function`]); `class_specifier` / `struct_specifier` /
+/// `enum_specifier` / `union_specifier` are the aggregate type units; and
+/// `namespace_definition` is a namespace. Names come from the relevant declarator/name
+/// field (see [`cpp_item_name`]).
+const CPP_ITEM_KINDS: [&str; 7] = [
+    "function_definition",
+    "declaration",
+    "class_specifier",
+    "struct_specifier",
+    "enum_specifier",
+    "union_specifier",
+    "namespace_definition",
+];
+
+/// The C/C++ declarator-wrapper kinds that nest around the leaf name. C++ declarators
+/// are recursive — `int *const f()` parses as `pointer_declarator` →
+/// `function_declarator` → `identifier` — so to find the declared name we descend
+/// through every wrapper toward the leaf. Listed exhaustively so an unrecognized
+/// wrapper stops the descent (best-effort, never guesses past a node we don't know).
+const CPP_DECLARATOR_WRAPPERS: [&str; 6] = [
+    "pointer_declarator",
+    "reference_declarator",
+    "function_declarator",
+    "parenthesized_declarator",
+    "array_declarator",
+    "init_declarator",
+];
+
+/// The C/C++ leaf node kinds that name a declared entity (the name a function/method
+/// declarator ultimately resolves to). `identifier` is the common case; `field_identifier`
+/// is an out-of-line member name; `qualified_identifier` is `Klass::method` (we take its
+/// text verbatim as the display hint); `destructor_name` / `operator_name` cover `~T()`
+/// and `operator==`.
+const CPP_NAME_LEAVES: [&str; 5] = [
+    "identifier",
+    "field_identifier",
+    "qualified_identifier",
+    "destructor_name",
+    "operator_name",
+];
+
+/// If `node` is a `template_declaration`, return its inner declaration child (the
+/// thing the template wraps — a `function_definition`, `class_specifier`, etc.);
+/// otherwise return `node` unchanged. A `template_declaration`'s last meaningful child
+/// is the templated entity (the `template<...>` parameter list precedes it); we pick
+/// the FIRST child whose kind is one of [`CPP_ITEM_KINDS`]. If none is found (a bare
+/// template forward-declaration), the node is returned unchanged and simply won't
+/// match an item kind. Cloned `Node` is `Copy`, so this is cheap.
+fn cpp_unwrap_template<'a>(node: tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
+    if node.kind() != "template_declaration" {
+        return node;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if CPP_ITEM_KINDS.contains(&child.kind()) {
+            return child;
+        }
+    }
+    node
+}
+
+/// Does this `declaration` node declare a FUNCTION (a prototype), as opposed to a plain
+/// variable? A function prototype's declarator subtree contains a `function_declarator`
+/// (`int f(int);` → `declaration` → `function_declarator`); a variable declaration does
+/// not (`int x;` → `declaration` → `identifier`). We scan the declaration's descendants
+/// for a `function_declarator`, but DO NOT descend into a nested `function_definition` /
+/// nested aggregate body (there is none at this point — a top-level `declaration` is a
+/// prototype, not a definition). Bounded DFS, never recurses unbounded.
+fn cpp_declaration_is_function(node: &tree_sitter::Node) -> bool {
+    let mut stack = vec![*node];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "function_declarator" {
+            return true;
+        }
+        let mut cursor = n.walk();
+        for child in n.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+/// Build a [`ReviewItem`] from a direct child of the `translation_unit` root (after
+/// template-unwrapping) IF it is one of [`CPP_ITEM_KINDS`]; else `None`. A bare
+/// `declaration` that is NOT a function prototype (a plain variable) is skipped. Row
+/// math SATURATES (see [`ts_review_item`]).
+fn cpp_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> {
+    let node = cpp_unwrap_template(*node);
+    let kind = node.kind();
+    if !CPP_ITEM_KINDS.contains(&kind) {
+        return None;
+    }
+    // A top-level `declaration` is a review unit ONLY when it is a function prototype;
+    // a plain variable declaration is intentionally skipped (don't crash, just drop).
+    if kind == "declaration" && !cpp_declaration_is_function(&node) {
+        return None;
+    }
+    let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    Some(ReviewItem {
+        // Report the UNWRAPPED kind so a `template<...> class C {}` is a
+        // `class_specifier` (the reviewed unit), not a `template_declaration`.
+        kind: kind.to_string(),
+        name: cpp_item_name(&node, bytes),
+        start_line: to_line(node.start_position().row),
+        end_line: to_line(node.end_position().row),
+    })
+}
+
+/// Pull the display name from a top-level C/C++ item node, best-effort:
+///   - `class_specifier` / `struct_specifier` / `enum_specifier` / `union_specifier` —
+///     the `name` field (a `type_identifier`, or a `qualified_identifier`/`template_type`
+///     for a specialized/qualified definition). An anonymous aggregate has no `name` →
+///     `None`.
+///   - `namespace_definition` — the `name` field (`namespace_identifier` or a
+///     `nested_namespace_specifier`); an anonymous namespace has none → `None`.
+///   - `function_definition` / `declaration` (function prototype) — there is NO single
+///     `name` field; the name is the leaf identifier at the bottom of the `declarator`
+///     chain (descended via [`cpp_declarator_leaf_name`]).
+/// Anything we can't resolve → `None` (never guess).
+fn cpp_item_name(node: &tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "class_specifier" | "struct_specifier" | "enum_specifier" | "union_specifier"
+        | "namespace_definition" => {
+            let name = node.child_by_field_name("name")?;
+            let text = name.utf8_text(bytes).ok()?;
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "function_definition" | "declaration" => {
+            let declarator = node.child_by_field_name("declarator")?;
+            cpp_declarator_leaf_name(declarator, bytes)
+        }
+        _ => None,
+    }
+}
+
+/// Descend a C/C++ `declarator` subtree toward the leaf name, returning that name's
+/// text. At each step: if the node IS a name leaf ([`CPP_NAME_LEAVES`]) return its
+/// text; if it is a known wrapper ([`CPP_DECLARATOR_WRAPPERS`]) follow its own
+/// `declarator` field one level down and repeat; otherwise stop (`None`). The loop is
+/// bounded by a small depth cap (pathological nesting can't spin). Best-effort: a name
+/// we can't resolve yields `None`, never a guess or a panic.
+fn cpp_declarator_leaf_name(mut node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    // C++ declarators don't nest deeply in practice; cap to guard against an adversarial
+    // or malformed tree without an unbounded loop.
+    for _ in 0..64 {
+        let kind = node.kind();
+        if CPP_NAME_LEAVES.contains(&kind) {
+            let text = node.utf8_text(bytes).ok()?;
+            return (!text.is_empty()).then(|| text.to_string());
+        }
+        if CPP_DECLARATOR_WRAPPERS.contains(&kind) {
+            node = node.child_by_field_name("declarator")?;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// The C/C++ leaf node kinds that count as "an identifier present in the file" for
+/// symbol grounding. `identifier` covers functions/vars/calls; `type_identifier` covers
+/// class/struct/enum/typedef names and type references; `field_identifier` covers struct
+/// members and method names; `namespace_identifier` covers a namespace name/qualifier;
+/// `destructor_name` / `operator_name` cover `~T` and `operator==`. Same conservative
+/// rule as the other languages: OVER-collect every name a finding might cite so symbol
+/// grounding never false-drops a real C/C++ finding.
+fn is_cpp_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "namespace_identifier"
+            | "destructor_name"
+            | "operator_name"
+    )
+}
+
+/// Parse C/C++ `source` into `(items, identifiers)` — the SINGLE C/C++ parse routine.
+/// Top-level items are the direct children of `translation_unit` (template-unwrapped;
+/// see [`CPP_ITEM_KINDS`]); the identifier set is every identifier-like leaf in the
+/// whole tree (see [`is_cpp_identifier_kind`]). A parse failure yields empty + empty
+/// (symbol grounding then disabled — fail-open, never a false drop).
+fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+    let tree = match parse_with(source, tree_sitter_cpp::LANGUAGE.into()) {
+        Some(t) => t,
+        None => return (Vec::new(), HashSet::new()),
+    };
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut items = Vec::new();
+    let mut top_cursor = root.walk();
+    for child in root.children(&mut top_cursor) {
+        if let Some(item) = cpp_top_level_item(&child, bytes) {
+            items.push(item);
+        }
+    }
+
+    let identifiers = collect_identifiers(root, bytes, is_cpp_identifier_kind);
     (items, identifiers)
 }
 
@@ -1696,5 +1926,158 @@ type Id = uint64
         );
         // The import line (3) is in the file but OUTSIDE any item → kept (no over-drop).
         assert_eq!(grounds(&parsed, Some(3), None), Grounding::Kept);
+    }
+
+    // =======================================================================
+    // C / C++
+    // =======================================================================
+
+    /// A C/C++ snippet exercising every top-level unit kind: a defined free function
+    /// (`function_definition`), a `class` with an inline method declaration (the method
+    /// `m` is NESTED inside the class body — NOT top-level), a `struct`, a `namespace`,
+    /// and a `template`d class (which must be UNWRAPPED to its inner `class_specifier`).
+    /// Line numbers (1-based) annotated for the assertions.
+    const CPP_SNIPPET: &str = "\
+void f() {}
+
+class C {
+    void m();
+};
+
+struct S {};
+
+namespace n {
+    int g();
+}
+
+template <class T>
+class TC {};
+";
+
+    #[test]
+    fn extract_items_cpp_kinds_lines_and_names() {
+        let items = extract_items(CPP_SNIPPET, FileLang::Cpp);
+
+        // Five top-level units: the func f, the class C, the struct S, the namespace n,
+        // and the templated class TC (template unwrapped). The inline method `m`, the
+        // namespace member `g`, and the `template<...>` wrapper are NOT separate units.
+        assert_eq!(items.len(), 5, "items: {items:?}");
+
+        // `void f() {}` is line 1 (start == end, single line).
+        let f = item(&items, "function_definition");
+        assert_eq!(f.name.as_deref(), Some("f"));
+        assert_eq!(f.start_line, 1);
+        assert_eq!(f.end_line, 1);
+
+        // `class C {` is line 3; closing `};` is line 5 (1-based inclusive).
+        let c = item(&items, "class_specifier");
+        assert_eq!(c.name.as_deref(), Some("C"));
+        assert_eq!(c.start_line, 3);
+        assert_eq!(c.end_line, 5);
+
+        // `struct S {};` is line 7 (single line).
+        let s = item(&items, "struct_specifier");
+        assert_eq!(s.name.as_deref(), Some("S"));
+        assert_eq!(s.start_line, 7);
+        assert_eq!(s.end_line, 7);
+
+        // `namespace n {` is line 9; closing `}` is line 11.
+        let ns = item(&items, "namespace_definition");
+        assert_eq!(ns.name.as_deref(), Some("n"));
+        assert_eq!(ns.start_line, 9);
+        assert_eq!(ns.end_line, 11);
+
+        // The templated class is UNWRAPPED: it reports as a `class_specifier` named
+        // `TC` on the inner-class line (14), NOT a `template_declaration`. There are
+        // two `class_specifier`s now (C and TC), so locate TC by name.
+        let tc = items
+            .iter()
+            .find(|i| i.kind == "class_specifier" && i.name.as_deref() == Some("TC"))
+            .unwrap_or_else(|| panic!("expected TC class_specifier in {items:?}"));
+        assert_eq!(tc.start_line, 14);
+        assert_eq!(tc.end_line, 14);
+        // No `template_declaration` survives as a unit (it was unwrapped).
+        assert!(
+            !items.iter().any(|i| i.kind == "template_declaration"),
+            "template should be unwrapped: {items:?}"
+        );
+    }
+
+    #[test]
+    fn extract_items_cpp_function_prototype_yes_variable_no() {
+        // A top-level function PROTOTYPE is a review unit; a plain top-level VARIABLE
+        // declaration is NOT (same `declaration` node kind, distinguished by the
+        // presence of a function_declarator).
+        let src = "\
+int proto(int a);
+int globalVar = 3;
+enum Color { Red, Green };
+union U { int i; float f; };
+";
+        let items = extract_items(src, FileLang::Cpp);
+        let kinds: HashSet<&str> = items.iter().map(|i| i.kind.as_str()).collect();
+        // The prototype (a `declaration` with a function_declarator) is kept and named.
+        let proto = item(&items, "declaration");
+        assert_eq!(proto.name.as_deref(), Some("proto"));
+        assert_eq!(proto.start_line, 1);
+        // The enum and union are units; the plain variable declaration is NOT.
+        assert!(kinds.contains("enum_specifier"), "kinds: {kinds:?}");
+        assert!(kinds.contains("union_specifier"), "kinds: {kinds:?}");
+        let enum_item = item(&items, "enum_specifier");
+        assert_eq!(enum_item.name.as_deref(), Some("Color"));
+        let union_item = item(&items, "union_specifier");
+        assert_eq!(union_item.name.as_deref(), Some("U"));
+        // Exactly one `declaration` survives (the prototype) — `globalVar` is dropped.
+        let decls: Vec<_> = items.iter().filter(|i| i.kind == "declaration").collect();
+        assert_eq!(decls.len(), 1, "only the prototype is a unit: {items:?}");
+    }
+
+    #[test]
+    fn extract_items_cpp_empty_and_malformed_do_not_panic() {
+        assert!(extract_items("", FileLang::Cpp).is_empty());
+        let _ = extract_items("void broken( {", FileLang::Cpp);
+        let _ = extract_items("}}}{{{ not c++ 流", FileLang::Cpp);
+        // A C file (the .c/.h family shares FileLang::Cpp) parses with the same grammar.
+        let _ = extract_items("int main(void) { return 0; }", FileLang::Cpp);
+    }
+
+    #[test]
+    fn grounding_cpp_keeps_present_symbol_drops_invented() {
+        let parsed = parse_file(CPP_SNIPPET, FileLang::Cpp);
+        // Symbol grounding is active for C/C++ (identifiers populated).
+        assert!(!parsed.identifiers.is_empty());
+        // `f` (identifier), `C`/`S`/`TC` (type_identifier), `m` (field_identifier as a
+        // method name), `n` (namespace_identifier) are collected.
+        assert!(parsed.identifiers.contains("f"));
+        assert!(parsed.identifiers.contains("C"));
+        assert!(parsed.identifiers.contains("S"));
+        assert!(parsed.identifiers.contains("TC"));
+        assert!(parsed.identifiers.contains("m"));
+        assert!(
+            parsed.identifiers.contains("n"),
+            "namespace_identifier 'n' missing: {:?}",
+            parsed.identifiers
+        );
+        // A finding citing a present symbol → kept (a qualified path with a known
+        // component is kept too).
+        assert_eq!(grounds(&parsed, Some(1), Some("f")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, None, Some("C::m")), Grounding::Kept);
+        // A wholly invented symbol with the grammar present → dropped.
+        assert_eq!(
+            grounds(&parsed, Some(1), Some("totallyInvented")),
+            Grounding::DroppedUnknownSymbol
+        );
+    }
+
+    #[test]
+    fn grounding_cpp_line_checks() {
+        let parsed = parse_file(CPP_SNIPPET, FileLang::Cpp);
+        // A finding past EOF is dropped.
+        assert_eq!(
+            grounds(&parsed, Some(parsed.total_lines + 1), None),
+            Grounding::DroppedLineOutOfFile
+        );
+        // The blank line (2) is in the file but OUTSIDE any item → kept (no over-drop).
+        assert_eq!(grounds(&parsed, Some(2), None), Grounding::Kept);
     }
 }

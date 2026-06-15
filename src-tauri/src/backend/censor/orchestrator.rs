@@ -189,6 +189,8 @@ fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFind
         // gofmt is FINE (per-file target); go vet is COARSE (whole module, root only).
         RunnerId::Gofmt => runners::gofmt::run(root, target),
         RunnerId::GoVet => runners::go_vet::run(root),
+        // cppcheck is FINE (per-file target; no-compile static analyzer).
+        RunnerId::Cppcheck => runners::cppcheck::run(root, target),
         RunnerId::Lizard => runners::lizard::run(root, target),
         RunnerId::Semgrep => runners::semgrep::run(root, target),
         RunnerId::Zizmor => runners::zizmor::run(root),
@@ -223,6 +225,7 @@ fn runner_source(id: RunnerId) -> &'static str {
         RunnerId::Vulture => "vulture",
         RunnerId::Gofmt => "gofmt",
         RunnerId::GoVet => "go-vet",
+        RunnerId::Cppcheck => "cppcheck",
         RunnerId::Lizard => "lizard",
         RunnerId::Semgrep => "semgrep",
         RunnerId::Zizmor => "zizmor",
@@ -1044,6 +1047,8 @@ mod tests {
         // zombie shard findings.
         assert_eq!(runner_source(RunnerId::Gofmt), "gofmt");
         assert_eq!(runner_source(RunnerId::GoVet), "go-vet");
+        // C/C++ runner: MUST equal the `source:` literal cppcheck.rs stamps ("cppcheck").
+        assert_eq!(runner_source(RunnerId::Cppcheck), "cppcheck");
     }
 
     #[test]
@@ -1067,6 +1072,29 @@ mod tests {
         let fp = &plan[0];
         assert!(fp.runners.contains(&RunnerId::Gofmt));
         assert!(!fp.runners.contains(&RunnerId::GoVet));
+        for r in &fp.runners {
+            assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
+        }
+    }
+
+    #[test]
+    fn coarse_runners_for_cpp_has_no_cppcheck() {
+        // cppcheck is FINE (no-compile, per-file), so it must NEVER appear in the
+        // COARSE set — only the cross-cutting coarse runners do for a C/C++ project.
+        let c = coarse_runners(&kinds(&[ProjectKind::Cpp]));
+        assert!(!c.contains(&RunnerId::Cppcheck));
+        assert!(c.contains(&RunnerId::Gitleaks));
+        for r in &c {
+            assert_eq!(r.granularity(), Granularity::Coarse, "{r:?} must be coarse");
+        }
+    }
+
+    #[test]
+    fn plan_fine_cpp_file_gets_cppcheck() {
+        // A .cpp file's FINE plan includes cppcheck (no-compile, per-file).
+        let plan = plan_fine(&kinds(&[ProjectKind::Cpp]), &["main.cpp".to_string()]);
+        let fp = &plan[0];
+        assert!(fp.runners.contains(&RunnerId::Cppcheck));
         for r in &fp.runners {
             assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
         }

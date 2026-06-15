@@ -29,6 +29,7 @@ pub mod cargo_check;
 pub mod cargo_deny;
 pub mod cargo_fmt;
 pub mod clippy;
+pub mod cppcheck;
 pub mod eslint;
 pub mod gitleaks;
 pub mod go_vet;
@@ -146,6 +147,7 @@ pub enum RunnerId {
     Vulture,
     Gofmt,
     GoVet,
+    Cppcheck,
     Gitleaks,
     Jscpd,
     Lizard,
@@ -189,6 +191,9 @@ impl RunnerId {
             | RunnerId::Vulture
             // gofmt only parses + reformats in memory (INSTANT, no compile) → Fine.
             | RunnerId::Gofmt
+            // cppcheck is a no-compile static analyzer (parses the source directly,
+            // never builds the TU), so it is cheap enough for the per-file loop → Fine.
+            | RunnerId::Cppcheck
             | RunnerId::Lizard
             | RunnerId::Semgrep
             | RunnerId::Oxlint
@@ -216,6 +221,7 @@ impl RunnerId {
             RunnerId::Vulture => "vulture",
             RunnerId::Gofmt => "gofmt",
             RunnerId::GoVet => "go",
+            RunnerId::Cppcheck => "cppcheck",
             RunnerId::Gitleaks => "gitleaks",
             RunnerId::Jscpd => "jscpd",
             RunnerId::Lizard => "lizard",
@@ -254,6 +260,7 @@ const CROSS_CUTTING: [RunnerId; 5] = [
 ///   - `.ts`/`.js` file in a Node project → tsc, eslint, knip
 ///   - `.py` file in a Python project → ruff, bandit, vulture
 ///   - `.go` file in a Go project → gofmt (fine), go vet (coarse, compile-based)
+///   - `.c`/`.cpp`/... file in a C/C++ project → cppcheck (fine, no-compile)
 ///   - ANY file → gitleaks, jscpd, lizard, semgrep (cross-cutting)
 ///
 /// A language-specific runner is only added when BOTH the file lang AND the
@@ -290,6 +297,10 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
             // debounced — never in the hot loop). Both advisory.
             out.push(RunnerId::Gofmt);
             out.push(RunnerId::GoVet);
+        }
+        FileLang::Cpp if kinds.contains(&ProjectKind::Cpp) => {
+            // cppcheck is Fine (no-compile static analyzer, per-file). Advisory.
+            out.push(RunnerId::Cppcheck);
         }
         _ => {}
     }
@@ -742,6 +753,28 @@ mod tests {
     }
 
     #[test]
+    fn cpp_file_in_cpp_project_gets_cppcheck_plus_cross_cutting() {
+        let r = applicable_runners(&kinds(&[ProjectKind::Cpp]), FileLang::Cpp);
+        assert!(r.contains(&RunnerId::Cppcheck));
+        // Cross-cutting always present.
+        assert!(r.contains(&RunnerId::Gitleaks));
+        assert!(r.contains(&RunnerId::Semgrep));
+        // No other-language tools for a C/C++ file.
+        assert!(!r.contains(&RunnerId::Clippy));
+        assert!(!r.contains(&RunnerId::Ruff));
+        assert!(!r.contains(&RunnerId::Eslint));
+        assert!(!r.contains(&RunnerId::Gofmt));
+    }
+
+    #[test]
+    fn cpp_file_without_cpp_project_kind_gets_only_cross_cutting() {
+        // A stray .cpp file in a Rust-only repo: no cppcheck, just cross-cutting.
+        let r = applicable_runners(&kinds(&[ProjectKind::Rust]), FileLang::Cpp);
+        assert!(!r.contains(&RunnerId::Cppcheck));
+        assert_eq!(r.len(), CROSS_CUTTING.len());
+    }
+
+    #[test]
     fn unknown_file_lang_gets_only_cross_cutting() {
         let r = applicable_runners(
             &kinds(&[ProjectKind::Rust, ProjectKind::Node]),
@@ -805,6 +838,8 @@ mod tests {
             RunnerId::Vulture,
             // gofmt is instant (no compile) → Fine.
             RunnerId::Gofmt,
+            // cppcheck is a no-compile static analyzer → Fine.
+            RunnerId::Cppcheck,
             RunnerId::Lizard,
             RunnerId::Semgrep,
         ] {

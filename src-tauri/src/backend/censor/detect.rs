@@ -21,6 +21,7 @@ pub enum ProjectKind {
     Node,
     Python,
     Go,
+    Cpp,
 }
 
 /// Canonical Python project markers. `pyproject.toml` is the modern standard, but
@@ -37,10 +38,11 @@ const PYTHON_MARKERS: [&str; 5] = [
 
 /// Detect which project kinds a root is, from the presence of a canonical manifest
 /// at the root: `Cargo.toml` → Rust, `package.json` → Node, any of
-/// [`PYTHON_MARKERS`] → Python, and `go.mod` → Go. Only the root level is probed
-/// (cheap, deterministic); nested manifests in subdirectories are out of scope here
-/// — the cross-cutting runners (gitleaks/jscpd/lizard/semgrep) cover files
-/// regardless of kind.
+/// [`PYTHON_MARKERS`] → Python, `go.mod` → Go, and `CMakeLists.txt` OR
+/// `compile_commands.json` → C/C++. Only the root level is probed (cheap,
+/// deterministic); nested manifests in subdirectories are out of scope here — the
+/// cross-cutting runners (gitleaks/jscpd/lizard/semgrep) cover files regardless of
+/// kind.
 pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     let mut kinds = HashSet::new();
     if root.join("Cargo.toml").exists() {
@@ -59,6 +61,15 @@ pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     if root.join("go.mod").exists() {
         kinds.insert(ProjectKind::Go);
     }
+    // A C/C++ project has no single universal manifest, but the two canonical, tool-
+    // agnostic markers are `CMakeLists.txt` (the de-facto cross-platform build
+    // generator) and `compile_commands.json` (the clang compilation database many
+    // tools — including cppcheck — consume). Either at the root flags a C/C++ project;
+    // we deliberately key off these (not a bare `.c`/`.cpp` heuristic) so a stray C
+    // source in another project doesn't spuriously enable the C/C++ runners.
+    if root.join("CMakeLists.txt").exists() || root.join("compile_commands.json").exists() {
+        kinds.insert(ProjectKind::Cpp);
+    }
     kinds
 }
 
@@ -70,6 +81,7 @@ pub enum FileLang {
     Ts,
     Py,
     Go,
+    Cpp,
     Other,
 }
 
@@ -77,7 +89,10 @@ impl FileLang {
     /// Classify a file path by its extension (case-insensitive). `.ts`/`.tsx`/
     /// `.js`/`.jsx`/`.cts`/`.mts`/`.cjs`/`.mjs` → `Ts` (the JS/TS toolchain:
     /// tsc/eslint/knip); `.rs` → `Rust`; `.py`/`.pyi` → `Py`; `.go` → `Go`
-    /// (the gofmt/go-vet toolchain); else `Other`.
+    /// (the gofmt/go-vet toolchain); the C/C++ family
+    /// `.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.c`/`.h` → `Cpp` (the
+    /// cppcheck toolchain — C and C++ share one [`FileLang`] since the wired grammar
+    /// and the runner both span the family); else `Other`.
     pub fn from_path(path: &Path) -> FileLang {
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_ascii_lowercase(),
@@ -88,6 +103,9 @@ impl FileLang {
             "ts" | "tsx" | "js" | "jsx" | "cts" | "mts" | "cjs" | "mjs" => FileLang::Ts,
             "py" | "pyi" => FileLang::Py,
             "go" => FileLang::Go,
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "c" | "h" => {
+                FileLang::Cpp
+            }
             _ => FileLang::Other,
         }
     }
@@ -176,18 +194,37 @@ mod tests {
     }
 
     #[test]
+    fn detect_cpp_from_cmakelists_or_compile_commands() {
+        // Either canonical marker independently identifies a C/C++ project.
+        for marker in ["CMakeLists.txt", "compile_commands.json"] {
+            let dir = unique_temp_root(&format!("cpp-{}", marker.replace('.', "_")));
+            fs::write(dir.join(marker), "x").unwrap();
+            let kinds = detect_project_kinds(&dir);
+            assert!(
+                kinds.contains(&ProjectKind::Cpp),
+                "{marker} should mark a C/C++ project"
+            );
+            assert!(!kinds.contains(&ProjectKind::Rust));
+            assert!(!kinds.contains(&ProjectKind::Go));
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn detect_multiple_kinds_for_polyglot_root() {
         let dir = unique_temp_root("poly");
         fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
         fs::write(dir.join("package.json"), "{}").unwrap();
         fs::write(dir.join("pyproject.toml"), "[project]").unwrap();
         fs::write(dir.join("go.mod"), "module example.com/x\n").unwrap();
+        fs::write(dir.join("CMakeLists.txt"), "project(x)\n").unwrap();
         let kinds = detect_project_kinds(&dir);
-        assert_eq!(kinds.len(), 4);
+        assert_eq!(kinds.len(), 5);
         assert!(kinds.contains(&ProjectKind::Rust));
         assert!(kinds.contains(&ProjectKind::Node));
         assert!(kinds.contains(&ProjectKind::Python));
         assert!(kinds.contains(&ProjectKind::Go));
+        assert!(kinds.contains(&ProjectKind::Cpp));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -202,11 +239,24 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("a.py")), FileLang::Py);
         assert_eq!(FileLang::from_path(Path::new("a.pyi")), FileLang::Py);
         assert_eq!(FileLang::from_path(Path::new("main.go")), FileLang::Go);
+        // C/C++ family — C++ sources/headers AND C sources/headers all map to Cpp.
+        assert_eq!(FileLang::from_path(Path::new("a.cpp")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.cc")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.cxx")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.c++")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.hpp")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.hh")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.hxx")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.h++")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.c")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("a.h")), FileLang::Cpp);
         assert_eq!(FileLang::from_path(Path::new("a.txt")), FileLang::Other);
         assert_eq!(FileLang::from_path(Path::new("README")), FileLang::Other);
         // Case-insensitive extension matching.
         assert_eq!(FileLang::from_path(Path::new("A.RS")), FileLang::Rust);
         assert_eq!(FileLang::from_path(Path::new("A.PY")), FileLang::Py);
         assert_eq!(FileLang::from_path(Path::new("MAIN.GO")), FileLang::Go);
+        assert_eq!(FileLang::from_path(Path::new("MAIN.CPP")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("HDR.H")), FileLang::Cpp);
     }
 }
