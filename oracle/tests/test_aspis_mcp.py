@@ -34,6 +34,9 @@ from oracle.server.aspis_mcp import (
     clean_text,
     MAX_GIT_PUSH_REQUESTS,
     MAX_MINI_CODER_DIRECTIVES,
+    MINI_CODER_WRITE_MODES,
+    MINI_CODER_WRITE_MODE_DEFAULT,
+    TOOLS,
     upsert_session,
     cloudflare_worker_in_aspis_bio_scope,
     create_mcp_server,
@@ -5478,6 +5481,38 @@ class SpawnMiniCoderTests(unittest.TestCase):
                 self._read_state(root).get("miniCoderDirectives"),
                 "no directive may be persisted when write_mode lacks write:true",
             )
+
+    def test_tool_description_documents_write_mode_rule(self):
+        # A3: the spawn_mini_coder tool DESCRIPTION must document the write_mode param
+        # and the one-line rule of thumb (agentic-iterative only for covered-language
+        # files + a capable model; else emit-edits), so the coder reading the tool list
+        # learns the decision. String-presence, consistent with the A2 param schema.
+        tool = next(t for t in TOOLS if t["name"] == "spawn_mini_coder")
+        desc = tool["description"]
+        self.assertIn("write_mode", desc, "tool description must name the param")
+        self.assertIn("agenticIterative", desc, "must mention the agentic mode")
+        self.assertIn("emitEdits", desc, "must mention the default mode")
+        self.assertIn("copertura", desc, "must mention the gate-coverage gating")
+        # The param schema (A2) still carries its own description + the canonical
+        # enum/default, and the rule of thumb is restated there.
+        param = tool["parameters"]["write_mode"]
+        self.assertEqual(list(param["enum"]), list(MINI_CODER_WRITE_MODES))
+        self.assertEqual(param["default"], MINI_CODER_WRITE_MODE_DEFAULT)
+        pdesc = param["description"]
+        self.assertIn("agenticIterative", pdesc)
+        self.assertIn("emitEdits", pdesc)
+        self.assertIn("gate coverage", pdesc, "param description states the coverage rule")
+        # A3 forward-looks past A2's plumbing-only wording.
+        self.assertNotIn("behavior wired later", pdesc)
+
+    def test_coder_role_rules_document_write_mode_rule(self):
+        # A3: the coder ROLE_RULES (surfaced by the agent_rules tool) carry the
+        # write_mode rule of thumb so the contract and the tool description agree.
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        joined = " ".join(coder.get("forbidden", []))
+        self.assertIn("write_mode", joined, "coder rules must mention write_mode")
+        self.assertIn("agenticIterative", joined)
+        self.assertIn("emitEdits", joined)
 
     def test_write_allowlist_is_capped_at_ten_files(self):
         # Max-recall: the Rust apply enforces 1..=10 files for write directives;

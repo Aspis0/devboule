@@ -1425,6 +1425,70 @@ fn directive_has_tier_a_coverage(root: &Path, files: &[String]) -> bool {
         .any(|f| fine_count(FileLang::from_path(Path::new(f))) > fine_baseline)
 }
 
+/// A3 (coder guidance): the human language names that have deterministic Tier-A
+/// gate coverage FOR THIS PROJECT — i.e. the languages where `agentic-iterative`
+/// can iterate against per-round feedback. This is the list the coder is shown so
+/// it knows where agentic-iterative actually helps.
+///
+/// SAME definition B2 uses (`directive_has_tier_a_coverage`): a language is
+/// "covered" iff `applicable_runners(detected_kinds, lang)` yields MORE
+/// [`Granularity::Fine`] runners than the dynamically-computed cross-cutting Fine
+/// baseline (`FileLang::Other`). So RUST is NOT listed (clippy/cargo-check/… are
+/// all Coarse — no per-round Rust-specific feedback); Python/TS/Go/C++/HTML/Kotlin/
+/// Shell/YAML/SQL/Dockerfile/GithubActions/CSS ARE listed WHEN their project-kind /
+/// lang gate is satisfied for this root (e.g. Python only when a Python manifest is
+/// present; HTML/Shell/YAML/SQL/Dockerfile/GithubActions/CSS have no manifest so they
+/// always pass the kind gate).
+///
+/// PRODUCT-GENERAL: the names are GENERIC language labels (no project/product
+/// hardcoding) and the set is computed entirely from the user's detected project +
+/// the wired runner table — nothing is keyed off a specific repo. Deterministic and
+/// SORTED (stable enumeration over the [`FileLang`] variants → filtered by the same
+/// Fine-over-baseline rule → sorted human names) so the injected coder text never
+/// churns between launches.
+///
+/// `pub(crate)` so the coder launch-prompt builder (`projects.rs`, A3) can show the
+/// coder this project's covered-language set when guiding its `write_mode` choice.
+pub(crate) fn tier_a_covered_languages(root: &Path) -> Vec<&'static str> {
+    use crate::backend::censor::detect::{detect_project_kinds, FileLang};
+    use crate::backend::censor::runners::{applicable_runners, Granularity};
+    let kinds = detect_project_kinds(root);
+    let fine_count = |lang: FileLang| {
+        applicable_runners(&kinds, lang)
+            .iter()
+            .filter(|r| r.granularity() == Granularity::Fine)
+            .count()
+    };
+    let fine_baseline = fine_count(FileLang::Other);
+    // Every language-bearing FileLang variant with a human name. `Other` is the
+    // baseline reference itself (no language-specific runner) and is intentionally
+    // excluded. Each `(variant, human-name)` pair is enumerated explicitly so adding
+    // a new wired language is a deliberate one-line addition here (mirrors the
+    // explicit match arms in `applicable_runners`/`FileLang::from_path`).
+    let candidates: [(FileLang, &'static str); 13] = [
+        (FileLang::Rust, "Rust"),
+        (FileLang::Ts, "TypeScript/JavaScript"),
+        (FileLang::Py, "Python"),
+        (FileLang::Go, "Go"),
+        (FileLang::Cpp, "C/C++"),
+        (FileLang::Html, "HTML"),
+        (FileLang::Kotlin, "Kotlin"),
+        (FileLang::Shell, "Shell"),
+        (FileLang::Yaml, "YAML"),
+        (FileLang::Sql, "SQL"),
+        (FileLang::Dockerfile, "Dockerfile"),
+        (FileLang::GithubActions, "GitHub Actions"),
+        (FileLang::Css, "CSS"),
+    ];
+    let mut out: Vec<&'static str> = candidates
+        .into_iter()
+        .filter(|(lang, _)| fine_count(*lang) > fine_baseline)
+        .map(|(_, name)| name)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 /// P6 verdict gate APPLY + finalize. The terminal `outcome` and `trusted` flag are
 /// PRECOMPUTED by the caller ([`finalize_finished_mini`], WARNING 3: from ONE snapshot);
 /// `verdict_fn(project_root, files) -> Vec<EscalationFinding>` is the deterministic-Censor
@@ -4570,6 +4634,62 @@ mod tests {
         std::fs::write(root.join("pyproject.toml"), "[project]\n").unwrap();
         assert!(!directive_has_tier_a_coverage(&root, &[]));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn covered_languages_python_project_includes_python_excludes_rust() {
+        // A3 helper: for a Python project the covered-language list MUST include Python
+        // (ruff/pyright/bandit/vulture are Fine) and MUST exclude Rust (clippy/cargo-* are
+        // all Coarse — the SAME Fine-over-baseline rule B2 uses). The manifest-free
+        // languages (HTML/Shell/YAML/SQL/Dockerfile/GitHub Actions/CSS) gate on FileLang
+        // alone, so they're covered in EVERY project. Result is deterministic + sorted.
+        let py_root = p4_temp_project("langs-python");
+        std::fs::write(py_root.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+        let langs = tier_a_covered_languages(&py_root);
+        assert!(langs.contains(&"Python"), "Python must be covered: {langs:?}");
+        assert!(!langs.contains(&"Rust"), "Rust is Coarse-only -> never covered: {langs:?}");
+        // TS/Go/C++/Kotlin need their own manifest (absent here) -> NOT covered.
+        assert!(!langs.contains(&"Go"), "Go needs go.mod (absent) -> uncovered: {langs:?}");
+        assert!(!langs.contains(&"Kotlin"), "Kotlin needs Gradle (absent) -> uncovered: {langs:?}");
+        // Manifest-free languages are always covered.
+        for l in ["HTML", "Shell", "YAML", "SQL", "Dockerfile", "GitHub Actions", "CSS"] {
+            assert!(langs.contains(&l), "manifest-free {l} must be covered: {langs:?}");
+        }
+        // Deterministic + sorted.
+        let mut sorted = langs.clone();
+        sorted.sort_unstable();
+        assert_eq!(langs, sorted, "covered languages must be sorted: {langs:?}");
+        assert_eq!(langs, tier_a_covered_languages(&py_root), "must be deterministic");
+        std::fs::remove_dir_all(&py_root).ok();
+    }
+
+    #[test]
+    fn covered_languages_rust_only_project_excludes_rust() {
+        // A Rust-only project: Rust's language-specific runners are ALL Coarse, so Rust is
+        // NOT in the covered list (agentic-iterative on .rs buys no per-round feedback).
+        // Only the manifest-free baseline languages remain. No Python/TS/Go/etc. (no
+        // matching manifest).
+        let rust_root = p4_temp_project("langs-rust");
+        std::fs::write(rust_root.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let langs = tier_a_covered_languages(&rust_root);
+        assert!(!langs.contains(&"Rust"), "Rust must NOT be covered (Coarse-only): {langs:?}");
+        assert!(!langs.contains(&"Python"), "no Python manifest -> uncovered: {langs:?}");
+        assert!(!langs.contains(&"TypeScript/JavaScript"), "no Node manifest -> uncovered: {langs:?}");
+        // The manifest-free baseline is still present (kind-gate-free).
+        assert!(langs.contains(&"HTML") && langs.contains(&"Shell"), "baseline langs present: {langs:?}");
+        std::fs::remove_dir_all(&rust_root).ok();
+    }
+
+    #[test]
+    fn covered_languages_node_project_includes_ts() {
+        // A Node project adds TypeScript/JavaScript (eslint/oxlint/prettier are Fine)
+        // to the covered set; Rust still excluded.
+        let node_root = p4_temp_project("langs-node");
+        std::fs::write(node_root.join("package.json"), "{\"name\":\"x\"}\n").unwrap();
+        let langs = tier_a_covered_languages(&node_root);
+        assert!(langs.contains(&"TypeScript/JavaScript"), "TS must be covered: {langs:?}");
+        assert!(!langs.contains(&"Rust"), "Rust excluded: {langs:?}");
+        std::fs::remove_dir_all(&node_root).ok();
     }
 
     #[test]

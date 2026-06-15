@@ -1057,6 +1057,19 @@ fn prepare_or_launch_project_agent(
     validate_agent_task_launch(&project, &role, task_id.as_deref())?;
     let launch_token = generate_launch_token()?;
     let launch_token_hash = hash_launch_token(&launch_token);
+    // A3 — coder-only MINI-CODER DELEGATION write_mode guidance. Computed ONLY for a
+    // coder launch (a verifier has no spawn_mini_coder access, so it gets no block and
+    // its prompt + the `detect_project_kinds` scan stay untouched). Reads the SAME
+    // configured mini backend the launch already relies on (no hardcoded model id) and
+    // THIS project's gate-covered languages; `None` backend ⇒ `None` block ⇒ the coder
+    // prompt is byte-identical to today (graceful degradation).
+    let mini_delegation_addendum: Option<String> = if role == "coder" {
+        let backend = read_mini_coder_backend(&app);
+        let covered = super::mini_coder_executor::tier_a_covered_languages(&root_path);
+        build_mini_delegation_addendum(backend.as_ref(), &covered)
+    } else {
+        None
+    };
     let prompt = project_agent_prompt(
         &project,
         &role,
@@ -1073,6 +1086,8 @@ fn prepare_or_launch_project_agent(
         // for every non-handoff launch keeps the prompt byte-for-byte unchanged.
         design_handoff_folder.as_deref(),
         workflow_addendum.as_deref(),
+        // A3: the pre-built MINI-CODER DELEGATION write_mode block (coder-only).
+        mini_delegation_addendum.as_deref(),
     );
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
@@ -2132,6 +2147,65 @@ fn validate_agent_task_launch(
     }
 }
 
+/// A short, GENERIC human label for a mini-coder backend kind, for the A3
+/// delegation-context block (e.g. `"a local Ollama model"`). Product-general —
+/// describes the RUNTIME, never a specific product/model. Used only as advisory
+/// prose for the coder; it carries no token/secret.
+fn mini_backend_kind_label(kind: super::mini_coder::MiniCoderBackendKind) -> &'static str {
+    use super::mini_coder::MiniCoderBackendKind as K;
+    match kind {
+        K::Ollama => "a local Ollama model",
+        K::Api => "a user-configured cheap-API CLI",
+        K::Codex => "a Codex CLI backend",
+        K::Omlx => "a local oMLX (MLX) model",
+        K::AppleFm => "an Apple Foundation Models backend",
+    }
+}
+
+/// A3 — build the coder-only MINI-CODER DELEGATION block that guides the
+/// `write_mode` choice for `spawn_mini_coder`. PRODUCT-GENERAL by construction: it
+/// names only the user's CONFIGURED mini model + backend runtime and THIS PROJECT's
+/// deterministic-gate covered languages (computed from the detected project, not a
+/// hardcoded map / model id). The coder — a capable frontier model that knows model
+/// capabilities — then judges whether its mini is strong enough for agentic
+/// iteration. The user's explicit Safe/Auto/Agentic policy ceiling is a later
+/// workstream; this block is the Auto-default guidance.
+///
+/// Inputs are PRE-READ by the caller so this stays a pure, unit-testable string
+/// builder (no AppHandle / filesystem): `backend` is the configured mini backend
+/// (`None` ⇒ no mini configured) and `covered` is `tier_a_covered_languages(root)`.
+///
+/// Graceful degradation:
+///   - `None` backend ⇒ `None` (no mini delegation at all → no block; the existing
+///     mini-coder routing addendum still stands on its own).
+///   - empty `covered` ⇒ the block still renders but says coverage is "none", so the
+///     coder defaults to `emit-edits` everywhere.
+///
+/// Carries NO token/secret (just the model tag + generic prose) — the
+/// prompt-token-off-argv / restricted-prompt-file guarantees are untouched. The
+/// model tag is sanitized like every other prompt field via `clean_optional` (the
+/// same `<`/`>`-stripping the launcher applies to the whole prompt).
+fn build_mini_delegation_addendum(
+    backend: Option<&super::mini_coder::MiniCoderBackend>,
+    covered: &[&'static str],
+) -> Option<String> {
+    let backend = backend?;
+    let model = clean_optional(backend.model.as_deref())
+        .unwrap_or_else(|| "your configured mini model".to_string());
+    let kind_label = mini_backend_kind_label(backend.kind);
+    let covered_list = if covered.is_empty() {
+        "none".to_string()
+    } else {
+        covered.join(", ")
+    };
+    Some(format!(
+        "MINI-CODER DELEGATION write_mode: your local mini is '{model}' ({kind_label}). When you delegate a WRITE task via spawn_mini_coder, set write_mode:\n\
+- 'agentic-iterative' = the mini fixes over multiple rounds against the deterministic gate. Use it ONLY for files in a language with gate coverage (this project: {covered_list}) AND when '{model}' is capable enough to iterate usefully.\n\
+- 'emit-edits' (default) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
+You decide per task; default to emit-edits when unsure.\n"
+    ))
+}
+
 fn project_agent_prompt(
     project: &ParsedProject,
     role: &str,
@@ -2160,6 +2234,13 @@ fn project_agent_prompt(
     // free text never reaches the prompt.
     design_handoff_folder: Option<&Path>,
     workflow_addendum: Option<&str>,
+    // A3 — the coder-only MINI-CODER DELEGATION write_mode guidance, PRE-BUILT by the
+    // caller from the configured mini backend + THIS project's gate-covered languages
+    // (`build_mini_delegation_addendum`). `None` when no mini backend is configured /
+    // for a verifier launch ⇒ no block (the prompt is byte-identical to today for those
+    // cases). Appended to the coder's mini-coder routing addendum below. Plain advisory
+    // text — no token/secret.
+    mini_delegation_addendum: Option<&str>,
 ) -> String {
     // Phase B merge: the coder PLANS and CODES — it absorbs the former
     // orchestrator's plan/coordinate mandate (claim tasks, create follow-ups,
@@ -2215,14 +2296,23 @@ fn project_agent_prompt(
     // F4: POSITIVE allowlist (coder-only), not a `_ => addendum` denylist. A future
     // role string would otherwise silently inherit the coder's mini-coder addendum;
     // only the coder gets it, every other role (verifier or anything new) gets "".
-    let mini_coder_addendum = match role {
+    // A3 appends the MINI-CODER DELEGATION write_mode block (pre-built by the caller)
+    // right AFTER the routing addendum, CODER-ONLY and only when a mini backend is
+    // configured (the caller passes `None` otherwise / for a verifier). Owned `String`
+    // so the optional A3 block can be concatenated; an empty/absent block leaves the
+    // base routing text byte-identical to today.
+    let mini_coder_addendum: String = match role {
         "coder" => {
-            "For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.\n\
+            let base = "For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.\n\
 When you call spawn_mini_coder it BLOCKS and returns a terminal status: \
 done -> verify its output and filesTouched, then use it; needs_clarification -> re-invoke with the answer or do it yourself; \
-aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do NOT silently retry the mini, and escalate to the human (agent_heartbeat status=\"needs_user\" with what happened); failed/timeout -> handle as an error. The mini never contacts the human — you are the only contact point.\n"
+aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do NOT silently retry the mini, and escalate to the human (agent_heartbeat status=\"needs_user\" with what happened); failed/timeout -> handle as an error. The mini never contacts the human — you are the only contact point.\n";
+            match mini_delegation_addendum {
+                Some(block) => format!("{base}{block}"),
+                None => base.to_string(),
+            }
         }
-        _ => "",
+        _ => String::new(),
     };
     // GH-P5 — cooperative git-push addendum (coder only). Mirrors the ROLE_RULES
     // coder.push mandate surfaced by the agent_rules MCP tool; this carries the
@@ -7740,6 +7830,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
+            None,
         );
 
         assert!(prompt.contains("Working root: C:\\Users\\gualt\\Desktop\\aspis bio"));
@@ -7762,6 +7853,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             Some("opus"),
             false,
+            None,
             None,
             None,
         );
@@ -7787,7 +7879,7 @@ updated_at: 2026-05-28T00:00:00Z
 
         // Absent skill -> no injection.
         let without = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None,
+            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
         );
         assert!(!without.contains("BEGIN PROJECT SKILL"));
 
@@ -7799,7 +7891,7 @@ updated_at: 2026-05-28T00:00:00Z
         drop(f);
 
         let with_skill = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None,
+            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
         );
         let _ = std::fs::remove_dir_all(&root);
 
@@ -7811,6 +7903,111 @@ updated_at: 2026-05-28T00:00:00Z
         // The rest of the prompt is preserved (skill is additive, not a rewrite).
         assert!(with_skill.contains("launch_token=\"tok\""));
         assert!(with_skill.len() > without.len());
+    }
+
+    // A3 — minimal Ollama mini backend for the delegation-block tests.
+    #[cfg(test)]
+    fn test_mini_backend(model: Option<&str>) -> crate::backend::mini_coder::MiniCoderBackend {
+        crate::backend::mini_coder::MiniCoderBackend {
+            kind: crate::backend::mini_coder::MiniCoderBackendKind::Ollama,
+            model: model.map(|m| m.to_string()),
+            command: None,
+            base_url: None,
+            max_concurrent: None,
+        }
+    }
+
+    #[test]
+    fn mini_delegation_addendum_names_model_langs_and_write_mode_rule() {
+        // A3 builder: with a configured backend the block names the model, the backend
+        // runtime, the covered-language list, and the agentic-iterative/emit-edits rule.
+        // PRODUCT-GENERAL: the text is built from the configured model + the passed
+        // covered set — no "Aspis"/product hardcoding, no hardcoded model id.
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let covered = ["Python", "TypeScript/JavaScript"];
+        let block = build_mini_delegation_addendum(Some(&backend), &covered)
+            .expect("a configured backend yields a block");
+        assert!(block.contains("qwen3.6-27b"), "names the configured model: {block}");
+        assert!(block.contains("a local Ollama model"), "names the backend runtime: {block}");
+        assert!(block.contains("agentic-iterative"), "mentions agentic-iterative: {block}");
+        assert!(block.contains("emit-edits"), "mentions emit-edits: {block}");
+        assert!(block.contains("write_mode"), "names the param: {block}");
+        assert!(
+            block.contains("this project: Python, TypeScript/JavaScript"),
+            "lists the covered languages: {block}"
+        );
+        // Product-general: no product/cloud hardcoding in the injected text.
+        for needle in ["Aspis", "Cloudflare", "Scaleway"] {
+            assert!(!block.contains(needle), "must be product-general; found {needle}: {block}");
+        }
+    }
+
+    #[test]
+    fn mini_delegation_addendum_empty_coverage_says_none() {
+        // Graceful degradation: an empty covered set still renders the block but reports
+        // coverage as "none", steering the coder to emit-edits everywhere.
+        let backend = test_mini_backend(Some("tiny-1b"));
+        let block = build_mini_delegation_addendum(Some(&backend), &[])
+            .expect("a configured backend yields a block");
+        assert!(block.contains("this project: none"), "empty coverage -> 'none': {block}");
+        assert!(block.contains("tiny-1b"), "still names the model: {block}");
+    }
+
+    #[test]
+    fn mini_delegation_addendum_absent_when_no_backend() {
+        // No mini backend configured -> no block at all (the coder prompt degrades to
+        // today's wording).
+        assert!(
+            build_mini_delegation_addendum(None, &["Python"]).is_none(),
+            "no backend -> no delegation block"
+        );
+    }
+
+    #[test]
+    fn mini_delegation_addendum_no_model_uses_generic_label() {
+        // A backend with no model tag (e.g. codex/appleFm) still produces a block using a
+        // generic stand-in label, never a fabricated model id.
+        let backend = test_mini_backend(None);
+        let block = build_mini_delegation_addendum(Some(&backend), &["Go"])
+            .expect("a configured backend yields a block");
+        assert!(block.contains("your configured mini model"), "generic model label: {block}");
+    }
+
+    #[test]
+    fn coder_prompt_includes_delegation_block_and_verifier_omits_it() {
+        // The full coder launch prompt carries the model name, the covered-langs list, and
+        // the write_mode guidance when a delegation block is supplied; a `None` block
+        // (e.g. no backend / verifier) leaves the prompt without it. The existing
+        // mini-coder routing addendum (coder-only) still precedes the new block.
+        let project = censor_prompt_test_project();
+        let root = PathBuf::from("C:\\Users\\gualt\\Desktop\\aspis bio");
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let block = build_mini_delegation_addendum(Some(&backend), &["Python"]).unwrap();
+
+        let coder = project_agent_prompt(
+            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None,
+            Some(block.as_str()),
+        );
+        assert!(coder.contains("qwen3.6-27b"), "coder prompt names the model");
+        assert!(coder.contains("MINI-CODER DELEGATION write_mode"), "carries the A3 block");
+        assert!(coder.contains("this project: Python"), "carries the covered langs");
+        // The routing addendum still leads the mini-coder section.
+        assert!(coder.contains("you MAY delegate to spawn_mini_coder"), "routing addendum kept");
+
+        // No block supplied -> coder prompt is the pre-A3 wording (no delegation block).
+        let coder_plain = project_agent_prompt(
+            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
+        );
+        assert!(!coder_plain.contains("MINI-CODER DELEGATION write_mode"), "absent without a block");
+        assert!(coder_plain.contains("you MAY delegate to spawn_mini_coder"), "routing addendum kept");
+
+        // A verifier never gets the mini-coder section at all (block ignored even if Some).
+        let verifier = project_agent_prompt(
+            &project, "verifier", "verifier-1", None, &root, "tok", None, false, None, None,
+            Some(block.as_str()),
+        );
+        assert!(!verifier.contains("MINI-CODER DELEGATION write_mode"), "verifier omits the block");
+        assert!(!verifier.contains("you MAY delegate to spawn_mini_coder"), "verifier has no mini section");
     }
 
     // Build a minimal ParsedProject for prompt tests (no tasks; the prompt is
@@ -7858,6 +8055,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
+            None,
         );
         assert!(
             prompt.contains("censor_findings(project_id, file=<files you just touched>)"),
@@ -7898,6 +8096,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
             None,
             None,
         );
@@ -7949,6 +8148,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
             None,
             None,
         );
@@ -8004,6 +8204,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
+            None,
         );
         assert!(
             prompt.contains("commit freely"),
@@ -8052,6 +8253,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
+            None,
         );
         assert!(
             !prompt.contains("aborted_by_human"),
@@ -8084,6 +8286,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             false,
+            None,
             None,
             None,
         );
@@ -8123,6 +8326,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
+            None,
         );
         assert!(
             !plain.contains("residual ledger"),
@@ -8143,6 +8347,7 @@ updated_at: 2026-05-28T00:00:00Z
             "test-launch-token",
             None,
             true,
+            None,
             None,
             None,
         );
@@ -8329,6 +8534,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             Some(design.as_path()),
             None,
+            None,
         );
 
         // The addendum is present and cites the RELATIVE bundle path (forward slashes),
@@ -8380,6 +8586,7 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
+            None,
         );
         assert!(
             !plain.contains("a design bundle has been saved"),
@@ -8398,6 +8605,7 @@ updated_at: 2026-05-28T00:00:00Z
             None,
             false,
             Some(root.as_path()),
+            None,
             None,
         );
         assert!(

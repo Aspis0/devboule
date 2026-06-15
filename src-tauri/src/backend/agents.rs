@@ -798,6 +798,11 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 // mechanical sub-tasks to spawn_mini_coder; front-load context; do
                 // the thinking yourself; REVIEW the cheaper model's output as a draft.
                 "Delegate only cheap, mechanical sub-tasks to spawn_mini_coder (boilerplate, bulk read->summary, simple edits, docstrings, tests); front-load the needed context; do the thinking yourself; REVIEW the mini's output as a draft before using it.",
+                // A3: mini-coder write_mode rule of thumb (bilingual by design — English
+                // here, Italian in the Python ROLE_RULES). agentic-iterative ONLY for files
+                // in a language with deterministic-gate coverage in THIS project AND a model
+                // capable enough to iterate; otherwise emit-edits (the default).
+                "For a WRITE task set spawn_mini_coder's write_mode: use 'agenticIterative' ONLY for files in a language with deterministic-gate coverage in this project AND when the local model is capable enough to iterate usefully; otherwise use 'emitEdits' (the default). When unsure, use 'emitEdits'.",
                 // MC-P5: mirror of the Python coder.forbidden mini-coder escalation
                 // line (bilingual by design — English here, Italian in the Python
                 // ROLE_RULES). If spawn_mini_coder returns aborted_by_human the coder
@@ -2732,6 +2737,29 @@ mod tests {
         assert!(
             !verifier.forbidden.join(" ").contains("spawn_mini_coder"),
             "verifier must not carry any spawn_mini_coder routing rule"
+        );
+    }
+
+    #[test]
+    fn coder_rule_carries_write_mode_rule() {
+        // A3: the coder role's forbidden list must carry the write_mode rule of thumb
+        // (agentic-iterative only for covered-language files + a capable model; else
+        // emit-edits), mirroring the Python ROLE_RULES coder.forbidden line. The
+        // verifier (no spawn_mini_coder) must NOT carry it.
+        let rules = default_role_rules();
+        let coder = rules.iter().find(|r| r.role == "coder").unwrap();
+        let blob = coder.forbidden.join(" ");
+        assert!(blob.contains("write_mode"), "coder cites write_mode");
+        assert!(blob.contains("agenticIterative"), "coder cites the agentic mode");
+        assert!(blob.contains("emitEdits"), "coder cites the default mode");
+        assert!(
+            blob.contains("deterministic-gate coverage"),
+            "coder states the gate-coverage gating"
+        );
+        let verifier = rules.iter().find(|r| r.role == "verifier").unwrap();
+        assert!(
+            !verifier.forbidden.join(" ").contains("write_mode"),
+            "verifier must not carry the write_mode rule"
         );
     }
 

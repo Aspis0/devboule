@@ -262,6 +262,7 @@ ROLE_RULES = [
             "Non imposta done: serve verifier con evidenza.",
             "Non legge o stampa token. Usa solo token da env e scope Aspis Bio verificato.",
             "Delega a spawn_mini_coder solo sub-task economici e meccanici (boilerplate, bulk read->summary, edit semplici, docstring, test); pre-carica il contesto necessario; ragiona tu; RIVEDI l'output del mini come bozza prima di usarlo.",
+            "Per un task di WRITE scegli `write_mode`: 'agenticIterative' SOLO per file in un linguaggio con copertura del gate deterministico in QUESTO progetto E con un modello mini abbastanza capace di iterare; altrimenti 'emitEdits' (default). Nel dubbio usa 'emitEdits'.",
             "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\").",
             "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), rifai il file TU STESSO: il rail di training ha gia' catturato il fallimento, quindi NON rilanciare ciecamente il mini sullo stesso file.",
             "Prima di mettere un task in review: fai girare UN SOLO pass di review tuo (un subagente Sonnet) sui file che hai toccato, fixa i finding, POI sposta il task a review con una nota 'ready for final reviewer'. Il verdetto FINALE resta del verifier (il pass finale censorReview si lancia dall'app, NON parte da solo quando metti review), mai del tuo pass.",
@@ -390,7 +391,15 @@ TOOLS = [
     },
     {
         "name": "spawn_mini_coder",
-        "description": "Solo coder: delega un sotto-task economico a un mini-coder one-shot ospitato dall'app; blocca finche il mini termina e restituisce il risultato terminale.",
+        "description": (
+            "Solo coder: delega un sotto-task economico a un mini-coder one-shot "
+            "ospitato dall'app; blocca finche il mini termina e restituisce il "
+            "risultato terminale. Per i task di WRITE scegli `write_mode`: "
+            "'agenticIterative' (il mini corregge su piu round contro il gate "
+            "deterministico) SOLO per file in un linguaggio con copertura del gate "
+            "in questo progetto E con un modello mini abbastanza capace di iterare; "
+            "altrimenti 'emitEdits' (default: una scrittura + una correzione)."
+        ),
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -405,9 +414,14 @@ TOOLS = [
                 "default": MINI_CODER_WRITE_MODE_DEFAULT,
                 "description": (
                     "How a write mini applies changes: 'emitEdits' (default; the "
-                    "model returns a JSON edit list, the app applies it) vs "
-                    "'agenticIterative' (the model iterates and writes files itself; "
-                    "gated by language coverage - behavior wired later)."
+                    "model returns a JSON edit list, the app applies it - use for "
+                    "mechanical/well-scoped edits, uncovered languages, or a "
+                    "small/weak local model) vs 'agenticIterative' (the model "
+                    "iterates over multiple rounds against the deterministic gate - "
+                    "use ONLY for files in a language with gate coverage in this "
+                    "project AND when the local model is capable enough to iterate "
+                    "usefully). Gated by language coverage; falls back to one-shot "
+                    "when uncovered. Default to emitEdits when unsure."
                 ),
             },
             "session_token": {"type": "string"},
