@@ -21,8 +21,8 @@
 //!      is not a hard contradiction is KEPT.
 //!
 //! PRODUCT GENERALITY: the API is keyed on [`FileLang`]. Wired grammars: Rust,
-//! TS/JS (the TSX grammar — broadest of the TS family, parses TS/JS/JSX/TSX), and
-//! Python. `FileLang::Other` degrades gracefully — [`extract_items`] returns an
+//! TS/JS (the TSX grammar — broadest of the TS family, parses TS/JS/JSX/TSX),
+//! Python, and Go. `FileLang::Other` degrades gracefully — [`extract_items`] returns an
 //! empty `Vec` and [`parse_file`] yields an empty identifier set, so symbol
 //! grounding is disabled for it (unknown != contradicted) while the universal
 //! line-range grounding still applies (it only needs the line count). tree-sitter
@@ -117,10 +117,18 @@ pub enum Grounding {
 /// Python (`Py`): parsed with `tree-sitter-python`; returns the top-level
 /// `function_definition` and `class_definition`, UNWRAPPING `decorated_definition`.
 ///
+/// Go (`Go`): parsed with `tree-sitter-go`; returns the top-level
+/// `function_declaration`, `method_declaration` (Go methods ARE top-level — they sit
+/// directly under `source_file`, unlike class methods in TS/Python), `type_declaration`
+/// (named by its inner `type_spec`'s `name` — covers struct/interface/alias),
+/// `const_declaration`, and `var_declaration`. Names come from the `name` field where
+/// the grammar exposes one (a `const`/`var` block has no single declaration-level name,
+/// so it is left `None`).
+///
 /// `Other`: returns an empty `Vec`. This NEVER panics (a grammar/parse failure
 /// yields an empty `Vec`).
 ///
-// TODO(C2/C3 follow-up): add the C/C++/Kotlin/Go/HTML grammars where a strong tool
+// TODO(C2/C3 follow-up): add the C/C++/Kotlin/HTML grammars where a strong tool
 // and a clear review-unit set exist.
 ///
 /// Delegates to [`parse_file`] (the SINGLE parse path) and returns only its `items`,
@@ -156,6 +164,14 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
         }
         FileLang::Py => {
             let (items, identifiers) = parse_py(source);
+            ParsedFile {
+                total_lines,
+                items,
+                identifiers,
+            }
+        }
+        FileLang::Go => {
+            let (items, identifiers) = parse_go(source);
             ParsedFile {
                 total_lines,
                 items,
@@ -691,6 +707,116 @@ fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, |k| k == "identifier");
+    (items, identifiers)
+}
+
+// ===========================================================================
+// Go
+// ===========================================================================
+
+/// The Go top-level item node kinds we treat as review units, as direct children of
+/// the `source_file` root. `function_declaration` (free functions) and
+/// `method_declaration` (methods — in Go these are TOP-LEVEL, declared on a receiver
+/// directly under the root, NOT nested inside their type) are named by a `name`
+/// field. `type_declaration` (which wraps one or more `type_spec`s — struct,
+/// interface, or alias) has NO `name` field of its own; it is named by its FIRST
+/// inner `type_spec`'s `name` (see [`go_item_name`]). `const_declaration` /
+/// `var_declaration` wrap `const_spec`/`var_spec`(s) and likewise carry no single
+/// declaration-level `name` (a `const ( ... )` block binds many), so they are review
+/// units with no name (`None`).
+const GO_ITEM_KINDS: [&str; 5] = [
+    "function_declaration",
+    "method_declaration",
+    "type_declaration",
+    "const_declaration",
+    "var_declaration",
+];
+
+/// Build a [`ReviewItem`] from a direct child of the `source_file` root IF it is one
+/// of [`GO_ITEM_KINDS`]; else `None`. Row math SATURATES (see [`ts_review_item`]).
+fn go_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> {
+    let kind = node.kind();
+    if !GO_ITEM_KINDS.contains(&kind) {
+        return None;
+    }
+    let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    Some(ReviewItem {
+        kind: kind.to_string(),
+        name: go_item_name(node, bytes),
+        start_line: to_line(node.start_position().row),
+        end_line: to_line(node.end_position().row),
+    })
+}
+
+/// Pull the name from a top-level Go item node, where the grammar exposes one:
+///   - `function_declaration` / `method_declaration` — the `name` field holds the
+///     declared identifier (the function name, or the method name; the receiver is a
+///     separate field we deliberately ignore for the display name).
+///   - `type_declaration` — has NO `name` field; it wraps `type_spec`(s). We name it
+///     by the FIRST `type_spec`'s `name` field (`type Point struct{}` → `Point`,
+///     covering struct/interface/alias). A grouped `type ( A …; B … )` block reports
+///     the first spec's name as the unit's display hint.
+///   - `const_declaration` / `var_declaration` — no single declaration-level name (a
+///     block binds many specs), so `None`.
+/// Anything else / a missing field → `None` (never guess).
+fn go_item_name(node: &tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let field = if node.kind() == "type_declaration" {
+        // The declaration has no `name`; descend to the first `type_spec` and take its
+        // `name` field (the new type's identifier — NOT the underlying type).
+        let mut cursor = node.walk();
+        let spec = node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "type_spec" || c.kind() == "type_alias")?;
+        spec.child_by_field_name("name")
+    } else {
+        node.child_by_field_name("name")
+    };
+    let child = field?;
+    let text = child.utf8_text(bytes).ok()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// The Go leaf node kinds that count as "an identifier present in the file" for symbol
+/// grounding. `identifier` covers funcs/consts/vars/locals/calls; `type_identifier`
+/// covers type names (structs/interfaces/aliases and type references);
+/// `field_identifier` covers struct fields and method names; `package_identifier`
+/// covers the package qualifier in a selector (`fmt` in `fmt.Println`) — a finding
+/// would plausibly cite any of these. Same conservative rule as the other languages:
+/// collect every name a finding might cite so symbol grounding never false-drops a
+/// real Go finding.
+fn is_go_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "type_identifier" | "field_identifier" | "package_identifier"
+    )
+}
+
+/// Parse Go `source` into `(items, identifiers)` — the SINGLE Go parse routine. Top-
+/// level items are the direct children of `source_file` (see [`GO_ITEM_KINDS`]); the
+/// identifier set is every identifier-like leaf in the whole tree (see
+/// [`is_go_identifier_kind`]). A parse failure yields empty + empty (symbol grounding
+/// then disabled — fail-open, never a false drop).
+fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+    let tree = match parse_with(source, tree_sitter_go::LANGUAGE.into()) {
+        Some(t) => t,
+        None => return (Vec::new(), HashSet::new()),
+    };
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut items = Vec::new();
+    let mut top_cursor = root.walk();
+    for child in root.children(&mut top_cursor) {
+        if let Some(item) = go_top_level_item(&child, bytes) {
+            items.push(item);
+        }
+    }
+
+    let identifiers = collect_identifiers(root, bytes, is_go_identifier_kind);
     (items, identifiers)
 }
 
@@ -1421,6 +1547,154 @@ def decorated():
             Grounding::DroppedLineOutOfFile
         );
         // A valid in-file blank line BETWEEN items (line 3) with no symbol → kept.
+        assert_eq!(grounds(&parsed, Some(3), None), Grounding::Kept);
+    }
+
+    // =======================================================================
+    // Go
+    // =======================================================================
+
+    /// A Go snippet: a package clause, an import, a free function, a struct type, and
+    /// a METHOD on that type (the method is TOP-LEVEL in Go — declared on a receiver
+    /// directly under `source_file`, NOT nested inside the struct). The method USES the
+    /// imported package (`fmt.Println`) so the grammar emits a `package_identifier`
+    /// node for `fmt` — an import path alone is a string literal, not an identifier, so
+    /// only a USE site exercises package-identifier collection. Line numbers (1-based)
+    /// annotated for the assertions.
+    const GO_SNIPPET: &str = "\
+package main
+
+import \"fmt\"
+
+func F() int {
+\treturn 1
+}
+
+type T struct {
+\tx int
+}
+
+func (t T) M() int {
+\tfmt.Println(t.x)
+\treturn t.x
+}
+";
+
+    #[test]
+    fn extract_items_go_kinds_lines_and_names() {
+        let items = extract_items(GO_SNIPPET, FileLang::Go);
+
+        // Three top-level units: the func F, the type T, and the method M. The
+        // package clause and the import are NOT review units.
+        assert_eq!(items.len(), 3, "items: {items:?}");
+
+        let f = item(&items, "function_declaration");
+        assert_eq!(f.name.as_deref(), Some("F"));
+        // `func F() int {` is line 5; closing `}` is line 7 (1-based inclusive).
+        assert_eq!(f.start_line, 5);
+        assert_eq!(f.end_line, 7);
+
+        // `type T struct{}` — the declaration has no `name`; named by its inner
+        // `type_spec`'s `name`. `type T struct {` is line 9; closing `}` is line 11.
+        let t = item(&items, "type_declaration");
+        assert_eq!(t.name.as_deref(), Some("T"));
+        assert_eq!(t.start_line, 9);
+        assert_eq!(t.end_line, 11);
+
+        // The method M is TOP-LEVEL in Go (unlike a class method). `func (t T) M()
+        // int {` is line 13; closing `}` is line 16 (the body now has two stmts).
+        let m = item(&items, "method_declaration");
+        assert_eq!(m.name.as_deref(), Some("M"));
+        assert_eq!(m.start_line, 13);
+        assert_eq!(m.end_line, 16);
+    }
+
+    #[test]
+    fn extract_items_go_covers_const_var_and_interface() {
+        // A const block, a var, an interface type (named via its type_spec), and a
+        // type alias — exercising the remaining GO_ITEM_KINDS + the type_spec naming.
+        let src = "\
+package p
+
+const K = 1
+
+var greeting = \"hi\"
+
+type Shape interface {
+\tArea() float64
+}
+
+type Id = uint64
+";
+        let items = extract_items(src, FileLang::Go);
+        let kinds: HashSet<&str> = items.iter().map(|i| i.kind.as_str()).collect();
+        for expected in [
+            "const_declaration",
+            "var_declaration",
+            "type_declaration",
+        ] {
+            assert!(kinds.contains(expected), "missing {expected} in {kinds:?}");
+        }
+        // The interface type is named by its type_spec (`Shape`); the alias by its
+        // (`Id`). Both are `type_declaration`s, so collect their names.
+        let type_names: HashSet<Option<&str>> = items
+            .iter()
+            .filter(|i| i.kind == "type_declaration")
+            .map(|i| i.name.as_deref())
+            .collect();
+        assert!(type_names.contains(&Some("Shape")), "names: {type_names:?}");
+        assert!(type_names.contains(&Some("Id")), "names: {type_names:?}");
+        // A single-binding `const K = 1` / `var greeting` block has no single
+        // declaration-level name → None (a review unit with no display name).
+        let consts: Vec<_> = items.iter().filter(|i| i.kind == "const_declaration").collect();
+        assert_eq!(consts.len(), 1);
+        assert_eq!(consts[0].name, None);
+    }
+
+    #[test]
+    fn extract_items_go_empty_and_malformed_do_not_panic() {
+        assert!(extract_items("", FileLang::Go).is_empty());
+        let _ = extract_items("func broken( {", FileLang::Go);
+        let _ = extract_items("}}}{{{ not go 流", FileLang::Go);
+    }
+
+    #[test]
+    fn grounding_go_keeps_present_symbol_drops_invented() {
+        let parsed = parse_file(GO_SNIPPET, FileLang::Go);
+        // Symbol grounding is active for Go (identifiers populated).
+        assert!(!parsed.identifiers.is_empty());
+        // `F` (identifier), `T` (type_identifier), `M` (field_identifier as a method
+        // name), `x` (field_identifier), `fmt` (package_identifier) are collected.
+        assert!(parsed.identifiers.contains("F"));
+        assert!(parsed.identifiers.contains("T"));
+        assert!(parsed.identifiers.contains("M"));
+        assert!(parsed.identifiers.contains("x"));
+        assert!(
+            parsed.identifiers.contains("fmt"),
+            "package_identifier 'fmt' missing: {:?}",
+            parsed.identifiers
+        );
+        // A finding citing a present symbol → kept (a qualified path with a known
+        // component is kept too).
+        assert_eq!(grounds(&parsed, Some(5), Some("F")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, None, Some("T.M")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, None, Some("fmt.Println")), Grounding::Kept);
+        // A wholly invented symbol with the grammar present → dropped.
+        assert_eq!(
+            grounds(&parsed, Some(5), Some("totallyInvented")),
+            Grounding::DroppedUnknownSymbol
+        );
+    }
+
+    #[test]
+    fn grounding_go_line_checks() {
+        let parsed = parse_file(GO_SNIPPET, FileLang::Go);
+        // A finding past EOF is dropped.
+        assert_eq!(
+            grounds(&parsed, Some(parsed.total_lines + 1), None),
+            Grounding::DroppedLineOutOfFile
+        );
+        // The import line (3) is in the file but OUTSIDE any item → kept (no over-drop).
         assert_eq!(grounds(&parsed, Some(3), None), Grounding::Kept);
     }
 }

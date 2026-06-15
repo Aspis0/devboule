@@ -20,6 +20,7 @@ pub enum ProjectKind {
     Rust,
     Node,
     Python,
+    Go,
 }
 
 /// Canonical Python project markers. `pyproject.toml` is the modern standard, but
@@ -35,11 +36,11 @@ const PYTHON_MARKERS: [&str; 5] = [
 ];
 
 /// Detect which project kinds a root is, from the presence of a canonical manifest
-/// at the root: `Cargo.toml` → Rust, `package.json` → Node, and any of
-/// [`PYTHON_MARKERS`] → Python. Only the root level is probed (cheap,
-/// deterministic); nested manifests in subdirectories are out of scope here — the
-/// cross-cutting runners (gitleaks/jscpd/lizard/semgrep) cover files regardless of
-/// kind.
+/// at the root: `Cargo.toml` → Rust, `package.json` → Node, any of
+/// [`PYTHON_MARKERS`] → Python, and `go.mod` → Go. Only the root level is probed
+/// (cheap, deterministic); nested manifests in subdirectories are out of scope here
+/// — the cross-cutting runners (gitleaks/jscpd/lizard/semgrep) cover files
+/// regardless of kind.
 pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     let mut kinds = HashSet::new();
     if root.join("Cargo.toml").exists() {
@@ -51,6 +52,13 @@ pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     if PYTHON_MARKERS.iter().any(|m| root.join(m).exists()) {
         kinds.insert(ProjectKind::Python);
     }
+    // `go.mod` is the canonical module manifest for a Go project (modules are the
+    // standard since Go 1.11). A GOPATH-only layout with no `go.mod` is legacy and
+    // rare; we deliberately key off the modern marker only (mirrors the
+    // single-canonical-marker choice for Rust/Node).
+    if root.join("go.mod").exists() {
+        kinds.insert(ProjectKind::Go);
+    }
     kinds
 }
 
@@ -61,13 +69,15 @@ pub enum FileLang {
     Rust,
     Ts,
     Py,
+    Go,
     Other,
 }
 
 impl FileLang {
     /// Classify a file path by its extension (case-insensitive). `.ts`/`.tsx`/
     /// `.js`/`.jsx`/`.cts`/`.mts`/`.cjs`/`.mjs` → `Ts` (the JS/TS toolchain:
-    /// tsc/eslint/knip); `.rs` → `Rust`; `.py`/`.pyi` → `Py`; else `Other`.
+    /// tsc/eslint/knip); `.rs` → `Rust`; `.py`/`.pyi` → `Py`; `.go` → `Go`
+    /// (the gofmt/go-vet toolchain); else `Other`.
     pub fn from_path(path: &Path) -> FileLang {
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_ascii_lowercase(),
@@ -77,6 +87,7 @@ impl FileLang {
             "rs" => FileLang::Rust,
             "ts" | "tsx" | "js" | "jsx" | "cts" | "mts" | "cjs" | "mjs" => FileLang::Ts,
             "py" | "pyi" => FileLang::Py,
+            "go" => FileLang::Go,
             _ => FileLang::Other,
         }
     }
@@ -153,16 +164,30 @@ mod tests {
     }
 
     #[test]
+    fn detect_go_from_go_mod() {
+        let dir = unique_temp_root("go");
+        fs::write(dir.join("go.mod"), "module example.com/x\n\ngo 1.22\n").unwrap();
+        let kinds = detect_project_kinds(&dir);
+        assert!(kinds.contains(&ProjectKind::Go));
+        assert!(!kinds.contains(&ProjectKind::Rust));
+        assert!(!kinds.contains(&ProjectKind::Node));
+        assert!(!kinds.contains(&ProjectKind::Python));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn detect_multiple_kinds_for_polyglot_root() {
         let dir = unique_temp_root("poly");
         fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
         fs::write(dir.join("package.json"), "{}").unwrap();
         fs::write(dir.join("pyproject.toml"), "[project]").unwrap();
+        fs::write(dir.join("go.mod"), "module example.com/x\n").unwrap();
         let kinds = detect_project_kinds(&dir);
-        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds.len(), 4);
         assert!(kinds.contains(&ProjectKind::Rust));
         assert!(kinds.contains(&ProjectKind::Node));
         assert!(kinds.contains(&ProjectKind::Python));
+        assert!(kinds.contains(&ProjectKind::Go));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -176,10 +201,12 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("src/a.mjs")), FileLang::Ts);
         assert_eq!(FileLang::from_path(Path::new("a.py")), FileLang::Py);
         assert_eq!(FileLang::from_path(Path::new("a.pyi")), FileLang::Py);
+        assert_eq!(FileLang::from_path(Path::new("main.go")), FileLang::Go);
         assert_eq!(FileLang::from_path(Path::new("a.txt")), FileLang::Other);
         assert_eq!(FileLang::from_path(Path::new("README")), FileLang::Other);
         // Case-insensitive extension matching.
         assert_eq!(FileLang::from_path(Path::new("A.RS")), FileLang::Rust);
         assert_eq!(FileLang::from_path(Path::new("A.PY")), FileLang::Py);
+        assert_eq!(FileLang::from_path(Path::new("MAIN.GO")), FileLang::Go);
     }
 }

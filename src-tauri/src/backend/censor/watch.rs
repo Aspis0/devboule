@@ -514,11 +514,14 @@ fn run_loop(
 
 /// Route one change onto the correct debounce window + accumulator.
 ///
-/// TS/Python files go to the FINE window (cheap per-file linters need the exact
-/// changed set). Rust files and "Other" files (cross-cutting only) go to the
-/// COARSE window — a Rust edit means clippy/cargo-check; an "Other" edit (config,
-/// etc.) still warrants the project-wide gitleaks/jscpd sweep. A file can only be
-/// one language, so it lands in exactly one bucket.
+/// TS/Python/Go files go to the FINE window (cheap per-file linters need the exact
+/// changed set: eslint/ruff/gofmt). Their COMPILE-BASED / project-wide tools
+/// (tsc/knip for TS, go vet for Go) are COARSE and ride the coarse window like every
+/// other coarse runner — never the hot per-file path (go vet COMPILES, so this is the
+/// load-bearing reason it must not be fine-routed). Rust files and "Other" files
+/// (cross-cutting only) go to the COARSE window — a Rust edit means clippy/cargo-check;
+/// an "Other" edit (config, etc.) still warrants the project-wide gitleaks/jscpd sweep.
+/// A file can only be one language, so it lands in exactly one bucket.
 fn bucket_event(
     ev: ChangeEvent,
     fine: &mut DebounceState,
@@ -528,7 +531,7 @@ fn bucket_event(
 ) {
     let now = Instant::now();
     match ev.lang {
-        FileLang::Ts | FileLang::Py => {
+        FileLang::Ts | FileLang::Py | FileLang::Go => {
             fine_files.insert(ev.rel_path);
             fine.record(now);
         }
@@ -648,6 +651,29 @@ mod tests {
             2,
             "rust/other files do not enter the fine set"
         );
+    }
+
+    #[test]
+    fn go_file_goes_to_fine_bucket() {
+        // A .go edit routes to FINE (gofmt runs per-file); it does NOT set the coarse
+        // pending flag (go vet rides the coarse window like tsc/knip for TS).
+        let mut fine = DebounceState::new(Duration::from_millis(FINE_DEBOUNCE_MS));
+        let mut coarse = DebounceState::new(Duration::from_millis(COARSE_DEBOUNCE_MS));
+        let mut fine_files = BTreeSet::new();
+        let mut coarse_pending = false;
+        bucket_event(
+            ChangeEvent {
+                rel_path: "cmd/main.go".into(),
+                lang: FileLang::Go,
+            },
+            &mut fine,
+            &mut coarse,
+            &mut fine_files,
+            &mut coarse_pending,
+        );
+        assert!(fine.pending());
+        assert!(fine_files.contains("cmd/main.go"));
+        assert!(!coarse_pending, "a go edit alone must not flip coarse pending");
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub mod cargo_fmt;
 pub mod clippy;
 pub mod eslint;
 pub mod gitleaks;
+pub mod go_vet;
+pub mod gofmt;
 pub mod jscpd;
 pub mod knip;
 pub mod lizard;
@@ -142,6 +144,8 @@ pub enum RunnerId {
     Pyright,
     Bandit,
     Vulture,
+    Gofmt,
+    GoVet,
     Gitleaks,
     Jscpd,
     Lizard,
@@ -171,6 +175,10 @@ impl RunnerId {
             | RunnerId::Gitleaks
             | RunnerId::NpmAudit
             | RunnerId::PipAudit
+            // go vet COMPILES the module's packages (type-checked AST) → heavy /
+            // thermal, project-wide; it is COARSE (debounced) and must never run in
+            // the tight interactive loop (see runners/go_vet.rs header).
+            | RunnerId::GoVet
             | RunnerId::Zizmor => Granularity::Coarse,
             // Per-file linters/scanners (invoked with the changed file path).
             RunnerId::Eslint
@@ -179,6 +187,8 @@ impl RunnerId {
             | RunnerId::RuffFormat
             | RunnerId::Bandit
             | RunnerId::Vulture
+            // gofmt only parses + reformats in memory (INSTANT, no compile) → Fine.
+            | RunnerId::Gofmt
             | RunnerId::Lizard
             | RunnerId::Semgrep
             | RunnerId::Oxlint
@@ -204,6 +214,8 @@ impl RunnerId {
             RunnerId::RuffFormat => "ruff",
             RunnerId::Bandit => "bandit",
             RunnerId::Vulture => "vulture",
+            RunnerId::Gofmt => "gofmt",
+            RunnerId::GoVet => "go",
             RunnerId::Gitleaks => "gitleaks",
             RunnerId::Jscpd => "jscpd",
             RunnerId::Lizard => "lizard",
@@ -241,6 +253,7 @@ const CROSS_CUTTING: [RunnerId; 5] = [
 ///   - `.rs` file in a Rust project → clippy, cargo-check, cargo-audit (coarse)
 ///   - `.ts`/`.js` file in a Node project → tsc, eslint, knip
 ///   - `.py` file in a Python project → ruff, bandit, vulture
+///   - `.go` file in a Go project → gofmt (fine), go vet (coarse, compile-based)
 ///   - ANY file → gitleaks, jscpd, lizard, semgrep (cross-cutting)
 ///
 /// A language-specific runner is only added when BOTH the file lang AND the
@@ -271,6 +284,12 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
             out.push(RunnerId::Pyright);
             out.push(RunnerId::Bandit);
             out.push(RunnerId::Vulture);
+        }
+        FileLang::Go if kinds.contains(&ProjectKind::Go) => {
+            // gofmt is Fine (instant, no compile); go vet is Coarse (compile-based,
+            // debounced — never in the hot loop). Both advisory.
+            out.push(RunnerId::Gofmt);
+            out.push(RunnerId::GoVet);
         }
         _ => {}
     }
@@ -700,6 +719,29 @@ mod tests {
     }
 
     #[test]
+    fn go_file_in_go_project_gets_gofmt_govet_plus_cross_cutting() {
+        let r = applicable_runners(&kinds(&[ProjectKind::Go]), FileLang::Go);
+        assert!(r.contains(&RunnerId::Gofmt));
+        assert!(r.contains(&RunnerId::GoVet));
+        // Cross-cutting always present.
+        assert!(r.contains(&RunnerId::Gitleaks));
+        assert!(r.contains(&RunnerId::Semgrep));
+        // No other-language tools for a .go file.
+        assert!(!r.contains(&RunnerId::Clippy));
+        assert!(!r.contains(&RunnerId::Ruff));
+        assert!(!r.contains(&RunnerId::Eslint));
+    }
+
+    #[test]
+    fn go_file_without_go_project_kind_gets_only_cross_cutting() {
+        // A stray .go file in a Rust-only repo: no gofmt/go-vet, just cross-cutting.
+        let r = applicable_runners(&kinds(&[ProjectKind::Rust]), FileLang::Go);
+        assert!(!r.contains(&RunnerId::Gofmt));
+        assert!(!r.contains(&RunnerId::GoVet));
+        assert_eq!(r.len(), CROSS_CUTTING.len());
+    }
+
+    #[test]
     fn unknown_file_lang_gets_only_cross_cutting() {
         let r = applicable_runners(
             &kinds(&[ProjectKind::Rust, ProjectKind::Node]),
@@ -742,6 +784,8 @@ mod tests {
             RunnerId::Knip,
             RunnerId::Jscpd,
             RunnerId::Gitleaks,
+            // go vet is compile-based / project-wide → Coarse.
+            RunnerId::GoVet,
         ] {
             assert_eq!(
                 c.granularity(),
@@ -759,6 +803,8 @@ mod tests {
             RunnerId::Ruff,
             RunnerId::Bandit,
             RunnerId::Vulture,
+            // gofmt is instant (no compile) → Fine.
+            RunnerId::Gofmt,
             RunnerId::Lizard,
             RunnerId::Semgrep,
         ] {

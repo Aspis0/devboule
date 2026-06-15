@@ -655,7 +655,13 @@ fn detect_tools_with(
     // each kind's representative language so kind-specific runners are included.
     let mut programs: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for lang in [FileLang::Rust, FileLang::Ts, FileLang::Py, FileLang::Other] {
+    for lang in [
+        FileLang::Rust,
+        FileLang::Ts,
+        FileLang::Py,
+        FileLang::Go,
+        FileLang::Other,
+    ] {
         for runner in applicable_runners(kinds, lang) {
             let prog = runner.program().to_string();
             if seen.insert(prog.clone()) {
@@ -1021,6 +1027,24 @@ mod tests {
         assert!(!gitleaks.available, "gitleaks probed absent");
         // tsc is a Node runner and must appear (absent here).
         assert!(tools.iter().any(|t| t.name == "tsc" && !t.available));
+    }
+
+    #[test]
+    fn detect_tools_includes_go_executables_for_go_project() {
+        use super::super::detect::ProjectKind;
+        let mut kinds = std::collections::HashSet::new();
+        kinds.insert(ProjectKind::Go);
+        let tools = detect_tools_with(&kinds, |_| true);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // gofmt (its own executable) and `go` (go vet) both appear for a Go project.
+        assert!(names.contains(&"gofmt"), "missing gofmt in {names:?}");
+        assert!(names.contains(&"go"), "missing go (go vet) in {names:?}");
+        // A non-Go project does NOT surface the Go executables.
+        let mut rust = std::collections::HashSet::new();
+        rust.insert(ProjectKind::Rust);
+        let rust_tools = detect_tools_with(&rust, |_| true);
+        let rust_names: Vec<&str> = rust_tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(!rust_names.contains(&"gofmt"), "gofmt leaked into a Rust project");
     }
 
     #[test]

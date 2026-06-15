@@ -128,7 +128,13 @@ pub fn coarse_runners(kinds: &HashSet<ProjectKind>) -> Vec<RunnerId> {
     let mut out = Vec::new();
     // Probe one file of each language so `applicable_runners` adds the matching
     // kind-specific coarse runners; `Other` contributes only the cross-cutting set.
-    for lang in [FileLang::Rust, FileLang::Ts, FileLang::Py, FileLang::Other] {
+    for lang in [
+        FileLang::Rust,
+        FileLang::Ts,
+        FileLang::Py,
+        FileLang::Go,
+        FileLang::Other,
+    ] {
         for r in applicable_runners(kinds, lang) {
             if r.granularity() == Granularity::Coarse && seen.insert(r) {
                 out.push(r);
@@ -180,6 +186,9 @@ fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFind
         RunnerId::RuffFormat => runners::ruff_format::run(root, target),
         RunnerId::Bandit => runners::bandit::run(root, target),
         RunnerId::Vulture => runners::vulture::run(root, target),
+        // gofmt is FINE (per-file target); go vet is COARSE (whole module, root only).
+        RunnerId::Gofmt => runners::gofmt::run(root, target),
+        RunnerId::GoVet => runners::go_vet::run(root),
         RunnerId::Lizard => runners::lizard::run(root, target),
         RunnerId::Semgrep => runners::semgrep::run(root, target),
         RunnerId::Zizmor => runners::zizmor::run(root),
@@ -212,6 +221,8 @@ fn runner_source(id: RunnerId) -> &'static str {
         RunnerId::RuffFormat => "ruff-format",
         RunnerId::Bandit => "bandit",
         RunnerId::Vulture => "vulture",
+        RunnerId::Gofmt => "gofmt",
+        RunnerId::GoVet => "go-vet",
         RunnerId::Lizard => "lizard",
         RunnerId::Semgrep => "semgrep",
         RunnerId::Zizmor => "zizmor",
@@ -1028,6 +1039,37 @@ mod tests {
         assert_eq!(runner_source(RunnerId::Prettier), "prettier");
         assert_eq!(runner_source(RunnerId::RuffFormat), "ruff-format");
         assert_eq!(runner_source(RunnerId::Zizmor), "zizmor");
+        // Go runners: these MUST equal the `source:` literal each parser stamps
+        // (gofmt.rs → "gofmt", go_vet.rs → "go-vet") or the scoped merge strands
+        // zombie shard findings.
+        assert_eq!(runner_source(RunnerId::Gofmt), "gofmt");
+        assert_eq!(runner_source(RunnerId::GoVet), "go-vet");
+    }
+
+    #[test]
+    fn coarse_runners_for_go_includes_go_vet_not_gofmt() {
+        // A Go project's COARSE set must include go vet (compile-based, project-wide)
+        // and must NOT include gofmt (it is FINE, per-file).
+        let c = coarse_runners(&kinds(&[ProjectKind::Go]));
+        assert!(c.contains(&RunnerId::GoVet));
+        assert!(!c.contains(&RunnerId::Gofmt));
+        // Cross-cutting coarse still present.
+        assert!(c.contains(&RunnerId::Gitleaks));
+        for r in &c {
+            assert_eq!(r.granularity(), Granularity::Coarse, "{r:?} must be coarse");
+        }
+    }
+
+    #[test]
+    fn plan_fine_go_file_gets_gofmt() {
+        // A .go file's FINE plan includes gofmt (instant) but NOT go vet (coarse).
+        let plan = plan_fine(&kinds(&[ProjectKind::Go]), &["main.go".to_string()]);
+        let fp = &plan[0];
+        assert!(fp.runners.contains(&RunnerId::Gofmt));
+        assert!(!fp.runners.contains(&RunnerId::GoVet));
+        for r in &fp.runners {
+            assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
+        }
     }
 
     // ---- collect cores: tempdir, no tools installed → empty, no panic ----

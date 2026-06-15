@@ -88,6 +88,23 @@ pub fn severity_from_cargo_fmt() -> (Severity, Category) {
     (Severity::Low, Category::Style)
 }
 
+/// gofmt (Go formatting). Style-only check, exactly like cargo fmt / prettier:
+/// a file that is not gofmt-formatted is Low severity, Style category.
+#[allow(dead_code)] // first caller is the gofmt runner.
+pub fn severity_from_gofmt() -> (Severity, Category) {
+    (Severity::Low, Category::Style)
+}
+
+/// go vet (Go correctness analyzer). vet flags suspicious constructs (printf
+/// mismatches, lost struct tags, unreachable code). P2 ROLLOUT DISCIPLINE:
+/// advisory-first — vet diagnostics are CAPPED at Medium (NOT High) until the
+/// FP-rate on this repo is measured and the owner promotes it. Always Correctness
+/// (vet is a correctness/idiom analyzer, not a style or security tool).
+#[allow(dead_code)] // first caller is the go_vet runner.
+pub fn severity_from_go_vet() -> (Severity, Category) {
+    (Severity::Medium, Category::Correctness)
+}
+
 /// npm audit. npm uses low|moderate|high|critical; a dependency vulnerability
 /// is always Security. critical/high → High, moderate → Medium, low → Low,
 /// unknown → Medium.
@@ -416,5 +433,19 @@ mod tests {
     #[test]
     fn knip_is_dead_code() {
         assert_eq!(knip_category(), (Severity::Low, Category::DeadCode));
+    }
+
+    #[test]
+    fn gofmt_is_style_low() {
+        assert_eq!(severity_from_gofmt(), (Severity::Low, Category::Style));
+    }
+
+    #[test]
+    fn go_vet_is_correctness_capped_at_medium() {
+        // Advisory-first: never High until FP-rate is measured.
+        assert_eq!(
+            severity_from_go_vet(),
+            (Severity::Medium, Category::Correctness)
+        );
     }
 }
