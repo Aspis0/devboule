@@ -91,12 +91,23 @@ PRICES_FILE = ROOT / "bench" / "prices.json"
 
 
 # ============================================================================= config
+# Mirror of the Rust MAX_AGENTIC_FIX_ROUNDS (mini_coder.rs) — keep in sync. The
+# fix-round budget the "agentic-iterative" write-mode derives in this benchmark.
+AGENTIC_FIX_ROUNDS = 2
+
+
 @dataclass
 class Config:
     sample: str = "model-tag"
     coder: str = "local-dense"            # local-moe | local-dense | api:<model>
     censor: str = "gemma-local"           # nemotron-local | gemma-local | devstral-local | sonnet-api | off
     max_fix_rounds: int = 1
+    # D (write-mode comparison): "emit-edits" = a single bounded fix pass (the default
+    # product behavior); "agentic-iterative" = up to AGENTIC_FIX_ROUNDS bounded fix
+    # rounds vs the gate. --write-mode DERIVES max_fix_rounds (unless --max-fix-rounds
+    # is given explicitly) and is tagged on every result row so the F2P comparison can
+    # aggregate per (coder x write_mode). Mirror of the Rust MAX_AGENTIC_FIX_ROUNDS.
+    write_mode: str = "emit-edits"
     think_budget: int | None = None       # dense thinking-token cap (budget forcing); None = unbounded
     escalate: bool = False
     wall_clock_cap: int = 600             # per coder call backstop (seconds)
@@ -666,6 +677,7 @@ def _emit(cfg, sample, f2p, cost_usd, pipeline_s, fix_rounds, censor_n, escalate
         "coder": cfg.coder,
         "censor": cfg.censor,
         "f2p": bool(f2p),
+        "write_mode": cfg.write_mode,
         "cost_usd": round(cost_usd, 6),
         "pipeline_s": round(pipeline_s, 1),
         "fix_rounds": fix_rounds,
@@ -698,6 +710,11 @@ def _config_from_args(args):
         cfg.think_budget = args.think_budget
     if args.escalate:
         cfg.escalate = True
+    if args.write_mode is not None:
+        cfg.write_mode = args.write_mode
+        # derive the fix-round budget from the mode unless --max-fix-rounds was explicit
+        if args.max_fix_rounds is None:
+            cfg.max_fix_rounds = AGENTIC_FIX_ROUNDS if args.write_mode == "agentic-iterative" else 1
     cfg.pipeline = f"{cfg.coder}>{cfg.censor}"
     return cfg
 
@@ -716,6 +733,10 @@ def main(argv=None):
     ap.add_argument("--censor", default=None,
                     choices=["nemotron-local", "gemma-local", "devstral-local", "sonnet-api", "off"])
     ap.add_argument("--max-fix-rounds", dest="max_fix_rounds", type=int, default=None)
+    ap.add_argument("--write-mode", dest="write_mode", default=None,
+                    choices=["emit-edits", "agentic-iterative"],
+                    help="D: emit-edits (1 fix pass, default) vs agentic-iterative "
+                         "(up to AGENTIC_FIX_ROUNDS); derives --max-fix-rounds unless that is given")
     ap.add_argument("--think-budget", dest="think_budget", type=int, default=None,
                     help="dense thinking-token cap (budget forcing); omit for unbounded")
     ap.add_argument("--escalate", action="store_true",
