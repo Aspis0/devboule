@@ -514,12 +514,13 @@ fn run_loop(
 
 /// Route one change onto the correct debounce window + accumulator.
 ///
-/// TS/Python/Go/C-C++ files go to the FINE window (cheap per-file linters need the
-/// exact changed set: eslint/ruff/gofmt/cppcheck — cppcheck is a no-compile static
-/// analyzer, cheap enough for the per-file path). Their COMPILE-BASED / project-wide
-/// tools (tsc/knip for TS, go vet for Go) are COARSE and ride the coarse window like
-/// every other coarse runner — never the hot per-file path (go vet COMPILES, so this is
-/// the load-bearing reason it must not be fine-routed). Rust files and "Other" files
+/// TS/Python/Go/C-C++/HTML/Kotlin files go to the FINE window (cheap per-file linters
+/// need the exact changed set: eslint/ruff/gofmt/cppcheck/tidy/ktlint — all no-compile,
+/// cheap enough for the per-file path). Their COMPILE-BASED / project-wide tools
+/// (tsc/knip for TS, go vet for Go) are COARSE and ride the coarse window like every
+/// other coarse runner — never the hot per-file path (go vet COMPILES, so this is the
+/// load-bearing reason it must not be fine-routed; HTML/Kotlin have NO coarse runner, so
+/// a tidy/ktlint edit never flips coarse pending). Rust files and "Other" files
 /// (cross-cutting only) go to the COARSE window — a Rust edit means clippy/cargo-check;
 /// an "Other" edit (config, etc.) still warrants the project-wide gitleaks/jscpd sweep.
 /// A file can only be one language, so it lands in exactly one bucket.
@@ -532,7 +533,12 @@ fn bucket_event(
 ) {
     let now = Instant::now();
     match ev.lang {
-        FileLang::Ts | FileLang::Py | FileLang::Go | FileLang::Cpp => {
+        FileLang::Ts
+        | FileLang::Py
+        | FileLang::Go
+        | FileLang::Cpp
+        | FileLang::Html
+        | FileLang::Kotlin => {
             fine_files.insert(ev.rel_path);
             fine.record(now);
         }
@@ -698,6 +704,52 @@ mod tests {
         assert!(fine.pending());
         assert!(fine_files.contains("src/main.cpp"));
         assert!(!coarse_pending, "a cpp edit alone must not flip coarse pending");
+    }
+
+    #[test]
+    fn html_file_goes_to_fine_bucket() {
+        // An .html edit routes to FINE (tidy is a single-binary per-file validator); it
+        // does NOT flip the coarse pending flag (no coarse HTML runner exists).
+        let mut fine = DebounceState::new(Duration::from_millis(FINE_DEBOUNCE_MS));
+        let mut coarse = DebounceState::new(Duration::from_millis(COARSE_DEBOUNCE_MS));
+        let mut fine_files = BTreeSet::new();
+        let mut coarse_pending = false;
+        bucket_event(
+            ChangeEvent {
+                rel_path: "public/index.html".into(),
+                lang: FileLang::Html,
+            },
+            &mut fine,
+            &mut coarse,
+            &mut fine_files,
+            &mut coarse_pending,
+        );
+        assert!(fine.pending());
+        assert!(fine_files.contains("public/index.html"));
+        assert!(!coarse_pending, "an html edit alone must not flip coarse pending");
+    }
+
+    #[test]
+    fn kotlin_file_goes_to_fine_bucket() {
+        // A .kt edit routes to FINE (ktlint is a no-compile per-file style linter); it
+        // does NOT flip the coarse pending flag (no coarse Kotlin runner exists).
+        let mut fine = DebounceState::new(Duration::from_millis(FINE_DEBOUNCE_MS));
+        let mut coarse = DebounceState::new(Duration::from_millis(COARSE_DEBOUNCE_MS));
+        let mut fine_files = BTreeSet::new();
+        let mut coarse_pending = false;
+        bucket_event(
+            ChangeEvent {
+                rel_path: "app/src/Main.kt".into(),
+                lang: FileLang::Kotlin,
+            },
+            &mut fine,
+            &mut coarse,
+            &mut fine_files,
+            &mut coarse_pending,
+        );
+        assert!(fine.pending());
+        assert!(fine_files.contains("app/src/Main.kt"));
+        assert!(!coarse_pending, "a kotlin edit alone must not flip coarse pending");
     }
 
     #[test]

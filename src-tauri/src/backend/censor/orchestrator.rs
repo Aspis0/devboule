@@ -191,6 +191,9 @@ fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFind
         RunnerId::GoVet => runners::go_vet::run(root),
         // cppcheck is FINE (per-file target; no-compile static analyzer).
         RunnerId::Cppcheck => runners::cppcheck::run(root, target),
+        // tidy (HTML) and ktlint (Kotlin) are FINE (per-file target; no-compile).
+        RunnerId::Tidy => runners::tidy::run(root, target),
+        RunnerId::Ktlint => runners::ktlint::run(root, target),
         RunnerId::Lizard => runners::lizard::run(root, target),
         RunnerId::Semgrep => runners::semgrep::run(root, target),
         RunnerId::Zizmor => runners::zizmor::run(root),
@@ -226,6 +229,8 @@ fn runner_source(id: RunnerId) -> &'static str {
         RunnerId::Gofmt => "gofmt",
         RunnerId::GoVet => "go-vet",
         RunnerId::Cppcheck => "cppcheck",
+        RunnerId::Tidy => "tidy",
+        RunnerId::Ktlint => "ktlint",
         RunnerId::Lizard => "lizard",
         RunnerId::Semgrep => "semgrep",
         RunnerId::Zizmor => "zizmor",
@@ -1049,6 +1054,10 @@ mod tests {
         assert_eq!(runner_source(RunnerId::GoVet), "go-vet");
         // C/C++ runner: MUST equal the `source:` literal cppcheck.rs stamps ("cppcheck").
         assert_eq!(runner_source(RunnerId::Cppcheck), "cppcheck");
+        // HTML/Kotlin runners: MUST equal the `source:` literals tidy.rs ("tidy") and
+        // ktlint.rs ("ktlint") stamp, or the scoped merge strands zombie shard findings.
+        assert_eq!(runner_source(RunnerId::Tidy), "tidy");
+        assert_eq!(runner_source(RunnerId::Ktlint), "ktlint");
     }
 
     #[test]
@@ -1095,6 +1104,41 @@ mod tests {
         let plan = plan_fine(&kinds(&[ProjectKind::Cpp]), &["main.cpp".to_string()]);
         let fp = &plan[0];
         assert!(fp.runners.contains(&RunnerId::Cppcheck));
+        for r in &fp.runners {
+            assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
+        }
+    }
+
+    #[test]
+    fn plan_fine_html_file_gets_tidy_with_no_project_kind() {
+        // An .html file's FINE plan includes tidy even with NO project kind (HTML has no
+        // manifest — tidy gates on the FileLang alone). cppcheck is FINE, so it must be.
+        let plan = plan_fine(&kinds(&[]), &["index.html".to_string()]);
+        let fp = &plan[0];
+        assert!(fp.runners.contains(&RunnerId::Tidy));
+        for r in &fp.runners {
+            assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
+        }
+    }
+
+    #[test]
+    fn coarse_runners_for_kotlin_has_no_ktlint() {
+        // ktlint is FINE (no-compile, per-file), so it must NEVER appear in the COARSE
+        // set — only the cross-cutting coarse runners do for a Kotlin project.
+        let c = coarse_runners(&kinds(&[ProjectKind::Kotlin]));
+        assert!(!c.contains(&RunnerId::Ktlint));
+        assert!(c.contains(&RunnerId::Gitleaks));
+        for r in &c {
+            assert_eq!(r.granularity(), Granularity::Coarse, "{r:?} must be coarse");
+        }
+    }
+
+    #[test]
+    fn plan_fine_kotlin_file_gets_ktlint() {
+        // A .kt file's FINE plan includes ktlint (no-compile, per-file).
+        let plan = plan_fine(&kinds(&[ProjectKind::Kotlin]), &["Main.kt".to_string()]);
+        let fp = &plan[0];
+        assert!(fp.runners.contains(&RunnerId::Ktlint));
         for r in &fp.runners {
             assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
         }

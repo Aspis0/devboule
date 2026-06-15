@@ -22,6 +22,7 @@ pub enum ProjectKind {
     Python,
     Go,
     Cpp,
+    Kotlin,
 }
 
 /// Canonical Python project markers. `pyproject.toml` is the modern standard, but
@@ -36,13 +37,34 @@ const PYTHON_MARKERS: [&str; 5] = [
     "Pipfile",
 ];
 
+/// Canonical Kotlin project markers. Kotlin builds with Gradle; the canonical root
+/// markers are a Gradle build script (`build.gradle.kts` is the idiomatic Kotlin-DSL
+/// form; `build.gradle` covers a Groovy-DSL Gradle project that still has Kotlin
+/// sources) or a Gradle settings script (`settings.gradle`/`settings.gradle.kts` —
+/// present at a multi-module root even when the build logic lives in submodules). We
+/// key off these (not a bare `.kt` heuristic) so a stray `.kt` script in another
+/// project doesn't spuriously enable the Kotlin runner — mirrors the
+/// canonical-marker choice for Go/C/C++.
+const KOTLIN_MARKERS: [&str; 4] = [
+    "build.gradle.kts",
+    "build.gradle",
+    "settings.gradle.kts",
+    "settings.gradle",
+];
+
 /// Detect which project kinds a root is, from the presence of a canonical manifest
 /// at the root: `Cargo.toml` → Rust, `package.json` → Node, any of
-/// [`PYTHON_MARKERS`] → Python, `go.mod` → Go, and `CMakeLists.txt` OR
-/// `compile_commands.json` → C/C++. Only the root level is probed (cheap,
+/// [`PYTHON_MARKERS`] → Python, `go.mod` → Go, `CMakeLists.txt` OR
+/// `compile_commands.json` → C/C++, and any of [`KOTLIN_MARKERS`] (a Gradle
+/// build/settings script) → Kotlin. Only the root level is probed (cheap,
 /// deterministic); nested manifests in subdirectories are out of scope here — the
 /// cross-cutting runners (gitleaks/jscpd/lizard/semgrep) cover files regardless of
 /// kind.
+///
+/// NOTE: HTML has NO project kind — there is no canonical HTML project manifest, so
+/// the HTML runner (tidy) gates on [`FileLang::Html`] ALONE in
+/// `runners::applicable_runners` (an `.html` file anywhere is checkable), not on a
+/// fabricated `ProjectKind`.
 pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     let mut kinds = HashSet::new();
     if root.join("Cargo.toml").exists() {
@@ -70,6 +92,13 @@ pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     if root.join("CMakeLists.txt").exists() || root.join("compile_commands.json").exists() {
         kinds.insert(ProjectKind::Cpp);
     }
+    // A Kotlin project is identified by a Gradle build/settings script at the root
+    // (see [`KOTLIN_MARKERS`]); we deliberately key off the canonical Gradle markers
+    // (not a bare `.kt`/`.kts` heuristic) so a stray Kotlin script doesn't spuriously
+    // enable ktlint.
+    if KOTLIN_MARKERS.iter().any(|m| root.join(m).exists()) {
+        kinds.insert(ProjectKind::Kotlin);
+    }
     kinds
 }
 
@@ -82,6 +111,8 @@ pub enum FileLang {
     Py,
     Go,
     Cpp,
+    Html,
+    Kotlin,
     Other,
 }
 
@@ -92,7 +123,8 @@ impl FileLang {
     /// (the gofmt/go-vet toolchain); the C/C++ family
     /// `.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.c`/`.h` → `Cpp` (the
     /// cppcheck toolchain — C and C++ share one [`FileLang`] since the wired grammar
-    /// and the runner both span the family); else `Other`.
+    /// and the runner both span the family); `.html`/`.htm` → `Html` (the HTML Tidy
+    /// toolchain); `.kt`/`.kts` → `Kotlin` (the ktlint toolchain); else `Other`.
     pub fn from_path(path: &Path) -> FileLang {
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_ascii_lowercase(),
@@ -106,6 +138,8 @@ impl FileLang {
             "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "c" | "h" => {
                 FileLang::Cpp
             }
+            "html" | "htm" => FileLang::Html,
+            "kt" | "kts" => FileLang::Kotlin,
             _ => FileLang::Other,
         }
     }
@@ -211,6 +245,28 @@ mod tests {
     }
 
     #[test]
+    fn detect_kotlin_from_gradle_markers() {
+        // Each canonical Gradle marker independently identifies a Kotlin project.
+        for marker in [
+            "build.gradle.kts",
+            "build.gradle",
+            "settings.gradle.kts",
+            "settings.gradle",
+        ] {
+            let dir = unique_temp_root(&format!("kotlin-{}", marker.replace('.', "_")));
+            fs::write(dir.join(marker), "x").unwrap();
+            let kinds = detect_project_kinds(&dir);
+            assert!(
+                kinds.contains(&ProjectKind::Kotlin),
+                "{marker} should mark a Kotlin project"
+            );
+            assert!(!kinds.contains(&ProjectKind::Rust));
+            assert!(!kinds.contains(&ProjectKind::Go));
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn detect_multiple_kinds_for_polyglot_root() {
         let dir = unique_temp_root("poly");
         fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
@@ -218,13 +274,15 @@ mod tests {
         fs::write(dir.join("pyproject.toml"), "[project]").unwrap();
         fs::write(dir.join("go.mod"), "module example.com/x\n").unwrap();
         fs::write(dir.join("CMakeLists.txt"), "project(x)\n").unwrap();
+        fs::write(dir.join("build.gradle.kts"), "plugins {}\n").unwrap();
         let kinds = detect_project_kinds(&dir);
-        assert_eq!(kinds.len(), 5);
+        assert_eq!(kinds.len(), 6);
         assert!(kinds.contains(&ProjectKind::Rust));
         assert!(kinds.contains(&ProjectKind::Node));
         assert!(kinds.contains(&ProjectKind::Python));
         assert!(kinds.contains(&ProjectKind::Go));
         assert!(kinds.contains(&ProjectKind::Cpp));
+        assert!(kinds.contains(&ProjectKind::Kotlin));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -250,6 +308,15 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("a.h++")), FileLang::Cpp);
         assert_eq!(FileLang::from_path(Path::new("a.c")), FileLang::Cpp);
         assert_eq!(FileLang::from_path(Path::new("a.h")), FileLang::Cpp);
+        // HTML.
+        assert_eq!(FileLang::from_path(Path::new("index.html")), FileLang::Html);
+        assert_eq!(FileLang::from_path(Path::new("page.htm")), FileLang::Html);
+        // Kotlin — sources and Gradle/script `.kts`.
+        assert_eq!(FileLang::from_path(Path::new("Main.kt")), FileLang::Kotlin);
+        assert_eq!(
+            FileLang::from_path(Path::new("build.gradle.kts")),
+            FileLang::Kotlin
+        );
         assert_eq!(FileLang::from_path(Path::new("a.txt")), FileLang::Other);
         assert_eq!(FileLang::from_path(Path::new("README")), FileLang::Other);
         // Case-insensitive extension matching.
@@ -258,5 +325,7 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("MAIN.GO")), FileLang::Go);
         assert_eq!(FileLang::from_path(Path::new("MAIN.CPP")), FileLang::Cpp);
         assert_eq!(FileLang::from_path(Path::new("HDR.H")), FileLang::Cpp);
+        assert_eq!(FileLang::from_path(Path::new("INDEX.HTML")), FileLang::Html);
+        assert_eq!(FileLang::from_path(Path::new("MAIN.KT")), FileLang::Kotlin);
     }
 }

@@ -661,6 +661,8 @@ fn detect_tools_with(
         FileLang::Py,
         FileLang::Go,
         FileLang::Cpp,
+        FileLang::Html,
+        FileLang::Kotlin,
         FileLang::Other,
     ] {
         for runner in applicable_runners(kinds, lang) {
@@ -1069,12 +1071,53 @@ mod tests {
     }
 
     #[test]
-    fn detect_tools_empty_kinds_is_cross_cutting_only() {
+    fn detect_tools_includes_tidy_regardless_of_project_kind() {
+        use super::super::detect::ProjectKind;
+        // HTML has NO ProjectKind, so tidy is surfaced for EVERY project (and for none) —
+        // the probe loop includes FileLang::Html, which applies tidy on the lang alone.
+        for kset in [
+            std::collections::HashSet::new(),
+            std::collections::HashSet::from([ProjectKind::Rust]),
+        ] {
+            let tools = detect_tools_with(&kset, |_| true);
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"tidy"), "missing tidy for kinds {kset:?}");
+        }
+    }
+
+    #[test]
+    fn detect_tools_includes_ktlint_for_kotlin_project() {
+        use super::super::detect::ProjectKind;
+        let mut kinds = std::collections::HashSet::new();
+        kinds.insert(ProjectKind::Kotlin);
+        let tools = detect_tools_with(&kinds, |_| true);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // ktlint appears for a Kotlin project.
+        assert!(names.contains(&"ktlint"), "missing ktlint in {names:?}");
+        // A non-Kotlin project does NOT surface ktlint.
+        let mut rust = std::collections::HashSet::new();
+        rust.insert(ProjectKind::Rust);
+        let rust_tools = detect_tools_with(&rust, |_| true);
+        let rust_names: Vec<&str> = rust_tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !rust_names.contains(&"ktlint"),
+            "ktlint leaked into a Rust project"
+        );
+    }
+
+    #[test]
+    fn detect_tools_empty_kinds_is_tidy_plus_cross_cutting() {
         let kinds = std::collections::HashSet::new();
         let tools = detect_tools_with(&kinds, |_| true);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        // No project kind → no kind-specific runners, only the cross-cutting set.
-        assert_eq!(names, vec!["gitleaks", "jscpd", "lizard", "semgrep", "zizmor"]);
+        // No project kind → no KIND-gated runners. The cross-cutting set is seen first
+        // (every probed lang appends it), and HTML's tidy — the one lang-only runner
+        // (HTML has no manifest, so it applies everywhere) — is the sole extra, appended
+        // when the FileLang::Html probe runs after the cross-cutting set is already seen.
+        assert_eq!(
+            names,
+            vec!["gitleaks", "jscpd", "lizard", "semgrep", "zizmor", "tidy"]
+        );
     }
 
     // ---- WARNING 1 / N3: the one-time Gemma probe runs ONCE under concurrency ----

@@ -125,6 +125,30 @@ pub fn severity_from_cppcheck(sev: &str) -> (Severity, Category) {
     (s, Category::Correctness)
 }
 
+/// HTML Tidy (HTML validity checker). Tidy emits `Warning:`/`Error:` diagnostics
+/// (markup validity, deprecated attributes, missing required structure). P2 ROLLOUT
+/// DISCIPLINE: advisory-first — a tidy `Error` is CAPPED at Medium (NOT High) until the
+/// FP-rate on this repo is measured; a `Warning` → Low. Always Correctness (tidy is a
+/// markup-correctness checker, not a style or security tool).
+#[allow(dead_code)] // first caller is the tidy runner.
+pub fn severity_from_tidy(sev: &str) -> (Severity, Category) {
+    let s = match sev.trim().to_ascii_lowercase().as_str() {
+        // Advisory cap: `error` → Medium (NOT High) until FP-rate measured.
+        "error" => Severity::Medium,
+        "warning" => Severity::Low,
+        _ => Severity::Low,
+    };
+    (s, Category::Correctness)
+}
+
+/// ktlint (Kotlin formatter/linter). ktlint is a STYLE/formatting tool (it enforces a
+/// consistent Kotlin code style — indentation, import ordering, spacing), exactly like
+/// gofmt / cargo fmt / prettier: every ktlint finding is Low severity, Style category.
+#[allow(dead_code)] // first caller is the ktlint runner.
+pub fn severity_from_ktlint() -> (Severity, Category) {
+    (Severity::Low, Category::Style)
+}
+
 /// npm audit. npm uses low|moderate|high|critical; a dependency vulnerability
 /// is always Security. critical/high → High, moderate → Medium, low → Low,
 /// unknown → Medium.
@@ -498,5 +522,33 @@ mod tests {
             severity_from_cppcheck("???"),
             (Severity::Low, Category::Correctness)
         );
+    }
+
+    #[test]
+    fn tidy_is_correctness_advisory_capped_at_medium() {
+        // Advisory-first: an `Error` token is capped at Medium (never High); a `Warning`
+        // → Low. Always Correctness. Case-insensitive; unknown/empty → Low.
+        assert_eq!(
+            severity_from_tidy("Error"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_tidy("Warning"),
+            (Severity::Low, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_tidy("WARNING"),
+            (Severity::Low, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_tidy("???"),
+            (Severity::Low, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn ktlint_is_style_low() {
+        // ktlint is a formatting/style tool, like gofmt/cargo-fmt/prettier.
+        assert_eq!(severity_from_ktlint(), (Severity::Low, Category::Style));
     }
 }

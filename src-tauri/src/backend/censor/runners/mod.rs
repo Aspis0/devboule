@@ -36,6 +36,7 @@ pub mod go_vet;
 pub mod gofmt;
 pub mod jscpd;
 pub mod knip;
+pub mod ktlint;
 pub mod lizard;
 pub mod npm_audit;
 pub mod oxlint;
@@ -45,6 +46,7 @@ pub mod prettier;
 pub mod ruff;
 pub mod ruff_format;
 pub mod semgrep;
+pub mod tidy;
 pub mod tsc;
 pub mod vulture;
 pub mod zizmor;
@@ -148,6 +150,8 @@ pub enum RunnerId {
     Gofmt,
     GoVet,
     Cppcheck,
+    Tidy,
+    Ktlint,
     Gitleaks,
     Jscpd,
     Lizard,
@@ -194,6 +198,10 @@ impl RunnerId {
             // cppcheck is a no-compile static analyzer (parses the source directly,
             // never builds the TU), so it is cheap enough for the per-file loop → Fine.
             | RunnerId::Cppcheck
+            // tidy is a single-binary HTML validator (no compile) → Fine (per-file).
+            | RunnerId::Tidy
+            // ktlint analyzes the Kotlin source directly (no compile-of-target) → Fine.
+            | RunnerId::Ktlint
             | RunnerId::Lizard
             | RunnerId::Semgrep
             | RunnerId::Oxlint
@@ -222,6 +230,8 @@ impl RunnerId {
             RunnerId::Gofmt => "gofmt",
             RunnerId::GoVet => "go",
             RunnerId::Cppcheck => "cppcheck",
+            RunnerId::Tidy => "tidy",
+            RunnerId::Ktlint => "ktlint",
             RunnerId::Gitleaks => "gitleaks",
             RunnerId::Jscpd => "jscpd",
             RunnerId::Lizard => "lizard",
@@ -261,11 +271,15 @@ const CROSS_CUTTING: [RunnerId; 5] = [
 ///   - `.py` file in a Python project → ruff, bandit, vulture
 ///   - `.go` file in a Go project → gofmt (fine), go vet (coarse, compile-based)
 ///   - `.c`/`.cpp`/... file in a C/C++ project → cppcheck (fine, no-compile)
+///   - `.html`/`.htm` file (ANY project — HTML has no manifest) → tidy (fine, no-compile)
+///   - `.kt`/`.kts` file in a Kotlin project → ktlint (fine, no-compile)
 ///   - ANY file → gitleaks, jscpd, lizard, semgrep (cross-cutting)
 ///
 /// A language-specific runner is only added when BOTH the file lang AND the
 /// matching project kind are present (a stray `.py` in a Rust-only repo gets only
 /// the cross-cutting set — no point running ruff where there's no Python config).
+/// HTML is the deliberate EXCEPTION: there is no canonical HTML project manifest, so
+/// tidy gates on [`FileLang::Html`] ALONE (an `.html` anywhere is checkable).
 pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<RunnerId> {
     let mut out: Vec<RunnerId> = Vec::new();
     match lang {
@@ -301,6 +315,16 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
         FileLang::Cpp if kinds.contains(&ProjectKind::Cpp) => {
             // cppcheck is Fine (no-compile static analyzer, per-file). Advisory.
             out.push(RunnerId::Cppcheck);
+        }
+        // HTML has NO project manifest / ProjectKind — an `.html` file anywhere is
+        // checkable, so tidy gates on the FileLang ALONE (deliberately no kind guard).
+        FileLang::Html => {
+            // tidy is Fine (single-binary HTML validator, per-file). Advisory.
+            out.push(RunnerId::Tidy);
+        }
+        FileLang::Kotlin if kinds.contains(&ProjectKind::Kotlin) => {
+            // ktlint is Fine (analyzes the source, no compile-of-target). Style/advisory.
+            out.push(RunnerId::Ktlint);
         }
         _ => {}
     }
@@ -775,6 +799,50 @@ mod tests {
     }
 
     #[test]
+    fn html_file_gets_tidy_plus_cross_cutting_regardless_of_project_kind() {
+        // HTML has NO ProjectKind: tidy applies for an .html file in ANY project (or
+        // none) — the runner gates on FileLang::Html alone.
+        for kset in [
+            kinds(&[]),
+            kinds(&[ProjectKind::Rust]),
+            kinds(&[ProjectKind::Node]),
+        ] {
+            let r = applicable_runners(&kset, FileLang::Html);
+            assert!(r.contains(&RunnerId::Tidy), "tidy missing for kinds {kset:?}");
+            // Cross-cutting always present.
+            assert!(r.contains(&RunnerId::Gitleaks));
+            assert!(r.contains(&RunnerId::Semgrep));
+            // No other-language tools for an HTML file.
+            assert!(!r.contains(&RunnerId::Clippy));
+            assert!(!r.contains(&RunnerId::Eslint));
+            assert!(!r.contains(&RunnerId::Ktlint));
+            // tidy + the cross-cutting set, no duplicates.
+            assert_eq!(r.len(), CROSS_CUTTING.len() + 1);
+        }
+    }
+
+    #[test]
+    fn kotlin_file_in_kotlin_project_gets_ktlint_plus_cross_cutting() {
+        let r = applicable_runners(&kinds(&[ProjectKind::Kotlin]), FileLang::Kotlin);
+        assert!(r.contains(&RunnerId::Ktlint));
+        // Cross-cutting always present.
+        assert!(r.contains(&RunnerId::Gitleaks));
+        assert!(r.contains(&RunnerId::Semgrep));
+        // No other-language tools for a Kotlin file.
+        assert!(!r.contains(&RunnerId::Clippy));
+        assert!(!r.contains(&RunnerId::Eslint));
+        assert!(!r.contains(&RunnerId::Tidy));
+    }
+
+    #[test]
+    fn kotlin_file_without_kotlin_project_kind_gets_only_cross_cutting() {
+        // A stray .kt file in a Rust-only repo: no ktlint, just cross-cutting.
+        let r = applicable_runners(&kinds(&[ProjectKind::Rust]), FileLang::Kotlin);
+        assert!(!r.contains(&RunnerId::Ktlint));
+        assert_eq!(r.len(), CROSS_CUTTING.len());
+    }
+
+    #[test]
     fn unknown_file_lang_gets_only_cross_cutting() {
         let r = applicable_runners(
             &kinds(&[ProjectKind::Rust, ProjectKind::Node]),
@@ -840,6 +908,9 @@ mod tests {
             RunnerId::Gofmt,
             // cppcheck is a no-compile static analyzer → Fine.
             RunnerId::Cppcheck,
+            // tidy (HTML validator) and ktlint (Kotlin style) are no-compile → Fine.
+            RunnerId::Tidy,
+            RunnerId::Ktlint,
             RunnerId::Lizard,
             RunnerId::Semgrep,
         ] {

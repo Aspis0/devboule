@@ -22,11 +22,11 @@
 //!
 //! PRODUCT GENERALITY: the API is keyed on [`FileLang`]. Wired grammars: Rust,
 //! TS/JS (the TSX grammar — broadest of the TS family, parses TS/JS/JSX/TSX),
-//! Python, and Go. `FileLang::Other` degrades gracefully — [`extract_items`] returns an
-//! empty `Vec` and [`parse_file`] yields an empty identifier set, so symbol
-//! grounding is disabled for it (unknown != contradicted) while the universal
-//! line-range grounding still applies (it only needs the line count). tree-sitter
-//! is not OS-specific, so there is NO `cfg` gating here.
+//! Python, Go, C/C++, HTML, and Kotlin. `FileLang::Other` degrades gracefully —
+//! [`extract_items`] returns an empty `Vec` and [`parse_file`] yields an empty
+//! identifier set, so symbol grounding is disabled for it (unknown != contradicted)
+//! while the universal line-range grounding still applies (it only needs the line
+//! count). tree-sitter is not OS-specific, so there is NO `cfg` gating here.
 //!
 //! DEAD-CODE NOTE: this module ships "dark". The public API is consumed by the
 //! Censor merge in a LATER workstream (C4 wires grounding into the live reviewer
@@ -135,11 +135,21 @@ pub enum Grounding {
 /// `None` if it can't be resolved); a class/struct/enum/union/namespace is named by its
 /// `name`/`type_identifier` field.
 ///
+/// HTML (`Html`): parsed with `tree-sitter-html`; returns the top-level `element`
+/// children of the `document` root. HTML's "review unit" is WEAK (a document is a tree
+/// of nested elements, not a list of named declarations), so items are best-effort:
+/// each top-level element is named by its `tag_name` (e.g. `html`, `body`). The
+/// load-bearing job for HTML is identifier collection for grounding — the names a
+/// finding would cite: every `tag_name` plus the VALUES of the name/reference attributes
+/// `id`/`class`/`name`/`for`/`href`/`src`/`action` (see [`collect_html_identifiers`]).
+///
+/// Kotlin (`Kotlin`): parsed with `tree-sitter-kotlin-ng`; returns the top-level
+/// `function_declaration`, `class_declaration`, `object_declaration`, and
+/// `property_declaration` units (best-effort — node-kind names per the grammar's
+/// `node-types.json`), named by the `identifier` found under the declaration.
+///
 /// `Other`: returns an empty `Vec`. This NEVER panics (a grammar/parse failure
 /// yields an empty `Vec`).
-///
-// TODO(C2/C3 follow-up): add the Kotlin/HTML grammars where a strong tool and a clear
-// review-unit set exist.
 ///
 /// Delegates to [`parse_file`] (the SINGLE parse path) and returns only its `items`,
 /// so a file is parsed by exactly one routine. A caller that needs items AND grounding
@@ -190,6 +200,22 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
         }
         FileLang::Cpp => {
             let (items, identifiers) = parse_cpp(source);
+            ParsedFile {
+                total_lines,
+                items,
+                identifiers,
+            }
+        }
+        FileLang::Html => {
+            let (items, identifiers) = parse_html(source);
+            ParsedFile {
+                total_lines,
+                items,
+                identifiers,
+            }
+        }
+        FileLang::Kotlin => {
+            let (items, identifiers) = parse_kotlin(source);
             ParsedFile {
                 total_lines,
                 items,
@@ -1047,6 +1073,320 @@ fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, is_cpp_identifier_kind);
+    (items, identifiers)
+}
+
+// ===========================================================================
+// HTML
+// ===========================================================================
+
+/// The HTML attributes whose VALUE is a name a finding would cite, so we collect those
+/// values into the identifier set:
+///   - `id` / `name` — element identifiers a CSS/JS/a11y finding references.
+///   - `class` — one or more space-separated class names; a `class="a b c"` value
+///     contributes EACH whitespace-separated token (CSS class names are space-delimited
+///     within the attribute).
+///   - `for` / `href` / `src` / `action` — REFERENCE attributes: a finding can cite the
+///     TARGET of a broken `<label for="email">`, a dangling `href="#missing"`, a bad
+///     `src`/`action` (e.g. an a11y "label points to a non-existent id" or a "broken
+///     anchor" finding). Without these, the cited target (`email`, `missing`) would be in
+///     no `id`/`name` either and the real finding would be FALSE-DROPPED. Over-collecting
+///     these is the conservative, stated principle. Their values are tokenized into
+///     identifier-like runs (see [`collect_html_attribute`]) so `href="#missing"` yields
+///     `missing` and `action="/api/login"` yields `api`/`login` — the bare names a
+///     finding cites — rather than a URL/fragment that would never match a cited symbol.
+/// Lowercased compare so `ID`/`Class`/`HREF` match.
+const HTML_NAME_ATTRS: [&str; 7] = ["id", "class", "name", "for", "href", "src", "action"];
+
+/// The subset of [`HTML_NAME_ATTRS`] whose value is a REFERENCE (a URL, an anchor, an id
+/// reference) rather than a bare identifier. For these we collect the identifier-like
+/// TOKENS of the value (stripping `#`, `/`, `.`, query punctuation, …) so the bare names
+/// a finding cites land in the set; `id`/`name` keep their whole value, `class` is
+/// whitespace-split (handled separately).
+const HTML_REFERENCE_ATTRS: [&str; 4] = ["for", "href", "src", "action"];
+
+/// Build a [`ReviewItem`] from a direct `element` child of the `document` root; `None`
+/// for non-element children (text, comments, doctype). HTML's review unit is WEAK — a
+/// top-level element is the best available unit — so this is best-effort: the element is
+/// named by its `tag_name` (the opening tag's name) where one is present. Row math
+/// SATURATES (see [`ts_review_item`]).
+fn html_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> {
+    if node.kind() != "element" {
+        return None;
+    }
+    let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    Some(ReviewItem {
+        kind: "element".to_string(),
+        name: html_element_tag_name(node, bytes),
+        start_line: to_line(node.start_position().row),
+        end_line: to_line(node.end_position().row),
+    })
+}
+
+/// The tag name of an `element` node: descend to its `start_tag` (or a
+/// `self_closing_tag`) child and take that tag's `tag_name` leaf. `None` if the grammar
+/// doesn't expose one (a fragment/erroneous parse). Never guesses.
+fn html_element_tag_name(node: &tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let tag = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "start_tag" || c.kind() == "self_closing_tag")?;
+    let mut tcursor = tag.walk();
+    let name = tag.children(&mut tcursor).find(|c| c.kind() == "tag_name")?;
+    let text = name.utf8_text(bytes).ok()?;
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Strip the surrounding quotes from a `quoted_attribute_value` node's text, returning
+/// the inner value. The grammar wraps a quoted value as `quoted_attribute_value` with an
+/// inner `attribute_value`; we prefer that inner node's text, falling back to trimming
+/// the literal `"`/`'` quotes off the node text (an EMPTY `id=""` yields `None`).
+fn html_attr_value_text(value_node: &tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    // Prefer the inner `attribute_value` (the unquoted content) when present.
+    let mut cursor = value_node.walk();
+    if let Some(inner) = value_node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "attribute_value")
+    {
+        let text = inner.utf8_text(bytes).ok()?;
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    // An unquoted `attribute_value` node, or a quoted node we trim the quotes off of.
+    let raw = value_node.utf8_text(bytes).ok()?;
+    let trimmed = raw.trim_matches(|c| c == '"' || c == '\'');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Collect the HTML names a finding would cite into the identifier set, by a pre-order
+/// DFS over an explicit stack (never recurses unbounded — mirrors [`collect_identifiers`]).
+/// We collect:
+///   - EVERY `tag_name` (`div`, `span`, … — element names a finding references); and
+///   - the VALUE of each name/reference attribute (see [`HTML_NAME_ATTRS`]) — `id`/`name`
+///     whole, `class` split on whitespace, and the reference attributes `for`/`href`/
+///     `src`/`action` tokenized to their bare names (see [`collect_html_attribute`]). An
+///     attribute's name is its `attribute_name` child; its value is the following
+///     `quoted_attribute_value`/`attribute_value`.
+/// Same conservative rule as the other languages: OVER-collect every name a finding
+/// might cite so symbol grounding never false-drops a real HTML finding. A parse failure
+/// yields an empty set (grounding then disabled — fail-open).
+fn collect_html_identifiers(root: tree_sitter::Node, bytes: &[u8]) -> HashSet<String> {
+    let mut identifiers = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "tag_name" => {
+                if let Ok(text) = node.utf8_text(bytes) {
+                    if !text.is_empty() {
+                        identifiers.insert(text.to_string());
+                    }
+                }
+            }
+            "attribute" => {
+                collect_html_attribute(&node, bytes, &mut identifiers);
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    identifiers
+}
+
+/// From one `attribute` node, if its name is one of [`HTML_NAME_ATTRS`], collect its
+/// value into `identifiers`:
+///   - `class` — split on whitespace into its individual class names.
+///   - `for`/`href`/`src`/`action` ([`HTML_REFERENCE_ATTRS`]) — tokenized into
+///     identifier-like runs (so `#missing` → `missing`, `/api/login` → `api`/`login`),
+///     since these carry a REFERENCE (anchor/URL/id-ref), not a bare name.
+///   - `id`/`name` — the whole (trimmed) value, the bare identifier itself.
+/// The attribute's name is the `attribute_name` child; the value is the
+/// `quoted_attribute_value` (or bare `attribute_value`) child. A nameless / valueless
+/// attribute contributes nothing.
+fn collect_html_attribute(
+    node: &tree_sitter::Node,
+    bytes: &[u8],
+    identifiers: &mut HashSet<String>,
+) {
+    let mut cursor = node.walk();
+    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+    let name = children
+        .iter()
+        .find(|c| c.kind() == "attribute_name")
+        .and_then(|c| c.utf8_text(bytes).ok())
+        .map(|s| s.to_ascii_lowercase());
+    let Some(name) = name else { return };
+    if !HTML_NAME_ATTRS.contains(&name.as_str()) {
+        return;
+    }
+    let Some(value_node) = children
+        .iter()
+        .find(|c| c.kind() == "quoted_attribute_value" || c.kind() == "attribute_value")
+    else {
+        return;
+    };
+    let Some(value) = html_attr_value_text(value_node, bytes) else {
+        return;
+    };
+    if name == "class" {
+        // CSS class names are space-separated within the attribute value.
+        for token in value.split_whitespace() {
+            if !token.is_empty() {
+                identifiers.insert(token.to_string());
+            }
+        }
+    } else if HTML_REFERENCE_ATTRS.contains(&name.as_str()) {
+        // A reference value (`#missing`, `/api/login`, `email`) carries the cited target
+        // wrapped in URL/anchor punctuation. Collect its identifier-like tokens so a
+        // finding citing the bare target (`missing`, `login`, `email`) is grounded.
+        for token in ident_tokens(&value) {
+            identifiers.insert(token.to_string());
+        }
+    } else {
+        // `id` / `name`: the whole value IS the bare identifier.
+        identifiers.insert(value);
+    }
+}
+
+/// Parse HTML `source` into `(items, identifiers)` — the SINGLE HTML parse routine. Items
+/// are the top-level `element` children of `document` (best-effort, named by `tag_name`;
+/// see [`html_top_level_item`]); the identifier set is every `tag_name` plus the values of
+/// `id`/`class`/`name` attributes (see [`collect_html_identifiers`]). A parse failure
+/// yields empty + empty (symbol grounding then disabled — fail-open, never a false drop).
+fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+    let tree = match parse_with(source, tree_sitter_html::LANGUAGE.into()) {
+        Some(t) => t,
+        None => return (Vec::new(), HashSet::new()),
+    };
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut items = Vec::new();
+    let mut top_cursor = root.walk();
+    for child in root.children(&mut top_cursor) {
+        if let Some(item) = html_top_level_item(&child, bytes) {
+            items.push(item);
+        }
+    }
+
+    let identifiers = collect_html_identifiers(root, bytes);
+    (items, identifiers)
+}
+
+// ===========================================================================
+// Kotlin
+// ===========================================================================
+
+/// The Kotlin top-level item node kinds we treat as review units, as direct children of
+/// the `source_file` root (per the `tree-sitter-kotlin-ng` grammar's `node-types.json`):
+/// `function_declaration` (top-level `fun`), `class_declaration` (`class`/`interface`),
+/// `object_declaration` (`object`), and `property_declaration` (top-level `val`/`var`).
+/// Names come from the declaration's `identifier` (see [`kotlin_item_name`]).
+const KOTLIN_ITEM_KINDS: [&str; 4] = [
+    "function_declaration",
+    "class_declaration",
+    "object_declaration",
+    "property_declaration",
+];
+
+/// Build a [`ReviewItem`] from a direct child of the `source_file` root IF it is one of
+/// [`KOTLIN_ITEM_KINDS`]; else `None`. Row math SATURATES (see [`ts_review_item`]).
+fn kotlin_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> {
+    let kind = node.kind();
+    if !KOTLIN_ITEM_KINDS.contains(&kind) {
+        return None;
+    }
+    let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    Some(ReviewItem {
+        kind: kind.to_string(),
+        name: kotlin_item_name(node, bytes),
+        start_line: to_line(node.start_position().row),
+        end_line: to_line(node.end_position().row),
+    })
+}
+
+/// Pull the display name from a top-level Kotlin item node, best-effort. The grammar
+/// names a declaration via an `identifier` leaf (the sole identifier leaf kind in
+/// `tree-sitter-kotlin-ng` 1.1.0 — see [`is_kotlin_identifier_kind`]). For `fun`/`class`/
+/// `object` the name leaf is a DIRECT child of the declaration; for a
+/// `property_declaration` (`val`/`var`) the grammar nests the name one level deeper
+/// inside a `variable_declaration` child (`property_declaration → variable_declaration →
+/// identifier`), so we ALSO descend into a `variable_declaration` to find it. We take the
+/// FIRST name leaf found in source order. A destructuring `multi_variable_declaration`,
+/// or any declaration we can't resolve, yields `None` (never guess).
+fn kotlin_item_name(node: &tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    // Prefer the grammar's `name`/`identifier` field where one is exposed.
+    if let Some(child) = node.child_by_field_name("name") {
+        if let Ok(text) = child.utf8_text(bytes) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        // Direct name leaf (fun/class/object).
+        if is_kotlin_identifier_kind(child.kind()) {
+            if let Ok(text) = child.utf8_text(bytes) {
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        // A `property_declaration` wraps the name in a `variable_declaration`; descend
+        // one level to its first identifier leaf.
+        if child.kind() == "variable_declaration" {
+            let mut vcursor = child.walk();
+            for grandchild in child.children(&mut vcursor) {
+                if is_kotlin_identifier_kind(grandchild.kind()) {
+                    if let Ok(text) = grandchild.utf8_text(bytes) {
+                        if !text.is_empty() {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The Kotlin leaf node kind that counts as "an identifier present in the file" for
+/// symbol grounding. In `tree-sitter-kotlin-ng` 1.1.0, `identifier` is the SOLE
+/// identifier leaf kind — its `node-types.json` has no `simple_identifier` or
+/// `type_identifier` node (those exist in OTHER Kotlin grammars, not this fork), so
+/// matching them would be dead code. A composite `qualified_identifier` (`a.b.c`) is a
+/// PARENT of `identifier` leaves, not a leaf itself, so the walk reaches each bare
+/// `identifier` underneath it. Same conservative rule as the other languages: collect
+/// every name a finding might cite so symbol grounding never false-drops a real Kotlin
+/// finding.
+fn is_kotlin_identifier_kind(kind: &str) -> bool {
+    kind == "identifier"
+}
+
+/// Parse Kotlin `source` into `(items, identifiers)` — the SINGLE Kotlin parse routine.
+/// Top-level items are the direct children of `source_file` (see [`KOTLIN_ITEM_KINDS`]);
+/// the identifier set is every identifier-like leaf in the whole tree (see
+/// [`is_kotlin_identifier_kind`]). A parse failure yields empty + empty (symbol grounding
+/// then disabled — fail-open, never a false drop).
+fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+    let tree = match parse_with(source, tree_sitter_kotlin_ng::LANGUAGE.into()) {
+        Some(t) => t,
+        None => return (Vec::new(), HashSet::new()),
+    };
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut items = Vec::new();
+    let mut top_cursor = root.walk();
+    for child in root.children(&mut top_cursor) {
+        if let Some(item) = kotlin_top_level_item(&child, bytes) {
+            items.push(item);
+        }
+    }
+
+    let identifiers = collect_identifiers(root, bytes, is_kotlin_identifier_kind);
     (items, identifiers)
 }
 
@@ -2079,5 +2419,213 @@ union U { int i; float f; };
         );
         // The blank line (2) is in the file but OUTSIDE any item → kept (no over-drop).
         assert_eq!(grounds(&parsed, Some(2), None), Grounding::Kept);
+    }
+
+    // =======================================================================
+    // HTML
+    // =======================================================================
+
+    /// An HTML snippet: a `<div>` with `id` + `class`, a nested `<span>` with a `name`
+    /// attribute, and a multi-class element. The identifier set must contain the tag
+    /// names (`div`, `span`, `p`) and the attribute VALUES a finding would cite
+    /// (`main`, the class tokens `x`/`y`/`z`, the `name` value `field1`). Line numbers
+    /// (1-based) annotated for the assertions.
+    const HTML_SNIPPET: &str = "\
+<div id=\"main\" class=\"x y\">
+  <span name=\"field1\">hi</span>
+</div>
+<p class=\"z\">bye</p>
+";
+
+    #[test]
+    fn extract_items_html_top_level_elements_and_tag_names() {
+        let items = extract_items(HTML_SNIPPET, FileLang::Html);
+        // Two TOP-LEVEL elements: the `div` (lines 1-3) and the `p` (line 4). The nested
+        // `<span>` is NOT a top-level unit. HTML's review unit is weak/best-effort.
+        assert_eq!(items.len(), 2, "items: {items:?}");
+        let div = items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("div"))
+            .unwrap_or_else(|| panic!("expected a div element in {items:?}"));
+        assert_eq!(div.kind, "element");
+        assert_eq!(div.start_line, 1);
+        assert_eq!(div.end_line, 3);
+        let p = items
+            .iter()
+            .find(|i| i.name.as_deref() == Some("p"))
+            .unwrap_or_else(|| panic!("expected a p element in {items:?}"));
+        assert_eq!(p.start_line, 4);
+        assert_eq!(p.end_line, 4);
+    }
+
+    #[test]
+    fn extract_html_identifiers_collects_tags_ids_classes_names() {
+        // The spec's grounding contract: `<div id="main" class="x">` → `div`, `main`,
+        // `x` collected (here also `span`/`p` tags, `y`/`z` classes, `field1` name).
+        let parsed = parse_file(HTML_SNIPPET, FileLang::Html);
+        assert!(!parsed.identifiers.is_empty());
+        // Tag names.
+        for tag in ["div", "span", "p"] {
+            assert!(
+                parsed.identifiers.contains(tag),
+                "tag '{tag}' missing: {:?}",
+                parsed.identifiers
+            );
+        }
+        // `id` value.
+        assert!(parsed.identifiers.contains("main"), "id value missing");
+        // `class` values — each space-separated token is its own identifier.
+        for class in ["x", "y", "z"] {
+            assert!(
+                parsed.identifiers.contains(class),
+                "class '{class}' missing: {:?}",
+                parsed.identifiers
+            );
+        }
+        // `name` value.
+        assert!(parsed.identifiers.contains("field1"), "name value missing");
+    }
+
+    #[test]
+    fn grounding_html_keeps_present_drops_invented_and_line_checks() {
+        let parsed = parse_file(HTML_SNIPPET, FileLang::Html);
+        // A finding citing a present tag/id/class → kept.
+        assert_eq!(grounds(&parsed, Some(1), Some("main")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, Some(1), Some("div")), Grounding::Kept);
+        // A wholly invented symbol with the grammar present → dropped.
+        assert_eq!(
+            grounds(&parsed, Some(1), Some("totallyInvented")),
+            Grounding::DroppedUnknownSymbol
+        );
+        // Line-range grounding works for HTML: past EOF → dropped; in-file → kept.
+        assert_eq!(
+            grounds(&parsed, Some(parsed.total_lines + 1), None),
+            Grounding::DroppedLineOutOfFile
+        );
+        assert_eq!(grounds(&parsed, Some(2), None), Grounding::Kept);
+    }
+
+    #[test]
+    fn extract_html_collects_reference_attr_targets_and_grounds_them() {
+        // A broken `<label for="email">` and a dangling `<a href="#missing">`: the cited
+        // TARGETS (`email`, `missing`) are not also `id`s in this snippet, so without
+        // collecting `for`/`href` values a finding citing them would be FALSE-DROPPED.
+        let src = "\
+<label for=\"email\">Email</label>
+<a href=\"#missing\">link</a>
+<form action=\"/api/login\"></form>
+<img src=\"logo.png\">
+";
+        let parsed = parse_file(src, FileLang::Html);
+        // The reference targets land in the identifier set (tokenized: `#missing` →
+        // `missing`, `/api/login` → `api`/`login`, `logo.png` → `logo`/`png`).
+        for ident in ["email", "missing", "api", "login", "logo"] {
+            assert!(
+                parsed.identifiers.contains(ident),
+                "reference target '{ident}' missing: {:?}",
+                parsed.identifiers
+            );
+        }
+        // A finding citing a `for`/`href` target is KEPT (no longer a false drop).
+        assert_eq!(grounds(&parsed, Some(1), Some("email")), Grounding::Kept);
+        assert_eq!(grounds(&parsed, Some(2), Some("missing")), Grounding::Kept);
+        // A wholly invented target with the grammar present is still dropped.
+        assert_eq!(
+            grounds(&parsed, Some(1), Some("nonexistentTarget")),
+            Grounding::DroppedUnknownSymbol
+        );
+    }
+
+    #[test]
+    fn extract_items_html_empty_and_malformed_do_not_panic() {
+        assert!(extract_items("", FileLang::Html).is_empty());
+        let _ = extract_items("<div><span>", FileLang::Html);
+        let _ = extract_items("}}}<<< not html 流", FileLang::Html);
+    }
+
+    // =======================================================================
+    // Kotlin
+    // =======================================================================
+
+    /// A Kotlin snippet: a top-level `fun`, a `class`, an `object`, and a top-level
+    /// `val` property — one of each [`KOTLIN_ITEM_KINDS`]. Line numbers (1-based)
+    /// annotated for the assertions.
+    const KOTLIN_SNIPPET: &str = "\
+fun f(): Int {
+    return 1
+}
+
+class C {
+    fun m(): Int = 2
+}
+
+object O {
+    val k = 3
+}
+
+val greeting = \"hi\"
+";
+
+    #[test]
+    fn extract_items_kotlin_top_level_kinds_and_names() {
+        let items = extract_items(KOTLIN_SNIPPET, FileLang::Kotlin);
+        // Four top-level units: fun f, class C, object O, val greeting. The nested
+        // method `m` and the nested `val k` are NOT top-level.
+        assert_eq!(items.len(), 4, "items: {items:?}");
+
+        let kinds: HashSet<&str> = items.iter().map(|i| i.kind.as_str()).collect();
+        for expected in [
+            "function_declaration",
+            "class_declaration",
+            "object_declaration",
+            "property_declaration",
+        ] {
+            assert!(kinds.contains(expected), "missing {expected} in {kinds:?}");
+        }
+
+        // Names: `f` (fun), `C` (class), `O` (object), `greeting` (val).
+        let f = item(&items, "function_declaration");
+        assert_eq!(f.name.as_deref(), Some("f"));
+        assert_eq!(f.start_line, 1);
+        let c = item(&items, "class_declaration");
+        assert_eq!(c.name.as_deref(), Some("C"));
+        let o = item(&items, "object_declaration");
+        assert_eq!(o.name.as_deref(), Some("O"));
+        let v = item(&items, "property_declaration");
+        assert_eq!(v.name.as_deref(), Some("greeting"));
+    }
+
+    #[test]
+    fn grounding_kotlin_keeps_present_drops_invented_and_line_checks() {
+        let parsed = parse_file(KOTLIN_SNIPPET, FileLang::Kotlin);
+        // Symbol grounding is active for Kotlin (identifiers populated).
+        assert!(!parsed.identifiers.is_empty());
+        for name in ["f", "C", "O", "greeting"] {
+            assert!(
+                parsed.identifiers.contains(name),
+                "identifier '{name}' missing: {:?}",
+                parsed.identifiers
+            );
+        }
+        // A finding citing a present symbol → kept.
+        assert_eq!(grounds(&parsed, Some(1), Some("f")), Grounding::Kept);
+        // A wholly invented symbol with the grammar present → dropped.
+        assert_eq!(
+            grounds(&parsed, Some(1), Some("totallyInvented")),
+            Grounding::DroppedUnknownSymbol
+        );
+        // Line-range grounding works for Kotlin.
+        assert_eq!(
+            grounds(&parsed, Some(parsed.total_lines + 1), None),
+            Grounding::DroppedLineOutOfFile
+        );
+        assert_eq!(grounds(&parsed, Some(4), None), Grounding::Kept);
+    }
+
+    #[test]
+    fn extract_items_kotlin_empty_and_malformed_do_not_panic() {
+        assert!(extract_items("", FileLang::Kotlin).is_empty());
+        let _ = extract_items("fun broken( {", FileLang::Kotlin);
+        let _ = extract_items("}}}{{{ not kotlin 流", FileLang::Kotlin);
     }
 }
