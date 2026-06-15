@@ -192,6 +192,51 @@ pub fn severity_from_sqlfluff() -> (Severity, Category) {
     (Severity::Low, Category::Style)
 }
 
+/// hadolint (Dockerfile linter). hadolint emits a per-finding `level`
+/// (`error`/`warning`/`info`/`style`) in its `--format json` output. P2 ROLLOUT
+/// DISCIPLINE: advisory-first — even an `error` level is CAPPED at Medium (NOT High)
+/// until the FP-rate on this repo is measured; `warning` → Low. Category tracks the
+/// level's nature: `error`/`warning` are likely-wrong Dockerfile constructs (pinned
+/// versions, layer hygiene, shell pitfalls) → Correctness; `info`/`style` are stylistic
+/// suggestions → Style. Unknown/empty → Low/Style (never crash, never escalate).
+#[allow(dead_code)] // first caller is the hadolint runner.
+pub fn severity_from_hadolint(level: &str) -> (Severity, Category) {
+    match level.trim().to_ascii_lowercase().as_str() {
+        // Advisory cap: `error` → Medium (NOT High) until FP-rate measured.
+        "error" => (Severity::Medium, Category::Correctness),
+        "warning" => (Severity::Low, Category::Correctness),
+        "info" | "style" => (Severity::Low, Category::Style),
+        _ => (Severity::Low, Category::Style),
+    }
+}
+
+/// actionlint (GitHub Actions workflow linter). actionlint has no severity field — every
+/// diagnostic is a workflow CORRECTNESS issue (an invalid expression, a missing input, a
+/// shellcheck-flagged `run:` script, a bad `needs:` reference). P2 ROLLOUT DISCIPLINE:
+/// advisory-first — CAPPED at Medium (NOT High) until the FP-rate on this repo is measured.
+/// Always Correctness. Takes no argument (the trailing `[rule]` kind is informational, not
+/// a severity tier).
+#[allow(dead_code)] // first caller is the actionlint runner.
+pub fn severity_from_actionlint() -> (Severity, Category) {
+    (Severity::Medium, Category::Correctness)
+}
+
+/// stylelint (CSS/SCSS/Sass/Less linter). stylelint emits a per-warning `severity`
+/// (`error`/`warning`). P2 ROLLOUT DISCIPLINE: advisory-first — an `error` is CAPPED at
+/// Medium (NOT High) until the FP-rate on this repo is measured; a `warning` → Low. An
+/// `error` is a likely-wrong stylesheet construct (invalid value, duplicate selector,
+/// unknown property) → Correctness; a `warning` is a stylistic convention (ordering,
+/// notation) → Style. Unknown/empty → Low/Style.
+#[allow(dead_code)] // first caller is the stylelint runner.
+pub fn severity_from_stylelint(severity: &str) -> (Severity, Category) {
+    match severity.trim().to_ascii_lowercase().as_str() {
+        // Advisory cap: `error` → Medium (NOT High) until FP-rate measured.
+        "error" => (Severity::Medium, Category::Correctness),
+        "warning" => (Severity::Low, Category::Style),
+        _ => (Severity::Low, Category::Style),
+    }
+}
+
 /// npm audit. npm uses low|moderate|high|critical; a dependency vulnerability
 /// is always Security. critical/high → High, moderate → Medium, low → Low,
 /// unknown → Medium.
@@ -656,5 +701,69 @@ mod tests {
     fn sqlfluff_is_style_low() {
         // sqlfluff is a style/format tool, like gofmt/ktlint/prettier.
         assert_eq!(severity_from_sqlfluff(), (Severity::Low, Category::Style));
+    }
+
+    #[test]
+    fn hadolint_is_advisory_capped_at_medium() {
+        // Advisory-first: even an `error` level is capped at Medium (never High) until
+        // the FP-rate is measured. error/warning → Correctness; info/style → Style.
+        assert_eq!(
+            severity_from_hadolint("error"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_hadolint("warning"),
+            (Severity::Low, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_hadolint("info"),
+            (Severity::Low, Category::Style)
+        );
+        assert_eq!(
+            severity_from_hadolint("style"),
+            (Severity::Low, Category::Style)
+        );
+        // Case-insensitive; unknown/empty → Low/Style (never crash, never escalate).
+        assert_eq!(
+            severity_from_hadolint("ERROR"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_hadolint("???"),
+            (Severity::Low, Category::Style)
+        );
+        assert_eq!(severity_from_hadolint(""), (Severity::Low, Category::Style));
+    }
+
+    #[test]
+    fn actionlint_is_correctness_capped_at_medium() {
+        // actionlint findings are workflow correctness issues, capped at Medium (advisory).
+        assert_eq!(
+            severity_from_actionlint(),
+            (Severity::Medium, Category::Correctness)
+        );
+    }
+
+    #[test]
+    fn stylelint_is_advisory_capped_at_medium() {
+        // Advisory-first: an `error` is capped at Medium (never High); a `warning` → Low.
+        assert_eq!(
+            severity_from_stylelint("error"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_stylelint("warning"),
+            (Severity::Low, Category::Style)
+        );
+        // Case-insensitive; unknown/empty → Low/Style.
+        assert_eq!(
+            severity_from_stylelint("ERROR"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_stylelint("???"),
+            (Severity::Low, Category::Style)
+        );
+        assert_eq!(severity_from_stylelint(""), (Severity::Low, Category::Style));
     }
 }

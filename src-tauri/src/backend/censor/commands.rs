@@ -666,6 +666,9 @@ fn detect_tools_with(
         FileLang::Shell,
         FileLang::Yaml,
         FileLang::Sql,
+        FileLang::Dockerfile,
+        FileLang::GithubActions,
+        FileLang::Css,
         FileLang::Other,
     ] {
         for runner in applicable_runners(kinds, lang) {
@@ -1108,6 +1111,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_tools_includes_hadolint_actionlint_stylelint_regardless_of_project_kind() {
+        use super::super::detect::ProjectKind;
+        // Dockerfile/GithubActions/CSS have NO ProjectKind, so their runners surface for
+        // EVERY project (and for none) — the probe loop includes
+        // FileLang::Dockerfile/GithubActions/Css, which apply their runner on the lang alone.
+        for kset in [
+            std::collections::HashSet::new(),
+            std::collections::HashSet::from([ProjectKind::Rust]),
+            std::collections::HashSet::from([ProjectKind::Node, ProjectKind::Python]),
+        ] {
+            let tools = detect_tools_with(&kset, |_| true);
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"hadolint"), "missing hadolint for {kset:?}");
+            assert!(names.contains(&"actionlint"), "missing actionlint for {kset:?}");
+            assert!(names.contains(&"stylelint"), "missing stylelint for {kset:?}");
+        }
+    }
+
+    #[test]
     fn detect_tools_includes_ktlint_for_kotlin_project() {
         use super::super::detect::ProjectKind;
         let mut kinds = std::collections::HashSet::new();
@@ -1136,7 +1158,7 @@ mod tests {
         // (every probed lang appends it). The LANG-ONLY runners (no manifest, so they
         // apply everywhere) are the extras, appended in probe order AFTER the cross-
         // cutting set is already seen: HTML→tidy, Shell→shellcheck, YAML→yamllint,
-        // SQL→sqlfluff.
+        // SQL→sqlfluff, Dockerfile→hadolint, GithubActions→actionlint, CSS→stylelint.
         assert_eq!(
             names,
             vec![
@@ -1148,7 +1170,10 @@ mod tests {
                 "tidy",
                 "shellcheck",
                 "yamllint",
-                "sqlfluff"
+                "sqlfluff",
+                "hadolint",
+                "actionlint",
+                "stylelint"
             ]
         );
     }

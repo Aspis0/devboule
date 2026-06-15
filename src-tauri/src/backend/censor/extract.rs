@@ -28,9 +28,10 @@
 //! while the universal line-range grounding still applies (it only needs the line
 //! count). tree-sitter is not OS-specific, so there is NO `cfg` gating here.
 //!
-//! NO GRAMMAR (lint-runner-only quick wins): `FileLang::Shell`/`Yaml`/`Sql` are
-//! deliberately NOT given a tree-sitter grammar — they exist only to route the
-//! shellcheck/yamllint/sqlfluff lint runners. They degrade EXACTLY like
+//! NO GRAMMAR (lint-runner-only quick wins): `FileLang::Shell`/`Yaml`/`Sql`/
+//! `Dockerfile`/`GithubActions`/`Css` are deliberately NOT given a tree-sitter
+//! grammar — they exist only to route the shellcheck/yamllint/sqlfluff/hadolint/
+//! actionlint/stylelint lint runners. They degrade EXACTLY like
 //! `FileLang::Other`: [`extract_items`] returns an empty `Vec` and [`parse_file`]
 //! yields an empty identifier set, so symbol grounding stays DISABLED for them
 //! (unknown != contradicted) while the universal line-range grounding still applies.
@@ -233,7 +234,13 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
         // No grammar wired for these (lint-runner-only quick wins) — they degrade
         // exactly like `Other`: empty items + empty identifier set (symbol grounding
         // disabled), with the real `total_lines` so line-range grounding still works.
-        FileLang::Shell | FileLang::Yaml | FileLang::Sql | FileLang::Other => ParsedFile {
+        FileLang::Shell
+        | FileLang::Yaml
+        | FileLang::Sql
+        | FileLang::Dockerfile
+        | FileLang::GithubActions
+        | FileLang::Css
+        | FileLang::Other => ParsedFile {
             total_lines,
             items: Vec::new(),
             identifiers: HashSet::new(),
@@ -1736,11 +1743,18 @@ macro_rules! noop { () => {}; }
 
     #[test]
     fn grounding_lint_only_langs_have_no_grammar_but_keep_line_range() {
-        // Shell/Yaml/Sql are lint-runner-only quick wins with NO tree-sitter grammar:
-        // they behave exactly like `Other` — empty items + empty identifiers (symbol
-        // grounding DISABLED), with line-range grounding still active.
+        // Shell/Yaml/Sql/Dockerfile/GithubActions/Css are lint-runner-only quick wins with
+        // NO tree-sitter grammar: they behave exactly like `Other` — empty items + empty
+        // identifiers (symbol grounding DISABLED), with line-range grounding still active.
         let src = "first\nsecond\nthird\n"; // 3 content lines
-        for lang in [FileLang::Shell, FileLang::Yaml, FileLang::Sql] {
+        for lang in [
+            FileLang::Shell,
+            FileLang::Yaml,
+            FileLang::Sql,
+            FileLang::Dockerfile,
+            FileLang::GithubActions,
+            FileLang::Css,
+        ] {
             let parsed = parse_file(src, lang);
             assert!(parsed.items.is_empty(), "{lang:?} should yield no items");
             assert!(

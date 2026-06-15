@@ -122,6 +122,14 @@ pub enum FileLang {
     Shell,
     Yaml,
     Sql,
+    // Lint-runner-only quick wins with NON-EXTENSION detection (no tree-sitter grammar):
+    // Dockerfile (hadolint) is detected by FILE NAME; GithubActions (actionlint) is
+    // detected by PATH (a YAML file under `.github/workflows/`); CSS (stylelint) is the
+    // `.css`/`.scss`/`.sass`/`.less` family. Like Shell/Yaml/Sql they gate their runner on
+    // the FileLang ALONE and `parse_file`/`extract_items` return EMPTY for them.
+    Dockerfile,
+    GithubActions,
+    Css,
     Other,
 }
 
@@ -135,13 +143,41 @@ impl FileLang {
     /// and the runner both span the family); `.html`/`.htm` → `Html` (the HTML Tidy
     /// toolchain); `.kt`/`.kts` → `Kotlin` (the ktlint toolchain);
     /// `.sh`/`.bash`/`.ksh`/`.zsh` → `Shell` (the shellcheck toolchain);
-    /// `.yml`/`.yaml` → `Yaml` (the yamllint toolchain); `.sql` → `Sql` (the sqlfluff
-    /// toolchain); else `Other`.
+    /// `.sql` → `Sql` (the sqlfluff toolchain); the CSS family
+    /// `.css`/`.scss`/`.sass`/`.less` → `Css` (the stylelint toolchain).
+    ///
+    /// NON-EXTENSION detection (checked BEFORE the extension match, since these
+    /// classifications take precedence over the bare extension):
+    ///   - `Dockerfile` is detected by FILE NAME (Dockerfiles have no canonical
+    ///     extension): the name is exactly `Dockerfile`/`Containerfile`, OR ends
+    ///     with `.dockerfile` (e.g. `foo.dockerfile`), OR is `Dockerfile.<suffix>`
+    ///     (e.g. `Dockerfile.prod`) / `<prefix>.Dockerfile` → `Dockerfile`
+    ///     (the hadolint toolchain).
+    ///   - `GithubActions` is detected by PATH: a `.yml`/`.yaml` file whose path runs
+    ///     through a `.github/workflows/` directory → `GithubActions` (the actionlint
+    ///     toolchain). A `.yml`/`.yaml` file NOT under `.github/workflows/` stays
+    ///     `Yaml` (the yamllint toolchain). GithubActions takes precedence so a
+    ///     workflow file is never double-classified.
+    ///
+    /// Anything else falls through to the extension match: `.yml`/`.yaml` → `Yaml`;
+    /// else `Other`.
     pub fn from_path(path: &Path) -> FileLang {
+        // FILENAME-based: Dockerfile / Containerfile (no canonical extension). Checked
+        // first so a `Dockerfile.prod` (which has the `prod` "extension") is classified
+        // by name, not by the bogus extension.
+        if is_dockerfile_name(path) {
+            return FileLang::Dockerfile;
+        }
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_ascii_lowercase(),
             None => return FileLang::Other,
         };
+        // PATH-based: a YAML file under `.github/workflows/` is a GitHub Actions
+        // workflow (actionlint), not plain YAML (yamllint). Checked before the
+        // extension match so GithubActions wins over Yaml for workflow files.
+        if matches!(ext.as_str(), "yml" | "yaml") && is_under_github_workflows(path) {
+            return FileLang::GithubActions;
+        }
         match ext.as_str() {
             "rs" => FileLang::Rust,
             "ts" | "tsx" | "js" | "jsx" | "cts" | "mts" | "cjs" | "mjs" => FileLang::Ts,
@@ -158,9 +194,52 @@ impl FileLang {
             "sh" | "bash" | "ksh" | "zsh" => FileLang::Shell,
             "yml" | "yaml" => FileLang::Yaml,
             "sql" => FileLang::Sql,
+            // CSS family (stylelint): plain CSS plus the SCSS/Sass/Less preprocessors,
+            // all of which stylelint lints with the appropriate syntax.
+            "css" | "scss" | "sass" | "less" => FileLang::Css,
             _ => FileLang::Other,
         }
     }
+}
+
+/// Is `path`'s FILE NAME a Dockerfile, by the conventional naming patterns? Matches
+/// (case-insensitively): an exact `Dockerfile`/`Containerfile`; a name ending in
+/// `.dockerfile` (e.g. `foo.dockerfile`); a `Dockerfile.<suffix>` (e.g.
+/// `Dockerfile.prod`); or a `<prefix>.Dockerfile`. PURE — inspects only the final path
+/// component, never the filesystem.
+fn is_dockerfile_name(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "dockerfile"
+        || lower == "containerfile"
+        || lower.ends_with(".dockerfile")
+        || lower.ends_with(".containerfile")
+        || lower.starts_with("dockerfile.")
+        || lower.starts_with("containerfile.")
+}
+
+/// Does `path` run through a `.github/workflows/` directory (the canonical location of
+/// GitHub Actions workflow files)? Scans the path COMPONENTS for an adjacent
+/// `.github` → `workflows` pair (case-insensitive on the segment names, matching the
+/// rest of this module's casing tolerance). PURE — never touches the filesystem.
+fn is_under_github_workflows(path: &Path) -> bool {
+    use std::path::Component;
+    // Collect the normal (named) path segments, lowercased, in order — INCLUDING the
+    // filename. The windows(2) scan for a consecutive `.github` → `workflows` pair is safe
+    // with the filename present: a workflow file is never itself the bare segment
+    // `workflows`, so the filename can't create a false match. Any such pair qualifies.
+    let segs: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str().map(|s| s.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    segs.windows(2)
+        .any(|w| w[0] == ".github" && w[1] == "workflows")
 }
 
 #[cfg(test)]
@@ -345,6 +424,11 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("conf.yaml")), FileLang::Yaml);
         // SQL (sqlfluff).
         assert_eq!(FileLang::from_path(Path::new("schema.sql")), FileLang::Sql);
+        // CSS family (stylelint) — plain CSS plus the preprocessors.
+        assert_eq!(FileLang::from_path(Path::new("a.css")), FileLang::Css);
+        assert_eq!(FileLang::from_path(Path::new("a.scss")), FileLang::Css);
+        assert_eq!(FileLang::from_path(Path::new("a.sass")), FileLang::Css);
+        assert_eq!(FileLang::from_path(Path::new("a.less")), FileLang::Css);
         assert_eq!(FileLang::from_path(Path::new("a.txt")), FileLang::Other);
         assert_eq!(FileLang::from_path(Path::new("README")), FileLang::Other);
         // Case-insensitive extension matching.
@@ -358,5 +442,91 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("DEPLOY.SH")), FileLang::Shell);
         assert_eq!(FileLang::from_path(Path::new("CI.YML")), FileLang::Yaml);
         assert_eq!(FileLang::from_path(Path::new("SCHEMA.SQL")), FileLang::Sql);
+        assert_eq!(FileLang::from_path(Path::new("A.CSS")), FileLang::Css);
+        assert_eq!(FileLang::from_path(Path::new("A.SCSS")), FileLang::Css);
+    }
+
+    #[test]
+    fn dockerfile_is_detected_by_filename_not_extension() {
+        // Exact canonical names (no extension).
+        assert_eq!(
+            FileLang::from_path(Path::new("Dockerfile")),
+            FileLang::Dockerfile
+        );
+        assert_eq!(
+            FileLang::from_path(Path::new("Containerfile")),
+            FileLang::Dockerfile
+        );
+        // Nested in a path.
+        assert_eq!(
+            FileLang::from_path(Path::new("docker/Dockerfile")),
+            FileLang::Dockerfile
+        );
+        // `Dockerfile.<suffix>` (e.g. an environment-specific build).
+        assert_eq!(
+            FileLang::from_path(Path::new("Dockerfile.prod")),
+            FileLang::Dockerfile
+        );
+        // `<prefix>.dockerfile` extension form.
+        assert_eq!(
+            FileLang::from_path(Path::new("foo.dockerfile")),
+            FileLang::Dockerfile
+        );
+        assert_eq!(
+            FileLang::from_path(Path::new("app.Dockerfile")),
+            FileLang::Dockerfile
+        );
+        // Containerfile variants (Podman) — symmetric with the Dockerfile forms.
+        assert_eq!(
+            FileLang::from_path(Path::new("Containerfile.prod")),
+            FileLang::Dockerfile
+        );
+        assert_eq!(
+            FileLang::from_path(Path::new("base.Containerfile")),
+            FileLang::Dockerfile
+        );
+        // Case-insensitive on the whole name.
+        assert_eq!(
+            FileLang::from_path(Path::new("DOCKERFILE")),
+            FileLang::Dockerfile
+        );
+        // A file that merely CONTAINS "dockerfile" in the middle is NOT a Dockerfile.
+        assert_eq!(
+            FileLang::from_path(Path::new("my-dockerfile-notes.txt")),
+            FileLang::Other
+        );
+    }
+
+    #[test]
+    fn github_workflow_yaml_is_actions_but_plain_yaml_is_yaml() {
+        // A YAML file under `.github/workflows/` is a GitHub Actions workflow.
+        assert_eq!(
+            FileLang::from_path(Path::new(".github/workflows/ci.yml")),
+            FileLang::GithubActions
+        );
+        assert_eq!(
+            FileLang::from_path(Path::new(".github/workflows/release.yaml")),
+            FileLang::GithubActions
+        );
+        // Works with a project-prefixed path too (ancestry scan, not a prefix anchor).
+        assert_eq!(
+            FileLang::from_path(Path::new("repo/.github/workflows/build.yml")),
+            FileLang::GithubActions
+        );
+        // A `.yml`/`.yaml` NOT under `.github/workflows/` stays plain YAML.
+        assert_eq!(
+            FileLang::from_path(Path::new("config/ci.yml")),
+            FileLang::Yaml
+        );
+        // `.github/` but NOT in `workflows/` (e.g. dependabot config) stays YAML.
+        assert_eq!(
+            FileLang::from_path(Path::new(".github/dependabot.yml")),
+            FileLang::Yaml
+        );
+        // A non-YAML file under `.github/workflows/` is not a workflow (e.g. a README).
+        assert_eq!(
+            FileLang::from_path(Path::new(".github/workflows/README.md")),
+            FileLang::Other
+        );
     }
 }

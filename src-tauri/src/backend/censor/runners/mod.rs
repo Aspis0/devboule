@@ -23,6 +23,7 @@
 //! file-scoped (not crate-wide) and removed when A3 consumes these APIs.
 #![allow(dead_code)]
 
+pub mod actionlint;
 pub mod bandit;
 pub mod cargo_audit;
 pub mod cargo_check;
@@ -34,6 +35,7 @@ pub mod eslint;
 pub mod gitleaks;
 pub mod go_vet;
 pub mod gofmt;
+pub mod hadolint;
 pub mod jscpd;
 pub mod knip;
 pub mod ktlint;
@@ -48,6 +50,7 @@ pub mod ruff_format;
 pub mod semgrep;
 pub mod shellcheck;
 pub mod sqlfluff;
+pub mod stylelint;
 pub mod tidy;
 pub mod tsc;
 pub mod vulture;
@@ -158,6 +161,9 @@ pub enum RunnerId {
     Shellcheck,
     Yamllint,
     Sqlfluff,
+    Hadolint,
+    Actionlint,
+    Stylelint,
     Gitleaks,
     Jscpd,
     Lizard,
@@ -212,6 +218,11 @@ impl RunnerId {
             | RunnerId::Shellcheck
             | RunnerId::Yamllint
             | RunnerId::Sqlfluff
+            // hadolint (Dockerfile)/actionlint (GH Actions)/stylelint (CSS) are
+            // single-binary, no-compile linters → Fine (per-file).
+            | RunnerId::Hadolint
+            | RunnerId::Actionlint
+            | RunnerId::Stylelint
             | RunnerId::Lizard
             | RunnerId::Semgrep
             | RunnerId::Oxlint
@@ -245,6 +256,9 @@ impl RunnerId {
             RunnerId::Shellcheck => "shellcheck",
             RunnerId::Yamllint => "yamllint",
             RunnerId::Sqlfluff => "sqlfluff",
+            RunnerId::Hadolint => "hadolint",
+            RunnerId::Actionlint => "actionlint",
+            RunnerId::Stylelint => "stylelint",
             RunnerId::Gitleaks => "gitleaks",
             RunnerId::Jscpd => "jscpd",
             RunnerId::Lizard => "lizard",
@@ -289,14 +303,19 @@ const CROSS_CUTTING: [RunnerId; 5] = [
 ///   - `.sh`/`.bash`/... file (ANY project — shell has no manifest) → shellcheck (fine)
 ///   - `.yml`/`.yaml` file (ANY project — YAML has no manifest) → yamllint (fine)
 ///   - `.sql` file (ANY project — SQL has no manifest) → sqlfluff (fine)
+///   - `Dockerfile`/`Containerfile`/`*.dockerfile` (ANY project — no manifest) → hadolint (fine)
+///   - `.yml`/`.yaml` under `.github/workflows/` (ANY project) → actionlint (fine)
+///   - `.css`/`.scss`/`.sass`/`.less` file (ANY project — CSS has no manifest) → stylelint (fine)
 ///   - ANY file → gitleaks, jscpd, lizard, semgrep (cross-cutting)
 ///
 /// A language-specific runner is only added when BOTH the file lang AND the
 /// matching project kind are present (a stray `.py` in a Rust-only repo gets only
 /// the cross-cutting set — no point running ruff where there's no Python config).
-/// HTML / Shell / YAML / SQL are the deliberate EXCEPTIONS: none has a canonical project
-/// manifest, so tidy / shellcheck / yamllint / sqlfluff gate on the FileLang ALONE (an
-/// `.html`/`.sh`/`.yml`/`.sql` file anywhere is checkable, like a standalone document).
+/// HTML / Shell / YAML / SQL / Dockerfile / GithubActions / CSS are the deliberate
+/// EXCEPTIONS: none has a canonical project manifest, so tidy / shellcheck / yamllint /
+/// sqlfluff / hadolint / actionlint / stylelint gate on the FileLang ALONE (an
+/// `.html`/`.sh`/`.yml`/`.sql`/`Dockerfile`/workflow/`.css` file anywhere is checkable,
+/// like a standalone document).
 pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<RunnerId> {
     let mut out: Vec<RunnerId> = Vec::new();
     match lang {
@@ -357,6 +376,23 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
         FileLang::Sql => {
             // sqlfluff is Fine (single-binary SQL linter). Style/advisory.
             out.push(RunnerId::Sqlfluff);
+        }
+        // Dockerfile/GithubActions/CSS have NO project manifest / ProjectKind (like HTML
+        // and Shell/YAML/SQL) — a Dockerfile / a `.github/workflows/*.yml` / a `.css`
+        // file anywhere is checkable, so each runner gates on the FileLang ALONE
+        // (deliberately no kind guard). All Fine (single-binary, no-compile).
+        FileLang::Dockerfile => {
+            // hadolint is Fine (single-binary Dockerfile linter). Advisory.
+            // (GPL-3.0 → INVOKE-ONLY, never bundled — see runners/hadolint.rs.)
+            out.push(RunnerId::Hadolint);
+        }
+        FileLang::GithubActions => {
+            // actionlint is Fine (single-binary workflow checker). Correctness/advisory.
+            out.push(RunnerId::Actionlint);
+        }
+        FileLang::Css => {
+            // stylelint is Fine (CSS linter). Advisory; only fires when a config exists.
+            out.push(RunnerId::Stylelint);
         }
         _ => {}
     }
@@ -904,6 +940,36 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_actions_css_files_get_their_runner_regardless_of_project_kind() {
+        // Dockerfile/GithubActions/CSS have NO ProjectKind (like HTML/Shell/YAML/SQL): the
+        // runner applies for the file's lang in ANY project (or none) — it gates on the
+        // FileLang alone.
+        for (lang, id) in [
+            (FileLang::Dockerfile, RunnerId::Hadolint),
+            (FileLang::GithubActions, RunnerId::Actionlint),
+            (FileLang::Css, RunnerId::Stylelint),
+        ] {
+            for kset in [
+                kinds(&[]),
+                kinds(&[ProjectKind::Rust]),
+                kinds(&[ProjectKind::Node, ProjectKind::Python]),
+            ] {
+                let r = applicable_runners(&kset, lang);
+                assert!(r.contains(&id), "{id:?} missing for {lang:?} / kinds {kset:?}");
+                // Cross-cutting always present.
+                assert!(r.contains(&RunnerId::Gitleaks));
+                assert!(r.contains(&RunnerId::Semgrep));
+                // No OTHER lang-specific runner leaks in.
+                assert!(!r.contains(&RunnerId::Clippy));
+                assert!(!r.contains(&RunnerId::Tidy));
+                assert!(!r.contains(&RunnerId::Shellcheck));
+                // The lang runner + the cross-cutting set, no duplicates.
+                assert_eq!(r.len(), CROSS_CUTTING.len() + 1);
+            }
+        }
+    }
+
+    #[test]
     fn unknown_file_lang_gets_only_cross_cutting() {
         let r = applicable_runners(
             &kinds(&[ProjectKind::Rust, ProjectKind::Node]),
@@ -976,6 +1042,10 @@ mod tests {
             RunnerId::Shellcheck,
             RunnerId::Yamllint,
             RunnerId::Sqlfluff,
+            // hadolint/actionlint/stylelint are single-binary, no-compile → Fine.
+            RunnerId::Hadolint,
+            RunnerId::Actionlint,
+            RunnerId::Stylelint,
             RunnerId::Lizard,
             RunnerId::Semgrep,
         ] {
