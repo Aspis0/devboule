@@ -5,6 +5,13 @@
 > "local coder actually codes well" validation is GPU-deferred (see
 > `docs/breezy-gpu-deferred-verifications.md` + memory `concurrent-training-gpu-rule`).
 > Decision-oriented: it ends with a phased plan + the owner decisions still open.
+>
+> **IMPLEMENTATION STATUS (2026-06-15):** L1 **Step A DONE + committed** (commit 917d694) —
+> the `AgentConsole` Console dock tab is built (prop-driven, faithful to the approved
+> `agent-console/Agent Activity Console.html` mock; CSP-safe; tsc clean / vitest green). It
+> renders the empty state until **L1 Step B** (the backend `mini-activity://<id>` event
+> channel + `mini_activity_snapshot` command instrumenting `mini_coder_executor`) lands to
+> feed it live data — Step B is the next piece. L2/L3/L4 unstarted.
 
 ## 0. The gap this solves
 
@@ -255,10 +262,20 @@ is the coder.
 
 Recommended order reflects the §2 synthesis (build the MINIMAL part ourselves; adopt for the
 heavy part):
-- **L1 — Activity TUI / panel (cheap, do first).** Stream what EVERY agent is doing
-  (mini/coder/harness): tool calls, edits, Censor verdicts, fix rounds — over the data the
-  mini loop already produces. Solves "farsi vedere nel lavoro"; pure display, no engine
-  (frontend + a Tauri activity feed). GPU-free.
+- **L1 — Activity Console = a "Console" DOCK TAB in `ProjectWorkspace`** (peer of
+  Censor | Activity | Git | Plans), **project-scoped**. Decided 2026-06-15: NOT a top-level
+  global view (parked — judged confusing now; revisit only if cross-project "mission control"
+  is ever wanted). It COMPLEMENTS the existing in-app xterm (`AgentTerminalViewer`, h-72, raw
+  PTY bytes) by surfacing the STRUCTURED loop the terminal doesn't. TWO TIERS: (1) **main
+  coder** (claude/codex — they own their TUI elsewhere) → sparse BASIC milestones for context
+  only ("spawned mini-coder", "claimed task", "moved to review", "requested push"); (2)
+  **mini + our local loop** → rich, NESTED, per-round detail: directive/file scope, emit-edits
+  + togglable diff, **Censor verdict per round** (CLEAN/DIRTY + severity-colored findings with
+  file:line), fix rounds, Done/Escalated/Stopped banner. Compact, collapsed-by-default
+  entries; dock-panel footprint. **Backend piece:** emit the mini loop lifecycle on a new
+  `mini-activity://<id>` Tauri channel (today only the 5s `get_agent_live_state` poll + a
+  single `censor://findings-updated` exist). Pure display + that event channel — no engine.
+  GPU-free. Designer prompt drafted 2026-06-15.
 - **L2 — Devboule's OWN minimal local-coder loop (the zero-install out-of-box coder).** Extend
   `mini_coder_executor`'s write→gate→fix loop into a small general tool-using loop: a handful
   of mediated + P5-sandboxed tools (read-file, emit-edits write, run-command, grep/search),
