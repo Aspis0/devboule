@@ -635,7 +635,10 @@ function DockActivity({
 
 function DockGit({ project }: { project: ProjectDetail }) {
   const git = project.gitStatus;
-  if (!git.isGitRepo) {
+  // Defensive: gitStatus is typed non-null but the backend can omit it (other call
+  // sites — projectWorkspaceModel/censorCounts — treat it as nullable), so guard so
+  // the Git dock tab renders a message instead of crashing on a missing status.
+  if (!git || !git.isGitRepo) {
     return (
       <p className="text-[11px] text-cream-400">
         The project root is not inside a Git repository.

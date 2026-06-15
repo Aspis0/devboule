@@ -386,8 +386,10 @@ export function isLikelyGithubRepoUrl(value: string): boolean {
     return false;
   }
   if (url.protocol !== "https:" || url.hostname !== "github.com") return false;
+  // The filter already drops empty segments, so length >= 2 alone guarantees a
+  // non-empty owner + repo (the prior per-segment `!== ""` checks were dead code).
   const segments = url.pathname.split("/").filter((s) => s.length > 0);
-  return segments.length >= 2 && segments[0] !== "" && segments[1] !== "";
+  return segments.length >= 2;
 }
 
 /** The IPC call for cloning a GitHub repository and registering it as a project.
