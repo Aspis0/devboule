@@ -37,6 +37,10 @@ vi.mock("./MiniCoderBackendCard", () => ({
   MiniCoderBackendCard: () =>
     createElement("div", { "data-testid": "mini-coder-card" }),
 }));
+vi.mock("./MiniWriteBehaviorCard", () => ({
+  MiniWriteBehaviorCard: () =>
+    createElement("div", { "data-testid": "mini-write-behavior-card" }),
+}));
 vi.mock("./OracleAnswerSettingsCard", () => ({
   OracleAnswerSettingsCard: () =>
     createElement("div", { "data-testid": "oracle-llm-card" }),
@@ -141,13 +145,16 @@ describe("ProvidersModelsTab", () => {
     expect(html).toContain("running (1 model)");
   });
 
-  it("renders all four per-role card sections", async () => {
+  it("renders all per-role card sections", async () => {
     await mount();
     expect(
       container.querySelector('[data-testid="censor-model-card"]'),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="mini-coder-card"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="mini-write-behavior-card"]'),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="oracle-llm-card"]'),

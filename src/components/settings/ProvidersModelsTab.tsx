@@ -15,6 +15,7 @@ import {
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
+import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
 import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
 import { CensorLocalAiCard } from "../views/WorkspaceView";
@@ -260,6 +261,13 @@ export function ProvidersModelsTab() {
         description="The runtime your coders delegate cheap one-shot sub-tasks to."
       >
         <MiniCoderBackendCard />
+      </RoleSection>
+
+      <RoleSection
+        title="Mini write behavior"
+        description="The ceiling for how your coders delegate file writes to the local mini."
+      >
+        <MiniWriteBehaviorCard />
       </RoleSection>
 
       <RoleSection

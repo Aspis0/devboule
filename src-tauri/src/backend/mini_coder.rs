@@ -144,9 +144,21 @@ pub const MAX_AGENTIC_FIX_ROUNDS: u32 = 2;
 /// consulted ONLY in the agentic+write branch; for every other directive the result is
 /// identical to the pre-B1 behavior regardless of `covered`, so the default emit-edits and
 /// the non-write paths stay byte-identical.
-pub fn max_mini_retries_for(directive: &MiniCoderDirective, covered: bool) -> u32 {
+///
+/// E1 (FIX 1): `write_mode` is the EFFECTIVE mode supplied by the caller, NOT
+/// `directive.write_mode`. The executor reads the global [`MiniWriteBehavior`] policy at
+/// DECISION time and clamps a `Safe` policy to [`WriteMode::EmitEdits`] BEFORE calling this,
+/// so a directive that arrived with `write_mode == AgenticIterative` (coder hallucination /
+/// prompt-injection / replayed directive) is FORCED to the single-pass budget under Safe —
+/// the policy is now a HARD ceiling at the budget gate, not just launch-prompt guidance.
+/// `Auto`/`AgenticAllowed` pass `directive.write_mode` through unchanged (today's behavior).
+pub fn max_mini_retries_for(
+    directive: &MiniCoderDirective,
+    write_mode: WriteMode,
+    covered: bool,
+) -> u32 {
     if directive.write {
-        if directive.write_mode == WriteMode::AgenticIterative && covered {
+        if write_mode == WriteMode::AgenticIterative && covered {
             MAX_AGENTIC_FIX_ROUNDS
         } else {
             // EmitEdits write, or agentic-but-uncovered (B2 fallback): one fix pass.
@@ -468,6 +480,48 @@ pub enum WriteMode {
 /// `writeMode` round-trips through Rust without gaining a `"writeMode":"emitEdits"`.
 fn is_emit_edits(m: &WriteMode) -> bool {
     matches!(m, WriteMode::EmitEdits)
+}
+
+/// E1 — the USER-FACING write-behavior POLICY (the ceiling the coder's per-task
+/// A3 `write_mode` decision must respect). Persisted in config.json under
+/// `miniWriteBehavior`; absent ⇒ [`MiniWriteBehavior::Auto`] (the current behavior).
+///
+/// This is NOT the same axis as [`WriteMode`]: `WriteMode` is the per-directive
+/// mechanism the coder picks for a single delegation; `MiniWriteBehavior` is the
+/// global policy that BOUNDS what the coder is allowed/encouraged to pick. The
+/// coder reads it through the A3 launch-prompt guidance (`projects.rs`).
+///
+/// camelCase over the wire to match the TS `MiniWriteBehavior` + the config.json
+/// discriminator (e.g. `"agenticAllowed"`), exactly like [`MiniCoderBackendKind`].
+/// `Default` is [`MiniWriteBehavior::Auto`] so a config missing the key (today's
+/// configs, hand-edited, older) resolves to the unchanged Auto guidance — paired
+/// with [`is_auto_write_behavior`] as the `skip_serializing_if` predicate so the
+/// Auto default serializes BYTE-IDENTICALLY to today (no `"miniWriteBehavior"` key
+/// injected → NO-CHURN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MiniWriteBehavior {
+    /// The user forbids agentic-iterative entirely: the coder must delegate with
+    /// emit-edits ONLY (one write + one fix), regardless of language coverage or
+    /// model capability. Wire: `"safe"`.
+    Safe,
+    /// The default: the coder decides per task (agentic where the language is gate-
+    /// covered AND the model is capable, emit-edits otherwise). This is today's
+    /// behavior. Wire: `"auto"`.
+    #[default]
+    Auto,
+    /// The user opts in to agentic-iterative for capable models: it is ENCOURAGED on
+    /// gate-covered languages (the coder still falls back to emit-edits for uncovered
+    /// languages or a weak model). Wire: `"agenticAllowed"`.
+    AgenticAllowed,
+}
+
+/// `skip_serializing_if` for a [`MiniWriteBehavior`] that is `Auto`-by-default
+/// (NO-CHURN co-ownership, like [`is_emit_edits`] for [`WriteMode`]): a config that
+/// never set / left the policy at Auto round-trips through Rust without gaining a
+/// `"miniWriteBehavior":"auto"` key, so an existing config.json is byte-identical.
+pub fn is_auto_write_behavior(m: &MiniWriteBehavior) -> bool {
+    matches!(m, MiniWriteBehavior::Auto)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -909,13 +963,19 @@ pub enum GateDecision {
 ///   with the High findings summarized into its feedback.
 /// * Clean `done`, trusted, dirty, `attempt >= budget` → `Escalate(escalated)`.
 ///
-/// The retry `budget` is [`max_mini_retries_for`]`(directive, covered)`: 1 for an
-/// emit-edits (or agentic-but-uncovered) write, [`MAX_AGENTIC_FIX_ROUNDS`] for an
+/// The retry `budget` is [`max_mini_retries_for`]`(directive, effective_write_mode, covered)`:
+/// 1 for an emit-edits (or agentic-but-uncovered) write, [`MAX_AGENTIC_FIX_ROUNDS`] for an
 /// agentic-iterative write on a covered language (the N-round loop — raising the budget IS
 /// the loop), [`MAX_MINI_RETRIES`] for a non-write directive. `covered` is the caller's
 /// "this directive's files include a language with deterministic Tier-A coverage" signal;
 /// it is consulted ONLY for the agentic+write case, so emit-edits/non-write decisions are
 /// byte-identical to before regardless of its value.
+///
+/// E1 (FIX 1): `effective_write_mode` is the policy-clamped write mode the caller decided
+/// (Safe ⇒ [`WriteMode::EmitEdits`]; Auto/AgenticAllowed ⇒ `directive.write_mode`). It is
+/// threaded straight into [`max_mini_retries_for`] so a `Safe` policy forces budget 1 even
+/// when the directive on disk says `AgenticIterative`. The gate consults the EFFECTIVE mode,
+/// never `directive.write_mode`, for the budget — the policy is a HARD ceiling here.
 ///
 /// `new_retry_id`/`retry_result_path`/`now` are supplied by the impure caller (fresh id,
 /// scratch-relative result path, RFC3339 clock) so this stays clock/IO-free.
@@ -923,6 +983,7 @@ pub fn verdict_gate_decision(
     directive: &MiniCoderDirective,
     outcome: &MiniCoderOutcome,
     trusted: bool,
+    effective_write_mode: WriteMode,
     covered: bool,
     high_findings: Vec<EscalationFinding>,
     new_retry_id: impl Into<String>,
@@ -945,10 +1006,12 @@ pub fn verdict_gate_decision(
         return GateDecision::StampTerminal(outcome.clone());
     }
     // Dirty. Retry if budget remains, else escalate. The budget depends on the
-    // directive kind + write mode + language coverage (see max_mini_retries_for):
+    // directive kind + EFFECTIVE write mode + language coverage (see max_mini_retries_for):
     // emit-edits/uncovered-agentic write -> 1; agentic-iterative write on a covered
     // language -> MAX_AGENTIC_FIX_ROUNDS (the N-round loop); non-write -> MAX_MINI_RETRIES.
-    if directive.attempt < max_mini_retries_for(directive, covered) {
+    // `effective_write_mode` is the policy-clamped mode (Safe ⇒ EmitEdits), so a Safe
+    // policy forces budget 1 regardless of `directive.write_mode` (FIX 1).
+    if directive.attempt < max_mini_retries_for(directive, effective_write_mode, covered) {
         let feedback = summarize_findings_for_feedback(&high_findings);
         let retry = build_retry_directive(
             directive,
@@ -1933,6 +1996,50 @@ mod tests {
     use std::cell::RefCell;
     use std::io::Write;
 
+    // E1 — the user-facing write-behavior policy.
+    #[test]
+    fn mini_write_behavior_default_is_auto() {
+        assert_eq!(MiniWriteBehavior::default(), MiniWriteBehavior::Auto);
+    }
+
+    #[test]
+    fn mini_write_behavior_wire_tokens_are_camel_case() {
+        // The TS `MiniWriteBehavior` + config.json discriminator must match these.
+        assert_eq!(
+            serde_json::to_string(&MiniWriteBehavior::Safe).unwrap(),
+            "\"safe\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MiniWriteBehavior::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MiniWriteBehavior::AgenticAllowed).unwrap(),
+            "\"agenticAllowed\""
+        );
+    }
+
+    #[test]
+    fn mini_write_behavior_round_trips() {
+        for v in [
+            MiniWriteBehavior::Safe,
+            MiniWriteBehavior::Auto,
+            MiniWriteBehavior::AgenticAllowed,
+        ] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: MiniWriteBehavior = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v, "round-trip for {v:?}");
+        }
+    }
+
+    #[test]
+    fn mini_write_behavior_no_churn_predicate() {
+        // `is_auto_write_behavior` is the skip_serializing_if guard: ONLY Auto omits.
+        assert!(is_auto_write_behavior(&MiniWriteBehavior::Auto));
+        assert!(!is_auto_write_behavior(&MiniWriteBehavior::Safe));
+        assert!(!is_auto_write_behavior(&MiniWriteBehavior::AgenticAllowed));
+    }
+
     fn directive(id: &str, status: MiniCoderStatus, created_at: &str) -> MiniCoderDirective {
         MiniCoderDirective {
             id: id.into(),
@@ -2915,6 +3022,7 @@ mod tests {
             &d,
             &outcome,
             false,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding()],
             "root-r1",
@@ -2935,6 +3043,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![],
             "root-r1",
@@ -2957,6 +3066,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![visual],
             "root-r1",
@@ -2978,6 +3088,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding()],
             "root-r1",
@@ -3011,6 +3122,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding(), visual],
             "root-r1",
@@ -3039,6 +3151,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding()],
             "root-r3",
@@ -3074,6 +3187,7 @@ mod tests {
             &w,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding()],
             "root-r2",
@@ -3095,6 +3209,7 @@ mod tests {
             &nw,
             &outcome,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding()],
             "root2-r2",
@@ -3120,6 +3235,7 @@ mod tests {
             &d,
             &failed,
             true,
+            WriteMode::EmitEdits,
             false,
             vec![high_finding()],
             "x",
@@ -3138,24 +3254,38 @@ mod tests {
 
         // Non-write: always MAX_MINI_RETRIES; `covered` and write_mode are irrelevant.
         d.write = false;
-        d.write_mode = WriteMode::EmitEdits;
-        assert_eq!(max_mini_retries_for(&d, false), MAX_MINI_RETRIES);
-        assert_eq!(max_mini_retries_for(&d, true), MAX_MINI_RETRIES);
-        d.write_mode = WriteMode::AgenticIterative; // write=false -> write_mode ignored
-        assert_eq!(max_mini_retries_for(&d, true), MAX_MINI_RETRIES);
-        assert_eq!(max_mini_retries_for(&d, false), MAX_MINI_RETRIES);
+        assert_eq!(max_mini_retries_for(&d, WriteMode::EmitEdits, false), MAX_MINI_RETRIES);
+        assert_eq!(max_mini_retries_for(&d, WriteMode::EmitEdits, true), MAX_MINI_RETRIES);
+        // write=false -> the effective write_mode is ignored.
+        assert_eq!(max_mini_retries_for(&d, WriteMode::AgenticIterative, true), MAX_MINI_RETRIES);
+        assert_eq!(max_mini_retries_for(&d, WriteMode::AgenticIterative, false), MAX_MINI_RETRIES);
 
         // EmitEdits write: always exactly 1 (covered must NOT change it — NO-CHURN).
         d.write = true;
-        d.write_mode = WriteMode::EmitEdits;
-        assert_eq!(max_mini_retries_for(&d, false), 1);
-        assert_eq!(max_mini_retries_for(&d, true), 1, "covered must not affect emit-edits");
+        assert_eq!(max_mini_retries_for(&d, WriteMode::EmitEdits, false), 1);
+        assert_eq!(
+            max_mini_retries_for(&d, WriteMode::EmitEdits, true),
+            1,
+            "covered must not affect emit-edits"
+        );
 
         // AgenticIterative write + COVERED: the N-round loop.
-        d.write_mode = WriteMode::AgenticIterative;
-        assert_eq!(max_mini_retries_for(&d, true), MAX_AGENTIC_FIX_ROUNDS);
+        assert_eq!(
+            max_mini_retries_for(&d, WriteMode::AgenticIterative, true),
+            MAX_AGENTIC_FIX_ROUNDS
+        );
         // AgenticIterative write + UNCOVERED: B2 fallback to a single fix pass.
-        assert_eq!(max_mini_retries_for(&d, false), 1);
+        assert_eq!(max_mini_retries_for(&d, WriteMode::AgenticIterative, false), 1);
+
+        // E1 (FIX 1): the EFFECTIVE mode is what the budget reads, NOT `directive.write_mode`.
+        // A directive that says AgenticIterative on disk but whose policy clamped the effective
+        // mode to EmitEdits (Safe) gets the single-pass budget even WITH coverage.
+        d.write_mode = WriteMode::AgenticIterative;
+        assert_eq!(
+            max_mini_retries_for(&d, WriteMode::EmitEdits, true),
+            1,
+            "Safe-clamped effective EmitEdits forces budget 1 despite directive.write_mode=Agentic + covered"
+        );
     }
 
     #[test]
@@ -3211,6 +3341,7 @@ mod tests {
                 &d,
                 &outcome,
                 true,  // trusted
+                WriteMode::AgenticIterative, // effective mode (Auto/AgenticAllowed passthrough)
                 true,  // covered
                 vec![high_finding()],
                 format!("root-r{}", attempt + 1),
@@ -3234,6 +3365,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::AgenticIterative,
             true,
             vec![high_finding()],
             "root-rN",
@@ -3266,6 +3398,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            WriteMode::AgenticIterative,
             false, // UNCOVERED -> budget 1
             vec![high_finding()],
             "root-r2",
@@ -3276,6 +3409,106 @@ mod tests {
             matches!(decision, GateDecision::Escalate(_)),
             "agentic+uncovered must escalate after one pass, got {decision:?}"
         );
+    }
+
+    #[test]
+    fn gate_safe_policy_clamps_agentic_directive_to_single_pass_budget() {
+        // E1 (FIX 1): the Safe policy is a HARD CEILING enforced at the budget gate, NOT just
+        // in the launch prompt. A directive that arrived with write_mode=AgenticIterative
+        // (coder hallucination / prompt-injection / replayed directive) on a COVERED language
+        // gets budget 1 — NOT MAX_AGENTIC_FIX_ROUNDS — once the policy clamp resolves the
+        // EFFECTIVE write mode to EmitEdits. Auto/AgenticAllowed pass the directive's mode
+        // through, so the same directive keeps the N-round budget under those policies.
+        //
+        // This mirrors the executor's `match policy { Safe => EmitEdits, _ => directive.write_mode }`
+        // clamp (mini_coder_executor.rs ~:1600) at the pure layer the executor delegates to.
+        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        d.write = true;
+        d.write_mode = WriteMode::AgenticIterative; // what the (possibly tampered) directive requested
+
+        let effective_for = |policy: MiniWriteBehavior| match policy {
+            MiniWriteBehavior::Safe => WriteMode::EmitEdits,
+            MiniWriteBehavior::Auto | MiniWriteBehavior::AgenticAllowed => d.write_mode,
+        };
+
+        // SAFE + covered: budget == 1 (single pass), so dirty at attempt 1 escalates.
+        assert_eq!(
+            max_mini_retries_for(&d, effective_for(MiniWriteBehavior::Safe), true),
+            1,
+            "Safe must force budget 1 even for an AgenticIterative directive on a covered language"
+        );
+        // AUTO / AGENTIC_ALLOWED + covered: budget == MAX_AGENTIC_FIX_ROUNDS (the N-round loop).
+        for policy in [MiniWriteBehavior::Auto, MiniWriteBehavior::AgenticAllowed] {
+            assert_eq!(
+                max_mini_retries_for(&d, effective_for(policy), true),
+                MAX_AGENTIC_FIX_ROUNDS,
+                "{policy:?} must keep the N-round budget for a covered agentic directive"
+            );
+        }
+
+        // End-to-end through the gate: dirty Done at attempt 1, covered. Under SAFE the
+        // single-pass budget is exhausted -> Escalate; under AGENTIC_ALLOWED a round remains
+        // -> AwaitingRetryWith. (The covered flag the executor computes is true here.)
+        d.attempt = 1;
+        let outcome = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            files_touched: vec!["src/app.py".into()],
+            ..Default::default()
+        });
+        let safe_dec = verdict_gate_decision(
+            &d,
+            &outcome,
+            true,
+            effective_for(MiniWriteBehavior::Safe),
+            true,
+            vec![high_finding()],
+            "root-r2",
+            "root-r2.json",
+            "2026-06-06T00:00:10Z",
+        );
+        assert!(
+            matches!(safe_dec, GateDecision::Escalate(_)),
+            "Safe-clamped agentic directive must escalate after one pass, got {safe_dec:?}"
+        );
+        let allowed_dec = verdict_gate_decision(
+            &d,
+            &outcome,
+            true,
+            effective_for(MiniWriteBehavior::AgenticAllowed),
+            true,
+            vec![high_finding()],
+            "root-r2",
+            "root-r2.json",
+            "2026-06-06T00:00:10Z",
+        );
+        assert!(
+            matches!(allowed_dec, GateDecision::AwaitingRetryWith { .. }),
+            "AgenticAllowed must still have a round left at attempt 1, got {allowed_dec:?}"
+        );
+
+        // Emit-edits / non-write directives are unaffected by the policy clamp: their budget
+        // is identical under every policy (the clamp only ever narrows Agentic -> Emit).
+        let mut emit = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        emit.write = true; // write_mode defaults to EmitEdits
+        for policy in [MiniWriteBehavior::Safe, MiniWriteBehavior::Auto, MiniWriteBehavior::AgenticAllowed] {
+            let eff = match policy {
+                MiniWriteBehavior::Safe => WriteMode::EmitEdits,
+                _ => emit.write_mode,
+            };
+            assert_eq!(max_mini_retries_for(&emit, eff, true), 1, "emit-edits budget is 1 under {policy:?}");
+        }
+        let nonwrite = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        for policy in [MiniWriteBehavior::Safe, MiniWriteBehavior::Auto, MiniWriteBehavior::AgenticAllowed] {
+            let eff = match policy {
+                MiniWriteBehavior::Safe => WriteMode::EmitEdits,
+                _ => nonwrite.write_mode,
+            };
+            assert_eq!(
+                max_mini_retries_for(&nonwrite, eff, true),
+                MAX_MINI_RETRIES,
+                "non-write budget is MAX_MINI_RETRIES under {policy:?}"
+            );
+        }
     }
 
     #[test]
@@ -3293,7 +3526,7 @@ mod tests {
             let mut d0 = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
             d0.write = true; // write_mode defaults to EmitEdits
             let dec0 = verdict_gate_decision(
-                &d0, &outcome, true, covered, vec![high_finding()],
+                &d0, &outcome, true, WriteMode::EmitEdits, covered, vec![high_finding()],
                 "root-r1", "root-r1.json", "2026-06-06T00:00:10Z",
             );
             assert!(
@@ -3305,7 +3538,7 @@ mod tests {
             d1.write = true;
             d1.attempt = 1;
             let dec1 = verdict_gate_decision(
-                &d1, &outcome, true, covered, vec![high_finding()],
+                &d1, &outcome, true, WriteMode::EmitEdits, covered, vec![high_finding()],
                 "root-r2", "root-r2.json", "2026-06-06T00:00:10Z",
             );
             assert!(

@@ -885,6 +885,112 @@ pub fn set_design_llm_backend(
     Ok(normalized)
 }
 
+/// E1 — read the configured global mini write-behavior policy (Settings → Providers &
+/// Models). Returns [`MiniWriteBehavior::Auto`] when unset/invalid (today's behavior).
+/// Unlock-gated like the other settings get commands.
+#[tauri::command]
+pub fn get_mini_write_behavior(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+) -> Result<super::mini_coder::MiniWriteBehavior, String> {
+    state.ensure_unlocked()?;
+    Ok(read_mini_write_behavior(&app))
+}
+
+/// E1 — merge a write-behavior policy into a config.json `value` object with NO-CHURN
+/// semantics: the [`MiniWriteBehavior::Auto`] default carries no information beyond
+/// "today's behavior", so its key is REMOVED entirely (a config that never touched the
+/// control — or reset to Auto — stays byte-identical to its pre-E1 shape). Safe /
+/// AgenticAllowed write the explicit camelCase token. Pure + total so the round-trip
+/// (write → `read_mini_write_behavior`'s parse) is unit-testable without a Tauri
+/// runtime. Returns Err if `value` is not a JSON object.
+fn apply_mini_write_behavior_to_config(
+    value: &mut serde_json::Value,
+    behavior: super::mini_coder::MiniWriteBehavior,
+) -> Result<(), String> {
+    use super::mini_coder::is_auto_write_behavior;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "config.json is not a JSON object.".to_string())?;
+    if is_auto_write_behavior(&behavior) {
+        // The Auto default is represented by the ABSENCE of the key (no `"auto"` churn).
+        obj.remove("miniWriteBehavior");
+        return Ok(());
+    }
+    let serialized = serde_json::to_value(behavior)
+        .map_err(|e| format!("Could not serialize mini write-behavior policy: {e}"))?;
+    obj.insert("miniWriteBehavior".to_string(), serialized);
+    Ok(())
+}
+
+/// E1 — persist the global mini write-behavior policy into config.json (read-modify-
+/// write, mirroring `set_mini_coder_backend`). The Auto default drops the key entirely
+/// (NO-CHURN — see `apply_mini_write_behavior_to_config`), so a config left at Auto is
+/// byte-identical to today; Safe / AgenticAllowed write the explicit camelCase token.
+/// Unlock-gated; atomic temp+rename so a crash can never leave config.json partial.
+/// Returns the persisted policy.
+#[tauri::command]
+pub fn set_mini_write_behavior(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    behavior: super::mini_coder::MiniWriteBehavior,
+) -> Result<super::mini_coder::MiniWriteBehavior, String> {
+    state.ensure_unlocked()?;
+    let path = locate_config_path(&app).ok_or_else(|| {
+        "config.json could not be located to save the mini write-behavior policy.".to_string()
+    })?;
+    // Serialize the read-modify-write against the other config.json savers so two
+    // concurrent Settings saves can't last-writer-wins-drop each other's key.
+    let _config_guard = config_write_lock()
+        .lock()
+        .map_err(|_| "Config write lock is poisoned.".to_string())?;
+    let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config.json: {e}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("config.json is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("config.json is not a JSON object.".into());
+    }
+    apply_mini_write_behavior_to_config(&mut value, behavior)?;
+    let pretty = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("Could not serialize config.json: {e}"))?;
+    // Atomic temp+rename (same as set_mini_coder_backend): a crash mid-write can never
+    // leave a half-written config.json. Read-only packaged builds surface the same guidance.
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let temp_path = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup_path = path.with_extension(format!("json.{suffix}.bak"));
+    fs::write(&temp_path, format!("{pretty}\n")).map_err(|e| {
+        format!(
+            "Could not write config.json at {}: {e}. In a packaged build this file is read-only.",
+            path.to_string_lossy()
+        )
+    })?;
+    replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")
+        .map_err(|e| format!("{e}. In a packaged build this file is read-only."))?;
+    Ok(behavior)
+}
+
+/// E2 — read-only: the languages that have agentic-iterative (Tier-A FINE-gate)
+/// coverage POTENTIAL. Settings is GLOBAL (no current project), so this returns the
+/// PROJECT-AGNOSTIC set — every language with a language-specific Fine runner at all
+/// ([`tier_a_potential_languages`]) — which the UI labels as "depends on the
+/// project's manifests + installed tools". Generic language labels (no project /
+/// product / model hardcoding); deterministic + sorted so the list never churns.
+/// Unlock-gated like the other read commands.
+#[tauri::command]
+pub fn get_agentic_coverage_languages(
+    state: State<'_, BackendState>,
+) -> Result<Vec<String>, String> {
+    state.ensure_unlocked()?;
+    Ok(super::mini_coder_executor::tier_a_potential_languages()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect())
+}
+
 /// Merge a validated `censorLocalAi` config into a config.json `value` object with the
 /// SAME no-churn rule the mini-coder backend uses: the Ollama default (provider=ollama,
 /// no custom base/model) is persisted as the minimal `{ "provider": "ollama" }` (its
@@ -1066,7 +1172,12 @@ fn prepare_or_launch_project_agent(
     let mini_delegation_addendum: Option<String> = if role == "coder" {
         let backend = read_mini_coder_backend(&app);
         let covered = super::mini_coder_executor::tier_a_covered_languages(&root_path);
-        build_mini_delegation_addendum(backend.as_ref(), &covered)
+        // E1: the user's persisted write-behavior policy bounds the injected guidance
+        // (Safe ⇒ emit-edits only, Auto ⇒ unchanged, AgenticAllowed ⇒ encourage agentic
+        // on covered langs). Auto (the default for any config without the key) keeps the
+        // coder prompt byte-identical to pre-E1.
+        let policy = read_mini_write_behavior(&app);
+        build_mini_delegation_addendum(backend.as_ref(), &covered, policy)
     } else {
         None
     };
@@ -2050,6 +2161,34 @@ pub fn read_design_llm_backend(
     super::design_llm::validate_design_llm_backend(&parsed).ok()
 }
 
+/// E1 — read the global mini write-behavior policy (`miniWriteBehavior`) from
+/// config.json. A missing key / missing file / malformed value FALLS BACK to the
+/// safe default ([`MiniWriteBehavior::Auto`] = today's coder-decides guidance) —
+/// never errors, so an old config without the key resolves to the unchanged Auto
+/// behavior with ZERO migration. This is read at the coder-launch chokepoint (A3)
+/// to bound the injected `write_mode` guidance.
+pub fn read_mini_write_behavior(
+    app: &tauri::AppHandle,
+) -> super::mini_coder::MiniWriteBehavior {
+    use super::mini_coder::MiniWriteBehavior;
+    let default = MiniWriteBehavior::default();
+    let Some(path) = locate_config_path(app) else {
+        return default;
+    };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return default;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return default;
+    };
+    let Some(entry) = value.get("miniWriteBehavior") else {
+        return default;
+    };
+    // A present-but-bogus value (e.g. a hand-edited `"yolo"`) resolves to Auto, never
+    // a wider policy than the user actually picked.
+    serde_json::from_value::<MiniWriteBehavior>(entry.clone()).unwrap_or(default)
+}
+
 /// Read the Censor local-AI provider config (`censorLocalAi`) from config.json. A
 /// missing key / missing file / malformed value, OR a present-but-INVALID config (e.g.
 /// a non-loopback oMLX base, an oMLX config with no model) FALLS BACK to the safe
@@ -2168,12 +2307,27 @@ fn mini_backend_kind_label(kind: super::mini_coder::MiniCoderBackendKind) -> &'s
 /// deterministic-gate covered languages (computed from the detected project, not a
 /// hardcoded map / model id). The coder — a capable frontier model that knows model
 /// capabilities — then judges whether its mini is strong enough for agentic
-/// iteration. The user's explicit Safe/Auto/Agentic policy ceiling is a later
-/// workstream; this block is the Auto-default guidance.
+/// iteration, GUIDED by the user's explicit `policy` (E1):
+///   - [`MiniWriteBehavior::Safe`] ⇒ emit-edits ONLY (agentic disabled by the user).
+///   - [`MiniWriteBehavior::Auto`] (default) ⇒ the coder decides per task.
+///   - [`MiniWriteBehavior::AgenticAllowed`] ⇒ agentic-iterative is ENCOURAGED on
+///     covered-language files (for capable models).
+///
+/// ENFORCEMENT (FIX 1): this block is GUIDANCE, NOT the enforcement boundary. The
+/// `Safe` policy is a HARD CEILING enforced in the EXECUTOR at the budget-decision
+/// point (`mini_coder_executor::finalize_finished_mini_with`, ~:1600): there the policy
+/// is re-read at DECISION time and clamps the EFFECTIVE write mode to
+/// [`WriteMode::EmitEdits`] under `Safe`, so a directive that arrives with
+/// `write_mode == AgenticIterative` (coder hallucination / prompt-injection in the task /
+/// a replayed directive) still gets the single-pass budget — it can NOT buy the N-round
+/// agentic loop. The settable values quoted below are therefore the EXACT MCP wire tokens
+/// (`'emitEdits'` / `'agenticIterative'`, FIX 2) so a coder that follows the imperative
+/// literally passes a token the MCP enum accepts.
 ///
 /// Inputs are PRE-READ by the caller so this stays a pure, unit-testable string
 /// builder (no AppHandle / filesystem): `backend` is the configured mini backend
-/// (`None` ⇒ no mini configured) and `covered` is `tier_a_covered_languages(root)`.
+/// (`None` ⇒ no mini configured), `covered` is `tier_a_covered_languages(root)`, and
+/// `policy` is the persisted [`MiniWriteBehavior`] (`read_mini_write_behavior`).
 ///
 /// Graceful degradation:
 ///   - `None` backend ⇒ `None` (no mini delegation at all → no block; the existing
@@ -2188,22 +2342,50 @@ fn mini_backend_kind_label(kind: super::mini_coder::MiniCoderBackendKind) -> &'s
 fn build_mini_delegation_addendum(
     backend: Option<&super::mini_coder::MiniCoderBackend>,
     covered: &[&'static str],
+    policy: super::mini_coder::MiniWriteBehavior,
 ) -> Option<String> {
+    use super::mini_coder::MiniWriteBehavior;
     let backend = backend?;
     let model = clean_optional(backend.model.as_deref())
         .unwrap_or_else(|| "your configured mini model".to_string());
     let kind_label = mini_backend_kind_label(backend.kind);
-    let covered_list = if covered.is_empty() {
-        "none".to_string()
-    } else {
-        covered.join(", ")
+    // FIX 5: `covered_list` is ONLY used by the Auto/AgenticAllowed arms, so it is computed
+    // lazily inside them (the Safe arm omits the covered set entirely — it is irrelevant
+    // there). `covered.join(...)` is cheap, but no reason to allocate it on the Safe path.
+    let covered_list = || {
+        if covered.is_empty() {
+            "none".to_string()
+        } else {
+            covered.join(", ")
+        }
     };
-    Some(format!(
-        "MINI-CODER DELEGATION write_mode: your local mini is '{model}' ({kind_label}). When you delegate a WRITE task via spawn_mini_coder, set write_mode:\n\
-- 'agentic-iterative' = the mini fixes over multiple rounds against the deterministic gate. Use it ONLY for files in a language with gate coverage (this project: {covered_list}) AND when '{model}' is capable enough to iterate usefully.\n\
-- 'emit-edits' (default) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
-You decide per task; default to emit-edits when unsure.\n"
-    ))
+    let block = match policy {
+        // Safe: the user disabled agentic-iterative — the coder must always delegate
+        // with emit-edits (no agentic encouragement at all). The covered-language list
+        // is omitted because it is irrelevant under this policy (so it is NOT computed).
+        MiniWriteBehavior::Safe => format!(
+            "MINI-CODER DELEGATION write_mode: your local mini is '{model}' ({kind_label}). Your write-behavior policy is SAFE: when you delegate a WRITE task via spawn_mini_coder, you MUST set write_mode to 'emitEdits' (one write + one fix). Agentic-iterative is disabled by the user's policy; do not request 'agenticIterative'.\n"
+        ),
+        // Auto (default): the coder decides per task. Pinned by an exact-string golden test.
+        MiniWriteBehavior::Auto => format!(
+            "MINI-CODER DELEGATION write_mode: your local mini is '{model}' ({kind_label}). When you delegate a WRITE task via spawn_mini_coder, set write_mode:\n\
+- 'agenticIterative' (agentic-iterative) = the mini fixes over multiple rounds against the deterministic gate. Use it ONLY for files in a language with gate coverage (this project: {cl}) AND when '{model}' is capable enough to iterate usefully.\n\
+- 'emitEdits' (emit-edits, default) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
+You decide per task; default to 'emitEdits' when unsure.\n",
+            cl = covered_list()
+        ),
+        // AgenticAllowed: the user opted in for capable models — agentic-iterative is
+        // ENCOURAGED on covered-language files; emit-edits is still the fallback for
+        // uncovered languages or a weak model.
+        MiniWriteBehavior::AgenticAllowed => format!(
+            "MINI-CODER DELEGATION write_mode: your local mini is '{model}' ({kind_label}). Your write-behavior policy ALLOWS agentic-iterative for capable models. When you delegate a WRITE task via spawn_mini_coder, set write_mode:\n\
+- 'agenticIterative' (agentic-iterative) = the mini fixes over multiple rounds against the deterministic gate. PREFER it for files in a language with gate coverage (this project: {cl}) when '{model}' is capable enough to iterate usefully.\n\
+- 'emitEdits' (emit-edits) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
+You decide per task; lean agentic on covered languages, fall back to 'emitEdits' otherwise.\n",
+            cl = covered_list()
+        ),
+    };
+    Some(block)
 }
 
 fn project_agent_prompt(
@@ -7925,12 +8107,21 @@ updated_at: 2026-05-28T00:00:00Z
         // covered set — no "Aspis"/product hardcoding, no hardcoded model id.
         let backend = test_mini_backend(Some("qwen3.6-27b"));
         let covered = ["Python", "TypeScript/JavaScript"];
-        let block = build_mini_delegation_addendum(Some(&backend), &covered)
-            .expect("a configured backend yields a block");
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &covered,
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .expect("a configured backend yields a block");
         assert!(block.contains("qwen3.6-27b"), "names the configured model: {block}");
         assert!(block.contains("a local Ollama model"), "names the backend runtime: {block}");
         assert!(block.contains("agentic-iterative"), "mentions agentic-iterative: {block}");
         assert!(block.contains("emit-edits"), "mentions emit-edits: {block}");
+        // FIX 2: the SETTABLE value the coder is told to pass must be the EXACT MCP wire
+        // token (camelCase), not the hyphenated human gloss — a coder taking the imperative
+        // literally must pass a token the MCP enum (`MINI_CODER_WRITE_MODES`) accepts.
+        assert!(block.contains("'agenticIterative'"), "quotes the camelCase wire token: {block}");
+        assert!(block.contains("'emitEdits'"), "quotes the camelCase wire token: {block}");
         assert!(block.contains("write_mode"), "names the param: {block}");
         assert!(
             block.contains("this project: Python, TypeScript/JavaScript"),
@@ -7947,8 +8138,12 @@ updated_at: 2026-05-28T00:00:00Z
         // Graceful degradation: an empty covered set still renders the block but reports
         // coverage as "none", steering the coder to emit-edits everywhere.
         let backend = test_mini_backend(Some("tiny-1b"));
-        let block = build_mini_delegation_addendum(Some(&backend), &[])
-            .expect("a configured backend yields a block");
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &[],
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .expect("a configured backend yields a block");
         assert!(block.contains("this project: none"), "empty coverage -> 'none': {block}");
         assert!(block.contains("tiny-1b"), "still names the model: {block}");
     }
@@ -7958,7 +8153,12 @@ updated_at: 2026-05-28T00:00:00Z
         // No mini backend configured -> no block at all (the coder prompt degrades to
         // today's wording).
         assert!(
-            build_mini_delegation_addendum(None, &["Python"]).is_none(),
+            build_mini_delegation_addendum(
+                None,
+                &["Python"],
+                crate::backend::mini_coder::MiniWriteBehavior::Auto,
+            )
+            .is_none(),
             "no backend -> no delegation block"
         );
     }
@@ -7968,9 +8168,115 @@ updated_at: 2026-05-28T00:00:00Z
         // A backend with no model tag (e.g. codex/appleFm) still produces a block using a
         // generic stand-in label, never a fabricated model id.
         let backend = test_mini_backend(None);
-        let block = build_mini_delegation_addendum(Some(&backend), &["Go"])
-            .expect("a configured backend yields a block");
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Go"],
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .expect("a configured backend yields a block");
         assert!(block.contains("your configured mini model"), "generic model label: {block}");
+    }
+
+    // E1/FIX 2 — the Auto-default A3 block, pinned EXACTLY. The settable values are the
+    // camelCase MCP wire tokens ('emitEdits' / 'agenticIterative') with a human gloss in
+    // parens (FIX 2: a coder must pass a token the MCP enum accepts, not the hyphenated
+    // prose). This golden pins the whole string so a future edit to any policy arm can't
+    // silently shift the default prompt the coder sees. If you intentionally change the Auto
+    // guidance, update THIS golden deliberately.
+    #[test]
+    fn mini_delegation_addendum_auto_is_pinned_exact_string() {
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let covered = ["Python", "TypeScript/JavaScript"];
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &covered,
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .expect("a configured backend yields a block");
+        let expected = "MINI-CODER DELEGATION write_mode: your local mini is 'qwen3.6-27b' (a local Ollama model). When you delegate a WRITE task via spawn_mini_coder, set write_mode:\n\
+- 'agenticIterative' (agentic-iterative) = the mini fixes over multiple rounds against the deterministic gate. Use it ONLY for files in a language with gate coverage (this project: Python, TypeScript/JavaScript) AND when 'qwen3.6-27b' is capable enough to iterate usefully.\n\
+- 'emitEdits' (emit-edits, default) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
+You decide per task; default to 'emitEdits' when unsure.\n";
+        assert_eq!(block, expected, "Auto block must match the pinned camelCase-token string");
+    }
+
+    // E1 — Safe policy: emit-edits ONLY, with NO agentic-iterative encouragement.
+    #[test]
+    fn mini_delegation_addendum_safe_says_emit_edits_only_no_agentic() {
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python", "Go"],
+            crate::backend::mini_coder::MiniWriteBehavior::Safe,
+        )
+        .expect("a configured backend yields a block");
+        assert!(block.contains("SAFE"), "names the safe policy: {block}");
+        // FIX 2: the mandated settable value must be the camelCase wire token.
+        assert!(
+            block.contains("MUST set write_mode to 'emitEdits'"),
+            "mandates the camelCase emitEdits token only: {block}"
+        );
+        assert!(
+            block.contains("Agentic-iterative is disabled"),
+            "states agentic is disabled: {block}"
+        );
+        // No encouragement to pick agentic anywhere in the Safe block (neither the human
+        // gloss `agentic-iterative =` nor a settable-token form is described as an option).
+        assert!(
+            !block.contains("agentic-iterative ="),
+            "Safe must not describe/encourage the agentic option: {block}"
+        );
+        assert!(
+            !block.contains("'agenticIterative' ("),
+            "Safe must not present agenticIterative as a settable option: {block}"
+        );
+        assert!(
+            !block.contains("PREFER it"),
+            "Safe must not encourage agentic: {block}"
+        );
+        // Product-general: still no product/cloud hardcoding.
+        for needle in ["Aspis", "Cloudflare", "Scaleway"] {
+            assert!(!block.contains(needle), "product-general; found {needle}: {block}");
+        }
+    }
+
+    // E1 — AgenticAllowed policy: agentic-iterative is ENCOURAGED on covered langs.
+    #[test]
+    fn mini_delegation_addendum_agentic_allowed_encourages_agentic() {
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python", "Go"],
+            crate::backend::mini_coder::MiniWriteBehavior::AgenticAllowed,
+        )
+        .expect("a configured backend yields a block");
+        assert!(block.contains("ALLOWS agentic-iterative"), "names the policy: {block}");
+        assert!(block.contains("PREFER it"), "encourages agentic: {block}");
+        assert!(block.contains("agentic-iterative"), "mentions agentic: {block}");
+        assert!(block.contains("emit-edits"), "keeps emit-edits fallback: {block}");
+        // FIX 2: the settable values are the camelCase wire tokens.
+        assert!(block.contains("'agenticIterative'"), "quotes the camelCase wire token: {block}");
+        assert!(block.contains("'emitEdits'"), "quotes the camelCase wire token: {block}");
+        assert!(
+            block.contains("this project: Python, Go"),
+            "lists the covered languages: {block}"
+        );
+        // The three policy variants must produce DIFFERENT text.
+        let auto = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python", "Go"],
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .unwrap();
+        let safe = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python", "Go"],
+            crate::backend::mini_coder::MiniWriteBehavior::Safe,
+        )
+        .unwrap();
+        assert_ne!(block, auto, "AgenticAllowed differs from Auto");
+        assert_ne!(block, safe, "AgenticAllowed differs from Safe");
+        assert_ne!(auto, safe, "Auto differs from Safe");
     }
 
     #[test]
@@ -7982,7 +8288,12 @@ updated_at: 2026-05-28T00:00:00Z
         let project = censor_prompt_test_project();
         let root = PathBuf::from("C:\\Users\\gualt\\Desktop\\aspis bio");
         let backend = test_mini_backend(Some("qwen3.6-27b"));
-        let block = build_mini_delegation_addendum(Some(&backend), &["Python"]).unwrap();
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python"],
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .unwrap();
 
         let coder = project_agent_prompt(
             &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None,
@@ -10053,6 +10364,80 @@ updated_at: 2026-05-28T00:00:00Z
         )
         .expect("reset to default must persist");
         assert!(value.get("censorLocalAi").is_none());
+    }
+
+    // E1 — write-behavior policy persistence (pure value-level merge + parse, mirroring
+    // the censorLocalAi round-trip tests; no Tauri runtime needed).
+    #[test]
+    fn mini_write_behavior_auto_default_is_no_churn() {
+        // Auto carries no info beyond "today's behavior": it must NOT add a key to an
+        // existing config (byte-identical) and must read back as Auto from the absence.
+        use crate::backend::mini_coder::MiniWriteBehavior;
+        let mut value = serde_json::json!({ "project": { "name": "x", "version": "1" } });
+        let original = value.clone();
+        apply_mini_write_behavior_to_config(&mut value, MiniWriteBehavior::Auto)
+            .expect("auto default must merge");
+        assert_eq!(
+            value, original,
+            "Auto must not touch an existing config (no churn): {value}"
+        );
+        assert!(value.get("miniWriteBehavior").is_none(), "Auto writes no key");
+    }
+
+    #[test]
+    fn mini_write_behavior_auto_removes_a_stale_key() {
+        // Resetting to Auto must REMOVE a previously-written policy key.
+        use crate::backend::mini_coder::MiniWriteBehavior;
+        let mut value = serde_json::json!({ "miniWriteBehavior": "agenticAllowed" });
+        apply_mini_write_behavior_to_config(&mut value, MiniWriteBehavior::Auto)
+            .expect("reset to Auto must merge");
+        assert!(
+            value.get("miniWriteBehavior").is_none(),
+            "Auto must clear a stale key: {value}"
+        );
+    }
+
+    #[test]
+    fn mini_write_behavior_non_default_round_trips() {
+        // Safe / AgenticAllowed write the explicit camelCase token and parse back identically
+        // through the SAME parse path the reader uses.
+        use crate::backend::mini_coder::MiniWriteBehavior;
+        for (behavior, token) in [
+            (MiniWriteBehavior::Safe, "safe"),
+            (MiniWriteBehavior::AgenticAllowed, "agenticAllowed"),
+        ] {
+            let mut value = serde_json::json!({});
+            apply_mini_write_behavior_to_config(&mut value, behavior)
+                .expect("non-default policy must merge");
+            assert_eq!(
+                value["miniWriteBehavior"], token,
+                "{behavior:?} writes the camelCase token"
+            );
+            // Parse back the same way `read_mini_write_behavior` does.
+            let parsed: MiniWriteBehavior =
+                serde_json::from_value(value["miniWriteBehavior"].clone())
+                    .expect("written token must parse");
+            assert_eq!(parsed, behavior, "{behavior:?} round-trips through config.json");
+        }
+    }
+
+    #[test]
+    fn agentic_coverage_potential_set_is_product_general_and_sorted() {
+        // The E2 project-agnostic potential set: generic language labels, deterministic +
+        // sorted, no product/model hardcoding. It must include the manifest-less languages
+        // (HTML/Shell/YAML/...) AND the manifest-gated ones (Python/Go/...) since the
+        // potential set assumes all kinds; Rust is excluded (Coarse-only runners).
+        let langs = super::super::mini_coder_executor::tier_a_potential_languages();
+        assert!(!langs.is_empty(), "potential set must not be empty");
+        let mut sorted = langs.clone();
+        sorted.sort_unstable();
+        assert_eq!(langs, sorted, "must be sorted (no churn)");
+        assert!(langs.contains(&"Python"), "manifest-gated Python is in the potential set");
+        assert!(langs.contains(&"HTML"), "manifest-less HTML is in the potential set");
+        assert!(!langs.contains(&"Rust"), "Rust has only Coarse runners -> excluded");
+        for needle in ["Aspis", "Cloudflare", "Scaleway"] {
+            assert!(!langs.contains(&needle), "product-general; found {needle}");
+        }
     }
 
     #[test]

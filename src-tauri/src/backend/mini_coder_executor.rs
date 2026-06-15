@@ -1374,11 +1374,50 @@ fn run_verdict_thread_body(
     // `_guard` drops here (or during unwind above) -> the in-flight id is released.
 }
 
+/// FIX 3 — the SINGLE shared coverage core used by BOTH the B2 budget gate
+/// ([`directive_has_tier_a_coverage`]) and the A3/E2 language listers
+/// ([`tier_a_languages_for_kinds`]). A `lang` is "Tier-A covered" for `kinds` iff
+/// `applicable_runners(kinds, lang)` contributes MORE [`Granularity::Fine`] runners than the
+/// cross-cutting Fine baseline (the Fine count for [`FileLang::Other`], which hits the
+/// `_ => {}` arm and so yields ONLY the cross-cutting Fine runners). Both callers MUST route
+/// through this so the coder (A3) and the executor (B2) can NEVER drift apart on what
+/// "covered" means — a future runner/granularity change is made in ONE place.
+///
+/// `fine_baseline` is passed in (not recomputed) so a caller that classifies many files /
+/// languages computes the baseline ONCE. Compute it via [`tier_a_fine_baseline`].
+fn lang_is_tier_a_covered(
+    kinds: &std::collections::HashSet<crate::backend::censor::detect::ProjectKind>,
+    lang: crate::backend::censor::detect::FileLang,
+    fine_baseline: usize,
+) -> bool {
+    use crate::backend::censor::runners::{applicable_runners, Granularity};
+    let fine_count = applicable_runners(kinds, lang)
+        .iter()
+        .filter(|r| r.granularity() == Granularity::Fine)
+        .count();
+    fine_count > fine_baseline
+}
+
+/// FIX 3 — the cross-cutting-only FINE baseline for a `kinds` set: the count of Fine runners
+/// for [`FileLang::Other`] (no language-specific runner → only the cross-cutting Fine
+/// runners apply). Computed once per coverage query and fed to [`lang_is_tier_a_covered`].
+fn tier_a_fine_baseline(
+    kinds: &std::collections::HashSet<crate::backend::censor::detect::ProjectKind>,
+) -> usize {
+    use crate::backend::censor::detect::FileLang;
+    use crate::backend::censor::runners::{applicable_runners, Granularity};
+    applicable_runners(kinds, FileLang::Other)
+        .iter()
+        .filter(|r| r.granularity() == Granularity::Fine)
+        .count()
+}
+
 /// B2: does this directive touch at least one file in a language WITH deterministic
 /// Tier-A coverage that the PER-ROUND verdict actually exercises? "Covered" = the file's
 /// [`FileLang`] has a LANGUAGE-SPECIFIC **Fine-granularity** applicable runner — i.e.
 /// `applicable_runners(kinds, lang)` contributes MORE FINE runners than the cross-cutting
-/// set does.
+/// set does. Delegates the per-language decision to the shared [`lang_is_tier_a_covered`]
+/// core (FIX 3) so this gate and the A3/E2 language listers never diverge.
 ///
 /// WHY FINE ONLY (the load-bearing correction): the agentic loop's between-round feedback
 /// is produced by the deferred verdict thread (`spawn_verdict_thread` ->
@@ -1406,23 +1445,15 @@ fn run_verdict_thread_body(
 /// extension/name.
 fn directive_has_tier_a_coverage(root: &Path, files: &[String]) -> bool {
     use crate::backend::censor::detect::{detect_project_kinds, FileLang};
-    use crate::backend::censor::runners::{applicable_runners, Granularity};
     if files.is_empty() {
         return false;
     }
     let kinds = detect_project_kinds(root);
-    let fine_count = |lang: FileLang| {
-        applicable_runners(&kinds, lang)
-            .iter()
-            .filter(|r| r.granularity() == Granularity::Fine)
-            .count()
-    };
-    // The cross-cutting-only FINE baseline: FileLang::Other gets no language-specific runner,
-    // so this is exactly the count of Fine runners inside CROSS_CUTTING (not zero).
-    let fine_baseline = fine_count(FileLang::Other);
+    // Baseline ONCE, then classify each file by extension/name through the SHARED core.
+    let fine_baseline = tier_a_fine_baseline(&kinds);
     files
         .iter()
-        .any(|f| fine_count(FileLang::from_path(Path::new(f))) > fine_baseline)
+        .any(|f| lang_is_tier_a_covered(&kinds, FileLang::from_path(Path::new(f)), fine_baseline))
 }
 
 /// A3 (coder guidance): the human language names that have deterministic Tier-A
@@ -1450,16 +1481,83 @@ fn directive_has_tier_a_coverage(root: &Path, files: &[String]) -> bool {
 /// `pub(crate)` so the coder launch-prompt builder (`projects.rs`, A3) can show the
 /// coder this project's covered-language set when guiding its `write_mode` choice.
 pub(crate) fn tier_a_covered_languages(root: &Path) -> Vec<&'static str> {
-    use crate::backend::censor::detect::{detect_project_kinds, FileLang};
-    use crate::backend::censor::runners::{applicable_runners, Granularity};
+    use crate::backend::censor::detect::detect_project_kinds;
     let kinds = detect_project_kinds(root);
-    let fine_count = |lang: FileLang| {
-        applicable_runners(&kinds, lang)
-            .iter()
-            .filter(|r| r.granularity() == Granularity::Fine)
-            .count()
-    };
-    let fine_baseline = fine_count(FileLang::Other);
+    tier_a_languages_for_kinds(&kinds)
+}
+
+/// E2 — the PROJECT-AGNOSTIC potential set: every language that has a language-
+/// specific [`Granularity::Fine`] runner AT ALL, i.e. would be agentic-iterative
+/// covered IF its project kind / manifest were detected and its tool installed.
+/// Computed by evaluating the SAME Fine-over-baseline rule as
+/// [`tier_a_covered_languages`] against a kinds set containing EVERY
+/// [`ProjectKind`] variant (so manifest-gated languages — Rust/Node/Python/Go/
+/// C++/Kotlin — also pass the kind gate; the manifest-less languages —
+/// HTML/Shell/YAML/SQL/Dockerfile/GitHub Actions/CSS — already pass on FileLang
+/// alone). Used by the GLOBAL Settings coverage indicator, which has no current
+/// project: it shows what the gate CAN cover, with a note that actual coverage
+/// depends on the detected project's manifests + which tools are installed.
+///
+/// DETERMINISTIC + SORTED (same enumeration → same filter → sorted human names) so
+/// the Settings list never churns. Note this STILL excludes Rust — clippy/cargo-
+/// check/… are all [`Granularity::Coarse`], so Rust has no per-round Rust-specific
+/// Fine feedback (identical to `tier_a_covered_languages`'s exclusion of Rust).
+pub(crate) fn tier_a_potential_languages() -> Vec<&'static str> {
+    use crate::backend::censor::detect::ProjectKind;
+    use std::collections::HashSet;
+    // FIX 4 — EXHAUSTIVENESS GUARD. The "what COULD be covered" set must include EVERY
+    // `ProjectKind` variant, so a manifest-gated language is never silently dropped by an
+    // absent manifest. We enumerate the variants through an EXHAUSTIVE `match` (with NO
+    // wildcard arm) over a sample of each variant: adding a new `ProjectKind` makes this
+    // `match` non-exhaustive and FAILS TO COMPILE until the new variant is added to
+    // `ALL_KINDS` below — it can never be silently missed.
+    const ALL_KINDS: [ProjectKind; 6] = [
+        ProjectKind::Rust,
+        ProjectKind::Node,
+        ProjectKind::Python,
+        ProjectKind::Go,
+        ProjectKind::Cpp,
+        ProjectKind::Kotlin,
+    ];
+    // The compile-time guard: every variant MUST appear here. The `match` is exhaustive by
+    // construction (no `_` arm); a new variant breaks compilation. `debug_assert` that the
+    // mapped variant is present in `ALL_KINDS` so the array and the match cannot drift.
+    fn assert_in_all_kinds(k: ProjectKind) {
+        let named = match k {
+            ProjectKind::Rust => ProjectKind::Rust,
+            ProjectKind::Node => ProjectKind::Node,
+            ProjectKind::Python => ProjectKind::Python,
+            ProjectKind::Go => ProjectKind::Go,
+            ProjectKind::Cpp => ProjectKind::Cpp,
+            ProjectKind::Kotlin => ProjectKind::Kotlin,
+        };
+        debug_assert!(
+            ALL_KINDS.contains(&named),
+            "ProjectKind::{named:?} is handled by the exhaustiveness match but missing from ALL_KINDS"
+        );
+    }
+    for k in ALL_KINDS {
+        assert_in_all_kinds(k);
+    }
+    let all_kinds: HashSet<ProjectKind> = ALL_KINDS.into_iter().collect();
+    tier_a_languages_for_kinds(&all_kinds)
+}
+
+/// Shared core for [`tier_a_covered_languages`] (kinds = THIS root's detected kinds)
+/// and [`tier_a_potential_languages`] (kinds = all kinds). A language is "covered"
+/// iff `applicable_runners(kinds, lang)` yields MORE [`Granularity::Fine`] runners
+/// than the cross-cutting Fine baseline (`FileLang::Other`). The candidate list +
+/// human names live in ONE place so adding a wired language is a single edit.
+///
+/// FIX 3: the per-language "covered?" decision is the SHARED [`lang_is_tier_a_covered`]
+/// core — the SAME predicate the B2 budget gate ([`directive_has_tier_a_coverage`]) uses on
+/// each directive file. So the coder's covered-language list (A3) and the executor's
+/// per-file budget decision (B2) are guaranteed to agree by construction.
+fn tier_a_languages_for_kinds(
+    kinds: &std::collections::HashSet<crate::backend::censor::detect::ProjectKind>,
+) -> Vec<&'static str> {
+    use crate::backend::censor::detect::FileLang;
+    let fine_baseline = tier_a_fine_baseline(kinds);
     // Every language-bearing FileLang variant with a human name. `Other` is the
     // baseline reference itself (no language-specific runner) and is intentionally
     // excluded. Each `(variant, human-name)` pair is enumerated explicitly so adding
@@ -1482,7 +1580,7 @@ pub(crate) fn tier_a_covered_languages(root: &Path) -> Vec<&'static str> {
     ];
     let mut out: Vec<&'static str> = candidates
         .into_iter()
-        .filter(|(lang, _)| fine_count(*lang) > fine_baseline)
+        .filter(|(lang, _)| lang_is_tier_a_covered(kinds, *lang, fine_baseline))
         .map(|(_, name)| name)
         .collect();
     out.sort_unstable();
@@ -1540,8 +1638,39 @@ fn finalize_finished_mini_with(
     //     and any non-Done/untrusted/killed agentic outcome never run `detect_project_kinds`
     //     (those short-circuit to `StampTerminal` before the budget is read), so the hot
     //     path adds NO new filesystem scan and `covered` stays an irrelevant `false`.
+    // 2c) E1 (FIX 1) — the global write-behavior policy is a HARD CEILING enforced HERE,
+    //     at the budget-decision point, NOT just in the launch prompt. We read the policy
+    //     at DECISION time (not launch time) — this also closes the mid-session-stale-policy
+    //     gap: if the user flipped to Safe after the directive launched, the retry budget
+    //     still respects it. The EFFECTIVE write mode is `EmitEdits` under Safe (forcing the
+    //     single-pass budget regardless of what `directive.write_mode` requested — a coder
+    //     hallucination / prompt-injection / replayed directive can NOT buy the N-round
+    //     agentic budget), and `directive.write_mode` unchanged under Auto/AgenticAllowed.
+    //     A small config.json read per fix-pass decision is acceptable: this is NOT the hot
+    //     tick loop — it runs only when a mini finalizes (and only the agentic-write branch
+    //     below even consults `covered`).
+    //     EFFICIENCY: the policy read is the ONLY case where it can change the budget — an
+    //     AgenticIterative directive that a Safe policy must clamp to EmitEdits. For every
+    //     other `directive.write_mode` (EmitEdits) the effective mode is the directive's mode
+    //     regardless of policy (budget is identically 1/MAX_MINI_RETRIES), so we skip the
+    //     config.json read entirely on that common path.
+    let effective_write_mode = if directive.write_mode == WriteMode::AgenticIterative {
+        match super::projects::read_mini_write_behavior(app) {
+            // Safe is a HARD ceiling: clamp the agentic directive to a single-pass write.
+            mini_coder::MiniWriteBehavior::Safe => WriteMode::EmitEdits,
+            // Auto / AgenticAllowed: both permit agentic — pass the directive's mode through
+            // exactly as the executor did before FIX 1.
+            mini_coder::MiniWriteBehavior::Auto | mini_coder::MiniWriteBehavior::AgenticAllowed => {
+                directive.write_mode
+            }
+        }
+    } else {
+        // EmitEdits directive: the effective mode is EmitEdits under EVERY policy — the Safe
+        // clamp only ever narrows Agentic -> Emit, never the reverse. No config read needed.
+        directive.write_mode
+    };
     let covered = if directive.write
-        && directive.write_mode == WriteMode::AgenticIterative
+        && effective_write_mode == WriteMode::AgenticIterative
         && trusted
         && outcome.status == MiniCoderStatus::Done
         && !directive.kill_requested
@@ -1562,6 +1691,7 @@ fn finalize_finished_mini_with(
         directive,
         &outcome,
         trusted,
+        effective_write_mode,
         covered,
         high_findings,
         &retry_id,
@@ -4693,6 +4823,41 @@ mod tests {
     }
 
     #[test]
+    fn b2_gate_and_a3_lister_agree_via_shared_coverage_core() {
+        // FIX 3: the B2 budget gate (`directive_has_tier_a_coverage`) and the A3 language
+        // lister (`tier_a_covered_languages`) MUST agree on coverage for the SAME project,
+        // because both route through the SINGLE shared `lang_is_tier_a_covered` core. Pin
+        // the agreement on representative covered/uncovered languages so a future divergent
+        // edit (one updated, the other not) trips here.
+        let py_root = p4_temp_project("agree-python");
+        std::fs::write(py_root.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
+        let langs = tier_a_covered_languages(&py_root);
+
+        // Python: the lister says COVERED <=> the per-file gate says COVERED for a .py file.
+        assert!(langs.contains(&"Python"), "lister: Python covered for a Python project: {langs:?}");
+        assert!(
+            directive_has_tier_a_coverage(&py_root, &["src/a.py".to_string()]),
+            "gate: a .py file must be covered when the lister lists Python"
+        );
+
+        // Rust: the lister says UNCOVERED (Coarse-only) <=> the per-file gate says UNCOVERED
+        // for a .rs file. Both reach this verdict through the SAME core.
+        assert!(!langs.contains(&"Rust"), "lister: Rust never covered (Coarse-only): {langs:?}");
+        assert!(
+            !directive_has_tier_a_coverage(&py_root, &["src/a.rs".to_string()]),
+            "gate: a .rs file must be uncovered when the lister omits Rust"
+        );
+
+        // A manifest-free language (Shell): listed AND gate-covered in every project.
+        assert!(langs.contains(&"Shell"), "lister: Shell always covered: {langs:?}");
+        assert!(
+            directive_has_tier_a_coverage(&py_root, &["scripts/deploy.sh".to_string()]),
+            "gate: a .sh file must be covered when the lister lists Shell"
+        );
+        std::fs::remove_dir_all(&py_root).ok();
+    }
+
+    #[test]
     fn apply_edits_rejects_allowlist_miss_traversal_and_case_variant() {
         let root = p4_temp_project("allow");
         std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
@@ -5792,6 +5957,7 @@ mod tests {
             &d,
             &outcome,
             true,
+            mini_coder::WriteMode::EmitEdits,
             false,
             findings,
             "root-r1",

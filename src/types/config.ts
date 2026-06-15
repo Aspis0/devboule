@@ -184,6 +184,15 @@ export interface CensorLocalAi {
   ollamaModel?: string;
 }
 
+// The user-facing mini WRITE-BEHAVIOR policy (the ceiling the coder's per-task
+// write_mode decision must respect). Absent `miniWriteBehavior` key == "auto" — the
+// coder-decides default, ZERO migration. camelCase tokens match the Rust
+// `MiniWriteBehavior` serde + the config.json discriminator exactly.
+//   - "safe"           = emit-edits ONLY (agentic-iterative disabled by the user).
+//   - "auto"           = the coder decides per task by model + language (default).
+//   - "agenticAllowed" = agentic-iterative encouraged for capable models on covered langs.
+export type MiniWriteBehavior = "safe" | "auto" | "agenticAllowed";
+
 export interface TrustAnchor {
   // Admin Ed25519 signing public key (64-hex) collaborators verify role grants
   // against. Empty until the admin exports it and it is bundled before
@@ -217,4 +226,8 @@ export interface AppConfig {
   // older config.json without the key still parses; ABSENT means the Ollama default —
   // today's behavior, ZERO migration. See CensorLocalAi.
   censorLocalAi?: CensorLocalAi;
+  // The mini write-behavior policy (Settings → Providers & Models). Optional so an
+  // older config.json without the key still parses; ABSENT means "auto" — the coder-
+  // decides default, ZERO migration. See MiniWriteBehavior.
+  miniWriteBehavior?: MiniWriteBehavior;
 }
