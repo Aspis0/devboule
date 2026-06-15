@@ -137,6 +137,27 @@ sellable"** — see master plan LICENSING INVARIANT), Roo Code (dead), Continue 
 from interactive coding), codex-local (Responses-API constraint makes small local models
 unreliable — fine as the cloud coder it already is, weak as a local one).
 
+### 3b. Additional small repos evaluated (owner-supplied, 2026-06-15) → confirm BUILD OUR OWN
+
+The owner surfaced four obscure/new repos to vet against the same HARD bar. Verified from
+primary sources (README/LICENSE/manifest via `gh`). NONE is adoptable for the out-of-box
+local coder; the evaluation **confirms the layered plan: build our own minimal loop (L2).**
+
+| Repo | License → bundle? | Shape | MCP | Local model | Mac+Win | Verdict |
+|---|---|---|---|---|---|---|
+| **thClaws/thClaws** | MIT+Apache → yes | Rust single-binary agent harness; real loop (`/loop`,`/goal`, subagents, approval-gated bash) | ✓ native | ✓ Ollama no-key | ✓ | **closest fit** — but ~7wks old, CI-inflated versioning (v0.6x = per-PR auto-tag), crypto-adjacent backer, no telemetry statement → **user-installed EVAL candidate, NOT bundle yet** |
+| crynta/terax-ai | Apache-2.0 → yes | AI-native IDE/terminal *workspace* (Warp-like), NOT subprocess-drivable | **✗ none** | ✓ MLX/Ollama/LMStudio | ✓ | **fails the MCP seam bar** + wrong shape (a destination app, not a drivable coder); patched PTY path-traversal vuln (CWE-22) signals the risk class. Reference only |
+| OpenPawz/openpawz | MIT app but **embeds n8n (AGPL)** → no | general AI-automation platform, **not a coder** | ✓ (via n8n) | ✓ | ✓ | n8n-AGPL = bundle poison; not a coding harness. Reject |
+| UrbanWafflezz/GilbertCodex | **split license — agent tool system = All-Rights-Reserved** → no | Tauri2+React+Rust (a Devboule twin) | ✓ first-class | ✓ LMStudio/Ollama | ✓ | reserved core ⇒ not bundleable/forkable; alpha, ~52★. **Reference/competitor to study, not a component** |
+
+**Decision (owner-confirmed 2026-06-15):** do it ourselves. None changes the plan. **L2 (our own
+minimal orchestrator loop) is the path for the out-of-box local main coder**, building on the
+existing mini emit-edits executor + P5 sandbox + the now-live Activity Console (L1, Step B
+committed). Rationale reaffirmed: an adopted harness is a black box that does NOT feed the
+emit-edits→ORPO flywheel — our own loop keeps P5 + the training signal. **Goose stays the
+optional user-installed heavy-lift escape hatch (not bundled, not default); thClaws joins the
+user-installed eval shortlist beside Goose/OpenCode** (re-check if it matures).
+
 ## 4. The two tracks (owner policy: bundle-vs-installed depends on the harness)
 
 Owner rule: **big/established harness → user-installed** (we recommend + wire its launch);
