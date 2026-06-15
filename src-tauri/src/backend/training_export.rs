@@ -870,6 +870,7 @@ fn directive_parent_directive_id(d: &MiniCoderDirective) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::mini_coder::WriteMode;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Unique tempdir per test (process id + monotonic counter), mirroring the
@@ -894,6 +895,7 @@ mod tests {
             task: String::new(),
             files: vec![],
             write: false,
+            write_mode: WriteMode::EmitEdits,
             backend: None,
             allow_oracle: false,
             kill_requested: false,

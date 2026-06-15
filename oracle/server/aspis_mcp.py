@@ -82,6 +82,14 @@ MAX_VISUAL_CHECK_DIRECTIVES = 50
 # Bounds for the `spawn_mini_coder` tool inputs + its bounded result poll.
 MINI_CODER_MAX_TASK_LEN = 4000
 MINI_CODER_MAX_FILES = 64
+# How a WRITE mini applies its changes. These wire strings MUST EXACTLY MATCH the
+# Rust `WriteMode` serde representation (camelCase) in
+# `src-tauri/src/backend/mini_coder.rs` so a directive this writer emits
+# deserializes there. `emitEdits` is the default (and is OMITTED from the
+# directive, NO-CHURN — see `dispatch_spawn_mini_coder`). PLUMBING ONLY: nothing
+# branches on it yet (a later workstream reads it).
+MINI_CODER_WRITE_MODE_DEFAULT = "emitEdits"
+MINI_CODER_WRITE_MODES = ("emitEdits", "agenticIterative")
 # Hard wall-clock cap on the blocking poll the tool does for the directive's
 # `result`. The tool BLOCKS the coder's MCP thread by design (so the coder gets
 # the terminal outcome synchronously), but it MUST always time out: on expiry it
@@ -391,6 +399,17 @@ TOOLS = [
             "backend": {"type": "string", "default": ""},
             "allow_oracle": {"type": "boolean", "default": False},
             "write": {"type": "boolean", "default": False},
+            "write_mode": {
+                "type": "string",
+                "enum": list(MINI_CODER_WRITE_MODES),
+                "default": MINI_CODER_WRITE_MODE_DEFAULT,
+                "description": (
+                    "How a write mini applies changes: 'emitEdits' (default; the "
+                    "model returns a JSON edit list, the app applies it) vs "
+                    "'agenticIterative' (the model iterates and writes files itself; "
+                    "gated by language coverage - behavior wired later)."
+                ),
+            },
             "session_token": {"type": "string"},
         },
     },
@@ -4371,6 +4390,30 @@ def dispatch_spawn_mini_coder(
                 f"(got {len(files)}). Split the task."
             )
         directive["write"] = True
+
+    # A2 PLUMBING: carry the WRITE mode end-to-end. Validate against the enum (the
+    # wire strings MUST match the Rust `WriteMode` serde repr), then NO-CHURN:
+    # only emit `writeMode` when it is the NON-default (`agenticIterative`), so an
+    # `emitEdits` directive stays byte-identical to today and round-trips through
+    # the Rust serde skip. Nothing branches on it yet (later workstream reads it).
+    raw_write_mode = args.get("write_mode", MINI_CODER_WRITE_MODE_DEFAULT)
+    if raw_write_mode is None:
+        raw_write_mode = MINI_CODER_WRITE_MODE_DEFAULT
+    if raw_write_mode not in MINI_CODER_WRITE_MODES:
+        raise McpError(
+            "spawn_mini_coder `write_mode` must be one of "
+            f"{', '.join(MINI_CODER_WRITE_MODES)} (got {raw_write_mode!r})."
+        )
+    if raw_write_mode != MINI_CODER_WRITE_MODE_DEFAULT:
+        # `write_mode` governs HOW the mini writes, so it is only coherent on a
+        # WRITE directive — reject a non-default mode without `write: true` rather
+        # than leaving a dangling `writeMode` on a read directive (review F1).
+        if args.get("write") is not True:
+            raise McpError(
+                "spawn_mini_coder `write_mode` is only meaningful on a write "
+                "directive — pass `write: true` (write_mode governs HOW the mini writes)."
+            )
+        directive["writeMode"] = raw_write_mode
 
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)

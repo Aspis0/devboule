@@ -378,6 +378,38 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// How a WRITE mini-coder applies its changes. camelCase over the wire to match
+/// the owning [`MiniCoderDirective`]'s `#[serde(rename_all = "camelCase")]`
+/// (the struct's other enum-typed field `status` is snake_case only because it
+/// must mirror the plan's literal status strings — `WriteMode` has no such
+/// external contract, so it follows the struct's own convention).
+///
+/// `Default` is [`WriteMode::EmitEdits`] so a directive missing the key
+/// (today's writers, hand-edited, older) deserializes to the current behavior.
+/// NO-CHURN: paired with [`is_emit_edits`] as the `skip_serializing_if`
+/// predicate so an `EmitEdits` directive serializes BYTE-IDENTICALLY to today
+/// (no `"writeMode"` key injected).
+///
+/// PLUMBING ONLY: nothing branches on this yet — a later workstream reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteMode {
+    /// The mini returns a structured JSON edit list; the Rust executor validates
+    /// it against `files` and applies it (today's only behavior). Wire: `"emitEdits"`.
+    #[default]
+    EmitEdits,
+    /// The mini iterates agentically, writing files itself (gated by language
+    /// coverage — behavior wired later). Wire: `"agenticIterative"`.
+    AgenticIterative,
+}
+
+/// `skip_serializing_if` for a [`WriteMode`] that is `EmitEdits`-by-default
+/// (NO-CHURN co-ownership, like [`is_false`] for bools): a writer that omitted
+/// `writeMode` round-trips through Rust without gaining a `"writeMode":"emitEdits"`.
+fn is_emit_edits(m: &WriteMode) -> bool {
+    matches!(m, WriteMode::EmitEdits)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniCoderDirective {
@@ -398,6 +430,13 @@ pub struct MiniCoderDirective {
     /// NO-CHURN: omitted when false, like `allow_oracle` below.
     #[serde(default, skip_serializing_if = "is_false")]
     pub write: bool,
+    /// How a WRITE mini applies its changes (emit-edits vs agentic-iterative).
+    /// Only meaningful when `write` is true. PLUMBING ONLY: carried end-to-end,
+    /// nothing branches on it yet (a later workstream reads it). NO-CHURN:
+    /// omitted when `EmitEdits` (the default), so a directive that did not set it
+    /// serializes byte-identically to today, exactly like `write`/`allow_oracle`.
+    #[serde(default, skip_serializing_if = "is_emit_edits")]
+    pub write_mode: WriteMode,
     /// Backend override (ollama|api|codex); None -> the global configured backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -694,6 +733,7 @@ pub fn build_retry_directive(
         files,
         backend: predecessor.backend.clone(),
         write: predecessor.write,
+        write_mode: predecessor.write_mode,
         allow_oracle: predecessor.allow_oracle,
         kill_requested: false,
         result_path: result_path.into(),
@@ -1828,6 +1868,7 @@ mod tests {
             parent_agent_id: "coder-1".into(),
             status,
             write: false,
+            write_mode: WriteMode::EmitEdits,
             task: "docstring foo()".into(),
             files: vec!["src/a.rs".into()],
             backend: None,
@@ -1856,6 +1897,7 @@ mod tests {
             status: MiniCoderStatus::Running,
             task: "t".into(),
             write: false,
+            write_mode: WriteMode::EmitEdits,
             files: vec!["src/a.rs".into()],
             backend: Some("ollama".into()),
             allow_oracle: true,
@@ -1946,6 +1988,73 @@ mod tests {
         assert!(!json.contains("\"agentId\""), "json: {json}");
         assert!(!json.contains("\"startedAt\""), "json: {json}");
         assert!(!json.contains("\"result\""), "json: {json}");
+    }
+
+    #[test]
+    fn write_mode_default_emit_edits_omitted_no_churn() {
+        // A1 NO-CHURN: an EmitEdits (default) directive must serialize BYTE-
+        // IDENTICALLY to today — no `"writeMode"` key injected — and must
+        // deserialize back to EmitEdits when the key is absent.
+        let d = directive("d1", MiniCoderStatus::Pending, "2026-06-06T00:00:00Z");
+        assert_eq!(d.write_mode, WriteMode::EmitEdits, "default is EmitEdits");
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            !json.contains("writeMode"),
+            "default writeMode must be omitted (no churn): {json}"
+        );
+
+        // Absent in JSON -> EmitEdits.
+        let from_absent: MiniCoderDirective =
+            serde_json::from_str(r#"{ "id": "d1", "task": "x", "resultPath": "mini/d1.json" }"#)
+                .unwrap();
+        assert_eq!(from_absent.write_mode, WriteMode::EmitEdits);
+    }
+
+    #[test]
+    fn write_mode_agentic_iterative_round_trips_with_camel_case_wire() {
+        // A1 wire string: camelCase to match the directive's serde convention.
+        let mut d = directive("d1", MiniCoderStatus::Pending, "2026-06-06T00:00:00Z");
+        d.write = true;
+        d.write_mode = WriteMode::AgenticIterative;
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains("\"writeMode\":\"agenticIterative\""),
+            "expected camelCase wire string: {json}"
+        );
+        let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.write_mode, WriteMode::AgenticIterative);
+        assert_eq!(d, back);
+
+        // The standalone enum wire strings are exactly the contract A2 mirrors.
+        assert_eq!(
+            serde_json::to_string(&WriteMode::EmitEdits).unwrap(),
+            "\"emitEdits\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WriteMode::AgenticIterative).unwrap(),
+            "\"agenticIterative\""
+        );
+    }
+
+    #[test]
+    fn retry_directive_preserves_write_mode() {
+        // A1: the predecessor copy at build_retry_directive must carry write_mode.
+        let mut pred = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        pred.write = true;
+        pred.write_mode = WriteMode::AgenticIterative;
+        let retry = build_retry_directive(&pred, &[], "feedback", "root-r1", "root-r1.json", "t");
+        assert_eq!(
+            retry.write_mode,
+            WriteMode::AgenticIterative,
+            "retry must inherit the predecessor's write_mode"
+        );
+
+        // An EmitEdits predecessor stays EmitEdits (default carried verbatim).
+        let mut pred_default = directive("root2", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        pred_default.write = true;
+        let retry_default =
+            build_retry_directive(&pred_default, &[], "fb", "root2-r1", "root2-r1.json", "t");
+        assert_eq!(retry_default.write_mode, WriteMode::EmitEdits);
     }
 
     #[test]

@@ -5380,6 +5380,105 @@ class SpawnMiniCoderTests(unittest.TestCase):
             # P4: the write marker rides the directive for the Rust executor.
             self.assertIs(d["write"], True)
 
+    def test_write_mode_default_is_omitted_no_churn(self):
+        # A2 NO-CHURN: the default write_mode (emitEdits) must NOT be written into
+        # the directive, so it stays byte-identical to today and round-trips
+        # through the Rust serde skip. True whether omitted entirely OR passed
+        # explicitly as the default.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            for args_extra in ({}, {"write_mode": "emitEdits"}):
+                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                    handle_tool_call(
+                        "spawn_mini_coder",
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "write": True,
+                            "session_token": token,
+                            **args_extra,
+                        },
+                        root=root,
+                    )
+                d = self._read_state(root)["miniCoderDirectives"][-1]
+                self.assertNotIn("writeMode", d, f"args_extra={args_extra}")
+
+    def test_write_mode_agentic_iterative_is_forwarded(self):
+        # A2: a non-default write_mode rides the directive with the EXACT Rust
+        # serde wire string (camelCase) under the camelCase key `writeMode`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "write": True,
+                        "write_mode": "agenticIterative",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            d = self._read_state(root)["miniCoderDirectives"][-1]
+            self.assertEqual(d["writeMode"], "agenticIterative")
+
+    def test_write_mode_rejects_invalid_value(self):
+        # A2: an unknown write_mode is rejected with McpError (like other
+        # enum-validated params), never silently coerced.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "write": True,
+                        "write_mode": "bogus",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            # The rejection must fire BEFORE any state mutation (review F3).
+            self.assertFalse(
+                self._read_state(root).get("miniCoderDirectives"),
+                "no directive may be persisted when write_mode validation fails",
+            )
+
+    def test_write_mode_non_default_requires_write_directive(self):
+        # review F1: a non-default write_mode is only coherent on a write
+        # directive; without `write: true` it is rejected, not left dangling.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "write_mode": "agenticIterative",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertFalse(
+                self._read_state(root).get("miniCoderDirectives"),
+                "no directive may be persisted when write_mode lacks write:true",
+            )
+
     def test_write_allowlist_is_capped_at_ten_files(self):
         # Max-recall: the Rust apply enforces 1..=10 files for write directives;
         # python fails FAST (before the mini burns a run). 10 passes, 11 raises.
