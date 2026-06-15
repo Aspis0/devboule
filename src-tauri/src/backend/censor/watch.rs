@@ -774,7 +774,10 @@ mod tests {
         // shell/YAML/SQL runner exists).
         for (rel, lang) in [
             ("scripts/deploy.sh", FileLang::Shell),
-            (".github/workflows/ci.yml", FileLang::Yaml),
+            // A non-workflow yaml: `from_path` only yields FileLang::Yaml for a `.yml`
+            // OUTSIDE `.github/workflows/` (a workflow path resolves to GithubActions),
+            // so use a plain config yaml to keep the (path, lang) pair realistic.
+            ("config.yml", FileLang::Yaml),
             ("db/schema.sql", FileLang::Sql),
         ] {
             let mut fine = DebounceState::new(Duration::from_millis(FINE_DEBOUNCE_MS));

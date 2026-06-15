@@ -30,7 +30,10 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_cppcheck;
-use super::{cap, redact_secrets, run_capture_stderr_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{
+    cap, redact_secrets, run_capture_stderr_with_timeout, split_file_and_line, Granularity,
+    RawFinding, RunTarget,
+};
 use super::DEFAULT_RUNNER_TIMEOUT;
 use std::path::Path;
 
@@ -70,14 +73,21 @@ pub fn parse_cppcheck(stderr: &str) -> Vec<RawFinding> {
 }
 
 /// Parse ONE cppcheck diagnostic line `file:line:severity:id:message` into a
-/// [`RawFinding`], or `None` if the line does not match the shape (no panic). The
-/// split keeps the message remainder intact: `splitn(5, ':')` yields exactly
-/// `[file, line, severity, id, message-with-any-colons]`. A non-numeric line, a
-/// `file` that is empty / cppcheck's `nofile` placeholder, or an empty message → `None`.
+/// [`RawFinding`], or `None` if the line does not match the shape (no panic).
+///
+/// We anchor on the `file:line:` boundary via the shared [`split_file_and_line`], which
+/// scans for the FIRST numeric `:<digits>:` rather than splitting blindly on `:` — so a
+/// Windows drive colon in the path (`C:\src\a.cpp:10:warning:...`) is tolerated (the old
+/// naive `splitn(5, ':')` split inside the drive letter, parsed a non-numeric line, and
+/// silently produced ZERO findings). The remainder after `file:line:` is
+/// `severity:id:message`; we `splitn(3, ':')` it, keeping the message remainder intact (a
+/// message containing colons survives). A non-numeric line, a `file` that is empty /
+/// cppcheck's `nofile` placeholder, or an empty message → `None`.
 fn parse_cppcheck_line(line: &str) -> Option<RawFinding> {
-    let mut parts = line.splitn(5, ':');
-    let file = parts.next()?.trim();
-    let line_str = parts.next()?.trim();
+    let (file, lineno, after_line) = split_file_and_line(line)?;
+    let file = file.trim();
+    // after_line = "severity:id:message-with-any-colons"
+    let mut parts = after_line.splitn(3, ':');
     let severity_tok = parts.next()?.trim();
     let _id = parts.next()?; // the cppcheck check id (e.g. `nullPointer`) — not stored.
     let message = parts.next()?.trim();
@@ -85,7 +95,6 @@ fn parse_cppcheck_line(line: &str) -> Option<RawFinding> {
     if file.is_empty() || file == "nofile" || message.is_empty() {
         return None;
     }
-    let lineno: u32 = line_str.parse().ok()?;
     // cppcheck emits `0` for a file-level diagnostic with no specific line.
     let line_field = (lineno != 0).then_some(lineno);
 
@@ -207,6 +216,23 @@ b.cpp:9:warning:foo:another real one
         assert_eq!(findings[0].line, Some(10));
         assert_eq!(findings[1].file, "b.cpp");
         assert_eq!(findings[1].line, Some(9));
+    }
+
+    #[test]
+    fn windows_drive_path_is_not_split_on_the_drive_colon() {
+        // A Windows ABSOLUTE path has a drive-letter colon (`C:\...`). The old naive
+        // `splitn(5, ':')` split inside the drive letter, made `line` non-numeric, and
+        // dropped the finding (zero findings on a whole project). The shared anchor skips
+        // `C:` and locks onto the real `:10:` boundary, so the finding survives.
+        let stderr = "C:\\src\\a.cpp:10:warning:nullPointer:Possible null deref\n";
+        let findings = parse_cppcheck(stderr);
+        assert_eq!(findings.len(), 1, "drive-letter path dropped: {findings:?}");
+        let f = &findings[0];
+        assert_eq!(f.file, "C:/src/a.cpp");
+        assert_eq!(f.line, Some(10));
+        assert_eq!(f.severity, Severity::Medium);
+        assert_eq!(f.category, Category::Correctness);
+        assert!(f.body.contains("Possible null deref"));
     }
 
     #[test]

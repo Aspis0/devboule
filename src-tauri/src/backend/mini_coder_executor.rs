@@ -136,9 +136,14 @@ const OMLX_REPETITION_PENALTY: &str = "1.1";
 /// edits per P4). Each is emitted as `ulimit -X N 2>/dev/null || true` so a kernel-rejected
 /// limit (already lower, or unsupported) never aborts the script under `set -e`.
 ///
-/// The CPU-seconds cap REUSES the executor's wall-clock kill cap
-/// ([`DEFAULT_WALL_CLOCK_CAP_SECS`]) so the in-shell CPU budget and the out-of-band PTY
-/// wall-clock kill derive from ONE source and never silently diverge.
+/// `ulimit -t` is a CPU-TIME cap (RLIMIT_CPU — seconds the process spends ON-CPU), NOT a
+/// wall-clock cap: a child blocked in the HTTP wait accrues ~no CPU time, so `ulimit -t`
+/// would never fire on a stalled-network hang. The WALL-CLOCK enforcer is the out-of-band
+/// PTY kill (the executor kills the PTY after [`DEFAULT_WALL_CLOCK_CAP_SECS`]); `ulimit -t`
+/// only bounds a CPU-BOUND runaway (a busy-loop) as defense-in-depth. We REUSE the same
+/// [`DEFAULT_WALL_CLOCK_CAP_SECS`] value for the CPU cap so the in-shell CPU budget and the
+/// PTY wall-clock kill derive from ONE source and never silently diverge — but the two cap
+/// DIFFERENT things (on-CPU seconds vs. real elapsed time).
 ///
 /// Address-space cap ~= 4 GiB (in KiB, the `ulimit -v` unit). python's stdlib urllib POST
 /// + JSON parse is a few MiB; 4 GiB is generous headroom that still bounds a runaway
@@ -1505,41 +1510,14 @@ pub(crate) fn tier_a_covered_languages(root: &Path) -> Vec<&'static str> {
 pub(crate) fn tier_a_potential_languages() -> Vec<&'static str> {
     use crate::backend::censor::detect::ProjectKind;
     use std::collections::HashSet;
-    // FIX 4 — EXHAUSTIVENESS GUARD. The "what COULD be covered" set must include EVERY
-    // `ProjectKind` variant, so a manifest-gated language is never silently dropped by an
-    // absent manifest. We enumerate the variants through an EXHAUSTIVE `match` (with NO
-    // wildcard arm) over a sample of each variant: adding a new `ProjectKind` makes this
-    // `match` non-exhaustive and FAILS TO COMPILE until the new variant is added to
-    // `ALL_KINDS` below — it can never be silently missed.
-    const ALL_KINDS: [ProjectKind; 6] = [
-        ProjectKind::Rust,
-        ProjectKind::Node,
-        ProjectKind::Python,
-        ProjectKind::Go,
-        ProjectKind::Cpp,
-        ProjectKind::Kotlin,
-    ];
-    // The compile-time guard: every variant MUST appear here. The `match` is exhaustive by
-    // construction (no `_` arm); a new variant breaks compilation. `debug_assert` that the
-    // mapped variant is present in `ALL_KINDS` so the array and the match cannot drift.
-    fn assert_in_all_kinds(k: ProjectKind) {
-        let named = match k {
-            ProjectKind::Rust => ProjectKind::Rust,
-            ProjectKind::Node => ProjectKind::Node,
-            ProjectKind::Python => ProjectKind::Python,
-            ProjectKind::Go => ProjectKind::Go,
-            ProjectKind::Cpp => ProjectKind::Cpp,
-            ProjectKind::Kotlin => ProjectKind::Kotlin,
-        };
-        debug_assert!(
-            ALL_KINDS.contains(&named),
-            "ProjectKind::{named:?} is handled by the exhaustiveness match but missing from ALL_KINDS"
-        );
-    }
-    for k in ALL_KINDS {
-        assert_in_all_kinds(k);
-    }
-    let all_kinds: HashSet<ProjectKind> = ALL_KINDS.into_iter().collect();
+    // FIX 4 — EXHAUSTIVENESS GUARD (REAL, not tautological). The "what COULD be covered" set
+    // must include EVERY `ProjectKind` variant, so a manifest-gated language is never
+    // silently dropped by an absent manifest. We use the canonical [`ProjectKind::ALL`],
+    // which is pinned to the enum by an exhaustive, wildcard-free witness match + tests in
+    // `detect.rs`: adding a new `ProjectKind` makes that witness match non-exhaustive (FAILS
+    // TO COMPILE) and trips the membership test until the variant is added to `ALL` — so a
+    // new kind can never be silently missed here.
+    let all_kinds: HashSet<ProjectKind> = ProjectKind::ALL.into_iter().collect();
     tier_a_languages_for_kinds(&all_kinds)
 }
 
@@ -1650,30 +1628,37 @@ fn finalize_finished_mini_with(
     //     tick loop — it runs only when a mini finalizes (and only the agentic-write branch
     //     below even consults `covered`).
     //     EFFICIENCY: the policy read is the ONLY case where it can change the budget — an
-    //     AgenticIterative directive that a Safe policy must clamp to EmitEdits. For every
-    //     other `directive.write_mode` (EmitEdits) the effective mode is the directive's mode
-    //     regardless of policy (budget is identically 1/MAX_MINI_RETRIES), so we skip the
-    //     config.json read entirely on that common path.
-    let effective_write_mode = if directive.write_mode == WriteMode::AgenticIterative {
-        match super::projects::read_mini_write_behavior(app) {
-            // Safe is a HARD ceiling: clamp the agentic directive to a single-pass write.
-            mini_coder::MiniWriteBehavior::Safe => WriteMode::EmitEdits,
-            // Auto / AgenticAllowed: both permit agentic — pass the directive's mode through
-            // exactly as the executor did before FIX 1.
-            mini_coder::MiniWriteBehavior::Auto | mini_coder::MiniWriteBehavior::AgenticAllowed => {
-                directive.write_mode
-            }
-        }
-    } else {
-        // EmitEdits directive: the effective mode is EmitEdits under EVERY policy — the Safe
-        // clamp only ever narrows Agentic -> Emit, never the reverse. No config read needed.
-        directive.write_mode
-    };
-    let covered = if directive.write
-        && effective_write_mode == WriteMode::AgenticIterative
+    //     AgenticIterative directive that a Safe policy must clamp to EmitEdits. We gate the
+    //     config.json read behind the SAME guard `covered` uses (`directive.write && trusted
+    //     && Done && !kill_requested`): a non-write directive, an EmitEdits directive, or ANY
+    //     non-Done / untrusted / killed agentic outcome stamps a terminal via
+    //     `verdict_gate_decision` REGARDLESS of `effective_write_mode` (it returns
+    //     `StampTerminal` before ever reading the mode), so on those paths we leave
+    //     `effective_write_mode = directive.write_mode` and skip the IO. Behavior is identical
+    //     — only a clean trusted-Done agentic WRITE can have its budget changed by the policy.
+    let is_gateable_done_write = directive.write
         && trusted
         && outcome.status == MiniCoderStatus::Done
-        && !directive.kill_requested
+        && !directive.kill_requested;
+    let effective_write_mode =
+        if is_gateable_done_write && directive.write_mode == WriteMode::AgenticIterative {
+            match super::projects::read_mini_write_behavior(app) {
+                // Safe is a HARD ceiling: clamp the agentic directive to a single-pass write.
+                mini_coder::MiniWriteBehavior::Safe => WriteMode::EmitEdits,
+                // Auto / AgenticAllowed: both permit agentic — pass the directive's mode
+                // through exactly as the executor did before FIX 1.
+                mini_coder::MiniWriteBehavior::Auto
+                | mini_coder::MiniWriteBehavior::AgenticAllowed => directive.write_mode,
+            }
+        } else {
+            // EmitEdits directive, non-write, or a non-Done/untrusted/killed outcome: the
+            // effective mode is the directive's own mode. The Safe clamp only ever narrows
+            // Agentic -> Emit (never the reverse), and the gate ignores the mode on every
+            // non-clean-Done path, so no config read is needed here.
+            directive.write_mode
+        };
+    let covered = if is_gateable_done_write
+        && effective_write_mode == WriteMode::AgenticIterative
     {
         project_root
             .as_deref()
@@ -3364,6 +3349,11 @@ try {{\n\
     }}\n\
   }} finally {{ $sr.Close() }}\n\
   $raw = New-Object string($cbuf, 0, $total)\n\
+  # FIX2: capture the FIRST self-reported `failed` object (the oMLX truncation emitter\n\
+  # writes {{\"status\":\"failed\",\"output\":\"generation truncated at max_tokens ...\"}}) so\n\
+  # its DISTINCT message reaches the parent coder verbatim instead of the generic\n\
+  # fallback. A terminal status (done/needs_clarification) still WINS over it.\n\
+  $failedOut = $null\n\
   # MINOR 10: strip OSC/DCS/APC/PM/SOS payloads, then CSI escapes.\n\
   $clean = [regex]::Replace($raw, \"\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)\", '')\n\
   $clean = [regex]::Replace($clean, \"\\x1b[P_^X][^\\x1b]*\\x1b\\\\\", '')\n\
@@ -3390,11 +3380,14 @@ try {{\n\
       $parsed = $candidate | ConvertFrom-Json\n\
       if ($parsed.status -eq 'done' -or $parsed.status -eq 'needs_clarification') {{\n\
         $out = $candidate\n\
+      }} elseif ($parsed.status -eq 'failed' -and $null -eq $failedOut -and $parsed.output -is [string]) {{\n\
+        $failedOut = $candidate\n\
       }}\n\
     }} catch {{ }}\n\
   }}\n\
 }} catch {{ $out = $null }}\n\
 Remove-Item -LiteralPath $rawFile -Force -ErrorAction SilentlyContinue\n\
+if ($null -eq $out) {{ $out = $failedOut }}\n\
 if ($null -eq $out) {{\n\
   $out = '{{\"status\":\"failed\",\"output\":\"mini backend produced no valid JSON result\"}}'\n\
 }}\n\
@@ -4020,6 +4013,12 @@ fn build_mini_command_impl(
 #[cfg(target_os = "macos")]
 const MACOS_RESULT_EXTRACTOR_PY: &str = r#"import os, re, json
 out = None
+# FIX2: a backend that self-reports a DISTINCT failure (the oMLX finish_reason=='length'
+# truncation emitter writes {"status":"failed","output":"generation truncated at
+# max_tokens ..."}) must reach the parent coder VERBATIM, not be replaced by the generic
+# "no valid JSON" fallback. So we capture the FIRST balanced `failed` object too, but a
+# terminal status (done/needs_clarification) always WINS over it.
+failed_out = None
 try:
     with open(os.environ['MINI_RAW_FILE'], 'rb') as f:
         raw = f.read(@MAX_BYTES@).decode('utf-8', 'replace')
@@ -4036,8 +4035,13 @@ try:
             continue
         try:
             obj, _end = dec.raw_decode(clean, i)
-            if isinstance(obj, dict) and obj.get('status') in ('done', 'needs_clarification'):
-                out = clean[i:_end]
+            if isinstance(obj, dict):
+                st = obj.get('status')
+                if st in ('done', 'needs_clarification'):
+                    out = clean[i:_end]
+                elif st == 'failed' and failed_out is None and isinstance(obj.get('output'), str):
+                    # Keep the self-reported failure verbatim (distinct message survives).
+                    failed_out = clean[i:_end]
         except Exception:
             pass
         i += 1
@@ -4047,6 +4051,8 @@ try:
     os.remove(os.environ['MINI_RAW_FILE'])
 except Exception:
     pass
+if out is None:
+    out = failed_out
 if out is None:
     out = json.dumps({'status': 'failed', 'output': 'mini backend produced no valid JSON result'})
 with open(os.environ['MINI_RESULT'], 'w', encoding='utf-8') as f:
@@ -7887,6 +7893,79 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
         assert_eq!(parsed["status"], "done", "got: {written}");
         assert_eq!(parsed["output"], "fixed foo() {bar}", "got: {written}");
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    // FIX2 (behavioral, macOS): the oMLX finish_reason=='length' truncation emitter writes
+    // a DISTINCT `{"status":"failed","output":"generation truncated at max_tokens ..."}` to
+    // stdout. The REAL python extractor must surface that message VERBATIM (not replace it
+    // with the generic "no valid JSON result" fallback) so truncation is observable to the
+    // parent coder.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_wrapper_surfaces_truncation_failed_message_verbatim() {
+        use std::process::Command;
+        let scratch = std::env::temp_dir().join(format!("mc_fix2trunc_{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let result_target = scratch.join("t1.json");
+        let result_path = sh_single_quote_local(&result_target.to_string_lossy());
+        let raw_path = sh_single_quote_local(&format!("{}.raw", result_target.to_string_lossy()));
+
+        // Exactly what the truncation arm emits (see build oMLX wrapper).
+        let model_line =
+            r#"{"status":"failed","output":"generation truncated at max_tokens (4096) — increase budget or reduce scope"}"#;
+        let run = format!("printf '%s' {}", sh_single_quote_local(model_line));
+        let wrapper = macos_stdout_to_result_wrapper(&run, &result_path, &raw_path);
+
+        let status = Command::new("/bin/sh")
+            .args(["-c", &wrapper])
+            .status()
+            .expect("run wrapper");
+        assert!(status.success(), "wrapper exited non-zero");
+
+        let written = std::fs::read_to_string(&result_target).expect("result file");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert_eq!(parsed["status"], "failed", "got: {written}");
+        // The DISTINCT truncation message survives — NOT the generic fallback.
+        let out = parsed["output"].as_str().unwrap_or_default();
+        assert!(
+            out.contains("generation truncated at max_tokens"),
+            "truncation message swallowed; got: {written}"
+        );
+        assert!(
+            !out.contains("no valid JSON result"),
+            "must not fall through to the generic fallback: {written}"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    // FIX2 regression guard (macOS): a terminal `done` object always WINS over a `failed`
+    // object present earlier in the same stream — surfacing `failed` must not regress the
+    // common case where the model self-reports failure then a wrapper appends a done.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_wrapper_prefers_done_over_an_earlier_failed() {
+        use std::process::Command;
+        let scratch = std::env::temp_dir().join(format!("mc_fix2done_{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let result_target = scratch.join("t2.json");
+        let result_path = sh_single_quote_local(&result_target.to_string_lossy());
+        let raw_path = sh_single_quote_local(&format!("{}.raw", result_target.to_string_lossy()));
+
+        let model_line = r#"{"status":"failed","output":"transient"} then {"status":"done","output":"ok"}"#;
+        let run = format!("printf '%s' {}", sh_single_quote_local(model_line));
+        let wrapper = macos_stdout_to_result_wrapper(&run, &result_path, &raw_path);
+
+        let status = Command::new("/bin/sh")
+            .args(["-c", &wrapper])
+            .status()
+            .expect("run wrapper");
+        assert!(status.success(), "wrapper exited non-zero");
+
+        let written = std::fs::read_to_string(&result_target).expect("result file");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert_eq!(parsed["status"], "done", "terminal done must win: {written}");
+        assert_eq!(parsed["output"], "ok", "got: {written}");
         std::fs::remove_dir_all(&scratch).ok();
     }
 

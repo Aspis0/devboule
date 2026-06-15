@@ -29,7 +29,10 @@
 
 use super::super::severity::severity_from_actionlint;
 use super::DEFAULT_RUNNER_TIMEOUT;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{
+    cap, redact_secrets, run_capture_with_timeout, split_file_and_coord, Granularity, RawFinding,
+    RunTarget,
+};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -61,11 +64,12 @@ pub fn parse_actionlint(stdout: &str) -> Vec<RawFinding> {
 
 /// Parse ONE actionlint line `file:line:col: message [rule]` into a [`RawFinding`], or
 /// `None` if the line does not match the shape (no panic). We anchor on the first
-/// `:<line>:<col>: ` numeric coordinate triplet (tolerating a Windows drive colon in the
-/// file portion), treat everything before it as the file, and keep the whole remainder as
-/// the message. An empty file/message, or a non-numeric coordinate, → `None`.
+/// `:<line>:<col>: ` numeric coordinate triplet via the shared [`split_file_and_coord`]
+/// (tolerating a Windows drive colon in the file portion), treat everything before it as
+/// the file, and keep the whole remainder as the message. An empty file/message, or a
+/// non-numeric coordinate, → `None`.
 fn parse_actionlint_line(line: &str) -> Option<RawFinding> {
-    let (file, line_no, message) = split_file_and_coord(line)?;
+    let (file, line_no, _col, message) = split_file_and_coord(line)?;
     if file.is_empty() {
         return None;
     }
@@ -87,49 +91,6 @@ fn parse_actionlint_line(line: &str) -> Option<RawFinding> {
         title: format!("actionlint: {}", cap(&safe_message, 200)),
         body: cap(&safe_message, 1000),
     })
-}
-
-/// Anchor on the first `:<digits>:<digits>: ` coordinate triplet in a line, returning
-/// `(file, line_no, remainder_after_the_triplet)`. Tolerates a colon inside the file
-/// portion (a Windows drive letter) by scanning for the FIRST numeric `line:col` pair
-/// rather than splitting on every `:`. `None` if no such triplet exists or the digits
-/// don't parse. (Mirrors the shellcheck parser's anchor.)
-fn split_file_and_coord(line: &str) -> Option<(&str, u32, &str)> {
-    let bytes = line.as_bytes();
-    let mut search_from = 0usize;
-    while let Some(rel) = line[search_from..].find(':') {
-        let colon = search_from + rel;
-        let rest = &line[colon + 1..];
-        let (line_digits, after_line) = take_digits(rest);
-        if !line_digits.is_empty() {
-            if let Some(after_line_colon) = after_line.strip_prefix(':') {
-                let (col_digits, after_col) = take_digits(after_line_colon);
-                if !col_digits.is_empty() {
-                    if let Some(remainder) = after_col.strip_prefix(':') {
-                        if let Ok(n) = line_digits.parse::<u32>() {
-                            let file = &line[..colon];
-                            return Some((file, n, remainder.trim_start()));
-                        }
-                    }
-                }
-            }
-        }
-        search_from = colon + 1;
-        if search_from >= bytes.len() {
-            break;
-        }
-    }
-    None
-}
-
-/// Split a leading run of ASCII digits off `s`, returning `(digits, rest)`.
-fn take_digits(s: &str) -> (&str, &str) {
-    let end = s
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_digit())
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    (&s[..end], &s[end..])
 }
 
 /// Run actionlint on a single file from the project root. Absent `actionlint` → empty

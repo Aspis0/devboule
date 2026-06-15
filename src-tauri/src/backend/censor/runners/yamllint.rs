@@ -27,7 +27,10 @@
 
 use super::super::severity::severity_from_yamllint;
 use super::DEFAULT_RUNNER_TIMEOUT;
-use super::{cap, redact_secrets, run_capture_with_timeout, Granularity, RawFinding, RunTarget};
+use super::{
+    cap, redact_secrets, run_capture_with_timeout, split_file_and_coord, Granularity, RawFinding,
+    RunTarget,
+};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -61,12 +64,12 @@ pub fn parse_yamllint(stdout: &str) -> Vec<RawFinding> {
 /// [`RawFinding`], or `None` if the line does not match the shape (no panic).
 ///
 /// Like shellcheck, the `file` may contain a Windows drive colon, so we anchor on the
-/// first `:<digits>:<digits>: ` coordinate triplet (see [`split_file_and_coord`]) rather
-/// than splitting on every `:`. The remainder after the triplet is `[level] message`; we
-/// pull the bracketed level token, then take the rest as the message. An empty
+/// first `:<digits>:<digits>: ` coordinate triplet via the shared [`split_file_and_coord`]
+/// rather than splitting on every `:`. The remainder after the triplet is `[level]
+/// message`; we pull the bracketed level token, then take the rest as the message. An empty
 /// file/message, a non-numeric coordinate, or a missing `[level]` bracket → `None`.
 fn parse_yamllint_line(line: &str) -> Option<RawFinding> {
-    let (file, line_no, after_coord) = split_file_and_coord(line)?;
+    let (file, line_no, _col, after_coord) = split_file_and_coord(line)?;
     if file.is_empty() {
         return None;
     }
@@ -93,49 +96,6 @@ fn parse_yamllint_line(line: &str) -> Option<RawFinding> {
         title: format!("yamllint: {}", cap(&safe_message, 200)),
         body: cap(&safe_message, 1000),
     })
-}
-
-/// Anchor on the first `:<digits>:<digits>: ` coordinate triplet in a parsable line,
-/// returning `(file, line_no, remainder_after_the_triplet)`. Tolerates a colon inside the
-/// file portion (a Windows drive letter) by scanning for the FIRST numeric `line:col`
-/// pair rather than splitting on every `:`. `None` if no such triplet exists or the
-/// digits don't parse.
-fn split_file_and_coord(line: &str) -> Option<(&str, u32, &str)> {
-    let bytes = line.as_bytes();
-    let mut search_from = 0usize;
-    while let Some(rel) = line[search_from..].find(':') {
-        let colon = search_from + rel;
-        let rest = &line[colon + 1..];
-        let (line_digits, after_line) = take_digits(rest);
-        if !line_digits.is_empty() {
-            if let Some(after_line_colon) = after_line.strip_prefix(':') {
-                let (col_digits, after_col) = take_digits(after_line_colon);
-                if !col_digits.is_empty() {
-                    if let Some(remainder) = after_col.strip_prefix(':') {
-                        if let Ok(n) = line_digits.parse::<u32>() {
-                            let file = &line[..colon];
-                            return Some((file, n, remainder.trim_start()));
-                        }
-                    }
-                }
-            }
-        }
-        search_from = colon + 1;
-        if search_from >= bytes.len() {
-            break;
-        }
-    }
-    None
-}
-
-/// Split a leading run of ASCII digits off `s`, returning `(digits, rest)`.
-fn take_digits(s: &str) -> (&str, &str) {
-    let end = s
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_digit())
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    (&s[..end], &s[end..])
 }
 
 /// Run yamllint on a single file from the project root. Absent `yamllint` → empty

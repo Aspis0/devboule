@@ -81,10 +81,13 @@ pub fn parse_go_vet(stderr: &str) -> Vec<RawFinding> {
 /// module root), so we locate the `.go:` boundary explicitly rather than blindly
 /// splitting on the first colon.
 fn parse_vet_line(line: &str) -> Option<(String, u32, &str)> {
-    // Find the file/position boundary at the FIRST `.go:` so a path containing other
-    // colons (rare) or dots is handled. `find` gives the byte index of `.go:`.
+    // Find the file/position boundary at the LAST `.go:` so a path that itself embeds an
+    // earlier `.go:` (e.g. a directory literally named `foo.go:bar/…`, or a `.go:`
+    // substring inside the message that precedes the real coordinate) anchors on the
+    // FILENAME boundary rather than the first stray occurrence. `rfind` gives the byte
+    // index of the rightmost `.go:`.
     let go_marker = ".go:";
-    let marker_at = line.find(go_marker)?;
+    let marker_at = line.rfind(go_marker)?;
     // file = everything up to and including `.go`.
     let file_end = marker_at + 3; // ".go".len()
     let file = &line[..file_end];

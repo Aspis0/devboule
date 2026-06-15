@@ -35,7 +35,9 @@
 #![allow(dead_code)]
 
 use super::super::severity::severity_from_ktlint;
-use super::{cap, redact_secrets, run_capture, Granularity, RawFinding, RunTarget};
+use super::{
+    cap, redact_secrets, run_capture, split_file_and_coord, Granularity, RawFinding, RunTarget,
+};
 use std::path::Path;
 
 pub fn granularity() -> Granularity {
@@ -87,35 +89,30 @@ fn relativize_file(file: &str, root: &Path) -> String {
 }
 
 /// Parse ONE ktlint diagnostic line `file:line:col: message (rule-id)` into a
-/// [`RawFinding`], or `None` if the line does not match the shape (no panic). We split
-/// off exactly the three leading colon-delimited fields (`file`, `line`, `col`) and keep
-/// the WHOLE remainder as the message (so an internal colon in the message survives). A
-/// non-numeric line/col, an empty file, or an empty message → `None`. The `file` is kept
-/// VERBATIM here (it can be absolute OR relative depending on the ktlint version); the
-/// caller [`parse_ktlint`] relativizes and forward-slash normalizes it via
-/// [`relativize_file`], so the raw OS separators are preserved for `strip_prefix` to
-/// match `root`.
+/// [`RawFinding`], or `None` if the line does not match the shape (no panic). We anchor on
+/// the `:<line>:<col>: ` numeric coordinate triplet via the shared [`split_file_and_coord`]
+/// (requiring BOTH line and col to be numeric, which guards against matching an unrelated
+/// line that merely happens to contain colons) and keep the WHOLE remainder as the message
+/// (so an internal colon in the message survives). A line/col that isn't a numeric triplet,
+/// an empty file, or an empty message → `None`. The `file` is kept VERBATIM here (it can be
+/// absolute OR relative depending on the ktlint version); the caller [`parse_ktlint`]
+/// relativizes and forward-slash normalizes it via [`relativize_file`], so the raw OS
+/// separators are preserved for `strip_prefix` to match `root`.
 ///
-/// NOTE: a Windows absolute path has a drive-letter colon (`C:\dir\A.kt:3:1: msg`) which
-/// `splitn(4, ':')` would split inside the drive letter, corrupting the path. ktlint is
-/// invoked with the project-RELATIVE path under cwd=root, so it echoes a relative path
-/// (no drive colon) on every platform — this parser is reached with a drive-letter path
-/// only if a future version emits one, an accepted best-effort limitation documented here.
+/// Because the shared anchor scans for the FIRST numeric `line:col` boundary (rather than a
+/// blind `splitn(_, ':')`), a Windows absolute path's drive-letter colon (`C:\dir\A.kt:3:1:
+/// msg`) is tolerated: the `C:` is not followed by a `<digits>:<digits>:` triplet, so the
+/// parser skips it and anchors on the real `:3:1:` coordinate (no longer corrupting the path).
 fn parse_ktlint_line(line: &str) -> Option<RawFinding> {
-    // splitn(4, ':') → [file, line, col, " message (rule-id)"]
-    let mut parts = line.splitn(4, ':');
-    let file = parts.next()?.trim();
-    let line_str = parts.next()?.trim();
-    let col_str = parts.next()?.trim();
-    let message = parts.next()?.trim();
+    // `file:line:col: message` → (file, line, col, "message (rule-id)"); both line and
+    // col must be numeric, the drive colon is skipped (see the shared helper).
+    let (file, lineno, _col, message) = split_file_and_coord(line)?;
+    let file = file.trim();
+    let message = message.trim();
 
     if file.is_empty() || message.is_empty() {
         return None;
     }
-    let lineno: u32 = line_str.parse().ok()?;
-    // The column field must be numeric too (guards against matching an unrelated line
-    // that merely happens to contain colons). We don't store the column.
-    let _col: u32 = col_str.parse().ok()?;
     let line_field = (lineno != 0).then_some(lineno);
 
     let (severity, category) = severity_from_ktlint();
@@ -248,6 +245,29 @@ Summary error count (descending) by rule:
             "absolute path not relativized against root: {}",
             findings[0].file
         );
+    }
+
+    #[test]
+    fn windows_drive_path_is_not_split_on_the_drive_colon() {
+        // A ktlint version that emits a Windows ABSOLUTE path (drive-letter colon) must
+        // still parse: the shared anchor skips `C:` and locks onto the real `:3:1:`
+        // coordinate, so the finding survives instead of being lost (the old naive
+        // `splitn(4, ':')` split inside the drive letter → zero findings). `root` is a
+        // matching Windows path so `relativize_file` strips the prefix.
+        let stdout = "C:\\repo\\app\\src\\Main.kt:3:1: Unexpected indentation (indent)\n";
+        let findings = parse_ktlint(stdout, Path::new("C:\\repo"));
+        assert_eq!(findings.len(), 1, "drive-letter path dropped: {findings:?}");
+        assert_eq!(findings[0].line, Some(3));
+        // `strip_prefix` matches on path COMPONENTS, which on a non-Windows host treats
+        // the backslash path as a single component (no match) — so assert only that the
+        // finding parsed and is forward-slash normalized (no drive colon corrupted it).
+        assert!(
+            findings[0].file.ends_with("Main.kt"),
+            "file not parsed from drive-letter path: {}",
+            findings[0].file
+        );
+        assert!(!findings[0].file.contains('\\'), "not normalized: {}", findings[0].file);
+        assert_eq!(findings[0].severity, Severity::Low);
     }
 
     #[test]

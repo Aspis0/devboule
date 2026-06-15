@@ -2336,9 +2336,12 @@ fn mini_backend_kind_label(kind: super::mini_coder::MiniCoderBackendKind) -> &'s
 ///     coder defaults to `emit-edits` everywhere.
 ///
 /// Carries NO token/secret (just the model tag + generic prose) — the
-/// prompt-token-off-argv / restricted-prompt-file guarantees are untouched. The
-/// model tag is sanitized like every other prompt field via `clean_optional` (the
-/// same `<`/`>`-stripping the launcher applies to the whole prompt).
+/// prompt-token-off-argv / restricted-prompt-file guarantees are untouched. The model tag
+/// is sanitized like every other prompt field via `clean_optional`, which WHITESPACE-
+/// NORMALIZES (collapses runs of whitespace to single spaces), trims, and TRUNCATES to 500
+/// chars; it does NOT strip `<`/`>`. That is fine here: the prompt is delivered to the mini
+/// on STDIN (a restricted prompt file), never on argv / via a shell, so `<`/`>` are not
+/// shell-special and need no stripping.
 fn build_mini_delegation_addendum(
     backend: Option<&super::mini_coder::MiniCoderBackend>,
     covered: &[&'static str],

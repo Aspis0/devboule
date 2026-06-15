@@ -19,9 +19,14 @@ let persistedPolicy: MiniWriteBehavior = "auto";
 let coverage: string[] = ["Python", "TypeScript/JavaScript"];
 let coverageThrows = false;
 const setCalls: MiniWriteBehavior[] = [];
+// When set, get_mini_write_behavior awaits this gate before resolving so a test can
+// observe the pre-load (!loaded) window deterministically.
+let pendingPolicyLoad: Promise<void> | null = null;
+let resolvePolicyLoad: (() => void) | null = null;
 
 const invokeMock = vi.fn(async (name: string, args?: Record<string, unknown>) => {
   if (name === "get_mini_write_behavior") {
+    if (pendingPolicyLoad) await pendingPolicyLoad;
     return persistedPolicy;
   }
   if (name === "set_mini_write_behavior") {
@@ -66,6 +71,8 @@ beforeEach(() => {
   coverage = ["Python", "TypeScript/JavaScript"];
   coverageThrows = false;
   setCalls.length = 0;
+  pendingPolicyLoad = null;
+  resolvePolicyLoad = null;
   invokeMock.mockClear();
 });
 
@@ -141,6 +148,44 @@ describe("MiniWriteBehaviorCard", () => {
     const checked = container.querySelector('[role="radio"][aria-checked="true"]');
     expect(checked?.textContent).toContain("Auto");
     expect(container.innerHTML).toContain("write failed");
+  });
+
+  it("does NOT persist a click while the policy is still loading (!loaded)", async () => {
+    // The persisted policy is a non-Auto value that has not resolved yet. The control
+    // must be inert (disabled) so a premature click can't overwrite "safe" with the
+    // still-default "auto" — the original pre-load write race.
+    persistedPolicy = "safe";
+    pendingPolicyLoad = new Promise<void>((resolve) => {
+      resolvePolicyLoad = resolve;
+    });
+    await mount();
+
+    const radios = Array.from(
+      container.querySelectorAll('[role="radio"]'),
+    ) as HTMLButtonElement[];
+    // Every radio is disabled until the persisted value has loaded.
+    expect(radios.every((r) => r.disabled)).toBe(true);
+    const auto = radios[1]; // Auto — the still-default selection.
+    expect(auto.textContent).toContain("Auto");
+    await act(async () => {
+      auto.click();
+      await Promise.resolve();
+    });
+    // No write was issued — the persisted "safe" is untouched.
+    expect(setCalls).toEqual([]);
+
+    // Once the load resolves the control becomes interactive again.
+    await act(async () => {
+      resolvePolicyLoad?.();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const enabled = Array.from(
+      container.querySelectorAll('[role="radio"]'),
+    ) as HTMLButtonElement[];
+    expect(enabled.every((r) => r.disabled)).toBe(false);
+    const checked = container.querySelector('[role="radio"][aria-checked="true"]');
+    expect(checked?.textContent).toContain("Safe");
   });
 
   it("shows the coverage list from get_agentic_coverage_languages", async () => {

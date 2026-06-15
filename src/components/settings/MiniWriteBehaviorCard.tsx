@@ -198,7 +198,10 @@ export function MiniWriteBehaviorCard() {
               type="button"
               role="radio"
               aria-checked={selected}
-              disabled={busy}
+              // Block selection until the persisted policy has loaded: a click while
+              // !loaded would not early-return on the still-default "auto" and could
+              // silently overwrite a persisted non-Auto policy (e.g. Safe -> auto).
+              disabled={busy || !loaded}
               onClick={() => void onSelect(option.value)}
               className={`flex items-start gap-3 rounded-2xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
                 selected

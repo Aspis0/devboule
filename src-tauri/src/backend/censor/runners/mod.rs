@@ -519,6 +519,99 @@ pub(super) fn redact_secrets(s: &str) -> String {
     out
 }
 
+/// Split a leading run of ASCII digits off `s`, returning `(digits, rest)`. Shared by
+/// the coordinate parsers below so the digit-scan logic lives in exactly one place.
+pub(super) fn take_digits(s: &str) -> (&str, &str) {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    (&s[..end], &s[end..])
+}
+
+/// Anchor on the first `:<digits>:` (the file/line boundary) in a gcc/template-style
+/// diagnostic line, returning `(file, line_no, remainder_after_the_first_colon-line-colon)`.
+///
+/// The split is deliberately NOT a blind `splitn(_, ':')`: a `file` may itself contain a
+/// Windows drive colon (`C:\path\a.cpp`), so we scan from the LEFT for the FIRST `:` that
+/// is immediately followed by `<digits>:`. Everything before that colon is the file, the
+/// digit run is the line number, and the remainder is whatever follows the line's
+/// trailing colon (a tool-specific tail such as `severity:id:message` for cppcheck, or a
+/// further `<col>: message` triplet consumed by [`split_file_and_coord`]). `None` if no
+/// such boundary exists or the digits don't parse to a `u32`.
+pub(super) fn split_file_and_line(line: &str) -> Option<(&str, u32, &str)> {
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = line[search_from..].find(':') {
+        let colon = search_from + rel;
+        let rest = &line[colon + 1..];
+        // rest must begin with digits, then ':'.
+        let (line_digits, after_line) = take_digits(rest);
+        if !line_digits.is_empty() {
+            if let Some(remainder) = after_line.strip_prefix(':') {
+                if let Ok(n) = line_digits.parse::<u32>() {
+                    let file = &line[..colon];
+                    return Some((file, n, remainder));
+                }
+            }
+        }
+        // Advance past this colon (guard against a zero-width loop).
+        search_from = colon + 1;
+        if search_from >= bytes.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Anchor on the first `:<digits>:<digits>: ` coordinate triplet in a gcc/parsable-style
+/// diagnostic line, returning `(file, line_no, col_no, remainder_after_the_triplet)`.
+///
+/// Builds on [`split_file_and_line`] (which already tolerates a Windows drive colon in the
+/// file portion by scanning for the FIRST numeric `line:` boundary): after the `file:line:`
+/// split, the remainder must itself begin with `<digits>:` (the column), and what follows
+/// is returned with a single leading space trimmed (`"`: severity`" → "severity"`). If a
+/// candidate `file:line:` boundary is NOT followed by a numeric column (e.g. cppcheck's
+/// `file:line:severity:...`, where `severity` is non-numeric), we keep scanning for a LATER
+/// boundary that does, so a line with no real `line:col` triplet → `None` rather than a
+/// false match. `None` if no such triplet exists or the digits don't parse.
+///
+/// This is the ONE shared coordinate parser used by shellcheck / yamllint / actionlint /
+/// ktlint (all of whose default reporters emit `file:line:col: …`).
+pub(super) fn split_file_and_coord(line: &str) -> Option<(&str, u32, u32, &str)> {
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+    // We can't reuse `split_file_and_line` directly in a loop because a non-numeric
+    // column must let us keep scanning for a LATER boundary, so we inline the scan and
+    // additionally require a numeric column after the line.
+    while let Some(rel) = line[search_from..].find(':') {
+        let colon = search_from + rel;
+        let rest = &line[colon + 1..];
+        let (line_digits, after_line) = take_digits(rest);
+        if !line_digits.is_empty() {
+            if let Some(after_line_colon) = after_line.strip_prefix(':') {
+                let (col_digits, after_col) = take_digits(after_line_colon);
+                if !col_digits.is_empty() {
+                    if let Some(remainder) = after_col.strip_prefix(':') {
+                        if let (Ok(l), Ok(c)) =
+                            (line_digits.parse::<u32>(), col_digits.parse::<u32>())
+                        {
+                            let file = &line[..colon];
+                            return Some((file, l, c, remainder.trim_start()));
+                        }
+                    }
+                }
+            }
+        }
+        search_from = colon + 1;
+        if search_from >= bytes.len() {
+            break;
+        }
+    }
+    None
+}
+
 /// Run a single piped command from `root` with the [`DEFAULT_RUNNER_TIMEOUT`].
 /// See [`run_capture_with_timeout`] for the full contract.
 pub fn run_capture(program: &str, args: &[&str], root: &Path) -> Option<String> {
@@ -1138,6 +1231,62 @@ mod tests {
         assert!(overran);
         assert_eq!(out.len(), 100);
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn split_file_and_line_anchors_on_first_numeric_line_boundary() {
+        // Relative path, simple line:rest.
+        let (file, line, rest) = split_file_and_line("a.cpp:10:warning:nullPointer:msg").unwrap();
+        assert_eq!(file, "a.cpp");
+        assert_eq!(line, 10);
+        assert_eq!(rest, "warning:nullPointer:msg");
+    }
+
+    #[test]
+    fn split_file_and_line_tolerates_windows_drive_colon() {
+        // A Windows drive colon must NOT be mistaken for the line boundary — the drive
+        // letter `C` is followed by `\`, not `<digits>:`, so we skip it and anchor on
+        // the real `:10:` boundary.
+        let (file, line, rest) =
+            split_file_and_line("C:\\scripts\\a.cpp:10:warning:foo:msg").unwrap();
+        assert_eq!(file, "C:\\scripts\\a.cpp");
+        assert_eq!(line, 10);
+        assert_eq!(rest, "warning:foo:msg");
+    }
+
+    #[test]
+    fn split_file_and_line_none_without_a_numeric_boundary() {
+        assert!(split_file_and_line("no colon here").is_none());
+        assert!(split_file_and_line("a.cpp:notanumber:warning").is_none());
+        assert!(split_file_and_line("").is_none());
+    }
+
+    #[test]
+    fn split_file_and_coord_anchors_on_line_col_triplet() {
+        let (file, line, col, rest) = split_file_and_coord("a.sh:3:5: warning: msg").unwrap();
+        assert_eq!(file, "a.sh");
+        assert_eq!(line, 3);
+        assert_eq!(col, 5);
+        // The single leading space after the triplet is trimmed.
+        assert_eq!(rest, "warning: msg");
+    }
+
+    #[test]
+    fn split_file_and_coord_tolerates_windows_drive_colon() {
+        let (file, line, col, rest) =
+            split_file_and_coord("C:\\repo\\Main.kt:3:1: Unexpected indentation (indent)").unwrap();
+        assert_eq!(file, "C:\\repo\\Main.kt");
+        assert_eq!(line, 3);
+        assert_eq!(col, 1);
+        assert_eq!(rest, "Unexpected indentation (indent)");
+    }
+
+    #[test]
+    fn split_file_and_coord_skips_a_non_numeric_column_and_keeps_scanning() {
+        // cppcheck-shaped `file:line:severity:...` has a numeric line but a NON-numeric
+        // "column" (`warning`), so there is no real line:col triplet → None (we don't
+        // false-match `:10:` as a triplet when the next field isn't a column).
+        assert!(split_file_and_coord("a.cpp:10:warning:foo:msg").is_none());
     }
 
     #[test]

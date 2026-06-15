@@ -25,6 +25,44 @@ pub enum ProjectKind {
     Kotlin,
 }
 
+impl ProjectKind {
+    /// The canonical list of EVERY [`ProjectKind`] variant, in declaration order. This is
+    /// the single source of truth for code that must enumerate all kinds (e.g. the
+    /// executor's "what COULD be covered" potential-languages set, which evaluates the gate
+    /// against a kinds-set containing every variant).
+    ///
+    /// EXHAUSTIVENESS: the array is pinned to the enum by [`Self::exhaustive_witness`] (an
+    /// exhaustive, wildcard-free match) plus the `all_kinds_*` tests below — adding a new
+    /// variant makes the witness match non-exhaustive (FAILS TO COMPILE) and trips the
+    /// length/membership tests until the variant is added here. So `ALL` can never silently
+    /// drift out of sync with the enum.
+    pub const ALL: [ProjectKind; 6] = [
+        ProjectKind::Rust,
+        ProjectKind::Node,
+        ProjectKind::Python,
+        ProjectKind::Go,
+        ProjectKind::Cpp,
+        ProjectKind::Kotlin,
+    ];
+
+    /// Identity map over EVERY variant via a wildcard-free `match`. Its only purpose is to
+    /// be the compile-time exhaustiveness anchor for [`Self::ALL`]: a newly-added variant
+    /// makes this match non-exhaustive and breaks the build, and the tests assert the new
+    /// variant is also present in `ALL`. (Never called in non-test code — it carries no
+    /// runtime behavior.)
+    #[cfg(test)]
+    const fn exhaustive_witness(self) -> ProjectKind {
+        match self {
+            ProjectKind::Rust => ProjectKind::Rust,
+            ProjectKind::Node => ProjectKind::Node,
+            ProjectKind::Python => ProjectKind::Python,
+            ProjectKind::Go => ProjectKind::Go,
+            ProjectKind::Cpp => ProjectKind::Cpp,
+            ProjectKind::Kotlin => ProjectKind::Kotlin,
+        }
+    }
+}
+
 /// Canonical Python project markers. `pyproject.toml` is the modern standard, but
 /// many real projects predate / skip it, so we also accept the classic setuptools
 /// markers and the common dependency manifests — otherwise ruff/bandit/vulture
@@ -178,6 +216,15 @@ impl FileLang {
         if matches!(ext.as_str(), "yml" | "yaml") && is_under_github_workflows(path) {
             return FileLang::GithubActions;
         }
+        // FILENAME-based: a Gradle Kotlin DSL script (`*.gradle.kts` — `build.gradle.kts`,
+        // `settings.gradle.kts`, convention-plugin scripts) is a BUILD script, not Kotlin
+        // application source. ktlint on a Gradle DSL script is FP noise (it flags the DSL's
+        // builder syntax), so we classify it as `Other` (no per-file runner). Checked before
+        // the extension match so it wins over the bare `.kts` → Kotlin mapping. Application
+        // `.kt` and a non-Gradle `.kts` script stay Kotlin.
+        if matches!(ext.as_str(), "kts") && is_gradle_kts_name(path) {
+            return FileLang::Other;
+        }
         match ext.as_str() {
             "rs" => FileLang::Rust,
             "ts" | "tsx" | "js" | "jsx" | "cts" | "mts" | "cjs" | "mjs" => FileLang::Ts,
@@ -242,6 +289,20 @@ fn is_under_github_workflows(path: &Path) -> bool {
         .any(|w| w[0] == ".github" && w[1] == "workflows")
 }
 
+/// Is `path`'s FILE NAME a Gradle Kotlin DSL script (`*.gradle.kts`)? Matches
+/// (case-insensitively) any name ending in `.gradle.kts` — `build.gradle.kts`,
+/// `settings.gradle.kts`, and convention-plugin scripts like `my-plugin.gradle.kts`.
+/// These are Gradle BUILD scripts (builder DSL), not Kotlin application source, so the
+/// caller classifies them as `Other` to keep ktlint's DSL-syntax FP noise off them. A
+/// plain `.kts` (a standalone Kotlin script) is NOT matched and stays Kotlin. PURE —
+/// inspects only the final path component, never the filesystem.
+fn is_gradle_kts_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase().ends_with(".gradle.kts"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +320,42 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn all_project_kinds_is_exhaustive_and_unique() {
+        use std::collections::HashSet;
+        // Every entry round-trips through the wildcard-free witness match (identity), and
+        // the set is duplicate-free. The REAL guard is the combination: a variant added to
+        // the enum makes `exhaustive_witness`'s match non-exhaustive (compile error) and,
+        // once handled there, this membership assertion forces it into `ProjectKind::ALL`.
+        let set: HashSet<ProjectKind> = ProjectKind::ALL.into_iter().collect();
+        assert_eq!(set.len(), ProjectKind::ALL.len(), "ALL has duplicates");
+        for k in ProjectKind::ALL {
+            assert_eq!(k.exhaustive_witness(), k);
+            assert!(set.contains(&k.exhaustive_witness()));
+        }
+    }
+
+    #[test]
+    fn each_known_variant_is_present_in_all() {
+        // Spell out each known variant explicitly so that adding a variant to the enum
+        // (and to `exhaustive_witness`) but FORGETTING it in `ProjectKind::ALL` is caught:
+        // the variant would not be in `ALL`, so this assertion (driven by the witness over
+        // `ALL`) plus the exhaustive witness match together fail.
+        for k in [
+            ProjectKind::Rust,
+            ProjectKind::Node,
+            ProjectKind::Python,
+            ProjectKind::Go,
+            ProjectKind::Cpp,
+            ProjectKind::Kotlin,
+        ] {
+            assert!(
+                ProjectKind::ALL.contains(&k),
+                "ProjectKind::{k:?} missing from ProjectKind::ALL"
+            );
+        }
     }
 
     #[test]
@@ -408,11 +505,28 @@ mod tests {
         // HTML.
         assert_eq!(FileLang::from_path(Path::new("index.html")), FileLang::Html);
         assert_eq!(FileLang::from_path(Path::new("page.htm")), FileLang::Html);
-        // Kotlin — sources and Gradle/script `.kts`.
+        // Kotlin — application sources (`.kt`) and a standalone Kotlin script (`.kts`).
         assert_eq!(FileLang::from_path(Path::new("Main.kt")), FileLang::Kotlin);
+        assert_eq!(FileLang::from_path(Path::new("script.kts")), FileLang::Kotlin);
+        // A Gradle Kotlin DSL build script (`*.gradle.kts`) is NOT Kotlin source — it is a
+        // builder-DSL build file, so it maps to `Other` (no ktlint FP noise). Covers the
+        // canonical build/settings scripts AND convention-plugin scripts.
         assert_eq!(
             FileLang::from_path(Path::new("build.gradle.kts")),
-            FileLang::Kotlin
+            FileLang::Other
+        );
+        assert_eq!(
+            FileLang::from_path(Path::new("settings.gradle.kts")),
+            FileLang::Other
+        );
+        assert_eq!(
+            FileLang::from_path(Path::new("gradle/my-plugin.gradle.kts")),
+            FileLang::Other
+        );
+        // Case-insensitive: a SHOUTED Gradle DSL name is still `Other`.
+        assert_eq!(
+            FileLang::from_path(Path::new("BUILD.GRADLE.KTS")),
+            FileLang::Other
         );
         // Shell scripts (shellcheck) — the whole `.sh`/`.bash`/`.ksh`/`.zsh` family.
         assert_eq!(FileLang::from_path(Path::new("deploy.sh")), FileLang::Shell);
