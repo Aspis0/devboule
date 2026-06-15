@@ -28,6 +28,13 @@
 //! while the universal line-range grounding still applies (it only needs the line
 //! count). tree-sitter is not OS-specific, so there is NO `cfg` gating here.
 //!
+//! NO GRAMMAR (lint-runner-only quick wins): `FileLang::Shell`/`Yaml`/`Sql` are
+//! deliberately NOT given a tree-sitter grammar — they exist only to route the
+//! shellcheck/yamllint/sqlfluff lint runners. They degrade EXACTLY like
+//! `FileLang::Other`: [`extract_items`] returns an empty `Vec` and [`parse_file`]
+//! yields an empty identifier set, so symbol grounding stays DISABLED for them
+//! (unknown != contradicted) while the universal line-range grounding still applies.
+//!
 //! DEAD-CODE NOTE: this module ships "dark". The public API is consumed by the
 //! Censor merge in a LATER workstream (C4 wires grounding into the live reviewer
 //! path; B uses item extraction for per-item review). The pure logic is fully
@@ -148,8 +155,9 @@ pub enum Grounding {
 /// `property_declaration` units (best-effort — node-kind names per the grammar's
 /// `node-types.json`), named by the `identifier` found under the declaration.
 ///
-/// `Other`: returns an empty `Vec`. This NEVER panics (a grammar/parse failure
-/// yields an empty `Vec`).
+/// `Shell`/`Yaml`/`Sql`/`Other`: no grammar wired — returns an empty `Vec` (the
+/// shell/YAML/SQL langs are lint-runner-only quick wins; see the module header).
+/// This NEVER panics (a grammar/parse failure also yields an empty `Vec`).
 ///
 /// Delegates to [`parse_file`] (the SINGLE parse path) and returns only its `items`,
 /// so a file is parsed by exactly one routine. A caller that needs items AND grounding
@@ -222,7 +230,10 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
                 identifiers,
             }
         }
-        FileLang::Other => ParsedFile {
+        // No grammar wired for these (lint-runner-only quick wins) — they degrade
+        // exactly like `Other`: empty items + empty identifier set (symbol grounding
+        // disabled), with the real `total_lines` so line-range grounding still works.
+        FileLang::Shell | FileLang::Yaml | FileLang::Sql | FileLang::Other => ParsedFile {
             total_lines,
             items: Vec::new(),
             identifiers: HashSet::new(),
@@ -1721,6 +1732,40 @@ macro_rules! noop { () => {}; }
         assert_eq!(grounds(&parsed, Some(3), None), Grounding::DroppedLineOutOfFile);
         // An in-range line with no symbol → kept.
         assert_eq!(grounds(&parsed, Some(2), None), Grounding::Kept);
+    }
+
+    #[test]
+    fn grounding_lint_only_langs_have_no_grammar_but_keep_line_range() {
+        // Shell/Yaml/Sql are lint-runner-only quick wins with NO tree-sitter grammar:
+        // they behave exactly like `Other` — empty items + empty identifiers (symbol
+        // grounding DISABLED), with line-range grounding still active.
+        let src = "first\nsecond\nthird\n"; // 3 content lines
+        for lang in [FileLang::Shell, FileLang::Yaml, FileLang::Sql] {
+            let parsed = parse_file(src, lang);
+            assert!(parsed.items.is_empty(), "{lang:?} should yield no items");
+            assert!(
+                parsed.identifiers.is_empty(),
+                "{lang:?} should yield no identifiers (no grammar)"
+            );
+            assert_eq!(parsed.total_lines, 3, "{lang:?} line count");
+            // Symbol grounding disabled → an invented symbol is KEPT (unknown != contradicted).
+            assert_eq!(
+                grounds(&parsed, Some(2), Some("invented_name")),
+                Grounding::Kept,
+                "{lang:?} must not drop on an unknown symbol (no grammar)"
+            );
+            // Line-range grounding still works: out-of-EOF dropped, in-range kept.
+            assert_eq!(
+                grounds(&parsed, Some(4), None),
+                Grounding::DroppedLineOutOfFile,
+                "{lang:?} must drop a line past EOF"
+            );
+            assert_eq!(
+                grounds(&parsed, Some(3), None),
+                Grounding::Kept,
+                "{lang:?} must keep an in-range line"
+            );
+        }
     }
 
     #[test]

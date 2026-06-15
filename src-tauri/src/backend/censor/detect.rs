@@ -113,6 +113,15 @@ pub enum FileLang {
     Cpp,
     Html,
     Kotlin,
+    // Lint-runner-only quick wins (no tree-sitter grammar wired — see extract.rs):
+    // shell scripts (shellcheck), YAML (yamllint), SQL (sqlfluff). These have no
+    // canonical project manifest, so their runners gate on the FileLang ALONE
+    // (like HTML), and `parse_file`/`extract_items` return EMPTY items + an empty
+    // identifier set for them, so symbol grounding stays disabled while the
+    // universal line-range grounding still applies.
+    Shell,
+    Yaml,
+    Sql,
     Other,
 }
 
@@ -124,7 +133,10 @@ impl FileLang {
     /// `.cpp`/`.cc`/`.cxx`/`.c++`/`.hpp`/`.hh`/`.hxx`/`.h++`/`.c`/`.h` → `Cpp` (the
     /// cppcheck toolchain — C and C++ share one [`FileLang`] since the wired grammar
     /// and the runner both span the family); `.html`/`.htm` → `Html` (the HTML Tidy
-    /// toolchain); `.kt`/`.kts` → `Kotlin` (the ktlint toolchain); else `Other`.
+    /// toolchain); `.kt`/`.kts` → `Kotlin` (the ktlint toolchain);
+    /// `.sh`/`.bash`/`.ksh`/`.zsh` → `Shell` (the shellcheck toolchain);
+    /// `.yml`/`.yaml` → `Yaml` (the yamllint toolchain); `.sql` → `Sql` (the sqlfluff
+    /// toolchain); else `Other`.
     pub fn from_path(path: &Path) -> FileLang {
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e.to_ascii_lowercase(),
@@ -140,6 +152,12 @@ impl FileLang {
             }
             "html" | "htm" => FileLang::Html,
             "kt" | "kts" => FileLang::Kotlin,
+            // Shell-script family (shellcheck). Extensions are enough; we deliberately
+            // skip a `.bashrc`/`.zshrc` filename heuristic (shellcheck on a dotfile is a
+            // marginal case and the filename check adds complexity for little gain).
+            "sh" | "bash" | "ksh" | "zsh" => FileLang::Shell,
+            "yml" | "yaml" => FileLang::Yaml,
+            "sql" => FileLang::Sql,
             _ => FileLang::Other,
         }
     }
@@ -317,6 +335,16 @@ mod tests {
             FileLang::from_path(Path::new("build.gradle.kts")),
             FileLang::Kotlin
         );
+        // Shell scripts (shellcheck) — the whole `.sh`/`.bash`/`.ksh`/`.zsh` family.
+        assert_eq!(FileLang::from_path(Path::new("deploy.sh")), FileLang::Shell);
+        assert_eq!(FileLang::from_path(Path::new("lib.bash")), FileLang::Shell);
+        assert_eq!(FileLang::from_path(Path::new("old.ksh")), FileLang::Shell);
+        assert_eq!(FileLang::from_path(Path::new("env.zsh")), FileLang::Shell);
+        // YAML (yamllint).
+        assert_eq!(FileLang::from_path(Path::new("ci.yml")), FileLang::Yaml);
+        assert_eq!(FileLang::from_path(Path::new("conf.yaml")), FileLang::Yaml);
+        // SQL (sqlfluff).
+        assert_eq!(FileLang::from_path(Path::new("schema.sql")), FileLang::Sql);
         assert_eq!(FileLang::from_path(Path::new("a.txt")), FileLang::Other);
         assert_eq!(FileLang::from_path(Path::new("README")), FileLang::Other);
         // Case-insensitive extension matching.
@@ -327,5 +355,8 @@ mod tests {
         assert_eq!(FileLang::from_path(Path::new("HDR.H")), FileLang::Cpp);
         assert_eq!(FileLang::from_path(Path::new("INDEX.HTML")), FileLang::Html);
         assert_eq!(FileLang::from_path(Path::new("MAIN.KT")), FileLang::Kotlin);
+        assert_eq!(FileLang::from_path(Path::new("DEPLOY.SH")), FileLang::Shell);
+        assert_eq!(FileLang::from_path(Path::new("CI.YML")), FileLang::Yaml);
+        assert_eq!(FileLang::from_path(Path::new("SCHEMA.SQL")), FileLang::Sql);
     }
 }

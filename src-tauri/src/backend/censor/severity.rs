@@ -149,6 +149,49 @@ pub fn severity_from_ktlint() -> (Severity, Category) {
     (Severity::Low, Category::Style)
 }
 
+/// shellcheck (shell-script static analyzer). shellcheck emits a per-finding level
+/// (`error`/`warning`/`info`/`style`) in its gcc-format output. P2 ROLLOUT DISCIPLINE:
+/// advisory-first — even an `error` level is CAPPED at Medium (NOT High) until the
+/// FP-rate on this repo is measured; `warning`/`info`/`style` → Low. Category tracks
+/// the level's nature: `error`/`warning` are likely bugs (quoting, unset vars,
+/// glob-vs-regex) → Correctness; `info`/`style` are stylistic suggestions → Style.
+/// Unknown/empty → Low/Style (never crash, never escalate).
+#[allow(dead_code)] // first caller is the shellcheck runner.
+pub fn severity_from_shellcheck(level: &str) -> (Severity, Category) {
+    match level.trim().to_ascii_lowercase().as_str() {
+        // Advisory cap: `error` → Medium (NOT High) until FP-rate measured.
+        "error" => (Severity::Medium, Category::Correctness),
+        "warning" => (Severity::Low, Category::Correctness),
+        "info" | "style" => (Severity::Low, Category::Style),
+        _ => (Severity::Low, Category::Style),
+    }
+}
+
+/// yamllint (YAML linter). yamllint emits `[error]`/`[warning]` levels in its parsable
+/// output. P2 ROLLOUT DISCIPLINE: advisory-first — an `error` level is CAPPED at Medium
+/// (NOT High) until the FP-rate on this repo is measured; a `warning` → Low. An `error`
+/// is a structural problem (syntax error, duplicate key) → Correctness; a `warning` is a
+/// style suggestion (line length, indentation, trailing spaces) → Style. Unknown/empty →
+/// Low/Style.
+#[allow(dead_code)] // first caller is the yamllint runner.
+pub fn severity_from_yamllint(level: &str) -> (Severity, Category) {
+    match level.trim().to_ascii_lowercase().as_str() {
+        // Advisory cap: `error` → Medium (NOT High) until FP-rate measured.
+        "error" => (Severity::Medium, Category::Correctness),
+        "warning" => (Severity::Low, Category::Style),
+        _ => (Severity::Low, Category::Style),
+    }
+}
+
+/// sqlfluff (SQL linter/formatter). sqlfluff is predominantly a STYLE/format tool
+/// (layout, capitalization, aliasing conventions); every violation is treated as Low
+/// severity, Style category — exactly like gofmt / ktlint / prettier. Takes no argument
+/// (sqlfluff's per-violation `code` is a rule id, not a severity tier).
+#[allow(dead_code)] // first caller is the sqlfluff runner.
+pub fn severity_from_sqlfluff() -> (Severity, Category) {
+    (Severity::Low, Category::Style)
+}
+
 /// npm audit. npm uses low|moderate|high|critical; a dependency vulnerability
 /// is always Security. critical/high → High, moderate → Medium, low → Low,
 /// unknown → Medium.
@@ -550,5 +593,68 @@ mod tests {
     fn ktlint_is_style_low() {
         // ktlint is a formatting/style tool, like gofmt/cargo-fmt/prettier.
         assert_eq!(severity_from_ktlint(), (Severity::Low, Category::Style));
+    }
+
+    #[test]
+    fn shellcheck_is_advisory_capped_at_medium() {
+        // Advisory-first: even an `error` level is capped at Medium (never High) until
+        // the FP-rate is measured. error/warning → Correctness; info/style → Style.
+        assert_eq!(
+            severity_from_shellcheck("error"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_shellcheck("warning"),
+            (Severity::Low, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_shellcheck("info"),
+            (Severity::Low, Category::Style)
+        );
+        assert_eq!(
+            severity_from_shellcheck("style"),
+            (Severity::Low, Category::Style)
+        );
+        // Case-insensitive; unknown/empty → Low/Style (never crash, never escalate).
+        assert_eq!(
+            severity_from_shellcheck("ERROR"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_shellcheck("???"),
+            (Severity::Low, Category::Style)
+        );
+        assert_eq!(
+            severity_from_shellcheck(""),
+            (Severity::Low, Category::Style)
+        );
+    }
+
+    #[test]
+    fn yamllint_is_advisory_capped_at_medium() {
+        // Advisory-first: an `error` is capped at Medium (never High); a `warning` → Low.
+        assert_eq!(
+            severity_from_yamllint("error"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_yamllint("warning"),
+            (Severity::Low, Category::Style)
+        );
+        // Case-insensitive; unknown/empty → Low/Style.
+        assert_eq!(
+            severity_from_yamllint("ERROR"),
+            (Severity::Medium, Category::Correctness)
+        );
+        assert_eq!(
+            severity_from_yamllint("???"),
+            (Severity::Low, Category::Style)
+        );
+    }
+
+    #[test]
+    fn sqlfluff_is_style_low() {
+        // sqlfluff is a style/format tool, like gofmt/ktlint/prettier.
+        assert_eq!(severity_from_sqlfluff(), (Severity::Low, Category::Style));
     }
 }

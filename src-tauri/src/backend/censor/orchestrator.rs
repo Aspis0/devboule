@@ -194,6 +194,10 @@ fn dispatch_runner(id: RunnerId, root: &Path, target: &RunTarget) -> Vec<RawFind
         // tidy (HTML) and ktlint (Kotlin) are FINE (per-file target; no-compile).
         RunnerId::Tidy => runners::tidy::run(root, target),
         RunnerId::Ktlint => runners::ktlint::run(root, target),
+        // shellcheck/yamllint/sqlfluff are FINE (per-file target; single-binary, no-compile).
+        RunnerId::Shellcheck => runners::shellcheck::run(root, target),
+        RunnerId::Yamllint => runners::yamllint::run(root, target),
+        RunnerId::Sqlfluff => runners::sqlfluff::run(root, target),
         RunnerId::Lizard => runners::lizard::run(root, target),
         RunnerId::Semgrep => runners::semgrep::run(root, target),
         RunnerId::Zizmor => runners::zizmor::run(root),
@@ -231,6 +235,9 @@ fn runner_source(id: RunnerId) -> &'static str {
         RunnerId::Cppcheck => "cppcheck",
         RunnerId::Tidy => "tidy",
         RunnerId::Ktlint => "ktlint",
+        RunnerId::Shellcheck => "shellcheck",
+        RunnerId::Yamllint => "yamllint",
+        RunnerId::Sqlfluff => "sqlfluff",
         RunnerId::Lizard => "lizard",
         RunnerId::Semgrep => "semgrep",
         RunnerId::Zizmor => "zizmor",
@@ -1058,6 +1065,9 @@ mod tests {
         // ktlint.rs ("ktlint") stamp, or the scoped merge strands zombie shard findings.
         assert_eq!(runner_source(RunnerId::Tidy), "tidy");
         assert_eq!(runner_source(RunnerId::Ktlint), "ktlint");
+        assert_eq!(runner_source(RunnerId::Shellcheck), "shellcheck");
+        assert_eq!(runner_source(RunnerId::Yamllint), "yamllint");
+        assert_eq!(runner_source(RunnerId::Sqlfluff), "sqlfluff");
     }
 
     #[test]
@@ -1141,6 +1151,40 @@ mod tests {
         assert!(fp.runners.contains(&RunnerId::Ktlint));
         for r in &fp.runners {
             assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
+        }
+    }
+
+    #[test]
+    fn plan_fine_shell_yaml_sql_files_get_their_runner_with_no_project_kind() {
+        // Shell/YAML/SQL files' FINE plans include their runner even with NO project kind
+        // (these langs have no manifest — the runner gates on the FileLang alone). All Fine.
+        for (rel, id) in [
+            ("deploy.sh", RunnerId::Shellcheck),
+            ("ci.yml", RunnerId::Yamllint),
+            ("schema.sql", RunnerId::Sqlfluff),
+        ] {
+            let plan = plan_fine(&kinds(&[]), &[rel.to_string()]);
+            let fp = &plan[0];
+            assert!(
+                fp.runners.contains(&id),
+                "{id:?} missing from FINE plan for {rel}"
+            );
+            for r in &fp.runners {
+                assert_eq!(r.granularity(), Granularity::Fine, "{r:?} must be fine");
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_runners_for_no_kind_has_no_shell_yaml_sql_runners() {
+        // shellcheck/yamllint/sqlfluff are FINE (per-file), so they must NEVER appear in
+        // the COARSE set — they ride the fine window like tidy/ktlint.
+        let c = coarse_runners(&kinds(&[]));
+        assert!(!c.contains(&RunnerId::Shellcheck));
+        assert!(!c.contains(&RunnerId::Yamllint));
+        assert!(!c.contains(&RunnerId::Sqlfluff));
+        for r in &c {
+            assert_eq!(r.granularity(), Granularity::Coarse, "{r:?} must be coarse");
         }
     }
 

@@ -663,6 +663,9 @@ fn detect_tools_with(
         FileLang::Cpp,
         FileLang::Html,
         FileLang::Kotlin,
+        FileLang::Shell,
+        FileLang::Yaml,
+        FileLang::Sql,
         FileLang::Other,
     ] {
         for runner in applicable_runners(kinds, lang) {
@@ -1086,6 +1089,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_tools_includes_shellcheck_yamllint_sqlfluff_regardless_of_project_kind() {
+        use super::super::detect::ProjectKind;
+        // Shell/YAML/SQL have NO ProjectKind, so their runners surface for EVERY project
+        // (and for none) — the probe loop includes FileLang::Shell/Yaml/Sql, which apply
+        // their runner on the lang alone.
+        for kset in [
+            std::collections::HashSet::new(),
+            std::collections::HashSet::from([ProjectKind::Rust]),
+            std::collections::HashSet::from([ProjectKind::Node, ProjectKind::Python]),
+        ] {
+            let tools = detect_tools_with(&kset, |_| true);
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"shellcheck"), "missing shellcheck for {kset:?}");
+            assert!(names.contains(&"yamllint"), "missing yamllint for {kset:?}");
+            assert!(names.contains(&"sqlfluff"), "missing sqlfluff for {kset:?}");
+        }
+    }
+
+    #[test]
     fn detect_tools_includes_ktlint_for_kotlin_project() {
         use super::super::detect::ProjectKind;
         let mut kinds = std::collections::HashSet::new();
@@ -1106,17 +1128,28 @@ mod tests {
     }
 
     #[test]
-    fn detect_tools_empty_kinds_is_tidy_plus_cross_cutting() {
+    fn detect_tools_empty_kinds_is_lang_only_runners_plus_cross_cutting() {
         let kinds = std::collections::HashSet::new();
         let tools = detect_tools_with(&kinds, |_| true);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         // No project kind → no KIND-gated runners. The cross-cutting set is seen first
-        // (every probed lang appends it), and HTML's tidy — the one lang-only runner
-        // (HTML has no manifest, so it applies everywhere) — is the sole extra, appended
-        // when the FileLang::Html probe runs after the cross-cutting set is already seen.
+        // (every probed lang appends it). The LANG-ONLY runners (no manifest, so they
+        // apply everywhere) are the extras, appended in probe order AFTER the cross-
+        // cutting set is already seen: HTML→tidy, Shell→shellcheck, YAML→yamllint,
+        // SQL→sqlfluff.
         assert_eq!(
             names,
-            vec!["gitleaks", "jscpd", "lizard", "semgrep", "zizmor", "tidy"]
+            vec![
+                "gitleaks",
+                "jscpd",
+                "lizard",
+                "semgrep",
+                "zizmor",
+                "tidy",
+                "shellcheck",
+                "yamllint",
+                "sqlfluff"
+            ]
         );
     }
 

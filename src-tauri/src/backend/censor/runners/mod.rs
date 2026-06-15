@@ -46,9 +46,12 @@ pub mod prettier;
 pub mod ruff;
 pub mod ruff_format;
 pub mod semgrep;
+pub mod shellcheck;
+pub mod sqlfluff;
 pub mod tidy;
 pub mod tsc;
 pub mod vulture;
+pub mod yamllint;
 pub mod zizmor;
 
 use super::detect::{FileLang, ProjectKind};
@@ -152,6 +155,9 @@ pub enum RunnerId {
     Cppcheck,
     Tidy,
     Ktlint,
+    Shellcheck,
+    Yamllint,
+    Sqlfluff,
     Gitleaks,
     Jscpd,
     Lizard,
@@ -202,6 +208,10 @@ impl RunnerId {
             | RunnerId::Tidy
             // ktlint analyzes the Kotlin source directly (no compile-of-target) → Fine.
             | RunnerId::Ktlint
+            // shellcheck/yamllint/sqlfluff are single-binary, no-compile linters → Fine.
+            | RunnerId::Shellcheck
+            | RunnerId::Yamllint
+            | RunnerId::Sqlfluff
             | RunnerId::Lizard
             | RunnerId::Semgrep
             | RunnerId::Oxlint
@@ -232,6 +242,9 @@ impl RunnerId {
             RunnerId::Cppcheck => "cppcheck",
             RunnerId::Tidy => "tidy",
             RunnerId::Ktlint => "ktlint",
+            RunnerId::Shellcheck => "shellcheck",
+            RunnerId::Yamllint => "yamllint",
+            RunnerId::Sqlfluff => "sqlfluff",
             RunnerId::Gitleaks => "gitleaks",
             RunnerId::Jscpd => "jscpd",
             RunnerId::Lizard => "lizard",
@@ -273,13 +286,17 @@ const CROSS_CUTTING: [RunnerId; 5] = [
 ///   - `.c`/`.cpp`/... file in a C/C++ project → cppcheck (fine, no-compile)
 ///   - `.html`/`.htm` file (ANY project — HTML has no manifest) → tidy (fine, no-compile)
 ///   - `.kt`/`.kts` file in a Kotlin project → ktlint (fine, no-compile)
+///   - `.sh`/`.bash`/... file (ANY project — shell has no manifest) → shellcheck (fine)
+///   - `.yml`/`.yaml` file (ANY project — YAML has no manifest) → yamllint (fine)
+///   - `.sql` file (ANY project — SQL has no manifest) → sqlfluff (fine)
 ///   - ANY file → gitleaks, jscpd, lizard, semgrep (cross-cutting)
 ///
 /// A language-specific runner is only added when BOTH the file lang AND the
 /// matching project kind are present (a stray `.py` in a Rust-only repo gets only
 /// the cross-cutting set — no point running ruff where there's no Python config).
-/// HTML is the deliberate EXCEPTION: there is no canonical HTML project manifest, so
-/// tidy gates on [`FileLang::Html`] ALONE (an `.html` anywhere is checkable).
+/// HTML / Shell / YAML / SQL are the deliberate EXCEPTIONS: none has a canonical project
+/// manifest, so tidy / shellcheck / yamllint / sqlfluff gate on the FileLang ALONE (an
+/// `.html`/`.sh`/`.yml`/`.sql` file anywhere is checkable, like a standalone document).
 pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<RunnerId> {
     let mut out: Vec<RunnerId> = Vec::new();
     match lang {
@@ -325,6 +342,21 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
         FileLang::Kotlin if kinds.contains(&ProjectKind::Kotlin) => {
             // ktlint is Fine (analyzes the source, no compile-of-target). Style/advisory.
             out.push(RunnerId::Ktlint);
+        }
+        // Shell/YAML/SQL have NO project manifest / ProjectKind (like HTML) — a
+        // `.sh`/`.yml`/`.sql` file anywhere is checkable, so each runner gates on the
+        // FileLang ALONE (deliberately no kind guard). All Fine (single-binary, no-compile).
+        FileLang::Shell => {
+            // shellcheck is Fine (single-binary shell analyzer). Advisory.
+            out.push(RunnerId::Shellcheck);
+        }
+        FileLang::Yaml => {
+            // yamllint is Fine (single-binary YAML linter). Advisory.
+            out.push(RunnerId::Yamllint);
+        }
+        FileLang::Sql => {
+            // sqlfluff is Fine (single-binary SQL linter). Style/advisory.
+            out.push(RunnerId::Sqlfluff);
         }
         _ => {}
     }
@@ -843,6 +875,35 @@ mod tests {
     }
 
     #[test]
+    fn shell_yaml_sql_files_get_their_runner_regardless_of_project_kind() {
+        // Shell/YAML/SQL have NO ProjectKind (like HTML): the runner applies for the
+        // file's lang in ANY project (or none) — it gates on the FileLang alone.
+        for (lang, id) in [
+            (FileLang::Shell, RunnerId::Shellcheck),
+            (FileLang::Yaml, RunnerId::Yamllint),
+            (FileLang::Sql, RunnerId::Sqlfluff),
+        ] {
+            for kset in [
+                kinds(&[]),
+                kinds(&[ProjectKind::Rust]),
+                kinds(&[ProjectKind::Node, ProjectKind::Python]),
+            ] {
+                let r = applicable_runners(&kset, lang);
+                assert!(r.contains(&id), "{id:?} missing for {lang:?} / kinds {kset:?}");
+                // Cross-cutting always present.
+                assert!(r.contains(&RunnerId::Gitleaks));
+                assert!(r.contains(&RunnerId::Semgrep));
+                // No OTHER lang-specific runner leaks in.
+                assert!(!r.contains(&RunnerId::Clippy));
+                assert!(!r.contains(&RunnerId::Tidy));
+                assert!(!r.contains(&RunnerId::Ktlint));
+                // The lang runner + the cross-cutting set, no duplicates.
+                assert_eq!(r.len(), CROSS_CUTTING.len() + 1);
+            }
+        }
+    }
+
+    #[test]
     fn unknown_file_lang_gets_only_cross_cutting() {
         let r = applicable_runners(
             &kinds(&[ProjectKind::Rust, ProjectKind::Node]),
@@ -911,6 +972,10 @@ mod tests {
             // tidy (HTML validator) and ktlint (Kotlin style) are no-compile → Fine.
             RunnerId::Tidy,
             RunnerId::Ktlint,
+            // shellcheck/yamllint/sqlfluff are single-binary, no-compile → Fine.
+            RunnerId::Shellcheck,
+            RunnerId::Yamllint,
+            RunnerId::Sqlfluff,
             RunnerId::Lizard,
             RunnerId::Semgrep,
         ] {

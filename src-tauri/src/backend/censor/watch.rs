@@ -514,13 +514,14 @@ fn run_loop(
 
 /// Route one change onto the correct debounce window + accumulator.
 ///
-/// TS/Python/Go/C-C++/HTML/Kotlin files go to the FINE window (cheap per-file linters
-/// need the exact changed set: eslint/ruff/gofmt/cppcheck/tidy/ktlint — all no-compile,
-/// cheap enough for the per-file path). Their COMPILE-BASED / project-wide tools
-/// (tsc/knip for TS, go vet for Go) are COARSE and ride the coarse window like every
-/// other coarse runner — never the hot per-file path (go vet COMPILES, so this is the
-/// load-bearing reason it must not be fine-routed; HTML/Kotlin have NO coarse runner, so
-/// a tidy/ktlint edit never flips coarse pending). Rust files and "Other" files
+/// TS/Python/Go/C-C++/HTML/Kotlin/Shell/YAML/SQL files go to the FINE window (cheap
+/// per-file linters need the exact changed set: eslint/ruff/gofmt/cppcheck/tidy/ktlint/
+/// shellcheck/yamllint/sqlfluff — all no-compile, cheap enough for the per-file path).
+/// Their COMPILE-BASED / project-wide tools (tsc/knip for TS, go vet for Go) are COARSE
+/// and ride the coarse window like every other coarse runner — never the hot per-file
+/// path (go vet COMPILES, so this is the load-bearing reason it must not be fine-routed;
+/// HTML/Kotlin/Shell/YAML/SQL have NO coarse runner, so a tidy/ktlint/shellcheck/yamllint/
+/// sqlfluff edit never flips coarse pending). Rust files and "Other" files
 /// (cross-cutting only) go to the COARSE window — a Rust edit means clippy/cargo-check;
 /// an "Other" edit (config, etc.) still warrants the project-wide gitleaks/jscpd sweep.
 /// A file can only be one language, so it lands in exactly one bucket.
@@ -538,7 +539,13 @@ fn bucket_event(
         | FileLang::Go
         | FileLang::Cpp
         | FileLang::Html
-        | FileLang::Kotlin => {
+        | FileLang::Kotlin
+        // Shell/YAML/SQL route to FINE: shellcheck/yamllint/sqlfluff are single-binary,
+        // no-compile per-file linters with NO coarse runner, so a `.sh`/`.yml`/`.sql`
+        // edit never flips coarse pending (exactly like tidy/ktlint).
+        | FileLang::Shell
+        | FileLang::Yaml
+        | FileLang::Sql => {
             fine_files.insert(ev.rel_path);
             fine.record(now);
         }
@@ -750,6 +757,39 @@ mod tests {
         assert!(fine.pending());
         assert!(fine_files.contains("app/src/Main.kt"));
         assert!(!coarse_pending, "a kotlin edit alone must not flip coarse pending");
+    }
+
+    #[test]
+    fn shell_yaml_sql_files_go_to_fine_bucket() {
+        // A .sh/.yml/.sql edit routes to FINE (shellcheck/yamllint/sqlfluff are
+        // single-binary per-file linters); none flips the coarse pending flag (no coarse
+        // shell/YAML/SQL runner exists).
+        for (rel, lang) in [
+            ("scripts/deploy.sh", FileLang::Shell),
+            (".github/workflows/ci.yml", FileLang::Yaml),
+            ("db/schema.sql", FileLang::Sql),
+        ] {
+            let mut fine = DebounceState::new(Duration::from_millis(FINE_DEBOUNCE_MS));
+            let mut coarse = DebounceState::new(Duration::from_millis(COARSE_DEBOUNCE_MS));
+            let mut fine_files = BTreeSet::new();
+            let mut coarse_pending = false;
+            bucket_event(
+                ChangeEvent {
+                    rel_path: rel.into(),
+                    lang,
+                },
+                &mut fine,
+                &mut coarse,
+                &mut fine_files,
+                &mut coarse_pending,
+            );
+            assert!(fine.pending(), "{lang:?} should make fine pending");
+            assert!(fine_files.contains(rel), "{lang:?} should land in fine_files");
+            assert!(
+                !coarse_pending,
+                "a {lang:?} edit alone must not flip coarse pending"
+            );
+        }
     }
 
     #[test]
