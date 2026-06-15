@@ -699,6 +699,10 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 }
                 cap_pass(state);
             });
+            // FIX 2: terminate the live console too (timeout reap) — OUTSIDE the lock above,
+            // after the directive transition is durably applied. Without this the console is
+            // stuck running:true (shimmer on) and the store entry stays pinned forever.
+            console_mark_stopped(app, directive);
         }
     }
 
@@ -727,6 +731,11 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 }
                 cap_pass(state);
             });
+            // FIX 2: terminate the live console (stuck-launching reap) — OUTSIDE the lock. A
+            // never-seeded directive (no build_initial ran) has no live mini, so set_terminal
+            // only flips running=Some(false): it stops "running", never paints a phantom
+            // timeline. A directive that DID seed a console gets the neutral Stop banner.
+            console_mark_stopped(app, directive);
         }
     }
 
@@ -784,6 +793,9 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 }
                 cap_pass(state);
             });
+            // FIX 2: terminate the live console too (parent-gone reap) — OUTSIDE the lock,
+            // before the `continue`. Without this the console is stuck running:true forever.
+            console_mark_stopped(app, directive);
             continue;
         }
         // BLOCKER 2 (IN-FLIGHT GUARD): a finished mini whose deferred-verdict thread is
@@ -1173,6 +1185,32 @@ fn claim_and_launch(
         );
         cap_pass(state);
     });
+
+    // CONSOLE (Step B): the run is now live — publish the initial Activity Console snapshot
+    // on `mini-activity://<agent_id>` (same id as `agent-terminal://<agent_id>`). A single
+    // spawn entry: model label + scope + the first round, the working shimmer, running=true.
+    // `directive.attempt` is 0-based, so the first round number is attempt+1 (a retry that
+    // launches as its own directive seeds the console at its own round). Pure observer: a
+    // missing store (unmanaged in some tests) makes this a no-op.
+    if let Some(store) = console_store(app) {
+        let model = console_model_label(&backend);
+        let label = console_run_label(directive);
+        let scope = directive.files.clone();
+        let round_n = directive.attempt.saturating_add(1);
+        store.update(app, &agent_id, |a| {
+            // FIX 3: a retry CHAIN shares ONE agent_id (mini_agent_id collapses `{root}-r{N}`
+            // to the root id), so a blanket `build_initial` on EVERY launch would WIPE the
+            // predecessor's rounds (round 1's dirty verdict that caused the retry). Branch on
+            // `attempt`: the fresh original (attempt==0) ALWAYS reseeds (also re-arms an
+            // agent_id reused across unrelated originals); a retry (attempt>0) resumes the
+            // shared console additively, preserving the predecessor's closed rounds.
+            if directive.attempt == 0 {
+                *a = super::mini_activity::build_initial(&model, &label, &scope, round_n);
+            } else {
+                super::mini_activity::resume_retry_round(a, &model, &label, &scope, round_n);
+            }
+        });
+    }
 }
 
 /// Read the finished mini's result file and apply the terminal outcome to its directive.
@@ -1668,6 +1706,13 @@ fn finalize_finished_mini_with(
         false
     };
 
+    // CONSOLE (Step B): clone the gate's High findings BEFORE they are MOVED into
+    // `verdict_gate_decision` below — the Activity Console renders them in the round's
+    // verdict (dirty → the findings list; clean → an empty set). Cheap (a handful of small
+    // privacy-safe finding summaries) and only on the gateable path (`high_findings` is
+    // empty on every non-clean-done / untrusted / killed outcome).
+    let console_findings = high_findings.clone();
+
     // 3) Pure decision.
     let now = Utc::now().to_rfc3339();
     let retry_id = format!("{}-r{}", mini_coder::chain_root_id(directive), directive.attempt + 1);
@@ -1789,6 +1834,187 @@ fn finalize_finished_mini_with(
                 }
             }
         }
+
+        // CONSOLE (Step B): publish the finalize snapshot AFTER the state write succeeded so
+        // the console mirrors the actually-applied terminal/retry state. Runs on BOTH the
+        // inline finalize AND the deferred-verdict thread (each has its own `app` clone +
+        // managed-state access), so the trusted-clean-done deferred verdict lights up too.
+        // Keyed on the mini's launch `agent_id` (the `mini-activity://<agentId>` channel id);
+        // a directive with no `agent_id` (never launched) has no console to update.
+        if let Some(agent_id) = directive.agent_id.as_deref() {
+            console_finalize(
+                app,
+                agent_id,
+                &decision,
+                applied_outcome.as_ref(),
+                &outcome.files_touched,
+                &console_findings,
+                directive.attempt,
+                directive.write,
+            );
+        }
+    }
+}
+
+/// CONSOLE (Step B): map a finalized [`GateDecision`] (+ the actually-applied terminal
+/// outcome) onto the Activity Console store mutations, then publish the resulting full
+/// snapshot. Pure observer — a missing store (unmanaged in tests) is a silent no-op.
+///
+/// PATHS:
+///  * AwaitingRetry (dirty, retries left): close the CURRENT round with the DIRTY verdict
+///    (the gate findings) + the applied-write action rows, then open the NEXT round. The
+///    run stays in flight (shimmer on, running stays true).
+///  * Terminal Done (`StampTerminal(done)` that the kill did NOT override): close the round
+///    with the verdict (CLEAN if the gate found nothing, else DIRTY) + write rows, then the
+///    `done` banner ("N file(s) · M round(s) · edits applied"). running=false.
+///  * Escalated: close the round with the DIRTY verdict + the `esc` banner.
+///  * Aborted/killed (the P5 live-kill override, or any aborted terminal): the `stop`
+///    banner; no verdict (the human cut it short — there is no Censor judgment to show).
+///  * Other terminal (failed/timeout/needs_clarification): the `stop` banner as the neutral
+///    terminal (a non-success that is neither a clean done nor an escalation).
+///
+/// `attempt` is the finalized directive's 0-based round index; the human-facing round
+/// number is `attempt + 1`, and a retry opens round `attempt + 2`.
+#[allow(clippy::too_many_arguments)]
+fn console_finalize(
+    app: &AppHandle,
+    agent_id: &str,
+    decision: &mini_coder::GateDecision,
+    applied_outcome: Option<&MiniCoderOutcome>,
+    files_touched: &[String],
+    findings: &[mini_coder::EscalationFinding],
+    attempt: u32,
+    // FIX 5: whether the finalized directive was a WRITE directive — gates the done banner's
+    // "edits applied" clause (a non-write run never applied edits, even if it touched files).
+    is_write: bool,
+) {
+    use super::mini_activity as console;
+
+    let Some(store) = console_store(app) else {
+        return;
+    };
+    let round_number = attempt.saturating_add(1);
+    let file_count = files_touched.len();
+
+    match decision {
+        mini_coder::GateDecision::AwaitingRetryWith { .. } => {
+            // Dirty with retries left: close THIS round (write rows + dirty verdict), open
+            // the next. The applied write rows are the ground-truth files the mini changed.
+            store.update(app, agent_id, |a| {
+                for path in files_touched {
+                    console::push_write_action(a, path);
+                }
+                console::set_current_round_verdict(
+                    a,
+                    console::verdict_from_findings(findings, file_count),
+                );
+                // The shimmer stays on — the run is still in flight for the next round.
+                console::append_round(a, round_number.saturating_add(1));
+            });
+        }
+        mini_coder::GateDecision::Escalate(_) | mini_coder::GateDecision::StampTerminal(_) => {
+            // A terminal. The ACTUAL outcome (after the P5 live-kill re-check) drives the
+            // banner — a Stop that won the race shows `stop`, not the gate's done/esc.
+            let status = applied_outcome
+                .map(|o| o.status)
+                .unwrap_or(MiniCoderStatus::Done);
+            store.update(app, agent_id, |a| {
+                for path in files_touched {
+                    console::push_write_action(a, path);
+                }
+                match status {
+                    MiniCoderStatus::AbortedByHuman => {
+                        // The human cut it short: no Censor verdict to show — just the stop.
+                        console::set_terminal(
+                            a,
+                            console::Banner {
+                                kind: console::BannerKind::Stop,
+                                title: None,
+                                sub: None,
+                            },
+                        );
+                    }
+                    MiniCoderStatus::Escalated => {
+                        console::set_current_round_verdict(
+                            a,
+                            console::verdict_from_findings(findings, file_count),
+                        );
+                        console::set_terminal(
+                            a,
+                            console::Banner {
+                                kind: console::BannerKind::Esc,
+                                title: None,
+                                sub: Some(escalation_sub(file_count, round_number)),
+                            },
+                        );
+                    }
+                    MiniCoderStatus::Done => {
+                        // CLEAN if the gate found nothing, else the dirty findings (a
+                        // terminal dirty done with no retries left is escalated above, so a
+                        // Done here is normally clean — but render whatever the gate said).
+                        console::set_current_round_verdict(
+                            a,
+                            console::verdict_from_findings(findings, file_count),
+                        );
+                        console::set_terminal(
+                            a,
+                            console::Banner {
+                                kind: console::BannerKind::Done,
+                                title: None,
+                                sub: Some(done_sub(file_count, round_number, is_write)),
+                            },
+                        );
+                    }
+                    // failed / timeout / needs_clarification / (pending/launching/running are
+                    // unreachable here): the neutral `stop` terminal. No verdict.
+                    _ => {
+                        console::set_terminal(
+                            a,
+                            console::Banner {
+                                kind: console::BannerKind::Stop,
+                                title: None,
+                                sub: None,
+                            },
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// CONSOLE (Step B): the muted sub-line for a `done` banner, e.g.
+/// "2 files · 1 round · edits applied" (singular/plural respected).
+///
+/// FIX 5: the "edits applied" clause is pushed ONLY for an actual WRITE directive
+/// (`is_write`). A NON-write directive's `file_count` is the mini's self-reported
+/// `files_touched` — those files were inspected, NOT edited by us — so claiming "edits
+/// applied" there is a lie. A non-write run with touched files thus reads e.g. "2 files · 1
+/// round" with no edits clause.
+fn done_sub(file_count: usize, rounds: u32, is_write: bool) -> String {
+    let mut parts = vec![plural(file_count, "file"), plural(rounds as usize, "round")];
+    if file_count > 0 && is_write {
+        parts.push("edits applied".to_string());
+    }
+    parts.join(" · ")
+}
+
+/// CONSOLE (Step B): the muted sub-line for an `esc` banner, e.g. "2 files · 2 rounds".
+fn escalation_sub(file_count: usize, rounds: u32) -> String {
+    if file_count == 0 {
+        plural(rounds as usize, "round")
+    } else {
+        format!("{} · {}", plural(file_count, "file"), plural(rounds as usize, "round"))
+    }
+}
+
+/// CONSOLE (Step B): "N noun" with a naive plural-s (N≠1 → "Ns"). Only used for the
+/// console banner sub-lines, where the nouns are "file"/"round".
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }
 
@@ -2536,6 +2762,80 @@ fn backend_client_label(backend: &MiniCoderBackend) -> String {
         MiniCoderBackendKind::AppleFm => "appleFm",
     }
     .to_string()
+}
+
+/// CONSOLE (Step B): the monospace model label for the Activity Console's `MiniRun`, e.g.
+/// "mini · ollama/qwen2.5-coder" or "mini · codex". The backend kind label + the resolved
+/// model tag (when set); a backend with no model tag (api/codex without a pinned model)
+/// shows just the kind. Privacy-safe: only the already-surfaced runtime label, no secrets.
+fn console_model_label(backend: &MiniCoderBackend) -> String {
+    let kind = backend_client_label(backend);
+    match backend.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => format!("mini · {kind}/{model}"),
+        None => format!("mini · {kind}"),
+    }
+}
+
+/// CONSOLE (Step B): a short, privacy-safe label for the spawn row + the run's working
+/// shimmer. Prefers the directive's `task` (already a human task summary), trimmed to a
+/// one-line cap; falls back to a file-scope summary, then a generic label. Never leaks a
+/// raw transcript — `task` is the coder-authored one-line intent the rail already shows.
+fn console_run_label(directive: &MiniCoderDirective) -> String {
+    let task = directive.task.trim();
+    if !task.is_empty() {
+        // One line, bounded — the row is a single chip, not a paragraph.
+        let first_line = task.lines().next().unwrap_or(task).trim();
+        return truncate_label(first_line, 80);
+    }
+    match directive.files.len() {
+        0 => "mini-coder".to_string(),
+        1 => format!("mini-coder · {}", directive.files[0]),
+        n => format!("mini-coder · {n} files"),
+    }
+}
+
+/// Char-bounded truncation with an ellipsis (no panic on a multi-byte boundary — we count
+/// chars, not bytes). Used only for the console row label.
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+/// CONSOLE (Step B): the managed activity store, if installed. Absent only in tests that do
+/// not `.manage` it; every console mutation is then a silent no-op (the executor's behavior
+/// is otherwise unchanged — the console is a pure observer).
+fn console_store(app: &AppHandle) -> Option<tauri::State<'_, super::mini_activity::MiniActivityStore>> {
+    app.try_state::<super::mini_activity::MiniActivityStore>()
+}
+
+/// CONSOLE (Step B) — FIX 2: stamp the live console TERMINAL for the executor's terminal-reap
+/// paths (timeout / stuck-launching / parent-gone). Those paths transition the directive to a
+/// terminal status but never go through `console_finalize`, so without this the console stays
+/// `running:true` (shimmer on) forever AND the store entry is pinned non-evictable (running ⇒
+/// pinned). `set_terminal` flips `running=Some(false)` regardless of whether a live mini
+/// exists (so a never-seeded stuck-launching directive simply stops being "running" — no
+/// phantom timeline), and stamps the neutral `Stop` banner (mirrors `console_finalize`'s
+/// `_ => stop` neutral terminal) only when there IS a live mini. Pure observer: a missing
+/// store (unmanaged in tests) or a directive with no `agent_id` (never launched a PTY) is a
+/// silent no-op — the console NEVER alters the directive's outcome.
+fn console_mark_stopped(app: &AppHandle, directive: &MiniCoderDirective) {
+    if let Some(store) = console_store(app) {
+        if let Some(agent_id) = directive.agent_id.as_deref() {
+            store.update(app, agent_id, |a| {
+                super::mini_activity::set_terminal(
+                    a,
+                    super::mini_activity::Banner {
+                        kind: super::mini_activity::BannerKind::Stop,
+                        title: None,
+                        sub: None,
+                    },
+                );
+            });
+        }
+    }
 }
 
 /// Resolve the MCP roots (`management_root`, `projects_dir`) the codex backend's
@@ -8484,5 +8784,29 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn done_sub_edits_clause_only_for_write_directives() {
+        // FIX 5: "edits applied" appears ONLY when the directive actually wrote
+        // (`is_write`) AND it touched files. A non-write run's touched files were
+        // inspected, not edited by us — so no edits clause.
+        assert_eq!(
+            done_sub(2, 1, true),
+            "2 files · 1 round · edits applied",
+            "write directive with files -> edits clause present"
+        );
+        assert_eq!(
+            done_sub(2, 1, false),
+            "2 files · 1 round",
+            "non-write directive -> NO edits clause even with touched files"
+        );
+        assert_eq!(
+            done_sub(0, 1, true),
+            "0 files · 1 round",
+            "write directive with zero files -> no edits clause"
+        );
+        // Singular/plural still respected on both axes.
+        assert_eq!(done_sub(1, 2, true), "1 file · 2 rounds · edits applied");
     }
 }

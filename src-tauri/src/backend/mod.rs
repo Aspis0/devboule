@@ -16,6 +16,7 @@ pub mod fs_watch;
 pub mod git_push;
 pub mod github;
 pub mod hardware;
+pub mod mini_activity;
 pub mod mini_coder;
 pub mod mini_coder_executor;
 pub mod model;

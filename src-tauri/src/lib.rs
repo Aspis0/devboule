@@ -289,6 +289,7 @@ pub fn run() {
         .manage(agent_pty_sessions)
         .manage(censor_state)
         .manage(mini_coder_state)
+        .manage(backend::mini_activity::MiniActivityStore::default())
         .manage(design_gen_state)
         .setup(|app| {
             // Record the bundled, read-only `oracle/` location so release builds
@@ -404,6 +405,7 @@ pub fn run() {
             backend::agent_pty::agent_pty_kill,
             backend::agent_pty::agent_pty_list,
             backend::mini_coder_executor::mini_coder_kill,
+            backend::mini_activity::mini_activity_snapshot,
             backend::token_usage::get_agent_token_usage,
             backend::commands::get_cloud_dashboard_snapshot,
             backend::commands::get_cloudflare_agent_token_profiles,
