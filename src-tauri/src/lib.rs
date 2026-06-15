@@ -295,6 +295,11 @@ pub fn run() {
             // run Oracle Python only from there, never from a user "drop" dir.
             if let Ok(dir) = app.path().resource_dir() {
                 oracle::python_oracle::set_bundled_oracle_root(&dir);
+                // Record the same resource dir for the Censor's bundled, OFFLINE
+                // semgrep ruleset (`resources/censor/semgrep-rules.yml`), so the
+                // runner resolves an absolute local `--config` path instead of the
+                // network registry. Dev/test builds use a crate-relative fallback.
+                backend::censor::runners::semgrep::set_censor_resource_dir(&dir);
             }
             // RELEASE: data root = app_data_dir (writable). The bundled package
             // root above is read-only, so the `oracle-data/venv` runtime must be

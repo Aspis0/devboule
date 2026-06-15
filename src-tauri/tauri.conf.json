@@ -43,6 +43,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../oracle"]
+    "resources": ["../oracle", "resources/censor/semgrep-rules.yml"]
   }
 }

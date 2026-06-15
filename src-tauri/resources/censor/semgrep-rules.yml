@@ -1,0 +1,86 @@
+# Aspis Censor — bundled, OFFLINE semgrep ruleset.
+#
+# WHY this file exists (do not replace with `--config p/ci` / `r/` / `auto`):
+#   1. PRIVACY  — the registry packs (`p/ci`, `auto`, `r/...`) fetch rules from
+#                 semgrep's registry at run time = phone-home. The Censor is
+#                 loopback-only; it must NEVER reach the network. A local
+#                 `--config <abs path>` to THIS file does zero fetches.
+#   2. LICENSE  — registry rules ship under the Semgrep Rules License (the gray
+#                 area the 2026-06-15 audit flagged). These rules are OURS, so
+#                 that license never applies. (The semgrep CLI/engine itself is
+#                 LGPL — invoke-only, fine; only the RULES were the concern.)
+#   3. DETERMINISM — the registry pack drifts over time, which destabilizes both
+#                 the gate and the ORPO labels. A pinned local file is stable.
+#
+# SCOPE: a SMALL seed of HIGH-SIGNAL, LOW-FP, CROSS-LANGUAGE checks that the
+# per-language linters (clippy / eslint / ruff / bandit / ...) typically MISS.
+# It deliberately does NOT duplicate those tools.
+#
+# SEVERITY: every rule is WARNING (advisory-first discipline — NOT ERROR). A rule
+# is only promoted past advisory AFTER the validation pass below.
+#
+# ⚠️ SEED ruleset — needs a live-semgrep validation + per-repo FP-tuning pass
+#    (master plan P15) before any rule is promoted past advisory. semgrep is not
+#    installed in the authoring environment, so these patterns were written to
+#    standard, simple semgrep syntax but have NOT been executed against a live
+#    engine. Validate (`semgrep --validate --config semgrep-rules.yml`) and tune
+#    for false positives before relying on them as more than advisory signal.
+
+rules:
+  # --- TLS / certificate verification disabled ------------------------------
+  - id: aspis-python-tls-verify-disabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      TLS certificate verification is disabled (verify=False). This silently
+      accepts any certificate and exposes the request to MITM. Remove the
+      argument or pin a trusted CA bundle instead.
+    pattern-either:
+      - pattern: requests.get(..., verify=False, ...)
+      - pattern: requests.post(..., verify=False, ...)
+      - pattern: requests.put(..., verify=False, ...)
+      - pattern: requests.delete(..., verify=False, ...)
+      - pattern: requests.patch(..., verify=False, ...)
+      - pattern: requests.head(..., verify=False, ...)
+      - pattern: requests.request(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)
+      - pattern: httpx.AsyncClient(..., verify=False, ...)
+
+  - id: aspis-js-tls-verify-disabled
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      TLS certificate verification is disabled (rejectUnauthorized: false). The
+      connection will accept any certificate and is exposed to MITM. Remove this
+      option or supply a trusted CA.
+    pattern: 'rejectUnauthorized: false'
+
+  - id: aspis-go-tls-verify-disabled
+    languages: [go]
+    severity: WARNING
+    message: >-
+      TLS certificate verification is disabled (InsecureSkipVerify: true). The
+      connection will accept any certificate and is exposed to MITM. Remove this
+      field or set it to false.
+    pattern: 'InsecureSkipVerify: true'
+
+  # --- Dynamic code execution -----------------------------------------------
+  - id: aspis-python-dynamic-exec
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Dynamic code execution (eval/exec) runs arbitrary code and is a common RCE
+      sink. If the input is ever attacker-influenced this is exploitable. Prefer
+      a parser, a lookup table, or ast.literal_eval for data.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: aspis-js-dynamic-eval
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Dynamic code execution (eval) runs arbitrary code and is a common XSS/RCE
+      sink. If the input is ever attacker-influenced this is exploitable. Avoid
+      eval; use JSON.parse for data or a dispatch table for behavior.
+    pattern: eval(...)
