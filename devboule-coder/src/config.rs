@@ -54,13 +54,21 @@ const ENV_MCP_APP_BIN: &str = "ASPIS_APP_BIN";
 /// it hashed into the session. Read from env and passed into `agent_register`
 /// only — never logged.
 const ENV_MCP_LAUNCH_TOKEN: &str = "DEVBOULE_MCP_LAUNCH_TOKEN";
+/// The Oracle-side project key (Phase 11.2). The local planner passes it to the
+/// `project_structure` / `plan_submit` MCP tools. The launch wiring sets it to the
+/// project the orchestrator was opened on; absent on the no-project dev path (the
+/// planner then escalates with a clear message instead of planning the wrong
+/// project). NOT a secret.
+const ENV_PROJECT_ID: &str = "DEVBOULE_PROJECT_ID";
 
 /// Build the runtime from the environment. Async because the real MCP backend
 /// connects to (spawns) the Oracle server during construction. Never panics:
 /// every real-path failure falls back to the safe default with a stderr note.
 pub async fn build_runtime() -> Runtime {
     let model = build_model();
-    let (executor, allow_egress) = build_executor().await;
+    // The executor needs a handle to the SAME model to drive the local planner
+    // (Phase 11.2), so build the model first and pass a clone into the executor.
+    let (executor, allow_egress) = build_executor(Arc::clone(&model)).await;
     Runtime { model, executor, allow_egress }
 }
 
@@ -85,7 +93,7 @@ fn build_model() -> Arc<dyn CoderModel> {
 /// The executor: the real MCP+FS+Exa executor when the MCP server connects, else
 /// the Stub. Returns `(executor, allow_egress)`; egress is on ONLY for the real
 /// executor with an Exa key.
-async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
+async fn build_executor(model: Arc<dyn CoderModel>) -> (Arc<dyn ToolExecutor>, bool) {
     // The FS backend is rooted at DEVBOULE_PROJECT_ROOT, defaulting to the cwd.
     let project_root = std::env::var(ENV_PROJECT_ROOT)
         .ok()
@@ -162,7 +170,14 @@ async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
         None => None,
     };
 
-    let executor = RealExecutor::new(mcp, fs, web, project_root);
+    // The planner needs the Oracle-side project key. Empty when unset: `run_planner`
+    // validates it non-empty BEFORE the first STRUCTURE MCP call and escalates with a
+    // clear "project_id not set" message (no wasted tool call) rather than submitting
+    // a plan against the wrong project.
+    let project_id = env_nonempty(ENV_PROJECT_ID).unwrap_or_default();
+
+    let executor = RealExecutor::new(mcp, fs, web, project_root)
+        .with_planner(model, project_id);
     let allow_egress = executor.egress_enabled();
     (Arc::new(executor), allow_egress)
 }

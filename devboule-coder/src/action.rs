@@ -233,7 +233,7 @@ fn check_text(field: &str, value: &str) -> Result<(), String> {
 /// on a non-Windows host, then walk components rejecting `..`, root/prefix, and
 /// any `-`-leading piece (argv-injection guard: a future tool may hand the path
 /// to a CLI where a `-`-leading name reads as a flag).
-fn check_rel_path(field: &str, raw: &str) -> Result<(), String> {
+pub(crate) fn check_rel_path(field: &str, raw: &str) -> Result<(), String> {
     if raw.trim().is_empty() {
         return Err(format!("`{field}` must not be empty"));
     }

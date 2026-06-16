@@ -31,6 +31,8 @@ use serde_json::json;
 
 use crate::action::AgentAction;
 use crate::agent_loop::{ToolExecutor, ToolResult, MAX_RESULT_LEN};
+use crate::model::CoderModel;
+use crate::planner::run_planner;
 
 // --- FS backend caps ---------------------------------------------------------
 // Bound the in-process walk so a pathological tree (a huge monorepo, a deeply
@@ -542,8 +544,15 @@ pub struct RealExecutor {
     mcp: std::sync::Arc<dyn McpBackend>,
     fs: FsBackend,
     web: Option<ExaBackend>,
-    #[allow(dead_code)] // retained for diagnostics / future per-action policy
     project_root: PathBuf,
+    /// The model that drives the LOCAL planner (Phase 11.2). `None` when no model
+    /// is configured (the no-config dev path), which disables the `plan` routine
+    /// with a clear error rather than running it against a missing model.
+    model: Option<std::sync::Arc<dyn CoderModel>>,
+    /// The Oracle-side project key the planner passes to `project_structure` /
+    /// `plan_submit`. Empty when not configured; the planner then escalates with a
+    /// precise message instead of submitting a plan against the wrong project.
+    project_id: String,
 }
 
 impl RealExecutor {
@@ -553,7 +562,29 @@ impl RealExecutor {
         web: Option<ExaBackend>,
         project_root: PathBuf,
     ) -> Self {
-        Self { mcp, fs, web, project_root }
+        Self {
+            mcp,
+            fs,
+            web,
+            project_root,
+            model: None,
+            project_id: String::new(),
+        }
+    }
+
+    /// Attach the planner inputs (the model that drives the local planner + the
+    /// Oracle-side project id). Builder-style so existing call sites / tests that
+    /// do not need the planner keep using [`RealExecutor::new`] unchanged. Without
+    /// this, the `plan` action escalates with a clear "planner not configured"
+    /// message rather than running half-wired.
+    pub fn with_planner(
+        mut self,
+        model: std::sync::Arc<dyn CoderModel>,
+        project_id: impl Into<String>,
+    ) -> Self {
+        self.model = Some(model);
+        self.project_id = project_id.into();
+        self
     }
 
     /// `true` when an Exa key is configured. The binary passes this as the
@@ -594,14 +625,14 @@ impl ToolExecutor for RealExecutor {
                 });
                 self.mcp_call("spawn_mini_coder", params).await
             }
-            // `plan` is recorded LOCALLY as a milestone — there is no server tool
-            // for it (do NOT invent one). The model gets an acknowledgement so it
-            // can proceed; the plan steps are already in the transcript.
-            AgentAction::Plan { steps } => ToolResult::ok(format!(
-                "plan recorded ({} step(s)): {}",
-                steps.len(),
-                steps.join(" | ")
-            )),
+            // `plan` triggers the LOCAL planner (Phase 11.2): STRUCTURE -> EXPLORE
+            // -> PLAN -> tasks.json -> plan_submit (the human gate). The goal is the
+            // model's `steps` joined into one framing line — the orchestrator emits
+            // its intent as plan steps, and the planner turns that into an atomic
+            // `tasks.json` for Phase 11.3's runner. The burst model gets back a
+            // COMPACT outcome line ("Plan: N tasks, submitted -> approved/…") so the
+            // outer loop knows the verdict without re-reading the plan.
+            AgentAction::Plan { steps } => self.run_plan(steps).await,
 
             // --- FS backend: in-process, root-confined, read-only -------------
             // The FS ops do BLOCKING syscalls (`std::fs`, the `ignore` walker), so
@@ -674,6 +705,37 @@ impl ToolExecutor for RealExecutor {
 }
 
 impl RealExecutor {
+    /// Drive the LOCAL planner for a `plan` action (Phase 11.2). The goal is the
+    /// joined plan `steps`. Requires the model + project id wired via
+    /// [`RealExecutor::with_planner`]; without them the action is an error the model
+    /// can recover from (never a panic). The planner persists `tasks.json` and
+    /// submits the plan through the human gate; on any planner error (structure
+    /// failure, no valid plan in the retry budget, plan_submit failure) we surface
+    /// the precise reason as a failed result.
+    async fn run_plan(&self, steps: &[String]) -> ToolResult {
+        let Some(model) = self.model.clone() else {
+            return ToolResult::err(
+                "plan: the local planner is not configured (no model wired); cannot plan",
+            );
+        };
+        // The goal is the model's intent: the plan steps as one framing line. The
+        // action layer already validated each step non-empty + bounded.
+        let goal = steps.join("\n");
+        match run_planner(
+            &goal,
+            model.as_ref(),
+            self.mcp.as_ref(),
+            &self.fs,
+            &self.project_id,
+            &self.project_root,
+        )
+        .await
+        {
+            Ok(outcome) => ToolResult::ok(outcome.compact_summary()),
+            Err(e) => ToolResult::err(format!("plan: {e}")),
+        }
+    }
+
     /// Dispatch one MCP `call_tool` and wrap its result. A backend error becomes
     /// a failed [`ToolResult`] the model can recover from, never a panic.
     async fn mcp_call(&self, name: &str, params: serde_json::Value) -> ToolResult {
@@ -779,19 +841,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_is_recorded_locally_without_a_server_tool() {
+    async fn plan_without_planner_configured_is_a_clear_error() {
+        // Phase 11.2: `plan` now drives the LOCAL planner. An executor built via
+        // `new` (no `with_planner`) has no model wired, so the action returns a
+        // clear not-configured error the model can recover from — and must NOT call
+        // any server tool (the planner short-circuits before STRUCTURE).
         let dir = tempdir().unwrap();
         let mcp = std::sync::Arc::new(MockMcpBackend::new());
         let exec = exec_with(dir.path(), mcp.clone());
         let r = exec
             .execute(&AgentAction::Plan { steps: vec!["a".into(), "b".into()] })
             .await;
-        assert!(r.ok);
-        assert!(r.output.contains("plan recorded"), "got: {}", r.output);
+        assert!(!r.ok, "plan without a wired planner is an error: {}", r.output);
+        assert!(
+            r.output.contains("not configured"),
+            "names the missing-planner cause: {}",
+            r.output
+        );
         assert!(
             mcp.calls.lock().unwrap().is_empty(),
-            "plan must NOT call any server tool"
+            "plan must NOT call any server tool when the planner is not configured"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_with_planner_drives_the_local_planner_and_submits() {
+        // With the planner wired (`with_planner`), the `plan` action runs the real
+        // STRUCTURE -> EXPLORE -> PLAN -> plan_submit routine against the mock MCP.
+        // The mock returns a one-file spine, a canned note from the scripted model,
+        // a valid plan, and an approved plan_submit; the compact result names the
+        // outcome. (The deep planner behavior is unit-tested in `crate::planner`.)
+        use crate::model::ScriptedModel;
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), b"fn a() {}\n").unwrap();
+
+        // A planner-aware mock MCP: a one-file spine, grounding, and an approved
+        // plan_submit. (Distinct from MockMcpBackend, which canned every call.)
+        struct PlannerMcp;
+        #[async_trait]
+        impl McpBackend for PlannerMcp {
+            async fn call_tool(&self, name: &str, _params: serde_json::Value) -> Result<String, String> {
+                match name {
+                    "project_structure" => Ok(json!({
+                        "spine": [{"path": "src/a.rs", "inDegree": 1, "topReferencedSymbols": ["a"]}],
+                        "summary": {"scanned": 1},
+                    })
+                    .to_string()),
+                    "oracle_context" => Ok("[grounding]".to_string()),
+                    "plan_submit" => Ok(json!({"planId": "p1", "status": "approved"}).to_string()),
+                    other => Err(format!("unexpected {other}")),
+                }
+            }
+        }
+
+        let note = format!(
+            "```note\n{}\n```",
+            json!({"source": "src/a.rs", "role": "core", "key_symbols": ["a"], "watch_out": ""})
+        );
+        let plan = format!(
+            "```plan\n{}\n```",
+            json!({"projectGoal": "g", "tasks": [{
+                "id": "T001", "title": "edit a", "scope": ["src/a.rs"], "contextFiles": [],
+                "acceptance": "cargo test", "dependsOn": [], "status": "pending", "attempts": 0,
+            }]})
+        );
+        let model: std::sync::Arc<dyn CoderModel> =
+            std::sync::Arc::new(ScriptedModel::new(vec![note, plan]));
+
+        let fs = FsBackend::new(dir.path()).unwrap();
+        let exec = RealExecutor::new(std::sync::Arc::new(PlannerMcp), fs, None, dir.path().to_path_buf())
+            .with_planner(model, "proj");
+
+        let r = exec
+            .execute(&AgentAction::Plan { steps: vec!["do the thing".into()] })
+            .await;
+        assert!(r.ok, "the planner succeeded: {}", r.output);
+        assert!(r.output.contains("approved"), "compact result names the verdict: {}", r.output);
+        assert!(r.output.contains("1 task"), "compact result names the task count: {}", r.output);
+        // The atomic artifact was persisted under the project root.
+        assert!(dir.path().join(".devboule/tasks.json").exists(), "tasks.json persisted");
     }
 
     // --- FS confinement -------------------------------------------------------

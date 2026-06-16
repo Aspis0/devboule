@@ -19,6 +19,7 @@ mod conversation;
 mod executor;
 mod model;
 mod model_client;
+mod planner;
 mod prompt;
 mod rmcp_backend;
 mod terminal;
