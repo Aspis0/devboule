@@ -389,3 +389,60 @@ reviewer → fix → next; whole-diff max-recall at the end.
 - Harness churn is real (Roo died, Continue pivoted in months) — prefer Apache/MIT +
   AAIF/Linux-Foundation governance (Goose) or a published embeddable SDK (Cline) to reduce
   lock-in to any single project.
+
+## Phase 11 — Planning & task decomposition (owner-approved 2026-06-15, GROUNDED)
+
+The local main coder must DECOMPOSE a goal into atomic, deterministically-verifiable tasks
+before executing — a 30-35B local model cannot reason over a whole codebase in one shot
+(models degrade hard past ~100K real tokens). Source: the owner's `devboule_local_orchestration`
+design (Agentless / TDAG / EffGen / Voyager / Aider-edit-formats / OpenDev / AGENTS.md-spec).
+Today the orchestrator's `plan` action is a STUB — this phase makes it real.
+
+**Architecture reconciliation (load-bearing — do NOT build a parallel system):** the doc's
+"Python-pure Orchestrator" + "Watchdog" + "Main/Mini/Censor loop" ALREADY EXIST as our
+`devboule-coder` (Rust orchestrator) + `mini_coder_executor.rs` (write→Censor-gate→fix/retry
+(budget)→escalate→stamp-findings-back) + the Kanban + `plan_submit`. The PLANNER is a CAPABILITY
+the orchestrator runs, reusing all of the above — not a second Python orchestrator.
+
+**Grounding of what EXISTS-REUSE vs NEW (verified 2026-06-15):**
+| Doc concept | Reality in repo | Verdict |
+|---|---|---|
+| Tree-sitter STRUCTURE phase | `censor/extract.rs` — per-file items + identifier set, 7 langs; **NO cross-file graph / in-degree / spine** | reuse extract; **BUILD the graph on top** |
+| Oracle as context | `oracle_context`/`oracle_ask` return semantic chunks; `dependencies:[]` always empty; no centrality | reuse for EXPLORE context; NOT for the graph |
+| Per-task watchdog/escalation | `mini_coder_executor.rs` retry(EmitEdits=1/Agentic=2/non-write=2)→escalate→`EscalationFinding[]` back; Censor feedback appended to `task` | **EXISTS-REUSE wholesale** |
+| tasks.json + Kanban | `project_*` tools; tasks live in project `.md` state block (`todo/wip/review/blocked/done`, `T<n>`); `PlansPanel.tsx`/`TaskCard.tsx`; **no `dependsOn`/DAG field** | reuse Kanban; **ADD a `dependsOn` field** (no separate tasks.json) |
+| Human plan gate | `plan_submit`/`plan_status` (markdown + approval bell + blocking poll) | **EXISTS-REUSE** as the planner's output gate |
+| Activity Console diff preview | `mini_activity.rs` Verdict/Action.diff structs + `AgentConsole.tsx` renderer wired, but executor emits `Vec::new()` diffs | reuse; **populate real unified-diff content** (additive) |
+| Edit format | exact `str_replace` (`MiniEdit{path,old_string,new_string}`, match-exactly-once); **no fuzzy** | reuse; **ADD fuzzy/whitespace fallback** |
+| Context builder | `build_mini_prompt` (scope files + skill + constraints + oracle grant + task+feedback); **no per-role token budget** | reuse; **ADD per-role token budgeting** |
+| Skills / AGENTS.md / per-role | **P10b DONE** (static, hand-authored SKILL.md per role, injected) — doc's own data: static 100% vs dynamic 79%; don't auto-generate | **DONE**; keep static; Oracle skill-routing optional, NOT default |
+
+**Sub-phases (GPU-free to build; live LLM = GPU-deferred; each: implement→verify→1 reviewer→fix→commit):**
+- **11.1 — STRUCTURE graph + spine ranking (NEW, Rust, deterministic, no LLM).** A new module
+  (e.g. `censor/structure.rs` or a planner crate) that reuses `extract_items` + the identifier
+  sets across ALL project files to build a cross-file symbol/import edge set → file in-degree →
+  the 5-8 highest-centrality "spine" files. Pure + unit-testable on a fixture tree. The load-
+  bearing new piece.
+- **11.2 — PLANNER (EXPLORE + PLAN), orchestrator-driven.** The `plan` action triggers: get the
+  spine (11.1) → per spine file, a BOUNDED EXPLORE call (the orchestrator's own model, ≤3 files /
+  ~20K ctx, structured note: role / key symbols / watch-out, via `oracle_context` for extra
+  grounding) → a single PLAN call → emit atomic tasks (`scope` ≤3 files, deterministic
+  `acceptance`, `dependsOn`) → `plan_submit` (existing human gate) → on approval, write the tasks
+  into the Kanban (`project_create_followup` + the new `dependsOn`).
+- **11.3 — `dependsOn` DAG field + linear runner.** Add `dependsOn: [taskId]` to the Kanban task
+  schema (`aspis_mcp.py` state block + `validate`); the orchestrator runs tasks whose deps are all
+  `done`, LINEAR-blocking first (DAG-parallel = v2), each task delegated to `spawn_mini` (the
+  existing executor carries the Censor/retry/escalate). BLOCKED → `ask_user`.
+- **11.4 — Context-builder + watchdog refinements.** Per-role token budgeting in `build_mini_prompt`
+  / the orchestrator `build_messages`; an output-hash loop-detector + context-overflow auto-split
+  (Rust) on top of the existing wall-clock/oscillation guards.
+- **11.5 — Edit fuzzy-fallback** in `apply_emitted_edits` (exact → whitespace-normalized →
+  difflib-style ratio>0.92 → structured error to Censor) + **populate real unified-diff content**
+  in the Activity Console so the task view shows diffs.
+- **11.6 — TUI/Console task-execution view** (task progress + diff preview + keys r/s/b/e),
+  extending the L2.1 TUI + the L1 Activity Console — not a new surface.
+
+**Caveats (some from the doc's own data):** do NOT auto-generate AGENTS.md/skills (−0.5-2% success,
++20% inference); keep skills static (P10b); the 35B/23B/6-10B hierarchy assumes models we may not
+all have — our mini is user-selectable + Censor=Gemma, the "Main 35B" = devboule-coder on a local
+35B. TDAG re-planning on BLOCKED = v2, not MVP. Sequence: finish L2 first, then 11.1→11.6.
