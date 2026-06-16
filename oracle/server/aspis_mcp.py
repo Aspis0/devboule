@@ -54,15 +54,28 @@ AGENTS_STATE_VERSION = 2
 VALID_PROJECT_STATUSES = {"active", "paused", "done", "archived"}
 VALID_TASK_STATUSES = {"todo", "wip", "review", "blocked", "done"}
 # Phase B role merge: spawn-time roles collapse to {coder, verifier}. The
-# coder PLANS and CODES (and may spawn subagents); "orchestrator" is no longer a
-# spawnable role. It survives ONLY as a back-compat inbound alias so old
-# launchers and old `.aspis-agents.json` sessions still register/load — they
-# normalize to coder. "orchestrator" then becomes a DERIVED UI badge (shown when
-# a session currently has subagents), not a stored spawn role.
+# coder PLANS and CODES (and may spawn subagents).
 # "mini" (P3) is the one-shot read-only sub-agent: oracle_context only, no
 # mutation tools — enforced by ROLE_ALLOWED_TOOLS via require_registered_role.
-VALID_ROLES = {"coder", "verifier", "mini"}
-ROLE_ALIASES = {"architect": "coder", "code": "coder", "orchestrator": "coder"}
+# "orchestrator" (devboule-coder): the FIRST-CLASS planning+delegation main
+# coder. The new Rust `devboule-coder` binary self-registers under this role.
+# BEHAVIOR CHANGE (deliberate): "orchestrator" was previously an ALIAS that
+# collapsed to "coder". It is now its OWN role and must NOT be normalized away —
+# otherwise its narrower allowlist (no direct file-write/mutation tool; it
+# delegates ALL writes to spawn_mini_coder) would never be reached. Its Kanban /
+# project semantics are IDENTICAL to coder's (see CODER_LIKE_ROLES) so it never
+# gains a verifier-only transition; it is strictly tighter-or-equal to coder.
+VALID_ROLES = {"coder", "verifier", "mini", "orchestrator"}
+# "orchestrator" intentionally REMOVED from the aliases below: as a first-class
+# role it normalizes to itself, not to coder.
+ROLE_ALIASES = {"architect": "coder", "code": "coder"}
+# Roles that share the coder's project/Kanban transition + claim semantics. The
+# orchestrator is the planning main coder, so it gets EXACTLY the coder's
+# task-status powers (claim todo/wip/blocked, set todo/wip/review/blocked, reopen
+# to todo) — never the verifier-only `done`. Used by validate_transition and
+# project_claim_task so the orchestrator mirrors the coder there without widening
+# any gate (tighter-or-equal to coder, never broader).
+CODER_LIKE_ROLES = {"coder", "orchestrator"}
 MAX_EVENTS = 300
 # FIX 6: hard caps so a long-lived `.aspis-agents.json` cannot grow without bound
 # (every register/heartbeat/claim appended forever). Enforced at the single
@@ -271,6 +284,65 @@ ROLE_RULES = [
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
             "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
+            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+        ],
+    },
+    {
+        # ORCHESTRATOR (devboule-coder): the MAIN coder that PLANS + DELEGATES. The
+        # new Rust `devboule-coder` binary self-registers under this role. It owns
+        # the same Kanban/transition powers as the coder (CODER_LIKE_ROLES) but
+        # holds NO direct file-write/mutation tool of its own: EVERY write is
+        # delegated to spawn_mini_coder. Its allowlist is a STRICT SUBSET of the
+        # coder's (tighter-or-equal, never broader) — no Censor dispose, no
+        # provider/cloudflare/scaleway tool, no verifier-only transition.
+        "role": "orchestrator",
+        "summary": "Coder principale che PIANIFICA e DELEGA: capisce il progetto via oracle_ask/oracle_context, delega OGNI scrittura a spawn_mini_coder, gestisce il Kanban come un coder (claim, wip/review/blocked, riapri a todo) ma il done resta verifier; pubblica via request_git_push col gate umano.",
+        # Plan-approval + reply-box mandate (same shape as the coder's). Prima di
+        # lavoro multi-file l'orchestrator sottomette il piano e ASPETTA
+        # l'approvazione umana — "mai full-auto non presidiato".
+        "plan": [
+            "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare la delega prima di status=\"approved\".",
+            "Se il piano viene rifiutato (status=\"rejected\") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.",
+            "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
+        ],
+        # Cooperative push mandate (identical to the coder's): commit freely, never
+        # raw-push, publish only via the human-approved request_git_push gate.
+        "push": [
+            "Committa liberamente (git add -u / git commit) per salvare il lavoro.",
+            "NON fare mai un `git push` grezzo: il tuo ambiente non ha credenziali git e fallira. Per pubblicare chiama il tool MCP `request_git_push`; un umano lo approva.",
+            "Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all'umano via ask_user. NON riprovare, NON tentare un push grezzo, NON aggirare il gate.",
+        ],
+        "allowedTools": [
+            "agent_register",
+            "agent_heartbeat",
+            "agent_state",
+            "project_list",
+            "project_get",
+            "project_next_task",
+            "project_claim_task",
+            "project_update_status",
+            "project_append_note",
+            "project_create_followup",
+            "oracle_ask",
+            "oracle_context",
+            "spawn_mini_coder",
+            "request_git_push",
+            "plan_submit",
+            "plan_status",
+            "ask_user",
+        ],
+        "forbidden": [
+            "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per spawn_mini_coder (tu pianifichi e riveli il contesto; il mini scrive).",
+            "Per domande su progetto o codebase usa PRIMA oracle_ask / oracle_context (capacita di comprensione grounded): non indovinare ne leggere il filesystem a mano.",
+            "Non imposta done: e verifier-only con evidenza. Tu puoi solo claim e wip/review/blocked (e riapertura a todo), esattamente come un coder.",
+            "Ogni cambiamento passa per Censor + il Kanban + il gate umano: mai full-auto non presidiato. Quando un sotto-task e pronto, mettilo in review con una nota e lascia il verdetto finale al verifier.",
+            "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via ask_user.",
+            "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), FERMATI ed escala all'umano via ask_user invece di rilanciare ciecamente lo stesso file.",
+            "Non legge o stampa token o segreti. Usa solo token da env e scope Aspis Bio verificato; nessun provider OpenAI/Anthropic-API/GCP/AWS sui dati utente (solo Scaleway/Infomaniak EU, ZDR).",
+        ],
+        "contract": [
+            "Dichiara il modello (`model`) ad agent_register.",
+            "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
             "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
         ],
     },
@@ -2089,8 +2161,8 @@ def upsert_session(
         session = {"agentId": clean_agent_id, "firstSeenAt": now()}
         state["sessions"].append(session)
     # BLOCKER 1: never DOWNGRADE a stored alias role to its own canonical. A legacy
-    # session stored as role="orchestrator" (or "architect"/"code") normalizes to
-    # "coder", and callers (e.g. agent_heartbeat) pass that normalized "coder" in.
+    # session stored as role="orchestrator" is now first-class and normalizes to
+    # "orchestrator" (not downgraded); "architect" and "code" still normalize to "coder".
     # Writing it back would destroy the legacy role string on disk and with it the
     # derived UI badge, diverging from Rust (which never rewrites the role). So when
     # the session ALREADY has a role whose normalized form equals the incoming
@@ -2239,7 +2311,9 @@ def validate_transition(
         raise McpError("Done tasks cannot be changed through project_update_status.")
     # Phase B merge: the coder absorbs the former orchestrator's planning power,
     # so it may also reopen a task to `todo` (in addition to wip/review/blocked).
-    if role == "coder" and status not in {"todo", "wip", "review", "blocked"}:
+    # The orchestrator (devboule-coder) shares these exact coder semantics
+    # (CODER_LIKE_ROLES) — same status set, never the verifier-only `done`.
+    if role in CODER_LIKE_ROLES and status not in {"todo", "wip", "review", "blocked"}:
         raise McpError("Coder can only set todo, wip, review or blocked.")
     if role == "verifier" and status not in {"done", "blocked"}:
         raise McpError("Verifier can only set done or blocked.")
@@ -4252,7 +4326,7 @@ def dispose_censor_finding(
             caller_role = ""
 
         # WARNING 2 precedence: a coder cannot override a verifier's adjudication.
-        if caller_role == "coder":
+        if caller_role in CODER_LIKE_ROLES:
             current = str(target.get("disposition", "open") or "open")
             if (
                 current in CENSOR_VERIFIER_ADJUDICATED
@@ -4786,8 +4860,8 @@ def dispatch_request_git_push(
     the Rust approve command (which injects the credential off argv via GIT_ASKPASS).
 
     GATING: the CALLER (`agent_id`/`role`/`session_token`) is validated via
-    `require_agent_tool`; `request_git_push` is in the coder role's allowedTools
-    ONLY (a verifier cannot call it). The caller must be a LIVE session.
+    `require_agent_tool`; `request_git_push` is in the coder or orchestrator role's
+    allowedTools ONLY (a verifier cannot call it). The caller must be a LIVE session.
     """
     # 1) Authn/authz the CALLER (registered coder + valid session token).
     agent_id, role = require_agent_tool(projects_dir, args, "request_git_push")
@@ -5056,8 +5130,8 @@ def dispatch_plan_submit(
     a synthesized `timeout` and best-effort stamps the still-pending request `timeout`.
 
     GATING: the CALLER is validated via `require_agent_tool`; `plan_submit` is in the
-    coder role's allowedTools ONLY (a verifier cannot call it). The caller must be a
-    LIVE session.
+    coder or orchestrator role's allowedTools ONLY (a verifier cannot call it). The
+    caller must be a LIVE session.
     """
     # 1) Authn/authz the CALLER (registered coder + valid session token).
     agent_id, role = require_agent_tool(projects_dir, args, "plan_submit")
@@ -5621,11 +5695,11 @@ def handle_tool_call(
                 and claim.get("agentId") != agent_id
                 and claim_is_active(claim)
             }
-        # WARNING 4/6: only {coder, verifier} reach here — `role` comes from
-        # require_agent_tool -> normalize_role, which collapses every alias to one of
-        # the two canonical roles and RAISES on anything else. The former third
-        # ("orchestrator") branch with a "review" fallback was therefore unreachable
-        # dead code; coder is the canonical default for the merged former-orchestrator.
+        # WARNING 4/6: only {coder, orchestrator, verifier} reach here — `role` comes
+        # from require_agent_tool -> normalize_role, which returns "orchestrator" as a
+        # first-class role (no longer an alias). Orchestrator and coder fall into the
+        # same `else` branch by design (same Kanban semantics); the runtime behavior is
+        # unchanged, only the comment was previously wrong about the normalized roles.
         if role == "verifier":
             preferred = ["review", "blocked"]
         else:
@@ -5681,9 +5755,12 @@ def handle_tool_call(
                     raise McpError("Done tasks cannot be claimed.")
                 if role == "verifier" and task_status not in {"review", "blocked"}:
                     raise McpError("Verifier agents can only claim review or blocked tasks.")
-                if role == "coder" and task_status not in {"todo", "wip", "blocked"}:
+                # Orchestrator shares the coder's claim semantics (CODER_LIKE_ROLES):
+                # it may claim todo/wip/blocked and auto-advances a todo to wip. It is
+                # NOT a verifier, so it can never claim a review task — tighter-or-equal.
+                if role in CODER_LIKE_ROLES and task_status not in {"todo", "wip", "blocked"}:
                     raise McpError("Coder agents can only claim todo, wip or blocked tasks.")
-                if role == "coder" and task_status == "todo":
+                if role in CODER_LIKE_ROLES and task_status == "todo":
                     task["status"] = "wip"
                     task["updatedAt"] = now()
                     project["metadata"]["status"] = "active"
@@ -5698,7 +5775,7 @@ def handle_tool_call(
                     )
                     project = write_project_file(project)
             lease_until = (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat()
-            claim_status = "wip" if role == "coder" and task.get("status") == "wip" else "claimed"
+            claim_status = "wip" if role in CODER_LIKE_ROLES and task.get("status") == "wip" else "claimed"
             state["claims"] = [
                 item
                 for item in state["claims"]

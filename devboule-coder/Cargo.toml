@@ -45,6 +45,30 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
+# L2.3 async seams. `async-trait` makes the `ToolExecutor` / `CoderModel` traits
+# object-safe with `async fn` bodies, so the binary can keep holding `Arc<dyn …>`
+# while the executor/model do real async I/O. Tiny proc-macro crate, no runtime
+# weight; it already resolves transitively under tokio's tree so it adds no
+# ratatui/crossterm duplicate.
+async-trait = "0.1"
+# L2.3 executor I/O. `rmcp` is the official MCP Rust SDK: a `client` + an
+# `stdio`-style `transport-child-process` to spawn and talk to the Oracle MCP
+# server, plus `macros`. `reqwest` (rustls, no native-tls / no OpenSSL) is the
+# single HTTP client shared by BOTH the Exa web backend AND the loopback oMLX
+# chat-completions model client — one HTTP stack, no `async-openai` (which would
+# pull a second reqwest + backoff/derive tree for a single loopback call). The
+# local FS backend uses `ignore` (the ripgrep walker: gitignore-aware, fast,
+# skips `.git`/`target`/dotdirs for us) + `globset` for the `glob` action.
+rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process", "macros"] }
+# `stream` enables `Response::bytes_stream` so HTTP bodies are read CAPPED (the
+# Exa + loopback clients never buffer a gigabyte whole). It pulls only `tokio-util`
+# codec glue already in the tree under tokio — no new ratatui/crossterm duplicate.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+ignore = "0.4"
+globset = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+# L2.3 FS-backend confinement tests build a real tempdir tree (confined read,
+# `..`-escape rejection, planted grep match, glob listing, symlink-out non-traversal).
+tempfile = "3"

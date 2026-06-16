@@ -13,6 +13,7 @@ from oracle.server.aspis_mcp import (
     APP_VAULT_ACCOUNTS,
     MAX_CLAIMS,
     MAX_SESSIONS,
+    ROLE_ALIASES,
     ROLE_ALLOWED_TOOLS,
     ROLE_RULES,
     VALID_ROLES,
@@ -365,9 +366,9 @@ root_path: "{escaped_work_root}"
 
     def test_legacy_orchestrator_can_claim_but_only_verifier_closes(self):
         # BACK-COMPAT FIXTURE: this agent registers and operates with the legacy
-        # role="orchestrator", which now normalizes to coder. It can claim and
-        # (as a coder) move to review/blocked, but it still cannot self-close;
-        # only a verifier sets done.
+        # role="orchestrator", which now normalizes to itself (first-class role).
+        # It can claim and (as an orchestrator/coder-like) move to review/blocked,
+        # but it still cannot self-close; only a verifier sets done.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects = root / "projects"
@@ -3293,9 +3294,14 @@ class NormalizeSubagentsTests(unittest.TestCase):
         )
 
     def test_role_alias_normalized(self):
-        # Phase B merge: the architect/orchestrator aliases both fold to coder.
+        # Phase B merge: the architect alias folds to coder; orchestrator is first-class.
         result = normalize_subagents([{"label": "plan", "model": "opus", "count": 1, "role": "architect"}])
         self.assertEqual(result[0]["role"], "coder")
+
+    def test_orchestrator_role_preserved(self):
+        # Orchestrator is now a first-class role and normalizes to itself.
+        result = normalize_subagents([{"label": "plan", "model": "opus", "count": 1, "role": "orchestrator"}])
+        self.assertEqual(result[0]["role"], "orchestrator")
 
     def test_invalid_role_becomes_none(self):
         result = normalize_subagents([{"label": "x", "model": "opus", "count": 1, "role": "wizard"}])
@@ -3405,19 +3411,24 @@ class RoleRulesContractTests(unittest.TestCase):
 
 
 class RoleMergeTests(unittest.TestCase):
-    """Phase B role merge: spawn roles collapse to {coder, verifier};
-    'orchestrator' survives only as a back-compat inbound alias that normalizes
-    to coder, and the coder rule carries the folded planning mandate."""
+    """Phase B role merge: spawn roles collapse to {coder, verifier}; P3 added the
+    read-only 'mini' leaf. DEVBOULE: 'orchestrator' is now a FIRST-CLASS role (the
+    devboule-coder main planner/delegator), NO LONGER an alias to coder — it
+    normalizes to itself and carries its own narrower (tighter-or-equal) allowlist."""
 
-    def test_valid_roles_are_coder_verifier_and_mini(self):
-        # Phase B collapsed the spawn roles to {coder, verifier}; P3 then added
-        # "mini" as the one-shot read-only leaf (oracle_context only).
-        self.assertEqual(VALID_ROLES, {"coder", "verifier", "mini"})
+    def test_valid_roles_are_coder_verifier_mini_and_orchestrator(self):
+        # Phase B collapsed the spawn roles to {coder, verifier}; P3 added "mini"
+        # (read-only leaf); DEVBOULE promoted "orchestrator" to a first-class role.
+        self.assertEqual(VALID_ROLES, {"coder", "verifier", "mini", "orchestrator"})
 
-    def test_orchestrator_normalizes_to_coder(self):
-        # Back-compat hinge: an inbound 'orchestrator' (old launchers, old
-        # .aspis-agents.json sessions re-registering) maps to coder.
-        self.assertEqual(normalize_role("orchestrator"), "coder")
+    def test_orchestrator_normalizes_to_itself_not_coder(self):
+        # DEVBOULE behavior change: 'orchestrator' was previously an ALIAS that
+        # collapsed to coder. As a first-class role it now normalizes to ITSELF,
+        # so its narrower allowlist is actually reached (an alias would route the
+        # gate through the coder's broader set). 'orchestrator' is no longer in
+        # ROLE_ALIASES.
+        self.assertEqual(normalize_role("orchestrator"), "orchestrator")
+        self.assertNotIn("orchestrator", ROLE_ALIASES)
 
     def test_architect_alias_normalizes_to_coder(self):
         self.assertEqual(normalize_role("architect"), "coder")
@@ -3435,9 +3446,9 @@ class RoleMergeTests(unittest.TestCase):
         with self.assertRaises(McpError):
             normalize_role("hacker")
 
-    def test_role_rules_keys_are_coder_verifier_and_mini(self):
+    def test_role_rules_keys_are_coder_verifier_mini_and_orchestrator(self):
         roles = {rule["role"] for rule in ROLE_RULES}
-        self.assertEqual(roles, {"coder", "verifier", "mini"})
+        self.assertEqual(roles, {"coder", "verifier", "mini", "orchestrator"})
 
     def test_coder_rule_carries_folded_planning_mandate(self):
         coder = next(rule for rule in ROLE_RULES if rule["role"] == "coder")
@@ -3446,7 +3457,10 @@ class RoleMergeTests(unittest.TestCase):
         self.assertIn("project_create_followup", coder["allowedTools"])
         self.assertIn("plan", coder["summary"].lower())
 
-    def test_register_orchestrator_stores_coder_session(self):
+    def test_register_orchestrator_stores_orchestrator_session(self):
+        # DEVBOULE: registering as "orchestrator" now stores the role VERBATIM (no
+        # collapse to coder). The session must be read back under role="orchestrator"
+        # (reading as "coder" would now be a role mismatch — see the mismatch test).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prepare_management_root(root)
@@ -3455,7 +3469,7 @@ class RoleMergeTests(unittest.TestCase):
                 handle_tool_call(
                     "agent_register",
                     {
-                        "agent_id": "legacy-orch-1",
+                        "agent_id": "devboule-orch-1",
                         "role": "orchestrator",
                         "model": "opus",
                         "message": "starting",
@@ -3464,12 +3478,238 @@ class RoleMergeTests(unittest.TestCase):
                 )
                 state = handle_tool_call(
                     "agent_state",
-                    {"agent_id": "legacy-orch-1", "role": "coder"},
+                    {"agent_id": "devboule-orch-1", "role": "orchestrator"},
                     root=root,
                 )
             finally:
                 os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
-            self.assertEqual(state["sessions"][0]["role"], "coder")
+            self.assertEqual(state["sessions"][0]["role"], "orchestrator")
+
+
+class OrchestratorRoleTests(unittest.TestCase):
+    """DEVBOULE: the first-class `orchestrator` role (the devboule-coder main
+    planner/delegator). Pins its allowlist (PRIMARY oracle + delegation + the
+    coder-equivalent Kanban tools + the human gate), and pins that it is
+    tighter-or-equal to coder: NO direct write/mutation tool, NO Censor dispose,
+    NO verifier-only transition, NO provider/secret tool."""
+
+    def setUp(self):
+        # Tokenless self-registration so the role-gate (not the launch-token gate)
+        # is what these tests exercise — same pattern as the other role tests.
+        self._old = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
+        else:
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old
+
+    def _register_orchestrator(self, root: Path, agent_id: str = "orch") -> None:
+        handle_tool_call(
+            "agent_register",
+            {"agent_id": agent_id, "role": "orchestrator", "model": "opus", "message": "planning"},
+            root=root,
+        )
+
+    # --- Allowlist shape (server-side gate is ROLE_ALLOWED_TOOLS) ---------------
+
+    def test_orchestrator_allowlist_is_strict_subset_of_coder(self):
+        # No privilege escalation: every orchestrator tool is also a coder tool.
+        orch = ROLE_ALLOWED_TOOLS["orchestrator"]
+        coder = ROLE_ALLOWED_TOOLS["coder"]
+        self.assertTrue(orch <= coder, f"orchestrator gained non-coder tools: {sorted(orch - coder)}")
+        # And it is genuinely tighter (drops the provider/censor/visual tools).
+        self.assertTrue(orch < coder)
+
+    def test_orchestrator_allowlist_exact_contents(self):
+        self.assertEqual(
+            ROLE_ALLOWED_TOOLS["orchestrator"],
+            {
+                "agent_register",
+                "agent_heartbeat",
+                "agent_state",
+                "project_list",
+                "project_get",
+                "project_next_task",
+                "project_claim_task",
+                "project_update_status",
+                "project_append_note",
+                "project_create_followup",
+                "oracle_ask",
+                "oracle_context",
+                "spawn_mini_coder",
+                "request_git_push",
+                "plan_submit",
+                "plan_status",
+                "ask_user",
+            },
+        )
+
+    def test_orchestrator_has_no_write_mutation_or_secret_tool(self):
+        # It delegates ALL writes to spawn_mini_coder, so it must NOT itself hold a
+        # direct file-write/mutation tool, a Censor dispose, or any provider/secret
+        # tool. These would each be a privilege escalation over its mandate.
+        orch = ROLE_ALLOWED_TOOLS["orchestrator"]
+        for forbidden in (
+            "censor_findings",
+            "censor_dispose",
+            "visual_check",
+            "provider_credentials_status",
+            "cloudflare_list_workers",
+            "cloudflare_rotate_worker_secret",
+            "scaleway_list_resources",
+            "scaleway_resource_action",
+        ):
+            self.assertNotIn(forbidden, orch)
+
+    def test_role_gate_allows_orchestrator_for_its_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            self._register_orchestrator(root)
+            for tool in (
+                "oracle_ask",
+                "oracle_context",
+                "spawn_mini_coder",
+                "ask_user",
+                "request_git_push",
+                "project_get",
+                "project_list",
+                "project_next_task",
+                "project_claim_task",
+                "project_update_status",
+                "project_append_note",
+                "project_create_followup",
+                "plan_submit",
+                "plan_status",
+            ):
+                self.assertEqual(
+                    require_registered_role(projects, "orch", "orchestrator", tool),
+                    "orchestrator",
+                    tool,
+                )
+
+    def test_role_gate_rejects_orchestrator_for_non_allowlisted_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            self._register_orchestrator(root)
+            for tool in (
+                "censor_dispose",
+                "censor_findings",
+                "visual_check",
+                "provider_credentials_status",
+                "cloudflare_rotate_worker_secret",
+                "scaleway_resource_action",
+            ):
+                with self.assertRaises(McpError, msg=tool):
+                    require_registered_role(projects, "orch", "orchestrator", tool)
+
+    # --- End-to-end tool dispatch (allowed) ------------------------------------
+
+    def test_orchestrator_can_read_and_create_followup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            self._register_orchestrator(root)
+            got = handle_tool_call(
+                "project_get",
+                {"project_id": "scrna-seq", "agent_id": "orch", "role": "orchestrator"},
+                root=root,
+            )
+            self.assertEqual(got["metadata"]["id"], "scrna-seq")
+            # A coder-equivalent Kanban write (NOT verifier-only) succeeds.
+            handle_tool_call(
+                "project_create_followup",
+                {
+                    "project_id": "scrna-seq",
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "title": "Follow-up from orchestrator",
+                    "reason": "Orchestrator holds coder-equivalent Kanban powers.",
+                },
+                root=root,
+            )
+
+    def test_orchestrator_claims_like_a_coder_and_moves_to_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            self._register_orchestrator(root)
+            claimed = handle_tool_call(
+                "project_claim_task",
+                {"project_id": "scrna-seq", "task_id": "T1", "agent_id": "orch", "role": "orchestrator"},
+                root=root,
+            )
+            # Same as coder: claiming a todo auto-advances it to wip.
+            self.assertEqual(claimed["claims"][0]["status"], "wip")
+            reviewed = handle_tool_call(
+                "project_update_status",
+                {
+                    "project_id": "scrna-seq",
+                    "task_id": "T1",
+                    "status": "review",
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "evidence": "Delegated implementation is ready for verifier handoff.",
+                    "confidence": 0.6,
+                },
+                root=root,
+            )
+            self.assertEqual(reviewed["state"]["tasks"][0]["status"], "review")
+
+    # --- Rejections (role gate / verifier-only transition / mismatch) ----------
+
+    def test_orchestrator_cannot_set_done_verifier_only_transition(self):
+        # Mirrors test_coder_cannot_close_task_without_verifier: the orchestrator
+        # shares the coder's transitions, so `done` (verifier-only) is rejected.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            self._register_orchestrator(root)
+            handle_tool_call(
+                "project_claim_task",
+                {"project_id": "scrna-seq", "task_id": "T1", "agent_id": "orch", "role": "orchestrator"},
+                root=root,
+            )
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "project_update_status",
+                    {
+                        "project_id": "scrna-seq",
+                        "task_id": "T1",
+                        "status": "done",
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                        "evidence": "I think the delegated work is complete.",
+                        "confidence": 0.95,
+                    },
+                    root=root,
+                )
+
+    def test_orchestrator_role_mismatch_when_calling_as_coder(self):
+        # Registered as orchestrator, a tool call claiming role="coder" hits the
+        # role-mismatch gate (mirrors test_mini_cannot_act_or_reregister_as_coder).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            self._register_orchestrator(root)
+            with self.assertRaises(McpError) as ctx:
+                require_registered_role(projects, "orch", "coder", "oracle_ask")
+            self.assertIn("mismatch", str(ctx.exception).lower())
 
 
 def _write_legacy_agents_state(projects: Path, state: dict) -> None:
@@ -3532,9 +3772,13 @@ class LegacyRolePersistenceTests(unittest.TestCase):
             # The stored role string is PRESERVED verbatim across the heartbeat.
             self.assertEqual(session["role"], "orchestrator")
 
-    def test_legacy_orchestrator_session_functions_as_coder_for_permissions(self):
-        # The preserved badge role still behaves as a coder for tool gating: it can
-        # use a coder-only tool (project_create_followup is NOT in the verifier set).
+    def test_orchestrator_session_functions_with_coder_kanban_powers(self):
+        # DEVBOULE: a session stored as "orchestrator" now acts AS orchestrator (no
+        # collapse to coder), so it must request role="orchestrator". It still has
+        # the coder's Kanban powers (project_create_followup is in its allowlist and
+        # NOT verifier-only), proving the first-class role keeps coder-equivalent
+        # project tools. Requesting role="coder" against this stored role would now
+        # be a role mismatch (covered by the dedicated mismatch test).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects = root / "projects"
@@ -3557,16 +3801,15 @@ class LegacyRolePersistenceTests(unittest.TestCase):
                     "events": [],
                 },
             )
-            # A coder-only tool succeeds when the agent requests role="coder"
-            # (the alias the legacy role normalizes to).
+            # A coder-equivalent Kanban tool succeeds under role="orchestrator".
             handle_tool_call(
                 "project_create_followup",
                 {
                     "project_id": "scrna-seq",
                     "agent_id": "orch-legacy",
-                    "role": "coder",
-                    "title": "Follow-up from legacy orchestrator",
-                    "reason": "Confirm the legacy session still has coder powers.",
+                    "role": "orchestrator",
+                    "title": "Follow-up from orchestrator",
+                    "reason": "Confirm the orchestrator session has coder-equivalent Kanban powers.",
                 },
                 root=root,
             )
@@ -3637,21 +3880,24 @@ class LegacyRolePersistenceTests(unittest.TestCase):
                 {"agent_id": "orch-legacy", "status": "active", "message": "alive"},
                 root=root,
             )
-            # Usable: next-task selection works for the coder alias.
+            # Usable: next-task selection works under the (now first-class)
+            # orchestrator role — the stored role is "orchestrator", so the request
+            # must match it (a "coder" request would be a role mismatch now).
             nxt = handle_tool_call(
                 "project_next_task",
-                {"project_id": "scrna-seq", "agent_id": "orch-legacy", "role": "coder"},
+                {"project_id": "scrna-seq", "agent_id": "orch-legacy", "role": "orchestrator"},
                 root=root,
             )
             self.assertEqual(nxt["task"]["id"], "T1")
-            # Usable: claim works and the legacy claim/event are still present after.
+            # Usable: claim works (orchestrator shares the coder's claim semantics)
+            # and the legacy claim/event are still present after.
             claimed = handle_tool_call(
                 "project_claim_task",
                 {
                     "project_id": "scrna-seq",
                     "task_id": "T1",
                     "agent_id": "orch-legacy",
-                    "role": "coder",
+                    "role": "orchestrator",
                 },
                 root=root,
             )
@@ -3778,7 +4024,9 @@ class StoredRoleSanitizationTests(unittest.TestCase):
 
     def test_coerce_role_maps_unknown_to_coder_and_preserves_canonical(self):
         self.assertEqual(coerce_role("admin"), "coder")
-        self.assertEqual(coerce_role("orchestrator"), "coder")
+        # DEVBOULE: "orchestrator" is now a first-class VALID role, so coerce_role
+        # preserves it verbatim (it previously folded to coder via ROLE_ALIASES).
+        self.assertEqual(coerce_role("orchestrator"), "orchestrator")
         self.assertEqual(coerce_role("verifier"), "verifier")
         self.assertEqual(coerce_role("coder"), "coder")
         self.assertEqual(coerce_role(""), "coder")
@@ -3962,10 +4210,23 @@ class AllowedToolsCrossLanguageMirrorTests(unittest.TestCase):
             result[match.group("role")] = tools
         return result
 
+    # SERVER-ONLY role: "orchestrator" (devboule-coder) is enforced by THIS MCP
+    # server's ROLE_ALLOWED_TOOLS gate. The Rust `default_role_rules()` in agents.rs
+    # is the desktop-app fleet-UI copy and is owned separately; the new Rust
+    # `devboule-coder` binary is a thin client that REGISTERS as "orchestrator", it
+    # does not re-declare the role's allowlist. So orchestrator is intentionally NOT
+    # in the agents.rs mirror — exclude it from the cross-language parity comparison
+    # rather than weaken the server-side allowlist that actually gates the role.
+    PYTHON_ONLY_ROLES = {"orchestrator"}
+
     def test_allowed_tools_match_rust_default_role_rules(self):
         rust = self._parse_rust_allowed_tools()
         self.assertTrue(rust, "failed to parse allowed_tools from agents.rs")
-        python = {rule["role"]: list(rule["allowedTools"]) for rule in ROLE_RULES}
+        python = {
+            rule["role"]: list(rule["allowedTools"])
+            for rule in ROLE_RULES
+            if rule["role"] not in self.PYTHON_ONLY_ROLES
+        }
         self.assertEqual(set(python), set(rust))
         for role in python:
             self.assertEqual(
@@ -5231,6 +5492,15 @@ class CensorRoleMandateTests(unittest.TestCase):
             if rule["role"] == "mini":
                 # P3: the mini is a read-only oracle leaf — censor adjudication
                 # stays a coder/verifier duty, so the mini gets NO censor tools.
+                self.assertNotIn("censor_findings", rule["allowedTools"])
+                self.assertNotIn("censor_dispose", rule["allowedTools"])
+                continue
+            if rule["role"] == "orchestrator":
+                # The orchestrator (devboule-coder) PLANS and DELEGATES every write
+                # to spawn_mini_coder; the per-step Censor consumption happens inside
+                # the spawned mini / the coder, and residual adjudication stays with
+                # the verifier. So the orchestrator deliberately carries NO censor
+                # tool — it must never dispose a finding (tighter-or-equal to coder).
                 self.assertNotIn("censor_findings", rule["allowedTools"])
                 self.assertNotIn("censor_dispose", rule["allowedTools"])
                 continue

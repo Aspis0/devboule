@@ -318,8 +318,38 @@ fn check_url(url: &str) -> Result<(), String> {
         .trim_end_matches(']')
         .to_ascii_lowercase();
 
-    // The IPv6 brackets are already stripped above, so a bracketed `[::1]` is
-    // normalised to `::1` and matched by that entry.
+    // IP-aware block: PARSE the host as an IP and reject the whole loopback /
+    // unspecified ranges, not just specific literals. A plain string blocklist
+    // only catches `127.0.0.1`, so `127.0.0.2` / `127.1.2.3` (all of 127/8) and
+    // `::ffff:127.x` (IPv4-mapped loopback) slip through — exactly the SSRF holes
+    // we must close here, at parse time, before a fetch is ever dispatched.
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        // `is_loopback()` covers all of 127.0.0.0/8; also block the unspecified
+        // 0.0.0.0 and the cloud-metadata link-local address.
+        if v4.is_loopback()
+            || v4.is_unspecified()
+            || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
+        {
+            return Err(format!("url host `{host_raw}` is not allowed (internal/loopback)"));
+        }
+    } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        // `::1` (loopback) and `::` (unspecified) directly; plus the IPv4-mapped
+        // form `::ffff:a.b.c.d`, which `is_loopback()` does NOT flag, so unwrap the
+        // embedded v4 and re-apply the v4 rules.
+        let mapped_blocked = v6.to_ipv4_mapped().is_some_and(|v4| {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
+        });
+        if v6.is_loopback() || v6.is_unspecified() || mapped_blocked {
+            return Err(format!("url host `{host_raw}` is not allowed (internal/loopback)"));
+        }
+    }
+
+    // Non-IP hosts (and any IP not caught above): keep the literal string checks.
+    // `localhost` is a name, not an IP, so the IP parse above never sees it; the
+    // bracketed `[::1]` was normalised to `::1` and is already caught as an IPv6
+    // loopback, but it stays listed for clarity/defence in depth.
     const BLOCKED_HOSTS: [&str; 5] = [
         "localhost",
         "127.0.0.1",
@@ -1023,6 +1053,49 @@ mod tests {
                 url: "https://example.com/x".into()
             }
         );
+    }
+
+    #[test]
+    fn fetch_loopback_ip_outside_127_0_0_1_is_invalid() {
+        // FIX 8: the old string blocklist only caught 127.0.0.1; the whole 127/8
+        // range is loopback and must be rejected (SSRF), so 127.0.0.2 and
+        // 127.1.2.3 must both fail now.
+        for url in [
+            "http://127.0.0.2/x",
+            "http://127.1.2.3/x",
+            "http://127.255.255.254/admin",
+        ] {
+            let out = block(&format!(r#"{{"tool":"fetch","url":"{url}"}}"#));
+            match parse_action(&out) {
+                Err(FormatError::Invalid(msg)) => {
+                    assert!(msg.contains("not allowed"), "{url}: {msg}")
+                }
+                other => panic!("expected Invalid for loopback {url}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_ipv4_mapped_ipv6_loopback_is_invalid() {
+        // FIX 8: `::ffff:127.0.0.1` is IPv4-mapped loopback; Ipv6Addr::is_loopback
+        // does NOT flag it, so the mapped-v4 unwrap must catch it.
+        let out = block(r#"{"tool":"fetch","url":"http://[::ffff:127.0.0.1]/x"}"#);
+        match parse_action(&out) {
+            Err(FormatError::Invalid(msg)) => assert!(msg.contains("not allowed"), "{msg}"),
+            other => panic!("expected Invalid for ::ffff:127.0.0.1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_normal_public_host_is_ok() {
+        // FIX 8: a public host (and a public IP) must still pass.
+        for url in ["http://93.184.216.34/x", "https://example.org/path"] {
+            let out = block(&format!(r#"{{"tool":"fetch","url":"{url}"}}"#));
+            assert!(
+                matches!(parse_action(&out), Ok(AgentAction::Fetch { .. })),
+                "public host {url} must be allowed"
+            );
+        }
     }
 
     #[test]

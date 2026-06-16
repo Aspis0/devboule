@@ -14,8 +14,13 @@
 mod action;
 mod agent_loop;
 mod app;
+mod config;
 mod conversation;
+mod executor;
 mod model;
+mod model_client;
+mod prompt;
+mod rmcp_backend;
 mod terminal;
 
 use std::sync::Arc;
@@ -28,9 +33,9 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tui_textarea::Input;
 
-use agent_loop::{run_burst, BurstOutcome, StubExecutor, SystemClock, DEFAULT_BURST_BUDGET};
+use agent_loop::{run_burst, BurstOutcome, SystemClock, DEFAULT_BURST_BUDGET};
 use app::{render, Activity, App};
-use model::{CoderModel, MockModel};
+use config::Runtime;
 use terminal::TerminalGuard;
 
 /// Redraw cadence; also paces the spinner animation.
@@ -40,14 +45,18 @@ const CHUNK_BUFFER: usize = 64;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let model: Arc<dyn CoderModel> = Arc::new(MockModel::new());
+    // Resolve the model + executor from env BEFORE entering raw mode, so any
+    // fallback note (oMLX/MCP disabled) prints to a normal terminal rather than
+    // the alternate screen. With no config this yields the Mock + Stub so
+    // `cargo run` works without a server.
+    let runtime = Arc::new(config::build_runtime().await);
     let mut guard = TerminalGuard::enter()?;
-    let result = run(&mut guard, model).await;
+    let result = run(&mut guard, runtime).await;
     // `guard` drops here -> terminal restored before we surface any error.
     result
 }
 
-async fn run(guard: &mut TerminalGuard, model: Arc<dyn CoderModel>) -> std::io::Result<()> {
+async fn run(guard: &mut TerminalGuard, runtime: Arc<Runtime>) -> std::io::Result<()> {
     let mut app = App::new();
     let mut events = EventStream::new();
     let mut ticker = interval(TICK);
@@ -65,7 +74,7 @@ async fn run(guard: &mut TerminalGuard, model: Arc<dyn CoderModel>) -> std::io::
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(event)) => {
-                        handle_event(&mut app, event, &model, &mut chunk_rx);
+                        handle_event(&mut app, event, &runtime, &mut chunk_rx);
                         app.mark_dirty(); // an input/scroll/submit may have changed state
                         if app.should_quit {
                             // Quit while a reply is still streaming: finalize the
@@ -137,7 +146,7 @@ async fn run(guard: &mut TerminalGuard, model: Arc<dyn CoderModel>) -> std::io::
 fn handle_event(
     app: &mut App,
     event: Event,
-    model: &Arc<dyn CoderModel>,
+    runtime: &Arc<Runtime>,
     chunk_rx: &mut Option<mpsc::Receiver<String>>,
 ) {
     if let Event::Key(key) = event {
@@ -146,7 +155,7 @@ fn handle_event(
         if key.kind != KeyEventKind::Press {
             return;
         }
-        if handle_key(app, key, model, chunk_rx) {
+        if handle_key(app, key, runtime, chunk_rx) {
             return;
         }
     }
@@ -164,7 +173,7 @@ fn handle_event(
 fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    model: &Arc<dyn CoderModel>,
+    runtime: &Arc<Runtime>,
     chunk_rx: &mut Option<mpsc::Receiver<String>>,
 ) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -182,7 +191,7 @@ fn handle_key(
         }
         // Submit on Enter (without modifiers). Shift/Alt+Enter inserts a newline.
         KeyCode::Enter if key.modifiers.is_empty() => {
-            submit(app, model, chunk_rx);
+            submit(app, runtime, chunk_rx);
             true
         }
         KeyCode::PageUp => {
@@ -203,7 +212,7 @@ fn handle_key(
 /// progress line per action+result over the SAME chunk channel L2.1 uses, then
 /// appends the burst CONCLUSION as the final chunk(s) before dropping `tx` (which
 /// the loop's chunk arm sees as end-of-stream and finalizes the assistant turn).
-fn submit(app: &mut App, model: &Arc<dyn CoderModel>, chunk_rx: &mut Option<mpsc::Receiver<String>>) {
+fn submit(app: &mut App, runtime: &Arc<Runtime>, chunk_rx: &mut Option<mpsc::Receiver<String>>) {
     // Single-flight: guard at BOTH layers — the channel (a burst task is live)
     // and the conversation state (a turn is still streaming). Either alone is
     // sufficient today; defending both keeps the invariant honest if the
@@ -223,22 +232,20 @@ fn submit(app: &mut App, model: &Arc<dyn CoderModel>, chunk_rx: &mut Option<mpsc
 
     let (tx, rx) = mpsc::channel(CHUNK_BUFFER);
     *chunk_rx = Some(rx);
-    let model = Arc::clone(model);
+    let runtime = Arc::clone(runtime);
     tokio::spawn(async move {
-        // The executor + clock are owned by the burst. L2.2 dispatch is STUBBED
-        // ([`StubExecutor`]); L2.3 swaps in the MCP-backed executor behind the same
-        // [`ToolExecutor`] seam. The wall-clock cap uses the real [`SystemClock`].
-        let executor = StubExecutor;
+        // The model + executor are the runtime-resolved ones (L2.3): real oMLX +
+        // MCP/FS/Exa when configured, else Mock + Stub. `allow_egress` is the
+        // executor's authoritative gate (true ONLY with a real Exa-backed
+        // executor). The wall-clock cap uses the real [`SystemClock`].
         let clock = SystemClock::start_now();
         let outcome = run_burst(
             prompt,
-            model.as_ref(),
-            &executor,
+            runtime.model.as_ref(),
+            runtime.executor.as_ref(),
             &clock,
             DEFAULT_BURST_BUDGET,
-            // L2.2: no web provider is wired yet, so egress is structurally OFF.
-            // L2.3 flips this on once the MCP-backed fetch/search executor lands.
-            false,
+            runtime.allow_egress,
             &tx,
         )
         .await;

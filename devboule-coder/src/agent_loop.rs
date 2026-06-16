@@ -24,6 +24,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::action::{parse_action, AgentAction, FormatError};
@@ -99,26 +100,30 @@ impl ToolResult {
 }
 
 /// Dispatches a validated [`AgentAction`] to a [`ToolResult`]. The ONLY seam the
-/// real MCP-backed executor (L2.3) needs to implement; L2.2 ships [`StubExecutor`].
+/// real MCP-backed executor (L2.3, [`crate::executor::RealExecutor`]) needs to
+/// implement; L2.2 ships [`StubExecutor`].
 ///
-/// `Send + Sync` so the burst future (which holds `&dyn ToolExecutor` across the
-/// progress-send awaits) is itself `Send` and can be `tokio::spawn`'d by the TUI.
-// L2.3: make async (rmcp executor is async) — the real MCP-backed executor does
-// network/process I/O, so `execute` becomes an `async fn` (or returns a boxed
-// future) once it lands. Kept SYNC in L2.2 so the loop stays testable with no
-// runtime; the async-seam refactor is deferred to L2.3 where real awaits exist.
+/// `#[async_trait]` (L2.3): `execute` is `async` because the real executor does
+/// genuine I/O — MCP `call_tool` over a child-process transport, an Exa HTTP
+/// egress call — none of which may block the tokio reactor. The trait stays
+/// object-safe so the burst still holds `&dyn ToolExecutor`. `Send + Sync` keeps
+/// the burst future `Send` (it holds the executor across the progress-send
+/// awaits) so the TUI can `tokio::spawn` it.
+#[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    fn execute(&self, action: &AgentAction) -> ToolResult;
+    async fn execute(&self, action: &AgentAction) -> ToolResult;
 }
 
 /// Canned, MCP-free executor for L2.2: every non-terminal action maps to a
 /// deterministic stub result. Terminal actions never reach an executor (the loop
-/// returns before dispatching them), so they are not represented here.
+/// returns before dispatching them), so they are not represented here. Retained
+/// as the no-config / `cargo run`-without-a-server default and as the test stub.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubExecutor;
 
+#[async_trait]
 impl ToolExecutor for StubExecutor {
-    fn execute(&self, action: &AgentAction) -> ToolResult {
+    async fn execute(&self, action: &AgentAction) -> ToolResult {
         match action {
             AgentAction::OracleAsk { .. } => ToolResult::ok("[stub: 2 snippets]"),
             AgentAction::OracleContext { .. } => ToolResult::ok("[stub: context block]"),
@@ -216,6 +221,14 @@ impl Transcript {
     fn push(&mut self, entry: TranscriptEntry) {
         self.entries.push(entry);
     }
+
+    /// Test-only entry push, so sibling modules (e.g. the model-client transcript
+    /// eviction test) can build a transcript with arbitrary entries without
+    /// driving a whole burst. NOT compiled into the binary.
+    #[cfg(test)]
+    pub(crate) fn push_entry_for_test(&mut self, entry: TranscriptEntry) {
+        self.entries.push(entry);
+    }
 }
 
 /// Run ONE bounded tool-burst for `human_msg`, streaming a progress line per
@@ -260,7 +273,7 @@ pub async fn run_burst(
             return BurstOutcome::Escalated("time cap reached".to_string());
         }
 
-        let raw = model.next_output(&transcript);
+        let raw = model.next_output(&transcript).await;
 
         match parse_action(&raw) {
             Err(fe) => {
@@ -344,7 +357,7 @@ pub async fn run_burst(
                     ),
                 )
                 .await;
-                let result = cap_result(executor.execute(&action));
+                let result = cap_result(executor.execute(&action).await);
                 emit(progress_tx, format!("   {}", elide(&result.output))).await;
 
                 transcript.push(TranscriptEntry::Action(action));
@@ -503,8 +516,9 @@ mod tests {
         // order and the terminal action was NOT dispatched.
         use std::sync::Mutex;
         struct Recorder(Mutex<Vec<String>>);
+        #[async_trait]
         impl ToolExecutor for Recorder {
-            fn execute(&self, action: &AgentAction) -> ToolResult {
+            async fn execute(&self, action: &AgentAction) -> ToolResult {
                 self.0.lock().unwrap().push(action.tool_name().to_string());
                 ToolResult::ok(format!("ran {}", action.tool_name()))
             }
@@ -705,8 +719,9 @@ mod tests {
         // the stored Result entry through a recording wrapper).
         use std::sync::Mutex;
         struct BigExec;
+        #[async_trait]
         impl ToolExecutor for BigExec {
-            fn execute(&self, _action: &AgentAction) -> ToolResult {
+            async fn execute(&self, _action: &AgentAction) -> ToolResult {
                 ToolResult::ok("x".repeat(50_000))
             }
         }
@@ -715,15 +730,10 @@ mod tests {
         struct CapturingModel {
             captured: Mutex<Option<String>>,
         }
+        #[async_trait]
         impl CoderModel for CapturingModel {
-            fn reply<'a>(
-                &'a self,
-                _prompt: String,
-                _tx: mpsc::Sender<String>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-                Box::pin(async {})
-            }
-            fn next_output(&self, transcript: &Transcript) -> String {
+            async fn reply(&self, _prompt: String, _tx: mpsc::Sender<String>) {}
+            async fn next_output(&self, transcript: &Transcript) -> String {
                 // First round: no result yet -> emit a read. Second round: capture
                 // the stored result, then emit done.
                 let last_result = transcript.entries().iter().rev().find_map(|e| match e {
@@ -762,22 +772,18 @@ mod tests {
     async fn small_tool_result_is_not_truncated() {
         // W6: a small output passes through untouched (no marker).
         struct SmallExec;
+        #[async_trait]
         impl ToolExecutor for SmallExec {
-            fn execute(&self, _action: &AgentAction) -> ToolResult {
+            async fn execute(&self, _action: &AgentAction) -> ToolResult {
                 ToolResult::ok("just a little output")
             }
         }
         use std::sync::Mutex;
         struct CapturingModel(Mutex<Option<String>>);
+        #[async_trait]
         impl CoderModel for CapturingModel {
-            fn reply<'a>(
-                &'a self,
-                _prompt: String,
-                _tx: mpsc::Sender<String>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-                Box::pin(async {})
-            }
-            fn next_output(&self, transcript: &Transcript) -> String {
+            async fn reply(&self, _prompt: String, _tx: mpsc::Sender<String>) {}
+            async fn next_output(&self, transcript: &Transcript) -> String {
                 let last = transcript.entries().iter().rev().find_map(|e| match e {
                     TranscriptEntry::Result(r) => Some(r.output.clone()),
                     _ => None,
@@ -808,8 +814,9 @@ mod tests {
         // model can recover (here it follows up with done).
         use std::sync::Mutex;
         struct Recorder(Mutex<Vec<String>>);
+        #[async_trait]
         impl ToolExecutor for Recorder {
-            fn execute(&self, action: &AgentAction) -> ToolResult {
+            async fn execute(&self, action: &AgentAction) -> ToolResult {
                 self.0.lock().unwrap().push(action.tool_name().to_string());
                 ToolResult::ok("dispatched")
             }
@@ -838,8 +845,9 @@ mod tests {
         // W7: with allow_egress=true the same fetch IS dispatched to the executor.
         use std::sync::Mutex;
         struct Recorder(Mutex<Vec<String>>);
+        #[async_trait]
         impl ToolExecutor for Recorder {
-            fn execute(&self, action: &AgentAction) -> ToolResult {
+            async fn execute(&self, action: &AgentAction) -> ToolResult {
                 self.0.lock().unwrap().push(action.tool_name().to_string());
                 ToolResult::ok("dispatched")
             }

@@ -18,6 +18,7 @@
 
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -30,9 +31,12 @@ use crate::agent_loop::Transcript;
 /// would. The implementation returns when the reply is fully sent; dropping
 /// `tx` signals end-of-stream to the consumer.
 ///
-/// Object-safe on purpose: the async work is expressed via the channel rather
-/// than an `async fn`, so the trait stays `dyn`-compatible and the call site can
-/// hold a `Box<dyn CoderModel>` without extra machinery.
+/// `#[async_trait]` (L2.3): both methods are `async fn` but the trait stays
+/// object-safe, so the binary keeps holding `Arc<dyn CoderModel>`. The async
+/// shape is what lets the real L2.3 model ([`crate::model_client::OmlxModel`])
+/// do non-blocking loopback inference inside `next_output` without blocking the
+/// tokio runtime — the prior sync seam would have stalled the reactor.
+#[async_trait]
 pub trait CoderModel: Send + Sync {
     /// Stream a reply to `prompt` into `tx`. Awaits until the full reply has
     /// been sent.
@@ -41,26 +45,20 @@ pub trait CoderModel: Send + Sync {
     /// uses [`CoderModel::next_output`] instead, so in the non-test binary this
     /// method is currently unwired (silenced there, still live in test builds).
     #[cfg_attr(not(test), allow(dead_code))]
-    fn reply<'a>(
-        &'a self,
-        prompt: String,
-        tx: mpsc::Sender<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+    async fn reply(&self, prompt: String, tx: mpsc::Sender<String>);
 
     /// Produce the model's next RAW output for the current burst, given the full
     /// running [`Transcript`] (the human message + every prior action and its
     /// tool result). The burst loop feeds the returned string to
     /// [`parse_action`](crate::action::parse_action).
     ///
-    /// Synchronous on purpose: it keeps the burst loop ([`run_burst`]) a plain
-    /// function that tests can drive with no tokio runtime, while the TUI still
-    /// runs the whole loop inside the existing spawned task. The real L2.3 model
-    /// will block on its own inference here (or be adapted behind this seam); the
-    /// `&self` shared-borrow is fine because [`ScriptedModel`] guards its cursor
-    /// with a `Mutex`.
+    /// ASYNC (L2.3): the real model awaits a loopback chat-completions call
+    /// here. The burst loop ([`run_burst`]) `.await`s it. Tests still drive it
+    /// trivially under `#[tokio::test]`; [`ScriptedModel`] guards its cursor with
+    /// a `Mutex` so the `&self` shared borrow is fine.
     ///
     /// [`run_burst`]: crate::agent_loop::run_burst
-    fn next_output(&self, transcript: &Transcript) -> String;
+    async fn next_output(&self, transcript: &Transcript) -> String;
 }
 
 /// Canned model: acknowledges the user input and emits a short markdown blob in
@@ -110,31 +108,26 @@ impl MockModel {
     }
 }
 
+#[async_trait]
 impl CoderModel for MockModel {
-    fn reply<'a>(
-        &'a self,
-        prompt: String,
-        tx: mpsc::Sender<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    async fn reply(&self, prompt: String, tx: mpsc::Sender<String>) {
         let delay = self.chunk_delay;
-        Box::pin(async move {
-            for chunk in Self::chunks_for(&prompt) {
-                // Receiver gone (TUI quit mid-stream) -> stop cleanly.
-                if tx.send(chunk).await.is_err() {
-                    return;
-                }
-                if !delay.is_zero() {
-                    sleep(delay).await;
-                }
+        for chunk in Self::chunks_for(&prompt) {
+            // Receiver gone (TUI quit mid-stream) -> stop cleanly.
+            if tx.send(chunk).await.is_err() {
+                return;
             }
-        })
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+        }
     }
 
     /// The mock has no action policy: it immediately ends the burst with a
     /// canned `done` referencing the human message, so a burst driven by
     /// [`MockModel`] terminates in one round. (The scripted action sequences live
     /// in [`ScriptedModel`].)
-    fn next_output(&self, transcript: &Transcript) -> String {
+    async fn next_output(&self, transcript: &Transcript) -> String {
         let human = transcript.human_message();
         let reply = format!("Mock reply to: {}", human.trim());
         let json = serde_json::json!({ "tool": "done", "reply": reply });
@@ -183,24 +176,21 @@ impl ScriptedModel {
     }
 }
 
+#[async_trait]
 impl CoderModel for ScriptedModel {
     /// Unused by the burst loop; the L2.1 streaming path is `MockModel`'s. A
     /// minimal honest implementation: stream the next scripted output as one
     /// chunk so the trait stays fully usable, then return.
-    fn reply<'a>(
-        &'a self,
-        _prompt: String,
-        tx: mpsc::Sender<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        let next = self.next_output(&Transcript::new(String::new()));
-        Box::pin(async move {
-            let _ = tx.send(next).await;
-        })
+    async fn reply(&self, _prompt: String, tx: mpsc::Sender<String>) {
+        let next = self.next_output(&Transcript::new(String::new())).await;
+        let _ = tx.send(next).await;
     }
 
-    fn next_output(&self, _transcript: &Transcript) -> String {
+    async fn next_output(&self, _transcript: &Transcript) -> String {
         // Poisoned only if a prior call panicked between lock and unlock, which
         // it cannot here (no panic point under the guard); recover defensively.
+        // The cursor is taken and released synchronously within this `async fn`
+        // (the guard never crosses an `.await`), so the future stays `Send`.
         let mut cursor = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
         let idx = *cursor;
         if idx < self.outputs.len() {
@@ -249,12 +239,12 @@ mod tests {
         model.reply("q".to_string(), tx).await;
     }
 
-    #[test]
-    fn mock_next_output_is_a_terminal_done() {
+    #[tokio::test]
+    async fn mock_next_output_is_a_terminal_done() {
         // The mock's burst policy is a single canned `done` echoing the human.
         let model = MockModel::with_delay(Duration::ZERO);
         let transcript = Transcript::new("hello there".to_string());
-        let raw = model.next_output(&transcript);
+        let raw = model.next_output(&transcript).await;
         let action = crate::action::parse_action(&raw).expect("mock emits a valid action");
         match action {
             crate::action::AgentAction::Done { reply } => {
@@ -264,14 +254,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scripted_model_replays_in_order_then_exhausts_to_done() {
+    #[tokio::test]
+    async fn scripted_model_replays_in_order_then_exhausts_to_done() {
         let model = ScriptedModel::new(vec!["first".to_string(), "second".to_string()]);
         let t = Transcript::new(String::new());
-        assert_eq!(model.next_output(&t), "first");
-        assert_eq!(model.next_output(&t), "second");
+        assert_eq!(model.next_output(&t).await, "first");
+        assert_eq!(model.next_output(&t).await, "second");
         // Past the script: a terminal `done` so a burst cannot hang.
-        let exhausted = model.next_output(&t);
+        let exhausted = model.next_output(&t).await;
         let action = crate::action::parse_action(&exhausted)
             .expect("the exhausted output is a valid action");
         assert!(matches!(action, crate::action::AgentAction::Done { .. }));
