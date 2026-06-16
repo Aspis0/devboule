@@ -316,6 +316,68 @@ heavy part):
   goes through Censor + review + Kanban; never unattended full-auto without the gate; the
   mini + ORPO flywheel are preserved, and our own loop EXTENDS the flywheel.
 
+## 10b. L2 — lean implementation plan (revised 2026-06-15: OSS-grounded, conversational, `devboule`-named)
+
+Owner-confirmed shape after evaluating Pi/Goose/etc. and an OSS-pattern sweep. The earlier
+architect draft was trimmed for being "esagerato": **NO Cargo-workspace conversion + no 2nd
+crate on day 1** (one binary crate, schema inside, mirrored to Python via tests as mini↔
+`aspis_mcp.py` already do); **the rich two-tier Console producer + the eval harness are
+DEFERRED** until a working MVP exists. Naming: everything `devboule` (the binary is
+`devboule-coder`), no new `aspis` names.
+
+**Conversational-first (the key correction):** the orchestrator is a **REPL**, not a fire-and-
+forget task runner. OUTER loop = an UNBOUNDED conversation with the human (talk, organize the
+Kanban, read, ask back — no round cap). INNER loop = a BOUNDED autonomous tool-burst between
+human turns (`MAX_ROUNDS` ~12–16 + a 3-consecutive-format-error stop + a wall-clock cap). The
+cap governs the autonomous burst ONLY — never the human conversation.
+
+**Reuse, not reinvent ("stolen, not invented" — license-checked, no GPL/AGPL/FSL):**
+| Concern | Reuse | License | Source |
+|---|---|---|---|
+| MCP client (Rust) | **`rmcp`** v1.7 (stdio child + `list_all_tools`/`call_tool`; steal Goose's `RunningService` wrapper) | Apache-2.0 | github.com/modelcontextprotocol/rust-sdk |
+| TUI framework | **`ratatui`** | MIT | crates.io/ratatui |
+| REPL input pane | **`tui-textarea`** | MIT | crates.io/tui-textarea |
+| Render model markdown | **`tui-markdown`** | MIT/Apache | crates.io/tui-markdown |
+| Spinner during tool-burst | **`throbber-widgets-tui`** | Zlib | crates.io/throbber-widgets-tui |
+| Local model client (loopback oMLX, OpenAI-compat) | **`async-openai`** | MIT | crates.io/async-openai |
+| Loop control + emit-action format | **mini-swe-agent** (one ` ```action ` JSON block/turn, regex parse, precise error feedback, stop on 3 format errors) — learn-only (Python), reimplement in Rust | MIT | github.com/SWE-agent/mini-swe-agent |
+| Rust scaffold (ratatui+rmcp+async-openai+tui-textarea already wired) | **`fortunto2/rust-code`** — start from this shape, not from scratch | MIT | github.com/fortunto2/rust-code |
+| Robust write format | NOT NEEDED — aider's SEARCH/REPLACE lesson is already satisfied by our **emit-edits** path; writes delegate to `spawn_mini`, never local | — | (our `mini_coder`) |
+
+**The 4 lean steps (GPU-free to build; real oMLX e2e = GPU-deferred):**
+- **L2.1 — `devboule-coder` crate skeleton + conversational TUI shell.** A standalone binary
+  crate (built separately, NOT a workspace member): `ratatui` + `tui-textarea` + `tui-markdown`
+  + `throbber`; the UNBOUNDED outer REPL (type → scrollback → streamed reply), a `MockModel` so
+  it runs with no GPU. Mine `fortunto2/rust-code` for the channel/TUI wiring (tokio task ↔
+  `mpsc` ↔ `terminal.draw()` on tick/message; `crossterm::EventStream` async input).
+- **L2.2 — action protocol + bounded inner loop (the heart).** The `AgentAction` enum + the
+  mini-swe-agent fenced-` ```action ` parser (exactly-one, error-feedback) + the bounded burst
+  (`MAX_ROUNDS`, 3-format-error stop, wall-clock cap) nested inside the outer conversation.
+  Model behind a `CoderModel` trait (`MockModel` for tests, `async-openai` loopback for real;
+  reuse the loopback/http-only validator). Pure `cargo` tests for parse + every stop condition.
+- **L2.3 — `rmcp` client + `orchestrator` role + tools.** `rmcp` stdio client launching the
+  SAME Oracle MCP server; `agent_register` as a NEW `orchestrator` role (Python: add to
+  `VALID_ROLES`, REMOVE it from `ROLE_ALIASES` so it stops collapsing to `coder`, add
+  `ROLE_RULES` + allowlist). Dispatch actions → `oracle_ask`/`oracle_context` (PRIMARY, private,
+  grounded) · `spawn_mini_coder` (writes delegate here — P5 + Censor + ORPO untouched) ·
+  `project_*` · `ask_user` · `request_git_push`; read/grep/glob run LOCALLY in Rust (read-only,
+  root-confined), not server tools; `fetch`/`websearch` → **Exa** (`/contents` + `/search`),
+  key in **Settings** (`provider:exa`), **key-presence IS the opt-in** (no key → both off,
+  graceful fallback to the Oracle; no extra toggle). Private-vs-egress hierarchy baked into the
+  system prompt (project Qs → always Oracle; Exa = conscious egress exception).
+- **L2.4 — launch wiring + minimal Console hook.** Devboule launches `devboule-coder` over the
+  EXISTING PTY+MCP seam (mirror `macos_codex_launch_line`/Windows script + `codex_mcp_config_args`;
+  token off-argv), surfaced in the xterm `AgentTerminalViewer`; P10b skill injection (add
+  `orchestrator` to `KNOWN_ROLES`); Settings "Main coder = Local (Devboule)". A MINIMAL Console
+  state only (running/idle) — the rich two-tier `CoderEntry` producer is DEFERRED.
+
+**Deferred (post-MVP, tracked):** rich two-tier Activity Console producer (orchestrator emits
+its own `CoderEntry` milestones wrapping nested mini `SpawnEntry`s — extends `mini_activity.rs`
+keying); the `orchestrator_bench` eval (prodbench/`heldout.py`, GPU-deferred for real numbers);
+extracting a shared `devboule-protocol` crate ONLY if `src-tauri` ends up duplicating the
+schema. Sequencing per repo discipline: each step → implement → verify on disk → ONE hostile
+reviewer → fix → next; whole-diff max-recall at the end.
+
 ## Open risks
 
 - A minimalist harness + a *local* model = quality bounded by the model; measure before
