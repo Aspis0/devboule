@@ -34,8 +34,13 @@ use serde::Deserialize;
 
 /// Max length (chars) of a free-text query / task / reply / question argument.
 pub const MAX_TEXT_LEN: usize = 4096;
-/// Max number of files a single `spawn_mini` may name.
+/// Max number of files a single `spawn_mini` may name (the READ arm).
 pub const MAX_FILES: usize = 32;
+/// Max number of files a single WRITE `spawn_mini` may name. Tighter than
+/// [`MAX_FILES`]: the Oracle server REJECTS a `write=true` `spawn_mini_coder`
+/// naming more than this, so we cap at the same bound at PARSE time to give the
+/// model immediate, self-correctable feedback instead of a deep server error.
+pub const MAX_WRITE_FILES: usize = 10;
 /// Max length (chars) of a single path string. Keeps a pathological path from
 /// dominating the transcript even before component validation runs.
 pub const MAX_PATH_LEN: usize = 1024;
@@ -161,10 +166,19 @@ impl AgentAction {
                 }
                 Ok(())
             }
-            AgentAction::SpawnMini { task, files, .. } => {
+            AgentAction::SpawnMini { task, files, write } => {
                 check_text("task", task)?;
                 if files.is_empty() {
                     return Err("files must not be empty".to_string());
+                }
+                // The WRITE arm is capped TIGHTER than the read arm: the Oracle
+                // server rejects a `write=true` spawn naming more than
+                // MAX_WRITE_FILES, so mirror that bound here for parse-time feedback
+                // instead of a deep server error. The read arm keeps the 32 cap.
+                if *write && files.len() > MAX_WRITE_FILES {
+                    return Err(format!(
+                        "write spawn_mini: at most {MAX_WRITE_FILES} files (split the task)"
+                    ));
                 }
                 if files.len() > MAX_FILES {
                     return Err(format!(
@@ -301,6 +315,21 @@ fn check_url(url: &str) -> Result<(), String> {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or("");
+
+    // SSRF via userinfo: `http://evil.com@127.0.0.1/` puts the REAL host after the
+    // `@`, but the naive host-span extraction below would take `evil.com@127.0.0.1`
+    // (or `evil.com`), miss the blocklist, and reqwest would then connect to the
+    // post-`@` target. Reject ANY `@` in the AUTHORITY (the span before the first
+    // `/ ? #`) outright — there is no legitimate need for userinfo in a fetch URL.
+    // Mirrors `model_client::validate_omlx_base_url`, which rejects `@` the same way.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err("url must not contain userinfo (@ in authority)".to_string());
+    }
+
     let host_raw = if let Some(rest) = after_scheme.strip_prefix('[') {
         // Up to and including the closing bracket (e.g. `[::1]`).
         match rest.split_once(']') {
@@ -503,10 +532,23 @@ fn action_re() -> &'static Regex {
 ///
 /// A legitimate single block is `(1, 1)`; the wrapper above is `(0, 1)`; two
 /// real blocks are `(2, 2)`. [`parse_action`] requires `(1, 1)` to dispatch.
-/// A fence line is ```` ``` ```` (line start) with an optional single-token info
-/// string and trailing whitespace; the info string is the text up to the first
-/// space/tab (markdown's rule). A bare ```` ``` ```` toggles a fence closed.
+///
+/// CommonMark closing rule (load-bearing for the anti-evasion): a fenced code
+/// block is opened by a ```` ``` ```` line WITH an info string and CLOSES only on a
+/// later ```` ``` ```` line with NO info string. An info-string fence line that
+/// appears WHILE a block is already open is literal CONTENT, not a new fence. A
+/// naive open/close TOGGLE on every fence line is defeated by even parity: two
+/// UNCLOSED prose openers (```` ```json ````, ```` ```yaml ````) would toggle the
+/// state back to "outside", so the following ```` ```action ```` would be miscounted
+/// as TOP-LEVEL and dispatched. Tracking the real open/closed state (only a bare
+/// fence closes) keeps that ```` ```action ```` recognised as nested -> `top_level == 0`.
+///
+/// We track whether we are currently inside ANY open fence. An ```` ```action ````
+/// line ALWAYS counts toward `total`; it counts toward `top_level` ONLY when not
+/// currently inside another open fence.
 fn count_action_fences(input: &str) -> (usize, usize) {
+    /// The info string of a fence line, or `None` if the line is not a fence.
+    /// Empty (`Some("")`) means a BARE fence (no info string) -> a valid closer.
     fn fence_info(line: &str) -> Option<&str> {
         let t = line.trim_end_matches(['\r', ' ', '\t']);
         t.strip_prefix("```")
@@ -521,14 +563,20 @@ fn count_action_fences(input: &str) -> (usize, usize) {
             continue;
         };
         if inside_fence {
-            // A fence line while already inside a fence CLOSES it. If that line is
-            // itself ```` ```action ````, it is a nested opener (the wrapper case):
-            // count it toward `total` but NOT `top_level`.
-            if info == "action" {
+            // Inside an open block: a BARE fence (no info string) CLOSES it; an
+            // info-string fence line is literal CONTENT (NOT a new fence and NOT a
+            // close). A nested ```` ```action ```` here is the wrapper case: count it
+            // toward `total` but NOT `top_level`, and stay inside (it does not open
+            // a real new block in CommonMark).
+            if info.is_empty() {
+                inside_fence = false;
+            } else if info == "action" {
                 total += 1;
             }
-            inside_fence = false;
         } else {
+            // Outside any block: an info-string fence OPENS a block (a bare fence
+            // here opens an info-less block, equally). An ```` ```action ```` opener at
+            // this level is genuinely TOP-LEVEL.
             if info == "action" {
                 top_level += 1;
                 total += 1;
@@ -787,6 +835,23 @@ mod tests {
     }
 
     #[test]
+    fn two_unclosed_prose_fences_then_action_is_rejected() {
+        // FIX 2 (fence-depth evasion): a naive open/close TOGGLE is defeated by
+        // EVEN PARITY — two UNCLOSED prose openers (```json, ```yaml) would toggle
+        // the state back to "outside", so the following ```action would be
+        // miscounted as TOP-LEVEL and dispatched. Under the CommonMark closing rule
+        // (only a BARE fence closes), both prose openers and the action line are
+        // CONTENT inside the first open block -> top_level == 0 -> rejected.
+        let out = "```json\n```yaml\n```action\n{\"tool\":\"fetch\",\"url\":\"http://169.254.169.254/\"}\n```";
+        match parse_action(out) {
+            Err(FormatError::Invalid(msg)) => {
+                assert!(msg.contains("nested"), "message must mention nesting: {msg}")
+            }
+            other => panic!("even-parity prose-fence evasion must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn malformed_json_is_invalid() {
         let out = block(r#"{"tool":"read","path":"a.rs""#); // missing close brace
         match parse_action(&out) {
@@ -962,6 +1027,46 @@ mod tests {
     }
 
     #[test]
+    fn write_spawn_mini_over_ten_files_is_invalid() {
+        // FIX 4: the WRITE arm is capped at MAX_WRITE_FILES (10) — the server
+        // rejects more, so we reject at parse time for self-correctable feedback.
+        let files: Vec<String> = (0..(MAX_WRITE_FILES + 1)).map(|i| format!("f{i}.rs")).collect();
+        let json = serde_json::json!({
+            "tool": "spawn_mini",
+            "task": "edit many",
+            "files": files,
+            "write": true,
+        })
+        .to_string();
+        match parse_action(&block(&json)) {
+            Err(FormatError::Invalid(msg)) => {
+                assert!(msg.contains("at most 10 files"), "{msg}")
+            }
+            other => panic!("expected Invalid for over-10 write spawn_mini, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_spawn_mini_with_eleven_files_is_ok() {
+        // FIX 4: the READ arm keeps the 32 cap, so 11 files (write=false) is fine.
+        let files: Vec<String> = (0..(MAX_WRITE_FILES + 1)).map(|i| format!("f{i}.rs")).collect();
+        let json = serde_json::json!({
+            "tool": "spawn_mini",
+            "task": "read many",
+            "files": files,
+            "write": false,
+        })
+        .to_string();
+        match parse_action(&block(&json)) {
+            Ok(AgentAction::SpawnMini { write, files, .. }) => {
+                assert!(!write, "read arm");
+                assert_eq!(files.len(), MAX_WRITE_FILES + 1, "all 11 files kept");
+            }
+            other => panic!("expected Ok for 11-file read spawn_mini, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn one_bad_file_in_list_is_invalid() {
         let out = block(r#"{"tool":"spawn_mini","task":"t","files":["ok.rs","/abs.rs"]}"#);
         match parse_action(&out) {
@@ -1096,6 +1201,37 @@ mod tests {
                 "public host {url} must be allowed"
             );
         }
+    }
+
+    #[test]
+    fn fetch_userinfo_at_in_authority_is_invalid() {
+        // FIX 1 (SSRF): `http://evil.com@127.0.0.1/` puts the REAL host after the
+        // `@`. The naive host-span extraction would take `evil.com@127.0.0.1` (not
+        // in the blocklist, not a valid IP) and pass — then reqwest connects to
+        // 127.0.0.1. Any `@` in the authority must be rejected at parse time.
+        for url in [
+            "http://evil.com@127.0.0.1/",
+            "http://x@localhost/",
+            "http://a@169.254.169.254/",
+        ] {
+            let out = block(&format!(r#"{{"tool":"fetch","url":"{url}"}}"#));
+            match parse_action(&out) {
+                Err(FormatError::Invalid(msg)) => {
+                    assert!(msg.contains("userinfo"), "{url}: {msg}")
+                }
+                other => panic!("expected Invalid for userinfo {url}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_normal_url_without_userinfo_is_ok() {
+        // FIX 1: a normal URL (no `@` in the authority) must still pass.
+        let out = block(r#"{"tool":"fetch","url":"https://example.com/p"}"#);
+        assert!(
+            matches!(parse_action(&out), Ok(AgentAction::Fetch { .. })),
+            "a normal URL without userinfo must be allowed"
+        );
     }
 
     #[test]

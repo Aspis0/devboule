@@ -1334,10 +1334,17 @@ mod tests {
 
     #[test]
     fn cloudflare_agent_profile_ids_are_role_least_privilege() {
-        // Phase B merge: "orchestrator" is no longer a distinct profile arm — it
-        // normalizes to "coder" and thus receives the coder WRITE profile BY DESIGN
-        // (the merged coder plans AND writes). This is intentional, not a privilege
-        // regression: the only canonical roles are coder (write) and verifier (read).
+        // FIX 1 decoupling: "orchestrator" is now a FIRST-CLASS STORED session/
+        // registration role (the launch persists it so the devboule-coder binary's
+        // `agent_register(role="orchestrator")` matches — see projects.rs
+        // `pending_session_role`, mirrors aspis_mcp.py VALID_ROLES). For TOKEN/
+        // PERMISSION selection, however, `canonical_agent_role` still folds it to
+        // "coder", so it receives the coder WRITE profile BY DESIGN (the merged coder
+        // plans AND writes). The registration identity and the permission role are
+        // INTENTIONALLY decoupled: storing "orchestrator" never widens privileges.
+        // (NOTE: the launch path additionally OMITS the Cloudflare provider_env for the
+        // orchestrator client entirely — FIX 3 — since its binary has no Cloudflare
+        // tool; this function still reports the profile a coder-canonical role MAY hold.)
         assert_eq!(
             cloudflare_agent_token_profile_ids_for_role("orchestrator"),
             &["coder-worker-write"]

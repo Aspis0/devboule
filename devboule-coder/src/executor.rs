@@ -474,6 +474,19 @@ pub(crate) async fn read_body_capped(
 ) -> Result<String, String> {
     use futures::StreamExt;
 
+    // Fast path the doc promises: when the server declares a `Content-Length`
+    // larger than the cap, reject BEFORE pulling a single (possibly oversized)
+    // chunk — no point streaming a body we already know we will reject. The
+    // streaming truncation below is still the authoritative fallback for chunked /
+    // length-less responses (and for a server that under-declares its length).
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(format!(
+                "response too large ({len} bytes declared, cap {cap})"
+            ));
+        }
+    }
+
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -504,17 +517,18 @@ fn accumulate_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
     }
 }
 
-/// Truncate a string to at most `cap` bytes on a char boundary, appending a
-/// marker when cut. (The loop re-caps too; this keeps the executor honest.)
+/// Truncate a string to at most `cap` CHARS, appending a marker when cut. Counts
+/// `chars()` (not bytes) so the bound matches the loop's `cap_result` semantics
+/// (`MAX_RESULT_LEN` chars): a previous byte cap could let a multibyte body exceed
+/// the intended char bound, then the loop would cap it a SECOND time. Iterating
+/// `chars` also never splits a UTF-8 codepoint. (The loop re-caps too; this keeps
+/// the executor honest.)
 fn elide_to(s: &str, cap: usize) -> String {
-    if s.len() <= cap {
+    if s.chars().count() <= cap {
         return s.to_string();
     }
-    let mut end = cap;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n[…truncated]", &s[..end])
+    let kept: String = s.chars().take(cap).collect();
+    format!("{kept}\n[…truncated]")
 }
 
 // =============================================================================
@@ -1014,5 +1028,25 @@ mod tests {
     fn parse_exa_non_json_falls_back_to_capped_raw() {
         let out = parse_exa_response("not json at all");
         assert!(out.contains("not json"), "raw fallback: {out}");
+    }
+
+    #[test]
+    fn elide_to_caps_on_chars_not_bytes() {
+        // FIX 7: a multibyte string must be capped by CHAR count (matching the
+        // loop's cap_result), never by bytes. 5 multibyte chars under a 10-char cap
+        // pass through untouched even though they exceed 10 BYTES.
+        let multibyte = "élève"; // 5 chars, > 5 bytes
+        assert_eq!(elide_to(multibyte, 10), multibyte, "5 chars under a 10-char cap is untouched");
+
+        // Over the char cap: keep exactly `cap` chars (a clean char boundary), mark cut.
+        let long = "αβγδεζηθικ"; // 10 Greek chars, 20 bytes
+        let out = elide_to(long, 4);
+        assert!(out.starts_with("αβγδ"), "kept the first 4 chars: {out}");
+        assert!(out.contains("[…truncated]"), "marks truncation: {out}");
+        assert_eq!(
+            out.chars().filter(|c| ('α'..='κ').contains(c)).count(),
+            4,
+            "exactly 4 source chars retained: {out}"
+        );
     }
 }

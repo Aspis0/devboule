@@ -324,7 +324,10 @@ pub async fn run_burst(
                 // is allowed. When disabled, do NOT call the executor — push a
                 // disabled-result the model can recover from (answer via the
                 // Oracle), count it as a round so it can't be retried forever, and
-                // continue. The window is NOT updated (nothing was executed).
+                // continue. The (tool, target) IS recorded in the no-progress window
+                // (like a dispatched action): otherwise a model repeating the same
+                // blocked `fetch(url)` would never trip the no-progress guard and
+                // would burn every remaining round on an action that can never run.
                 if action.is_egress() && !allow_egress {
                     emit(
                         progress_tx,
@@ -337,6 +340,10 @@ pub async fn run_burst(
                     );
                     transcript.push(TranscriptEntry::Action(action));
                     transcript.push(TranscriptEntry::Result(cap_result(result)));
+                    executed_window.push_back(this);
+                    if executed_window.len() > NO_PROGRESS_WINDOW {
+                        executed_window.pop_front();
+                    }
                     rounds += 1;
                     if rounds >= MAX_ROUNDS {
                         return BurstOutcome::Escalated("round cap reached".to_string());
@@ -838,6 +845,33 @@ mod tests {
         );
         let joined = drain(&mut rx).join("\n");
         assert!(joined.contains("egress disabled"), "the disabled marker streamed: {joined}");
+    }
+
+    #[tokio::test]
+    async fn repeated_egress_blocked_action_trips_no_progress() {
+        // FIX 5: the SAME blocked fetch(url) twice must trip the no-progress guard
+        // on the second attempt. Previously the egress-blocked branch did not push
+        // to the executed window, so a model could repeat an action that can NEVER
+        // run and burn every round; now the (tool, target) is recorded like a
+        // dispatched action, so the second identical egress-blocked fetch escalates.
+        let model = ScriptedModel::new(vec![
+            action_block(serde_json::json!({"tool":"fetch","url":"https://example.com"})),
+            action_block(serde_json::json!({"tool":"fetch","url":"https://example.com"})),
+            action_block(serde_json::json!({"tool":"done","reply":"unreached"})),
+        ]);
+        let exec = StubExecutor;
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let outcome =
+            run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, false, &tx).await;
+        match outcome {
+            BurstOutcome::Escalated(reason) => {
+                assert!(reason.starts_with("no progress"), "reason: {reason}");
+                assert!(reason.contains("fetch"), "names the cycled tool: {reason}");
+            }
+            other => panic!("expected no-progress escalation on repeated blocked egress, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -19,6 +19,8 @@
 //!    `call_tool`,
 //! 5. on drop, cancel the running service (which terminates the child).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService, RunningServiceCancellationToken};
@@ -27,8 +29,23 @@ use rmcp::transport::ConfigureCommandExt;
 use rmcp::ServiceExt;
 use serde_json::{json, Map, Value};
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::executor::McpBackend;
+
+/// Wall-clock cap on the connect path (MCP `initialize` handshake + the
+/// `agent_register` round-trip). A hung Oracle server must NOT block
+/// `build_runtime` forever: without this the `.await` never returns and the
+/// burst's wall-clock guard (which only runs BETWEEN awaits) can never fire. On
+/// elapse we tear the child down and return `Err`, which `config::build_executor`
+/// turns into the safe Stub fallback.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wall-clock cap on a single `call_tool`. Oracle / `spawn_mini_coder` can be
+/// genuinely slow (grounded retrieval, a spawned sub-agent), so this is generous
+/// — but FINITE: a hung server turns one tool call into a recoverable
+/// `ToolResult::err` instead of wedging the whole burst on a pending `.await`.
+const CALL_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Config to launch + register against the Oracle MCP server. Nothing is
 /// hardcoded: the L2.4 Devboule launch wiring supplies the interpreter, the
@@ -103,10 +120,19 @@ impl RmcpBackend {
             .map_err(|e| format!("failed to spawn Oracle MCP child: {e}"))?;
 
         // `()` is the default client handler; `.serve` runs the initialize
-        // handshake and returns the running service.
-        let service = ().serve(transport).await.map_err(|e| {
-            format!("MCP initialize handshake failed: {e}")
-        })?;
+        // handshake and returns the running service. A hung server must not block
+        // `build_runtime` forever, so the handshake is bounded: on elapse the
+        // transport is dropped (terminating the child) and we return `Err`.
+        let service = match timeout(CONNECT_TIMEOUT, ().serve(transport)).await {
+            Ok(Ok(service)) => service,
+            Ok(Err(e)) => return Err(format!("MCP initialize handshake failed: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "MCP initialize handshake timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            }
+        };
 
         // From here the child is RUNNING but `Self` is not yet constructed, so a
         // bare `?`/early `return Err` on the registration below would drop neither
@@ -126,15 +152,24 @@ impl RmcpBackend {
         // managed launch the server rejects a blank or wrong token.
         let reg_args = build_register_args(&config);
 
-        let result = match service
+        // Bound the registration round-trip too: a server that completed the
+        // handshake but then hangs on `agent_register` would otherwise wedge
+        // startup just the same. On timeout, tear the child down before returning.
+        let register = service
             .peer()
-            .call_tool(CallToolRequestParams::new("agent_register").with_arguments(reg_args))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+            .call_tool(CallToolRequestParams::new("agent_register").with_arguments(reg_args));
+        let result = match timeout(CONNECT_TIMEOUT, register).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 cleanup.cancel();
                 return Err(format!("agent_register failed: {e}"));
+            }
+            Err(_) => {
+                cleanup.cancel();
+                return Err(format!(
+                    "agent_register timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ));
             }
         };
 
@@ -187,13 +222,24 @@ impl McpBackend for RmcpBackend {
         args.insert("session_token".into(), json!(self.session_token));
 
         // `name` is a borrowed &str but CallToolRequestParams wants a
-        // Cow<'static, str>, so own it.
-        let result = self
+        // Cow<'static, str>, so own it. The call is bounded by CALL_TOOL_TIMEOUT:
+        // a hung server turns a pending `.await` into a recoverable error the burst
+        // can feed back to the model, instead of wedging the whole burst (the
+        // wall-clock guard only runs BETWEEN awaits, never during a pending one).
+        let call = self
             .service
             .peer()
-            .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args))
-            .await
-            .map_err(|e| format!("call_tool {name} failed: {e}"))?;
+            .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args));
+        let result = match timeout(CALL_TOOL_TIMEOUT, call).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(format!("call_tool {name} failed: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "call_tool {name} timed out after {}s",
+                    CALL_TOOL_TIMEOUT.as_secs()
+                ))
+            }
+        };
 
         // A tool-level error (`is_error == Some(true)`) is surfaced as an Err so
         // the executor turns it into a failed ToolResult the model can recover

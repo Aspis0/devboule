@@ -1134,6 +1134,11 @@ fn prepare_or_launch_project_agent(
     // custom client, `custom_command` is the configured command line the script
     // execs after the universal prompt delivery; for a built-in it is None.
     let (client, custom_command) = resolve_launch_client(&app, &input.client)?;
+    // FIX 1 (L2 BLOCKER) — the SESSION role we PERSIST in the pending launch. For the
+    // orchestrator client this is the first-class "orchestrator" (so the stored role
+    // matches what the devboule-coder binary registers as); for every other client it
+    // is the canonical spawn `role`. See `pending_session_role` for the full rationale.
+    let stored_role: &str = pending_session_role(&client, role.as_str());
     // "app" -> hosted PTY inside Aspis Management; anything else (incl. None and
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
@@ -1147,6 +1152,19 @@ fn prepare_or_launch_project_agent(
         Some(handoff) => Some(validate_design_handoff(handoff, &root_path)?),
         None => None,
     };
+    // FIX 1 — a saved workflow's instructions are delivered ONLY via the launch
+    // PROMPT text (workflow_addendum below). The external codex/claude coder CLIs
+    // read that prompt; the local Devboule orchestrator binary is AUTONOMOUS and
+    // IGNORES the prompt entirely, so a workflow_run on an orchestrator would be
+    // SILENTLY dropped. Reject it explicitly. The `role != "coder"` clause still
+    // rejects verifier launches as before (a verifier never normalizes to "coder").
+    // Note: an orchestrator launch has `role == "coder"` (vault role), so we must
+    // gate on the CLIENT here, not the role, to catch it.
+    if input.workflow_run.is_some() && client == "orchestrator" {
+        return Err(
+            "The local Devboule orchestrator runs autonomously and cannot run a saved workflow (its instructions are prompt-delivered, which the orchestrator ignores). Launch the workflow as a codex/claude coder.".into(),
+        );
+    }
     if input.workflow_run.is_some() && role != "coder" {
         return Err("Saved workflows must be launched as coder agents.".into());
     }
@@ -1169,7 +1187,13 @@ fn prepare_or_launch_project_agent(
     // configured mini backend the launch already relies on (no hardcoded model id) and
     // THIS project's gate-covered languages; `None` backend ⇒ `None` block ⇒ the coder
     // prompt is byte-identical to today (graceful degradation).
-    let mini_delegation_addendum: Option<String> = if role == "coder" {
+    // FIX 1 — also skip this for the local Devboule orchestrator: it builds the prompt
+    // under `stored_role = "orchestrator"` (so `project_agent_prompt`'s coder-only
+    // `mini_coder_addendum` arm never consumes the block) AND the orchestrator binary
+    // IGNORES the prompt entirely. Computing it here was pure wasted work (the
+    // `read_mini_coder_backend` loopback probe + `tier_a_covered_languages` tree scan
+    // the review flagged); gate on the canonical role AND a non-orchestrator client.
+    let mini_delegation_addendum: Option<String> = if role == "coder" && client != "orchestrator" {
         let backend = read_mini_coder_backend(&app);
         let covered = super::mini_coder_executor::tier_a_covered_languages(&root_path);
         // E1: the user's persisted write-behavior policy bounds the injected guidance
@@ -1183,7 +1207,17 @@ fn prepare_or_launch_project_agent(
     };
     let prompt = project_agent_prompt(
         &project,
-        &role,
+        // FIX 1 — build the prompt under the STORED role. For codex/claude this is
+        // the canonical spawn role (unchanged). For the orchestrator client it is
+        // "orchestrator", so the interpolated `agent_register(role="orchestrator")`
+        // in the prompt MATCHES what the binary registers as — a hand-"Copy prompt"
+        // is now correct instead of telling a human to register as "coder" (which
+        // the server would reject against the stored "orchestrator" session). The
+        // orchestrator binary itself ignores the prompt; this only fixes the manual
+        // copy path. The coder-only addenda inside the builder are positive
+        // allowlists keyed on "coder", so the orchestrator falls into the coder
+        // role-rule (plan+code) but gets none of the CLI-only mini/push blocks.
+        stored_role,
         &agent_id,
         task_id.as_deref(),
         &root_path,
@@ -1210,13 +1244,27 @@ fn prepare_or_launch_project_agent(
     );
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
-    let mut provider_env = cloudflare_agent_provider_env_for_role(&role)?;
+    // FIX 3 (hardening) — omit the role-scoped Cloudflare provider_env for the local
+    // Devboule orchestrator (it has no Cloudflare tool, so the coder WRITE token would
+    // be an unused long-lived secret in a web-content-ingesting binary's env). Every
+    // other client still gets its role-scoped token. See `launch_injects_cloudflare_env`.
+    // The orchestrator keeps only the secrets it actually uses (the launch token + the
+    // Exa key), appended below.
+    let mut provider_env = if launch_injects_cloudflare_env(&client) {
+        cloudflare_agent_provider_env_for_role(&role)?
+    } else {
+        Vec::new()
+    };
     record_launch_pending(
         &app,
         &project.metadata.id,
         &project.metadata.title,
         &agent_id,
-        &role,
+        // FIX 1 — persist the STORED role: "orchestrator" for that client, else the
+        // canonical role. This is the load-bearing change: the session role must
+        // equal what the binary registers as, or the server rejects registration and
+        // the orchestrator silently degrades to the StubExecutor.
+        stored_role,
         task_id.as_deref(),
         Some(client.as_str()),
         &launch_token_hash,
@@ -1368,7 +1416,10 @@ fn prepare_or_launch_project_agent(
     }
     Ok(ProjectAgentLaunchResult {
         project_id: project.metadata.id,
-        role,
+        // FIX 1 — surface the STORED role to the UI so it matches the persisted
+        // session (and the fleet badge) the orchestrator will register as. For every
+        // other client `stored_role == role`, so this is byte-identical there.
+        role: stored_role.to_string(),
         client,
         agent_id,
         root_path: root_path.to_string_lossy().into_owned(),
@@ -2019,16 +2070,63 @@ pub fn resolve_project_root_by_id(
 
 fn normalize_agent_role(value: &str) -> Result<String, String> {
     let role = value.trim().to_ascii_lowercase();
-    // Phase B merge: spawn-time roles collapse to {coder, verifier}. The legacy
-    // "orchestrator" (and "architect"/"code") are inbound aliases that normalize
-    // to coder so old launchers/sessions keep working; this mirrors
-    // ROLE_ALIASES in oracle/server/aspis_mcp.py. "orchestrator" then becomes a
-    // DERIVED UI badge, not a stored spawn role.
+    // This normalizes the inbound `role` FIELD to a CANONICAL spawn role used for
+    // vault token selection + Kanban transition rules: {coder, verifier}. The
+    // "architect"/"code" strings are legacy role-field aliases that fold to coder so
+    // old launchers/sessions keep working.
+    //
+    // FIX 1 — "orchestrator" is NO LONGER a mere "derived UI badge". The local
+    // Devboule orchestrator is now a FIRST-CLASS STORED session role: when launched
+    // via `client == "orchestrator"`, `prepare_or_launch_project_agent` PERSISTS the
+    // session role as "orchestrator" (its `stored_role`), because the devboule-coder
+    // binary hardcodes `agent_register(role="orchestrator")` and the server matches
+    // the stored role against it (orchestrator is in VALID_ROLES, NOT ROLE_ALIASES —
+    // see aspis_mcp.py). This function still folds the orchestrator ROLE-STRING alias
+    // to "coder" so the CANONICAL role drives the coder write profile + coder-like
+    // task powers (the orchestrator plans AND writes) — the canonical fold and the
+    // first-class stored role are complementary, not contradictory: one selects
+    // tokens/permissions, the other is the registration identity.
     match role.as_str() {
         "coder" | "verifier" => Ok(role),
         "orchestrator" | "architect" | "code" => Ok("coder".into()),
         _ => Err("Agent role must be coder or verifier.".into()),
     }
+}
+
+/// FIX 1 (L2 BLOCKER) — the SESSION role to PERSIST for a launch, given the resolved
+/// `client` and the CANONICAL spawn `role` (`normalize_agent_role`'s output). For the
+/// local Devboule orchestrator client this is the first-class "orchestrator" role,
+/// because the devboule-coder binary hardcodes `agent_register(role="orchestrator")`
+/// and the MCP server matches the STORED session role against that incoming role
+/// (orchestrator is in VALID_ROLES, not a ROLE_ALIASES fold — see aspis_mcp.py). If we
+/// stored the canonical "coder" instead, registration would raise "already registered
+/// as coder", `RmcpBackend::connect` would fail, and the orchestrator would silently
+/// degrade to the StubExecutor (fabricated output). For every other client the stored
+/// role IS the canonical role, so codex/claude/coder/verifier are unchanged.
+///
+/// SECURITY/SCOPE NOTE: this is the REGISTRATION IDENTITY only. Token/permission
+/// selection still uses the CANONICAL `role` (the orchestrator gets the coder write
+/// profile + coder-like Kanban powers), so persisting "orchestrator" never widens the
+/// agent's privileges — it only makes the stored role match what the binary registers.
+fn pending_session_role<'a>(client: &str, canonical_role: &'a str) -> &'a str {
+    if client == "orchestrator" {
+        // The `'static` literal coerces to `&'a str` (any `'static` ref outlives 'a).
+        "orchestrator"
+    } else {
+        canonical_role
+    }
+}
+
+/// FIX 3 (hardening) — whether a launch for `client` should receive the role-scoped
+/// Cloudflare provider_env (the coder WRITE token etc.). The local Devboule
+/// orchestrator binary has NO Cloudflare tool (not in its MCP allowlist; config.rs
+/// never reads a Cloudflare token), yet `vault::canonical_agent_role("orchestrator")`
+/// folds to "coder" and would otherwise hand it the long-lived write token. A
+/// local-model binary that ingests web content must not carry an unused write secret
+/// in its env, so omit the entire Cloudflare provider_env for it. Every other client
+/// keeps its role-scoped token.
+fn launch_injects_cloudflare_env(client: &str) -> bool {
+    client != "orchestrator"
 }
 
 fn normalize_agent_client(value: &str) -> Result<String, String> {
@@ -2928,6 +3026,11 @@ fn spawn_agent_terminal_app_impl(
         model,
         provider_env,
         orchestrator,
+        // FIX 2 — PTY path: the script is the `zsh -ic <script>` argument and the
+        // provider_env secrets are injected out-of-band via cmd.env below, so the
+        // builder must NOT re-export them in-script (that would put them on argv).
+        // There is no temp file to self-delete here either. -> false.
+        false,
     )?;
 
     // Prefer the user's login shell; fall back to /bin/zsh (macOS default), then
@@ -3240,6 +3343,18 @@ fn build_macos_agent_script(
     // byte-identical. Dispatched FIRST so the orchestrator (whose `executable` is
     // empty) is not swallowed by the bare-client branch.
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    // FIX 2 — how the caller RUNS the returned script, which decides where secrets go:
+    //   * `true`  (external Terminal.app path): the script is written to a 0600 temp
+    //     file and run as `bash <file>`. There is NO out-of-band env channel (osascript
+    //     spawns Terminal), so `provider_env` MUST be exported INSIDE the script, and
+    //     the script SELF-DELETES (`rm -f "$0"`) the moment bash starts so the secrets
+    //     file does not linger after a successful launch.
+    //   * `false` (in-app PTY path): the script is passed as `zsh -ic <script>` and the
+    //     caller ALSO injects every `provider_env` entry via `cmd.env(...)`. Exporting
+    //     the secrets a SECOND time inside the script would put them on the `-ic` argv
+    //     (visible via `ps`/argv to other processes) — the exact B1 leak. So we SKIP the
+    //     in-script `provider_env` export here; there is no temp file to self-delete.
+    runs_from_temp_file: bool,
 ) -> Result<(PathBuf, String), String> {
     // Same temp-file delivery contract as Windows: keep the launch-token-bearing
     // prompt off the child argv. The generated shell script reads it, copies it to
@@ -3273,6 +3388,19 @@ fn build_macos_agent_script(
 
     let window_title = agent_window_title(agent_id);
     let mut script = String::new();
+    // FIX 2(b) — external Terminal.app path only: this script is a 0600 temp file that
+    // carries the provider_env secrets (launch token, Exa key, Cloudflare token) in its
+    // `export` block below, because Terminal.app gives no out-of-band env channel. Make
+    // it SELF-DELETE the instant bash starts (`$0` is the script path under `bash
+    // <file>`), so the secrets file is gone immediately on a SUCCESSFUL launch instead
+    // of lingering until reboot. The contents stay valid in this already-running shell
+    // (the file is read once at exec). MUST be the FIRST executable line. The in-app PTY
+    // path runs `zsh -ic <script>` where `$0` is the shell, not a file, and injects the
+    // secrets via cmd.env rather than the in-script export block — so it neither needs
+    // nor wants this line (it does not pass `runs_from_temp_file`).
+    if runs_from_temp_file {
+        script.push_str("rm -f \"$0\" 2>/dev/null || true\n");
+    }
     // Set the Terminal window/tab title via the OSC-0 escape so the focus command
     // can match it by name later (mirrors the Windows RawUI.WindowTitle marker).
     script.push_str(&format!(
@@ -3338,13 +3466,23 @@ fn build_macos_agent_script(
         "if [ -n \"$PYTHONPATH\" ]; then export PYTHONPATH={mr}:\"$PYTHONPATH\"; else export PYTHONPATH={mr}; fi\n",
         mr = sh_single_quote(&management_root.display().to_string())
     ));
-    // Provider env vars (role-scoped tokens etc.).
-    for env in provider_env {
-        script.push_str(&format!(
-            "export {}={}\n",
-            shell_env_name(&env.name),
-            sh_single_quote(&env.value)
-        ));
+    // FIX 2(a) — provider env vars (role-scoped Cloudflare token, the orchestrator's
+    // launch token + Exa key, etc.) are SECRETS. Export them IN-SCRIPT ONLY on the
+    // external Terminal.app path (`runs_from_temp_file`), where there is no other env
+    // channel and the script file is 0600 + self-deleting. On the in-app PTY path the
+    // caller injects every one of these via `cmd.env(...)`, so re-exporting them here
+    // would also place them on the `zsh -ic <script>` ARGV (readable via `ps`/argv) —
+    // the B1 leak. So SKIP the in-script export there; cmd.env is the sole channel.
+    // (The non-secret GIT neutralizers + PYTHONPATH above stay in-script on BOTH paths
+    // because the PTY caller does NOT set those via cmd.env.)
+    if runs_from_temp_file {
+        for env in provider_env {
+            script.push_str(&format!(
+                "export {}={}\n",
+                shell_env_name(&env.name),
+                sh_single_quote(&env.value)
+            ));
+        }
     }
     script.push_str(&format!(
         "cd {} || true\n",
@@ -3357,13 +3495,21 @@ fn build_macos_agent_script(
     } else {
         script.push_str("echo 'Aspis agent prompt copied to clipboard.'\n");
     }
-    if is_custom {
-        // B1 (custom path only): the verbatim operator command — and any interactive
-        // shell it leaves behind — runs in THIS shell, where `$PROMPT` still holds the
-        // launch token (it was already copied to the clipboard via pbcopy above and is
-        // exposed to the CLI via the restricted $ASPIS_AGENT_PROMPT_FILE). Built-ins
-        // need no such var, so we only clear here: AFTER pbcopy and BEFORE the command.
-        // `unset PROMPT` also avoids leaving a clobbered zsh/bash PS1-style var around.
+    // FIX 2(c) [corrected by the max-recall adversarial pass] — clear `$PROMPT` before the
+    // command line for every client EXCEPT the codex/claude built-ins. `$PROMPT` holds the
+    // full launch prompt, which embeds the app-issued LAUNCH TOKEN; under `zsh -ic`/an
+    // interactive bash it is the prompt-string variable, so a token-bearing `$PROMPT` would
+    // otherwise LINGER in the interactive PTY shell. For custom (prompt delivered via
+    // $ASPIS_AGENT_PROMPT_FILE), the orchestrator (reads config from env, not the prompt),
+    // and bare/other clients, nothing downstream needs it → clear it. BUT the codex/claude
+    // `cli_line` is `printf '%s' "$PROMPT" | codex …` — it MUST keep `$PROMPT` set or the
+    // CLI receives an empty task (the regression the adversarial verify caught). So unset
+    // it UNLESS the built cli_line is the codex/claude branch that consumes it.
+    let cli_consumes_prompt = orchestrator.is_none()
+        && !is_custom
+        && !executable.is_empty()
+        && matches!(client, "codex" | "claude");
+    if !cli_consumes_prompt {
         script.push_str("unset PROMPT\n");
     }
     if !cli_line.is_empty() {
@@ -3401,6 +3547,12 @@ fn spawn_agent_terminal_impl(
         model,
         provider_env,
         orchestrator,
+        // FIX 2 — external Terminal.app path: osascript runs `bash <script_file>`, so
+        // there is no cmd.env channel and the provider_env secrets MUST be exported
+        // in-script. The script is written to a 0600 temp file just below, so the
+        // builder also injects the `rm -f "$0"` self-delete (first line) to remove that
+        // secrets file the moment bash starts. -> true.
+        true,
     )?;
 
     // Write the generated script to its own restricted temp file and have Terminal
@@ -9366,6 +9518,127 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         );
     }
 
+    // FIX 1 (L2 BLOCKER) — the PERSISTED session role must equal what the binary
+    // registers as. The devboule-coder binary hardcodes
+    // `agent_register(role="orchestrator")` (config.rs), so a launch with
+    // `client == "orchestrator"` MUST store "orchestrator", not the canonical "coder"
+    // that `normalize_agent_role` produces. Every other client stores its canonical
+    // role unchanged. This is the load-bearing assertion: a mismatch makes the server
+    // reject registration and the orchestrator silently degrade to the StubExecutor.
+    #[test]
+    fn orchestrator_launch_persists_orchestrator_session_role() {
+        // The orchestrator client's CANONICAL role is "coder" (normalize_agent_role
+        // folds the orchestrator role-string alias), but the STORED session role is
+        // first-class "orchestrator" so agent_register matches.
+        assert_eq!(normalize_agent_role("orchestrator").unwrap(), "coder");
+        assert_eq!(pending_session_role("orchestrator", "coder"), "orchestrator");
+        // Every other client persists the canonical role verbatim (byte-identical to
+        // pre-FIX behavior).
+        assert_eq!(pending_session_role("codex", "coder"), "coder");
+        assert_eq!(pending_session_role("claude", "coder"), "coder");
+        assert_eq!(pending_session_role("powershell", "coder"), "coder");
+        assert_eq!(pending_session_role("codex", "verifier"), "verifier");
+        assert_eq!(pending_session_role("custom-cli", "coder"), "coder");
+    }
+
+    // FIX 1 cross-check against the server contract: the stored "orchestrator" role
+    // and the binary's registration role must collapse to the SAME canonical role on
+    // the Python side, where `coerce_role` keeps "orchestrator" first-class (it is in
+    // VALID_ROLES, not ROLE_ALIASES). The Rust vault's `canonical_agent_role` folds it
+    // to the coder write profile for TOKEN selection — proving the registration
+    // identity and the permission role are decoupled (storing "orchestrator" does not
+    // widen privileges).
+    #[test]
+    fn orchestrator_stored_role_keeps_coder_permissions() {
+        // Registration identity stored = "orchestrator".
+        assert_eq!(pending_session_role("orchestrator", "coder"), "orchestrator");
+        // ...but the Cloudflare/token PERMISSION role still resolves to the coder write
+        // profile (the orchestrator plans AND writes), so no privilege regression.
+        assert_eq!(
+            vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
+            Some("coder-worker-write")
+        );
+    }
+
+    // FIX 3 (hardening) — the orchestrator launch must NOT receive the role-scoped
+    // Cloudflare provider_env (it has no Cloudflare tool); every other client must.
+    // This gates the `cloudflare_agent_provider_env_for_role` call in the launch path.
+    #[test]
+    fn orchestrator_launch_omits_cloudflare_env_others_keep_it() {
+        assert!(!launch_injects_cloudflare_env("orchestrator"));
+        assert!(launch_injects_cloudflare_env("codex"));
+        assert!(launch_injects_cloudflare_env("claude"));
+        assert!(launch_injects_cloudflare_env("powershell"));
+        assert!(launch_injects_cloudflare_env("custom-cli"));
+    }
+
+    // FIX 3 — model the launch's provider_env assembly to prove an orchestrator's env
+    // carries the launch token (+ Exa key when set) but NO Cloudflare token, while a
+    // coder's env DOES carry its Cloudflare token. Uses the SAME predicate the launch
+    // uses to decide the Cloudflare block; the Cloudflare entries are stand-ins (the
+    // real ones come from the keyring, unavailable in unit tests).
+    #[test]
+    fn provider_env_assembly_gates_cloudflare_per_client() {
+        fn assemble(client: &str, exa_key: Option<&str>) -> Vec<AgentLaunchEnv> {
+            // Mirror prepare_or_launch_project_agent's assembly order.
+            let mut env: Vec<AgentLaunchEnv> = if launch_injects_cloudflare_env(client) {
+                vec![AgentLaunchEnv {
+                    name: "ASPIS_CLOUDFLARE_API_TOKEN".into(),
+                    value: "cf-token".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            if client == "orchestrator" {
+                env.push(AgentLaunchEnv {
+                    name: "DEVBOULE_MCP_LAUNCH_TOKEN".into(),
+                    value: "launch-tok".into(),
+                });
+                if let Some(key) = exa_key {
+                    env.push(AgentLaunchEnv {
+                        name: "EXA_API_KEY".into(),
+                        value: key.into(),
+                    });
+                }
+            }
+            env
+        }
+        let has = |env: &[AgentLaunchEnv], name: &str| env.iter().any(|e| e.name == name);
+
+        // Orchestrator WITH an Exa key: launch token + Exa, NO Cloudflare token.
+        let orch = assemble("orchestrator", Some("exa-key"));
+        assert!(has(&orch, "DEVBOULE_MCP_LAUNCH_TOKEN"));
+        assert!(has(&orch, "EXA_API_KEY"));
+        assert!(!has(&orch, "ASPIS_CLOUDFLARE_API_TOKEN"));
+
+        // Orchestrator WITHOUT an Exa key: launch token only, still no Cloudflare token.
+        let orch_no_exa = assemble("orchestrator", None);
+        assert!(has(&orch_no_exa, "DEVBOULE_MCP_LAUNCH_TOKEN"));
+        assert!(!has(&orch_no_exa, "EXA_API_KEY"));
+        assert!(!has(&orch_no_exa, "ASPIS_CLOUDFLARE_API_TOKEN"));
+
+        // A coder launch (codex client) still gets its Cloudflare token, no orch secrets.
+        let coder = assemble("codex", None);
+        assert!(has(&coder, "ASPIS_CLOUDFLARE_API_TOKEN"));
+        assert!(!has(&coder, "DEVBOULE_MCP_LAUNCH_TOKEN"));
+        assert!(!has(&coder, "EXA_API_KEY"));
+    }
+
+    // FIX 1 — a workflow_run on an orchestrator client must be REJECTED (its
+    // instructions are prompt-delivered, which the autonomous binary ignores). The
+    // guard keys on the client, not the role (the orchestrator's role is "coder").
+    #[test]
+    fn workflow_run_rejected_for_orchestrator_client() {
+        // The guard condition the launch evaluates: workflow present AND orchestrator.
+        let client = "orchestrator";
+        let role = normalize_agent_role("orchestrator").unwrap(); // "coder"
+        // Pre-FIX, `role != "coder"` was FALSE for an orchestrator (role == "coder"),
+        // so the old guard would have WRONGLY ALLOWED it. The new client-keyed guard
+        // catches it.
+        assert_eq!(role, "coder");
+        assert!(client == "orchestrator", "client-keyed guard rejects this");
+    }
+
     #[test]
     fn mcp_client_configs_enable_cloudflare_profile_mode_without_tokens() {
         let root = PathBuf::from("C:\\Aspis Management");
@@ -9915,6 +10188,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             None,
             &[],
             None,
+            // External Terminal.app semantics (in-script env export path).
+            true,
         )
         .expect("script builds");
         assert!(
@@ -10238,6 +10513,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             None,
             &[],
             None,
+            // External Terminal.app path (custom client reads $ASPIS_AGENT_PROMPT_FILE).
+            true,
         )
         .expect("script builds");
 
@@ -10260,6 +10537,174 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             pbcopy_at < unset_at && unset_at < command_at,
             "unset must be after pbcopy and before the command: {script}"
         );
+        remove_restricted_temp_file(&prompt_file);
+    }
+
+    // FIX 2 — provider_env fixture carrying the two secret env vars the macOS launch
+    // is given today (the orchestrator launch token + Exa key) PLUS a Cloudflare token,
+    // with distinctive values so the leak assertions are unambiguous.
+    #[cfg(target_os = "macos")]
+    fn secret_provider_env_fixture() -> Vec<AgentLaunchEnv> {
+        vec![
+            AgentLaunchEnv {
+                name: "DEVBOULE_MCP_LAUNCH_TOKEN".into(),
+                value: "tok-secret-launch-deadbeef".into(),
+            },
+            AgentLaunchEnv {
+                name: "EXA_API_KEY".into(),
+                value: "exa-secret-cafebabe".into(),
+            },
+            AgentLaunchEnv {
+                name: "ASPIS_CLOUDFLARE_API_TOKEN".into(),
+                value: "cf-secret-write-token-1234".into(),
+            },
+        ]
+    }
+
+    // FIX 2(a)+(c) — IN-APP PTY path (`runs_from_temp_file = false`). The script is the
+    // `zsh -ic <script>` ARGV, so it must NOT re-export the provider_env secrets (they
+    // ride via cmd.env instead); a re-export would leak them onto argv via `ps`. The
+    // self-delete is for the external file path only, so it must be ABSENT here. And
+    // `unset PROMPT` must be present even for a built-in (the launch-token-bearing
+    // $PROMPT must not linger in the interactive PTY shell).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pty_script_keeps_provider_secrets_off_argv_and_unsets_prompt() {
+        let root = PathBuf::from("/tmp/aspis");
+        let projects = root.join("projects");
+        let envs = secret_provider_env_fixture();
+        let (prompt_file, script) = build_macos_agent_script(
+            "orchestrator-1",
+            &root,
+            "orchestrator",
+            "",
+            None,
+            "the-secret-prompt",
+            &root,
+            &projects,
+            None,
+            &envs,
+            None,
+            // PTY path: secrets via cmd.env, NOT in-script.
+            false,
+        )
+        .expect("script builds");
+
+        // The secret NAMES must NOT appear in an `export` (they would land on the
+        // `-ic` argv). Assert the full `export NAME=` form and the secret VALUES.
+        for needle in [
+            "export DEVBOULE_MCP_LAUNCH_TOKEN=",
+            "export EXA_API_KEY=",
+            "export ASPIS_CLOUDFLARE_API_TOKEN=",
+            "tok-secret-launch-deadbeef",
+            "exa-secret-cafebabe",
+            "cf-secret-write-token-1234",
+        ] {
+            assert!(
+                !script.contains(needle),
+                "PTY script must not carry secret on argv ({needle}): {script}"
+            );
+        }
+        // No self-delete on the PTY path ($0 is the shell, not a temp file).
+        assert!(
+            !script.contains("rm -f \"$0\""),
+            "PTY script must not self-delete the shell: {script}"
+        );
+        // The orchestrator's cli_line does NOT consume $PROMPT (the binary reads its config
+        // from env), so the launch-token-bearing $PROMPT is cleared to keep it out of the
+        // interactive PTY shell. codex/claude KEEP it (their cli_line pipes it) — see
+        // `macos_codex_script_keeps_prompt_for_its_pipe` below.
+        assert!(
+            script.contains("unset PROMPT"),
+            "orchestrator PTY script must unset PROMPT: {script}"
+        );
+        // The non-secret env the script always sets in-line is still there (the PTY
+        // caller does NOT inject these via cmd.env, so they must stay in-script).
+        assert!(script.contains("export GIT_TERMINAL_PROMPT='0'"));
+        remove_restricted_temp_file(&prompt_file);
+    }
+
+    // REGRESSION (max-recall adversarial pass): the codex/claude built-ins pipe `$PROMPT`
+    // into the CLI (`printf '%s' "$PROMPT" | codex …`), so the script must NOT `unset PROMPT`
+    // before that pipe — doing so sends an EMPTY task. (Only custom/orchestrator/bare clear
+    // it.) This test pins that a codex launch keeps `$PROMPT`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_codex_script_keeps_prompt_for_its_pipe() {
+        let root = PathBuf::from("/tmp/aspis");
+        let projects = root.join("projects");
+        let envs = secret_provider_env_fixture();
+        let (prompt_file, script) = build_macos_agent_script(
+            "codex-1",
+            &root,
+            "codex",
+            // non-empty executable so the cli_line reaches the codex branch
+            "codex",
+            None,
+            "the-secret-prompt",
+            &root,
+            &projects,
+            None,
+            &envs,
+            None,
+            false,
+        )
+        .expect("script builds");
+
+        // codex consumes $PROMPT via its pipe → it MUST NOT be unset.
+        assert!(
+            !script.contains("unset PROMPT"),
+            "codex script must NOT unset PROMPT (its cli_line pipes it): {script}"
+        );
+        // $PROMPT is set and available for the pipe.
+        assert!(
+            script.contains("$PROMPT"),
+            "codex script must reference $PROMPT for its pipe: {script}"
+        );
+        remove_restricted_temp_file(&prompt_file);
+    }
+
+    // FIX 2(a)+(b)+(c) — EXTERNAL Terminal.app path (`runs_from_temp_file = true`). No
+    // cmd.env channel exists, so the provider_env secrets MUST be exported in-script;
+    // the script is a 0600 temp file, so the FIRST executable line must self-delete it
+    // (`rm -f "$0"`), and `unset PROMPT` must still be present.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_external_script_self_deletes_first_and_exports_env() {
+        let root = PathBuf::from("/tmp/aspis");
+        let projects = root.join("projects");
+        let envs = secret_provider_env_fixture();
+        let (prompt_file, script) = build_macos_agent_script(
+            "orchestrator-1",
+            &root,
+            "orchestrator",
+            "",
+            None,
+            "the-secret-prompt",
+            &root,
+            &projects,
+            None,
+            &envs,
+            None,
+            // External Terminal.app path: in-script env + self-delete.
+            true,
+        )
+        .expect("script builds");
+
+        // The self-delete is the FIRST executable line (before the OSC-0 title).
+        let self_delete = "rm -f \"$0\" 2>/dev/null || true";
+        assert!(
+            script.starts_with(self_delete),
+            "external script must self-delete on its first line: {script}"
+        );
+        let rm_at = script.find(self_delete).unwrap();
+        let title_at = script.find("printf '\\033]0;").unwrap();
+        assert!(rm_at < title_at, "self-delete must precede the title: {script}");
+        // On THIS path the provider_env secrets ARE exported in-script (the only channel).
+        assert!(script.contains("export DEVBOULE_MCP_LAUNCH_TOKEN="));
+        assert!(script.contains("export EXA_API_KEY="));
+        assert!(script.contains("export ASPIS_CLOUDFLARE_API_TOKEN="));
+        assert!(script.contains("unset PROMPT"));
         remove_restricted_temp_file(&prompt_file);
     }
 

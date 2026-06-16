@@ -187,18 +187,24 @@ impl CoderModel for ScriptedModel {
     }
 
     async fn next_output(&self, _transcript: &Transcript) -> String {
-        // Poisoned only if a prior call panicked between lock and unlock, which
-        // it cannot here (no panic point under the guard); recover defensively.
-        // The cursor is taken and released synchronously within this `async fn`
-        // (the guard never crosses an `.await`), so the future stays `Send`.
-        let mut cursor = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
-        let idx = *cursor;
-        if idx < self.outputs.len() {
-            *cursor += 1;
-            self.outputs[idx].clone()
-        } else {
-            Self::exhausted_output()
-        }
+        // Take the cursor index inside a TIGHT block so the `MutexGuard` is DROPPED
+        // before this `async fn` returns. A guard held across the function body
+        // would be live across any future `.await` added here, making the returned
+        // future `!Send` and breaking `tokio::spawn` of the burst. Poisoned only if
+        // a prior call panicked under the guard (it cannot — no panic point here);
+        // recover defensively. This block has no `.await`, so the guard never
+        // crosses a suspend point.
+        let next: Option<String> = {
+            let mut cursor = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            let idx = *cursor;
+            if idx < self.outputs.len() {
+                *cursor += 1;
+                self.outputs.get(idx).cloned()
+            } else {
+                None
+            }
+        };
+        next.unwrap_or_else(Self::exhausted_output)
     }
 }
 

@@ -85,11 +85,19 @@ async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
 
     // The real executor needs the MCP server connection details. Without them,
-    // stay on the Stub so `cargo run` works with no server.
+    // stay on the Stub so `cargo run` works with no server — but say so loudly:
+    // a real model against a StubExecutor returns FAKE oracle/spawn output with no
+    // signal, which silently looks like a working agent. This is the diagnostic for
+    // a mis-launch (DEVBOULE_MCP_ROOT / DEVBOULE_MCP_PROJECTS_DIR not set).
     let (Some(root), Some(projects_dir)) = (
         env_nonempty(ENV_MCP_ROOT),
         env_nonempty(ENV_MCP_PROJECTS_DIR),
     ) else {
+        eprintln!(
+            "devboule: MCP backend disabled (DEVBOULE_MCP_ROOT / \
+             DEVBOULE_MCP_PROJECTS_DIR not set); oracle/spawn tools will return \
+             STUB results — the local coder is NOT connected"
+        );
         return (Arc::new(StubExecutor), false);
     };
 
@@ -118,7 +126,10 @@ async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
     let mcp = match RmcpBackend::connect(config).await {
         Ok(backend) => Arc::new(backend) as Arc<dyn crate::executor::McpBackend>,
         Err(e) => {
-            eprintln!("devboule: MCP backend disabled ({e}); using StubExecutor");
+            eprintln!(
+                "devboule: MCP backend disabled ({e}); oracle/spawn tools will \
+                 return STUB results — the local coder is NOT connected"
+            );
             return (Arc::new(StubExecutor), false);
         }
     };
