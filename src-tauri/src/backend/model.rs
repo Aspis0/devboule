@@ -561,6 +561,16 @@ pub struct ProjectAgentLaunchInput {
     /// per-step Censor addendum is unconditional). camelCase over IPC.
     #[serde(default)]
     pub censor_review: Option<bool>,
+    /// 3b: when `Some(true)` AND `client == "orchestrator"`, the local Devboule coder is
+    /// launched in PLAN-FIRST mode — the launch adds `DEVBOULE_PLAN_FIRST=1` to the
+    /// orchestrator binary's env so its system prompt biases toward producing a plan
+    /// (and submitting it for approval via `plan_submit`) before any other action.
+    /// Optional and lenient: `None`/`Some(false)` omits the env entirely, so the default
+    /// launch is byte-identical and every existing caller (codex/claude, the current TS
+    /// invokes that send no `planFirst`) is unaffected. Ignored for non-orchestrator
+    /// clients (they have no planner / read no such env). camelCase over IPC.
+    #[serde(default)]
+    pub plan_first: Option<bool>,
     /// Phase D: when `Some`, this is a design "Save & hand off" dispatch — the coder's
     /// launch prompt gains a FIXED-WORDING addendum that points it at the validated
     /// design bundle and instructs it to implement that design (respecting design.md as

@@ -1050,6 +1050,13 @@ export interface ProjectAgentLaunchInput {
   // leaves the verifier prompt unchanged (back-compat). Mirrors the
   // #[serde(default)] censor_review on ProjectAgentLaunchInput in model.rs.
   censorReview?: boolean | null;
+  // 3b: true only for a LOCAL orchestrator launch (client === "orchestrator") with
+  // the "Plan first" toggle ON. The backend then adds DEVBOULE_PLAN_FIRST=1 to the
+  // orchestrator's env so its system prompt biases toward planning before acting.
+  // Optional and lenient: absent/false omits the env entirely (the default launch
+  // is byte-identical). Ignored for codex/claude. Mirrors the #[serde(default)]
+  // plan_first on ProjectAgentLaunchInput in model.rs.
+  planFirst?: boolean | null;
   // Saved Claude Code workflow launch. The backend validates name against
   // list_saved_workflows(projectId) before building the fixed prompt addendum.
   workflowRun?: {

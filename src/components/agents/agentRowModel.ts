@@ -275,6 +275,14 @@ export interface SpawnSelection {
   // widening at every call site; the Rust boundary re-validates it against
   // config.json (normalize_agent_client).
   client: string;
+  // 3b — "Plan first" bias for the LOCAL orchestrator (client === "orchestrator")
+  // ONLY. When true the launch sets DEVBOULE_PLAN_FIRST=1 so the orchestrator's
+  // system prompt gains a plan-before-acting directive. Meaningless for
+  // codex/claude (the toggle is not shown for them); SpawnPanel forces it to false
+  // for any non-orchestrator client so the launch input never carries a stale flag.
+  // Optional so existing callers (e.g. the Censor final-review path) type-check
+  // without setting it; absent is treated as off everywhere downstream.
+  planFirst?: boolean;
 }
 
 // The exact ProjectAgentLaunchInput sent over IPC, built from a selection plus a
@@ -294,6 +302,12 @@ export interface SpawnLaunchInput {
   // and the verifier prompt is unchanged. Threaded to ProjectAgentLaunchInput
   // .censorReview over IPC.
   censorReview?: boolean;
+  // 3b — true only for a LOCAL orchestrator launch (client === "orchestrator")
+  // with the "Plan first" toggle ON. Threaded to ProjectAgentLaunchInput.planFirst
+  // over IPC; the Rust launch wiring turns it into DEVBOULE_PLAN_FIRST=1 for the
+  // orchestrator binary (and omits it when false/absent so a non-plan-first launch
+  // is byte-identical). Always absent for codex/claude — the toggle is not shown.
+  planFirst?: boolean;
 }
 
 // Max length of an advisory model hint that rides into the prompt. A model name
@@ -371,6 +385,15 @@ export function buildLaunchInput(
     taskId: selection.taskId.trim().length > 0 ? selection.taskId : null,
     host,
     model: normalizeModelHint(selection.model),
+    // 3b — "Plan first" is a LOCAL-orchestrator-only bias. Gate it on the client
+    // here (belt-and-suspenders alongside SpawnPanel forcing it off for non-
+    // orchestrator clients) so a stale selection flag can never ride a codex/claude
+    // launch. Only emit `true`; leave it undefined otherwise so the launch input —
+    // and the IPC payload — is byte-identical to a pre-3b launch when off.
+    planFirst:
+      selection.client === "orchestrator" && selection.planFirst === true
+        ? true
+        : undefined,
   };
 }
 

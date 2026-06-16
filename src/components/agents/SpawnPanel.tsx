@@ -102,6 +102,13 @@ export function SpawnPanel({
   // The CLI the launch uses: a built-in id ("codex"/"claude") or a configured
   // custom client id. Codex is the default.
   const [client, setClient] = useState<string>("codex");
+  // 3b — "Plan first" bias, shown ONLY for the local orchestrator. Default ON:
+  // planning-first is the intended UX for the local coder (it plans before acting
+  // and surfaces the plan in the Plans tab for approval). The state is kept
+  // regardless of the selected client; it is only RENDERED for the orchestrator and
+  // only THREADED into the launch for the orchestrator (see `selection` below), so
+  // toggling to codex/claude can never carry the flag.
+  const [planFirst, setPlanFirst] = useState<boolean>(true);
 
   // The selector options: built-ins first, then each configured custom client
   // (label shown, id is the value). Deduped/validated upstream; rendered as-is.
@@ -185,6 +192,11 @@ export function SpawnPanel({
     model,
     taskId,
     client,
+    // 3b — only the orchestrator carries "Plan first"; leave it unset (absent === off
+    // per the SpawnSelection contract) for every other client so a stale toggle state
+    // never threads into a codex/claude launch, and no consumer mistakes a not-applicable
+    // field for a deliberately-disabled one.
+    planFirst: client === "orchestrator" ? planFirst : undefined,
   };
 
   const roleSummary = ROLE_OPTIONS.find((r) => r.id === role)?.summary ?? "";
@@ -350,9 +362,29 @@ export function SpawnPanel({
         })}
       </div>
       {client === "orchestrator" && (
-        <p className="mb-3 -mt-1.5 text-[10px] leading-4 text-cream-400">
+        <p className="mb-2 -mt-1.5 text-[10px] leading-4 text-cream-400">
           {orchestratorModelNote(localCoderModel)}
         </p>
+      )}
+      {/* 3b — "Plan first" toggle, orchestrator-only. Default ON: the local coder
+          should plan before acting and surface the plan in the Plans tab for
+          approval. Hidden for codex/claude (they have no planner entry). */}
+      {client === "orchestrator" && (
+        <label className="mb-3 flex cursor-pointer items-start gap-2">
+          <input
+            type="checkbox"
+            checked={planFirst}
+            onChange={(e) => setPlanFirst(e.target.checked)}
+            aria-label="Plan first"
+            data-testid="plan-first-toggle"
+            className="mt-0.5 h-3.5 w-3.5 cursor-pointer accent-terracotta"
+          />
+          <span className="text-[11px] leading-4 text-cream-600">
+            <span className="font-semibold text-cream-800">Plan first</span> — the
+            coder produces a task plan and submits it for your approval (Plans tab)
+            before doing any other work.
+          </span>
+        </label>
       )}
 
       {/* Launch actions. */}

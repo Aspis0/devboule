@@ -1409,6 +1409,19 @@ fn prepare_or_launch_project_agent(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             activity_file,
+            // 3c — the Oracle-side project key the planner needs so its `plan_submit`
+            // surfaces under THIS project in the per-project Plans tab. This is the SAME
+            // id the PlansPanel queries (`project.metadata.id`), already normalized at
+            // project creation. Without it the planner escalates instead of planning.
+            project_id: project.metadata.id.clone(),
+            // 3b — "1" only when the launch input requested plan-first; empty otherwise
+            // so `orchestrator_env_pairs` omits DEVBOULE_PLAN_FIRST and the launch is
+            // byte-identical to a non-plan-first one.
+            plan_first: if input.plan_first.unwrap_or(false) {
+                "1".to_string()
+            } else {
+                String::new()
+            },
         })
     } else {
         None
@@ -4244,6 +4257,19 @@ struct OrchestratorLaunchConfig {
     /// when the bridge could not be set up (the orchestrator then no-ops its milestones).
     /// NOT a secret — it carries only redacted, label-only milestone events.
     activity_file: String,
+    /// `DEVBOULE_PROJECT_ID` (3c): the Oracle-side project key the orchestrator was
+    /// launched on. The local planner reads it from the binary's config and passes it to
+    /// the `project_structure` / `plan_submit` MCP tools; an EMPTY value makes the planner
+    /// escalate ("project_id not set") instead of submitting a plan against the wrong
+    /// project, and the resulting `planApprovalRequest` would not surface under this
+    /// project in the per-project `PlansPanel`. Set to the launched project's id (already
+    /// normalized at project creation). NOT a secret.
+    project_id: String,
+    /// `DEVBOULE_PLAN_FIRST` (3b): "1" when the operator launched with the "Plan first"
+    /// toggle ON, else empty. When set, the orchestrator's system prompt gains a
+    /// plan-before-acting directive. Empty/absent leaves the prompt unchanged, so a
+    /// non-plan-first launch is byte-identical. NOT a secret.
+    plan_first: String,
 }
 
 /// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
@@ -4278,6 +4304,19 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     if !config.activity_file.trim().is_empty() {
         pairs.push(("DEVBOULE_ACTIVITY_FILE", config.activity_file.clone()));
     }
+    // 3c — the Oracle-side project key for the planner's `plan_submit` (so the plan
+    // surfaces under THIS project in the per-project Plans tab). Set ONLY when present;
+    // an empty id is omitted (the binary's config reader treats absent == empty and the
+    // planner escalates rather than mis-submitting). Non-secret.
+    if !config.project_id.trim().is_empty() {
+        pairs.push(("DEVBOULE_PROJECT_ID", config.project_id.clone()));
+    }
+    // 3b — plan-first bias. Appended ONLY when set ("1"); when the toggle was OFF the
+    // field is empty and the pair is omitted entirely, so a non-plan-first launch is
+    // byte-identical to a pre-3b one. Non-secret.
+    if !config.plan_first.trim().is_empty() {
+        pairs.push(("DEVBOULE_PLAN_FIRST", config.plan_first.clone()));
+    }
     pairs
 }
 
@@ -4296,8 +4335,10 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
 fn macos_orchestrator_launch_line(config: &OrchestratorLaunchConfig) -> String {
-    // Each pair is `export NAME=<sh-quoted value>`. Only NON-SECRET config is set
-    // inline; the loopback-only base URL is validated upstream (read_mini_coder_backend).
+    // Each pair is emitted as an inline shell assignment `NAME=<sh-quoted value> ` that
+    // prefixes the exec line (NOT `export` — a temporary, per-command assignment, which
+    // the exec'd binary still inherits like env(1)). Only NON-SECRET config is set this
+    // way; the loopback-only base URL is validated upstream (read_local_coder_backend).
     let pairs = orchestrator_env_pairs(config);
     let mut line = String::new();
     for (name, value) in &pairs {
@@ -9471,6 +9512,15 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             serde_json::from_str(r#"{"projectId":"p","role":"verifier","client":"claude"}"#)
                 .expect("legacy launch input without censorReview must parse");
         assert_eq!(without.censor_review, None);
+        // 3b — the same legacy payload omits planFirst ⇒ None (no DEVBOULE_PLAN_FIRST).
+        assert_eq!(without.plan_first, None);
+
+        // 3b — the orchestrator "Plan first" payload carries planFirst: true.
+        let plan_first: ProjectAgentLaunchInput = serde_json::from_str(
+            r#"{"projectId":"p","role":"coder","client":"orchestrator","planFirst":true}"#,
+        )
+        .expect("launch input with planFirst must parse");
+        assert_eq!(plan_first.plan_first, Some(true));
 
         // The "Run final review" payload carries censorReview: true.
         let with: ProjectAgentLaunchInput = serde_json::from_str(
@@ -9911,6 +9961,9 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             project_root: PathBuf::from("/work/the-project"),
             app_bin: "/opt/aspis/aspis-management".to_string(),
             activity_file: "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl".to_string(),
+            // 3c — the project key the planner submits under. 3b — plan-first ON.
+            project_id: "the-project-sentinel".to_string(),
+            plan_first: "1".to_string(),
         }
     }
 
@@ -9945,6 +9998,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             "DEVBOULE_APP_BIN",
             // FILE BRIDGE: the orchestrator appends its coder-tier milestones here.
             "DEVBOULE_ACTIVITY_FILE",
+            // 3c — the Oracle-side project key the planner submits under.
+            "DEVBOULE_PROJECT_ID",
+            // 3b — plan-first bias (the fixture has it ON).
+            "DEVBOULE_PLAN_FIRST",
         ] {
             assert!(text.contains(name), "missing env var {name}: {text}");
         }
@@ -9959,6 +10016,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             "/work/the-project",
             "/opt/aspis/aspis-management",
             "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl",
+            // 3c — the project key value.
+            "the-project-sentinel",
         ] {
             assert!(text.contains(value), "missing env value {value}: {text}");
         }
@@ -10016,6 +10075,51 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let with = orchestrator_fixture();
         let names: Vec<&str> = orchestrator_env_pairs(&with).into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"DEVBOULE_ACTIVITY_FILE"));
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_carries_project_id_for_plans_tab() {
+        // 3c — the planner's plan_submit surfaces under THIS project only when the launch
+        // sets DEVBOULE_PROJECT_ID. Present with the right value when set; OMITTED when
+        // empty (the binary then escalates rather than mis-submitting).
+        let pairs = orchestrator_env_pairs(&orchestrator_fixture());
+        let project = pairs.iter().find(|(n, _)| *n == "DEVBOULE_PROJECT_ID");
+        assert_eq!(
+            project.map(|(_, v)| v.as_str()),
+            Some("the-project-sentinel"),
+            "DEVBOULE_PROJECT_ID must carry the launched project id"
+        );
+
+        let mut empty = orchestrator_fixture();
+        empty.project_id = String::new();
+        let names: Vec<&str> = orchestrator_env_pairs(&empty).into_iter().map(|(n, _)| n).collect();
+        assert!(
+            !names.contains(&"DEVBOULE_PROJECT_ID"),
+            "empty project_id ⇒ no DEVBOULE_PROJECT_ID pair"
+        );
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_plan_first_present_only_when_on() {
+        // 3b — DEVBOULE_PLAN_FIRST=1 is set ONLY when the operator launched with the
+        // toggle ON (plan_first == "1"). When OFF (empty) the pair is OMITTED so the
+        // launch is byte-identical to a non-plan-first one.
+        let on = orchestrator_fixture(); // fixture has plan_first = "1".
+        let on_pairs = orchestrator_env_pairs(&on);
+        let flag = on_pairs.iter().find(|(n, _)| *n == "DEVBOULE_PLAN_FIRST");
+        assert_eq!(
+            flag.map(|(_, v)| v.as_str()),
+            Some("1"),
+            "plan-first ON ⇒ DEVBOULE_PLAN_FIRST=1"
+        );
+
+        let mut off = orchestrator_fixture();
+        off.plan_first = String::new();
+        let names: Vec<&str> = orchestrator_env_pairs(&off).into_iter().map(|(n, _)| n).collect();
+        assert!(
+            !names.contains(&"DEVBOULE_PLAN_FIRST"),
+            "plan-first OFF ⇒ no DEVBOULE_PLAN_FIRST pair (byte-identical default launch)"
+        );
     }
 
     #[cfg(target_os = "macos")]

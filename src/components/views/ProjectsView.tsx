@@ -1393,6 +1393,11 @@ export function ProjectsView() {
             // normal SpawnPanel launch leaves it undefined, so the backend's
             // lenient default keeps the verifier prompt unchanged.
             censorReview: input.censorReview,
+            // 3b: "Plan first" rides through ONLY for the orchestrator client
+            // (buildLaunchInput already gates it). Undefined for every other
+            // launch, so the backend omits DEVBOULE_PLAN_FIRST and the env is
+            // byte-identical to a pre-3b launch.
+            planFirst: input.planFirst,
           },
         },
       );

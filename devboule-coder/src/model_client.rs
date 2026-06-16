@@ -144,18 +144,27 @@ pub fn validate_omlx_base_url(base_url: &str) -> Result<String, String> {
 }
 
 /// The real loopback chat-completions model. Holds the validated+normalized base
-/// URL, the model id, and a rustls reqwest client.
+/// URL, the model id, a rustls reqwest client, and the plan-first prompt bias.
 pub struct OmlxModel {
     base_url: String,
     model: String,
     client: reqwest::Client,
+    /// 3b — the operator's "Plan first" launch bias (from `DEVBOULE_PLAN_FIRST`,
+    /// resolved in `config.rs`). Threaded into `build_system_prompt` so the model's
+    /// standing prompt gains the PLAN-FIRST directive when set. `false` keeps the
+    /// prompt byte-identical to the pre-3b default.
+    plan_first: bool,
 }
 
 impl OmlxModel {
-    /// Build from a base URL + model id. The base URL is validated to be a
-    /// loopback http endpoint (privacy); an invalid endpoint is an error so a
-    /// misconfiguration never silently routes the prompt off-machine.
-    pub fn new(base_url: &str, model: impl Into<String>) -> Result<Self, String> {
+    /// Build from a base URL + model id + the plan-first bias. The base URL is
+    /// validated to be a loopback http endpoint (privacy); an invalid endpoint is an
+    /// error so a misconfiguration never silently routes the prompt off-machine.
+    pub fn new(
+        base_url: &str,
+        model: impl Into<String>,
+        plan_first: bool,
+    ) -> Result<Self, String> {
         let base_url = validate_omlx_base_url(base_url)?;
         let model = model.into();
         if model.trim().is_empty() {
@@ -169,7 +178,7 @@ impl OmlxModel {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-        Ok(Self { base_url, model, client })
+        Ok(Self { base_url, model, client, plan_first })
     }
 
     /// The chat-completions endpoint URL.
@@ -183,7 +192,7 @@ impl OmlxModel {
     pub fn build_request_body(&self, transcript: &Transcript) -> Value {
         json!({
             "model": self.model,
-            "messages": build_messages(transcript),
+            "messages": build_messages(transcript, self.plan_first),
             "max_tokens": MAX_TOKENS,
             "temperature": 0.2,
             "stream": false,
@@ -195,11 +204,12 @@ impl OmlxModel {
 /// human message, then each prior action (as an assistant turn carrying its
 /// emitted action block) and its tool result / format feedback (as a user turn).
 /// The model thus sees the full local burst context the way it produced it.
-fn build_messages(transcript: &Transcript) -> Value {
+fn build_messages(transcript: &Transcript, plan_first: bool) -> Value {
     // The system prompt + the human message are NON-evictable framing: the model
-    // must always see who it is and what was asked.
+    // must always see who it is and what was asked. `plan_first` (3b) appends the
+    // PLAN-FIRST directive to the standing prompt when the operator requested it.
     let mut messages = vec![
-        json!({ "role": "system", "content": build_system_prompt() }),
+        json!({ "role": "system", "content": build_system_prompt(plan_first) }),
         json!({ "role": "user", "content": transcript.human_message() }),
     ];
 
@@ -419,7 +429,7 @@ mod tests {
 
     #[test]
     fn build_request_body_has_system_prompt_and_human_message() {
-        let model = OmlxModel::new("http://127.0.0.1:8000/v1", "test-model").unwrap();
+        let model = OmlxModel::new("http://127.0.0.1:8000/v1", "test-model", false).unwrap();
         let transcript = Transcript::new("do the thing".to_string());
         let body = model.build_request_body(&transcript);
 
@@ -442,7 +452,7 @@ mod tests {
         // `render_action_block_round_trips_through_the_parser` (the entries() push
         // surface is private to the loop, so the per-entry mapping is exercised
         // via the block renderer it delegates to).
-        let model = OmlxModel::new("http://127.0.0.1:8000", "m").unwrap();
+        let model = OmlxModel::new("http://127.0.0.1:8000", "m", false).unwrap();
         let body = model.build_request_body(&Transcript::new("find it".to_string()));
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2, "system + human only for an empty burst");
@@ -457,7 +467,7 @@ mod tests {
         // evicted, the last must survive, and the rendered history must be bounded.
         use crate::agent_loop::{ToolResult, TranscriptEntry};
 
-        let model = OmlxModel::new("http://127.0.0.1:8000", "m").unwrap();
+        let model = OmlxModel::new("http://127.0.0.1:8000", "m", false).unwrap();
         let mut transcript = Transcript::new("ORIGINAL HUMAN TASK".to_string());
 
         // Each round: a read action + a ~16 KB result (the per-result cap). With
@@ -569,7 +579,7 @@ mod tests {
 
     #[test]
     fn new_rejects_invalid_endpoint() {
-        assert!(OmlxModel::new("https://1.2.3.4", "m").is_err());
-        assert!(OmlxModel::new("http://127.0.0.1:8000", "").is_err());
+        assert!(OmlxModel::new("https://1.2.3.4", "m", false).is_err());
+        assert!(OmlxModel::new("http://127.0.0.1:8000", "", false).is_err());
     }
 }

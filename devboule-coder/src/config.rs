@@ -60,6 +60,12 @@ const ENV_MCP_LAUNCH_TOKEN: &str = "DEVBOULE_MCP_LAUNCH_TOKEN";
 /// planner then escalates with a clear message instead of planning the wrong
 /// project). NOT a secret.
 const ENV_PROJECT_ID: &str = "DEVBOULE_PROJECT_ID";
+/// 3b — the operator's "Plan first" launch bias. The launch wiring sets this to "1"
+/// when the Spawn panel's "Plan first" toggle was ON; absent/empty otherwise. When set
+/// (any non-empty value), the orchestrator's system prompt gains the PLAN-FIRST
+/// directive (`prompt::build_system_prompt(true)`) so the model's first action for a
+/// non-trivial goal is `plan`. NOT a secret.
+const ENV_PLAN_FIRST: &str = "DEVBOULE_PLAN_FIRST";
 
 /// Build the runtime from the environment. Async because the real MCP backend
 /// connects to (spawns) the Oracle server during construction. Never panics:
@@ -79,12 +85,24 @@ fn build_model() -> Arc<dyn CoderModel> {
         return Arc::new(MockModel::new());
     };
     let model_id = std::env::var(ENV_OMLX_MODEL).unwrap_or_default();
-    match OmlxModel::new(&base_url, model_id) {
+    // 3b — plan-first bias. Any non-empty DEVBOULE_PLAN_FIRST (the launch sets "1")
+    // turns it on; absent/blank keeps the standing prompt unchanged. Only the REAL
+    // oMLX model uses the system prompt, so the bias is meaningful only here (the
+    // Mock fallback never POSTs a prompt).
+    let plan_first = env_nonempty(ENV_PLAN_FIRST).is_some();
+    match OmlxModel::new(&base_url, model_id, plan_first) {
         Ok(m) => Arc::new(m),
         Err(e) => {
             // Misconfigured endpoint (non-loopback / https / empty model): refuse
-            // to route the prompt off-machine; fall back to the Mock.
-            eprintln!("devboule: oMLX model disabled ({e}); using MockModel");
+            // to route the prompt off-machine; fall back to the Mock. If "Plan first"
+            // was requested, say so explicitly — the Mock never plans, so otherwise an
+            // operator could believe the bias was honored when it silently was not.
+            let plan_note = if plan_first {
+                " (\"Plan first\" was requested but is now INACTIVE — the Mock does not plan)"
+            } else {
+                ""
+            };
+            eprintln!("devboule: oMLX model disabled ({e}); using MockModel{plan_note}");
             Arc::new(MockModel::new())
         }
     }
