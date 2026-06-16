@@ -16,6 +16,7 @@ import {
   MINI_BASE_URL_MAX_LENGTH,
   MINI_MODEL_MAX_LENGTH,
   validateMiniBackend,
+  validateOmlxBaseUrl,
 } from "./miniCoderBackend";
 import type {
   LocalCoderBackend,
@@ -38,8 +39,11 @@ export const LOCAL_BACKEND_KINDS: readonly LocalCoderBackendKind[] = [
 export interface LocalBackendDraft {
   kind: LocalCoderBackendKind;
   model: string;
-  // The oMLX base URL field. Optional so the ollama caller need not supply it; treated as
-  // "" when absent. Required + validated only for kind "omlx".
+  // The base URL field. REQUIRED + validated for kind "omlx". OPTIONAL + EDITABLE for kind
+  // "ollama": empty/absent => the launch uses the OLLAMA_OPENAI_BASE_URL default
+  // (http://localhost:11434/v1); a non-empty value is validated to the SAME loopback-http
+  // rule omlx uses (Ollama on a non-default port, no hardcode lock-in). Treated as "" when
+  // absent.
   baseUrl?: string;
 }
 
@@ -51,11 +55,19 @@ export interface LocalBackendValidation {
   value: LocalCoderBackend | null;
 }
 
-// Validate one draft. Pure and total: never throws. Delegates to `validateMiniBackend`
-// (the local kinds are a subset of the mini's, with the same per-kind rules), then re-maps
-// the normalized mini value to a LocalCoderBackend (dropping `command`/`maxConcurrent`,
-// which the local coder does not have). The error keys are narrowed to the two fields this
-// card surfaces (model/baseUrl) — `command` can never appear because no local kind uses it.
+// Validate one draft. Pure and total: never throws. Delegates the MODEL (and omlx's
+// REQUIRED baseUrl) to `validateMiniBackend` (the local kinds are a subset of the mini's,
+// with the same per-kind rules), then re-maps the normalized mini value to a
+// LocalCoderBackend (dropping `command`/`maxConcurrent`, which the local coder does not
+// have). The error keys are narrowed to the two fields this card surfaces (model/baseUrl) —
+// `command` can never appear because no local kind uses it.
+//
+// OLLAMA baseUrl is handled HERE, not by the mini validator: the mini's ollama arm IGNORES
+// baseUrl entirely (the mini never had a configurable Ollama endpoint). For the local coder
+// the field is OPTIONAL + EDITABLE — empty => omit (the launch uses the :11434 default); a
+// non-empty value is validated with the SAME `validateOmlxBaseUrl` (loopback http only) the
+// Rust `validate_local_coder_backend` ollama arm enforces, so TS/Rust accept/reject the same
+// set and a custom port round-trips.
 export function validateLocalBackend(
   draft: LocalBackendDraft,
 ): LocalBackendValidation {
@@ -74,7 +86,28 @@ export function validateLocalBackend(
   if (mini.errors.model) errors.model = mini.errors.model;
   if (mini.errors.baseUrl) errors.baseUrl = mini.errors.baseUrl;
 
-  if (!mini.ok || !mini.value) {
+  // Optional ollama baseUrl: validate it ourselves (the mini ignores it). Empty/absent is
+  // fine (use the default); a non-empty value must pass the loopback-http rule, else surface
+  // an inline error. Computed up front so both the error branch and the value branch agree.
+  let ollamaBaseUrl: string | undefined;
+  if (draft.kind === "ollama") {
+    const raw = (draft.baseUrl ?? "").trim();
+    if (raw.length > 0) {
+      if (raw.length > LOCAL_BASE_URL_MAX_LENGTH) {
+        errors.baseUrl = `Base URL must be at most ${LOCAL_BASE_URL_MAX_LENGTH} characters.`;
+      } else {
+        const normalized = validateOmlxBaseUrl(raw);
+        if (normalized === null) {
+          errors.baseUrl =
+            "Base URL must be a loopback http origin (localhost, 127.0.0.1 or [::1]).";
+        } else {
+          ollamaBaseUrl = normalized;
+        }
+      }
+    }
+  }
+
+  if (!mini.ok || !mini.value || Object.keys(errors).length > 0) {
     return { ok: false, errors, value: null };
   }
 
@@ -89,8 +122,10 @@ export function validateLocalBackend(
       baseUrl: mini.value.baseUrl!,
     };
   } else {
-    // ollama: model only (baseUrl is resolved by the launch, not stored).
+    // ollama: model always; baseUrl ONLY when the user set a (validated, normalized) custom
+    // endpoint — omitted otherwise so the launch falls back to the editable :11434 default.
     value = { kind: "ollama", model: mini.value.model! };
+    if (ollamaBaseUrl !== undefined) value.baseUrl = ollamaBaseUrl;
   }
   return { ok: true, errors, value };
 }

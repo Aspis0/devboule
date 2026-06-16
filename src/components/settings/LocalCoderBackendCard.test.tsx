@@ -57,17 +57,30 @@ describe("LocalCoderBackendCard — static shape", () => {
     expect(html).not.toContain('value="codex"');
     expect(html).not.toContain('value="api"');
     expect(html).not.toContain('value="appleFm"');
-    // Model field is always present; base URL only shows for omlx (default kind = ollama).
+    // Model field is always present. The base URL field now shows for ollama too (the
+    // default kind), but OPTIONAL — labelled as such, with the :11434 default as a
+    // placeholder (editable, no hardcode lock-in).
     expect(html).toContain("Model tag");
-    expect(html).not.toContain("Base URL");
+    expect(html).toContain("Base URL (optional)");
+    expect(html).toContain("http://localhost:11434/v1");
   });
 
-  it("shows the base URL field when the saved kind is omlx", () => {
+  it("shows a REQUIRED base URL field when the saved kind is omlx", () => {
     currentConfig = { kind: "omlx", model: "mlx-qwen", baseUrl: "http://localhost:8000/v1" };
     const html = renderToStaticMarkup(<LocalCoderBackendCard />);
-    expect(html).toContain("Base URL");
+    // omlx: required, so the label has no "(optional)" suffix.
+    expect(html).toContain(">Base URL");
+    expect(html).not.toContain("Base URL (optional)");
     expect(html).toContain("http://localhost:8000/v1");
     expect(html).toContain("mlx-qwen");
+  });
+
+  it("prefills a saved custom ollama base URL into the editable field", () => {
+    currentConfig = { kind: "ollama", model: "qwen2.5-coder", baseUrl: "http://localhost:11500/v1" };
+    const html = renderToStaticMarkup(<LocalCoderBackendCard />);
+    expect(html).toContain("Base URL (optional)");
+    // The saved non-default URL round-trips into the input value.
+    expect(html).toContain("http://localhost:11500/v1");
   });
 });
 
@@ -118,5 +131,28 @@ describe("LocalCoderBackendCard — persistence", () => {
     expect(
       invokeMock.mock.calls.some((c) => c[0] === "set_mini_coder_backend"),
     ).toBe(false);
+  });
+
+  it("persists a custom ollama base URL (Ollama on a non-default port)", async () => {
+    // A saved ollama config that already carries a custom loopback URL round-trips: the
+    // draft loads it and Save sends it back through set_local_coder_backend verbatim.
+    currentConfig = { kind: "ollama", model: "qwen2.5-coder", baseUrl: "http://localhost:11500/v1" };
+    await mount();
+
+    const saveBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Save backend"),
+    );
+    expect(saveBtn).toBeTruthy();
+    await act(async () => {
+      saveBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const saveCall = invokeMock.mock.calls.find(
+      (c) => c[0] === "set_local_coder_backend",
+    );
+    expect(saveCall).toBeTruthy();
+    expect(saveCall![1]).toEqual({
+      backend: { kind: "ollama", model: "qwen2.5-coder", baseUrl: "http://localhost:11500/v1" },
+    });
   });
 });

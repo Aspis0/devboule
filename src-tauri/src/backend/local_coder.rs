@@ -21,8 +21,12 @@
 //! loopback HTTP OpenAI-compatible endpoint (`DEVBOULE_OMLX_BASE_URL` + `DEVBOULE_OMLX_MODEL`,
 //! POSTed to `<baseUrl>/chat/completions` by its `OmlxModel` client). So the meaningful kinds
 //! are the LOCAL ones:
-//!   - `ollama`: a local Ollama server. `model` REQUIRED; the launch points the binary at
-//!     Ollama's loopback OpenAI-compatible endpoint (`http://localhost:11434/v1` by default).
+//!   - `ollama`: a local Ollama server. `model` REQUIRED; `baseUrl` OPTIONAL and EDITABLE —
+//!     when provided it is validated to a LOOPBACK http origin (same rule as `omlx`) and the
+//!     launch points the binary at exactly that URL (e.g. Ollama on a non-default port); when
+//!     absent/empty the launch falls back to the [`OLLAMA_OPENAI_BASE_URL`] default
+//!     (`http://localhost:11434/v1`). No hardcode lock-in — the default is just an editable
+//!     default, not a fixed value.
 //!   - `omlx`: a local oMLX (MLX) OpenAI-compatible server. `model` AND `baseUrl` REQUIRED;
 //!     `baseUrl` is constrained to a LOOPBACK http origin (http only; privacy: the prompt —
 //!     which may carry file content — never leaves the device).
@@ -49,8 +53,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LocalCoderBackendKind {
-    /// A local Ollama server. `model` REQUIRED. The launch resolves Ollama's loopback
-    /// OpenAI-compatible endpoint for the binary's `OmlxModel` client.
+    /// A local Ollama server. `model` REQUIRED; `base_url` OPTIONAL + EDITABLE (loopback
+    /// http only when set, else the [`OLLAMA_OPENAI_BASE_URL`] default). The launch resolves
+    /// the configured-or-default loopback OpenAI-compatible endpoint for the binary's
+    /// `OmlxModel` client.
     Ollama,
     /// A local oMLX (MLX) server exposing an OpenAI-compatible HTTP API. `model` AND
     /// `base_url` REQUIRED. The base URL is constrained to a LOOPBACK http origin (http
@@ -58,11 +64,13 @@ pub enum LocalCoderBackendKind {
     Omlx,
 }
 
-/// The Ollama loopback OpenAI-compatible base URL the orchestrator binary's `OmlxModel`
-/// client is pointed at when `kind == ollama`. Ollama serves an OpenAI-compatible API on
-/// its standard loopback port, so the orchestrator can drive it with the SAME HTTP client
-/// it uses for oMLX. Kept here (single source of truth) so the launch assembly never
-/// hardcodes the URL inline.
+/// The DEFAULT Ollama loopback OpenAI-compatible base URL the orchestrator binary's
+/// `OmlxModel` client is pointed at when `kind == ollama` and no `base_url` is configured.
+/// Ollama serves an OpenAI-compatible API on its standard loopback port, so the orchestrator
+/// can drive it with the SAME HTTP client it uses for oMLX. This is an EDITABLE default, not
+/// a fixed value: a user running Ollama on a non-default port can set `base_url` explicitly
+/// (validated loopback http) and the launch uses that instead. Kept here (single source of
+/// truth) so the launch assembly never hardcodes the URL inline.
 pub const OLLAMA_OPENAI_BASE_URL: &str = "http://localhost:11434/v1";
 
 /// The single, global local-coder backend config persisted in config.json under
@@ -83,10 +91,12 @@ pub struct LocalCoderBackend {
     /// Model tag/name. REQUIRED for both `ollama` and `omlx`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The oMLX server base URL (e.g. `http://localhost:8000/v1`). Required for `omlx`;
-    /// unused for `ollama` (which resolves Ollama's fixed loopback OpenAI endpoint).
-    /// Validated to a LOOPBACK http origin (http only) and STORED NORMALIZED (no trailing
-    /// slash) via the shared [`super::mini_coder::validate_omlx_base_url`].
+    /// The server base URL (e.g. `http://localhost:8000/v1`). REQUIRED for `omlx`; OPTIONAL
+    /// for `ollama` (absent/`None` => the launch uses the [`OLLAMA_OPENAI_BASE_URL`] default;
+    /// present => the launch uses exactly that, e.g. Ollama on a non-default port). When set
+    /// (either kind) it is validated to a LOOPBACK http origin (http only) and STORED
+    /// NORMALIZED (no trailing slash) via the shared
+    /// [`super::mini_coder::validate_omlx_base_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
@@ -121,12 +131,27 @@ pub fn validate_local_coder_backend(
                     "Local-coder model must be a bare tag (letters, digits, . _ : / -).".into(),
                 );
             }
+            // base_url is OPTIONAL + EDITABLE for ollama. Empty/absent => None (the launch
+            // falls back to the OLLAMA_OPENAI_BASE_URL default). A non-empty value is
+            // validated with the SAME shared loopback/http-only validator omlx uses (privacy
+            // invariant: the prompt — which may carry file content — never leaves the device)
+            // and STORED NORMALIZED, so a user can point at Ollama on a non-default port
+            // without any hardcode lock-in. The length cap is enforced INSIDE the validator.
+            let base_url = backend
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let base_url = if base_url.is_empty() {
+                None
+            } else {
+                Some(validate_omlx_base_url(&base_url)?)
+            };
             Ok(LocalCoderBackend {
                 kind: LocalCoderBackendKind::Ollama,
                 model: Some(model),
-                // base_url is dropped for ollama (the launch resolves the fixed Ollama
-                // loopback OpenAI endpoint), so a kind switch never leaves a stale URL.
-                base_url: None,
+                base_url,
             })
         }
         LocalCoderBackendKind::Omlx => {
@@ -171,16 +196,24 @@ pub fn validate_local_coder_backend(
 /// Resolve the loopback OpenAI-compatible base URL + model the orchestrator binary's env
 /// (`DEVBOULE_OMLX_BASE_URL` / `DEVBOULE_OMLX_MODEL`) should carry for a validated backend.
 ///
-/// - `ollama` => Ollama's fixed loopback OpenAI endpoint + the configured model tag.
+/// - `ollama` => the CONFIGURED (validated, normalized) loopback base URL if one was set
+///   (e.g. Ollama on a non-default port), else the [`OLLAMA_OPENAI_BASE_URL`] DEFAULT — plus
+///   the configured model tag.
 /// - `omlx`   => the configured (validated, normalized) loopback base URL + model.
 ///
-/// `model`/`base_url` are guaranteed `Some` for a value that went through
+/// `model` is guaranteed `Some` for a value that went through
 /// [`validate_local_coder_backend`]; the `unwrap_or_default` guards a hand-built struct so
 /// this never panics (an empty string then yields the binary's safe Mock-model fallback).
+/// For omlx, `base_url` is likewise guaranteed `Some` post-validation; for ollama it is
+/// genuinely optional and `None` selects the default.
 pub fn resolve_omlx_env(backend: &LocalCoderBackend) -> (String, String) {
     let model = backend.model.clone().unwrap_or_default();
     let base_url = match backend.kind {
-        LocalCoderBackendKind::Ollama => OLLAMA_OPENAI_BASE_URL.to_string(),
+        // ollama: the configured URL wins; fall back to the editable default when unset.
+        LocalCoderBackendKind::Ollama => backend
+            .base_url
+            .clone()
+            .unwrap_or_else(|| OLLAMA_OPENAI_BASE_URL.to_string()),
         LocalCoderBackendKind::Omlx => backend.base_url.clone().unwrap_or_default(),
     };
     (base_url, model)
@@ -219,6 +252,25 @@ mod tests {
         assert!(json.contains("\"kind\":\"ollama\""), "json: {json}");
         assert!(json.contains("\"model\":\"qwen2.5-coder\""), "json: {json}");
         assert!(!json.contains("baseUrl"), "unused baseUrl leaked: {json}");
+        let back: LocalCoderBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(ollama, back);
+    }
+
+    #[test]
+    fn ollama_with_custom_base_url_round_trips() {
+        // A saved ollama config with a custom (non-default) base_url must persist + reload
+        // byte-identically — the serde shape is unchanged (baseUrl already Option<String>).
+        let ollama = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Ollama,
+            model: Some("qwen2.5-coder".into()),
+            base_url: Some("http://localhost:11500/v1".into()),
+        };
+        let json = serde_json::to_string(&ollama).unwrap();
+        assert!(json.contains("\"kind\":\"ollama\""), "json: {json}");
+        assert!(
+            json.contains("\"baseUrl\":\"http://localhost:11500/v1\""),
+            "json: {json}"
+        );
         let back: LocalCoderBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(ollama, back);
     }
@@ -304,7 +356,7 @@ mod tests {
     // -- validation ---------------------------------------------------------
 
     #[test]
-    fn validate_ollama_requires_model_and_drops_base_url() {
+    fn validate_ollama_requires_model_and_base_url_is_optional() {
         let no_model = LocalCoderBackend {
             kind: LocalCoderBackendKind::Ollama,
             model: None,
@@ -312,14 +364,63 @@ mod tests {
         };
         assert!(validate_local_coder_backend(&no_model).is_err());
 
+        // No base_url => stays None (the launch will use the OLLAMA_OPENAI_BASE_URL default).
         let ok = LocalCoderBackend {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("  qwen2.5-coder  ".into()),
-            base_url: Some("http://localhost:1/v1".into()),
+            base_url: None,
         };
         let n = validate_local_coder_backend(&ok).unwrap();
         assert_eq!(n.model.as_deref(), Some("qwen2.5-coder")); // trimmed
-        assert_eq!(n.base_url, None); // base_url dropped for ollama
+        assert_eq!(n.base_url, None); // optional, left as default
+    }
+
+    #[test]
+    fn validate_ollama_treats_blank_base_url_as_default() {
+        // A whitespace-only base_url is "not configured" => None (use the default), NOT an
+        // error. This is the leniency that lets the UI send an empty field for "use default".
+        let ok = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Ollama,
+            model: Some("qwen2.5-coder".into()),
+            base_url: Some("   ".into()),
+        };
+        let n = validate_local_coder_backend(&ok).unwrap();
+        assert_eq!(n.base_url, None);
+    }
+
+    #[test]
+    fn validate_ollama_keeps_and_normalizes_custom_loopback_base_url() {
+        // A user pointing at Ollama on a NON-DEFAULT port: the value is validated + kept
+        // (normalized, trailing slash stripped) — no hardcode lock-in to :11434.
+        let ok = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Ollama,
+            model: Some("qwen2.5-coder".into()),
+            base_url: Some("  http://localhost:11500/v1/  ".into()),
+        };
+        let n = validate_local_coder_backend(&ok).unwrap();
+        assert_eq!(n.base_url.as_deref(), Some("http://localhost:11500/v1"));
+    }
+
+    #[test]
+    fn validate_ollama_rejects_non_loopback_or_https_base_url() {
+        // The privacy invariant applies to ollama's base_url too: a non-loopback host or an
+        // https scheme is REJECTED with the same shared validator omlx uses.
+        for bad in [
+            "https://localhost:11434/v1",   // https rejected
+            "http://evil.com:11434/v1",     // non-loopback host
+            "http://127.0.0.1.evil.com/v1", // suffix trick
+            "http://127.0.0.1@evil.com/v1", // userinfo trick
+        ] {
+            let b = LocalCoderBackend {
+                kind: LocalCoderBackendKind::Ollama,
+                model: Some("qwen2.5-coder".into()),
+                base_url: Some(bad.into()),
+            };
+            assert!(
+                validate_local_coder_backend(&b).is_err(),
+                "ollama base URL {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -431,7 +532,7 @@ mod tests {
     // -- resolve_omlx_env ---------------------------------------------------
 
     #[test]
-    fn resolve_env_ollama_points_at_loopback_openai_endpoint() {
+    fn resolve_env_ollama_without_base_url_uses_default() {
         let b = LocalCoderBackend {
             kind: LocalCoderBackendKind::Ollama,
             model: Some("qwen2.5-coder".into()),
@@ -439,6 +540,21 @@ mod tests {
         };
         let (base, model) = resolve_omlx_env(&b);
         assert_eq!(base, OLLAMA_OPENAI_BASE_URL);
+        assert_eq!(model, "qwen2.5-coder");
+    }
+
+    #[test]
+    fn resolve_env_ollama_with_custom_base_url_uses_it() {
+        // The configured loopback URL (e.g. Ollama on a non-default port) wins over the
+        // default — the whole point of making the endpoint user-settable.
+        let b = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Ollama,
+            model: Some("qwen2.5-coder".into()),
+            base_url: Some("http://localhost:11500/v1".into()),
+        };
+        let (base, model) = resolve_omlx_env(&b);
+        assert_eq!(base, "http://localhost:11500/v1");
+        assert_ne!(base, OLLAMA_OPENAI_BASE_URL);
         assert_eq!(model, "qwen2.5-coder");
     }
 

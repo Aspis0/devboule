@@ -104,8 +104,10 @@ export function LocalCoderBackendCard() {
   // Model is REQUIRED for both kinds, so surface its error even when empty (otherwise Save
   // just greys out with no inline reason for WHY).
   const showModelError = Boolean(validation.errors.model);
-  // The omlx base URL is REQUIRED, so surface its error even when empty.
-  const showBaseUrlError = kind === "omlx" && Boolean(validation.errors.baseUrl);
+  // Base URL: omlx is REQUIRED (its error shows even when empty); ollama is OPTIONAL, so a
+  // baseUrl error is only set when the user typed a non-empty INVALID URL — show it whenever
+  // present. The validator never emits a baseUrl error for an empty ollama field.
+  const showBaseUrlError = Boolean(validation.errors.baseUrl);
 
   const save = useCallback(
     async (next: LocalCoderBackend | null) => {
@@ -223,23 +225,25 @@ export function LocalCoderBackendCard() {
           )}
         </label>
 
-        {kind === "omlx" ? (
-          <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-            Base URL
-            <input
-              value={baseUrl}
-              onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder="http://localhost:8000/v1"
-              maxLength={LOCAL_BASE_URL_MAX_LENGTH}
-              className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
-            />
-            {showBaseUrlError && (
-              <span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
-                {validation.errors.baseUrl}
-              </span>
-            )}
-          </label>
-        ) : null}
+        <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          {kind === "omlx" ? "Base URL" : "Base URL (optional)"}
+          <input
+            value={baseUrl}
+            onChange={(event) => setBaseUrl(event.target.value)}
+            placeholder={
+              kind === "omlx"
+                ? "http://localhost:8000/v1"
+                : "http://localhost:11434/v1"
+            }
+            maxLength={LOCAL_BASE_URL_MAX_LENGTH}
+            className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+          />
+          {showBaseUrlError && (
+            <span className="mt-1 block text-[10px] normal-case tracking-normal text-coral-dark">
+              {validation.errors.baseUrl}
+            </span>
+          )}
+        </label>
 
         {kind === "omlx" ? (
           <p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
@@ -254,7 +258,9 @@ export function LocalCoderBackendCard() {
           <p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
             The orchestrator drives your local Ollama server over its loopback
             OpenAI-compatible API. Make sure Ollama is running and the model tag
-            is pulled.
+            is pulled. Leave the Base URL empty to use the default{" "}
+            <span className="font-mono">http://localhost:11434/v1</span>, or set
+            it (loopback http only) if Ollama listens on a non-default port.
           </p>
         ) : null}
 
