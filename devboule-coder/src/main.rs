@@ -11,6 +11,8 @@
 //! redraws on tick or on a channel message. The terminal is restored on every
 //! exit path (including panics) by [`TerminalGuard`].
 
+mod action;
+mod agent_loop;
 mod app;
 mod conversation;
 mod model;
@@ -26,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tui_textarea::Input;
 
+use agent_loop::{run_burst, BurstOutcome, StubExecutor, SystemClock, DEFAULT_BURST_BUDGET};
 use app::{render, Activity, App};
 use model::{CoderModel, MockModel};
 use terminal::TerminalGuard;
@@ -194,11 +197,14 @@ fn handle_key(
     }
 }
 
-/// Push the human turn, open the assistant turn, and spawn the streaming model
-/// task. No-op if the input is blank or a reply is already streaming (the model
-/// is single-flight in L2.1).
+/// Push the human turn, open the assistant turn, and spawn the bounded inner
+/// burst (L2.2). No-op if the input is blank or a burst is already streaming (the
+/// agent is single-flight). The spawned task runs [`run_burst`], streaming a
+/// progress line per action+result over the SAME chunk channel L2.1 uses, then
+/// appends the burst CONCLUSION as the final chunk(s) before dropping `tx` (which
+/// the loop's chunk arm sees as end-of-stream and finalizes the assistant turn).
 fn submit(app: &mut App, model: &Arc<dyn CoderModel>, chunk_rx: &mut Option<mpsc::Receiver<String>>) {
-    // Single-flight: guard at BOTH layers — the channel (a reply task is live)
+    // Single-flight: guard at BOTH layers — the channel (a burst task is live)
     // and the conversation state (a turn is still streaming). Either alone is
     // sufficient today; defending both keeps the invariant honest if the
     // plumbing changes.
@@ -219,7 +225,35 @@ fn submit(app: &mut App, model: &Arc<dyn CoderModel>, chunk_rx: &mut Option<mpsc
     *chunk_rx = Some(rx);
     let model = Arc::clone(model);
     tokio::spawn(async move {
-        model.reply(prompt, tx).await;
-        // `tx` drops here -> the loop's chunk arm sees the channel close.
+        // The executor + clock are owned by the burst. L2.2 dispatch is STUBBED
+        // ([`StubExecutor`]); L2.3 swaps in the MCP-backed executor behind the same
+        // [`ToolExecutor`] seam. The wall-clock cap uses the real [`SystemClock`].
+        let executor = StubExecutor;
+        let clock = SystemClock::start_now();
+        let outcome = run_burst(
+            prompt,
+            model.as_ref(),
+            &executor,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            // L2.2: no web provider is wired yet, so egress is structurally OFF.
+            // L2.3 flips this on once the MCP-backed fetch/search executor lands.
+            false,
+            &tx,
+        )
+        .await;
+
+        // Append the conclusion as the assistant turn's final content. A leading
+        // blank line separates it from the streamed progress lines above.
+        let conclusion = match outcome {
+            BurstOutcome::Done(reply) => format!("\n\n{reply}"),
+            BurstOutcome::AskUser(question) => format!("\n\n❓ {question}"),
+            BurstOutcome::Escalated(reason) => format!("\n\n⚠ escalated: {reason}"),
+        };
+        let _ = tx.send(conclusion).await;
+        // `tx` drops here -> the loop's chunk arm sees the channel close and
+        // finalizes the assistant turn, handing control back to the human. For
+        // AskUser this hand-back IS the conversational continuation: the human's
+        // next message starts a fresh burst.
     });
 }

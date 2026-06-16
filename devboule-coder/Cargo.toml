@@ -38,6 +38,13 @@ tui-markdown = "=0.3.6"
 throbber-widgets-tui = "0.8.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
+# L2.2 action protocol. All three already resolve transitively in the lockfile
+# (regex via ratatui's deps, serde/serde_json via the widget tree), so declaring
+# them directly reuses the SAME versions and introduces NO new crate and NO
+# ratatui/crossterm duplicate. `cargo tree -d` is re-asserted clean in verification.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
