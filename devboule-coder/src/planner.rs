@@ -40,6 +40,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::action::check_rel_path;
+use crate::activity::{Activity, Node};
 use crate::agent_loop::Transcript;
 use crate::executor::{FsBackend, McpBackend};
 use crate::model::CoderModel;
@@ -301,6 +302,18 @@ fn check_field(field: &str, value: &str) -> Result<(), String> {
         return Err(format!("`{field}` too long: {len} chars (max {MAX_FIELD_CHARS})"));
     }
     Ok(())
+}
+
+/// The trailing path component (basename) of a spine path, for the privacy-safe
+/// EXPLORE milestone label. The spine path is forward-slash relative (Oracle output);
+/// a path with no separator returns itself. An empty/`/`-terminated path falls back to
+/// the whole string so a label is never empty. Basenames-only keeps the live label
+/// short and leaks no directory layout into the Console.
+fn path_basename(path: &str) -> &str {
+    match path.rsplit('/').find(|seg| !seg.is_empty()) {
+        Some(seg) => seg,
+        None => path,
+    }
 }
 
 /// Truncate so the RESULT is at most `cap` CHARS (never splitting a codepoint),
@@ -794,6 +807,7 @@ pub async fn run_planner(
     fs: &FsBackend,
     project_id: &str,
     project_root: &Path,
+    activity: &Activity,
 ) -> Result<PlanOutcome, String> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -812,6 +826,12 @@ pub async fn run_planner(
         .await
         .map_err(|e| format!("project_structure failed: {e}"))?;
     let structure = parse_structure(&structure_text)?;
+    // STRUCTURE done → a coarse coder-tier milestone the Console shows live: how many
+    // spine files we are about to explore (a label only — no paths, no bodies).
+    activity.milestone(
+        &format!("Planning: {} spine files", structure.spine.len()),
+        Node::Dot,
+    );
 
     // --- 2) EXPLORE (bounded LLM loop, ONE small call per spine file) ---
     // We store the ALREADY-RENDERED note line (not the parsed note) so the budget
@@ -834,6 +854,15 @@ pub async fn run_planner(
             Ok(Ok(b)) => truncate_chars(&b, MAX_EXPLORE_FILE_CHARS),
             _ => continue,
         };
+
+        // EXPLORE milestone — one per spine file we ACTUALLY explore (a read that
+        // failed `continue`d above, so a skipped file emits nothing, matching the
+        // "one model call per explored file" invariant). The basename keeps the
+        // label short + privacy-safe; node "" (hollow) marks an in-progress step.
+        activity.milestone(
+            &format!("exploring {}", path_basename(&entry.path)),
+            Node::Hollow,
+        );
 
         // Optional grounding: ONE small oracle_context snippet. Best-effort — a
         // grounding failure must not sink the EXPLORE call.
@@ -921,6 +950,11 @@ pub async fn run_planner(
             prior_error.unwrap_or_else(|| "unknown error".to_string())
         )
     })?;
+    // PLAN done → how many tasks were drafted (a count label only).
+    activity.milestone(
+        &format!("drafted {} tasks", plan.tasks.len()),
+        Node::Dot,
+    );
 
     // --- 4) SUBMIT: persist tasks.json, then plan_submit (human gate) ---
     // Persist BEFORE submitting so the durable artifact exists even if the human
@@ -942,6 +976,10 @@ pub async fn run_planner(
         "Devboule plan: {}",
         truncate_chars(goal, 120).replace('\n', " ")
     );
+    // SUBMIT → the plan is now in front of the human gate. `plan_submit` BLOCKS for
+    // approval, so this milestone is the live "waiting on you" signal in the Console.
+    // Node terra = the warm/awaiting ring (the wire contract has no "coral" node).
+    activity.milestone("plan submitted — awaiting approval", Node::Terra);
     let submit_text = mcp
         .call_tool(
             "plan_submit",
@@ -955,6 +993,14 @@ pub async fn run_planner(
         .map_err(|e| format!("plan_submit failed: {e}"))?;
 
     let approval = parse_submit_status(&submit_text);
+    // Result milestone: approved (sage), rejected/timeout (terra — the warm ring, as
+    // the contract has no coral node; the TEXT carries the rejected/timed-out meaning).
+    let (result_text, result_node) = match approval {
+        PlanApproval::Approved => ("plan approved", Node::Sage),
+        PlanApproval::Rejected => ("plan rejected", Node::Terra),
+        PlanApproval::Timeout => ("plan approval timed out", Node::Terra),
+    };
+    activity.milestone(result_text, result_node);
 
     Ok(PlanOutcome {
         tasks_plan: plan,
@@ -1108,6 +1154,13 @@ mod tests {
         }
     }
 
+    /// A disabled (no-op) activity emitter for the tests that don't assert the
+    /// milestone stream — they exercise the planner exactly as before the milestones
+    /// were threaded in (no file is touched).
+    fn noop_activity() -> Activity {
+        Activity::disabled()
+    }
+
     /// Build an FsBackend over a tempdir with the named files planted, returning
     /// the dir guard (kept alive by the caller) + the backend.
     fn fs_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, FsBackend) {
@@ -1185,7 +1238,7 @@ mod tests {
             plan_block(one_valid_task()),
         ]);
 
-        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", dir.path())
+        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .expect("planner succeeds");
 
@@ -1249,12 +1302,125 @@ mod tests {
         let mcp = MockMcp::new(vec!["src/a.rs"], "rejected");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
 
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .expect("planner succeeds even when the human rejects");
         assert_eq!(outcome.approval, PlanApproval::Rejected);
         // The tasks.json is persisted regardless of the human verdict.
         assert!(outcome.tasks_json_path.exists());
+    }
+
+    // --- Milestone stream (the LIVE Console payoff) --------------------------
+
+    /// Read the activity file back as parsed (text, node) milestone tuples.
+    fn read_milestones(file: &std::path::Path) -> Vec<(String, String)> {
+        let body = std::fs::read_to_string(file).unwrap_or_default();
+        body.lines()
+            .map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).expect("each line is JSON");
+                assert_eq!(v["kind"], "milestone", "every event is a milestone");
+                (
+                    v["text"].as_str().unwrap().to_string(),
+                    v["node"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn planner_emits_the_expected_milestone_sequence() {
+        // Drive a full happy-path plan with a real (file-backed) Activity emitter and
+        // assert the EXACT coder-tier milestone sequence the Console will show live:
+        // STRUCTURE -> one EXPLORE per spine file -> PLAN drafted -> SUBMIT -> approved.
+        let (dir, fs) = fs_with_files(&[
+            ("src/a.rs", "fn a() {}\n"),
+            ("src/b.rs", "fn b() {}\n"),
+        ]);
+        let mcp = MockMcp::new(vec!["src/a.rs", "src/b.rs"], "approved");
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            note_block("src/b.rs"),
+            plan_block(one_valid_task()),
+        ]);
+        let act_file = dir.path().join("activity.jsonl");
+        let activity = Activity::with_path(&act_file);
+
+        run_planner("do the thing", &model, &mcp, &fs, "proj", dir.path(), &activity)
+            .await
+            .expect("planner succeeds");
+
+        let milestones = read_milestones(&act_file);
+        assert_eq!(
+            milestones,
+            vec![
+                ("Planning: 2 spine files".to_string(), "dot".to_string()),
+                ("exploring a.rs".to_string(), "".to_string()),
+                ("exploring b.rs".to_string(), "".to_string()),
+                ("drafted 1 tasks".to_string(), "dot".to_string()),
+                ("plan submitted — awaiting approval".to_string(), "terra".to_string()),
+                ("plan approved".to_string(), "sage".to_string()),
+            ],
+            "full ordered milestone stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_plan_emits_a_rejected_milestone() {
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "rejected");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        let act_file = dir.path().join("activity.jsonl");
+        let activity = Activity::with_path(&act_file);
+
+        run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &activity)
+            .await
+            .unwrap();
+
+        let milestones = read_milestones(&act_file);
+        // The terminal milestone reflects the human verdict (rejected -> terra ring).
+        assert_eq!(
+            milestones.last(),
+            Some(&("plan rejected".to_string(), "terra".to_string()))
+        );
+        // The submit milestone is still emitted before the verdict.
+        assert!(milestones
+            .iter()
+            .any(|(t, n)| t == "plan submitted — awaiting approval" && n == "terra"));
+    }
+
+    #[tokio::test]
+    async fn skipped_explore_emits_no_milestone_for_that_file() {
+        // A spine file that does not exist on disk is skipped (no model call, no
+        // EXPLORE milestone) — proof the per-EXPLORE milestone tracks ACTUAL work.
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs", "src/ghost.rs"], "approved");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        let act_file = dir.path().join("activity.jsonl");
+        let activity = Activity::with_path(&act_file);
+
+        run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &activity)
+            .await
+            .unwrap();
+
+        let milestones = read_milestones(&act_file);
+        let explore_count = milestones
+            .iter()
+            .filter(|(t, _)| t.starts_with("exploring "))
+            .count();
+        assert_eq!(explore_count, 1, "only the real file emits an explore milestone");
+        // The STRUCTURE milestone still counts BOTH spine files (it is the spine size).
+        assert_eq!(milestones[0].0, "Planning: 2 spine files");
+    }
+
+    #[test]
+    fn path_basename_extracts_the_trailing_component() {
+        assert_eq!(path_basename("src/backend/projects.rs"), "projects.rs");
+        assert_eq!(path_basename("main.rs"), "main.rs");
+        // A trailing slash falls back to the last non-empty segment.
+        assert_eq!(path_basename("src/dir/"), "dir");
+        // No usable segment -> the whole string (never empty).
+        assert_eq!(path_basename(""), "");
+        assert_eq!(path_basename("/"), "/");
     }
 
     #[tokio::test]
@@ -1264,7 +1430,7 @@ mod tests {
         let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "vanished");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .unwrap();
         assert_eq!(outcome.approval, PlanApproval::Timeout);
@@ -1280,7 +1446,7 @@ mod tests {
         let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs", "src/ghost.rs"], "approved");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .unwrap();
         // Only ONE explore call (ghost skipped) + ONE plan call.
@@ -1297,7 +1463,7 @@ mod tests {
             "not a note block at all".to_string(),
             plan_block(one_valid_task()),
         ]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .unwrap();
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
@@ -1327,7 +1493,7 @@ mod tests {
         outputs.push(plan_block(one_valid_task()));
         let model = CapturingModel::new(outputs);
 
-        run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .expect("planner succeeds");
 
@@ -1374,7 +1540,7 @@ mod tests {
             plan_block(four_scope),             // attempt 1: rejected (scope > 3)
             plan_block(one_valid_task()),       // attempt 2: valid
         ]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .expect("retry produces a valid plan");
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
@@ -1563,7 +1729,7 @@ mod tests {
             outputs.push(plan_block(bad.clone()));
         }
         let model = CapturingModel::new(outputs);
-        let err = run_planner("g", &model, &mcp, &fs, "proj", dir.path())
+        let err = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .expect_err("exhausted retries is an error");
         assert!(err.contains("could not produce a valid plan"), "escalation msg: {err}");
@@ -1670,7 +1836,7 @@ mod tests {
         let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![]);
-        let err = run_planner("   ", &model, &mcp, &fs, "proj", dir.path())
+        let err = run_planner("   ", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
             .await
             .expect_err("an empty goal is rejected before any work");
         assert!(err.contains("non-empty goal"));
@@ -1683,7 +1849,7 @@ mod tests {
         let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![]);
-        let err = run_planner("g", &model, &mcp, &fs, "", dir.path())
+        let err = run_planner("g", &model, &mcp, &fs, "", dir.path(), &noop_activity())
             .await
             .expect_err("an empty project_id is rejected before any work");
         assert!(err.contains("project_id"));

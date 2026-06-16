@@ -12,6 +12,7 @@
 //! exit path (including panics) by [`TerminalGuard`].
 
 mod action;
+mod activity;
 mod agent_loop;
 mod app;
 mod config;

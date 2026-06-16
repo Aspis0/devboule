@@ -30,10 +30,12 @@
 //! transcript / token / secret crosses this channel.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::mini_coder::EscalationFinding;
 
@@ -213,9 +215,9 @@ pub struct MiniRun {
 }
 
 /// Timeline node style: ""=hollow teal, dot=filled teal, sage/terra=colored ring.
-// CONTRACT COMPLETENESS: the live mini spawn row uses `Dot`; the others mirror the TS union
-// for coder-milestone rows a later cut adds. `dead_code` allowed.
-#[allow(dead_code)]
+// NOW LIVE: the live mini spawn row uses `Dot`; `push_coder_milestone` (the orchestrator
+// milestone stream) constructs Hollow/Dot/Sage/Terra from the file-bridge events, so every
+// variant is reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeStyle {
@@ -229,9 +231,9 @@ pub enum NodeStyle {
 
 /// A single top-level row of the timeline — the TS `ConsoleEntry` tagged union
 /// (`{type:"coder"|"spawn"}`). A coder milestone row, or a spawn row that OWNS a `MiniRun`.
-// CONTRACT COMPLETENESS: the live mini is a single `Spawn` entry; the `Coder` milestone row
-// mirrors the TS union for a later cut that surfaces standalone coder milestones.
-#[allow(dead_code)]
+// NOW LIVE: the live mini is a single `Spawn` entry; the `Coder` milestone row is
+// constructed by `push_coder_milestone` for the ORCHESTRATOR's coder-tier milestone stream
+// (the file-bridge tail task), so both variants are reachable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ConsoleEntry {
@@ -426,6 +428,56 @@ pub fn mini_activity_snapshot(
 /// shimmer strings are provably IDENTICAL — a retry that resumes the same console must not show
 /// a different shimmer than the original launch did.
 const WORKING_SHIMMER: &str = "working — running…";
+
+/// Hard cap on the number of timeline ENTRIES kept for ONE agent. The orchestrator's
+/// coder-milestone stream (`push_coder_milestone`) APPENDS a row per milestone, so over a
+/// long session it must be bounded or the per-agent state grows without limit. When the cap
+/// is exceeded the OLDEST entries are dropped (FIFO) — the live tail of the timeline is what
+/// the user watches; ancient milestones scroll off. Generous: a whole plan run is a handful
+/// of milestones, so the cap only ever trims a pathological flood.
+const MAX_ENTRIES_PER_AGENT: usize = 200;
+
+/// Append a coder-tier MILESTONE row (the orchestrator's own timeline, fed by the file
+/// bridge). Constructs `ConsoleEntry::Coder { node, text, time }`, marks the agent
+/// `running` (a milestone means the orchestrator is actively working), clears the `empty`
+/// resting flag, and bounds the entries list to [`MAX_ENTRIES_PER_AGENT`] (oldest dropped).
+///
+/// `time` is a short local clock stamp (`HH:MM:SS`) so the live stream shows WHEN each
+/// milestone arrived — the only host-synthesized field; `text` + `node` come verbatim from
+/// the (already redacted, label-only) bridge event. Coexists with the mini `Spawn` path:
+/// this only appends Coder rows and never touches a mini run, so an agent that has BOTH a
+/// spawn card and orchestrator milestones renders them in arrival order.
+pub fn push_coder_milestone(
+    activity: &mut ConsoleActivity,
+    text: &str,
+    node: Option<NodeStyle>,
+    time: &str,
+) {
+    let entries = activity.entries.get_or_insert_with(Vec::new);
+    entries.push(ConsoleEntry::Coder {
+        node,
+        text: text.to_string(),
+        time: time.to_string(),
+    });
+    // FIFO bound: drop the oldest entries if we exceed the cap. `drain(..n)` keeps the
+    // newest `MAX_ENTRIES_PER_AGENT` rows (the live tail the user is watching).
+    if entries.len() > MAX_ENTRIES_PER_AGENT {
+        let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+        entries.drain(0..overflow);
+    }
+    // A milestone means the orchestrator is live; reflect that in the tab (spinner + pill)
+    // and leave the resting/empty state. `run_count` mirrors the mini path's "one active".
+    activity.running = Some(true);
+    activity.run_count = Some(1);
+    activity.empty = None;
+}
+
+/// Mark an agent's orchestrator stream as no longer running (the PTY session ended). Flips
+/// `running=false` so the Console tab spinner stops, WITHOUT touching the timeline (the
+/// final milestones stay visible). A no-op-safe terminal the tail task calls on teardown.
+pub fn mark_coder_stopped(activity: &mut ConsoleActivity) {
+    activity.running = Some(false);
+}
 
 /// Build the INITIAL live activity for a freshly-launched mini round. The whole run is a
 /// single `Spawn` entry (the live mini is the only entry a stream mutates): a short
@@ -635,6 +687,372 @@ fn finding_from_escalation(f: &EscalationFinding) -> Finding {
         loc,
         msg: f.title.clone(),
     }
+}
+
+// =============================================================================
+// FILE BRIDGE TAIL — turn the orchestrator's activity file into live milestones
+// =============================================================================
+//
+// The local orchestrator (`devboule-coder`) runs as a SEPARATE PTY process with a
+// ratatui TUI, so it cannot print activity markers to stdout. Instead it APPENDS one
+// JSON event per line to `DEVBOULE_ACTIVITY_FILE` (see `devboule-coder/src/activity.rs`).
+// At orchestrator launch the host points that env at a per-agent file AND starts the
+// poll-tail task below: it watches the file, parses each new whole line into a
+// milestone, and pushes a `ConsoleEntry::Coder` into the store for that `agent_id`.
+//
+// ROBUSTNESS (all by construction, never a panic):
+//  * the file may not exist yet → the tail polls and starts reading once it appears;
+//  * only WHOLE newline-terminated lines are consumed (a partial trailing write is
+//    left for the next tick), so a mid-write read never yields a half line;
+//  * a malformed / non-milestone line is SKIPPED, not fatal;
+//  * an oversized line (> MAX_LINE_BYTES) is skipped so a single pathological write
+//    cannot blow memory; the read itself is bounded per tick (MAX_READ_PER_TICK);
+//  * the task self-terminates when its stop flag is set (the lifecycle teardown).
+//
+// PRIVACY: the bridge events are label-only (already redacted upstream); this task
+// adds only a host clock stamp. No raw transcript / secret crosses it.
+
+/// Poll interval between tail reads. Planner phases are seconds apart, so a sub-second
+/// poll keeps the Console feeling live without busy-spinning.
+const TAIL_POLL_MS: u64 = 300;
+
+/// Max bytes of a SINGLE event line we will parse. A longer line is skipped (the
+/// orchestrator caps its labels far below this; this is the host's belt-and-suspenders).
+const MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// Max bytes read from the file in ONE poll tick. Bounds the per-tick work so a huge
+/// backlog (or a misbehaving writer) can never stall the reactor or balloon memory; the
+/// remainder is consumed on subsequent ticks from the saved offset.
+const MAX_READ_PER_TICK: usize = 64 * 1024;
+
+/// One milestone event parsed off the bridge file — mirrors the writer's JSON shape
+/// `{ "kind": "milestone", "text": "...", "node": "dot|sage|terra|" }`. Unknown extra
+/// fields are ignored (forward-compatible); a missing/extra `kind` that is not
+/// `"milestone"` is rejected by [`parse_milestone_line`].
+#[derive(Debug, Deserialize)]
+struct BridgeEvent {
+    kind: String,
+    text: String,
+    #[serde(default)]
+    node: String,
+}
+
+/// Map the bridge `node` wire string onto the store's [`NodeStyle`]. The empty string
+/// is the hollow node; an unknown value falls back to hollow (never an error — a
+/// forward/unknown style degrades to the neutral node rather than dropping the row).
+fn node_from_wire(node: &str) -> Option<NodeStyle> {
+    match node {
+        "" => Some(NodeStyle::Hollow),
+        "dot" => Some(NodeStyle::Dot),
+        "sage" => Some(NodeStyle::Sage),
+        "terra" => Some(NodeStyle::Terra),
+        _ => Some(NodeStyle::Hollow),
+    }
+}
+
+/// Parse ONE file line into a `(text, node)` milestone, or `None` to SKIP it (blank,
+/// oversized, non-JSON, or not a `kind == "milestone"` event). Pure + directly testable.
+fn parse_milestone_line(line: &str) -> Option<(String, Option<NodeStyle>)> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: BridgeEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "milestone" {
+        return None;
+    }
+    // Defensive: re-cap the text length on the READ side too (a hand-crafted file could
+    // carry a long label). Char-truncate so we never split a codepoint.
+    let text = if event.text.chars().count() > MILESTONE_TEXT_CAP {
+        event.text.chars().take(MILESTONE_TEXT_CAP).collect()
+    } else {
+        event.text
+    };
+    Some((text, node_from_wire(&event.node)))
+}
+
+/// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
+/// because the file is untrusted input the host reads back.
+const MILESTONE_TEXT_CAP: usize = 200;
+
+/// A short local clock stamp (`HH:MM:SS`) for the milestone's `time` field, so the live
+/// timeline shows WHEN each phase arrived. Local time matches the user's wall clock.
+fn now_clock() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// One registered tail: its shared STOP flag plus a monotonic GENERATION stamp. The
+/// generation lets a teardown tell whether it is still the CURRENT tail for its id (a
+/// same-id relaunch bumps the generation), so a stale predecessor teardown becomes a no-op
+/// instead of flipping `running=false` on the live successor.
+#[derive(Clone)]
+struct TailEntry {
+    stop: Arc<AtomicBool>,
+    generation: u64,
+}
+
+/// The managed registry of running tail tasks, keyed by `agent_id`. Each entry is a
+/// shared STOP flag + a per-id generation; the launch path inserts one + spawns the task,
+/// the teardown path flips it (the task notices within one poll and exits, then drops
+/// itself). Registered in `lib.rs` via `.manage(ActivityTailRegistry::default())`.
+#[derive(Default)]
+pub struct ActivityTailRegistry {
+    inner: Mutex<HashMap<String, TailEntry>>,
+}
+
+impl ActivityTailRegistry {
+    /// Insert (or replace) the stop flag for `agent_id`, returning the flag the spawned
+    /// task watches AND the GENERATION it was registered under. A pre-existing flag for the
+    /// same id is FIRST flipped (so a relaunch cleanly stops the predecessor's task) then
+    /// replaced under a freshly-incremented generation.
+    ///
+    /// FIX 2(a): the returned `generation` is captured by the spawned task and re-checked at
+    /// teardown via [`is_current_generation`]; a relaunch bumps it, so the OLD task's teardown
+    /// recognizes it is no longer current and skips `mark_coder_stopped` (no spinner flip-off
+    /// on the live successor).
+    fn register(&self, agent_id: &str) -> (Arc<AtomicBool>, u64) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // The new generation is one past the predecessor's (or 0 for a first registration).
+        let generation = map.get(agent_id).map(|e| e.generation.wrapping_add(1)).unwrap_or(0);
+        let entry = TailEntry {
+            stop: Arc::clone(&flag),
+            generation,
+        };
+        if let Some(old) = map.insert(agent_id.to_string(), entry) {
+            old.stop.store(true, Ordering::SeqCst);
+        }
+        (flag, generation)
+    }
+
+    /// FIX 2(a): whether a teardown for `(agent_id, generation)` should run `mark_coder_stopped`.
+    /// The ONLY case it must NOT is a same-id RELAUNCH: the entry is still present but under a
+    /// DIFFERENT (newer) generation — the live successor owns `running`, so flipping it false
+    /// would turn off the spinner on a session that is actively pushing milestones.
+    ///
+    /// A clean `stop()` REMOVES the entry (absent → returns `true` here): teardown SHOULD still
+    /// flip `running=false`, because the spinner-clear on an explicit stop relies on exactly
+    /// this teardown (see `agents::mark_agent_session_closed`, which calls `stop()` and counts
+    /// on the tail to clear the Console `running`). So: present-and-same OR absent → mark;
+    /// present-and-different (relaunch) → skip.
+    fn should_mark_stopped(&self, agent_id: &str, generation: u64) -> bool {
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(agent_id) {
+            Some(entry) => entry.generation == generation,
+            None => true,
+        }
+    }
+
+    /// Stop the tail task for `agent_id` (idempotent): flip + remove its flag. The task
+    /// sees the flag on its next tick and exits. A missing id is a no-op.
+    ///
+    /// FIX 4 (TOCTOU): the flag is flipped WHILE STILL HOLDING the map lock, then the entry
+    /// removed. If the store happened AFTER releasing the lock, a racing `register()` could
+    /// observe no predecessor (entry already removed) yet the predecessor task would not yet
+    /// be told to stop — two live tails for one id. Storing under the lock closes that window.
+    pub fn stop(&self, agent_id: &str) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(agent_id) {
+            entry.stop.store(true, Ordering::SeqCst);
+            map.remove(agent_id);
+        }
+    }
+
+    /// FIX 3: signal EVERY registered tail to stop and clear the registry. Called from the
+    /// app-exit teardown (alongside the PTY reaper) so quit / dev Ctrl-C never leaves a tail
+    /// task spinning. Idempotent and safe when no tails are registered (empty map → no-op).
+    pub fn stop_all(&self) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in map.values() {
+            entry.stop.store(true, Ordering::SeqCst);
+        }
+        map.clear();
+    }
+}
+
+/// Sanitize an `agent_id` into a SINGLE safe filename component for the bridge file.
+/// Keeps only `[A-Za-z0-9._-]`, maps everything else to `_`, and rejects a name that
+/// reduces to empty / `.` / `..` (returns `None` → the caller skips the bridge). This is
+/// the path-traversal guard: the agent_id is app-generated but may be caller-influenced,
+/// and it is used to build a filesystem path.
+///
+/// LEADING-DOT TIGHTENING: a cleaned name that STARTS with `.` (e.g. `.hidden`, `...x`)
+/// would produce a hidden / odd dotfile. Separators are already neutralized so this is not
+/// a traversal bug, but we replace a leading `.` with `_` so the bridge never creates a
+/// hidden/odd file. We REPLACE (not reject) so a legitimate id like `.config-1` still gets a
+/// usable, visible file (`_config-1.jsonl`) and observability is not silently disabled.
+pub fn activity_file_name(agent_id: &str) -> Option<String> {
+    let cleaned: String = agent_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return None;
+    }
+    // Bound the length so an absurd id cannot create a pathological filename.
+    let bounded: String = cleaned.chars().take(128).collect();
+    // Tighten: never emit a leading-dot (hidden / odd) filename. Replace the first char's
+    // dot with `_` — the rest of the name keeps its dots (legal in a basename).
+    let safe = if bounded.starts_with('.') {
+        format!("_{}", &bounded[1..])
+    } else {
+        bounded
+    };
+    Some(format!("{safe}.jsonl"))
+}
+
+/// The subdir (under the projects dir) that holds per-agent bridge files. Kept out of
+/// the project repos themselves so a milestone file is never mistaken for project data.
+const ACTIVITY_SUBDIR: &str = ".devboule-activity";
+
+/// Resolve the per-agent bridge file path under `projects_dir`, creating the holding
+/// subdir. Returns `None` (bridge disabled) when the id cannot be made a safe filename
+/// or the subdir cannot be created — observability never blocks a launch.
+pub fn activity_file_path(projects_dir: &Path, agent_id: &str) -> Option<PathBuf> {
+    let name = activity_file_name(agent_id)?;
+    let dir = projects_dir.join(ACTIVITY_SUBDIR);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir.join(name))
+}
+
+/// Start the poll-tail task for `agent_id` reading `file_path`. Registers a stop flag in
+/// the managed [`ActivityTailRegistry`] and spawns a tokio task that, until stopped:
+///   1. reads any NEW whole lines appended since the last offset (bounded per tick),
+///   2. parses each into a milestone (skipping malformed/oversized),
+///   3. pushes it into the [`MiniActivityStore`] (which emits the snapshot).
+/// On stop it flips `running=false` for the agent so the Console tab spinner clears.
+///
+/// Best-effort: if the registry/store/runtime is unavailable the task simply does
+/// nothing — a missing Console never breaks a launch.
+pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) {
+    let Some(registry) = app.try_state::<ActivityTailRegistry>() else {
+        return;
+    };
+    // Capture the generation this tail was registered under (FIX 2(a)): teardown only marks
+    // the agent stopped if this generation is STILL current (a relaunch bumps it → no-op).
+    let (stop, generation) = registry.register(agent_id);
+    let app = app.clone();
+    let agent_id = agent_id.to_string();
+
+    tauri::async_runtime::spawn(async move {
+        // Byte offset already consumed from the file. Persists across ticks so we only
+        // ever read NEW bytes (true tail, not re-read).
+        let mut offset: u64 = 0;
+        // A RAW-BYTE carry for a trailing partial line (a write that landed without its
+        // newline yet). We carry BYTES — not a decoded String — so a multi-byte UTF-8
+        // codepoint that happens to straddle a per-tick read boundary is reassembled
+        // INTACT before decoding (decoding a half-codepoint chunk would corrupt it).
+        let mut carry: Vec<u8> = Vec::new();
+
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Read new bytes off the reactor thread (blocking file I/O on spawn_blocking).
+            let path = file_path.clone();
+            let read = tauri::async_runtime::spawn_blocking(move || read_new_chunk(&path, offset))
+                .await;
+
+            // FIX 2(b): re-check the stop flag AFTER the await. A `stop()` that landed while
+            // the blocking read was in flight must NOT push one more milestone (which would
+            // re-assert `running=true` AFTER teardown set it false → a zombie running state).
+            // Break before processing the bytes; the offset advance is irrelevant once stopped.
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if let Ok(Some((bytes, new_offset, was_reset))) = read {
+                offset = new_offset;
+                // FIX 1: the file was truncated/rotated and we restarted from 0. Any carried
+                // partial line is from the OLD file — drop it BEFORE extending, or its stale
+                // bytes would be prepended to the new file's first line and assemble a
+                // FABRICATED milestone that the orchestrator never wrote.
+                if was_reset {
+                    carry.clear();
+                }
+                carry.extend_from_slice(&bytes);
+                // Consume WHOLE lines (split on the '\n' byte). Decode each COMPLETE line
+                // with from_utf8_lossy — by construction a complete line never splits a
+                // codepoint, so the lossy decode is exact for well-formed input.
+                while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = carry.drain(..=nl).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    if let Some((text, node)) = parse_milestone_line(&line) {
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            let time = now_clock();
+                            store.update(&app, &agent_id, |a| {
+                                push_coder_milestone(a, &text, node, &time)
+                            });
+                        }
+                    }
+                }
+                // Guard `carry` from unbounded growth if the writer never emits a newline
+                // (it always does, but be defensive): drop an oversized partial line.
+                if carry.len() > MAX_LINE_BYTES {
+                    carry.clear();
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
+        }
+
+        // Teardown: mark the agent's stream stopped so the tab spinner clears, then emit
+        // the final snapshot. Best-effort.
+        //
+        // FIX 2(a) — RELAUNCH GUARD: a same-`agent_id` relaunch bumps the registry generation
+        // and starts a fresh tail (which may already have pushed its first milestone, marking
+        // `running=true`). This OLD task must NOT then flip `running=false` and turn off the
+        // spinner on the live successor. `should_mark_stopped` returns false ONLY in that
+        // relaunch case (entry present under a newer generation); a clean `stop()` removed the
+        // entry, so it returns true and we DO clear the spinner (the explicit-stop path relies
+        // on exactly this teardown to clear Console `running`). If the registry is gone
+        // (app teardown) we still mark stopped — best-effort, the store may also be gone.
+        let mark = match app.try_state::<ActivityTailRegistry>() {
+            Some(registry) => registry.should_mark_stopped(&agent_id, generation),
+            None => true,
+        };
+        if mark {
+            if let Some(store) = app.try_state::<MiniActivityStore>() {
+                store.update(&app, &agent_id, mark_coder_stopped);
+            }
+        }
+    });
+}
+
+/// Read up to [`MAX_READ_PER_TICK`] NEW raw BYTES from `path` starting at `offset`.
+/// Returns `Some((bytes, new_offset, was_reset))` when there were new bytes, `None` when the
+/// file is absent / unchanged / unreadable (the tail simply waits). RAW bytes (not decoded) so
+/// the caller can reassemble a codepoint that straddles a read boundary before decoding.
+///
+/// `was_reset` is `true` when the file SHRANK below the saved offset (truncation/rotation) and
+/// we restarted from byte 0. The caller MUST drop any persistent partial-line `carry` in that
+/// case BEFORE extending it with the new bytes — otherwise a stale fragment from the OLD file
+/// would be prepended to the NEW file's first line and assemble a FABRICATED milestone.
+/// Blocking I/O — call on a blocking thread. The offset advances by the bytes actually
+/// read so the next tick continues from there.
+fn read_new_chunk(path: &Path, offset: u64) -> Option<(Vec<u8>, u64, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    // File shrank (truncated/rotated) → reset to its start so we don't read garbage from
+    // a stale offset past EOF. Report the reset so the caller drops its stale carry.
+    let was_reset = offset > len;
+    let start = if was_reset { 0 } else { offset };
+    if start >= len {
+        return None; // nothing new
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let to_read = std::cmp::min((len - start) as usize, MAX_READ_PER_TICK);
+    let mut buf = vec![0u8; to_read];
+    let n = file.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    buf.truncate(n);
+    Some((buf, start + n as u64, was_reset))
 }
 
 #[cfg(test)]
@@ -934,6 +1352,96 @@ mod tests {
     }
 
     #[test]
+    fn push_coder_milestone_appends_a_coder_row_and_marks_running() {
+        // Start from the resting empty state (an orchestrator that has not emitted yet).
+        let mut a = ConsoleActivity::empty();
+        push_coder_milestone(&mut a, "Planning: 3 spine files", Some(NodeStyle::Dot), "14:22:08");
+
+        // A single Coder entry with the exact wire keys.
+        let v = to_value(&a).unwrap();
+        assert_eq!(v["running"], json!(true), "a milestone means the orchestrator is live");
+        assert_eq!(v["runCount"], json!(1));
+        assert!(v.get("empty").is_none(), "empty resting flag cleared on first milestone");
+        let entries = v["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["type"], json!("coder"));
+        assert_eq!(entries[0]["node"], json!("dot"));
+        assert_eq!(entries[0]["text"], json!("Planning: 3 spine files"));
+        assert_eq!(entries[0]["time"], json!("14:22:08"));
+        // No mini card on a standalone coder row (the frontend only renders MiniCard for spawn).
+        assert!(entries[0].get("mini").is_none());
+
+        // A second milestone APPENDS (oldest-first), preserving order.
+        push_coder_milestone(&mut a, "exploring main.rs", Some(NodeStyle::Hollow), "14:22:09");
+        let v = to_value(&a).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["text"], json!("Planning: 3 spine files"));
+        assert_eq!(entries[1]["text"], json!("exploring main.rs"));
+        // The hollow node serializes to the empty string (NOT "hollow").
+        assert_eq!(entries[1]["node"], json!(""));
+    }
+
+    #[test]
+    fn push_coder_milestone_coexists_with_a_live_mini_spawn_entry() {
+        // An agent that already has a mini Spawn card gets orchestrator milestones APPENDED
+        // after it — the mini run is never mutated by the coder path.
+        let mut a = build_initial("mini · m", "edit a.rs", &["a.rs".to_string()], 1);
+        push_coder_milestone(&mut a, "drafted 2 tasks", Some(NodeStyle::Dot), "00:01");
+        let entries = a.entries.as_ref().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0], ConsoleEntry::Spawn { .. }), "the mini spawn stays first");
+        assert!(matches!(entries[1], ConsoleEntry::Coder { .. }), "the milestone is appended");
+    }
+
+    #[test]
+    fn push_coder_milestone_bounds_entries_fifo() {
+        // Flood well past the cap; only the newest MAX_ENTRIES_PER_AGENT survive (FIFO).
+        let mut a = ConsoleActivity::empty();
+        for i in 0..(MAX_ENTRIES_PER_AGENT + 25) {
+            push_coder_milestone(&mut a, &format!("m{i}"), Some(NodeStyle::Hollow), "00:00");
+        }
+        let entries = a.entries.as_ref().unwrap();
+        assert_eq!(entries.len(), MAX_ENTRIES_PER_AGENT, "capped to the per-agent bound");
+        // The OLDEST were dropped; the newest is the last pushed.
+        match entries.last().unwrap() {
+            ConsoleEntry::Coder { text, .. } => {
+                assert_eq!(text, &format!("m{}", MAX_ENTRIES_PER_AGENT + 25 - 1));
+            }
+            _ => panic!("expected a coder entry"),
+        }
+        // The first surviving row is the one just past the dropped window (no off-by-one).
+        match entries.first().unwrap() {
+            ConsoleEntry::Coder { text, .. } => assert_eq!(text, "m25"),
+            _ => panic!("expected a coder entry"),
+        }
+    }
+
+    #[test]
+    fn mark_coder_stopped_flips_running_false_keeps_timeline() {
+        let mut a = ConsoleActivity::empty();
+        push_coder_milestone(&mut a, "plan approved", Some(NodeStyle::Sage), "00:05");
+        mark_coder_stopped(&mut a);
+        assert_eq!(a.running, Some(false), "the tab spinner stops on teardown");
+        // The timeline is preserved (the final milestone stays visible).
+        assert_eq!(a.entries.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn store_push_coder_milestone_through_inner_mutate_snapshots() {
+        // Drive the AppHandle-free core: a coder milestone via the store's mutate path
+        // lands in the snapshot exactly as constructed.
+        let mut inner = StoreInner::default();
+        inner.mutate("orch-1", |a| {
+            push_coder_milestone(a, "plan submitted — awaiting approval", Some(NodeStyle::Terra), "09:00")
+        });
+        let v = to_value(inner.snapshot("orch-1")).unwrap();
+        assert_eq!(v["entries"][0]["type"], json!("coder"));
+        assert_eq!(v["entries"][0]["node"], json!("terra"));
+        assert_eq!(v["entries"][0]["text"], json!("plan submitted — awaiting approval"));
+    }
+
+    #[test]
     fn resume_retry_round_does_not_open_duplicate_when_round_already_present() {
         // If the predecessor did NOT append_round (defensive path), resume opens it once.
         // If it DID, resume must not double it. Here the last round n == round_n -> no open.
@@ -946,5 +1454,404 @@ mod tests {
         };
         assert_eq!(mini.rounds.len(), 1, "round_n already open -> no duplicate");
         assert_eq!(mini.rounds[0].n, 2);
+    }
+
+    // ---- FILE BRIDGE TAIL --------------------------------------------------
+
+    #[test]
+    fn parse_milestone_line_accepts_a_well_formed_event() {
+        let line = r#"{"kind":"milestone","text":"Planning: 3 spine files","node":"dot"}"#;
+        let (text, node) = parse_milestone_line(line).expect("a valid milestone parses");
+        assert_eq!(text, "Planning: 3 spine files");
+        assert_eq!(node, Some(NodeStyle::Dot));
+    }
+
+    #[test]
+    fn parse_milestone_line_maps_every_node_wire_value() {
+        let cases = [
+            ("", NodeStyle::Hollow),
+            ("dot", NodeStyle::Dot),
+            ("sage", NodeStyle::Sage),
+            ("terra", NodeStyle::Terra),
+            ("future-unknown", NodeStyle::Hollow), // unknown degrades to hollow
+        ];
+        for (wire, expect) in cases {
+            let line = format!(r#"{{"kind":"milestone","text":"x","node":"{wire}"}}"#);
+            let (_, node) = parse_milestone_line(&line).expect("parses");
+            assert_eq!(node, Some(expect), "node {wire:?} maps correctly");
+        }
+    }
+
+    #[test]
+    fn parse_milestone_line_skips_malformed_blank_and_non_milestone() {
+        // Blank / whitespace.
+        assert!(parse_milestone_line("").is_none());
+        assert!(parse_milestone_line("   ").is_none());
+        // Non-JSON garbage.
+        assert!(parse_milestone_line("not json at all").is_none());
+        // Valid JSON but wrong/absent kind.
+        assert!(parse_milestone_line(r#"{"kind":"other","text":"x","node":""}"#).is_none());
+        assert!(parse_milestone_line(r#"{"text":"x","node":""}"#).is_none());
+        // Oversized line is skipped (no parse, no panic).
+        let huge = format!(
+            r#"{{"kind":"milestone","text":"{}","node":""}}"#,
+            "a".repeat(MAX_LINE_BYTES + 10)
+        );
+        assert!(parse_milestone_line(&huge).is_none(), "oversized line skipped");
+    }
+
+    #[test]
+    fn parse_milestone_line_recaps_text_on_the_read_side() {
+        // A hand-crafted file could carry a label longer than the writer's cap; the read
+        // side re-caps to MILESTONE_TEXT_CAP chars (without splitting a codepoint).
+        let long = "é".repeat(MILESTONE_TEXT_CAP + 30);
+        let line = format!(r#"{{"kind":"milestone","text":"{long}","node":"dot"}}"#);
+        let (text, _) = parse_milestone_line(&line).expect("parses");
+        assert_eq!(text.chars().count(), MILESTONE_TEXT_CAP);
+        assert!(text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn activity_file_name_sanitizes_and_rejects_traversal() {
+        assert_eq!(activity_file_name("coder-123").as_deref(), Some("coder-123.jsonl"));
+        // The KEY guarantee: the result is a SINGLE flat filename component — every path
+        // SEPARATOR (`/` and `\`) is neutralized to '_', so the name can never be a path.
+        // Dots are kept (legal in a basename), so `..` survives only INSIDE a longer flat
+        // name, which is harmless (it is not a directory hop).
+        let name = activity_file_name("../../etc/passwd").unwrap();
+        assert!(!name.contains('/') && !name.contains('\\'), "no path separators survive");
+        assert!(name.ends_with(".jsonl"));
+        // The cleaned name `.._.._etc_passwd` STARTS with a dot → the leading-dot tightening
+        // replaces ONLY the first char's dot with `_` (the rest keep their dots), so no
+        // hidden/odd file is produced.
+        assert_eq!(name, "_._.._etc_passwd.jsonl");
+        assert!(!name.starts_with('.'), "no leading-dot (hidden) filename");
+        assert_eq!(activity_file_name("a/b\\c").as_deref(), Some("a_b_c.jsonl"));
+        // Degenerate ids that reduce to EXACTLY "." / ".." / empty are rejected (bridge
+        // disabled) — those are the only names that would be a real traversal hop.
+        assert!(activity_file_name("").is_none());
+        assert!(activity_file_name(".").is_none());
+        assert!(activity_file_name("..").is_none());
+        // A separator-only id collapses to underscores (a flat name), never a hop.
+        assert_eq!(activity_file_name("/").as_deref(), Some("_.jsonl"));
+        // Leading-dot tightening: a legitimate id that begins with `.` is REPLACED (not
+        // rejected) so the bridge still produces a usable, VISIBLE file — never a dotfile.
+        assert_eq!(activity_file_name(".hidden").as_deref(), Some("_hidden.jsonl"));
+        assert_eq!(activity_file_name("...x").as_deref(), Some("_..x.jsonl"));
+        // A non-leading dot is untouched (legal in a basename).
+        assert_eq!(activity_file_name("v1.2.3").as_deref(), Some("v1.2.3.jsonl"));
+    }
+
+    /// A unique, auto-cleaned temp dir for the file-touching tail tests (the crate has
+    /// no `tempfile` dev-dep, so mirror the repo's `std::env::temp_dir()` idiom). The
+    /// returned guard removes the dir on drop.
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "aspis-activity-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TestDir(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_new_chunk_tails_only_new_bytes_and_advances_offset() {
+        use std::io::Write;
+        let dir = TestDir::new("readnew");
+        let path = dir.path().join("a.jsonl");
+
+        // Absent file → None.
+        assert!(read_new_chunk(&path, 0).is_none());
+
+        // First write, read from 0.
+        std::fs::write(&path, "line1\n").unwrap();
+        let (chunk, off, reset) = read_new_chunk(&path, 0).expect("reads new bytes");
+        assert_eq!(chunk, b"line1\n");
+        assert_eq!(off, 6);
+        assert!(!reset, "a fresh read from 0 is not a reset");
+
+        // No new bytes since the saved offset → None.
+        assert!(read_new_chunk(&path, off).is_none());
+
+        // Append more; reading from the saved offset returns ONLY the new bytes.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"line2\n").unwrap();
+        let (chunk2, off2, reset2) = read_new_chunk(&path, off).expect("reads appended bytes");
+        assert_eq!(chunk2, b"line2\n");
+        assert_eq!(off2, 12);
+        assert!(!reset2, "an append within bounds is not a reset");
+
+        // Truncation/rotation (file shrank below offset) → reset to start, was_reset=true.
+        std::fs::write(&path, "fresh\n").unwrap();
+        let (chunk3, _, reset3) = read_new_chunk(&path, off2).expect("reads from reset start");
+        assert_eq!(chunk3, b"fresh\n");
+        assert!(reset3, "a shrink below the saved offset reports was_reset");
+    }
+
+    #[test]
+    fn truncation_with_stale_carry_drops_the_fragment_no_phantom_milestone() {
+        // FIX 1: the BLOCKER scenario. The OLD file ended on a PARTIAL line (no trailing
+        // newline) so the tail kept it in `carry`. The file is then truncated/rotated and a
+        // FRESH file is written. The reset MUST drop the stale carry BEFORE extending, or the
+        // old fragment + the new file's first bytes assemble a fabricated milestone.
+        use std::io::Write;
+        let dir = TestDir::new("trunc-carry");
+        let path = dir.path().join("a.jsonl");
+
+        // OLD file: a complete milestone + a DANGLING partial line (no '\n').
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "{}\n{}",
+            r#"{"kind":"milestone","text":"old complete","node":"dot"}"#,
+            r#"{"kind":"milestone","text":"old PARTIAL fr"# // no closing / newline
+        )
+        .unwrap();
+        drop(f);
+
+        // Mirror the tail loop's carry handling exactly.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut inner = StoreInner::default();
+        let mut consume = |bytes: &[u8], was_reset: bool, carry: &mut Vec<u8>| {
+            if was_reset {
+                carry.clear();
+            }
+            carry.extend_from_slice(bytes);
+            while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = carry.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                if let Some((text, node)) = parse_milestone_line(&line) {
+                    inner.mutate("orch", |a| push_coder_milestone(a, &text, node, "00:00"));
+                }
+            }
+        };
+
+        // Tick 1: read the OLD file. The complete line is consumed; the partial stays in carry.
+        let (bytes1, off1, reset1) = read_new_chunk(&path, 0).expect("reads old file");
+        assert!(!reset1);
+        consume(&bytes1, reset1, &mut carry);
+        assert!(!carry.is_empty(), "the dangling partial line is carried");
+
+        // Truncate/rotate: a FRESH file whose first bytes would, if prepended with the stale
+        // carry, look JSON-ish. Its real first line is a single legitimate milestone.
+        std::fs::write(&path, "agment\"}\n{\"kind\":\"milestone\",\"text\":\"new clean\",\"node\":\"sage\"}\n").unwrap();
+
+        // Tick 2: the read reports was_reset=true. The stale carry MUST be dropped first.
+        let (bytes2, _off2, reset2) = read_new_chunk(&path, off1).expect("reads fresh file");
+        assert!(reset2, "the shrink is reported as a reset");
+        consume(&bytes2, reset2, &mut carry);
+
+        // Only the genuine milestones survive: "old complete" (tick 1) + "new clean" (tick 2).
+        // The fabricated `old PARTIAL fragment"}` line is NEVER assembled.
+        let snap = inner.snapshot("orch");
+        let entries = snap.entries.as_ref().expect("entries");
+        let texts: Vec<&str> = entries
+            .iter()
+            .map(|e| match e {
+                ConsoleEntry::Coder { text, .. } => text.as_str(),
+                ConsoleEntry::Spawn { text, .. } => text.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["old complete", "new clean"],
+            "no phantom milestone from the stale carry across truncation"
+        );
+    }
+
+    #[test]
+    fn tail_pipeline_parses_file_into_store_milestones() {
+        // End-to-end of the tail's INNER logic without an AppHandle: read the bridge
+        // file, parse each whole line, push into a store core, and assert the snapshot
+        // carries the coder milestones in order — a malformed middle line is skipped.
+        use std::io::Write;
+        let dir = TestDir::new("pipeline");
+        let path = dir.path().join("activity.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"kind":"milestone","text":"Planning: 2 spine files","node":"dot"}}"#).unwrap();
+        writeln!(f, "garbage-not-json").unwrap(); // skipped
+        writeln!(f, r#"{{"kind":"milestone","text":"exploring main.rs","node":""}}"#).unwrap();
+        writeln!(f, r#"{{"kind":"milestone","text":"plan approved","node":"sage"}}"#).unwrap();
+
+        let (bytes, _off, _reset) = read_new_chunk(&path, 0).expect("reads the file");
+
+        // Mirror the tail loop's byte-split → per-line lossy-decode → parse path.
+        let mut inner = StoreInner::default();
+        for line_bytes in bytes.split_inclusive(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(line_bytes);
+            if let Some((text, node)) = parse_milestone_line(&line) {
+                inner.mutate("orch", |a| push_coder_milestone(a, &text, node, "00:00"));
+            }
+        }
+
+        let snap = to_value(inner.snapshot("orch")).unwrap();
+        let entries = snap["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "the malformed line was skipped");
+        assert_eq!(entries[0]["text"], json!("Planning: 2 spine files"));
+        assert_eq!(entries[0]["node"], json!("dot"));
+        assert_eq!(entries[1]["text"], json!("exploring main.rs"));
+        assert_eq!(entries[1]["node"], json!(""));
+        assert_eq!(entries[2]["text"], json!("plan approved"));
+        assert_eq!(entries[2]["node"], json!("sage"));
+        assert_eq!(snap["running"], json!(true), "milestones mark the orchestrator live");
+    }
+
+    #[test]
+    fn activity_tail_registry_register_and_stop_flip_the_flag() {
+        let reg = ActivityTailRegistry::default();
+        let (flag, gen0) = reg.register("orch-1");
+        assert!(!flag.load(Ordering::SeqCst), "fresh flag starts un-stopped");
+        assert_eq!(gen0, 0, "first registration is generation 0");
+
+        // Re-registering the same id flips the PREDECESSOR's flag (clean relaunch) and bumps
+        // the generation.
+        let (flag2, gen1) = reg.register("orch-1");
+        assert!(flag.load(Ordering::SeqCst), "predecessor task is told to stop");
+        assert!(!flag2.load(Ordering::SeqCst));
+        assert_eq!(gen1, 1, "relaunch bumps the generation");
+
+        // stop() flips the current flag; a second stop / unknown id is a no-op.
+        reg.stop("orch-1");
+        assert!(flag2.load(Ordering::SeqCst), "stop flips the live flag");
+        reg.stop("orch-1");
+        reg.stop("never-registered");
+    }
+
+    #[test]
+    fn relaunch_generation_makes_predecessor_teardown_a_no_op() {
+        // FIX 2(a): the predecessor tail's teardown must NOT mark the agent stopped after a
+        // same-id relaunch bumped the generation — otherwise it would flip `running=false` on
+        // the live successor that already pushed a milestone.
+        let reg = ActivityTailRegistry::default();
+        let (_flag_old, gen_old) = reg.register("orch-1");
+        // Relaunch: a fresh tail registers under a NEW generation (predecessor flag flipped).
+        let (_flag_new, gen_new) = reg.register("orch-1");
+        assert_ne!(gen_old, gen_new);
+
+        // The PREDECESSOR's teardown checks its own (now stale) generation → must be a no-op.
+        assert!(
+            !reg.should_mark_stopped("orch-1", gen_old),
+            "stale predecessor teardown does NOT mark stopped (would kill the live successor)"
+        );
+        // The SUCCESSOR's teardown (its generation is current) WOULD mark stopped.
+        assert!(
+            reg.should_mark_stopped("orch-1", gen_new),
+            "the current generation's teardown marks stopped"
+        );
+    }
+
+    #[test]
+    fn clean_stop_lets_teardown_still_mark_stopped() {
+        // FIX 2(a) counterpart: an EXPLICIT stop() removes the entry. The teardown must STILL
+        // mark stopped (absent entry → true), because the spinner-clear on an explicit stop
+        // relies on this teardown (mark_agent_session_closed calls stop() and counts on the
+        // tail to flip Console `running=false`).
+        let reg = ActivityTailRegistry::default();
+        let (_flag, gen) = reg.register("orch-1");
+        reg.stop("orch-1");
+        assert!(
+            reg.should_mark_stopped("orch-1", gen),
+            "after a clean stop (no relaunch) the teardown still clears the spinner"
+        );
+    }
+
+    #[test]
+    fn stop_sets_flag_while_holding_the_lock_no_toctou() {
+        // FIX 4: stop() must flip the flag BEFORE the entry is observable-as-removed, so a
+        // racing register() never sees an absent predecessor whose task was not yet signaled.
+        // We can't easily drive the data race in a unit test, but we assert the observable
+        // contract: after stop() returns, the predecessor flag is set AND the entry is gone
+        // (so a subsequent register() starts a fresh generation 0-relative chain cleanly).
+        let reg = ActivityTailRegistry::default();
+        let (flag, _gen) = reg.register("orch-1");
+        reg.stop("orch-1");
+        assert!(flag.load(Ordering::SeqCst), "the predecessor flag is set by stop()");
+        // The entry is removed: a fresh register() sees NO predecessor → generation resets to 0.
+        let (_flag2, gen2) = reg.register("orch-1");
+        assert_eq!(gen2, 0, "after stop() removed the entry, the next register is generation 0");
+    }
+
+    #[test]
+    fn post_await_stop_check_drops_an_in_flight_tick_without_pushing() {
+        // FIX 2(b): if stop() lands while a read is in flight, the loop re-checks the stop flag
+        // AFTER the await and breaks BEFORE pushing — so no milestone is pushed (which would
+        // re-assert running=true) after stop. We mirror the loop's exact post-await gate.
+        use std::io::Write;
+        let dir = TestDir::new("postawait");
+        let path = dir.path().join("a.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"kind":"milestone","text":"would-be-pushed","node":"dot"}}"#).unwrap();
+        drop(f);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut inner = StoreInner::default();
+
+        // Simulate one tick: the (blocking) read completed and returned bytes...
+        let read = read_new_chunk(&path, 0);
+
+        // ...but a stop() landed during the read. The post-await gate must break first.
+        stop.store(true, Ordering::SeqCst);
+
+        if stop.load(Ordering::SeqCst) {
+            // break — do NOT process the bytes.
+        } else if let Some((bytes, _off, was_reset)) = read {
+            let mut carry: Vec<u8> = Vec::new();
+            if was_reset {
+                carry.clear();
+            }
+            carry.extend_from_slice(&bytes);
+            while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = carry.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                if let Some((text, node)) = parse_milestone_line(&line) {
+                    inner.mutate("orch", |a| push_coder_milestone(a, &text, node, "00:00"));
+                }
+            }
+        }
+
+        // Nothing was pushed: the agent never became known/running via this tick.
+        let snap = inner.snapshot("orch");
+        assert!(
+            snap.entries.is_none(),
+            "a stop during the in-flight read must NOT push a milestone after stop"
+        );
+        assert_ne!(snap.running, Some(true), "running is not re-asserted after stop");
+    }
+
+    #[test]
+    fn stop_all_signals_every_tail_and_clears_the_registry() {
+        // FIX 3: app-exit teardown. stop_all() flips EVERY registered flag and empties the
+        // map. Idempotent + safe when no tails are registered.
+        let reg = ActivityTailRegistry::default();
+        let (flag_a, _) = reg.register("orch-a");
+        let (flag_b, _) = reg.register("orch-b");
+        assert!(!flag_a.load(Ordering::SeqCst));
+        assert!(!flag_b.load(Ordering::SeqCst));
+
+        reg.stop_all();
+        assert!(flag_a.load(Ordering::SeqCst), "every tail flag flipped on app exit");
+        assert!(flag_b.load(Ordering::SeqCst));
+
+        // After stop_all the map is empty → a teardown for a now-absent id still marks stopped
+        // (absent → true), and a second stop_all on an empty registry is a harmless no-op.
+        reg.stop_all();
+
+        // A fresh ActivityTailRegistry with no tails: stop_all is a no-op (no panic).
+        let empty = ActivityTailRegistry::default();
+        empty.stop_all();
     }
 }

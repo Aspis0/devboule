@@ -1743,6 +1743,16 @@ fn mark_agent_session_closed(
     agent_id: &str,
     host: Option<&str>,
 ) -> Result<(), String> {
+    // FILE BRIDGE teardown: stop this agent's orchestrator activity-tail task (if any)
+    // BEFORE the state-file write, so the task is torn down even if that write errors.
+    // Every session-end path (app-hosted reader EOF, app kill, external stop) funnels
+    // through here, so this single idempotent call covers them all. A non-orchestrator
+    // agent never registered a tail → `stop` is a harmless no-op. The tail also flips the
+    // Console's `running=false` on exit so the tab spinner clears.
+    if let Some(registry) = app.try_state::<super::mini_activity::ActivityTailRegistry>() {
+        registry.stop(agent_id);
+    }
+
     let projects_dir = projects_dir(app)?;
     fs::create_dir_all(&projects_dir)
         .map_err(|e| format!("Could not create projects folder: {e}"))?;

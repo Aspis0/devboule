@@ -303,6 +303,7 @@ pub fn run() {
         .manage(censor_state)
         .manage(mini_coder_state)
         .manage(backend::mini_activity::MiniActivityStore::default())
+        .manage(backend::mini_activity::ActivityTailRegistry::default())
         .manage(design_gen_state)
         .setup(|app| {
             // Record the bundled, read-only `oracle/` location so release builds
@@ -631,6 +632,16 @@ pub fn run() {
                 // are reaped by agent_pty::kill_all_on_exit above (they live in the
                 // same PTY map). Non-blocking + idempotent.
                 backend::mini_coder_executor::kill_all_on_exit(app_handle);
+                // Signal EVERY orchestrator activity-tail task to stop on quit. The
+                // per-agent stop is normally driven by `mark_agent_session_closed`, but
+                // the app-EXIT path does not funnel through there — without this the tail
+                // tokio tasks would keep polling until the process actually tears down.
+                // Idempotent + safe when no tails are registered.
+                if let Some(registry) =
+                    app_handle.try_state::<backend::mini_activity::ActivityTailRegistry>()
+                {
+                    registry.stop_all();
+                }
             }
             _ => {}
         });

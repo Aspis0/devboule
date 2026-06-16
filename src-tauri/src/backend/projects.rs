@@ -1387,6 +1387,13 @@ fn prepare_or_launch_project_agent(
                 value: exa_key,
             });
         }
+        // FILE BRIDGE: resolve the per-agent activity file (under the projects dir's
+        // `.devboule-activity/`). The orchestrator appends its coder-tier milestones
+        // here; the host tails it into the live Console. `None` (unsafe id / unwritable
+        // dir) ⇒ empty env ⇒ the orchestrator no-ops milestones and the run is unaffected.
+        let activity_file = crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Some(OrchestratorLaunchConfig {
             binary,
             omlx_base_url,
@@ -1401,6 +1408,7 @@ fn prepare_or_launch_project_agent(
             app_bin: resolve_app_binary()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            activity_file,
         })
     } else {
         None
@@ -1500,6 +1508,24 @@ fn prepare_or_launch_project_agent(
         // session file without it. pid/title/creationTime/promptFile stay None.
         // Record the requested host so a later launch/stop knows the intent.
         record_agent_launch(&app, &agent_id, &client, None, None, None, None, Some(host))?;
+    }
+    // FILE BRIDGE: once the orchestrator PROCESS is actually running (launch_terminal)
+    // and its activity-file path was resolved, start the host tail task that streams the
+    // orchestrator's coder-tier milestones into the live Console for this agent. Gated on
+    // `launch_terminal` so the prepare-only path (no process) never starts an orphan tail;
+    // the task self-tears-down on stop (kill / PTY EOF flips its registry flag). The tail
+    // tolerates the file not existing yet (it polls), so starting it here — even slightly
+    // before the child opens the file — is safe.
+    if launch_terminal {
+        if let Some(orch) = orchestrator.as_ref() {
+            if !orch.activity_file.trim().is_empty() {
+                crate::backend::mini_activity::start_activity_tail(
+                    &app,
+                    &agent_id,
+                    PathBuf::from(&orch.activity_file),
+                );
+            }
+        }
     }
     Ok(ProjectAgentLaunchResult {
         project_id: project.metadata.id,
@@ -4212,6 +4238,12 @@ struct OrchestratorLaunchConfig {
     /// tree-sitter duplication). Empty when `current_exe` is unavailable; the binary then
     /// omits the forward and the tool degrades to a clear error. NOT a secret.
     app_bin: String,
+    /// `DEVBOULE_ACTIVITY_FILE`: the per-agent file the orchestrator APPENDS its
+    /// coder-tier milestones to (the FILE BRIDGE). The host tails this file and turns
+    /// each line into a live `CoderEntry` in the Activity Console for this agent. Empty
+    /// when the bridge could not be set up (the orchestrator then no-ops its milestones).
+    /// NOT a secret — it carries only redacted, label-only milestone events.
+    activity_file: String,
 }
 
 /// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
@@ -4240,6 +4272,11 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     ];
     if !config.app_bin.trim().is_empty() {
         pairs.push(("DEVBOULE_APP_BIN", config.app_bin.clone()));
+    }
+    // The activity-file bridge path, appended LAST and ONLY when present (so the
+    // bridge-disabled case stays byte-identical to the prior output). Non-secret.
+    if !config.activity_file.trim().is_empty() {
+        pairs.push(("DEVBOULE_ACTIVITY_FILE", config.activity_file.clone()));
     }
     pairs
 }
@@ -9873,6 +9910,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             agent_id: "orchestrator-sentinel-42".to_string(),
             project_root: PathBuf::from("/work/the-project"),
             app_bin: "/opt/aspis/aspis-management".to_string(),
+            activity_file: "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl".to_string(),
         }
     }
 
@@ -9905,6 +9943,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             "DEVBOULE_AGENT_ID",
             "DEVBOULE_PROJECT_ROOT",
             "DEVBOULE_APP_BIN",
+            // FILE BRIDGE: the orchestrator appends its coder-tier milestones here.
+            "DEVBOULE_ACTIVITY_FILE",
         ] {
             assert!(text.contains(name), "missing env var {name}: {text}");
         }
@@ -9918,6 +9958,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             "orchestrator-sentinel-42",
             "/work/the-project",
             "/opt/aspis/aspis-management",
+            "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl",
         ] {
             assert!(text.contains(value), "missing env value {value}: {text}");
         }
@@ -9956,6 +9997,25 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             script.contains("& '/repo/devboule-coder/target/release/devboule-coder'"),
             "binary must be invoked via `& '<path>'`: {script}"
         );
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_omits_activity_file_when_empty() {
+        // FILE BRIDGE: an empty `activity_file` (the bridge-disabled case — unsafe id or
+        // unwritable scratch dir) must OMIT the DEVBOULE_ACTIVITY_FILE pair entirely, so
+        // the orchestrator falls back to its silent no-op writer. Present when set.
+        let mut config = orchestrator_fixture();
+        config.activity_file = String::new();
+        let names: Vec<&str> = orchestrator_env_pairs(&config).into_iter().map(|(n, _)| n).collect();
+        assert!(
+            !names.contains(&"DEVBOULE_ACTIVITY_FILE"),
+            "empty activity_file ⇒ no DEVBOULE_ACTIVITY_FILE pair"
+        );
+
+        // Present when set (mirrors the app_bin omission discipline).
+        let with = orchestrator_fixture();
+        let names: Vec<&str> = orchestrator_env_pairs(&with).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"DEVBOULE_ACTIVITY_FILE"));
     }
 
     #[cfg(target_os = "macos")]

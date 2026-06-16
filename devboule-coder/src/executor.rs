@@ -553,6 +553,10 @@ pub struct RealExecutor {
     /// `plan_submit`. Empty when not configured; the planner then escalates with a
     /// precise message instead of submitting a plan against the wrong project.
     project_id: String,
+    /// The coder-tier milestone emitter the planner writes its phases through (the
+    /// FILE BRIDGE to the host Console). Disabled (no-op) unless the host set
+    /// `DEVBOULE_ACTIVITY_FILE` at launch — observability never gates the run.
+    activity: crate::activity::Activity,
 }
 
 impl RealExecutor {
@@ -569,6 +573,8 @@ impl RealExecutor {
             project_root,
             model: None,
             project_id: String::new(),
+            // Disabled by default; `with_planner` resolves the real emitter from env.
+            activity: crate::activity::Activity::disabled(),
         }
     }
 
@@ -584,6 +590,10 @@ impl RealExecutor {
     ) -> Self {
         self.model = Some(model);
         self.project_id = project_id.into();
+        // Resolve the coder-tier milestone emitter from the launch env
+        // (`DEVBOULE_ACTIVITY_FILE`). Unset (the headless / no-host case) ⇒ a disabled
+        // no-op emitter, so the planner runs identically with or without the Console.
+        self.activity = crate::activity::Activity::from_env();
         self
     }
 
@@ -618,6 +628,18 @@ impl ToolExecutor for RealExecutor {
             // itself; it delegates to the mini sub-agent. Tool name is
             // `spawn_mini_coder` on the server.
             AgentAction::SpawnMini { task, files, write } => {
+                // Coarse orchestrator milestone: a count label only (NO task text — it
+                // is free-form model output we must not surface). The mini's OWN
+                // per-round activity is emitted in-process under its own agent_id; this
+                // is the orchestrator's "I am delegating" line on its own timeline.
+                self.activity.milestone(
+                    &format!(
+                        "delegating {} file{} to mini-coder",
+                        files.len(),
+                        if files.len() == 1 { "" } else { "s" }
+                    ),
+                    crate::activity::Node::Dot,
+                );
                 let params = json!({
                     "task": task,
                     "files": files,
@@ -728,6 +750,7 @@ impl RealExecutor {
             &self.fs,
             &self.project_id,
             &self.project_root,
+            &self.activity,
         )
         .await
         {
