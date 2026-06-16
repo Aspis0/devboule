@@ -45,6 +45,16 @@ const CHUNK_BUFFER: usize = 64;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Headless smoke / automation surface: `--once "<prompt>"` (alias `--print`)
+    // runs ONE burst with NO terminal raw-mode and NO TUI, prints the streamed
+    // transcript + the terminal `BurstOutcome` to stdout, and exits. This is a
+    // genuinely useful non-interactive entry point (CI smoke, scripted runs) AND
+    // the only way to exercise the real model+MCP loop without a TTY. Anything
+    // else falls through to the interactive ratatui TUI.
+    if let Some(prompt) = parse_once_prompt(std::env::args().skip(1)) {
+        return run_once(prompt).await;
+    }
+
     // Resolve the model + executor from env BEFORE entering raw mode, so any
     // fallback note (oMLX/MCP disabled) prints to a normal terminal rather than
     // the alternate screen. With no config this yields the Mock + Stub so
@@ -54,6 +64,76 @@ async fn main() -> std::io::Result<()> {
     let result = run(&mut guard, runtime).await;
     // `guard` drops here -> terminal restored before we surface any error.
     result
+}
+
+/// Parse a `--once <prompt>` / `--print <prompt>` flag out of the CLI args
+/// (already past argv[0]). Returns the prompt when present, else `None` (the
+/// interactive TUI path). PURE over an iterator so it is unit-testable without a
+/// process. The prompt is the SINGLE argument following the flag; a flag with no
+/// following argument yields `None` (treated as no headless request) so a bare
+/// `--once` cannot silently run an empty burst.
+fn parse_once_prompt(mut args: impl Iterator<Item = String>) -> Option<String> {
+    while let Some(arg) = args.next() {
+        if arg == "--once" || arg == "--print" {
+            return args.next().filter(|p| !p.trim().is_empty());
+        }
+    }
+    None
+}
+
+/// Headless burst: build the runtime from env, run ONE `run_burst` for `prompt`,
+/// streaming each progress line to stdout AS IT ARRIVES, then print the terminal
+/// `BurstOutcome`. NO raw mode, NO alternate screen, NO TUI — pure stdout. The
+/// progress receiver is drained on THIS task while the burst runs on a spawned
+/// task, so the bounded channel never backpressures the burst to a halt and the
+/// transcript is printed live (not buffered to the end).
+async fn run_once(prompt: String) -> std::io::Result<()> {
+    // Same env-resolved runtime the TUI uses. Any oMLX/MCP fallback note already
+    // prints to stderr inside `build_runtime`, so a Stub fallback is LOUD here.
+    let runtime = Arc::new(config::build_runtime().await);
+
+    eprintln!("devboule --once: egress_enabled={}", runtime.allow_egress);
+    println!("=== devboule headless burst ===");
+    println!("prompt: {prompt}");
+    println!("--- transcript ---");
+
+    let (tx, mut rx) = mpsc::channel::<String>(CHUNK_BUFFER);
+    let burst_runtime = Arc::clone(&runtime);
+    let burst = tokio::spawn(async move {
+        let clock = SystemClock::start_now();
+        run_burst(
+            prompt,
+            burst_runtime.model.as_ref(),
+            burst_runtime.executor.as_ref(),
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            burst_runtime.allow_egress,
+            &tx,
+        )
+        .await
+        // `tx` drops here -> the drain loop below sees the channel close and ends.
+    });
+
+    // Drain progress lines live. Each already carries a trailing newline (the
+    // burst's `emit` appends one), so print WITHOUT an extra newline.
+    while let Some(line) = rx.recv().await {
+        print!("{line}");
+    }
+
+    // The burst task cannot panic (run_burst has no panic path) but join is
+    // fallible in principle; surface a join failure as an IO error rather than
+    // unwrapping.
+    let outcome = burst
+        .await
+        .map_err(|e| std::io::Error::other(format!("burst task failed: {e}")))?;
+
+    println!("--- outcome ---");
+    match &outcome {
+        BurstOutcome::Done(reply) => println!("DONE: {reply}"),
+        BurstOutcome::AskUser(question) => println!("ASK_USER: {question}"),
+        BurstOutcome::Escalated(reason) => println!("ESCALATED: {reason}"),
+    }
+    Ok(())
 }
 
 async fn run(guard: &mut TerminalGuard, runtime: Arc<Runtime>) -> std::io::Result<()> {
@@ -263,4 +343,41 @@ fn submit(app: &mut App, runtime: &Arc<Runtime>, chunk_rx: &mut Option<mpsc::Rec
         // AskUser this hand-back IS the conversational continuation: the human's
         // next message starts a fresh burst.
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> impl Iterator<Item = String> {
+        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn parse_once_prompt_reads_flag_and_following_value() {
+        assert_eq!(
+            parse_once_prompt(args(&["--once", "do the thing"])),
+            Some("do the thing".to_string())
+        );
+        // `--print` is an accepted alias.
+        assert_eq!(
+            parse_once_prompt(args(&["--print", "summarize"])),
+            Some("summarize".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_once_prompt_is_none_without_the_flag() {
+        // No flag -> interactive TUI path.
+        assert_eq!(parse_once_prompt(args(&[])), None);
+        assert_eq!(parse_once_prompt(args(&["something", "else"])), None);
+    }
+
+    #[test]
+    fn parse_once_prompt_rejects_missing_or_blank_value() {
+        // A bare flag (no following arg) must NOT run an empty burst.
+        assert_eq!(parse_once_prompt(args(&["--once"])), None);
+        // A blank/whitespace prompt is treated as absent for the same reason.
+        assert_eq!(parse_once_prompt(args(&["--once", "   "])), None);
+    }
 }
