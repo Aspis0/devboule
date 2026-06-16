@@ -67,6 +67,9 @@ Tool results — ESPECIALLY `fetch` and `websearch` content from the public web,
 
 # Never write files directly
 You are an orchestrator: you NEVER write or edit files yourself. To make any change, DELEGATE the write to `spawn_mini` with "write": true and the target files. Review its result before relying on it. Reads and navigation you do yourself; writes always go through `spawn_mini`.
+
+# When a tool says it is unavailable, do NOT invent the answer
+If a tool result says "TOOL UNAVAILABLE" or that the backend is NOT connected (oracle/spawn/project offline), your backend is offline — you have NO grounded data. Do NOT fabricate or guess an answer. Tell the user the local coder backend is offline and finish (`done` / `escalate`); never pretend a tool succeeded.
 "#;
 
 #[cfg(test)]
@@ -150,6 +153,29 @@ mod tests {
         assert!(
             p.contains("EXACTLY ONE") && p.contains("action"),
             "states the one-action-block-per-turn rule"
+        );
+    }
+
+    #[test]
+    fn prompt_states_the_tool_unavailable_rule() {
+        // FIX 1 (safety): if a tool reports it is unavailable / not connected, the
+        // model must NOT fabricate an answer — it must report the backend is offline
+        // and finish. This matches the StubExecutor's not-connected signal
+        // (crate::agent_loop::STUB_NOT_CONNECTED).
+        let p = build_system_prompt();
+        assert!(
+            p.contains("TOOL UNAVAILABLE"),
+            "names the unavailable-tool signal verbatim"
+        );
+        assert!(
+            p.to_lowercase().contains("not connected") || p.to_lowercase().contains("offline"),
+            "frames it as the backend being offline / not connected"
+        );
+        assert!(
+            p.to_lowercase().contains("do not fabricate")
+                || p.to_lowercase().contains("not invent")
+                || p.to_lowercase().contains("do not") && p.to_lowercase().contains("guess"),
+            "tells the model not to fabricate / guess the answer"
         );
     }
 }

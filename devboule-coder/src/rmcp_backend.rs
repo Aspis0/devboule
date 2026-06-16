@@ -90,6 +90,10 @@ pub struct RmcpBackend {
     service: RunningService<RoleClient, ()>,
     agent_id: String,
     role: String,
+    /// The per-call session token. Non-empty on the MANAGED path (the server minted
+    /// it and enforces it on every call). EMPTY on the UNMANAGED dev/CI path, where
+    /// the server issues no token and accepts tokenless calls; `call_tool` then omits
+    /// the `session_token` key entirely.
     session_token: String,
     cancel: Option<RunningServiceCancellationToken>,
 }
@@ -180,11 +184,23 @@ impl RmcpBackend {
                 return Err("agent_register returned no text content".to_string());
             }
         };
-        let session_token = match extract_session_token(&text) {
-            Some(t) => t,
-            None => {
+        // MANAGED vs UNMANAGED token handling. A MANAGED launch supplies a launch
+        // token; the server mints a sessionToken and stamps a per-agent hash, then
+        // REQUIRES that exact token on every subsequent call — so a managed register
+        // that returns no token is a hard error (we must never proceed tokenless
+        // against a server that will reject every call). The UNMANAGED dev/CI path
+        // (no launch token; server has ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS=1)
+        // registers WITHOUT a session hash and returns an empty/absent sessionToken;
+        // `require_session_token` in aspis_mcp.py then ACCEPTS a tokenless call for
+        // exactly that case. So tolerate an empty token there and proceed with an
+        // empty one, which `call_tool` omits from the args (matching the server's
+        // tokenless-call contract). See oracle/server/aspis_mcp.py:require_session_token.
+        let managed = !config.launch_token.trim().is_empty();
+        let session_token = match resolve_session_token(&text, managed) {
+            Ok(t) => t,
+            Err(e) => {
                 cleanup.cancel();
-                return Err("agent_register did not return a sessionToken".to_string());
+                return Err(e);
             }
         };
 
@@ -219,7 +235,14 @@ impl McpBackend for RmcpBackend {
         };
         args.insert("role".into(), json!(self.role));
         args.insert("agent_id".into(), json!(self.agent_id));
-        args.insert("session_token".into(), json!(self.session_token));
+        // Inject the session token only when we HAVE one (the managed path). On the
+        // unmanaged path the token is empty: leave the key ABSENT so the server sees
+        // a tokenless call, which `require_session_token` accepts for an unmanaged
+        // (no-hash) session. Sending `""` would also be accepted there, but omitting
+        // the key is the honest representation of "no session token".
+        if !self.session_token.is_empty() {
+            args.insert("session_token".into(), json!(self.session_token));
+        }
 
         // `name` is a borrowed &str but CallToolRequestParams wants a
         // Cow<'static, str>, so own it. The call is bounded by CALL_TOOL_TIMEOUT:
@@ -302,6 +325,32 @@ fn extract_session_token(text: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Decide the session token to store from an `agent_register` result, given
+/// whether this was a MANAGED registration (a launch token was supplied).
+///
+/// * MANAGED: the server mints a sessionToken and stamps a per-agent hash it then
+///   enforces on every call (`require_session_token` in `oracle/server/aspis_mcp.py`).
+///   A missing token here means every subsequent call would be rejected, so it is a
+///   HARD ERROR — never proceed tokenless against a server that will refuse us.
+/// * UNMANAGED (dev/CI, `ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS=1`): the server
+///   registers WITHOUT a session hash and returns an empty/absent sessionToken;
+///   `require_session_token` then ACCEPTS a tokenless call for exactly that case. So
+///   an empty token is TOLERATED and returned as `""` — `call_tool` omits the key,
+///   yielding the tokenless call the server expects. If the unmanaged server DID
+///   return a token, honor it.
+///
+/// Pure + total so it is unit-testable without a live server.
+fn resolve_session_token(register_text: &str, managed: bool) -> Result<String, String> {
+    match extract_session_token(register_text) {
+        Some(token) => Ok(token),
+        None if managed => {
+            Err("agent_register did not return a sessionToken".to_string())
+        }
+        // Unmanaged: no token is expected and the server accepts tokenless calls.
+        None => Ok(String::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +371,38 @@ mod tests {
         assert_eq!(extract_session_token(r#"{"role":"x"}"#), None);
         assert_eq!(extract_session_token(r#"{"sessionToken":""}"#), None);
         assert_eq!(extract_session_token("not json"), None);
+    }
+
+    #[test]
+    fn resolve_session_token_managed_requires_a_token() {
+        // MANAGED launch (a launch token was supplied): the server mints a
+        // sessionToken and enforces it on every call, so it MUST be present.
+        let body = r#"{"sessionToken": "tok-managed", "role": "orchestrator"}"#;
+        assert_eq!(resolve_session_token(body, true).as_deref(), Ok("tok-managed"));
+    }
+
+    #[test]
+    fn resolve_session_token_managed_errors_when_token_absent() {
+        // A managed register that returns no token must HARD-ERROR: proceeding
+        // tokenless against a server that enforces the hash would fail every call.
+        assert!(resolve_session_token(r#"{"role":"orchestrator"}"#, true).is_err());
+        assert!(resolve_session_token(r#"{"sessionToken":""}"#, true).is_err());
+    }
+
+    #[test]
+    fn resolve_session_token_unmanaged_tolerates_absent_token() {
+        // UNMANAGED dev/CI path: the server returns no sessionToken (no hash stored)
+        // and accepts tokenless calls. Tolerate it — store an empty token so
+        // subsequent calls omit the key, matching require_session_token's contract.
+        assert_eq!(resolve_session_token(r#"{"role":"orchestrator"}"#, false).as_deref(), Ok(""));
+        assert_eq!(resolve_session_token(r#"{"sessionToken":""}"#, false).as_deref(), Ok(""));
+    }
+
+    #[test]
+    fn resolve_session_token_unmanaged_still_honors_a_returned_token() {
+        // If an unmanaged server DID return a token, use it (don't discard it).
+        let body = r#"{"sessionToken": "tok-unmanaged"}"#;
+        assert_eq!(resolve_session_token(body, false).as_deref(), Ok("tok-unmanaged"));
     }
 
     fn test_config(launch_token: &str) -> RmcpConfig {

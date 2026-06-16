@@ -114,10 +114,23 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, action: &AgentAction) -> ToolResult;
 }
 
-/// Canned, MCP-free executor for L2.2: every non-terminal action maps to a
-/// deterministic stub result. Terminal actions never reach an executor (the loop
-/// returns before dispatching them), so they are not represented here. Retained
-/// as the no-config / `cargo run`-without-a-server default and as the test stub.
+/// The result every [`StubExecutor`] tool dispatch returns: an UNMISTAKABLE
+/// not-connected ERROR. This is the no-server fallback (`config::build_runtime`
+/// drops to the stub when the MCP backend can't be reached, in dev OR on a real
+/// production misconfig). A plausible-looking success here is DANGEROUS: a live
+/// model would treat fabricated "[stub: 2 snippets]" output as real and confidently
+/// hallucinate a working-looking answer that is entirely fake. So every stub result
+/// is an error whose text tells the model, in no uncertain terms, to stop and report
+/// the backend is offline rather than invent an answer. The system prompt
+/// (`crate::prompt`) carries the matching rule.
+pub const STUB_NOT_CONNECTED: &str = "TOOL UNAVAILABLE: the local coder is NOT connected to its backend (oracle/spawn/project). Do NOT fabricate an answer — tell the user the local coder backend is offline and stop.";
+
+/// MCP-free executor: every non-terminal action returns the SAME not-connected
+/// ERROR ([`STUB_NOT_CONNECTED`]). Terminal actions never reach an executor (the
+/// loop returns before dispatching them), so they are not represented here.
+/// Retained as the no-config / `cargo run`-without-a-server default and as the
+/// test stub — but it NEVER returns a plausible success, so a disconnected run
+/// cannot be mistaken for a working agent.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubExecutor;
 
@@ -125,20 +138,18 @@ pub struct StubExecutor;
 impl ToolExecutor for StubExecutor {
     async fn execute(&self, action: &AgentAction) -> ToolResult {
         match action {
-            AgentAction::OracleAsk { .. } => ToolResult::ok("[stub: 2 snippets]"),
-            AgentAction::OracleContext { .. } => ToolResult::ok("[stub: context block]"),
-            AgentAction::Plan { steps } => {
-                ToolResult::ok(format!("[stub: plan accepted, {} step(s)]", steps.len()))
-            }
-            AgentAction::SpawnMini { write, .. } => ToolResult::ok(format!(
-                "[stub: mini {} done]",
-                if *write { "write" } else { "read" }
-            )),
-            AgentAction::Read { path } => ToolResult::ok(format!("[stub file contents: {path}]")),
-            AgentAction::Grep { .. } => ToolResult::ok("[stub: 0 matches]"),
-            AgentAction::Glob { .. } => ToolResult::ok("[stub: 0 paths]"),
-            AgentAction::Fetch { .. } => ToolResult::ok("[stub: fetched 0 bytes]"),
-            AgentAction::Websearch { .. } => ToolResult::ok("[stub: 0 results]"),
+            // Every tool the stub can be asked to run is unavailable: there is no
+            // backend behind it. Return the same loud not-connected error for ALL
+            // of them so the model cannot mistake any of them for real output.
+            AgentAction::OracleAsk { .. }
+            | AgentAction::OracleContext { .. }
+            | AgentAction::Plan { .. }
+            | AgentAction::SpawnMini { .. }
+            | AgentAction::Read { .. }
+            | AgentAction::Grep { .. }
+            | AgentAction::Glob { .. }
+            | AgentAction::Fetch { .. }
+            | AgentAction::Websearch { .. } => ToolResult::err(STUB_NOT_CONNECTED),
             // Terminal actions are handled by the loop before dispatch; if one
             // ever reaches here it is a logic error, so report it rather than
             // silently succeed.
@@ -511,10 +522,14 @@ mod tests {
         assert!(oracle_at < read_at, "oracle_ask must precede read");
         assert!(read_at < done_at, "read must precede done");
 
-        // Transcript holds BOTH tool results (drive a fresh burst to inspect it
-        // via a probe executor — here we assert via the stub result strings).
-        assert!(joined.contains("2 snippets"), "oracle stub result streamed");
-        assert!(joined.contains("stub file contents"), "read stub result streamed");
+        // The stub now returns the SAME loud not-connected error for every tool
+        // (oracle_ask + read here), so the stream carries the not-connected wording
+        // instead of plausible-looking fake output. Truncated for the progress line,
+        // so match the unmistakable head ("TOOL UNAVAILABLE").
+        assert!(
+            joined.matches("TOOL UNAVAILABLE").count() >= 2,
+            "both stub tool results signalled not-connected"
+        );
     }
 
     #[tokio::test]
@@ -967,5 +982,46 @@ mod tests {
             outcome,
             BurstOutcome::Escalated("out of my depth".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn stub_executor_signals_not_connected_for_every_tool() {
+        // FIX 1 (safety): the no-server fallback must NEVER return a plausible
+        // success — a live model would treat it as real and hallucinate. Every
+        // non-terminal tool must come back as an ERROR carrying the unmistakable
+        // not-connected wording so the model stops instead of fabricating.
+        let exec = StubExecutor;
+        let actions = [
+            AgentAction::OracleAsk { query: "q".into() },
+            AgentAction::OracleContext { query: "q".into(), limit: None },
+            AgentAction::Plan { steps: vec!["s".into()] },
+            AgentAction::SpawnMini { task: "t".into(), files: vec!["a.rs".into()], write: true },
+            AgentAction::SpawnMini { task: "t".into(), files: vec!["a.rs".into()], write: false },
+            AgentAction::Read { path: "a.rs".into() },
+            AgentAction::Grep { pattern: "x".into(), glob: None },
+            AgentAction::Glob { pattern: "*.rs".into() },
+            AgentAction::Fetch { url: "https://example.com".into() },
+            AgentAction::Websearch { query: "q".into() },
+        ];
+        for action in &actions {
+            let result = exec.execute(action).await;
+            assert!(
+                !result.ok,
+                "{} stub result must be an error",
+                action.tool_name()
+            );
+            assert_eq!(
+                result.output, STUB_NOT_CONNECTED,
+                "{} stub result must be the not-connected signal",
+                action.tool_name()
+            );
+            assert!(
+                result.output.contains("TOOL UNAVAILABLE")
+                    && result.output.contains("NOT connected")
+                    && result.output.contains("Do NOT fabricate"),
+                "{} stub result must carry the not-connected wording",
+                action.tool_name()
+            );
+        }
     }
 }
