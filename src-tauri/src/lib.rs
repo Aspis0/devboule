@@ -24,6 +24,19 @@ pub fn run_auth_helper_from_args() -> Option<i32> {
     None
 }
 
+/// Headless STRUCTURE bridge dispatch (Phase 11.2). When the process is invoked as
+/// `aspis-management structure --root <path>` this prints the deterministic
+/// `StructureGraph` as JSON to stdout and returns `Some(exit_code)` (0 ok, non-zero on a
+/// bad/missing root); a normal launch returns `None` so `main` proceeds to the GUI.
+///
+/// This REUSES the existing `backend::structure` builder (no tree-sitter duplication) and
+/// is the binary the shared, read-only `project_structure` MCP tool shells out to (the
+/// Python tool resolves this binary via the `ASPIS_APP_BIN` env wired at every MCP launch
+/// site). All-args overload so `main` can pass `std::env::args()` verbatim.
+pub fn run_structure_cli_from_args() -> Option<i32> {
+    backend::structure::run_structure_cli(std::env::args())
+}
+
 const ALLOWED_EXTERNAL_HOSTS: &[&str] = &[
     "aspis-bio.com",
     "console.nebius.ai",

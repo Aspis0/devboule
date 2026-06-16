@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -42,8 +43,13 @@ from oracle.server.aspis_mcp import (
     cloudflare_worker_in_aspis_bio_scope,
     create_mcp_server,
     censor_shard_path,
+    compact_structure,
+    build_project_structure,
+    resolve_structure_bridge_binary,
+    _STRUCTURE_MAX_CONCURRENT_BUILDS,
     dispatch_oracle_ask,
     dispatch_oracle_context,
+    dispatch_project_structure,
     dispose_censor_finding,
     ensure_oracle_index_ready,
     handle_tool_call,
@@ -545,11 +551,13 @@ root_path: "{escaped_work_root}"
                 )
 
     def test_mini_role_is_oracle_context_only(self):
-        # P3: the mini's MCP scope is READ-ONLY — it may register and call
-        # oracle_context, and NOTHING else. Every mutation tool is rejected at
-        # the role gate, SERVER-side (the prompt is advisory; this is the wall).
+        # P3 + Phase 11.2: the mini's MCP scope is READ-ONLY — it may register and
+        # call the read-only retrieval tools (oracle_context + project_structure),
+        # and NOTHING else. Every mutation tool is rejected at the role gate,
+        # SERVER-side (the prompt is advisory; this is the wall).
         self.assertEqual(
-            ROLE_ALLOWED_TOOLS["mini"], {"agent_register", "oracle_context"}
+            ROLE_ALLOWED_TOOLS["mini"],
+            {"agent_register", "oracle_context", "project_structure"},
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3538,6 +3546,7 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_create_followup",
                 "oracle_ask",
                 "oracle_context",
+                "project_structure",
                 "spawn_mini_coder",
                 "request_git_push",
                 "plan_submit",
@@ -7831,6 +7840,469 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             {"version": 2, "planApprovalRequests": [{"id": "p", "status": "pending_approval", "createdAt": "z"}]}
         )
         self.assertEqual(len(state3["planApprovalRequests"]), 1)
+
+
+# A minimal StructureGraph (camelCase wire shape) the STUBBED bridge returns, so the
+# project_structure tests need NO real app binary. Mirrors the Rust serde shape.
+def _fake_structure_graph() -> dict:
+    return {
+        "files": [
+            {"path": "core.rs", "lang": "rust", "definedSymbols": 2, "inDegree": 3, "outDegree": 0},
+            {"path": "a.rs", "lang": "rust", "definedSymbols": 1, "inDegree": 0, "outDegree": 1},
+        ],
+        "spine": [
+            {"path": "core.rs", "inDegree": 3, "topReferencedSymbols": ["CoreThing"]},
+        ],
+        "scanned": 2,
+        "skippedTooLarge": 0,
+        "skippedUnsupported": 1,
+        "skippedUnreadable": 0,
+        "capped": False,
+    }
+
+
+class AspisMcpProjectStructureTests(unittest.TestCase):
+    """Phase 11.2 project_structure: role allowlist gating, project-root resolution,
+    compact spine/summary shape, full-graph opt-in, caching, and fail-soft bridge errors.
+    The Rust bridge is STUBBED so these tests need no real binary."""
+
+    def setUp(self):
+        self._old_unmanaged = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+        # A real existing, EXECUTABLE file so resolve_structure_bridge_binary() passes its
+        # is_file() + os.access(X_OK) check; the bridge ITSELF is stubbed, so this file is
+        # never actually executed. The running interpreter is guaranteed executable and
+        # present, which keeps the test hermetic (no reliance on /bin/sh layout).
+        self._old_app_bin = os.environ.get("ASPIS_APP_BIN")
+        os.environ["ASPIS_APP_BIN"] = sys.executable
+        import oracle.server.aspis_mcp as mcp
+
+        mcp._STRUCTURE_CACHE.clear()
+
+    def tearDown(self):
+        import oracle.server.aspis_mcp as mcp
+
+        mcp._STRUCTURE_CACHE.clear()
+        for key, old in (
+            ("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", self._old_unmanaged),
+            ("ASPIS_APP_BIN", self._old_app_bin),
+        ):
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    def _setup(self, tmp: str) -> tuple[Path, Path]:
+        root = Path(tmp)
+        projects_dir = prepare_management_root(root)
+        work_root = root / "Aspis Bio Work"
+        work_root.mkdir()
+        _project_with_root(projects_dir, work_root)
+        return root, work_root
+
+    # --- role allowlist -------------------------------------------------------
+
+    def test_project_structure_is_in_orienting_roles_allowlists(self):
+        for role in ("coder", "orchestrator", "mini", "verifier"):
+            self.assertIn(
+                "project_structure",
+                ROLE_ALLOWED_TOOLS[role],
+                f"{role} must be allowed project_structure",
+            )
+        self.assertTrue(
+            any(t["name"] == "project_structure" for t in TOOLS),
+            "project_structure must be a registered MCP tool",
+        )
+
+    def test_compact_shape_is_spine_plus_summary_and_full_adds_files(self):
+        graph = _fake_structure_graph()
+        compact = compact_structure(graph, full=False)
+        self.assertEqual(set(compact.keys()), {"spine", "summary"})
+        self.assertEqual(compact["spine"][0]["path"], "core.rs")
+        self.assertEqual(compact["spine"][0]["topReferencedSymbols"], ["CoreThing"])
+        self.assertEqual(compact["summary"]["scanned"], 2)
+        self.assertEqual(compact["summary"]["skippedUnsupported"], 1)
+        self.assertFalse(compact["summary"]["capped"])
+        self.assertNotIn("files", compact)
+        # full=True opts into the whole per-file node list.
+        full = compact_structure(graph, full=True)
+        self.assertIn("files", full)
+        self.assertEqual(len(full["files"]), 2)
+
+    def test_dispatch_returns_compact_spine_for_a_coder(self):
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _work_root = self._setup(tmp)
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "coder-1", "role": "coder", "model": "opus", "message": "x"},
+                root=root,
+            )
+            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+                result = handle_tool_call(
+                    "project_structure",
+                    {"project_id": "censor-proj", "agent_id": "coder-1", "role": "coder"},
+                    root=root,
+                )
+            self.assertEqual(result["projectId"], "censor-proj")
+            self.assertEqual(result["spine"][0]["path"], "core.rs")
+            self.assertEqual(result["summary"]["scanned"], 2)
+            # By default the full file list is NOT returned (compact payload only).
+            self.assertNotIn("files", result)
+            # The bridge ran on the resolved WORK ROOT (not an arbitrary path).
+            (_app_bin, called_root), _ = stub.call_args
+            self.assertEqual(Path(called_root).name, "Aspis Bio Work")
+
+    def test_dispatch_full_true_returns_files(self):
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._setup(tmp)
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "coder-2", "role": "coder", "model": "opus", "message": "x"},
+                root=root,
+            )
+            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()):
+                result = handle_tool_call(
+                    "project_structure",
+                    {"project_id": "censor-proj", "agent_id": "coder-2", "role": "coder", "full": True},
+                    root=root,
+                )
+            self.assertIn("files", result)
+            self.assertEqual(len(result["files"]), 2)
+
+    def test_dispatch_rejected_for_role_without_the_tool(self):
+        # No role outside {coder, orchestrator, mini, verifier} exists, but a role gate
+        # rejection is exercised by tampering the stored session role to one lacking the
+        # tool. Simpler: assert the gate via require_registered_role for a fabricated role
+        # by checking ROLE_ALLOWED_TOOLS, plus a live rejection when the registered role's
+        # session is for a tool it lacks. Here we verify a MINI cannot read a DIFFERENT
+        # project's structure (cross-project scope), and that an UNREGISTERED agent is
+        # rejected outright.
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._setup(tmp)
+            # Unregistered agent → rejected before any bridge call.
+            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+                with self.assertRaises(McpError):
+                    handle_tool_call(
+                        "project_structure",
+                        {"project_id": "censor-proj", "agent_id": "ghost", "role": "coder"},
+                        root=root,
+                    )
+                stub.assert_not_called()
+
+    def test_mini_cannot_read_a_different_projects_structure(self):
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._setup(tmp)
+            # A mini whose session is scoped to a DIFFERENT project.
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "mini-x", "role": "mini", "model": "qwen", "message": "x"},
+                root=root,
+            )
+            projects = root / "projects"
+            with mcp.file_lock(projects / f"{AGENTS_STATE_FILE}.lock"):
+                state = read_agents_state(projects)
+                session = next(s for s in state["sessions"] if s.get("agentId") == "mini-x")
+                session["currentProjectId"] = "other-project"
+                mcp.write_agents_state(projects, state)
+            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+                with self.assertRaises(McpError):
+                    handle_tool_call(
+                        "project_structure",
+                        {"project_id": "censor-proj", "agent_id": "mini-x", "role": "mini"},
+                        root=root,
+                    )
+                stub.assert_not_called()
+
+    def test_cache_reuses_build_within_ttl_and_full_reuses_cached_graph(self):
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._setup(tmp)
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "coder-3", "role": "coder", "model": "opus", "message": "x"},
+                root=root,
+            )
+            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+                first = handle_tool_call(
+                    "project_structure",
+                    {"project_id": "censor-proj", "agent_id": "coder-3", "role": "coder"},
+                    root=root,
+                )
+                # A SECOND call on the unchanged tree must hit the cache (no re-build),
+                # and a full=True call must reuse the SAME cached graph (still 1 build).
+                second = handle_tool_call(
+                    "project_structure",
+                    {"project_id": "censor-proj", "agent_id": "coder-3", "role": "coder"},
+                    root=root,
+                )
+                third_full = handle_tool_call(
+                    "project_structure",
+                    {"project_id": "censor-proj", "agent_id": "coder-3", "role": "coder", "full": True},
+                    root=root,
+                )
+            self.assertEqual(stub.call_count, 1, "the bridge must run exactly once (cached)")
+            self.assertEqual(first["spine"], second["spine"])
+            self.assertIn("files", third_full)
+
+    def test_bridge_failure_returns_clean_error_not_a_crash(self):
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._setup(tmp)
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "coder-4", "role": "coder", "model": "opus", "message": "x"},
+                root=root,
+            )
+            # The bridge raises McpError (e.g. timeout / bad exit) — the dispatcher must
+            # surface it as a clean McpError, never an unhandled crash.
+            with patch.object(
+                mcp, "_run_structure_bridge", side_effect=McpError("bridge exploded")
+            ):
+                with self.assertRaises(McpError) as ctx:
+                    handle_tool_call(
+                        "project_structure",
+                        {"project_id": "censor-proj", "agent_id": "coder-4", "role": "coder"},
+                        root=root,
+                    )
+            self.assertIn("bridge exploded", str(ctx.exception))
+
+    def test_missing_app_bin_env_fails_closed(self):
+        import oracle.server.aspis_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = self._setup(tmp)
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "coder-5", "role": "coder", "model": "opus", "message": "x"},
+                root=root,
+            )
+            os.environ.pop("ASPIS_APP_BIN", None)
+            # No bridge binary configured ⇒ a clear error (NEVER a guessed path / hang).
+            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+                with self.assertRaises(McpError) as ctx:
+                    handle_tool_call(
+                        "project_structure",
+                        {"project_id": "censor-proj", "agent_id": "coder-5", "role": "coder"},
+                        root=root,
+                    )
+                stub.assert_not_called()
+            self.assertIn("ASPIS_APP_BIN", str(ctx.exception))
+
+    # --- binary executability (BLOCKER fix) -----------------------------------
+
+    def test_non_executable_app_bin_fails_closed(self):
+        # A present-but-non-executable ASPIS_APP_BIN must fail closed at resolve time with
+        # an accurate "not an executable file" message — NOT pass the is_file() check and
+        # later blow up as an opaque spawn EACCES.
+        with tempfile.TemporaryDirectory() as tmp:
+            non_exec = Path(tmp) / "app-bin"
+            non_exec.write_text("not really a binary", encoding="utf-8")
+            non_exec.chmod(0o644)  # readable but NOT executable
+            os.environ["ASPIS_APP_BIN"] = str(non_exec)
+            with self.assertRaises(McpError) as ctx:
+                resolve_structure_bridge_binary()
+            msg = str(ctx.exception)
+            self.assertIn("is not an executable file", msg)
+            # PRIVACY: only the basename is echoed, never the full path.
+            self.assertIn("app-bin", msg)
+            self.assertNotIn(str(non_exec.parent), msg)
+
+    def test_executable_app_bin_resolves(self):
+        # The complement: a file WITH the exec bit set resolves cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "app-bin"
+            exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            exe.chmod(0o755)
+            os.environ["ASPIS_APP_BIN"] = str(exe)
+            self.assertEqual(resolve_structure_bridge_binary(), str(exe))
+
+    # --- concurrency: in-flight dedup + bounded semaphore ---------------------
+
+    def test_concurrent_same_key_calls_build_exactly_once(self):
+        # N threads requesting the SAME (root, freshness) key cold must dedup onto ONE
+        # builder via the per-key in-flight Condition: the stubbed bridge is called exactly
+        # once, and every caller gets the same graph.
+        import oracle.server.aspis_mcp as mcp
+        import threading as _threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, work_root = self._setup(tmp)
+
+            call_count = 0
+            count_lock = _threading.Lock()
+            release = _threading.Event()
+
+            def slow_runner(_app_bin, _root_arg):
+                nonlocal call_count
+                with count_lock:
+                    call_count += 1
+                # Hold the build open until all threads have parked as waiters, so the race
+                # is deterministic: the first thread is mid-build while the rest dedup.
+                release.wait(timeout=5.0)
+                return _fake_structure_graph()
+
+            n = 8
+            barrier = _threading.Barrier(n)
+            results: list = [None] * n
+            errors: list = [None] * n
+
+            def worker(i):
+                try:
+                    barrier.wait(timeout=5.0)
+                    results[i] = build_project_structure(work_root, False, runner=slow_runner)
+                except Exception as exc:  # noqa: BLE001 - record per-thread failure
+                    errors[i] = exc
+
+            threads = [_threading.Thread(target=worker, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            # Give the builder a beat to register as in-flight + the waiters to park.
+            time.sleep(0.2)
+            release.set()
+            for t in threads:
+                t.join(timeout=5.0)
+
+            self.assertTrue(all(not t.is_alive() for t in threads), "threads must not hang")
+            self.assertTrue(all(e is None for e in errors), f"no thread may error: {errors}")
+            self.assertEqual(call_count, 1, "the bridge must build exactly once under dedup")
+            for r in results:
+                self.assertEqual(r["spine"][0]["path"], "core.rs")
+            # The in-flight marker is fully cleared after the build completes.
+            self.assertEqual(len(mcp._STRUCTURE_INFLIGHT), 0)
+
+    def test_builder_error_wakes_waiters_then_one_retries(self):
+        # If the FIRST builder errors, waiters must NOT hang forever: they wake, find no
+        # cache entry + no in-flight marker, and exactly one becomes the new builder. With a
+        # runner that fails once then succeeds, the net effect is two build attempts and a
+        # successful result for everyone (no deadlock, no leaked in-flight marker).
+        import oracle.server.aspis_mcp as mcp
+        import threading as _threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _root, work_root = self._setup(tmp)
+
+            attempts = 0
+            attempt_lock = _threading.Lock()
+            first_in = _threading.Event()
+            release_first = _threading.Event()
+
+            def flaky_runner(_app_bin, _root_arg):
+                nonlocal attempts
+                with attempt_lock:
+                    attempts += 1
+                    mine = attempts
+                if mine == 1:
+                    first_in.set()
+                    release_first.wait(timeout=5.0)
+                    raise McpError("transient build failure")
+                return _fake_structure_graph()
+
+            n = 4
+            results: list = [None] * n
+            errors: list = [None] * n
+
+            def worker(i):
+                try:
+                    results[i] = build_project_structure(work_root, False, runner=flaky_runner)
+                except Exception as exc:  # noqa: BLE001
+                    errors[i] = exc
+
+            threads = [_threading.Thread(target=worker, args=(i,)) for i in range(n)]
+            # Start the first builder, let it register + park as the active build.
+            threads[0].start()
+            self.assertTrue(first_in.wait(timeout=5.0), "first builder must enter")
+            for t in threads[1:]:
+                t.start()
+            time.sleep(0.2)  # let the others park as waiters on the first builder
+            release_first.set()  # first builder now raises
+            for t in threads:
+                t.join(timeout=5.0)
+
+            self.assertTrue(all(not t.is_alive() for t in threads), "no thread may hang")
+            # Exactly one caller saw the transient error (the original builder); the rest
+            # were served by the retry build.
+            errored = [e for e in errors if e is not None]
+            self.assertEqual(len(errored), 1, f"only the first builder errors: {errors}")
+            self.assertIsInstance(errored[0], McpError)
+            served = [r for r in results if r is not None]
+            self.assertEqual(len(served), n - 1, "every other caller gets a result")
+            self.assertGreaterEqual(attempts, 2, "the failed build must be retried")
+            self.assertEqual(len(mcp._STRUCTURE_INFLIGHT), 0, "in-flight marker cleared")
+
+    def test_global_semaphore_bounds_concurrent_builds(self):
+        # Distinct keys do NOT dedup, so without the semaphore N distinct projects would
+        # spawn N concurrent walkers. The BoundedSemaphore caps in-flight subprocesses at
+        # _STRUCTURE_MAX_CONCURRENT_BUILDS regardless of distinct keys.
+        import oracle.server.aspis_mcp as mcp
+        import threading as _threading
+
+        self.assertIsInstance(mcp._STRUCTURE_BUILD_SEMAPHORE, _threading.BoundedSemaphore)
+        self.assertEqual(_STRUCTURE_MAX_CONCURRENT_BUILDS, 4)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # build_project_structure is exercised directly (no dispatcher / agent state),
+            # so distinct bare work-root dirs are all we need — each is a distinct cache key.
+            # N distinct work roots → N distinct cache keys (no dedup between them).
+            n = _STRUCTURE_MAX_CONCURRENT_BUILDS + 4
+            work_roots = []
+            for i in range(n):
+                wr = root / f"work-{i}"
+                wr.mkdir()
+                work_roots.append(wr)
+
+            concurrent = 0
+            peak = 0
+            peak_lock = _threading.Lock()
+            release = _threading.Event()
+
+            def gated_runner(_app_bin, _root_arg):
+                nonlocal concurrent, peak
+                with peak_lock:
+                    concurrent += 1
+                    peak = max(peak, concurrent)
+                release.wait(timeout=5.0)
+                with peak_lock:
+                    concurrent -= 1
+                return _fake_structure_graph()
+
+            errors: list = [None] * n
+
+            def worker(i):
+                try:
+                    build_project_structure(work_roots[i], False, runner=gated_runner)
+                except Exception as exc:  # noqa: BLE001
+                    errors[i] = exc
+
+            threads = [_threading.Thread(target=worker, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            # Let the first wave saturate the semaphore.
+            time.sleep(0.3)
+            with peak_lock:
+                observed_peak = peak
+            release.set()
+            for t in threads:
+                t.join(timeout=10.0)
+
+            self.assertTrue(all(not t.is_alive() for t in threads), "no thread may hang")
+            self.assertTrue(all(e is None for e in errors), f"no thread may error: {errors}")
+            self.assertLessEqual(
+                observed_peak,
+                _STRUCTURE_MAX_CONCURRENT_BUILDS,
+                "concurrent Rust walkers must be bounded by the semaphore",
+            )
+            self.assertGreater(observed_peak, 0, "the runner must actually have run")
 
 
 if __name__ == "__main__":

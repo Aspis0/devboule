@@ -3376,10 +3376,13 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
             // no grant ⇒ no flags ⇒ byte-identical to the MINOR 9 status quo.
             let mut args: Vec<String> = vec!["exec".to_string()];
             if let Some(roots) = mcp_roots {
+                let app_bin = super::projects::resolve_app_binary();
+                let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
                 args.extend(super::projects::codex_mcp_config_args(
                     &crate::oracle::oracle_setup::resolve_oracle_python(),
                     &roots.management_root,
                     &roots.projects_dir,
+                    app_bin.as_deref(),
                 ));
             }
             if let Some(model) = backend.model.as_deref() {
@@ -4167,10 +4170,13 @@ fn build_mini_command_impl(
             // `-c` flags ⇒ byte-identical to the MINOR 9 status quo.
             let mut args: Vec<String> = vec!["exec".to_string()];
             if let Some(roots) = mcp_roots {
+                let app_bin = super::projects::resolve_app_binary();
+                let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
                 args.extend(super::projects::codex_mcp_config_args(
                     &crate::oracle::oracle_setup::resolve_oracle_python(),
                     &roots.management_root,
                     &roots.projects_dir,
+                    app_bin.as_deref(),
                 ));
             }
             if let Some(model) = backend.model.as_deref() {

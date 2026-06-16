@@ -40,6 +40,14 @@ const ENV_MCP_PROJECTS_DIR: &str = "DEVBOULE_MCP_PROJECTS_DIR";
 const ENV_AGENT_ID: &str = "DEVBOULE_AGENT_ID";
 const ENV_PROJECT_ROOT: &str = "DEVBOULE_PROJECT_ROOT";
 const ENV_EXA_API_KEY: &str = "EXA_API_KEY";
+/// The Aspis Management app binary path the launch wiring set in OUR env (L2.4 /
+/// Phase 11.2). We FORWARD it to the MCP child as `ASPIS_APP_BIN` so the server's
+/// read-only `project_structure` tool can shell out to the Rust structure builder
+/// (zero tree-sitter duplication). Absent when the app could not resolve `current_exe`;
+/// we then omit the forward and the tool degrades to a clear error. NOT a secret.
+const ENV_APP_BIN: &str = "DEVBOULE_APP_BIN";
+/// The env var name the MCP server reads to find the structure-bridge binary.
+const ENV_MCP_APP_BIN: &str = "ASPIS_APP_BIN";
 /// The app-issued launch token (L2.4). The Oracle MCP server REQUIRES it on
 /// `agent_register` for a managed launch (it stamps a launchTokenHash on the
 /// pending session up front), so the launch wiring sets this from the same token
@@ -109,6 +117,14 @@ async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
         }
     };
 
+    // Forward DEVBOULE_APP_BIN (our env) to the MCP child as ASPIS_APP_BIN so the
+    // server's read-only `project_structure` tool can shell out to the Rust structure
+    // builder. Omitted when unset (the tool then errors clearly instead of guessing).
+    let child_env: Vec<(String, String)> = match env_nonempty(ENV_APP_BIN) {
+        Some(app_bin) => vec![(ENV_MCP_APP_BIN.to_string(), app_bin)],
+        None => Vec::new(),
+    };
+
     let config = RmcpConfig {
         python: env_nonempty(ENV_MCP_PYTHON).unwrap_or_else(|| "python".to_string()),
         root,
@@ -120,7 +136,7 @@ async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
         // agent_register. Empty on the no-server / unmanaged dev path (the server
         // either has the compat kill switch on or no session hash to match).
         launch_token: std::env::var(ENV_MCP_LAUNCH_TOKEN).unwrap_or_default(),
-        env: Vec::new(),
+        env: child_env,
     };
 
     let mcp = match RmcpBackend::connect(config).await {

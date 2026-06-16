@@ -777,6 +777,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "scaleway_resource_action",
                 "oracle_ask",
                 "oracle_context",
+                "project_structure",
                 "censor_findings",
                 "censor_dispose",
                 "visual_check",
@@ -880,6 +881,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "scaleway_list_resources",
                 "oracle_ask",
                 "oracle_context",
+                "project_structure",
                 "censor_findings",
                 "censor_dispose",
                 "visual_check",
@@ -915,14 +917,15 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
             plan: Vec::new(),
         },
         AgentRoleRule {
-            // P3: the mini is a one-shot READ-ONLY leaf — oracle_context only.
-            // No heartbeat/subagents/needs_user (the parent coder owns the human
-            // contact) and no censor/push/plan mandates. Mirrored in the Python
-            // ROLE_RULES "mini" entry; parity (list order included) is pinned by
+            // P3 + Phase 11.2: the mini is a one-shot READ-ONLY leaf — the read-only
+            // retrieval tools (oracle_context + project_structure) only. No
+            // heartbeat/subagents/needs_user (the parent coder owns the human contact)
+            // and no censor/push/plan mandates. Mirrored in the Python ROLE_RULES "mini"
+            // entry; parity (list order included) is pinned by
             // test_allowed_tools_match_rust_default_role_rules.
             role: "mini".into(),
-            summary: "One-shot read-only sub-agent: reads the codebase via oracle_context, nothing else.".into(),
-            allowed_tools: vec!["agent_register", "oracle_context"]
+            summary: "One-shot read-only sub-agent: reads the codebase via oracle_context and the architectural spine via project_structure, nothing else.".into(),
+            allowed_tools: vec!["agent_register", "oracle_context", "project_structure"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -2851,6 +2854,7 @@ mod tests {
             "scaleway_resource_action",
             "oracle_ask",
             "oracle_context",
+            "project_structure",
             "censor_findings",
             "censor_dispose",
             "visual_check",
@@ -2875,6 +2879,7 @@ mod tests {
             "scaleway_list_resources",
             "oracle_ask",
             "oracle_context",
+            "project_structure",
             "censor_findings",
             "censor_dispose",
             "visual_check",

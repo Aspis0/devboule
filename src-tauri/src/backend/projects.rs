@@ -1396,6 +1396,11 @@ fn prepare_or_launch_project_agent(
             mcp_projects_dir: projects_path.clone(),
             agent_id: agent_id.clone(),
             project_root: root_path.clone(),
+            // The running app binary so the orchestrator can forward ASPIS_APP_BIN to its
+            // MCP child (reuse the Rust structure builder). Empty when unavailable.
+            app_bin: resolve_app_binary()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         })
     } else {
         None
@@ -3237,9 +3242,13 @@ fn build_windows_agent_script(
         // is echoed; the script-level "prompt copied to clipboard" line follows.
         "Write-Host 'Aspis agent prompt is copied to clipboard.'".to_string()
     } else if client == "codex" {
-        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model)
+        let app_bin = resolve_app_binary();
+        let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
+        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref())
     } else if client == "claude" {
-        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model)
+        let app_bin = resolve_app_binary();
+        let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
+        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref())
     } else {
         executable.to_string()
     };
@@ -3484,9 +3493,13 @@ fn build_macos_agent_script(
         // clipboard and echoed above.
         String::new()
     } else if client == "codex" {
-        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model)
+        let app_bin = resolve_app_binary();
+        let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
+        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref())
     } else if client == "claude" {
-        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model)
+        let app_bin = resolve_app_binary();
+        let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
+        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref())
     } else {
         sh_single_quote(executable)
     };
@@ -4094,6 +4107,7 @@ fn macos_codex_launch_line(
     management_root: &Path,
     projects_dir: &Path,
     model: Option<&str>,
+    app_bin: Option<&str>,
 ) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let management_root_s = management_root.to_string_lossy().into_owned();
@@ -4106,7 +4120,7 @@ fn macos_codex_launch_line(
         "--projects-dir",
         &projects_dir_s,
     ]);
-    let config_args: Vec<String> = vec![
+    let mut config_args: Vec<String> = vec![
         format!(
             "mcp_servers.aspis-management.command={}",
             toml_string(python)
@@ -4137,6 +4151,15 @@ fn macos_codex_launch_line(
             toml_string("1")
         ),
     ];
+    // ASPIS_APP_BIN: the running app binary so the server's read-only
+    // `project_structure` tool can shell out to the Rust structure builder (zero
+    // tree-sitter duplication). Omitted when `current_exe` is unavailable. NOT a secret.
+    if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
+        config_args.push(format!(
+            "mcp_servers.aspis-management.env.ASPIS_APP_BIN={}",
+            toml_string(app_bin)
+        ));
+    }
     let mut line = String::from("printf '%s' \"$PROMPT\" | codex --cd ");
     line.push_str(&sh_single_quote(&root_s));
     if let Some(model) = model {
@@ -4182,6 +4205,43 @@ struct OrchestratorLaunchConfig {
     agent_id: String,
     /// `DEVBOULE_PROJECT_ROOT`: the project folder being worked on.
     project_root: PathBuf,
+    /// `DEVBOULE_APP_BIN`: the running Aspis Management app binary (owns the headless
+    /// `structure --root <path>` subcommand). The orchestrator binary forwards this to
+    /// the MCP child it spawns as `ASPIS_APP_BIN`, so the server's read-only
+    /// `project_structure` tool can shell out to the Rust structure builder (zero
+    /// tree-sitter duplication). Empty when `current_exe` is unavailable; the binary then
+    /// omits the forward and the tool degrades to a clear error. NOT a secret.
+    app_bin: String,
+}
+
+/// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
+/// orchestrator binary. Shared so the macOS line and the PowerShell script can never
+/// drift. `DEVBOULE_APP_BIN` is appended LAST and ONLY when present (so the empty-app-bin
+/// case stays byte-identical to the prior 7-pair output). The SECRETS (launch token, Exa
+/// key) are NEVER here — they ride via `provider_env` (env only, B1 invariant).
+fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static str, String)> {
+    let mut pairs: Vec<(&'static str, String)> = vec![
+        ("DEVBOULE_OMLX_BASE_URL", config.omlx_base_url.to_string()),
+        ("DEVBOULE_OMLX_MODEL", config.omlx_model.to_string()),
+        ("DEVBOULE_MCP_PYTHON", config.mcp_python.to_string()),
+        (
+            "DEVBOULE_MCP_ROOT",
+            config.mcp_root.to_string_lossy().into_owned(),
+        ),
+        (
+            "DEVBOULE_MCP_PROJECTS_DIR",
+            config.mcp_projects_dir.to_string_lossy().into_owned(),
+        ),
+        ("DEVBOULE_AGENT_ID", config.agent_id.to_string()),
+        (
+            "DEVBOULE_PROJECT_ROOT",
+            config.project_root.to_string_lossy().into_owned(),
+        ),
+    ];
+    if !config.app_bin.trim().is_empty() {
+        pairs.push(("DEVBOULE_APP_BIN", config.app_bin.clone()));
+    }
+    pairs
 }
 
 /// macOS-only: build the local Devboule orchestrator invocation LINE for the launch
@@ -4201,24 +4261,7 @@ struct OrchestratorLaunchConfig {
 fn macos_orchestrator_launch_line(config: &OrchestratorLaunchConfig) -> String {
     // Each pair is `export NAME=<sh-quoted value>`. Only NON-SECRET config is set
     // inline; the loopback-only base URL is validated upstream (read_mini_coder_backend).
-    let pairs: [(&str, String); 7] = [
-        ("DEVBOULE_OMLX_BASE_URL", config.omlx_base_url.to_string()),
-        ("DEVBOULE_OMLX_MODEL", config.omlx_model.to_string()),
-        ("DEVBOULE_MCP_PYTHON", config.mcp_python.to_string()),
-        (
-            "DEVBOULE_MCP_ROOT",
-            config.mcp_root.to_string_lossy().into_owned(),
-        ),
-        (
-            "DEVBOULE_MCP_PROJECTS_DIR",
-            config.mcp_projects_dir.to_string_lossy().into_owned(),
-        ),
-        ("DEVBOULE_AGENT_ID", config.agent_id.to_string()),
-        (
-            "DEVBOULE_PROJECT_ROOT",
-            config.project_root.to_string_lossy().into_owned(),
-        ),
-    ];
+    let pairs = orchestrator_env_pairs(config);
     let mut line = String::new();
     for (name, value) in &pairs {
         line.push_str(name);
@@ -4238,24 +4281,7 @@ fn macos_orchestrator_launch_line(config: &OrchestratorLaunchConfig) -> String {
 /// key) are injected via `provider_env` (the spawning process env), so they are
 /// NEVER on this script line / the binary's argv (B1 invariant).
 fn orchestrator_launch_script(config: &OrchestratorLaunchConfig) -> String {
-    let pairs: [(&str, String); 7] = [
-        ("DEVBOULE_OMLX_BASE_URL", config.omlx_base_url.to_string()),
-        ("DEVBOULE_OMLX_MODEL", config.omlx_model.to_string()),
-        ("DEVBOULE_MCP_PYTHON", config.mcp_python.to_string()),
-        (
-            "DEVBOULE_MCP_ROOT",
-            config.mcp_root.to_string_lossy().into_owned(),
-        ),
-        (
-            "DEVBOULE_MCP_PROJECTS_DIR",
-            config.mcp_projects_dir.to_string_lossy().into_owned(),
-        ),
-        ("DEVBOULE_AGENT_ID", config.agent_id.to_string()),
-        (
-            "DEVBOULE_PROJECT_ROOT",
-            config.project_root.to_string_lossy().into_owned(),
-        ),
-    ];
+    let pairs = orchestrator_env_pairs(config);
     let mut script = String::new();
     for (name, value) in &pairs {
         script.push_str(&format!("$env:{name} = {}\n", ps_single_quote(value)));
@@ -4270,8 +4296,8 @@ fn orchestrator_launch_script(config: &OrchestratorLaunchConfig) -> String {
 /// `--mcp-config` and pipes the prompt over STDIN.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
-fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>) -> String {
-    let config = mcp_client_config_json(python, management_root, projects_dir);
+fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>) -> String {
+    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin);
     let model_flag = match model {
         Some(model) => format!("--model {} ", sh_single_quote(model)),
         None => String::new(),
@@ -4296,7 +4322,12 @@ fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: 
 /// grant (mini_coder_executor): both wire the SAME server; the mini's scope is
 /// narrowed SERVER-side by its "mini" role (oracle_context only), never by the
 /// client config. Extracted so the two call sites cannot drift.
-pub(crate) fn codex_mcp_config_args(python: &str, management_root: &Path, projects_dir: &Path) -> Vec<String> {
+pub(crate) fn codex_mcp_config_args(
+    python: &str,
+    management_root: &Path,
+    projects_dir: &Path,
+    app_bin: Option<&str>,
+) -> Vec<String> {
     let management_root_s = management_root.to_string_lossy().into_owned();
     let projects_dir_s = projects_dir.to_string_lossy().into_owned();
     let mcp_args = toml_array(&[
@@ -4307,7 +4338,7 @@ pub(crate) fn codex_mcp_config_args(python: &str, management_root: &Path, projec
         "--projects-dir",
         &projects_dir_s,
     ]);
-    vec![
+    let mut out = vec![
         "-c".to_string(),
         format!(
             "mcp_servers.aspis-management.command={}",
@@ -4345,17 +4376,29 @@ pub(crate) fn codex_mcp_config_args(python: &str, management_root: &Path, projec
             "mcp_servers.aspis-management.env.ASPIS_MCP_CLOUDFLARE_PROFILE_MODE={}",
             toml_string("1")
         ),
-    ]
+    ];
+    // ASPIS_APP_BIN: the running app binary path so the server's read-only
+    // `project_structure` tool can shell out to the Rust structure builder (zero
+    // tree-sitter duplication). Omitted when `current_exe` is unavailable; the Python
+    // tool then degrades to a clear error instead of guessing a path. NOT a secret.
+    if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
+        out.push("-c".to_string());
+        out.push(format!(
+            "mcp_servers.aspis-management.env.ASPIS_APP_BIN={}",
+            toml_string(app_bin)
+        ));
+    }
+    out
 }
 
-fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path, model: Option<&str>) -> String {
+fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let mut args = vec!["--cd".to_string(), root_s];
     if let Some(model) = model {
         args.push("-m".to_string());
         args.push(model.to_string());
     }
-    args.extend(codex_mcp_config_args(python, management_root, projects_dir));
+    args.extend(codex_mcp_config_args(python, management_root, projects_dir, app_bin));
     let args = args
         .iter()
         .map(|value| ps_single_quote(value))
@@ -4375,8 +4418,8 @@ fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, p
     format!("$codexArgs = @({args})\n$prompt | & codex @codexArgs")
 }
 
-fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>) -> String {
-    let config = mcp_client_config_json(python, management_root, projects_dir).replace("'@", "' @");
+fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>) -> String {
+    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin).replace("'@", "' @");
     let model_flag = match model {
         Some(model) => format!("--model {} ", ps_single_quote(model)),
         None => String::new(),
@@ -4392,7 +4435,20 @@ fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Pat
     format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig")
 }
 
-fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &Path) -> String {
+fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &Path, app_bin: Option<&str>) -> String {
+    let mut env = serde_json::Map::new();
+    env.insert("PYTHONPATH".into(), management_root.to_string_lossy().into_owned().into());
+    env.insert("PYTHONIOENCODING".into(), "utf-8".into());
+    env.insert("HF_HUB_OFFLINE".into(), "1".into());
+    env.insert("TRANSFORMERS_OFFLINE".into(), "1".into());
+    env.insert("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".into(), "1".into());
+    // ASPIS_APP_BIN: the running app binary path so the server's read-only
+    // `project_structure` tool can shell out to the Rust structure builder (zero
+    // tree-sitter duplication). Omitted when unavailable (the Python tool errors
+    // clearly instead of guessing). NOT a secret.
+    if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
+        env.insert("ASPIS_APP_BIN".into(), app_bin.to_string().into());
+    }
     serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {
             "aspis-management": {
@@ -4406,13 +4462,7 @@ fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &P
                     projects_dir.to_string_lossy(),
                 ],
                 "cwd": management_root.to_string_lossy(),
-                "env": {
-                    "PYTHONPATH": management_root.to_string_lossy(),
-                    "PYTHONIOENCODING": "utf-8",
-                    "HF_HUB_OFFLINE": "1",
-                    "TRANSFORMERS_OFFLINE": "1",
-                    "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1",
-                },
+                "env": env,
             }
         }
     }))
@@ -6841,6 +6891,20 @@ fn resolve_orchestrator_binary() -> Result<PathBuf, String> {
             .collect::<Vec<_>>()
             .join(", ")
     ))
+}
+
+/// Resolve the RUNNING app binary path (`aspis-management`), which owns the headless
+/// `structure --root <path>` subcommand. Threaded to every MCP launch site as the
+/// `ASPIS_APP_BIN` env var so the shared, read-only `project_structure` MCP tool can shell
+/// out to it and REUSE the Rust structure builder (zero tree-sitter duplication). Returns
+/// `None` (never panics) when `current_exe` is unavailable — the launch still proceeds and
+/// the Python tool degrades to a clear "binary not configured" error rather than a hang.
+///
+/// We use `current_exe()` (the SAME binary the user is running) rather than a search:
+/// it is by definition present and runnable, and bundling guarantees the GUI binary and
+/// its subcommands ship together.
+pub(crate) fn resolve_app_binary() -> Option<PathBuf> {
+    std::env::current_exe().ok().filter(|p| p.is_file())
 }
 
 /// FIX 5: fail-closed launch token. The token gates MCP registration, so a
@@ -9749,13 +9813,46 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None);
-        let claude = mcp_client_config_json("python3", &root, &projects);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None);
+        let claude = mcp_client_config_json("python3", &root, &projects, None);
 
         assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(!codex.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
         assert!(!claude.contains("ASPIS_CLOUDFLARE_CODER_WORKER_WRITE_TOKEN"));
+    }
+
+    #[test]
+    fn mcp_configs_carry_app_bin_when_present_and_omit_it_when_absent() {
+        // Phase 11.2: the running app binary is injected as ASPIS_APP_BIN into the
+        // codex `-c env.*` and the claude `env` JSON so the server's read-only
+        // `project_structure` tool can shell out to the Rust structure builder. When the
+        // app binary is unavailable (None) the env key must be ENTIRELY absent (so the
+        // Python tool fails closed with a clear error, never an empty path).
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+        let app_bin = "/opt/aspis/aspis-management";
+
+        let codex_with = codex_mcp_config_args("python3", &root, &projects, Some(app_bin)).join(" ");
+        let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin));
+        assert!(
+            codex_with.contains("mcp_servers.aspis-management.env.ASPIS_APP_BIN="),
+            "codex args must set ASPIS_APP_BIN: {codex_with}"
+        );
+        assert!(codex_with.contains(app_bin), "codex args must carry the binary path");
+        assert!(
+            claude_with.contains("\"ASPIS_APP_BIN\""),
+            "claude env must set ASPIS_APP_BIN: {claude_with}"
+        );
+        assert!(claude_with.contains(app_bin), "claude env must carry the binary path");
+
+        // None / empty → the key is omitted entirely.
+        let codex_none = codex_mcp_config_args("python3", &root, &projects, None).join(" ");
+        let claude_none = mcp_client_config_json("python3", &root, &projects, None);
+        let codex_blank = codex_mcp_config_args("python3", &root, &projects, Some("   ")).join(" ");
+        assert!(!codex_none.contains("ASPIS_APP_BIN"), "absent app bin ⇒ no codex key");
+        assert!(!claude_none.contains("ASPIS_APP_BIN"), "absent app bin ⇒ no claude key");
+        assert!(!codex_blank.contains("ASPIS_APP_BIN"), "blank app bin ⇒ no codex key");
     }
 
     // --- L2.4 local Devboule orchestrator launch -----------------------------
@@ -9775,6 +9872,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             mcp_projects_dir: PathBuf::from("/srv/aspis-mcp-root/projects"),
             agent_id: "orchestrator-sentinel-42".to_string(),
             project_root: PathBuf::from("/work/the-project"),
+            app_bin: "/opt/aspis/aspis-management".to_string(),
         }
     }
 
@@ -9796,7 +9894,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             text.contains("/repo/devboule-coder/target/release/devboule-coder"),
             "missing binary path: {text}"
         );
-        // Every required env var NAME is set.
+        // Every required env var NAME is set (incl. DEVBOULE_APP_BIN — the orchestrator
+        // forwards it to its MCP child as ASPIS_APP_BIN for the project_structure tool).
         for name in [
             "DEVBOULE_OMLX_BASE_URL",
             "DEVBOULE_OMLX_MODEL",
@@ -9805,6 +9904,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             "DEVBOULE_MCP_PROJECTS_DIR",
             "DEVBOULE_AGENT_ID",
             "DEVBOULE_PROJECT_ROOT",
+            "DEVBOULE_APP_BIN",
         ] {
             assert!(text.contains(name), "missing env var {name}: {text}");
         }
@@ -9817,6 +9917,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             "/srv/aspis-mcp-root/projects",
             "orchestrator-sentinel-42",
             "/work/the-project",
+            "/opt/aspis/aspis-management",
         ] {
             assert!(text.contains(value), "missing env value {value}: {text}");
         }
@@ -9880,8 +9981,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let claude_json = mcp_client_config_json(python, &root, &projects);
-        let codex_args = codex_mcp_config_args(python, &root, &projects).join(" ");
+        let claude_json = mcp_client_config_json(python, &root, &projects, None);
+        let codex_args = codex_mcp_config_args(python, &root, &projects, None).join(" ");
 
         // The resolved interpreter is what actually runs the MCP server.
         assert!(claude_json.contains("\"command\": \"/opt/venv/bin/python3.11\""));
@@ -9901,8 +10002,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None);
-        let macos_claude = macos_claude_launch_line(python, &root, &projects, None);
+        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None, None);
+        let macos_claude = macos_claude_launch_line(python, &root, &projects, None, None);
 
         assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
         assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
@@ -9921,10 +10022,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
-        let codex_with = codex_launch_script("python3", &root, &root, &projects, Some(model));
-        let claude_with = claude_launch_script("python3", &root, &projects, Some(model));
-        let codex_none = codex_launch_script("python3", &root, &root, &projects, None);
-        let claude_none = claude_launch_script("python3", &root, &projects, None);
+        let codex_with = codex_launch_script("python3", &root, &root, &projects, Some(model), None);
+        let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None);
+        let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None);
+        let claude_none = claude_launch_script("python3", &root, &projects, None, None);
 
         // Selected model reaches the CLI.
         assert!(claude_with.contains("--model"));
@@ -9945,10 +10046,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
-        let codex_with = macos_codex_launch_line("python3", &root, &root, &projects, Some(model));
-        let claude_with = macos_claude_launch_line("python3", &root, &projects, Some(model));
-        let codex_none = macos_codex_launch_line("python3", &root, &root, &projects, None);
-        let claude_none = macos_claude_launch_line("python3", &root, &projects, None);
+        let codex_with = macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None);
+        let claude_with = macos_claude_launch_line("python3", &root, &projects, Some(model), None);
+        let codex_none = macos_codex_launch_line("python3", &root, &root, &projects, None, None);
+        let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None);
 
         assert!(claude_with.contains("--model"));
         assert!(claude_with.contains(model));
@@ -9964,7 +10065,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None);
 
         // The prompt must be piped into codex via STDIN so PowerShell never
         // word-splits it (which would mangle `<`/`>` and leak the launch token).
@@ -9979,7 +10080,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let claude = claude_launch_script("python3", &root, &projects, None);
+        let claude = claude_launch_script("python3", &root, &projects, None, None);
 
         assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
         assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
@@ -9997,8 +10098,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None);
-        let claude = claude_launch_script("python3", &root, &projects, None);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None);
+        let claude = claude_launch_script("python3", &root, &projects, None, None);
 
         // The literal prompt text is never embedded in either launch script: it
         // is supplied at runtime through the `$prompt` variable piped over STDIN.

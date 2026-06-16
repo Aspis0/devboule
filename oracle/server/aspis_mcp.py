@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -42,6 +43,35 @@ logger = logging.getLogger(__name__)
 ORACLE_HTTP_BASE_ENV = "ASPIS_ORACLE_HTTP_BASE"
 ORACLE_HTTP_TOKEN_ENV = "ASPIS_ORACLE_AUTH_TOKEN"
 ORACLE_DISCOVERY_FILENAME = ".oracle-server.json"
+
+# Phase 11.2 STRUCTURE bridge. The read-only `project_structure` tool shells out to the
+# Aspis Management app binary (`<app> structure --root <path>`) which REUSES the Rust
+# tree-sitter structure builder (`src-tauri/.../backend/structure.rs`) — there is NO
+# second parser in Python (zero duplication / no drift). The launch wiring sets the
+# binary path in this env at every MCP launch site; absent ⇒ the tool fails closed with
+# a clear error rather than guessing a path.
+ASPIS_APP_BIN_ENV = "ASPIS_APP_BIN"
+# Wall-clock cap on the bridge subprocess. The Rust builder is bounded (MAX_FILES /
+# MAX_WALK_ENTRIES) so a normal repo finishes in well under a second; this is generous
+# headroom for a huge tree on a cold disk. On elapse we kill the child and return a clean
+# error result (never hang the server).
+PROJECT_STRUCTURE_TIMEOUT_S = 60.0
+# POST-HOC reject on the bridge's stdout size. NOTE: this is NOT a streaming memory guard
+# — `_run_structure_bridge` uses `capture_output=True`, which buffers the ENTIRE stdout in
+# memory BEFORE this length check runs, so a pathological graph is fully materialized first
+# and only then rejected. That is acceptable because the bridge binary is the trusted app
+# (`current_exe`, wired by the launch site) and the Rust side caps the graph tightly at the
+# source (MAX_FILES / MAX_WALK_ENTRIES); this cap is a backstop sanity reject, not a true
+# upstream memory bound. 16 MiB is far above any real spine+files payload yet bounded.
+PROJECT_STRUCTURE_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+# Per-(root, freshness-key) cache TTL. Repeated calls within a session reuse the parsed
+# graph instead of re-walking the whole repo; the freshness key (newest mtime + file
+# count under the root, cheaply sampled) invalidates the entry when the tree changes, and
+# the TTL bounds staleness even if the freshness probe misses a same-second edit.
+PROJECT_STRUCTURE_CACHE_TTL_S = 30.0
+# Bound the cheap freshness probe so it never itself walks an unbounded tree (the build
+# is bounded by the Rust side; the probe must be cheaper than the build it guards).
+PROJECT_STRUCTURE_FRESHNESS_MAX_ENTRIES = 20_000
 
 
 BLOCK_MARKER = "```aspis-project"
@@ -262,6 +292,7 @@ ROLE_RULES = [
             "scaleway_resource_action",
             "oracle_ask",
             "oracle_context",
+            "project_structure",
             "censor_findings",
             "censor_dispose",
             "visual_check",
@@ -325,6 +356,7 @@ ROLE_RULES = [
             "project_create_followup",
             "oracle_ask",
             "oracle_context",
+            "project_structure",
             "spawn_mini_coder",
             "request_git_push",
             "plan_submit",
@@ -371,6 +403,7 @@ ROLE_RULES = [
             "scaleway_list_resources",
             "oracle_ask",
             "oracle_context",
+            "project_structure",
             "censor_findings",
             "censor_dispose",
             "visual_check",
@@ -391,10 +424,11 @@ ROLE_RULES = [
     },
     {
         "role": "mini",
-        "summary": "Sub-agente one-shot in SOLA LETTURA: usa oracle_context per leggere il codebase, nient'altro.",
+        "summary": "Sub-agente one-shot in SOLA LETTURA: usa oracle_context per leggere il codebase e project_structure per la spina dorsale architetturale, nient'altro.",
         "allowedTools": [
             "agent_register",
             "oracle_context",
+            "project_structure",
         ],
         "forbidden": [
             "Non modifica codice, task, Kanban, provider o findings: NESSUN tool di mutazione.",
@@ -403,7 +437,7 @@ ROLE_RULES = [
         ],
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
-            "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
+            "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context / project_structure.",
         ],
     },
 ]
@@ -721,6 +755,17 @@ TOOLS = [
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "project_id": {"type": "string", "default": ""},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "project_structure",
+        "description": "Read-only: i file architetturalmente centrali (la 'spina dorsale') del progetto + i conteggi riassuntivi, calcolati in modo deterministico (no-LLM, tree-sitter). Usalo PRIMA di oracle_ask per orientarti su quali file toccare.",
+        "parameters": {
+            "project_id": {"type": "string"},
+            "full": {"type": "boolean", "default": False},
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
         },
     },
@@ -4113,6 +4158,334 @@ def resolve_project_work_root(projects_dir: Path, project_id: str) -> Path:
     return validate_project_work_root(Path(root_path), management_root)
 
 
+# --- Phase 11.2: project_structure (shared, read-only STRUCTURE graph) ---------------
+#
+# `project_structure` exposes the deterministic, no-LLM cross-file STRUCTURE graph + the
+# architectural "spine" (the handful of files the rest of the code reaches into) so ANY
+# coder (orchestrator / claude / codex / mini) can orient BEFORE asking the Oracle.
+#
+# REUSE (load-bearing): the graph is built by the Rust tree-sitter builder
+# (`src-tauri/.../backend/structure.rs`), invoked via the app binary's headless
+# `structure --root <path>` subcommand. There is NO second parser here — Python only
+# resolves the project root (the SAME allowlist the censor/oracle tools use), shells out,
+# parses the JSON, and returns a COMPACT result.
+
+# Cache: (resolved_root_str, freshness_key) -> (built_at_monotonic, parsed_graph). Bounded
+# in size so a long-lived server with many projects cannot grow it without limit.
+#
+# CONCURRENCY (FastMCP runs sync tools on a worker-thread pool, so N agents calling
+# project_structure land on N threads concurrently). Three primitives guard the build:
+#   1. `_STRUCTURE_CACHE_LOCK` serializes every read/write/eviction of the cache dict AND
+#      the in-flight map below. It is held ONLY for the quick dict bookkeeping — NEVER
+#      across the ~60s subprocess (the build runs outside the lock).
+#   2. `_STRUCTURE_INFLIGHT` dedups concurrent builds for the SAME cache_key: the first
+#      caller becomes the builder, later same-key callers WAIT on the shared Condition and
+#      then re-read the cache instead of each spawning a subprocess. On builder error the
+#      waiters are woken (no entry appears) so exactly one of them retries / they surface
+#      the same failure — waiters never hang forever.
+#   3. `_STRUCTURE_BUILD_SEMAPHORE` caps TOTAL concurrent Rust subprocess walks across ALL
+#      keys, so N distinct projects cannot fan out into N concurrent walkers (DoS amp).
+_STRUCTURE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_STRUCTURE_CACHE_MAX_ENTRIES = 64
+_STRUCTURE_CACHE_LOCK = threading.Lock()
+# cache_key -> Condition (shared lock = _STRUCTURE_CACHE_LOCK) signalling "a build for this
+# key just finished (success or failure)". Presence of a key == "a build is in flight".
+_STRUCTURE_INFLIGHT: dict[tuple[str, str], threading.Condition] = {}
+# Max concurrent Rust structure-walk subprocesses, regardless of distinct cache keys. Small
+# on purpose: a walk is bounded but CPU/IO-heavy, and a build storm (many agents, many
+# projects) must not spawn an unbounded number of children.
+_STRUCTURE_MAX_CONCURRENT_BUILDS = 4
+_STRUCTURE_BUILD_SEMAPHORE = threading.BoundedSemaphore(_STRUCTURE_MAX_CONCURRENT_BUILDS)
+# How long a caller will block trying to acquire a build slot before returning a clean
+# "busy, try again" error. Bounded well under the subprocess timeout so a caller never
+# stacks both waits; the in-flight dedup means only the FIRST same-key caller ever reaches
+# this acquire, so contention here is across DISTINCT keys only.
+_STRUCTURE_BUILD_SLOT_TIMEOUT_S = 15.0
+
+
+def resolve_structure_bridge_binary() -> str:
+    """The Aspis Management app binary that owns the headless `structure` subcommand,
+    from `ASPIS_APP_BIN` (wired by the launch sites). Validated to be an existing,
+    executable file so a stale/empty/non-executable env fails closed with a clear message
+    instead of an opaque spawn error (e.g. EACCES). NEVER a bare command name or a guessed
+    path — the tool degrades to an error result.
+    SCOPE: this verifies the path is a runnable file, NOT its identity. Binary integrity
+    (hash/signature/ownership) is an OS/install-level concern — the launch site wires
+    `current_exe()` (the trusted running app), so identity is enforced upstream, not here."""
+    raw = str(os.environ.get(ASPIS_APP_BIN_ENV) or "").strip()
+    if not raw:
+        raise McpError(
+            "project_structure is unavailable: the app binary path is not configured "
+            f"({ASPIS_APP_BIN_ENV} unset). Relaunch the agent from the app so the bridge "
+            "is wired."
+        )
+    candidate = Path(raw)
+    # Require BOTH "is a file" AND "is executable": a present-but-non-executable path would
+    # otherwise pass here and fail later as an opaque spawn EACCES. Fail closed now with an
+    # accurate message. (os.access checks the real uid/gid permission bits.)
+    if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+        # PRIVACY: name only the basename, never echo the full path back to an agent.
+        raise McpError(
+            f"project_structure is unavailable: configured app binary '{candidate.name}' "
+            "is not an executable file."
+        )
+    return str(candidate)
+
+
+def _structure_freshness_key(root: Path) -> str:
+    """A cheap freshness signal for `root`: the newest mtime + the count of files seen in
+    a BOUNDED top-down walk (skipping the same build-artifact dirs the Rust builder skips
+    + hidden dirs). Same tree ⇒ same key ⇒ cache hit; an edit bumps an mtime and a
+    add/remove bumps the count, invalidating the entry. The TTL backstops a same-second
+    edit the mtime resolution might miss. Never raises — on any error returns a sentinel
+    that simply prevents caching (correctness over speed)."""
+    skip_dirs = {"target", "node_modules", "dist", "build", "out", ".git"}
+    newest_ns = 0
+    count = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Prune build artifacts + hidden dirs in place (mirrors the Rust SKIP_DIRS +
+            # the `ignore` crate's hidden filtering) so the probe stays cheap.
+            dirnames[:] = [
+                d for d in dirnames if d not in skip_dirs and not d.startswith(".")
+            ]
+            for name in filenames:
+                count += 1
+                if count > PROJECT_STRUCTURE_FRESHNESS_MAX_ENTRIES:
+                    # Too large to sample cheaply; fold the cap into the key so we still
+                    # cache deterministically (the TTL bounds staleness for huge trees).
+                    return f"capped:{PROJECT_STRUCTURE_FRESHNESS_MAX_ENTRIES}"
+                try:
+                    st = os.stat(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                if st.st_mtime_ns > newest_ns:
+                    newest_ns = st.st_mtime_ns
+    except OSError:
+        # Cannot walk ⇒ a unique-ish key so we do NOT serve a stale cache entry.
+        return f"nowalk:{time.time_ns()}"
+    return f"{count}:{newest_ns}"
+
+
+def _run_structure_bridge(app_bin: str, root: Path) -> dict[str, Any]:
+    """Invoke `<app_bin> structure --root <root>` and parse its stdout JSON into the
+    graph dict. Bounded by `PROJECT_STRUCTURE_TIMEOUT_S` (the child is killed on elapse).
+    `PROJECT_STRUCTURE_MAX_OUTPUT_BYTES` is a POST-HOC reject — `capture_output=True`
+    buffers all stdout first, so the cap rejects an over-large payload after the fact
+    rather than streaming-bounding memory; it relies on the trusted Rust-side caps to keep
+    the real output small (see the const's note). Raises `McpError` (never lets a
+    subprocess exception escape) so the dispatcher returns a clean error result, never a
+    crash."""
+    try:
+        proc = subprocess.run(
+            [app_bin, "structure", "--root", str(root)],
+            capture_output=True,
+            timeout=PROJECT_STRUCTURE_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise McpError(
+            f"project_structure timed out after {PROJECT_STRUCTURE_TIMEOUT_S:.0f}s "
+            "building the graph."
+        ) from exc
+    except OSError as exc:
+        raise McpError(f"project_structure could not run the structure bridge: {exc}") from exc
+
+    if proc.returncode != 0:
+        # The Rust bridge prints a one-line diagnostic to stderr on failure. Surface a
+        # bounded slice of it (never the whole output) so the agent gets a usable reason.
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        detail = detail.splitlines()[0][:200] if detail else "no diagnostic"
+        raise McpError(f"project_structure bridge failed (exit {proc.returncode}): {detail}")
+
+    raw = proc.stdout or b""
+    if len(raw) > PROJECT_STRUCTURE_MAX_OUTPUT_BYTES:
+        raise McpError("project_structure graph output exceeded the size limit.")
+    try:
+        graph = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise McpError("project_structure bridge returned unparseable JSON.") from exc
+    if not isinstance(graph, dict):
+        raise McpError("project_structure bridge returned a non-object graph.")
+    return graph
+
+
+def _structure_summary(graph: dict[str, Any]) -> dict[str, Any]:
+    """The bounded summary counts from the StructureGraph (camelCase wire shape)."""
+    return {
+        "scanned": graph.get("scanned"),
+        "skippedTooLarge": graph.get("skippedTooLarge"),
+        "skippedUnsupported": graph.get("skippedUnsupported"),
+        "skippedUnreadable": graph.get("skippedUnreadable"),
+        "capped": bool(graph.get("capped")),
+    }
+
+
+def compact_structure(graph: dict[str, Any], full: bool) -> dict[str, Any]:
+    """Project the full StructureGraph down to the payload a model can actually use:
+    the `spine` (the 5-8 central files + their `topReferencedSymbols`) + the summary
+    counts. The full `files`/edge list is HUGE for a big repo, so it is returned ONLY when
+    `full=True` is explicitly requested. Unknown/missing fields degrade to None/[]."""
+    spine = graph.get("spine")
+    spine_out = spine if isinstance(spine, list) else []
+    result: dict[str, Any] = {
+        "spine": spine_out,
+        "summary": _structure_summary(graph),
+    }
+    if full:
+        files = graph.get("files")
+        result["files"] = files if isinstance(files, list) else []
+    return result
+
+
+def _structure_cache_get(cache_key: tuple[str, str]) -> dict[str, Any] | None:
+    """Return the cached FULL graph for `cache_key` if present AND within TTL, else None.
+    MUST be called holding `_STRUCTURE_CACHE_LOCK`."""
+    cached = _STRUCTURE_CACHE.get(cache_key)
+    if cached is not None and (time.monotonic() - cached[0]) <= PROJECT_STRUCTURE_CACHE_TTL_S:
+        return cached[1]
+    return None
+
+
+def _structure_cache_put(cache_key: tuple[str, str], graph: dict[str, Any]) -> None:
+    """Insert `graph` under `cache_key`, evicting the oldest entry first if the cache is at
+    its bound. MUST be called holding `_STRUCTURE_CACHE_LOCK` (so the read-min-pop sequence
+    is atomic and can never race another writer into popping the wrong entry / a KeyError).
+    """
+    _STRUCTURE_CACHE.pop(cache_key, None)
+    if len(_STRUCTURE_CACHE) >= _STRUCTURE_CACHE_MAX_ENTRIES:
+        # Held under the lock, so the dict is stable here: a plain min over items() is safe
+        # (no "changed size during iteration", no racy wrong-entry pop).
+        oldest_key = min(_STRUCTURE_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _STRUCTURE_CACHE.pop(oldest_key, None)
+    _STRUCTURE_CACHE[cache_key] = (time.monotonic(), graph)
+
+
+def build_project_structure(
+    work_root: Path,
+    full: bool,
+    *,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """Resolve the bridge binary, build (or reuse a cached) StructureGraph for `work_root`,
+    and return the compact payload. `runner` is a seam for tests (defaults to the real
+    `_run_structure_bridge`) so the dispatch + cache logic is exercisable without a real
+    binary. Cached per (root, freshness-key) with a TTL; a fresh edit invalidates the key,
+    the TTL backstops a missed same-second edit. The cached value is the FULL parsed graph,
+    so a later `full=True` call reuses the same build.
+
+    CONCURRENCY (FastMCP worker-thread pool): the cache dict + the in-flight map are guarded
+    by `_STRUCTURE_CACHE_LOCK` (held ONLY for quick bookkeeping, NEVER across the build);
+    concurrent callers for the SAME cache_key dedup onto ONE builder via `_STRUCTURE_INFLIGHT`
+    (the rest wait then read the cache); and the actual subprocess launch is gated by the
+    global `_STRUCTURE_BUILD_SEMAPHORE` so total concurrent walkers are bounded regardless
+    of distinct keys."""
+    run = runner if runner is not None else _run_structure_bridge
+    app_bin = resolve_structure_bridge_binary()
+    root_str = str(work_root)
+    freshness = _structure_freshness_key(work_root)
+    cache_key = (root_str, freshness)
+
+    # Decide builder-vs-waiter atomically under the lock, in a loop so that if the current
+    # builder ERRORS (clears the in-flight marker without a cache entry), exactly the next
+    # thread to win the lock becomes the new builder while the others keep waiting on
+    # whatever Condition is current. `condition` is set only on the path where we become the
+    # builder; in that case we break out to run the build OUTSIDE the lock.
+    condition: threading.Condition
+    while True:
+        with _STRUCTURE_CACHE_LOCK:
+            cached = _structure_cache_get(cache_key)
+            if cached is not None:
+                return compact_structure(cached, full)
+            inflight = _STRUCTURE_INFLIGHT.get(cache_key)
+            if inflight is None:
+                # No build in flight for this key: WE become the builder. Publish an
+                # in-flight Condition (sharing the cache lock) so concurrent same-key
+                # callers dedup onto us, then leave the lock to run the build.
+                condition = threading.Condition(_STRUCTURE_CACHE_LOCK)
+                _STRUCTURE_INFLIGHT[cache_key] = condition
+                break
+            # A build for this key is already in flight: wait on the CURRENT Condition,
+            # then loop to re-check (cache hit, or builder gone → we may become builder).
+            inflight.wait(timeout=PROJECT_STRUCTURE_CACHE_TTL_S)
+
+    # OUTSIDE the lock: gate the actual subprocess on the global semaphore, run it, then
+    # re-acquire the lock only for the quick cache write + waking waiters. `finally` ALWAYS
+    # clears the in-flight marker and wakes waiters — so a builder error never leaves
+    # same-key callers hung, and never leaks a semaphore slot.
+    acquired = _STRUCTURE_BUILD_SEMAPHORE.acquire(timeout=_STRUCTURE_BUILD_SLOT_TIMEOUT_S)
+    if not acquired:
+        # Could not get a build slot in time: drop the in-flight marker and wake any waiters
+        # so one of them retries, then return a clean busy error (bounded, not a hang).
+        with _STRUCTURE_CACHE_LOCK:
+            _STRUCTURE_INFLIGHT.pop(cache_key, None)
+            condition.notify_all()
+        raise McpError(
+            "project_structure is busy building other projects; try again in a moment."
+        )
+    try:
+        graph = run(app_bin, work_root)
+        with _STRUCTURE_CACHE_LOCK:
+            _structure_cache_put(cache_key, graph)
+        return compact_structure(graph, full)
+    finally:
+        _STRUCTURE_BUILD_SEMAPHORE.release()
+        with _STRUCTURE_CACHE_LOCK:
+            _STRUCTURE_INFLIGHT.pop(cache_key, None)
+            condition.notify_all()
+
+
+def dispatch_project_structure(
+    projects_dir: Path,
+    state_lock: Path,
+    args: dict[str, Any],
+    *,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """The `project_structure` tool. GATING: the caller is validated via
+    `require_agent_tool` (registered, token-bearing, role-allowed); the project ROOT is
+    resolved the SAME way every other root-scoped tool resolves it
+    (`resolve_project_work_root` + the `validate_project_work_root` allowlist), so the tool
+    can NEVER walk an arbitrary path. Returns the compact spine + summary (the full graph
+    only when `full=True`). Fails SOFT: a bridge failure becomes a clean error result."""
+    agent_id, role = require_agent_tool(projects_dir, args, "project_structure")
+    if "project_structure" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use project_structure.")
+    project_id = normalize_project_id(str(args.get("project_id") or "").strip())
+    if not project_id:
+        raise McpError("project_id is required.")
+    # SEC: a mini is scoped to its spawning project exactly like oracle_context — reuse the
+    # same guard so a mini cannot read a DIFFERENT project's structure.
+    # TOCTOU NOTE: the scope check runs against `project_id` BEFORE the root is resolved
+    # below, so in principle the project's configured root could change in between. This is
+    # bounded — and benign — because `resolve_project_work_root` re-resolves through the
+    # SAME `validate_project_work_root` allowlist every root-scoped tool uses, so even a
+    # raced root can only ever be an already-allowed management-root path, never an
+    # arbitrary tree. The scope check gates WHICH project; the allowlist gates WHICH paths.
+    enforce_mini_oracle_project_scope(projects_dir, agent_id, role, args)
+    full = bool(args.get("full"))
+    work_root = resolve_project_work_root(projects_dir, project_id)
+
+    payload = build_project_structure(work_root, full, runner=runner)
+    # Audit the read (identity + project only — never path/contents), mirroring the other
+    # read tools' privacy posture.
+    audit_agent_read(
+        projects_dir,
+        state_lock,
+        agent_id,
+        role,
+        "project_structure",
+        f"Read project structure spine ({len(payload.get('spine') or [])} files).",
+        project_id,
+    )
+    return {
+        "projectId": project_id,
+        "spine": payload.get("spine") or [],
+        "summary": payload.get("summary") or {},
+        **({"files": payload["files"]} if "files" in payload else {}),
+    }
+
+
 def _read_censor_shard(path: Path) -> dict[str, Any] | None:
     """Read one shard JSON. `None` for a genuinely-absent file; a present-but-
     corrupt shard is returned as `None` here for the LISTING path (best-effort,
@@ -5655,6 +6028,9 @@ def handle_tool_call(
     if name == "ask_user":
         return dispatch_ask_user(projects_dir, state_lock, args)
 
+    if name == "project_structure":
+        return dispatch_project_structure(projects_dir, state_lock, args)
+
     if name == "project_list":
         agent_id, role = require_agent_tool(projects_dir, args, name)
         projects = []
@@ -6639,6 +7015,20 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         return call(
             "oracle_context",
             {"query": query, "limit": limit, "agent_id": agent_id, "role": role, "project_id": project_id, "session_token": session_token},
+        )
+
+    @server.tool()
+    def project_structure(project_id: str, agent_id: str, role: str, full: bool = False, session_token: str = "") -> dict:
+        """Return the project's architecturally-central 'spine' files + summary counts,
+        computed DETERMINISTICALLY (no-LLM, tree-sitter cross-file graph) from the project
+        root. Use this FIRST to orient — the spine is the handful of files the rest of the
+        codebase reaches into — then ask oracle_ask precise questions about them. Returns
+        `spine` (each: path, inDegree, topReferencedSymbols) + `summary` (scanned, capped,
+        skipped counts). Pass full=True to also get the whole per-file node list (large for
+        big repos; usually unnecessary)."""
+        return call(
+            "project_structure",
+            {"project_id": project_id, "full": full, "agent_id": agent_id, "role": role, "session_token": session_token},
         )
 
     @server.tool()

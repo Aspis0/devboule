@@ -51,13 +51,13 @@
 //! remain nodes and may still be edge TARGETS); they contribute no out-edges. Other
 //! languages can still over-connect on shared short names, mitigated as described above.
 //!
-//! DEAD-CODE NOTE: this module ships "dark" (mirrors `censor/extract.rs`). The public
-//! builder + types are the foundation of the planner's STRUCTURE phase; the production
-//! caller — the Tauri command that exposes the graph — lands in Phase 11.2, so the API
-//! reads as unused until then. The pure logic is fully exercised by this module's tests.
-//! The allow is file-scoped (not crate-wide) and removed when 11.2 wires the command in.
-// TODO(11.2): wire `build_structure_graph` into a Tauri command + MCP exposure.
-#![allow(dead_code)]
+//! PRODUCTION CALLER (Phase 11.2): the builder is no longer "dark". The headless CLI
+//! bridge [`run_structure_cli`] (invoked as `aspis-management structure --root <path>`,
+//! detected in `main` before the GUI builder runs) calls [`build_structure_graph`] and
+//! prints the [`StructureGraph`] as JSON to stdout, so the shared, read-only
+//! `project_structure` MCP tool can reuse THIS builder (zero tree-sitter duplication) by
+//! shelling out to the app binary. The pure graph logic is exercised by this module's
+//! tests; the CLI bridge by [`tests::cli_*`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -326,6 +326,89 @@ pub fn build_structure_graph(project_root: &Path) -> Result<StructureGraph, Stri
         skipped_unreadable: scan.skipped_unreadable,
         capped: scan.capped,
     })
+}
+
+/// The argv token that selects the headless STRUCTURE bridge: `aspis-management
+/// structure --root <path>`. Detected in `main` BEFORE the Tauri GUI builder runs, so the
+/// process behaves as a one-shot CLI (no window) when invoked this way. Kept here next to
+/// the builder so the bridge and the graph never drift.
+pub const STRUCTURE_SUBCOMMAND: &str = "structure";
+
+/// Build the structure graph for `root` and serialize it to a compact JSON string.
+///
+/// This is the pure core of the CLI bridge (no stdout, no process exit) so it is unit-
+/// testable. Returns `Err` with a human-readable message when the root cannot be walked
+/// or (vanishingly unlikely) the graph fails to serialize. The wire shape is exactly
+/// [`StructureGraph`] (serde camelCase) — the Python `project_structure` tool parses this.
+pub fn structure_cli_json(root: &Path) -> Result<String, String> {
+    let graph = build_structure_graph(root)?;
+    serde_json::to_string(&graph).map_err(|e| format!("structure: failed to serialize graph: {e}"))
+}
+
+/// Headless CLI bridge entry point. Given the FULL process args (`std::env::args()`),
+/// returns:
+///   - `None` when this is NOT a `structure` invocation (the caller proceeds to the GUI);
+///   - `Some(0)` after printing the graph JSON to stdout on success;
+///   - `Some(2)` after printing a one-line error to stderr on failure (bad/missing
+///     `--root`, or an unwalkable root).
+///
+/// The caller (`main`) must `std::process::exit(code)` on `Some` so the GUI never starts.
+/// We DETECT the subcommand from `args[1]` and require an explicit `--root <path>` so the
+/// bridge can never accidentally fire for a normal app launch (which has no such argv).
+pub fn run_structure_cli<I, S>(args: I) -> Option<i32>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let argv: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
+    // argv[0] is the program name; the subcommand is argv[1].
+    if argv.get(1).map(String::as_str) != Some(STRUCTURE_SUBCOMMAND) {
+        return None;
+    }
+
+    let root = match parse_root_flag(&argv[2..]) {
+        Ok(root) => root,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Some(2);
+        }
+    };
+
+    match structure_cli_json(Path::new(&root)) {
+        Ok(json) => {
+            println!("{json}");
+            Some(0)
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            Some(2)
+        }
+    }
+}
+
+/// Parse exactly the `--root <path>` flag out of the trailing args (everything after the
+/// `structure` subcommand). Requires the flag and a non-empty value; rejects unknown
+/// tokens so a typo fails loudly instead of silently walking the wrong tree.
+fn parse_root_flag(rest: &[String]) -> Result<String, String> {
+    let mut root: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(tok) = it.next() {
+        match tok.as_str() {
+            "--root" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "structure: --root requires a path argument".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("structure: --root path must not be empty".to_string());
+                }
+                root = Some(value.clone());
+            }
+            other => {
+                return Err(format!("structure: unexpected argument '{other}'"));
+            }
+        }
+    }
+    root.ok_or_else(|| "structure: missing required --root <path>".to_string())
 }
 
 /// Rank a target file's referenced symbols by distinct-referrer count (desc), then name
@@ -1155,5 +1238,103 @@ mod tests {
         assert!(graph.spine.is_empty(), "HTML-only references ⇒ no spine");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- CLI bridge (`aspis-management structure --root <path>`) ----------------------
+
+    #[test]
+    fn cli_non_structure_argv_returns_none() {
+        // A normal app launch (no `structure` subcommand) must NOT trigger the bridge,
+        // so `main` proceeds to the GUI. Both an empty argv tail and an unrelated first
+        // arg yield None.
+        assert_eq!(run_structure_cli(["aspis-management"]), None);
+        assert_eq!(
+            run_structure_cli(["aspis-management", "--some-tauri-flag"]),
+            None
+        );
+    }
+
+    #[test]
+    fn cli_emits_graph_json_and_exits_zero_for_a_valid_root() {
+        // argv -> JSON to stdout, exit 0. We assert the pure core (`structure_cli_json`,
+        // which `run_structure_cli` prints verbatim) so the test captures the exact wire
+        // bytes without intercepting stdout, AND that the dispatcher returns Some(0).
+        let dir = unique_temp_root("cli-ok");
+        write(
+            &dir,
+            "core.rs",
+            "pub struct CoreThing { pub value: u32 }\n\
+             pub fn make_core() -> CoreThing { CoreThing { value: 0 } }\n",
+        );
+        write(&dir, "a.rs", "fn ua() -> CoreThing { CoreThing { value: 1 } }\n");
+
+        let json = structure_cli_json(&dir).expect("cli json builds");
+        // It is the StructureGraph wire shape (camelCase) and round-trips.
+        let parsed: StructureGraph = serde_json::from_str(&json).expect("valid graph json");
+        assert!(
+            parsed.files.iter().any(|f| f.path == "core.rs"),
+            "core.rs must be a node in the CLI output"
+        );
+        assert!(
+            json.contains("\"spine\"") && json.contains("\"scanned\""),
+            "wire shape must carry spine + summary counts"
+        );
+
+        // The dispatcher recognizes the subcommand + --root and reports success.
+        let root_s = dir.to_string_lossy().into_owned();
+        let code = run_structure_cli([
+            "aspis-management".to_string(),
+            STRUCTURE_SUBCOMMAND.to_string(),
+            "--root".to_string(),
+            root_s,
+        ]);
+        assert_eq!(code, Some(0), "valid root must exit 0");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_bad_root_exits_nonzero() {
+        // A `structure` invocation whose root does not exist must return a NON-ZERO code
+        // (so the spawning Python tool sees the failure), not None and not 0.
+        let dir = unique_temp_root("cli-bad");
+        let missing = dir.join("does-not-exist");
+        let code = run_structure_cli([
+            "aspis-management".to_string(),
+            STRUCTURE_SUBCOMMAND.to_string(),
+            "--root".to_string(),
+            missing.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(code, Some(2), "an unwalkable root must exit non-zero");
+        // And the pure core surfaces an Err (never a panic).
+        assert!(structure_cli_json(&missing).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_missing_or_malformed_root_flag_exits_nonzero() {
+        // The subcommand is present but `--root` is absent / value-less / has an unknown
+        // extra token: each is a usage error → Some(2), never None (which would fall
+        // through to the GUI) and never 0.
+        assert_eq!(
+            run_structure_cli(["aspis-management", STRUCTURE_SUBCOMMAND]),
+            Some(2),
+            "missing --root is a usage error"
+        );
+        assert_eq!(
+            run_structure_cli(["aspis-management", STRUCTURE_SUBCOMMAND, "--root"]),
+            Some(2),
+            "--root with no value is a usage error"
+        );
+        assert_eq!(
+            run_structure_cli([
+                "aspis-management",
+                STRUCTURE_SUBCOMMAND,
+                "--bogus",
+                "x",
+            ]),
+            Some(2),
+            "an unknown flag is a usage error"
+        );
     }
 }
