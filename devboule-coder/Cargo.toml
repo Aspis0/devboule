@@ -1,0 +1,43 @@
+[package]
+name = "devboule-coder"
+version = "0.1.0"
+edition = "2021"
+description = "Devboule local main-coder L2.1: conversational TUI shell driven by a MockModel."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "devboule-coder"
+path = "src/main.rs"
+
+# --- Dependency matrix (the main compatibility risk) -------------------------
+# All TUI widget crates pin a specific `ratatui` generation, and the async
+# `crossterm::event::EventStream` MUST be the SAME crossterm that `ratatui`
+# re-exports, otherwise event types do not unify. The LATEST widget versions do
+# NOT agree (tui-markdown 0.3.7 / throbber 0.11 moved to the ratatui 0.30 /
+# ratatui-core line, while tui-textarea 0.7 is still on ratatui 0.29). We pin the
+# whole tree to the ratatui 0.29 generation, the newest line where ALL THREE
+# widgets agree:
+#   ratatui 0.29.0           -> crossterm ^0.28.1 (re-exported)
+#   tui-textarea 0.7.0       -> ratatui ^0.29 + crossterm ^0.28 (feature-selected)
+#   tui-markdown 0.3.6       -> ratatui ^0.29 (0.3.7 jumped to ratatui-core 0.30)
+#   throbber-widgets-tui 0.8 -> ratatui ^0.29 (0.9+ jumped to ratatui 0.30)
+# We enable ratatui's default `crossterm` backend so ratatui owns the single
+# crossterm 0.28.1 in the tree, add a DIRECT crossterm 0.28.1 with the
+# `event-stream` feature (for the async EventStream), and select tui-textarea's
+# matching `crossterm` feature. `cargo tree -d` is asserted clean (one ratatui,
+# one crossterm) in verification.
+[dependencies]
+ratatui = "0.29.0"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+tui-textarea = { version = "0.7.0", default-features = false, features = ["ratatui", "crossterm"] }
+# Pinned EXACTLY: 0.3.7 returns a `ratatui_core::text::Text` (the ratatui 0.30
+# line) which does NOT unify with ratatui 0.29's `Text`. 0.3.6 is the newest
+# tui-markdown that depends on ratatui 0.29 directly and returns its `Text`.
+tui-markdown = "=0.3.6"
+throbber-widgets-tui = "0.8.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
