@@ -15,6 +15,7 @@ import { CollapsibleSection } from "../projects/CollapsibleSection";
 import {
   buildLaunchInput,
   modelSuggestionsForClient,
+  orchestratorModelNote,
   spawnDisabledReason,
   type SpawnLaunchInput,
   type SpawnSelection,
@@ -67,6 +68,12 @@ export interface SpawnPanelProps {
   // Operator-configured extra agent CLIs (Settings → Workspace). Rendered after
   // the built-in codex/claude in the CLI selector. Default [].
   customClients?: CustomAgentClient[];
+  // The model the local Devboule orchestrator is configured to run (config
+  // .localCoderBackend.model). Surfaced when the "Local (Devboule)" CLI is selected so the
+  // launcher is NOT empty (the orchestrator's model is set in Settings, not free-typed).
+  // Absent/empty => the orchestrator note tells the user to configure it. Optional so a
+  // caller without config still type-checks.
+  localCoderModel?: string | null;
   // Launch (app/external) and copy callbacks.
   onLaunch: (input: SpawnLaunchInput) => void;
   onCopyPrompt: (selection: SpawnSelection) => void;
@@ -83,6 +90,7 @@ export function SpawnPanel({
   message,
   rules = [],
   customClients = [],
+  localCoderModel = null,
   onLaunch,
   onCopyPrompt,
 }: SpawnPanelProps) {
@@ -113,16 +121,23 @@ export function SpawnPanel({
     }
   }, [clientOptions, client]);
 
-  // Per-CLI quick-fill model suggestions (claude -> opus/sonnet/haiku; everything
-  // else -> none — we never invent model names for codex/custom CLIs).
+  // Per-CLI quick-fill model suggestions (claude -> opus/sonnet/haiku; orchestrator ->
+  // the configured local-coder model when known; everything else -> none — we never
+  // invent model names for codex/custom CLIs).
   const modelSuggestions = useMemo(
-    () => modelSuggestionsForClient(client),
-    [client],
+    () => modelSuggestionsForClient(client, localCoderModel),
+    [client, localCoderModel],
   );
 
   // Switching the CLI clears the model text ONLY if it exactly equals one of the
   // PREVIOUS client's suggestions (so a stale quick-fill suggestion does not stick
   // to a CLI it does not belong to). A hand-typed model is never wiped.
+  //
+  // L2 — when switching TO the orchestrator and the model field is now empty (either it
+  // was blank, or the previous client's suggestion was just cleared), PREFILL it with the
+  // configured local-coder model so the launcher surfaces a model instead of being empty.
+  // The user can still overwrite it (the orchestrator binary reads the model from config,
+  // so this field stays advisory for prompt/fleet display — but it should not read empty).
   //
   // This uses React's documented "adjust state during render" pattern instead of a
   // ref + effect: comparing `client` against the committed `prevClient` STATE during
@@ -133,10 +148,17 @@ export function SpawnPanel({
   // extra paint and no stale window.
   const [prevClient, setPrevClient] = useState(client);
   if (prevClient !== client) {
-    const prevSuggestions = modelSuggestionsForClient(prevClient);
+    const prevSuggestions = modelSuggestionsForClient(prevClient, localCoderModel);
+    let nextModel = model;
     if (prevSuggestions.includes(model.trim().toLowerCase())) {
-      setModel("");
+      nextModel = "";
     }
+    // Prefill the orchestrator's configured model when the field would otherwise be empty.
+    const localModel = (localCoderModel ?? "").trim();
+    if (client === "orchestrator" && nextModel.trim().length === 0 && localModel.length > 0) {
+      nextModel = localModel;
+    }
+    if (nextModel !== model) setModel(nextModel);
     setPrevClient(client);
   }
 
@@ -329,8 +351,7 @@ export function SpawnPanel({
       </div>
       {client === "orchestrator" && (
         <p className="mb-3 -mt-1.5 text-[10px] leading-4 text-cream-400">
-          Runs Devboule&apos;s own local coder (oMLX) as the main coder — no
-          external API.
+          {orchestratorModelNote(localCoderModel)}
         </p>
       )}
 

@@ -137,6 +137,30 @@ export interface DesignLlmBackend {
 // (low/medium/high); any other value is rejected by `validateDesignEffort`.
 export type DesignEffort = "low" | "medium" | "high";
 
+// The single, global backend the LOCAL MAIN coder (the Devboule orchestrator binary,
+// client === "orchestrator") runs on. A SEPARATE, INDEPENDENT value from MiniCoderBackend:
+// the orchestrator (local MAIN coder) and the mini (the delegated worker a coder spawns)
+// are DISTINCT tiers with DISTINCT models. Persisted in config.json under
+// `localCoderBackend`; absent means no local coder is configured (the orchestrator launch
+// then passes empty oMLX env and the binary falls back to its safe path). It does NOT
+// inherit the mini's value. Mirrors the Rust `LocalCoderBackend`.
+//
+// KIND SET is intentionally NARROWER than the mini: the orchestrator binary drives ONLY a
+// loopback HTTP OpenAI-compatible endpoint, so only the two LOCAL kinds are offered —
+// "ollama" (a local Ollama server) and "omlx" (a local oMLX MLX server). There is no
+// "api"/"codex"/"appleFm" arm (the binary cannot drive a CLI or a non-HTTP runtime).
+export type LocalCoderBackendKind = "ollama" | "omlx";
+
+export interface LocalCoderBackend {
+  kind: LocalCoderBackendKind;
+  // Model tag/name. REQUIRED for both "ollama" and "omlx".
+  model?: string;
+  // The oMLX server base URL (loopback http only, e.g. http://localhost:8000/v1).
+  // Required for "omlx"; unused for "ollama" (which resolves Ollama's fixed loopback
+  // OpenAI endpoint). Stored normalized (no trailing slash).
+  baseUrl?: string;
+}
+
 // One provider detected on this machine by the Rust `detect_providers` command
 // (Settings → Workspace). A 1:1 MIRROR of the Rust `DetectedProvider` (camelCase over
 // the IPC boundary): the detection-aware design-provider card reads it directly to mark
@@ -222,6 +246,12 @@ export interface AppConfig {
   // config.json without the key still parses; when absent, the design module has no
   // provider configured. A 1:1 mirror of miniCoderBackend. See DesignLlmBackend.
   designLlmBackend?: DesignLlmBackend;
+  // The global LOCAL MAIN-CODER backend — the model the Devboule orchestrator binary
+  // (client === "orchestrator") runs on. Optional so an older config.json without the key
+  // still parses; when absent, the orchestrator launch passes empty oMLX env (safe Mock
+  // fallback). A SEPARATE value from miniCoderBackend — the orchestrator and the mini are
+  // distinct tiers with distinct models. See LocalCoderBackend.
+  localCoderBackend?: LocalCoderBackend;
   // Censor's tier-2 (Gemma) local-AI provider (Settings → Workspace). Optional so an
   // older config.json without the key still parses; ABSENT means the Ollama default —
   // today's behavior, ZERO migration. See CensorLocalAi.

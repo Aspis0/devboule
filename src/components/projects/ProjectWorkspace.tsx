@@ -90,6 +90,9 @@ export interface ProjectWorkspaceProps {
   launchMessage: string | null;
   rules?: AgentRoleRule[];
   customClients?: CustomAgentClient[];
+  /** The configured local Devboule main-coder model (config.localCoderBackend.model),
+   *  threaded to SpawnPanel via the agent rail. Optional. */
+  localCoderModel?: string | null;
   onBack: () => void;
   onLaunch: (input: SpawnLaunchInput) => void;
   onCopyPrompt: (selection: SpawnSelection) => void;
@@ -113,6 +116,7 @@ export function ProjectWorkspace({
   launchMessage,
   rules = [],
   customClients = [],
+  localCoderModel = null,
   onBack,
   onLaunch,
   onCopyPrompt,
@@ -363,6 +367,7 @@ export function ProjectWorkspace({
           launchMessage={launchMessage}
           rules={rules}
           customClients={customClients}
+          localCoderModel={localCoderModel}
           onLaunch={onLaunch}
           onCopyPrompt={onCopyPrompt}
           launcherOpen={launcherOpen}

@@ -14,6 +14,7 @@ import {
   type ProviderStatusMap,
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
+import { LocalCoderBackendCard } from "./LocalCoderBackendCard";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
 import { ExaSearchKeyCard } from "./ExaSearchKeyCard";
@@ -27,6 +28,7 @@ import { CensorLocalAiCard } from "../views/WorkspaceView";
 // four per-role sections, each composing the EXISTING (moved) card components so
 // their persistence is unchanged:
 //   - Censor model      → <CensorModelCard /> (Ollama model override)
+//   - Local main coder  → <LocalCoderBackendCard /> (the orchestrator's own model)
 //   - Mini-coder backend→ <MiniCoderBackendCard />
 //   - Oracle LLM        → <OracleAnswerSettingsCard />
 //   - Design LLM        → <DesignLlmBackendCard />
@@ -255,6 +257,13 @@ export function ProvidersModelsTab() {
         description="Where Censor's tier-2 local review runs (Ollama, local oMLX, or Apple on-device) and which model it uses."
       >
         <CensorLocalAiCard />
+      </RoleSection>
+
+      <RoleSection
+        title="Local main coder (Devboule)"
+        description="The model the local Devboule orchestrator — your MAIN coder — runs on. A separate tier from the Mini-coder below (the worker it delegates to)."
+      >
+        <LocalCoderBackendCard />
       </RoleSection>
 
       <RoleSection

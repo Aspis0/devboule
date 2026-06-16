@@ -7,6 +7,7 @@ import {
   buildLaunchInput,
   normalizeModelHint,
   modelSuggestionsForClient,
+  orchestratorModelNote,
   MODEL_HINT_MAX_LENGTH,
   spawnDisabledReason,
   canRoleLaunchTask,
@@ -229,6 +230,38 @@ describe("modelSuggestionsForClient", () => {
     expect(modelSuggestionsForClient("powershell")).toEqual([]);
     expect(modelSuggestionsForClient("deepseek")).toEqual([]);
     expect(modelSuggestionsForClient("")).toEqual([]);
+  });
+
+  it("offers the configured local-coder model for the orchestrator (and nothing when unset)", () => {
+    // The orchestrator's model is set in Settings, not free-typed; when known it is the
+    // single quick-fill suggestion so the launcher is not empty.
+    expect(modelSuggestionsForClient("orchestrator", "qwen2.5-coder")).toEqual([
+      "qwen2.5-coder",
+    ]);
+    expect(modelSuggestionsForClient("orchestrator", "  trimmed-model  ")).toEqual([
+      "trimmed-model",
+    ]);
+    // Absent/blank config => no suggestion (the note then tells the user to configure it).
+    expect(modelSuggestionsForClient("orchestrator", null)).toEqual([]);
+    expect(modelSuggestionsForClient("orchestrator", "")).toEqual([]);
+    expect(modelSuggestionsForClient("orchestrator", "   ")).toEqual([]);
+    expect(modelSuggestionsForClient("orchestrator")).toEqual([]);
+  });
+});
+
+describe("orchestratorModelNote", () => {
+  it("names the configured model when set", () => {
+    const note = orchestratorModelNote("qwen2.5-coder");
+    expect(note).toContain("qwen2.5-coder");
+    expect(note).toContain("Settings → Local main coder");
+  });
+
+  it("prompts to configure a model when unset", () => {
+    const note = orchestratorModelNote(null);
+    expect(note).toContain("no model configured");
+    expect(note).toContain("Settings → Local main coder");
+    // Same guidance for a blank/whitespace value.
+    expect(orchestratorModelNote("   ")).toContain("no model configured");
   });
 });
 

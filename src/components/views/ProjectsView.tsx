@@ -1611,6 +1611,7 @@ export function ProjectsView() {
             launchMessage={launchMessage}
             rules={agentState?.rules ?? []}
             customClients={config.customAgentClients ?? []}
+            localCoderModel={config.localCoderBackend?.model ?? null}
             onBack={exitWorkMode}
             onLaunch={(input) => void launchFromSpawnPanel(input)}
             onCopyPrompt={(selection) => void copyFromSpawnPanel(selection)}

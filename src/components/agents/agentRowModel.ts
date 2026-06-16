@@ -320,8 +320,35 @@ export function normalizeModelHint(model: string): string | null {
 // types the model name themselves (or leaves it blank to self-report). Pure so
 // SpawnPanel can both render the chips and detect "did the user pick a suggestion"
 // when resetting on a client switch.
-export function modelSuggestionsForClient(client: string): string[] {
-  return client === "claude" ? ["opus", "sonnet", "haiku"] : [];
+//
+// L2 — the local Devboule orchestrator ("orchestrator") is a special case: its model
+// is NOT free-typed, it is the one configured in Settings → Local main coder. When that
+// configured model is known (passed by SpawnPanel from config.localCoderBackend), offer
+// it as the single quick-fill suggestion so the launcher is NOT empty and the user can
+// click it. Absent config => no suggestion (the orchestrator note then tells the user to
+// configure it in Settings).
+export function modelSuggestionsForClient(
+  client: string,
+  localCoderModel?: string | null,
+): string[] {
+  if (client === "claude") return ["opus", "sonnet", "haiku"];
+  if (client === "orchestrator") {
+    const trimmed = (localCoderModel ?? "").trim();
+    return trimmed.length > 0 ? [trimmed] : [];
+  }
+  return [];
+}
+
+// The note SpawnPanel shows under the CLI selector when the local Devboule orchestrator
+// is selected. Surfaces the configured local-main-coder model so the launcher always
+// communicates which model will run (it is NOT the free-text advisory field — the binary
+// reads it from config), and points the user at Settings to change it. Pure + total.
+export function orchestratorModelNote(localCoderModel?: string | null): string {
+  const trimmed = (localCoderModel ?? "").trim();
+  if (trimmed.length > 0) {
+    return `Runs Devboule's own local coder using "${trimmed}" (set in Settings → Local main coder).`;
+  }
+  return "Runs Devboule's own local coder — no model configured yet. Set one in Settings → Local main coder (until then it falls back to a safe local stub).";
 }
 
 // Build the IPC launch input for the in-app PTY ("app") or external console

@@ -885,6 +885,87 @@ pub fn set_design_llm_backend(
     Ok(normalized)
 }
 
+/// Read the configured global LOCAL MAIN-CODER backend (Settings → Providers & Models,
+/// "Local main coder (Devboule)" card). Returns `None` when unset or invalid. Unlock-gated
+/// like the other project commands. A SEPARATE value from `get_mini_coder_backend` — the
+/// orchestrator (local main coder) and the mini (delegated worker) are distinct tiers.
+#[tauri::command]
+pub fn get_local_coder_backend(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+) -> Result<Option<super::local_coder::LocalCoderBackend>, String> {
+    state.ensure_unlocked()?;
+    Ok(read_local_coder_backend(&app))
+}
+
+/// Persist the global LOCAL MAIN-CODER backend into config.json under `localCoderBackend`
+/// (read-modify-write, cloning `set_mini_coder_backend` exactly). `None` clears it (drops
+/// the key, no `null` churn). Validates + normalizes the config before writing. Unlock-gated;
+/// atomic temp+rename so a crash can never leave config.json partial. Returns the normalized,
+/// persisted backend (or `None` when cleared).
+///
+/// Writes the `localCoderBackend` key ONLY — it never touches `miniCoderBackend`, so saving
+/// the local coder can never clobber the mini's independent value (the bug this whole change
+/// removes).
+#[tauri::command]
+pub fn set_local_coder_backend(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    backend: Option<super::local_coder::LocalCoderBackend>,
+) -> Result<Option<super::local_coder::LocalCoderBackend>, String> {
+    state.ensure_unlocked()?;
+    let normalized = match &backend {
+        Some(b) => Some(super::local_coder::validate_local_coder_backend(b)?),
+        None => None,
+    };
+    let path = locate_config_path(&app).ok_or_else(|| {
+        "config.json could not be located to save the local-coder backend.".to_string()
+    })?;
+    // Serialize the read-modify-write against the other config.json savers so two
+    // concurrent Settings saves can't last-writer-wins-drop each other's key.
+    let _config_guard = config_write_lock()
+        .lock()
+        .map_err(|_| "Config write lock is poisoned.".to_string())?;
+    let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config.json: {e}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("config.json is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("config.json is not a JSON object.".into());
+    }
+    match &normalized {
+        Some(b) => {
+            value["localCoderBackend"] = serde_json::to_value(b)
+                .map_err(|e| format!("Could not serialize local-coder backend: {e}"))?;
+        }
+        None => {
+            // Clearing the backend: drop the key entirely (no `null` churn).
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("localCoderBackend");
+            }
+        }
+    }
+    let pretty = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("Could not serialize config.json: {e}"))?;
+    // Atomic temp+rename (same as set_mini_coder_backend): a crash mid-write can never
+    // leave a half-written config.json. Read-only packaged builds surface the same guidance.
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let temp_path = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup_path = path.with_extension(format!("json.{suffix}.bak"));
+    fs::write(&temp_path, format!("{pretty}\n")).map_err(|e| {
+        format!(
+            "Could not write config.json at {}: {e}. In a packaged build this file is read-only.",
+            path.to_string_lossy()
+        )
+    })?;
+    replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")
+        .map_err(|e| format!("{e}. In a packaged build this file is read-only."))?;
+    Ok(normalized)
+}
+
 /// E1 — read the configured global mini write-behavior policy (Settings → Providers &
 /// Models). Returns [`MiniWriteBehavior::Auto`] when unset/invalid (today's behavior).
 /// Unlock-gated like the other settings get commands.
@@ -1274,21 +1355,22 @@ fn prepare_or_launch_project_agent(
     // two SECRETS the binary reads (the launch token + the Exa key, when stored) are
     // appended to `provider_env` so they ride into the child PROCESS env only —
     // never the binary's argv (B1 invariant), exactly like the Cloudflare agent
-    // tokens. The oMLX base/model come from the SAME configured mini backend the
-    // rest of the launch uses (loopback-validated by `read_mini_coder_backend`); a
-    // `None`/non-oMLX backend yields empty oMLX env (the binary then runs its Mock).
+    // tokens. The oMLX base/model come from the orchestrator's OWN dedicated
+    // `localCoderBackend` (loopback-validated by `read_local_coder_backend`) — NOT the
+    // mini-coder backend. The orchestrator (local MAIN coder) and the mini (delegated
+    // worker) are DISTINCT tiers with DISTINCT models; reusing the mini's config here
+    // was a conceptual error (the two could never have separate models). A `None`
+    // local-coder backend yields empty oMLX env (the binary then runs its safe Mock) —
+    // it deliberately does NOT fall back to the mini's value.
     let orchestrator = if client == "orchestrator" {
         let binary = resolve_orchestrator_binary()?;
-        let (omlx_base_url, omlx_model) = match read_mini_coder_backend(&app) {
-            Some(backend)
-                if backend.kind == super::mini_coder::MiniCoderBackendKind::Omlx =>
-            {
-                (
-                    backend.base_url.clone().unwrap_or_default(),
-                    backend.model.clone().unwrap_or_default(),
-                )
-            }
-            _ => (String::new(), String::new()),
+        let (omlx_base_url, omlx_model) = match read_local_coder_backend(&app) {
+            // Both ollama and omlx resolve to a loopback OpenAI-compatible endpoint the
+            // binary's OmlxModel client can drive (ollama -> its fixed loopback OpenAI
+            // base; omlx -> the configured, validated loopback base). `resolve_omlx_env`
+            // owns that mapping so the launch never hardcodes a URL inline.
+            Some(backend) => super::local_coder::resolve_omlx_env(&backend),
+            None => (String::new(), String::new()),
         };
         // SECRET 1: the app-issued launch token (the SAME one hashed into the pending
         // session above). The binary's agent_register REQUIRES it for this managed
@@ -2319,6 +2401,29 @@ pub fn read_design_llm_backend(
     let entry = value.get("designLlmBackend")?;
     let parsed: super::design_llm::DesignLlmBackend = serde_json::from_value(entry.clone()).ok()?;
     super::design_llm::validate_design_llm_backend(&parsed).ok()
+}
+
+/// Read the single global LOCAL MAIN-CODER backend (the orchestrator/`devboule-coder`
+/// binary's model) from config.json under `localCoderBackend`. A missing key / missing
+/// file / malformed value, OR a present-but-INVALID config (e.g. omlx with no base URL)
+/// yields `None` — never errors, so a config without the key is fine.
+///
+/// CRITICAL TIER SEPARATION: this is a SEPARATE value from `read_mini_coder_backend`. The
+/// orchestrator (local MAIN coder) and the mini (delegated worker) are DISTINCT tiers with
+/// DISTINCT models; an absent `localCoderBackend` must NOT inherit the mini's value (the
+/// orchestrator launch then passes EMPTY oMLX env and the binary falls back to its safe
+/// Mock path). Validated through the SAME `validate_local_coder_backend` the save command +
+/// the UI use, so a hand-edited config can never feed the launch a half-configured backend.
+pub fn read_local_coder_backend(
+    app: &tauri::AppHandle,
+) -> Option<super::local_coder::LocalCoderBackend> {
+    let path = locate_config_path(app)?;
+    let raw = fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = value.get("localCoderBackend")?;
+    let parsed: super::local_coder::LocalCoderBackend =
+        serde_json::from_value(entry.clone()).ok()?;
+    super::local_coder::validate_local_coder_backend(&parsed).ok()
 }
 
 /// E1 — read the global mini write-behavior policy (`miniWriteBehavior`) from

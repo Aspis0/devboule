@@ -58,6 +58,9 @@ export interface ProjectWorkspaceAgentRailProps {
   launchMessage: string | null;
   rules?: AgentRoleRule[];
   customClients?: { id: string; label: string; command: string }[];
+  // The configured local Devboule main-coder model (config.localCoderBackend.model),
+  // surfaced by SpawnPanel when the "Local (Devboule)" CLI is selected. Optional.
+  localCoderModel?: string | null;
   onLaunch: (input: SpawnLaunchInput) => void;
   onCopyPrompt: (selection: SpawnSelection) => void;
   // Whether the launcher panel is expanded.
@@ -77,6 +80,7 @@ export function ProjectWorkspaceAgentRail({
   launchMessage,
   rules = [],
   customClients = [],
+  localCoderModel = null,
   onLaunch,
   onCopyPrompt,
   launcherOpen,
@@ -154,6 +158,7 @@ export function ProjectWorkspaceAgentRail({
           message={launchMessage}
           rules={rules}
           customClients={customClients}
+          localCoderModel={localCoderModel}
           onLaunch={onLaunch}
           onCopyPrompt={onCopyPrompt}
         />
