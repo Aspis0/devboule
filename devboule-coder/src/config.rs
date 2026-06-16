@@ -40,6 +40,12 @@ const ENV_MCP_PROJECTS_DIR: &str = "DEVBOULE_MCP_PROJECTS_DIR";
 const ENV_AGENT_ID: &str = "DEVBOULE_AGENT_ID";
 const ENV_PROJECT_ROOT: &str = "DEVBOULE_PROJECT_ROOT";
 const ENV_EXA_API_KEY: &str = "EXA_API_KEY";
+/// The app-issued launch token (L2.4). The Oracle MCP server REQUIRES it on
+/// `agent_register` for a managed launch (it stamps a launchTokenHash on the
+/// pending session up front), so the launch wiring sets this from the same token
+/// it hashed into the session. Read from env and passed into `agent_register`
+/// only — never logged.
+const ENV_MCP_LAUNCH_TOKEN: &str = "DEVBOULE_MCP_LAUNCH_TOKEN";
 
 /// Build the runtime from the environment. Async because the real MCP backend
 /// connects to (spawns) the Oracle server during construction. Never panics:
@@ -102,6 +108,10 @@ async fn build_executor() -> (Arc<dyn ToolExecutor>, bool) {
         agent_id: env_nonempty(ENV_AGENT_ID).unwrap_or_else(|| "devboule".to_string()),
         role: "orchestrator".to_string(),
         model: std::env::var(ENV_OMLX_MODEL).unwrap_or_default(),
+        // The app-issued launch token the managed launch requires for
+        // agent_register. Empty on the no-server / unmanaged dev path (the server
+        // either has the compat kill switch on or no session hash to match).
+        launch_token: std::env::var(ENV_MCP_LAUNCH_TOKEN).unwrap_or_default(),
         env: Vec::new(),
     };
 

@@ -1570,6 +1570,36 @@ pub fn delete_scaleway_object_secret_key(
     Ok(status)
 }
 
+// L2.4 — Exa web-search key for the local Devboule orchestrator. WRITE-ONLY from
+// the UI: the key value is never returned. `get_*_status` reports present/absent,
+// `save_*` SETs it, `delete_*` CLEARs it. The orchestrator launch reads the key
+// (backend-internal `vault::read_exa_key`) and sets `EXA_API_KEY` only when present.
+
+#[tauri::command]
+pub fn get_exa_key_status(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::exa_key_status()
+}
+
+#[tauri::command]
+pub fn save_exa_key(
+    state: State<'_, BackendState>,
+    key: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::save_exa_key(&key)
+}
+
+#[tauri::command]
+pub fn delete_exa_key(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::delete_exa_key()
+}
+
 #[tauri::command]
 pub fn get_oracle_llm_settings(
     state: State<'_, BackendState>,

@@ -75,6 +75,14 @@ fn github_token_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "provider:github").map_err(|_| vault_error("open"))
 }
 
+/// L2.4 — the Exa web-search API key for the local Devboule orchestrator. Stored
+/// under the `provider:exa` account, following the same `provider:*` convention as
+/// `provider:github`. The launch reads it (`read_exa_key`) and sets `EXA_API_KEY`
+/// ONLY when present, so a missing key keeps the orchestrator's egress OFF.
+fn exa_key_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, "provider:exa").map_err(|_| vault_error("open"))
+}
+
 fn device_private_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "device:local_private_key:v1").map_err(|_| vault_error("open"))
 }
@@ -245,6 +253,87 @@ pub fn read_github_token() -> Result<Option<String>, String> {
         Ok(token) => Ok(Some(token)),
         Err(KeyringError::NoEntry) => Ok(None),
         Err(_) => Err(vault_error("read")),
+    }
+}
+
+// --- Exa web-search key (L2.4 orchestrator egress) ---------------------------
+//
+// Stored under `provider:exa` (the `provider:*` convention). WRITE-ONLY from the
+// UI: `save`/`delete` mutate it and `exa_key_status` reports present/absent ONLY —
+// the raw value is NEVER returned to the frontend. The launch reads it via
+// `read_exa_key` (backend-internal) and exports `EXA_API_KEY` to the orchestrator
+// child ONLY when present, so a missing key keeps that agent's egress off.
+
+const EXA_KEY_ID: &str = "exa_api_key";
+const EXA_KEY_LABEL: &str = "Exa web-search API key";
+
+pub fn save_exa_key(key: &str) -> Result<AuxCredentialStatus, String> {
+    let cleaned = key.trim();
+    // Same minimum-length + no-whitespace guard the scaleway object keys use: a
+    // too-short / whitespace-bearing value is a paste error, not a real key.
+    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
+        return Ok(AuxCredentialStatus {
+            id: EXA_KEY_ID.into(),
+            label: EXA_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Exa API key is too short or contains whitespace.".into()),
+        });
+    }
+    exa_key_entry()?
+        .set_password(cleaned)
+        .map_err(|_| vault_error("save"))?;
+    exa_key_status()
+}
+
+pub fn delete_exa_key() -> Result<AuxCredentialStatus, String> {
+    match exa_key_entry()?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err(vault_error("delete")),
+    }
+    exa_key_status()
+}
+
+/// Backend-INTERNAL reader: returns the raw key (or `None`). Used ONLY by the
+/// orchestrator launch to set `EXA_API_KEY`. NOT exposed as a command — the UI can
+/// only ever see present/absent via [`exa_key_status`].
+pub fn read_exa_key() -> Result<Option<String>, String> {
+    match exa_key_entry()?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(_) => Err(vault_error("read")),
+    }
+}
+
+/// Present/absent status ONLY — never the value. Mirrors
+/// `scaleway_object_access_key_status`.
+pub fn exa_key_status() -> Result<AuxCredentialStatus, String> {
+    match read_exa_key() {
+        Ok(Some(_)) => Ok(AuxCredentialStatus {
+            id: EXA_KEY_ID.into(),
+            label: EXA_KEY_LABEL.into(),
+            configured: true,
+            status: "configured".into(),
+            last_checked_at: Some(now()),
+            message: None,
+        }),
+        Ok(None) => Ok(AuxCredentialStatus {
+            id: EXA_KEY_ID.into(),
+            label: EXA_KEY_LABEL.into(),
+            configured: false,
+            status: "missing".into(),
+            last_checked_at: Some(now()),
+            message: Some("Required for the local orchestrator's web-search egress.".into()),
+        }),
+        Err(e) => Ok(AuxCredentialStatus {
+            id: EXA_KEY_ID.into(),
+            label: EXA_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(e),
+        }),
     }
 }
 
@@ -1621,5 +1710,69 @@ mod tests {
         let out = sanitize_oracle_index_preferences(&prefs_with_mode(None))
             .expect("None mode is valid");
         assert_eq!(out.index_mode, None);
+    }
+
+    // --- L2.4 Exa key ---------------------------------------------------------
+
+    #[test]
+    fn exa_key_save_rejects_too_short_or_whitespace_without_leaking_value() {
+        // The reject path does NOT touch the keyring (it returns before set_password),
+        // so it is safe to run unconditionally. The status it returns must carry the
+        // present/absent shape and NEVER echo the rejected value back.
+        let short = save_exa_key("abc").expect("save returns a status, not Err");
+        assert!(!short.configured);
+        assert_eq!(short.status, "error");
+        let whitespace = save_exa_key("has space inside it").expect("status");
+        assert!(!whitespace.configured);
+        assert_eq!(whitespace.status, "error");
+        // The status NEVER contains the raw value (write-only contract).
+        for status in [&short, &whitespace] {
+            let json = serde_json::to_string(status).unwrap();
+            assert!(!json.contains("has space inside it"));
+            assert_eq!(status.id, "exa_api_key");
+        }
+    }
+
+    #[test]
+    fn exa_status_struct_never_carries_the_value() {
+        // The absent status (no keyring read needed for the shape assertion here, but
+        // this reads the slot; on a clean machine it is absent) must report present/
+        // absent ONLY — its serialized form must not include a `value`/key field.
+        let status = exa_key_status().expect("status");
+        let json = serde_json::to_string(&status).unwrap();
+        // The struct has no value field at all; assert the wire shape stays
+        // present/absent-only (id/label/configured/status/lastCheckedAt/message).
+        assert!(json.contains("\"configured\""));
+        assert!(!json.contains("\"value\""));
+        assert!(!json.contains("\"key\""));
+    }
+
+    #[test]
+    #[ignore = "mutates the real OS credential store; run with --ignored to verify the Exa round-trip"]
+    fn exa_key_round_trips_set_status_clear_status() {
+        // Full lifecycle against the REAL keyring: set -> status(present) -> clear ->
+        // status(absent). The raw value is NEVER returned by status — only the backend-
+        // internal read_exa_key (used by the launch) ever sees it.
+        let key = "exa-test-key-abcdef1234567890";
+        // Start clean.
+        let _ = delete_exa_key();
+        assert!(!exa_key_status().unwrap().configured, "must start absent");
+
+        let after_set = save_exa_key(key).unwrap();
+        assert!(after_set.configured, "set must report present");
+        assert_eq!(after_set.status, "configured");
+        assert!(after_set.message.is_none());
+        // status(present): never the value.
+        let status_present = exa_key_status().unwrap();
+        assert!(status_present.configured);
+        assert!(serde_json::to_string(&status_present).unwrap().contains(key) == false);
+        // The backend-internal reader (launch path) DOES see the raw value.
+        assert_eq!(read_exa_key().unwrap().as_deref(), Some(key));
+
+        let after_clear = delete_exa_key().unwrap();
+        assert!(!after_clear.configured, "clear must report absent");
+        assert_eq!(after_clear.status, "missing");
+        assert!(exa_key_status().unwrap().configured == false);
+        assert_eq!(read_exa_key().unwrap(), None);
     }
 }

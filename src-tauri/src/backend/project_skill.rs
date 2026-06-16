@@ -70,7 +70,7 @@ fn default_enabled() -> bool {
 /// panel-manageable roles only: that site passes a DYNAMIC role (can be "verifier"), which
 /// is NOT toggleable from the Skills panel, so a hand-dropped `verifier/SKILL.md` must not
 /// inject (no way to turn it off). Membership here == "the panel can manage this role".
-pub(crate) const KNOWN_ROLES: &[&str] = &["mini", "coder", "design"];
+pub(crate) const KNOWN_ROLES: &[&str] = &["mini", "coder", "design", "orchestrator"];
 
 /// Reject any `role` not in [`KNOWN_ROLES`]. Gate on EVERY write/install command so a
 /// crafted role can never become a directory name under `.claude/skills/`.
@@ -448,6 +448,22 @@ fn bundled_catalog() -> Vec<CatalogEntry> {
 - Prefer composing existing components over inventing one-off variants.\n\
 - Do not add external fonts, CDNs, or assets the project does not already self-host.\n\
 - Keep output focused on the request; avoid unrelated visual changes.\n"
+                .to_string(),
+        },
+        CatalogEntry {
+            id: "starter-orchestrator".to_string(),
+            name: "Orchestrator — plan, ground, and route".to_string(),
+            role: "orchestrator".to_string(),
+            description: "Ground in the repo first, plan before coding, delegate the I/O, keep egress minimal.".to_string(),
+            source_url: None,
+            body: "# Orchestrator — house conventions\n\n\
+- Ground yourself in the actual repository before acting: read the relevant files and the project state first.\n\
+- Plan the change, then make the smallest edit that fully solves the task; no speculative refactors.\n\
+- Delegate mechanical I/O (bulk reads, boilerplate, simple edits) and keep the reasoning yourself.\n\
+- Use web search sparingly and only when the repo and local knowledge are insufficient; prefer first-party docs.\n\
+- Match the surrounding code's existing style, naming, and patterns; reuse what the project already imports.\n\
+- Run the project's formatter/linter and keep the build green before handing work off.\n\
+- Never print secrets or tokens; never push to remotes without going through the review gate.\n"
                 .to_string(),
         },
     ]

@@ -50,6 +50,15 @@ pub struct RmcpConfig {
     /// The model id declared to `agent_register` (for the dashboard). May be
     /// empty.
     pub model: String,
+    /// The app-issued launch token (L2.4). The Oracle server stamps a
+    /// `launchTokenHash` on this agent's pending session BEFORE the launch, so
+    /// `agent_register` REQUIRES the matching raw token (see
+    /// `validate_launch_token_for_registration` in `oracle/server/aspis_mcp.py`):
+    /// without it the server raises and registration fails. Empty only for the
+    /// unmanaged / no-token dev path (a server with the compat kill switch on, or
+    /// a session with no hash). NEVER logged — it is sent in the register params
+    /// only.
+    pub launch_token: String,
     /// Extra env vars for the child (e.g. an Oracle index path). Never secrets in
     /// logs — these are passed to the child env only.
     pub env: Vec<(String, String)>,
@@ -108,13 +117,14 @@ impl RmcpBackend {
         // `Drop` later cancels it to tear the child down on shutdown.
         let cleanup = service.cancellation_token();
 
-        // Register to obtain the session token. This call carries identity but no
-        // token yet (registration is what mints it).
-        let mut reg_args = Map::new();
-        reg_args.insert("agent_id".into(), json!(config.agent_id));
-        reg_args.insert("role".into(), json!(config.role));
-        reg_args.insert("model".into(), json!(config.model));
-        reg_args.insert("message".into(), json!("devboule orchestrator online"));
+        // Register to obtain the session token. This call carries identity plus the
+        // app-issued LAUNCH token (the one-shot credential the server requires to
+        // mint the session token); registration consumes the launch token and
+        // returns the session token. The field name `launch_token` matches the
+        // server's `agent_register` schema (oracle/server/aspis_mcp.py). An empty
+        // launch token is only valid on the unmanaged/no-hash dev path; against a
+        // managed launch the server rejects a blank or wrong token.
+        let reg_args = build_register_args(&config);
 
         let result = match service
             .peer()
@@ -211,6 +221,20 @@ impl Drop for RmcpBackend {
     }
 }
 
+/// Build the `agent_register` argument map from the config. PURE (no transport) so
+/// the identity + launch-token wiring is unit-testable without a live server. The
+/// `launch_token` field name matches the server's `agent_register` schema
+/// (`oracle/server/aspis_mcp.py`), which REQUIRES it for a managed launch.
+fn build_register_args(config: &RmcpConfig) -> Map<String, Value> {
+    let mut reg_args = Map::new();
+    reg_args.insert("agent_id".into(), json!(config.agent_id));
+    reg_args.insert("role".into(), json!(config.role));
+    reg_args.insert("model".into(), json!(config.model));
+    reg_args.insert("message".into(), json!("devboule orchestrator online"));
+    reg_args.insert("launch_token".into(), json!(config.launch_token));
+    reg_args
+}
+
 /// Extract the first text-content block from a tool result. The Oracle returns
 /// its JSON payload as a text content block (the MCP convention).
 fn first_text(result: &CallToolResult) -> Option<String> {
@@ -252,5 +276,37 @@ mod tests {
         assert_eq!(extract_session_token(r#"{"role":"x"}"#), None);
         assert_eq!(extract_session_token(r#"{"sessionToken":""}"#), None);
         assert_eq!(extract_session_token("not json"), None);
+    }
+
+    fn test_config(launch_token: &str) -> RmcpConfig {
+        RmcpConfig {
+            python: "python3".into(),
+            root: "/srv/root".into(),
+            projects_dir: "/srv/root/projects".into(),
+            agent_id: "orchestrator-1".into(),
+            role: "orchestrator".into(),
+            model: "qwen".into(),
+            launch_token: launch_token.into(),
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn register_args_carry_launch_token_under_server_field_name() {
+        // The server's agent_register REQUIRES `launch_token` for a managed launch
+        // (validate_launch_token_for_registration), so it must ride in the register
+        // params under that exact field name with the configured value.
+        let args = build_register_args(&test_config("tok-xyz-789"));
+        assert_eq!(args.get("launch_token").and_then(|v| v.as_str()), Some("tok-xyz-789"));
+        assert_eq!(args.get("agent_id").and_then(|v| v.as_str()), Some("orchestrator-1"));
+        assert_eq!(args.get("role").and_then(|v| v.as_str()), Some("orchestrator"));
+    }
+
+    #[test]
+    fn register_args_emit_blank_launch_token_for_unmanaged_path() {
+        // The dev / unmanaged path passes no token; the field is still present (the
+        // server only enforces it when a session hash exists).
+        let args = build_register_args(&test_config(""));
+        assert_eq!(args.get("launch_token").and_then(|v| v.as_str()), Some(""));
     }
 }
