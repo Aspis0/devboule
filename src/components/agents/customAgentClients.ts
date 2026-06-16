@@ -13,8 +13,15 @@ export const CLIENT_LABEL_MAX_LENGTH = 40;
 export const CLIENT_COMMAND_MAX_LENGTH = 400;
 
 // Built-in CLI ids a custom client must never shadow. Lowercased; the id is
-// always normalized to lowercase before this check.
-export const RESERVED_CLIENT_IDS = ["codex", "claude", "powershell"] as const;
+// always normalized to lowercase before this check. MUST mirror the Rust
+// RESERVED_CLIENT_IDS in backend/projects.rs — "orchestrator" is the L2.4 local
+// Devboule main-coder client, reserved there too (normalize_agent_client).
+export const RESERVED_CLIENT_IDS = [
+  "codex",
+  "claude",
+  "powershell",
+  "orchestrator",
+] as const;
 
 const ID_PATTERN = /^[a-z0-9-]{1,32}$/;
 

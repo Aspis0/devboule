@@ -49,6 +49,10 @@ vi.mock("./DesignLlmBackendCard", () => ({
   DesignLlmBackendCard: () =>
     createElement("div", { "data-testid": "design-llm-card" }),
 }));
+vi.mock("./ExaSearchKeyCard", () => ({
+  ExaSearchKeyCard: () =>
+    createElement("div", { "data-testid": "exa-search-key-card" }),
+}));
 
 import { ProvidersModelsTab } from "./ProvidersModelsTab";
 
@@ -161,6 +165,9 @@ describe("ProvidersModelsTab", () => {
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="design-llm-card"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="exa-search-key-card"]'),
     ).not.toBeNull();
   });
 

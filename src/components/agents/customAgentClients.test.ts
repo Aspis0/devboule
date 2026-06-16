@@ -65,6 +65,10 @@ describe("validateCustomClient", () => {
       .toMatch(/reserved/);
     expect(validateCustomClient({ id: "PowerShell", label: "L", command: "c" }, []).errors.id)
       .toMatch(/reserved/);
+    // L2.4: the local Devboule main-coder id is reserved too (must mirror the Rust
+    // RESERVED_CLIENT_IDS), so a custom client can never shadow it.
+    expect(validateCustomClient({ id: "Orchestrator", label: "L", command: "c" }, []).errors.id)
+      .toMatch(/reserved/);
   });
 
   it("rejects a duplicate id against the existing list", () => {

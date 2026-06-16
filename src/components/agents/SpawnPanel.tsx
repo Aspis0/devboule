@@ -38,8 +38,17 @@ export const ROLE_OPTIONS: { id: SpawnRole; label: string; summary: string }[] =
 ];
 
 // Built-in CLIs always shown in the selector; configured custom clients are
-// appended after these (see `clientOptions`).
-const BUILTIN_CLIENTS = ["codex", "claude"] as const;
+// appended after these (see `clientOptions`). Each carries an explicit label so
+// the orchestrator can read "Local (Devboule)" rather than its raw id. "codex" /
+// "claude" keep their id as the label (rendered capitalized by the selector).
+// L2.4: "orchestrator" selects the LOCAL Devboule main coder (oMLX) — the backend
+// dispatches its own binary instead of an external CLI when client ===
+// "orchestrator" (normalize_agent_client + RESERVED_CLIENT_IDS in projects.rs).
+const BUILTIN_CLIENTS: { id: string; label: string }[] = [
+  { id: "codex", label: "codex" },
+  { id: "claude", label: "claude" },
+  { id: "orchestrator", label: "Local (Devboule)" },
+];
 
 export interface SpawnPanelProps {
   // Project dropdown source (global use). When `lockedProjectId` is set the
@@ -90,7 +99,7 @@ export function SpawnPanel({
   // (label shown, id is the value). Deduped/validated upstream; rendered as-is.
   const clientOptions = useMemo(
     () => [
-      ...BUILTIN_CLIENTS.map((id) => ({ id: id as string, label: id })),
+      ...BUILTIN_CLIENTS.map((c) => ({ id: c.id, label: c.label })),
       ...customClients.map((c) => ({ id: c.id, label: c.label })),
     ],
     [customClients],
@@ -318,6 +327,12 @@ export function SpawnPanel({
           );
         })}
       </div>
+      {client === "orchestrator" && (
+        <p className="mb-3 -mt-1.5 text-[10px] leading-4 text-cream-400">
+          Runs Devboule&apos;s own local coder (oMLX) as the main coder — no
+          external API.
+        </p>
+      )}
 
       {/* Launch actions. */}
       <div className="flex flex-wrap gap-2">

@@ -16,6 +16,7 @@ import {
 import type { DetectedProvider } from "../../types/config";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
+import { ExaSearchKeyCard } from "./ExaSearchKeyCard";
 import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
 import { CensorLocalAiCard } from "../views/WorkspaceView";
@@ -268,6 +269,13 @@ export function ProvidersModelsTab() {
         description="The ceiling for how your coders delegate file writes to the local mini."
       >
         <MiniWriteBehaviorCard />
+      </RoleSection>
+
+      <RoleSection
+        title="Local coder web search"
+        description="The Exa key the local Devboule coder uses for web search + fetch. Optional and opt-in — no key keeps web tools off (Oracle-only, on-device)."
+      >
+        <ExaSearchKeyCard />
       </RoleSection>
 
       <RoleSection

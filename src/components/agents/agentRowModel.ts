@@ -267,10 +267,13 @@ export interface SpawnSelection {
   // value" means "let the agent self-report" and no hint is sent.
   model: string;
   taskId: string;
-  // Built-in CLIs ("codex" | "claude" | "powershell") or a user-configured custom
-  // agent client id (validated [a-z0-9-]{1,32}). Kept as a string so a custom
-  // client id threads through the launch pipeline without a type widening at every
-  // call site; the Rust boundary re-validates it against config.json.
+  // Built-in CLIs ("codex" | "claude" | "powershell" | "orchestrator") or a
+  // user-configured custom agent client id (validated [a-z0-9-]{1,32}).
+  // "orchestrator" (L2.4) selects the LOCAL Devboule main coder (oMLX); the
+  // backend dispatches its own binary instead of an external CLI. Kept as a string
+  // so a custom client id threads through the launch pipeline without a type
+  // widening at every call site; the Rust boundary re-validates it against
+  // config.json (normalize_agent_client).
   client: string;
 }
 
