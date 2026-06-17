@@ -51,6 +51,7 @@ from oracle.server.aspis_mcp import (
     dispatch_oracle_context,
     dispatch_project_structure,
     dispatch_steer_mini_coder,
+    dispatch_mini_coder_result,
     write_agents_state,
     MINI_CODER_MAX_STEER_LEN,
     MINI_CODER_MAX_STEER_QUEUE,
@@ -3557,6 +3558,7 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_structure",
                 "spawn_mini_coder",
                 "steer_mini_coder",
+                "mini_coder_result",
                 "request_git_push",
                 "plan_submit",
                 "plan_status",
@@ -8800,6 +8802,669 @@ class SteerMiniCoderTests(unittest.TestCase):
             set(schema["parameters"]),
             {"agent_id", "role", "directive_id", "message", "session_token"},
         )
+
+
+class AsyncMiniCoderResultTests(unittest.TestCase):
+    """ASYNC (b): spawn_mini_coder(wait=false) returns the directiveId immediately and
+    mini_coder_result collects the outcome (blocking wait=true reuses the same poll as
+    the blocking spawn; wait=false does a single read). The DEFAULT blocking spawn path
+    is byte-identical (covered by SpawnMiniCoderTests)."""
+
+    def _project_dir(self, tmp: str) -> Path:
+        root = Path(tmp)
+        projects = root / "projects"
+        projects.mkdir()
+        sample_project(projects)
+        return root
+
+    def _register_coder(self, root: Path, agent_id: str = "codex") -> str:
+        token = "test-launch-token"
+        (root / "projects" / ".aspis-agents.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "updatedAt": "2026-06-06T00:00:00+00:00",
+                    "sessions": [
+                        {
+                            "agentId": agent_id,
+                            "role": "coder",
+                            "status": "launch_pending",
+                            "lastSeenAt": "2026-06-06T00:00:00+00:00",
+                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                        }
+                    ],
+                    "claims": [],
+                    "events": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = handle_tool_call(
+            "agent_register",
+            {
+                "agent_id": agent_id,
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+                "launch_token": token,
+            },
+            root=root,
+        )
+        return result["sessionToken"]
+
+    def _read_state(self, root: Path) -> dict:
+        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+
+    def test_spawn_wait_false_returns_running_without_polling(self):
+        # wait=false must return {directiveId, status:'running'} IMMEDIATELY and never
+        # poll — even though there is no executor, the directive stays pending and the
+        # call returns at once (no synthesized failed/timeout). The directive is still
+        # written for the executor to claim.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            start = time.monotonic()
+            out = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 5.0, f"wait=false must not block: {elapsed:.2f}s")
+            self.assertIn("directiveId", out)
+            self.assertEqual(out["status"], "running")
+            self.assertNotIn("result", out)
+            # The directive was appended and is still pending (no synthesized result).
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["id"], out["directiveId"])
+            self.assertEqual(d["status"], "pending")
+            self.assertNotIn("result", d)
+
+    def test_spawn_wait_truthy_non_bool_still_blocks(self):
+        # STRICT bool: only the explicit bool False skips the wait. A truthy non-bool
+        # (e.g. the string "false") must NOT be treated as wait=false — it BLOCKS like
+        # the default. With no executor + a 0s cap, the blocking path synthesizes a
+        # terminal `failed` result (proving it took the blocking branch).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "spawn_mini_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "wait": "false",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertIn("result", out)
+            self.assertEqual(out["result"]["status"], "failed")
+            self.assertNotIn("status", out)
+
+    def test_result_wait_false_running_then_terminal(self):
+        # Spawn non-blocking, then a single non-blocking read: while pending it is
+        # 'running'; once the executor stamps a terminal result the read returns it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            # Single read while still pending -> running.
+            out = handle_tool_call(
+                "mini_coder_result",
+                {"agent_id": "codex", "role": "coder", "directive_id": did, "wait": False, "session_token": token},
+                root=root,
+            )
+            self.assertEqual(out, {"directiveId": did, "status": "running"})
+            # Executor stamps a terminal result on the SAME id.
+            from oracle.server.aspis_mcp import (
+                AGENTS_STATE_FILE,
+                file_lock,
+                read_agents_state,
+                write_agents_state,
+            )
+
+            projects_dir = root / "projects"
+            lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+            done = {"status": "done", "output": "wrote the docstring", "filesTouched": ["src/a.rs"]}
+            with file_lock(lock):
+                state = read_agents_state(projects_dir)
+                d = next(x for x in state["miniCoderDirectives"] if x["id"] == did)
+                d["status"] = "done"
+                d["result"] = done
+                write_agents_state(projects_dir, state)
+            out2 = handle_tool_call(
+                "mini_coder_result",
+                {"agent_id": "codex", "role": "coder", "directive_id": did, "wait": False, "session_token": token},
+                root=root,
+            )
+            self.assertEqual(out2["directiveId"], did)
+            self.assertEqual(out2["result"], done)
+            self.assertNotIn("status", out2)
+
+    def test_result_wait_false_unknown_directive_is_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            out = handle_tool_call(
+                "mini_coder_result",
+                {"agent_id": "codex", "role": "coder", "directive_id": "nope", "wait": False, "session_token": token},
+                root=root,
+            )
+            self.assertEqual(out, {"directiveId": "nope", "status": "not_found"})
+
+    def test_result_wait_true_blocks_and_returns_executor_outcome(self):
+        # wait=true reuses the SAME bounded poll as the blocking spawn: a background
+        # thread stamps a terminal result and the blocking read returns it.
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            done = {"status": "done", "output": "ok"}
+
+            def executor():
+                from oracle.server.aspis_mcp import (
+                    AGENTS_STATE_FILE,
+                    file_lock,
+                    read_agents_state,
+                    write_agents_state,
+                )
+
+                projects_dir = root / "projects"
+                lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+                for _ in range(200):
+                    with file_lock(lock):
+                        state = read_agents_state(projects_dir)
+                        ds = state.get("miniCoderDirectives", [])
+                        if ds:
+                            ds[0]["status"] = "done"
+                            ds[0]["result"] = done
+                            write_agents_state(projects_dir, state)
+                            return
+                    time.sleep(0.02)
+
+            t = threading.Thread(target=executor)
+            t.start()
+            try:
+                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02):
+                    out = handle_tool_call(
+                        "mini_coder_result",
+                        {"agent_id": "codex", "role": "coder", "directive_id": did, "session_token": token},
+                        root=root,
+                    )
+            finally:
+                t.join()
+            self.assertEqual(out["directiveId"], did)
+            self.assertEqual(out["result"], done)
+
+    def test_result_wait_true_synthesizes_failed_on_never_claimed(self):
+        # wait=true on a pending directive past the deadline -> the SAME `failed`
+        # synthesis the blocking spawn does (FIX 3), proving the shared helper.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "mini_coder_result",
+                    {"agent_id": "codex", "role": "coder", "directive_id": did, "session_token": token},
+                    root=root,
+                )
+            self.assertEqual(out["result"]["status"], "failed")
+            self.assertIn("did not start", out["result"]["error"])
+
+    def test_result_default_wait_is_blocking(self):
+        # `wait` omitted defaults to blocking (like spawn): with no executor + 0s cap it
+        # synthesizes a terminal result rather than returning status:'running'.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "wait": False, "session_token": token},
+                root=root,
+            )
+            did = spawn["directiveId"]
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "mini_coder_result",
+                    {"agent_id": "codex", "role": "coder", "directive_id": did, "session_token": token},
+                    root=root,
+                )
+            self.assertIn("result", out)
+            self.assertNotIn("status", out)
+
+    def test_result_is_coder_and_orchestrator_only(self):
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        orch = next(r for r in ROLE_RULES if r["role"] == "orchestrator")
+        verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
+        self.assertIn("mini_coder_result", coder["allowedTools"])
+        self.assertIn("mini_coder_result", orch["allowedTools"])
+        self.assertNotIn("mini_coder_result", verifier["allowedTools"])
+
+    def test_result_verifier_rejected_at_dispatch(self):
+        # A verifier (no mini_coder_result) is rejected by the role gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            projects = root / "projects"
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+            os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = "1"
+            try:
+                handle_tool_call(
+                    "agent_register",
+                    {"agent_id": "ver", "role": "verifier", "model": "opus", "message": "reviewing"},
+                    root=root,
+                )
+                state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
+                with self.assertRaises(McpError):
+                    dispatch_mini_coder_result(
+                        projects,
+                        state_lock,
+                        {"agent_id": "ver", "role": "verifier", "directive_id": "d1"},
+                    )
+            finally:
+                os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
+                os.environ.pop("ASPIS_MCP_DISABLE_APP_VAULT", None)
+
+    def test_result_tool_is_registered_in_schema_and_dispatch(self):
+        names = {t["name"] for t in TOOLS}
+        self.assertIn("mini_coder_result", names)
+        schema = next(t for t in TOOLS if t["name"] == "mini_coder_result")
+        self.assertEqual(
+            set(schema["parameters"]),
+            {"agent_id", "role", "directive_id", "wait", "session_token"},
+        )
+
+    def test_spawn_schema_carries_wait_param(self):
+        schema = next(t for t in TOOLS if t["name"] == "spawn_mini_coder")
+        self.assertIn("wait", schema["parameters"])
+        self.assertEqual(schema["parameters"]["wait"]["default"], True)
+
+    # ---- Fix #1: timeout error must name the calling tool -----------------------
+
+    def test_result_wait_true_timeout_error_names_mini_coder_result(self):
+        # A mini_coder_result(wait=true) that hits the deadline must stamp an error
+        # mentioning "mini_coder_result", NOT "spawn_mini_coder". The directive must
+        # have been seen as running at least once so the `timeout` branch fires (not
+        # the `failed` / never-started branch). We fake that by setting status=running.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            # Spawn non-blocking to create the directive.
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            # Promote the directive to `running` so _await_mini_directive takes the
+            # timeout branch (ever_ran=True) and uses the caller_tool string.
+            from oracle.server.aspis_mcp import (
+                AGENTS_STATE_FILE,
+                file_lock,
+                read_agents_state,
+                write_agents_state,
+            )
+            projects_dir = root / "projects"
+            lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+            with file_lock(lock):
+                state = read_agents_state(projects_dir)
+                for d in state.get("miniCoderDirectives", []):
+                    if d.get("id") == did:
+                        d["status"] = "running"
+                write_agents_state(projects_dir, state)
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "mini_coder_result",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "directive_id": did,
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertEqual(out["result"]["status"], "timeout")
+            self.assertIn(
+                "mini_coder_result",
+                out["result"]["error"],
+                "timeout error must name mini_coder_result, not spawn_mini_coder",
+            )
+            self.assertNotIn(
+                "spawn_mini_coder",
+                out["result"]["error"],
+                "spawn_mini_coder must not appear in a mini_coder_result timeout error",
+            )
+
+    # ---- Fix #2: wait=true on a nonexistent directive must not block -----------
+
+    def test_result_wait_true_unknown_directive_returns_not_found_fast(self):
+        # mini_coder_result(wait=true, directive_id="nonexistent") must return
+        # {status: "not_found"} immediately — NOT block for the poll timeout and NOT
+        # synthesize "failed". Timing verified: must return in << 1 s even with a
+        # multi-second cap patched in (no sleep loop entered).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            start = time.monotonic()
+            # Use a large-ish timeout so the test would obviously stall if it polled.
+            with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 30.0):
+                out = handle_tool_call(
+                    "mini_coder_result",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "directive_id": "nonexistent-directive-id",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            elapsed = time.monotonic() - start
+            self.assertEqual(out, {"directiveId": "nonexistent-directive-id", "status": "not_found"})
+            self.assertLess(elapsed, 5.0, f"not_found must be instant, got {elapsed:.2f}s")
+            self.assertNotIn("result", out, "not_found must not synthesize a result payload")
+
+    # ---- Fix #3: ownership check ------------------------------------------------
+
+    def _register_two_coders(
+        self, root: Path, owner_id: str = "codex", other_id: str = "codex2"
+    ) -> tuple[str, str]:
+        """Register two distinct coder sessions; return (owner_token, other_token)."""
+        owner_token = "owner-token"
+        other_token = "other-token"
+        (root / "projects" / ".aspis-agents.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "updatedAt": "2026-06-06T00:00:00+00:00",
+                    "sessions": [
+                        {
+                            "agentId": owner_id,
+                            "role": "coder",
+                            "status": "launch_pending",
+                            "lastSeenAt": "2026-06-06T00:00:00+00:00",
+                            "launchTokenHash": hashlib.sha256(owner_token.encode()).hexdigest(),
+                            "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                        },
+                        {
+                            "agentId": other_id,
+                            "role": "coder",
+                            "status": "launch_pending",
+                            "lastSeenAt": "2026-06-06T00:00:00+00:00",
+                            "launchTokenHash": hashlib.sha256(other_token.encode()).hexdigest(),
+                            "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                        },
+                    ],
+                    "claims": [],
+                    "events": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        r1 = handle_tool_call(
+            "agent_register",
+            {
+                "agent_id": owner_id,
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+                "launch_token": owner_token,
+            },
+            root=root,
+        )
+        r2 = handle_tool_call(
+            "agent_register",
+            {
+                "agent_id": other_id,
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+                "launch_token": other_token,
+            },
+            root=root,
+        )
+        return r1["sessionToken"], r2["sessionToken"]
+
+    def test_mini_coder_result_rejects_non_owner(self):
+        # A coder that does NOT own the directive must be rejected with McpError.
+        # The directive OWNER (codex) still succeeds.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            owner_token, other_token = self._register_two_coders(root, "codex", "codex2")
+            # Owner spawns a mini non-blocking — the directive carries parentAgentId="codex".
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": owner_token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            # Non-owner (codex2) tries to read the directive — must be rejected.
+            with self.assertRaises(McpError) as cm:
+                handle_tool_call(
+                    "mini_coder_result",
+                    {
+                        "agent_id": "codex2",
+                        "role": "coder",
+                        "directive_id": did,
+                        "wait": False,
+                        "session_token": other_token,
+                    },
+                    root=root,
+                )
+            self.assertIn("not owned by this agent", str(cm.exception))
+            # Owner (codex) must still succeed — returns running (no executor).
+            out = handle_tool_call(
+                "mini_coder_result",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": did,
+                    "wait": False,
+                    "session_token": owner_token,
+                },
+                root=root,
+            )
+            self.assertEqual(out["status"], "running")
+
+
+class OwnershipSteerMiniCoderTests(unittest.TestCase):
+    """Fix #3 (steer path): steer_mini_coder must reject a caller that does not own
+    the directive's parentAgentId. The OWNER still succeeds."""
+
+    def setUp(self):
+        self._old = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        self._old_vault = os.environ.get("ASPIS_MCP_DISABLE_APP_VAULT")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+        os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = "1"
+
+    def tearDown(self):
+        for key, old in (
+            ("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", self._old),
+            ("ASPIS_MCP_DISABLE_APP_VAULT", self._old_vault),
+        ):
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    def _setup_two_coders(
+        self, tmp: str, directives: list[dict]
+    ) -> tuple[Path, Path]:
+        """Register two coders (owner=codex, other=codex2) and seed directives."""
+        root = Path(tmp)
+        projects = prepare_management_root(root)
+        handle_tool_call(
+            "agent_register",
+            {"agent_id": "codex", "role": "coder", "model": "codex", "message": "coding"},
+            root=root,
+        )
+        handle_tool_call(
+            "agent_register",
+            {"agent_id": "codex2", "role": "coder", "model": "codex", "message": "coding"},
+            root=root,
+        )
+        state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
+        from oracle.server.aspis_mcp import file_lock
+
+        with file_lock(state_lock):
+            state = read_agents_state(projects)
+            state["miniCoderDirectives"] = directives
+            write_agents_state(projects, state)
+        return projects, state_lock
+
+    def test_steer_rejects_non_owner(self):
+        # A directive owned by codex must reject a steer from codex2.
+        # The owner (codex) must still successfully queue a correction.
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup_two_coders(
+                tmp,
+                [
+                    {
+                        "id": "d1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "d1.json",
+                        "parentAgentId": "codex",
+                    }
+                ],
+            )
+            # Non-owner attempt.
+            with self.assertRaises(McpError) as cm:
+                dispatch_steer_mini_coder(
+                    projects,
+                    state_lock,
+                    {
+                        "agent_id": "codex2",
+                        "role": "coder",
+                        "directive_id": "d1",
+                        "message": "should be rejected",
+                    },
+                )
+            self.assertIn("not owned by this agent", str(cm.exception))
+            # Owner succeeds.
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": "valid owner correction",
+                },
+            )
+            self.assertEqual(res["status"], "queued")
+
+    def test_steer_retry_child_ownership_uses_root_parent_agent_id(self):
+        # When directive_id refers to a ROOT that is awaiting_retry and a retry child
+        # exists WITHOUT its own parentAgentId, the check must use the ROOT's
+        # parentAgentId. A non-owner is rejected; the owner succeeds.
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup_two_coders(
+                tmp,
+                [
+                    {
+                        "id": "root",
+                        "status": "awaiting_retry",
+                        "task": "x",
+                        "resultPath": "root.json",
+                        "parentAgentId": "codex",
+                    },
+                    {
+                        "id": "root-r1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "root-r1.json",
+                        "parentDirectiveId": "root",
+                        "attempt": 1,
+                        # Deliberately no parentAgentId on the retry child.
+                    },
+                ],
+            )
+            with self.assertRaises(McpError):
+                dispatch_steer_mini_coder(
+                    projects,
+                    state_lock,
+                    {
+                        "agent_id": "codex2",
+                        "role": "coder",
+                        "directive_id": "root",
+                        "message": "must be rejected",
+                    },
+                )
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "root",
+                    "message": "valid steer on retry chain",
+                },
+            )
+            self.assertEqual(res["status"], "queued")
 
 
 if __name__ == "__main__":

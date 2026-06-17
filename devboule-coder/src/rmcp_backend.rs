@@ -60,6 +60,8 @@ const DEFAULT_CALL_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 /// for the server's final result-stamp + transport). Keep each ≥ its server counterpart
 /// if those change:
 ///   spawn_mini_coder : MINI_CODER_POLL_TIMEOUT_SECS  = 1800 -> 1920 (32 min)
+///   mini_coder_result: MINI_CODER_POLL_TIMEOUT_SECS  = 1800 -> 1920 (same poll; the
+///                      blocking wait=true path waits on the SAME server poll as spawn)
 ///   plan_submit      : PLAN_POLL_TIMEOUT_SECS        = 600  -> 720
 ///   request_git_push : GIT_PUSH_POLL_TIMEOUT_SECS    = 600  -> 720
 ///   ask_user         : ASK_USER_POLL_TIMEOUT_SECS    = 600  -> 720
@@ -67,7 +69,7 @@ const DEFAULT_CALL_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Everything else falls back to [`DEFAULT_CALL_TOOL_TIMEOUT`].
 fn call_tool_timeout(tool: &str) -> Duration {
     let secs = match tool {
-        "spawn_mini_coder" => 1920,
+        "spawn_mini_coder" | "mini_coder_result" => 1920,
         "plan_submit" | "request_git_push" | "ask_user" => 720,
         "visual_check" => 240,
         _ => return DEFAULT_CALL_TOOL_TIMEOUT,
@@ -404,6 +406,13 @@ mod tests {
         assert!(
             call_tool_timeout("spawn_mini_coder").as_secs() > 1800,
             "mini > 1800s"
+        );
+        // mini_coder_result(wait=true) blocks on the SAME ~1800s server poll as spawn,
+        // so it MUST get the same (>1800s) client cap — never give up while the server
+        // is still polling for the mini's terminal outcome.
+        assert!(
+            call_tool_timeout("mini_coder_result").as_secs() > 1800,
+            "mini_coder_result > 1800s"
         );
         assert!(
             call_tool_timeout("plan_submit").as_secs() > 600,

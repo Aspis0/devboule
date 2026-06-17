@@ -316,6 +316,7 @@ ROLE_RULES = [
             "visual_check",
             "spawn_mini_coder",
             "steer_mini_coder",
+            "mini_coder_result",
             "request_git_push",
             "plan_submit",
             "plan_status",
@@ -325,6 +326,7 @@ ROLE_RULES = [
             "Non imposta done: serve verifier con evidenza.",
             "Non legge o stampa token. Usa solo token da env e scope Aspis Bio verificato.",
             "Delega a spawn_mini_coder solo sub-task economici e meccanici (boilerplate, bulk read->summary, edit semplici, docstring, test); pre-carica il contesto necessario; ragiona tu; RIVEDI l'output del mini come bozza prima di usarlo.",
+            "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
             "Per un task di WRITE scegli `write_mode`: 'agenticIterative' SOLO per file in un linguaggio con copertura del gate deterministico in QUESTO progetto E con un modello mini abbastanza capace di iterare; altrimenti 'emitEdits' (default). Nel dubbio usa 'emitEdits'.",
             "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\").",
             "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), rifai il file TU STESSO: il rail di training ha gia' catturato il fallimento, quindi NON rilanciare ciecamente il mini sullo stesso file.",
@@ -379,6 +381,7 @@ ROLE_RULES = [
             "project_structure",
             "spawn_mini_coder",
             "steer_mini_coder",
+            "mini_coder_result",
             "request_git_push",
             "plan_submit",
             "plan_status",
@@ -386,6 +389,7 @@ ROLE_RULES = [
         ],
         "forbidden": [
             "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per spawn_mini_coder (tu pianifichi e riveli il contesto; il mini scrive).",
+            "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
             "Per domande su progetto o codebase usa PRIMA oracle_ask / oracle_context (capacita di comprensione grounded): non indovinare ne leggere il filesystem a mano.",
             "Non imposta done: e verifier-only con evidenza. Tu puoi solo claim e wip/review/blocked (e riapertura a todo), esattamente come un coder.",
             "Ogni cambiamento passa per Censor + il Kanban + il gate umano: mai full-auto non presidiato. Quando un sotto-task e pronto, mettilo in review con una nota e lascia il verdetto finale al verifier.",
@@ -535,6 +539,17 @@ TOOLS = [
             "backend": {"type": "string", "default": ""},
             "allow_oracle": {"type": "boolean", "default": False},
             "write": {"type": "boolean", "default": False},
+            "wait": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Whether to BLOCK until the mini finishes (default true: returns "
+                    "{directiveId, result}). Pass false to return immediately with "
+                    "{directiveId, status:'running'} so you can supervise the mini — "
+                    "watch it, send corrections with steer_mini_coder, then collect "
+                    "the outcome with mini_coder_result(directiveId)."
+                ),
+            },
             "write_mode": {
                 "type": "string",
                 "enum": list(MINI_CODER_WRITE_MODES),
@@ -574,6 +589,32 @@ TOOLS = [
                 "description": (
                     "The mid-flight correction to fold into the mini's next round, or "
                     "'stop' to abort the mini (the stop sentinel maps to the kill path)."
+                ),
+            },
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "mini_coder_result",
+        "description": (
+            "Solo coder/orchestrator: collect the outcome of a mini you delegated with "
+            "spawn_mini_coder(wait=false). Pass the directiveId it returned. With "
+            "wait=true (default) BLOCKS until the mini reaches a terminal outcome and "
+            "returns {directiveId, result} (same poll/timeout semantics as the blocking "
+            "spawn_mini_coder). With wait=false does a single read: {directiveId, result} "
+            "if terminal, else {directiveId, status:'running'} (or status='not_found' if "
+            "the directive is unknown/evicted)."
+        ),
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "directive_id": {"type": "string"},
+            "wait": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Block until the mini is terminal (default true) vs a single "
+                    "non-blocking read (false)."
                 ),
             },
             "session_token": {"type": "string"},
@@ -4960,6 +5001,168 @@ def _mini_directive_result(
     return False, "", None
 
 
+def _mini_directive_parent_agent_id(
+    projects_dir: Path, state_lock: Path, directive_id: str
+) -> str | None:
+    """Return the `parentAgentId` of the ROOT directive for `directive_id`.
+
+    For the root itself (`id == directive_id`) this is the value stored directly.
+    For a retry descendant (`parentDirectiveId == directive_id` / any depth), we
+    walk up to the root and read ITS `parentAgentId` — the Rust executor inherits
+    the owner from the root, and a retry child may not carry `parentAgentId` at all.
+
+    Returns `None` if the directive (root or chain member) is not found.
+    """
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+    directives = state.get("miniCoderDirectives") or []
+    # Build a quick id→directive index.
+    by_id: dict[str, dict] = {
+        str(d.get("id") or ""): d for d in directives if isinstance(d, dict)
+    }
+    # Look for the root: the entry whose id == directive_id.
+    root = by_id.get(directive_id)
+    if root is None:
+        # directive_id might not be a root — scan for a chain member and walk up.
+        for d in directives:
+            if not isinstance(d, dict):
+                continue
+            if str(d.get("parentDirectiveId") or "") == directive_id:
+                root = by_id.get(directive_id)
+                break
+        if root is None:
+            return None
+    parent = root.get("parentAgentId")
+    return str(parent) if parent else None
+
+
+def _await_mini_directive(
+    projects_dir: Path,
+    state_lock: Path,
+    directive_id: str,
+    deadline: float,
+    caller_tool: str = "spawn_mini_coder",
+) -> dict[str, Any]:
+    """BOUNDED poll for the executor's terminal verdict on `directive_id`, returning
+    `{directiveId, result}` once it is terminal (or a synthesized terminal outcome on
+    the hard cap). Re-reads the directive UNDER THE LOCK each pass via
+    `_mini_directive_result`; NEVER holds the lock across the sleep (the Rust executor
+    co-writes the same file). On the hard wall-clock cap (`deadline`, a
+    `time.monotonic()` value) it returns a synthesized `timeout`/`failed` outcome the
+    caller can act on (and best-effort marks the directive so the executor stops
+    chasing it).
+
+    The blocking `spawn_mini_coder` (wait=true, the default) AND the blocking
+    `mini_coder_result` (wait=true) share this exact poll — extracted verbatim so the
+    timeout/failed/killRequested-WINS semantics are identical on every path. The poll
+    watches the ROOT id: the Rust executor PROPAGATES a retry chain's leaf outcome onto
+    the awaiting_retry root (`awaiting_retry_ancestors`), so the terminal result lands
+    on `directive_id` itself.
+    """
+    seen = False
+    ever_ran = False  # FIX 3: observed in running/launching at least once (was claimed).
+    while True:
+        present, status, result = _mini_directive_result(
+            projects_dir, state_lock, directive_id
+        )
+        if result is not None:
+            return {"directiveId": directive_id, "result": result}
+        if present:
+            seen = True
+            if status in ("running", "launching"):
+                ever_ran = True
+        elif seen:
+            # WARNING 5: the directive was visible earlier and is now GONE (capped
+            # out / dropped) with no terminal result we ever read. Do NOT block for
+            # the full poll cap — return a synthesized `failed`/`gone` outcome now.
+            return {
+                "directiveId": directive_id,
+                "result": {
+                    "status": "failed",
+                    "error": "mini-coder directive vanished before producing a result.",
+                },
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(MINI_CODER_POLL_INTERVAL_SECS)
+
+    # Cap exceeded. FIX 3: the synthesized terminal outcome DEPENDS on whether the
+    # executor ever actually CLAIMED the directive within the poll window:
+    #   * it ran (status was running/launching at least once) -> `timeout` (it started
+    #     but did not finish in time);
+    #   * it is still `pending` (the executor never picked it up — e.g. the app is
+    #     locked, the executor is down, or contention) -> `failed`, NOT `timeout`,
+    #     with a clear error. A never-started directive timing out would mislead the
+    #     coder into thinking the mini ran and merely overran.
+    if ever_ran:
+        synthesized = {
+            "status": "timeout",
+            "error": f"{caller_tool} poll timed out waiting for the mini result.",
+        }
+    else:
+        synthesized = {
+            "status": "failed",
+            "error": "executor did not start this mini within the poll window.",
+        }
+    try:
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            for directive in state.get("miniCoderDirectives", []):
+                if not isinstance(directive, dict):
+                    continue
+                if str(directive.get("id") or "") == directive_id:
+                    existing = directive.get("result")
+                    # If the executor stamped a real terminal result in the tiny
+                    # window since our last read, PREFER it (do not clobber a done).
+                    if isinstance(existing, dict) and existing:
+                        synthesized = existing
+                    elif directive.get("killRequested"):
+                        # BLOCKER 1 — killRequested WINS over the poll timeout. A human
+                        # hit Stop (the Rust executor set killRequested=true + killed the
+                        # PTY) but hasn't written the aborted_by_human result yet when our
+                        # deadline fires. We must NOT stamp `timeout` here: that would make
+                        # this directive terminal, the executor's later aborted_by_human
+                        # `apply_result` would be refused (already terminal), and the human
+                        # Stop would be silently lost at the MCP return (the coder retries
+                        # instead of stop+escalate). Synthesize aborted_by_human instead so
+                        # the contract honors killRequested-WINS end-to-end.
+                        synthesized = {
+                            "status": "aborted_by_human",
+                            "error": "stopped by human (Stop button) — do not retry, escalate.",
+                        }
+                        directive["status"] = "aborted_by_human"
+                        directive["result"] = synthesized
+                    else:
+                        # FIX 3: re-derive from the directive's CURRENT status under the
+                        # lock (authoritative) — a directive still `pending` here was
+                        # never claimed, so stamp `failed`; otherwise `timeout`.
+                        # BLOCKER F-2: `awaiting_retry` means the mini DID start, ran, and
+                        # triggered a retry chain that is still live at the deadline. It is
+                        # NOT a "never started" failure — stamping `failed`/"did not start"
+                        # would mislead the orchestrator into re-spawning the whole task
+                        # from scratch. Treat it as a `timeout` (still running / retrying).
+                        live_status = str(directive.get("status") or "")
+                        if live_status in ("running", "launching", "awaiting_retry"):
+                            synthesized = {
+                                "status": "timeout",
+                                "error": f"{caller_tool} poll timed out (mini still running / retry chain in progress).",
+                            }
+                        else:
+                            synthesized = {
+                                "status": "failed",
+                                "error": "executor did not start this mini within the poll window.",
+                            }
+                        directive["status"] = synthesized["status"]
+                        directive["result"] = synthesized
+                    break
+            write_agents_state(projects_dir, state)
+    except McpError:
+        # A failed best-effort stamp must not change the contract: the coder still
+        # gets a terminal outcome it can act on.
+        pass
+    return {"directiveId": directive_id, "result": synthesized}
+
+
 def dispatch_spawn_mini_coder(
     projects_dir: Path,
     state_lock: Path,
@@ -4968,12 +5171,21 @@ def dispatch_spawn_mini_coder(
     """Coder-only: delegate a cheap sub-task to a one-shot mini-coder the APP hosts.
 
     Writes a `pending` directive into `.aspis-agents.json` (the file-only bridge to
-    the Rust executor — there is no push/reverse-trigger), then BLOCKS the caller's
-    MCP thread on a BOUNDED poll of that directive's `result`. The executor claims
-    the directive, spawns the one-shot PTY, reads the mini's result file on EOF, and
-    stamps the terminal `MiniCoderOutcome` back onto the directive — which this poll
-    returns. On the hard wall-clock cap the tool returns a synthesized `timeout`
-    outcome (and the executor's own per-mini cap independently kills a runaway mini).
+    the Rust executor — there is no push/reverse-trigger). The executor claims the
+    directive, spawns the one-shot PTY, reads the mini's result file on EOF, and stamps
+    the terminal `MiniCoderOutcome` back onto the directive.
+
+    `wait` (DEFAULT true) controls how the result is collected:
+      * `wait` true → BLOCKS the caller's MCP thread on a BOUNDED poll of that
+        directive's `result` and returns `{directiveId, result}`. On the hard
+        wall-clock cap the tool returns a synthesized `timeout` outcome (and the
+        executor's own per-mini cap independently kills a runaway mini). This is the
+        fire-and-forget path every existing caller (the local runner, claude/codex)
+        uses — byte-identical to before.
+      * `wait` false → returns IMMEDIATELY with `{directiveId, status: "running"}`; the
+        caller then watches the mini, sends corrections via `steer_mini_coder`, and
+        collects the outcome via `mini_coder_result(directiveId)`. This lets an LLM
+        coder self-steer a running mini instead of blocking.
 
     GATING: the CALLER (`agent_id`/`role`/`session_token`) is validated via
     `require_agent_tool` (so only a registered, token-bearing coder reaches here);
@@ -5003,6 +5215,11 @@ def dispatch_spawn_mini_coder(
     backend = args.get("backend")
     backend = clean_text(backend, "Mini-coder backend", 40) if str(backend or "").strip() else None
     allow_oracle = bool(args.get("allow_oracle", False))
+    # ASYNC (b): `wait` toggles blocking. STRICT bool (like the `write` flag, review F7):
+    # a truthy non-bool ("false", 0, "") is NOT a request to skip the wait — only an
+    # explicit `wait: false` returns immediately. Default (omitted / True) BLOCKS, so
+    # every existing caller (the local runner, claude/codex) is byte-identical to today.
+    wait = args.get("wait", True) is not False
 
     # 3) The caller must be a LIVE session (its parent-of-the-mini role). Verified
     #    under the lock in the SAME pass that appends the directive, so a coder that
@@ -5092,113 +5309,84 @@ def dispatch_spawn_mini_coder(
         )
         write_agents_state(projects_dir, state)
 
-    # 4) BOUNDED poll for the executor's terminal verdict. Re-read under the lock
-    #    each pass; NEVER hold the lock across the sleep. On the hard cap, return a
-    #    synthesized `timeout` outcome the coder can act on (and best-effort mark the
-    #    directive timed-out so the executor stops chasing it).
-    deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
-    seen = False
-    ever_ran = False  # FIX 3: observed in running/launching at least once (was claimed).
-    while True:
-        present, status, result = _mini_directive_result(
-            projects_dir, state_lock, directive_id
-        )
-        if result is not None:
-            return {"directiveId": directive_id, "result": result}
-        if present:
-            seen = True
-            if status in ("running", "launching"):
-                ever_ran = True
-        elif seen:
-            # WARNING 5: the directive was visible earlier and is now GONE (capped
-            # out / dropped) with no terminal result we ever read. Do NOT block for
-            # the full poll cap — return a synthesized `failed`/`gone` outcome now.
-            return {
-                "directiveId": directive_id,
-                "result": {
-                    "status": "failed",
-                    "error": "mini-coder directive vanished before producing a result.",
-                },
-            }
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(MINI_CODER_POLL_INTERVAL_SECS)
+    # 4) ASYNC (b): a `wait: false` caller (an LLM coder self-steering a running mini)
+    #    gets the directiveId IMMEDIATELY and watches / steers / collects via
+    #    `mini_coder_result` itself — NO poll here. The DEFAULT (`wait` omitted/true)
+    #    BLOCKS on the bounded poll exactly as before, so every existing caller (the
+    #    local runner, claude/codex) is byte-identical to today.
+    if not wait:
+        return {"directiveId": directive_id, "status": "running"}
 
-    # Cap exceeded. FIX 3: the synthesized terminal outcome DEPENDS on whether the
-    # executor ever actually CLAIMED the directive within the poll window:
-    #   * it ran (status was running/launching at least once) -> `timeout` (it started
-    #     but did not finish in time);
-    #   * it is still `pending` (the executor never picked it up — e.g. the app is
-    #     locked, the executor is down, or contention) -> `failed`, NOT `timeout`,
-    #     with a clear error. A never-started directive timing out would mislead the
-    #     coder into thinking the mini ran and merely overran.
-    if ever_ran:
-        synthesized = {
-            "status": "timeout",
-            "error": "spawn_mini_coder poll timed out waiting for the mini result.",
-        }
-    else:
-        synthesized = {
-            "status": "failed",
-            "error": "executor did not start this mini within the poll window.",
-        }
-    try:
-        with file_lock(state_lock):
-            state = read_agents_state(projects_dir)
-            for directive in state.get("miniCoderDirectives", []):
-                if not isinstance(directive, dict):
-                    continue
-                if str(directive.get("id") or "") == directive_id:
-                    existing = directive.get("result")
-                    # If the executor stamped a real terminal result in the tiny
-                    # window since our last read, PREFER it (do not clobber a done).
-                    if isinstance(existing, dict) and existing:
-                        synthesized = existing
-                    elif directive.get("killRequested"):
-                        # BLOCKER 1 — killRequested WINS over the poll timeout. A human
-                        # hit Stop (the Rust executor set killRequested=true + killed the
-                        # PTY) but hasn't written the aborted_by_human result yet when our
-                        # deadline fires. We must NOT stamp `timeout` here: that would make
-                        # this directive terminal, the executor's later aborted_by_human
-                        # `apply_result` would be refused (already terminal), and the human
-                        # Stop would be silently lost at the MCP return (the coder retries
-                        # instead of stop+escalate). Synthesize aborted_by_human instead so
-                        # the contract honors killRequested-WINS end-to-end.
-                        synthesized = {
-                            "status": "aborted_by_human",
-                            "error": "stopped by human (Stop button) — do not retry, escalate.",
-                        }
-                        directive["status"] = "aborted_by_human"
-                        directive["result"] = synthesized
-                    else:
-                        # FIX 3: re-derive from the directive's CURRENT status under the
-                        # lock (authoritative) — a directive still `pending` here was
-                        # never claimed, so stamp `failed`; otherwise `timeout`.
-                        # BLOCKER F-2: `awaiting_retry` means the mini DID start, ran, and
-                        # triggered a retry chain that is still live at the deadline. It is
-                        # NOT a "never started" failure — stamping `failed`/"did not start"
-                        # would mislead the orchestrator into re-spawning the whole task
-                        # from scratch. Treat it as a `timeout` (still running / retrying).
-                        live_status = str(directive.get("status") or "")
-                        if live_status in ("running", "launching", "awaiting_retry"):
-                            synthesized = {
-                                "status": "timeout",
-                                "error": "spawn_mini_coder poll timed out (mini still running / retry chain in progress).",
-                            }
-                        else:
-                            synthesized = {
-                                "status": "failed",
-                                "error": "executor did not start this mini within the poll window.",
-                            }
-                        directive["status"] = synthesized["status"]
-                        directive["result"] = synthesized
-                    break
-            write_agents_state(projects_dir, state)
-    except McpError:
-        # A failed best-effort stamp must not change the contract: the coder still
-        # gets a terminal outcome it can act on.
-        pass
-    return {"directiveId": directive_id, "result": synthesized}
+    # BOUNDED poll for the executor's terminal verdict. Re-read under the lock each
+    # pass; NEVER hold the lock across the sleep. On the hard cap, return a synthesized
+    # `timeout` outcome the coder can act on (and best-effort mark the directive
+    # timed-out so the executor stops chasing it). Shared verbatim with the blocking
+    # `mini_coder_result` so the timeout/failed/killRequested-WINS semantics match.
+    deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
+    return _await_mini_directive(projects_dir, state_lock, directive_id, deadline)
+
+
+def dispatch_mini_coder_result(
+    projects_dir: Path,
+    state_lock: Path,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """ASYNC (b): collect the outcome of a mini delegated with `spawn_mini_coder(wait=false)`.
+
+    A supervising coder/orchestrator that spawned a mini non-blocking holds its
+    `directiveId`; it watches the mini's activity, sends corrections via
+    `steer_mini_coder`, then calls this to fetch the terminal result.
+
+    Returns:
+      * `wait` true (DEFAULT) → BLOCKS on the SAME bounded poll the blocking
+        `spawn_mini_coder` uses (`_await_mini_directive`: identical deadline,
+        timeout/failed synthesis, and killRequested-WINS) and returns
+        `{directiveId, result}`.
+      * `wait` false → a SINGLE read under the lock: `{directiveId, result}` if the
+        directive is terminal, else `{directiveId, status: "running"}` for a live
+        directive, or `{directiveId, status: "not_found"}` if the id is unknown /
+        evicted.
+
+    The poll/read watches the ROOT id the coder holds: the Rust executor PROPAGATES a
+    retry chain's leaf outcome back onto the awaiting_retry root, so the terminal result
+    lands on `directive_id` itself (same as the blocking `spawn_mini_coder` poll).
+    """
+    # Authn/authz the CALLER (registered coder/orchestrator + valid session token).
+    agent_id, role = require_agent_tool(projects_dir, args, "mini_coder_result")
+    if "mini_coder_result" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use mini_coder_result.")
+
+    directive_id = clean_text(args.get("directive_id"), "Mini-coder directive id", 200)
+    # STRICT bool (mirrors spawn_mini_coder's `wait`): only an explicit `wait: false`
+    # bool does the single non-blocking read; anything else (omitted / truthy non-bool)
+    # BLOCKS on the shared poll.
+    wait = args.get("wait", True) is not False
+
+    # OWNERSHIP CHECK (multi-agent safety): a non-owner querying or blocking on another
+    # agent's directive could receive cross-session state and (on wait=true timeout)
+    # stamp a synthesized result onto the wrong coder's directive. Reject immediately.
+    # The check is combined with the not-found guard (fix #2) for both paths: one read
+    # covers both concerns and avoids a redundant second lock acquisition below.
+    _present, _st, _res = _mini_directive_result(projects_dir, state_lock, directive_id)
+    if not _present:
+        return {"directiveId": directive_id, "status": "not_found"}
+    _owner = _mini_directive_parent_agent_id(projects_dir, state_lock, directive_id)
+    if _owner is not None and _owner != agent_id:
+        raise McpError("mini-coder directive is not owned by this agent.")
+
+    if wait:
+        if _res is not None:
+            # Already terminal — return immediately without entering the bounded poll.
+            return {"directiveId": directive_id, "result": _res}
+        deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
+        return _await_mini_directive(
+            projects_dir, state_lock, directive_id, deadline, caller_tool="mini_coder_result"
+        )
+
+    # wait=false: single-read result (we already have _res from the not-found/owner check).
+    if _res is not None:
+        return {"directiveId": directive_id, "result": _res}
+    return {"directiveId": directive_id, "status": "running"}
 
 
 def dispatch_steer_mini_coder(
@@ -5263,6 +5451,15 @@ def dispatch_steer_mini_coder(
         ]
         if not in_chain:
             return {"directiveId": directive_id, "status": "not_found"}
+        # OWNERSHIP CHECK (multi-agent safety): find the ROOT directive (id == directive_id)
+        # and compare its parentAgentId to the caller. Retry children inherit their
+        # parent's ownership from the root; a retry may not carry parentAgentId itself.
+        _root_d = next(
+            (d for d in in_chain if str(d.get("id") or "") == directive_id), in_chain[0]
+        )
+        _root_owner = str(_root_d.get("parentAgentId") or "")
+        if _root_owner and _root_owner != agent_id:
+            raise McpError("mini-coder directive is not owned by this agent.")
         active = next(
             (d for d in in_chain if str(d.get("status") or "") in _MINI_ACTIVE_STATUSES),
             None,
@@ -6325,6 +6522,9 @@ def handle_tool_call(
     if name == "steer_mini_coder":
         return dispatch_steer_mini_coder(projects_dir, state_lock, args)
 
+    if name == "mini_coder_result":
+        return dispatch_mini_coder_result(projects_dir, state_lock, args)
+
     if name == "visual_check":
         return dispatch_visual_check(projects_dir, state_lock, args)
 
@@ -7165,6 +7365,7 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         backend: str = "",
         allow_oracle: bool = False,
         write: bool = False,
+        wait: bool = True,
         session_token: str = "",
     ) -> dict:
         """Coder-only: delegate a cheap, well-scoped sub-task to a one-shot mini-coder
@@ -7175,12 +7376,18 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         is a non-empty list of PROJECT-RELATIVE paths the mini may touch. `backend`
         optionally overrides the configured mini backend.
 
-        BLOCKS until the mini finishes and returns its terminal result:
+        `wait` (DEFAULT true) BLOCKS until the mini finishes and returns its terminal
+        result:
           - done -> accept/verify its output + filesTouched;
           - needs_clarification -> re-invoke with the answer, or do it yourself;
           - aborted_by_human -> STOP and escalate to the human (never silently
             retry); the mini never contacts the human, you are the only contact point;
           - failed/timeout -> handle as an error.
+
+        Pass `wait=false` to return immediately with {directiveId, status:'running'} so
+        you can SUPERVISE the mini: watch its activity, send corrections with
+        steer_mini_coder(directiveId, message) (or steer_mini_coder(directiveId, 'stop')
+        to abort), then collect the outcome with mini_coder_result(directiveId).
         """
         return call(
             "spawn_mini_coder",
@@ -7192,6 +7399,7 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
                 "backend": backend,
                 "allow_oracle": allow_oracle,
                 "write": write,
+                "wait": wait,
                 "session_token": session_token,
             },
         )
@@ -7223,6 +7431,34 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
                 "role": role,
                 "directive_id": directive_id,
                 "message": message,
+                "session_token": session_token,
+            },
+        )
+
+    @server.tool()
+    def mini_coder_result(
+        agent_id: str,
+        role: str,
+        directive_id: str,
+        wait: bool = True,
+        session_token: str = "",
+    ) -> dict:
+        """Coder/orchestrator-only: collect the outcome of a mini you delegated with
+        spawn_mini_coder(wait=false). Pass the `directive_id` it returned.
+
+        With `wait=true` (default) BLOCKS until the mini reaches a terminal outcome and
+        returns `{directiveId, result}` (same poll/timeout/abort semantics as the
+        blocking spawn_mini_coder). With `wait=false` does a single read: `{directiveId,
+        result}` if terminal, else `{directiveId, status:'running'}` for a live
+        directive, or `{directiveId, status:'not_found'}` if the id is unknown/evicted.
+        """
+        return call(
+            "mini_coder_result",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "directive_id": directive_id,
+                "wait": wait,
                 "session_token": session_token,
             },
         )
