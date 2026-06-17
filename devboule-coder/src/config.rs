@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::agent_loop::{StubExecutor, ToolExecutor};
 use crate::executor::{ExaBackend, FsBackend, RealExecutor};
 use crate::model::{CoderModel, MockModel};
-use crate::model_client::OmlxModel;
+use crate::model_client::{CloudModel, OmlxModel};
 use crate::rmcp_backend::{RmcpBackend, RmcpConfig};
 
 /// Everything the burst loop needs, resolved once at startup.
@@ -34,6 +34,14 @@ pub struct Runtime {
 /// Env var names. Kept here so the binary's configuration surface is in one place.
 const ENV_OMLX_BASE_URL: &str = "DEVBOULE_OMLX_BASE_URL";
 const ENV_OMLX_MODEL: &str = "DEVBOULE_OMLX_MODEL";
+/// CLOUD model env set (the OPT-IN, consent-gated backend). When `DEVBOULE_CLOUD_BASE_URL`
+/// is present, `build_model` builds the [`CloudModel`] (https + bearer) INSTEAD of the
+/// loopback oMLX model — the host UI only sets these when the operator picked Cloud mode and
+/// consented to prompts leaving the machine. The base URL + model are non-secret; the API key
+/// is a SECRET injected via the per-launch process env (off argv) and is NEVER logged.
+const ENV_CLOUD_BASE_URL: &str = "DEVBOULE_CLOUD_BASE_URL";
+const ENV_CLOUD_MODEL: &str = "DEVBOULE_CLOUD_MODEL";
+const ENV_CLOUD_API_KEY: &str = "DEVBOULE_CLOUD_API_KEY";
 const ENV_MCP_PYTHON: &str = "DEVBOULE_MCP_PYTHON";
 const ENV_MCP_ROOT: &str = "DEVBOULE_MCP_ROOT";
 const ENV_MCP_PROJECTS_DIR: &str = "DEVBOULE_MCP_PROJECTS_DIR";
@@ -82,18 +90,50 @@ pub async fn build_runtime() -> Runtime {
     }
 }
 
-/// The model: real loopback oMLX when configured + valid, else the Mock.
+/// The model. PRECEDENCE (a discriminated-backend extension):
+///   1. CLOUD (opt-in) — when `DEVBOULE_CLOUD_BASE_URL` is present, build the
+///      [`CloudModel`] (https + bearer). This is the ONLY path that sends the prompt
+///      off-machine; the host UI sets these vars only after the operator chose Cloud
+///      mode and consented.
+///   2. LOOPBACK oMLX — else when `DEVBOULE_OMLX_BASE_URL` is present, build the
+///      private loopback [`OmlxModel`] (UNCHANGED — byte-identical to before).
+///   3. Mock — else the GPU-free / server-free default.
+///
+/// 3b — plan-first bias. Any non-empty `DEVBOULE_PLAN_FIRST` (the launch sets "1")
+/// turns it on; absent/blank keeps the standing prompt unchanged. It applies to BOTH
+/// real models (each POSTs the system prompt); the Mock never plans.
 fn build_model() -> Arc<dyn CoderModel> {
+    let plan_first = env_nonempty(ENV_PLAN_FIRST).is_some();
+
+    // 1. CLOUD first (opt-in). The PRESENCE of the cloud base URL selects this path;
+    // a misconfiguration (bad https/host, empty model, missing key) fails LOUD to the
+    // Mock rather than silently routing an unauthenticated request off-machine.
+    if let Some(cloud_base) = env_nonempty(ENV_CLOUD_BASE_URL) {
+        let cloud_model = std::env::var(ENV_CLOUD_MODEL).unwrap_or_default();
+        // The key comes ONLY from env and is NEVER logged (errors below print no key).
+        let cloud_key = std::env::var(ENV_CLOUD_API_KEY).unwrap_or_default();
+        match CloudModel::new(&cloud_base, cloud_model, cloud_key, plan_first) {
+            Ok(m) => return Arc::new(m),
+            Err(e) => {
+                let plan_note = if plan_first {
+                    " (\"Plan first\" was requested but is now INACTIVE — the Mock does not plan)"
+                } else {
+                    ""
+                };
+                // `e` is a validation message (scheme/host/empty-field); it NEVER
+                // contains the key value.
+                eprintln!("devboule: Cloud model disabled ({e}); using MockModel{plan_note}");
+                return Arc::new(MockModel::new());
+            }
+        }
+    }
+
+    // 2. LOOPBACK oMLX (the private default) — UNCHANGED.
     let base_url = std::env::var(ENV_OMLX_BASE_URL).ok();
     let Some(base_url) = base_url.filter(|s| !s.trim().is_empty()) else {
         return Arc::new(MockModel::new());
     };
     let model_id = std::env::var(ENV_OMLX_MODEL).unwrap_or_default();
-    // 3b — plan-first bias. Any non-empty DEVBOULE_PLAN_FIRST (the launch sets "1")
-    // turns it on; absent/blank keeps the standing prompt unchanged. Only the REAL
-    // oMLX model uses the system prompt, so the bias is meaningful only here (the
-    // Mock fallback never POSTs a prompt).
-    let plan_first = env_nonempty(ENV_PLAN_FIRST).is_some();
     match OmlxModel::new(&base_url, model_id, plan_first) {
         Ok(m) => Arc::new(m),
         Err(e) => {
@@ -161,7 +201,7 @@ async fn build_executor(model: Arc<dyn CoderModel>) -> (Arc<dyn ToolExecutor>, b
         projects_dir,
         agent_id: env_nonempty(ENV_AGENT_ID).unwrap_or_else(|| "devboule".to_string()),
         role: "orchestrator".to_string(),
-        model: std::env::var(ENV_OMLX_MODEL).unwrap_or_default(),
+        model: resolve_register_model(),
         // The app-issued launch token the managed launch requires for
         // agent_register. Empty on the no-server / unmanaged dev path (the server
         // either has the compat kill switch on or no session hash to match).
@@ -211,6 +251,16 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The model id declared to the Oracle's `agent_register` (for the dashboard). Prefer the
+/// loopback oMLX model, but FALL BACK to the cloud model id: in Cloud mode `DEVBOULE_OMLX_MODEL`
+/// is unset, so without this fallback an EMPTY model string would be registered. Empty when
+/// neither is set (the Mock/no-config path), matching the prior behavior for non-cloud.
+fn resolve_register_model() -> String {
+    env_nonempty(ENV_OMLX_MODEL)
+        .or_else(|| env_nonempty(ENV_CLOUD_MODEL))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +279,39 @@ mod tests {
         assert_eq!(env_nonempty("DEVBOULE_TEST_BLANK").as_deref(), Some("x"));
         std::env::remove_var("DEVBOULE_TEST_BLANK");
         assert_eq!(env_nonempty("DEVBOULE_TEST_BLANK"), None);
+    }
+
+    #[test]
+    fn resolve_register_model_falls_back_to_cloud_model() {
+        // FIX 5: in Cloud mode DEVBOULE_OMLX_MODEL is unset, so the register model must fall
+        // back to DEVBOULE_CLOUD_MODEL instead of registering an empty string. Env is
+        // process-global; this test owns BOTH vars and restores them, so it is serialized by
+        // setting/removing the exact keys it asserts on (no shared key with other tests).
+        let prev_omlx = std::env::var(ENV_OMLX_MODEL).ok();
+        let prev_cloud = std::env::var(ENV_CLOUD_MODEL).ok();
+
+        // Only the cloud model is set -> it is the registered model.
+        std::env::remove_var(ENV_OMLX_MODEL);
+        std::env::set_var(ENV_CLOUD_MODEL, "gpt-cloud-4");
+        assert_eq!(resolve_register_model(), "gpt-cloud-4");
+
+        // oMLX wins when both are set (loopback default takes precedence).
+        std::env::set_var(ENV_OMLX_MODEL, "local-mlx");
+        assert_eq!(resolve_register_model(), "local-mlx");
+
+        // Neither set -> empty (the Mock/no-config path, unchanged for non-cloud).
+        std::env::remove_var(ENV_OMLX_MODEL);
+        std::env::remove_var(ENV_CLOUD_MODEL);
+        assert_eq!(resolve_register_model(), "");
+
+        // Restore.
+        match prev_omlx {
+            Some(v) => std::env::set_var(ENV_OMLX_MODEL, v),
+            None => std::env::remove_var(ENV_OMLX_MODEL),
+        }
+        match prev_cloud {
+            Some(v) => std::env::set_var(ENV_CLOUD_MODEL, v),
+            None => std::env::remove_var(ENV_CLOUD_MODEL),
+        }
     }
 }

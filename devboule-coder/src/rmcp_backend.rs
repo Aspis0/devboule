@@ -522,6 +522,23 @@ mod tests {
             args.get("role").and_then(|v| v.as_str()),
             Some("orchestrator")
         );
+        // FIX 5: the configured model id (resolved in config.rs, falling back to the cloud
+        // model in Cloud mode) must ride into the register args under `model` — never empty
+        // when a model is configured.
+        assert_eq!(args.get("model").and_then(|v| v.as_str()), Some("qwen"));
+    }
+
+    #[test]
+    fn register_args_carry_the_configured_model_including_cloud() {
+        // A Cloud-mode launch resolves the cloud model id into RmcpConfig.model (config.rs).
+        // build_register_args must forward whatever it is verbatim — here a cloud model id.
+        let mut cfg = test_config("tok");
+        cfg.model = "openrouter/auto".into();
+        let args = build_register_args(&cfg);
+        assert_eq!(
+            args.get("model").and_then(|v| v.as_str()),
+            Some("openrouter/auto")
+        );
     }
 
     #[test]

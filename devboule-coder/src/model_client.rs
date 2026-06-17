@@ -143,6 +143,123 @@ pub fn validate_omlx_base_url(base_url: &str) -> Result<String, String> {
     Ok(trimmed.strip_suffix('/').unwrap_or(trimmed).to_string())
 }
 
+/// Validate + NORMALIZE a CLOUD base URL (trailing slash stripped), or a human error
+/// string. This is the OPT-IN, consent-gated counterpart to
+/// [`validate_omlx_base_url`]: where the loopback validator FORBIDS leaving the
+/// machine, the cloud validator requires it — `https://` (TLS, since a real provider
+/// is never on loopback) and a NON-loopback host (a loopback host here is a
+/// misconfiguration, not a cloud endpoint). The same control/bidi/invisible char
+/// rejection and the same userinfo-trick (`user@host`) rejection apply, so a
+/// credential or a hidden-semantics host can never be smuggled into the URL.
+///
+/// This NEVER touches the loopback path: a Local-mode user goes through
+/// `validate_omlx_base_url` exclusively and sends nothing off-machine. The cloud
+/// path is reached ONLY when the operator explicitly configured Cloud mode and
+/// consented (see the host UI's mandatory disclosure).
+pub fn validate_cloud_base_url(base_url: &str) -> Result<String, String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err("Cloud base URL must not be empty.".into());
+    }
+    if trimmed.len() > OMLX_BASE_URL_MAX_LEN {
+        return Err(format!(
+            "Cloud base URL must be at most {OMLX_BASE_URL_MAX_LEN} characters."
+        ));
+    }
+    if trimmed.chars().any(is_forbidden_url_char) {
+        return Err(
+            "Cloud base URL must not contain control, bidi or invisible characters.".into(),
+        );
+    }
+
+    // Scheme: https ONLY. A cloud provider is reached over TLS; http would send the
+    // prompt (which can carry file content) in clear text off the machine.
+    let rest = match trimmed.strip_prefix("https://") {
+        Some(r) => r,
+        None => return Err("Cloud base URL must start with https:// (TLS required).".into()),
+    };
+
+    // Authority = up to the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("Cloud base URL must include a host.".into());
+    }
+    // Reject a userinfo trick (`user:pass@host`, `host@evil.com`): credentials must
+    // never live in the URL (they go in the Authorization header), and an `@` also
+    // hides the real host after it.
+    if authority.contains('@') {
+        return Err("Cloud base URL must not contain credentials (no '@' / userinfo).".into());
+    }
+
+    // Split off an optional `:port`. An IPv6 literal `[..]` is rejected outright: a
+    // cloud provider is addressed by hostname, and a bare IP literal here is far more
+    // likely an SSRF attempt than a real endpoint.
+    if authority.starts_with('[') {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    let mut parts = authority.splitn(2, ':');
+    let host = parts.next().unwrap_or("");
+    if !is_valid_optional_port(parts.next()) {
+        return Err("Cloud base URL has an invalid :port.".into());
+    }
+
+    // The host must be a real public hostname: reject loopback (a loopback host in
+    // Cloud mode is a misconfiguration — Local mode is the loopback path), reject a
+    // bare IPv4 literal (SSRF surface), and require at least one dot so a single-label
+    // intranet name (`internal`, `metadata`) cannot be targeted.
+    if host.is_empty() {
+        return Err("Cloud base URL must include a host.".into());
+    }
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "localhost" {
+        return Err("Cloud base URL host must be a public provider host, not loopback.".into());
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    // Rust's `Ipv4Addr` parser REJECTS leading-zero dotted-quads (`01.02.03.04`,
+    // `010.0.0.1`, `0177.0.0.1`) and out-of-range quads (`999.999.999.999`), so those
+    // slip past the parse above and look like a hostname (all labels are alphanumeric).
+    // Reject any host that is exactly 4 dot-separated all-ASCII-digit labels: a numeric
+    // dotted-quad is always an IP-literal-disguised target, never a real provider host.
+    let numeric_quad: Vec<&str> = host.split('.').collect();
+    if numeric_quad.len() == 4
+        && numeric_quad
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    // PARTIAL SSRF mitigation: deny the well-known cloud-metadata FQDN and the conventional
+    // intranet suffixes `.internal` / `.local`. This is NOT complete SSRF protection —
+    // COMPLETE protection requires post-DNS-resolution IP filtering (reject RFC1918 /
+    // link-local / loopback RESOLVED IPs) in the HTTP client's connect layer (a custom
+    // reqwest resolver). That is a deliberate follow-up and is intentionally NOT done here.
+    if host_lower == "metadata.google.internal"
+        || host_lower.ends_with(".internal")
+        || host_lower.ends_with(".local")
+    {
+        return Err("Cloud base URL host must be a public provider host, not an intranet/metadata name.".into());
+    }
+    if !host.contains('.') {
+        return Err("Cloud base URL host must be a fully-qualified domain name.".into());
+    }
+    // Each label must be a sane DNS label (alnum + hyphen, not empty). This bars
+    // smuggled path/query bytes and keeps the SigV4-style key surface clean.
+    let labels_ok = host.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    if !labels_ok {
+        return Err("Cloud base URL host is not a valid domain name.".into());
+    }
+
+    // Normalize: strip a single trailing slash so `<base>/chat/completions` is clean.
+    Ok(trimmed.strip_suffix('/').unwrap_or(trimmed).to_string())
+}
+
 /// The real loopback chat-completions model. Holds the validated+normalized base
 /// URL, the model id, a rustls reqwest client, and the plan-first prompt bias.
 pub struct OmlxModel {
@@ -191,14 +308,24 @@ impl OmlxModel {
     /// OpenAI-compatible `messages` and a small request envelope. Separated from
     /// the live POST so the request shape is unit-testable without inference.
     pub fn build_request_body(&self, transcript: &Transcript) -> Value {
-        json!({
-            "model": self.model,
-            "messages": build_messages(transcript, self.plan_first),
-            "max_tokens": MAX_TOKENS,
-            "temperature": 0.2,
-            "stream": false,
-        })
+        build_chat_body(&self.model, transcript, self.plan_first)
     }
+}
+
+/// PURE, model-agnostic chat-completions body builder shared by the loopback
+/// [`OmlxModel`] and the [`CloudModel`]: the request SHAPE (model id + rendered
+/// messages + the sampling envelope) is identical across backends — only the
+/// transport (loopback http vs. https + Authorization header) differs. Centralizing
+/// it here guarantees the cloud path sends EXACTLY the body the loopback path builds,
+/// so a body change can never drift between the two backends.
+fn build_chat_body(model: &str, transcript: &Transcript, plan_first: bool) -> Value {
+    json!({
+        "model": model,
+        "messages": build_messages(transcript, plan_first),
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.2,
+        "stream": false,
+    })
 }
 
 /// Render a [`Transcript`] into OpenAI chat `messages`: the system prompt, the
@@ -360,6 +487,133 @@ impl OmlxModel {
             return Err(format!("HTTP {}", status.as_u16()));
         }
         parse_chat_response(&text)
+    }
+}
+
+/// The CLOUD chat-completions model: the OPT-IN, consent-gated counterpart to
+/// [`OmlxModel`]. It talks to an HTTPS OpenAI-compatible endpoint (e.g. OpenRouter)
+/// with an `Authorization: Bearer <key>` header, sending the SAME request body the
+/// loopback client builds (via the shared [`build_chat_body`]) and parsing the SAME
+/// response shape (via [`parse_chat_response`]). Only the transport differs:
+/// https + TLS + the bearer header instead of plain loopback http.
+///
+/// PRIVACY: unlike the loopback path, this DOES send the prompt (which can carry file
+/// content) off the machine to the configured provider. It is constructed ONLY when
+/// the operator explicitly configured Cloud mode (the host UI shows a mandatory
+/// disclosure before this is reachable). The API key is held in memory, set ONLY from
+/// the environment, and NEVER logged: the [`std::fmt::Debug`] impl redacts it, and no
+/// error string ever embeds it.
+pub struct CloudModel {
+    base_url: String,
+    model: String,
+    /// The bearer credential. Set ONLY from `DEVBOULE_CLOUD_API_KEY` (env). Never
+    /// logged, never serialized, redacted in Debug.
+    api_key: String,
+    client: reqwest::Client,
+    plan_first: bool,
+}
+
+impl std::fmt::Debug for CloudModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the key so a `{:?}` of the model (or anything holding it) can never
+        // print the credential to a log/diagnostic.
+        f.debug_struct("CloudModel")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("plan_first", &self.plan_first)
+            .finish()
+    }
+}
+
+impl CloudModel {
+    /// Build from an HTTPS base URL + model id + bearer key + the plan-first bias.
+    /// The base URL is validated as an https NON-loopback host (the cloud invariant);
+    /// the key is validated non-empty (a blank key would produce silent 401s). An
+    /// invalid input is an error so a misconfiguration fails LOUD rather than silently
+    /// sending an unauthenticated request off-machine.
+    pub fn new(
+        base_url: &str,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        plan_first: bool,
+    ) -> Result<Self, String> {
+        let base_url = validate_cloud_base_url(base_url)?;
+        let model = model.into();
+        if model.trim().is_empty() {
+            return Err("Cloud model id must not be empty.".into());
+        }
+        let api_key = api_key.into();
+        if api_key.trim().is_empty() {
+            return Err("Cloud API key must not be empty.".into());
+        }
+        let client = reqwest::Client::builder()
+            // Same bound as the loopback client so a stalled cloud call cannot wedge
+            // the burst's wall-clock check. A cloud round-trip can be slower than
+            // loopback, but 60s still caps a hung connection.
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        Ok(Self {
+            base_url,
+            model,
+            api_key,
+            client,
+            plan_first,
+        })
+    }
+
+    /// The chat-completions endpoint URL.
+    fn endpoint(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
+    }
+
+    /// PURE request-body builder: identical shape to the loopback client's, via the
+    /// shared [`build_chat_body`]. Unit-testable without inference or a network.
+    pub fn build_request_body(&self, transcript: &Transcript) -> Value {
+        build_chat_body(&self.model, transcript, self.plan_first)
+    }
+
+    /// POST one chat-completions request (https + bearer) and return the assistant
+    /// text. The bearer header carries the key; it is NEVER put on the URL or logged.
+    async fn run_completion(&self, transcript: &Transcript) -> Result<String, String> {
+        let body = self.build_request_body(transcript);
+        let resp = self
+            .client
+            .post(self.endpoint())
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        let status = resp.status();
+        let text =
+            crate::executor::read_body_capped(resp, crate::executor::HTTP_BODY_CAP).await?;
+        if !status.is_success() {
+            // Status code only — never the body, which a provider may echo the prompt
+            // or key fragment into.
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+        parse_chat_response(&text)
+    }
+}
+
+#[async_trait]
+impl CoderModel for CloudModel {
+    async fn reply(&self, prompt: String, tx: mpsc::Sender<String>) {
+        let t = Transcript::new(prompt);
+        let text = match self.run_completion(&t).await {
+            Ok(s) => s,
+            Err(e) => format!("[model error: {e}]"),
+        };
+        let _ = tx.send(text).await;
+    }
+
+    async fn next_output(&self, transcript: &Transcript) -> String {
+        match self.run_completion(transcript).await {
+            Ok(text) => text,
+            Err(e) => format!("[model request failed: {e}]"),
+        }
     }
 }
 
@@ -607,5 +861,168 @@ mod tests {
     fn new_rejects_invalid_endpoint() {
         assert!(OmlxModel::new("https://1.2.3.4", "m", false).is_err());
         assert!(OmlxModel::new("http://127.0.0.1:8000", "", false).is_err());
+    }
+
+    // --- cloud base-url validator ---------------------------------------------
+
+    #[test]
+    fn cloud_validator_accepts_https_public_host() {
+        for ok in [
+            "https://openrouter.ai/api/v1",
+            "https://api.openai.com/v1",
+            "https://api.together.xyz/v1",
+            "https://gateway.example.com:8443/v1",
+            "https://openrouter.ai/api/v1/", // trailing slash normalized off
+        ] {
+            assert!(validate_cloud_base_url(ok).is_ok(), "should accept {ok}");
+        }
+        assert_eq!(
+            validate_cloud_base_url("https://openrouter.ai/api/v1/").unwrap(),
+            "https://openrouter.ai/api/v1"
+        );
+    }
+
+    #[test]
+    fn cloud_validator_rejects_non_https() {
+        // http (clear text off-machine) and other schemes must fail.
+        assert!(validate_cloud_base_url("http://openrouter.ai/api/v1").is_err());
+        assert!(validate_cloud_base_url("ftp://openrouter.ai").is_err());
+        assert!(validate_cloud_base_url("openrouter.ai/api/v1").is_err());
+    }
+
+    #[test]
+    fn cloud_validator_rejects_loopback_as_cloud() {
+        // A loopback host in CLOUD mode is a misconfiguration (Local mode is the
+        // loopback path). Reject localhost, 127.0.0.0/8 and [::1].
+        for bad in [
+            "https://localhost/v1",
+            "https://localhost:8000/v1",
+            "https://127.0.0.1/v1",
+            "https://127.0.0.1:8000/v1",
+            "https://[::1]:8000/v1",
+        ] {
+            assert!(
+                validate_cloud_base_url(bad).is_err(),
+                "loopback {bad} must be rejected as a cloud host"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_validator_rejects_ip_literals_and_single_label_hosts() {
+        for bad in [
+            "https://1.2.3.4/v1",          // bare IPv4 -> SSRF surface
+            "https://1.2.3.4:8443/v1",     // bare IPv4 with port
+            "https://[2001:db8::1]/v1",    // IPv6 literal
+            "https://internal/v1",         // single-label intranet name
+            "https://metadata/v1",         // single-label (cloud-metadata-ish)
+        ] {
+            assert!(
+                validate_cloud_base_url(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_validator_rejects_numeric_quad_ip_literals_with_leading_zeros() {
+        // Rust's Ipv4Addr parser REJECTS leading-zero / out-of-range dotted-quads, so
+        // without the all-numeric-4-label fallback these slip past `parse::<Ipv4Addr>()`
+        // and look like a hostname. They must be rejected as IP literals.
+        for bad in [
+            "https://01.02.03.04/v1",
+            "https://010.0.0.1/v1",
+            "https://0177.0.0.1/v1",
+            "https://999.999.999.999/v1",
+            "https://01.02.03.04:8443/v1",
+        ] {
+            assert!(
+                validate_cloud_base_url(bad).is_err(),
+                "numeric-quad IP literal {bad} must be rejected"
+            );
+        }
+        // A real public hostname is still accepted (the fallback must not over-reject).
+        assert!(validate_cloud_base_url("https://api.openai.com/v1").is_ok());
+        assert!(validate_cloud_base_url("https://openrouter.ai/api/v1").is_ok());
+    }
+
+    #[test]
+    fn cloud_validator_rejects_metadata_and_intranet_suffix_hosts() {
+        // PARTIAL SSRF mitigation: the cloud-metadata FQDN + `.internal` / `.local`
+        // suffixes are denied even though they are FQDN-shaped.
+        for bad in [
+            "https://metadata.google.internal/computeMetadata/v1",
+            "https://foo.internal/v1",
+            "https://bar.local/v1",
+            "https://METADATA.GOOGLE.INTERNAL/v1", // case-insensitive
+        ] {
+            assert!(
+                validate_cloud_base_url(bad).is_err(),
+                "intranet/metadata host {bad} must be rejected"
+            );
+        }
+        // Real public hosts still pass.
+        assert!(validate_cloud_base_url("https://api.openai.com/v1").is_ok());
+        assert!(validate_cloud_base_url("https://openrouter.ai/api/v1").is_ok());
+    }
+
+    #[test]
+    fn cloud_validator_rejects_userinfo_and_bad_chars() {
+        assert!(validate_cloud_base_url("https://user:pass@openrouter.ai/v1").is_err());
+        assert!(validate_cloud_base_url("https://openrouter.ai@evil.com/v1").is_err());
+        assert!(validate_cloud_base_url("https://open\u{202e}router.ai/v1").is_err());
+        assert!(validate_cloud_base_url("   ").is_err());
+        let long = format!("https://openrouter.ai/{}", "a".repeat(OMLX_BASE_URL_MAX_LEN));
+        assert!(validate_cloud_base_url(&long).is_err());
+    }
+
+    #[test]
+    fn cloud_validator_rejects_bad_port() {
+        assert!(validate_cloud_base_url("https://openrouter.ai:/v1").is_err());
+        assert!(validate_cloud_base_url("https://openrouter.ai:99999/v1").is_err());
+        assert!(validate_cloud_base_url("https://openrouter.ai:abc/v1").is_err());
+    }
+
+    // --- cloud model -----------------------------------------------------------
+
+    #[test]
+    fn cloud_new_rejects_bad_inputs() {
+        // Loopback / http base URL, empty model, empty key all fail loud.
+        assert!(CloudModel::new("http://openrouter.ai/v1", "m", "k", false).is_err());
+        assert!(CloudModel::new("https://127.0.0.1/v1", "m", "k", false).is_err());
+        assert!(CloudModel::new("https://openrouter.ai/v1", "", "k", false).is_err());
+        assert!(CloudModel::new("https://openrouter.ai/v1", "m", "  ", false).is_err());
+        assert!(CloudModel::new("https://openrouter.ai/api/v1", "m", "k", false).is_ok());
+    }
+
+    #[test]
+    fn cloud_body_is_byte_identical_to_loopback_body() {
+        // The whole point of the shared builder: a cloud request body matches the
+        // loopback one for the same model + transcript + plan_first. Only the
+        // transport (https + bearer) differs, NOT the body.
+        let omlx = OmlxModel::new("http://127.0.0.1:8000/v1", "shared-model", true).unwrap();
+        let cloud =
+            CloudModel::new("https://openrouter.ai/api/v1", "shared-model", "sk-test", true)
+                .unwrap();
+        let transcript = Transcript::new("do the thing".to_string());
+        assert_eq!(
+            omlx.build_request_body(&transcript),
+            cloud.build_request_body(&transcript),
+            "cloud body must equal the loopback body for the same inputs"
+        );
+    }
+
+    #[test]
+    fn cloud_debug_redacts_the_api_key() {
+        // A `{:?}` of the model must never print the credential.
+        let cloud =
+            CloudModel::new("https://openrouter.ai/api/v1", "m", "sk-super-secret", false)
+                .unwrap();
+        let dbg = format!("{cloud:?}");
+        assert!(dbg.contains("<redacted>"), "key must be redacted: {dbg}");
+        assert!(
+            !dbg.contains("sk-super-secret"),
+            "the raw key must never appear in Debug: {dbg}"
+        );
     }
 }

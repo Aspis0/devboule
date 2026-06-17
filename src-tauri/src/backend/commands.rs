@@ -1600,6 +1600,37 @@ pub fn delete_exa_key(
     vault::delete_exa_key()
 }
 
+// Cloud main-coder API key for the local Devboule orchestrator's OPT-IN Cloud mode.
+// WRITE-ONLY from the UI: the key value is never returned. `get_*_status` reports
+// present/absent, `save_*` SETs it, `delete_*` CLEARs it. The orchestrator launch reads
+// the key (backend-internal `vault::read_cloud_llm_key`) and sets `DEVBOULE_CLOUD_API_KEY`
+// only when present AND the configured backend is `cloud`.
+
+#[tauri::command]
+pub fn get_cloud_llm_key_status(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::cloud_llm_key_status()
+}
+
+#[tauri::command]
+pub fn save_cloud_llm_key(
+    state: State<'_, BackendState>,
+    key: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::save_cloud_llm_key(&key)
+}
+
+#[tauri::command]
+pub fn delete_cloud_llm_key(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::delete_cloud_llm_key()
+}
+
 #[tauri::command]
 pub fn get_oracle_llm_settings(
     state: State<'_, BackendState>,

@@ -83,6 +83,16 @@ fn exa_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "provider:exa").map_err(|_| vault_error("open"))
 }
 
+/// The CLOUD LLM bearer key for the LOCAL Devboule orchestrator's OPT-IN Cloud mode.
+/// Stored under `provider:cloud_llm` (the same `provider:*` convention as `provider:exa`
+/// and `provider:github`). The launch reads it (`read_cloud_llm_key`) and sets
+/// `DEVBOULE_CLOUD_API_KEY` ONLY when present + the configured backend is `cloud`, so a
+/// missing key keeps the orchestrator on its safe Mock path (the binary refuses to send an
+/// unauthenticated request off-machine).
+fn cloud_llm_key_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, "provider:cloud_llm").map_err(|_| vault_error("open"))
+}
+
 fn device_private_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "device:local_private_key:v1").map_err(|_| vault_error("open"))
 }
@@ -329,6 +339,104 @@ pub fn exa_key_status() -> Result<AuxCredentialStatus, String> {
         Err(e) => Ok(AuxCredentialStatus {
             id: EXA_KEY_ID.into(),
             label: EXA_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(e),
+        }),
+    }
+}
+
+// --- Cloud LLM key (opt-in Cloud mode for the local main coder) --------------
+//
+// Stored under `provider:cloud_llm` (the `provider:*` convention). WRITE-ONLY from
+// the UI: `save`/`delete` mutate it and `cloud_llm_key_status` reports present/absent
+// ONLY — the raw value is NEVER returned to the frontend. The launch reads it via
+// `read_cloud_llm_key` (backend-internal) and exports `DEVBOULE_CLOUD_API_KEY` to the
+// orchestrator child ONLY when present AND the configured backend is `cloud`. This
+// mirrors the Exa key block field-for-field.
+
+const CLOUD_LLM_KEY_ID: &str = "cloud_llm_api_key";
+const CLOUD_LLM_KEY_LABEL: &str = "Cloud main-coder API key";
+
+pub fn save_cloud_llm_key(key: &str) -> Result<AuxCredentialStatus, String> {
+    let cleaned = key.trim();
+    // Same minimum-length + no-whitespace guard the Exa key uses: a too-short /
+    // whitespace-bearing value is a paste error, not a real bearer key.
+    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
+        return Ok(AuxCredentialStatus {
+            id: CLOUD_LLM_KEY_ID.into(),
+            label: CLOUD_LLM_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Cloud API key is too short or contains whitespace.".into()),
+        });
+    }
+    // Reject other ASCII control characters (`\x01`, `\x7f`, …) the whitespace check above
+    // misses. reqwest would later refuse such a header value gracefully (no leak, no panic),
+    // but the user only sees confusing repeated "request failed" with no diagnostic — fail
+    // LOUD at save time instead. A real bearer key is never control-bearing.
+    if cleaned.chars().any(|c| c.is_control()) {
+        return Ok(AuxCredentialStatus {
+            id: CLOUD_LLM_KEY_ID.into(),
+            label: CLOUD_LLM_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Cloud API key must not contain control characters.".into()),
+        });
+    }
+    cloud_llm_key_entry()?
+        .set_password(cleaned)
+        .map_err(|_| vault_error("save"))?;
+    cloud_llm_key_status()
+}
+
+pub fn delete_cloud_llm_key() -> Result<AuxCredentialStatus, String> {
+    match cloud_llm_key_entry()?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err(vault_error("delete")),
+    }
+    cloud_llm_key_status()
+}
+
+/// Backend-INTERNAL reader: returns the raw key (or `None`). Used ONLY by the
+/// orchestrator launch to set `DEVBOULE_CLOUD_API_KEY`. NOT exposed as a command — the
+/// UI can only ever see present/absent via [`cloud_llm_key_status`].
+pub fn read_cloud_llm_key() -> Result<Option<String>, String> {
+    match cloud_llm_key_entry()?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(_) => Err(vault_error("read")),
+    }
+}
+
+/// Present/absent status ONLY — never the value. Mirrors [`exa_key_status`].
+pub fn cloud_llm_key_status() -> Result<AuxCredentialStatus, String> {
+    match read_cloud_llm_key() {
+        Ok(Some(_)) => Ok(AuxCredentialStatus {
+            id: CLOUD_LLM_KEY_ID.into(),
+            label: CLOUD_LLM_KEY_LABEL.into(),
+            configured: true,
+            status: "configured".into(),
+            last_checked_at: Some(now()),
+            message: None,
+        }),
+        Ok(None) => Ok(AuxCredentialStatus {
+            id: CLOUD_LLM_KEY_ID.into(),
+            label: CLOUD_LLM_KEY_LABEL.into(),
+            configured: false,
+            status: "missing".into(),
+            last_checked_at: Some(now()),
+            message: Some(
+                "Required for the local main coder's opt-in Cloud mode (prompts leave the machine)."
+                    .into(),
+            ),
+        }),
+        Err(e) => Ok(AuxCredentialStatus {
+            id: CLOUD_LLM_KEY_ID.into(),
+            label: CLOUD_LLM_KEY_LABEL.into(),
             configured: false,
             status: "error".into(),
             last_checked_at: Some(now()),
@@ -1781,5 +1889,81 @@ mod tests {
         assert_eq!(after_clear.status, "missing");
         assert!(exa_key_status().unwrap().configured == false);
         assert_eq!(read_exa_key().unwrap(), None);
+    }
+
+    // --- Cloud LLM key (opt-in Cloud mode) ------------------------------------
+
+    #[test]
+    fn cloud_llm_key_save_rejects_too_short_or_whitespace_without_leaking_value() {
+        // The reject path does NOT touch the keyring (it returns before set_password),
+        // so it is safe to run unconditionally. The status must carry the present/absent
+        // shape and NEVER echo the rejected value back.
+        let short = save_cloud_llm_key("abc").expect("save returns a status, not Err");
+        assert!(!short.configured);
+        assert_eq!(short.status, "error");
+        let whitespace = save_cloud_llm_key("has space inside it").expect("status");
+        assert!(!whitespace.configured);
+        assert_eq!(whitespace.status, "error");
+        for status in [&short, &whitespace] {
+            let json = serde_json::to_string(status).unwrap();
+            assert!(!json.contains("has space inside it"));
+            assert_eq!(status.id, "cloud_llm_api_key");
+        }
+    }
+
+    #[test]
+    fn cloud_llm_key_save_rejects_control_characters_without_leaking_value() {
+        // A key carrying an embedded ASCII control char (`\x01`) is a paste/corruption
+        // error reqwest would only reject later as an opaque request failure. The save
+        // path rejects it up front BEFORE touching the keyring, and never echoes the value.
+        let with_ctrl = "sk-cloud\u{0001}key-1234";
+        let status = save_cloud_llm_key(with_ctrl).expect("save returns a status, not Err");
+        assert!(!status.configured);
+        assert_eq!(status.status, "error");
+        assert_eq!(status.id, "cloud_llm_api_key");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains('\u{0001}'));
+        assert!(!json.contains("sk-cloud"));
+        // DEL (0x7f) is also a control char and must be rejected.
+        let with_del = "sk-cloud\u{007f}key-5678";
+        let del_status = save_cloud_llm_key(with_del).expect("status");
+        assert!(!del_status.configured);
+        assert_eq!(del_status.status, "error");
+    }
+
+    #[test]
+    fn cloud_llm_status_struct_never_carries_the_value() {
+        // Present/absent ONLY — the serialized form must not include a value/key field.
+        let status = cloud_llm_key_status().expect("status");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"configured\""));
+        assert!(!json.contains("\"value\""));
+        assert!(!json.contains("\"key\""));
+    }
+
+    #[test]
+    #[ignore = "mutates the real OS credential store; run with --ignored to verify the Cloud key round-trip"]
+    fn cloud_llm_key_round_trips_set_status_clear_status() {
+        // Full lifecycle against the REAL keyring: set -> status(present) -> clear ->
+        // status(absent). The raw value is NEVER returned by status — only the backend-
+        // internal read_cloud_llm_key (used by the launch) ever sees it.
+        let key = "sk-cloud-test-key-abcdef1234567890";
+        let _ = delete_cloud_llm_key();
+        assert!(!cloud_llm_key_status().unwrap().configured, "must start absent");
+
+        let after_set = save_cloud_llm_key(key).unwrap();
+        assert!(after_set.configured, "set must report present");
+        assert_eq!(after_set.status, "configured");
+        assert!(after_set.message.is_none());
+        let status_present = cloud_llm_key_status().unwrap();
+        assert!(status_present.configured);
+        assert!(!serde_json::to_string(&status_present).unwrap().contains(key));
+        assert_eq!(read_cloud_llm_key().unwrap().as_deref(), Some(key));
+
+        let after_clear = delete_cloud_llm_key().unwrap();
+        assert!(!after_clear.configured, "clear must report absent");
+        assert_eq!(after_clear.status, "missing");
+        assert!(!cloud_llm_key_status().unwrap().configured);
+        assert_eq!(read_cloud_llm_key().unwrap(), None);
     }
 }

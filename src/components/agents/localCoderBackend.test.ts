@@ -110,6 +110,78 @@ describe("validateLocalBackend — omlx", () => {
   });
 });
 
+describe("validateLocalBackend — cloud (opt-in)", () => {
+  it("requires both a model and an https non-loopback base URL", () => {
+    expect(validateLocalBackend({ kind: "cloud", model: "m", baseUrl: "" }).ok).toBe(false);
+    expect(
+      validateLocalBackend({ kind: "cloud", model: "", baseUrl: "https://openrouter.ai/api/v1" })
+        .ok,
+    ).toBe(false);
+  });
+
+  it("accepts an https public host and normalizes (trailing slash stripped, model trimmed)", () => {
+    const ok = validateLocalBackend({
+      kind: "cloud",
+      model: "  openrouter/auto  ",
+      baseUrl: "  https://openrouter.ai/api/v1/  ",
+    });
+    expect(ok.ok).toBe(true);
+    expect(ok.value).toEqual({
+      kind: "cloud",
+      model: "openrouter/auto",
+      baseUrl: "https://openrouter.ai/api/v1",
+    });
+  });
+
+  it("rejects http / loopback / IP literal / single-label / userinfo (mirrors Rust)", () => {
+    for (const bad of [
+      "http://openrouter.ai/api/v1", // http (clear text)
+      "https://localhost:8000/v1", // loopback as cloud
+      "https://127.0.0.1/v1", // loopback IP
+      "https://1.2.3.4/v1", // bare IPv4 (SSRF)
+      "https://[2001:db8::1]/v1", // IPv6 literal
+      "https://internal/v1", // single-label intranet
+      "https://user:pass@openrouter.ai/v1", // credentials in URL
+      "https://openrouter.ai@evil.com/v1", // host-confusion userinfo
+      "ftp://openrouter.ai/v1", // wrong scheme
+      // Numeric dotted-quad IP literals Rust's Ipv4Addr parser rejects (leading zeros /
+      // out of range) and which therefore need the all-numeric-4-label fallback.
+      "https://01.02.03.04/v1",
+      "https://010.0.0.1/v1",
+      "https://0177.0.0.1/v1",
+      "https://999.999.999.999/v1",
+      // Cloud-metadata FQDN + intranet suffixes (PARTIAL SSRF mitigation).
+      "https://metadata.google.internal/computeMetadata/v1",
+      "https://foo.internal/v1",
+      "https://bar.local/v1",
+    ]) {
+      const v = validateLocalBackend({ kind: "cloud", model: "m", baseUrl: bad });
+      expect(v.ok, `${bad} must be rejected`).toBe(false);
+      expect(v.errors.baseUrl).toBeTruthy();
+      expect(v.value).toBeNull();
+    }
+  });
+
+  it("still accepts real public provider hosts after the IP/metadata hardening", () => {
+    for (const ok of ["https://api.openai.com/v1", "https://openrouter.ai/api/v1"]) {
+      const v = validateLocalBackend({ kind: "cloud", model: "m", baseUrl: ok });
+      expect(v.ok, `${ok} must be accepted`).toBe(true);
+    }
+  });
+
+  it("does NOT carry an API key in the validated value (key lives in the vault)", () => {
+    const ok = validateLocalBackend({
+      kind: "cloud",
+      model: "openrouter/auto",
+      baseUrl: "https://openrouter.ai/api/v1",
+    });
+    expect(ok.ok).toBe(true);
+    const json = JSON.stringify(ok.value);
+    expect(json.toLowerCase()).not.toContain("key");
+    expect(json.toLowerCase()).not.toContain("secret");
+  });
+});
+
 describe("validateLocalBackend — error keys are narrowed to model/baseUrl", () => {
   it("never surfaces a command error (no local kind uses a command)", () => {
     const v = validateLocalBackend({ kind: "ollama", model: "" });

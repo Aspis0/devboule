@@ -113,6 +113,89 @@ export function validateOmlxBaseUrl(raw: string): string | null {
   return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
 }
 
+// Validate + NORMALIZE a CLOUD base URL. MUST stay EXACTLY equivalent to the Rust
+// `validate_cloud_base_url` (the local_coder.rs + devboule-coder versions) — a value one
+// accepts the other accepts; same rejects.
+//
+// This is the OPT-IN, consent-gated counterpart to `validateOmlxBaseUrl`: where the loopback
+// validator FORBIDS leaving the machine, this REQUIRES it — https (TLS), a NON-loopback,
+// fully-qualified public host. The SAME control/bidi/invisible blocklist + the SAME
+// optional-port rule apply. SSRF/privacy hardening: reject loopback hosts, bare IP literals
+// (IPv4/IPv6), single-label/intranet names (require a dot), and userinfo (`user@host` /
+// credentials in the URL — they belong in the Authorization header). Returns the normalized
+// URL (trailing slash stripped) or null if invalid.
+//
+// EXPORTED so the local-coder card's `validateLocalBackend` reuses the EXACT same rules — one
+// validator, no drift with the Rust boundary.
+export function validateCloudBaseUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.length > MINI_BASE_URL_MAX_LENGTH) return null;
+  if (CONTROL_CHAR_PATTERN.test(trimmed)) return null;
+
+  // https ONLY (TLS): http would send the prompt (which can carry file content) in clear text.
+  if (!trimmed.startsWith("https://")) return null;
+  const rest = trimmed.slice("https://".length);
+
+  const authority = rest.split(/[/?#]/, 1)[0] ?? "";
+  if (authority.length === 0) return null;
+  // Reject userinfo: credentials never live in the URL, and an `@` hides the real host.
+  if (authority.includes("@")) return null;
+  // IPv6 literal `[..]` rejected outright: a cloud provider is addressed by hostname.
+  if (authority.startsWith("[")) return null;
+
+  // Split off an optional `:port`.
+  const colon = authority.indexOf(":");
+  const host = colon === -1 ? authority : authority.slice(0, colon);
+  const port = colon === -1 ? null : authority.slice(colon + 1);
+  if (!isValidOptionalPort(port)) return null;
+  if (host.length === 0) return null;
+  if (host.toLowerCase() === "localhost") return null;
+  // Bare IPv4 literal -> SSRF surface.
+  if (isIpv4(host)) return null;
+  // Mirror the Rust all-numeric-4-label fallback: Rust's Ipv4Addr parser rejects
+  // leading-zero / out-of-range dotted-quads (`01.02.03.04`, `999.999.999.999`), so those
+  // would otherwise look like a hostname. A numeric dotted-quad is always an IP literal.
+  if (isNumericQuad(host)) return null;
+  // PARTIAL SSRF mitigation (mirrors Rust): deny the cloud-metadata FQDN + the conventional
+  // `.internal` / `.local` intranet suffixes. NOT complete — full protection needs
+  // post-DNS-resolution IP filtering in the connect layer (a deliberate follow-up, not done).
+  const hostLower = host.toLowerCase();
+  if (
+    hostLower === "metadata.google.internal" ||
+    hostLower.endsWith(".internal") ||
+    hostLower.endsWith(".local")
+  ) {
+    return null;
+  }
+  // Require a dot so a single-label intranet name (internal/metadata) cannot be targeted.
+  if (!host.includes(".")) return null;
+  // Each DNS label must be alnum + hyphen and non-empty.
+  const labelsOk = host
+    .split(".")
+    .every((label) => label.length > 0 && /^[A-Za-z0-9-]+$/.test(label));
+  if (!labelsOk) return null;
+
+  return trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+}
+
+// Does `host` parse as ANY dotted-quad IPv4 literal (not just loopback)? Used by the cloud
+// validator to reject a bare IP (SSRF surface). Mirrors the Rust `host.parse::<Ipv4Addr>()`.
+function isIpv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^[0-9]+$/.test(p) && Number(p) <= 255);
+}
+
+// Is `host` exactly 4 dot-separated all-ASCII-digit labels (regardless of leading zeros
+// or range)? Mirrors the Rust all-numeric-4-label fallback in `validate_cloud_base_url`:
+// it catches IP literals that Rust's strict `Ipv4Addr` parser rejects (`01.02.03.04`,
+// `010.0.0.1`, `0177.0.0.1`, `999.999.999.999`) and which `isIpv4` therefore misses.
+function isNumericQuad(host: string): boolean {
+  const parts = host.split(".");
+  return parts.length === 4 && parts.every((p) => /^[0-9]+$/.test(p));
+}
+
 // A `:port` suffix, when present, must be 1-5 ASCII digits and <= 65535 (F2). An EMPTY
 // port (`host:`) is rejected as invalid. `null` = no port component to check. Mirrors the
 // Rust `is_valid_optional_port`; keep both sides byte-for-byte equivalent.

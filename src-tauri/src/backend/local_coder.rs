@@ -42,7 +42,10 @@
 //! the `get_/set_local_coder_backend` commands live in `projects.rs` next to
 //! `set_mini_coder_backend`, cloning that atomic read-modify-write idiom.
 
-use super::mini_coder::{is_valid_model, validate_omlx_base_url, MINI_MODEL_MAX_LEN};
+use super::mini_coder::{
+    is_forbidden_command_char, is_valid_model, is_valid_optional_port, validate_omlx_base_url,
+    MINI_BASE_URL_MAX_LEN, MINI_MODEL_MAX_LEN,
+};
 use serde::{Deserialize, Serialize};
 
 /// The kind of runtime the LOCAL main coder (orchestrator) runs on. snake/lower over the
@@ -62,6 +65,16 @@ pub enum LocalCoderBackendKind {
     /// `base_url` REQUIRED. The base URL is constrained to a LOOPBACK http origin (http
     /// only; privacy: the prompt never leaves the device).
     Omlx,
+    /// CLOUD (opt-in): an HTTPS OpenAI-compatible endpoint (e.g. OpenRouter). `model` AND
+    /// `base_url` REQUIRED; the base URL is constrained to an HTTPS, NON-loopback public
+    /// host (the inverse of the loopback rule). The API KEY is NOT part of this struct or
+    /// config.json — it lives ONLY in the vault (`provider:cloud_llm`) and is read at launch
+    /// into `DEVBOULE_CLOUD_API_KEY` (env, off argv, never logged).
+    ///
+    /// PRIVACY CONTRACT: unlike the two local kinds, Cloud sends the prompt — which may carry
+    /// file content — OFF the machine to the configured provider. The host UI shows a
+    /// mandatory consent disclosure before this kind can be saved.
+    Cloud,
 }
 
 /// The DEFAULT Ollama loopback OpenAI-compatible base URL the orchestrator binary's
@@ -72,6 +85,110 @@ pub enum LocalCoderBackendKind {
 /// (validated loopback http) and the launch uses that instead. Kept here (single source of
 /// truth) so the launch assembly never hardcodes the URL inline.
 pub const OLLAMA_OPENAI_BASE_URL: &str = "http://localhost:11434/v1";
+
+/// Validate + NORMALIZE a CLOUD base URL (trailing slash stripped), or a human error string.
+/// This is the OPT-IN, consent-gated counterpart to [`validate_omlx_base_url`]: where the
+/// loopback validator FORBIDS leaving the machine, this REQUIRES it — `https://` (TLS, since a
+/// real provider is never on loopback) + a NON-loopback, fully-qualified public host. It
+/// REUSES the SAME `pub(crate)` primitives the loopback validator uses (the char blocklist,
+/// the optional-port rule, the length cap) so the two surfaces never drift on those rules.
+///
+/// SSRF / privacy hardening: reject loopback hosts (a loopback host in Cloud mode is a
+/// misconfiguration — the local kinds are the loopback path), reject bare IP literals
+/// (IPv4/IPv6), reject single-label/intranet names (require a dot), and reject userinfo
+/// (`user@host` / credentials in the URL — they belong in the Authorization header). Mirrors
+/// `devboule_coder::model_client::validate_cloud_base_url` so the host and the binary
+/// accept/reject the same set.
+pub fn validate_cloud_base_url(base_url: &str) -> Result<String, String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err("Cloud local-coder backend requires a base URL.".into());
+    }
+    if trimmed.len() > MINI_BASE_URL_MAX_LEN {
+        return Err(format!(
+            "Cloud base URL must be at most {MINI_BASE_URL_MAX_LEN} characters."
+        ));
+    }
+    if trimmed.chars().any(is_forbidden_command_char) {
+        return Err(
+            "Cloud base URL must not contain control, bidi or invisible characters.".into(),
+        );
+    }
+
+    // Scheme: https ONLY. http would send the prompt (which can carry file content) in clear
+    // text off the machine.
+    let rest = match trimmed.strip_prefix("https://") {
+        Some(r) => r,
+        None => return Err("Cloud base URL must start with https:// (TLS required).".into()),
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("Cloud base URL must include a host.".into());
+    }
+    // Reject userinfo: credentials never live in the URL, and an `@` hides the real host.
+    if authority.contains('@') {
+        return Err("Cloud base URL must not contain credentials (no '@' / userinfo).".into());
+    }
+    // IPv6 literal `[..]` is rejected outright: a cloud provider is addressed by hostname.
+    if authority.starts_with('[') {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+
+    let mut parts = authority.splitn(2, ':');
+    let host = parts.next().unwrap_or("");
+    if !is_valid_optional_port(parts.next()) {
+        return Err("Cloud base URL has an invalid :port.".into());
+    }
+    if host.is_empty() {
+        return Err("Cloud base URL must include a host.".into());
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err("Cloud base URL host must be a public provider host, not loopback.".into());
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    // Rust's `Ipv4Addr` parser REJECTS leading-zero dotted-quads (`01.02.03.04`,
+    // `010.0.0.1`, `0177.0.0.1`) and out-of-range quads (`999.999.999.999`), so those
+    // slip past the parse above and look like a hostname (all labels are alphanumeric).
+    // Reject any host that is exactly 4 dot-separated all-ASCII-digit labels: a numeric
+    // dotted-quad is always an IP-literal-disguised target, never a real provider host.
+    let numeric_quad: Vec<&str> = host.split('.').collect();
+    if numeric_quad.len() == 4
+        && numeric_quad
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    // PARTIAL SSRF mitigation: deny the well-known cloud-metadata FQDN and the conventional
+    // intranet suffixes `.internal` / `.local`. This is NOT complete SSRF protection —
+    // COMPLETE protection requires post-DNS-resolution IP filtering (reject RFC1918 /
+    // link-local / loopback RESOLVED IPs) in the HTTP client's connect layer (a custom
+    // reqwest resolver). That is a deliberate follow-up and is intentionally NOT done here.
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "metadata.google.internal"
+        || host_lower.ends_with(".internal")
+        || host_lower.ends_with(".local")
+    {
+        return Err("Cloud base URL host must be a public provider host, not an intranet/metadata name.".into());
+    }
+    if !host.contains('.') {
+        return Err("Cloud base URL host must be a fully-qualified domain name.".into());
+    }
+    let labels_ok = host.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    if !labels_ok {
+        return Err("Cloud base URL host is not a valid domain name.".into());
+    }
+
+    Ok(trimmed.strip_suffix('/').unwrap_or(trimmed).to_string())
+}
 
 /// The single, global local-coder backend config persisted in config.json under
 /// `localCoderBackend`. A discriminated struct mirroring
@@ -88,15 +205,19 @@ pub const OLLAMA_OPENAI_BASE_URL: &str = "http://localhost:11434/v1";
 #[serde(rename_all = "camelCase")]
 pub struct LocalCoderBackend {
     pub kind: LocalCoderBackendKind,
-    /// Model tag/name. REQUIRED for both `ollama` and `omlx`.
+    /// Model tag/name. REQUIRED for `ollama`, `omlx` and `cloud`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The server base URL (e.g. `http://localhost:8000/v1`). REQUIRED for `omlx`; OPTIONAL
-    /// for `ollama` (absent/`None` => the launch uses the [`OLLAMA_OPENAI_BASE_URL`] default;
-    /// present => the launch uses exactly that, e.g. Ollama on a non-default port). When set
-    /// (either kind) it is validated to a LOOPBACK http origin (http only) and STORED
-    /// NORMALIZED (no trailing slash) via the shared
-    /// [`super::mini_coder::validate_omlx_base_url`].
+    /// The server base URL. REQUIRED for `omlx` (LOOPBACK http) and `cloud` (HTTPS public
+    /// host); OPTIONAL for `ollama` (absent/`None` => the launch uses the
+    /// [`OLLAMA_OPENAI_BASE_URL`] default; present => exactly that, e.g. Ollama on a
+    /// non-default port). For the local kinds it is validated to a LOOPBACK http origin via
+    /// [`super::mini_coder::validate_omlx_base_url`]; for `cloud` it is validated to an HTTPS
+    /// non-loopback host via [`validate_cloud_base_url`]. Always STORED NORMALIZED (no
+    /// trailing slash).
+    ///
+    /// The CLOUD API KEY is deliberately NOT a field here — it never touches config.json. It
+    /// lives ONLY in the OS vault and is read at launch into `DEVBOULE_CLOUD_API_KEY` (env).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
@@ -190,6 +311,44 @@ pub fn validate_local_coder_backend(
                 base_url: Some(normalized_base),
             })
         }
+        LocalCoderBackendKind::Cloud => {
+            // cloud requires BOTH a model (a bare tag, same rule as the local kinds) and an
+            // HTTPS NON-loopback base URL. The API KEY is NOT validated here: it is not part
+            // of this struct (it lives in the vault). Key PRESENCE is enforced at the
+            // command/launch layer (where the vault is reachable), not in this pure
+            // config-shape validator — so a saved Cloud config + a separately-saved key stay
+            // independent surfaces.
+            if model.is_empty() {
+                return Err("Cloud local-coder backend requires a model tag.".into());
+            }
+            if model.len() > MINI_MODEL_MAX_LEN {
+                return Err(format!(
+                    "Local-coder model must be at most {MINI_MODEL_MAX_LEN} characters."
+                ));
+            }
+            if !is_valid_model(&model) {
+                return Err(
+                    "Local-coder model must be a bare tag (letters, digits, . _ : / -).".into(),
+                );
+            }
+            let base_url = backend
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            if base_url.is_empty() {
+                return Err("Cloud local-coder backend requires a base URL.".into());
+            }
+            // The cloud (https / non-loopback / FQDN) validator+normalizer. The length cap is
+            // enforced INSIDE it (same MINI_BASE_URL_MAX_LEN), so we do not re-check it here.
+            let normalized_base = validate_cloud_base_url(&base_url)?;
+            Ok(LocalCoderBackend {
+                kind: LocalCoderBackendKind::Cloud,
+                model: Some(model),
+                base_url: Some(normalized_base),
+            })
+        }
     }
 }
 
@@ -215,8 +374,33 @@ pub fn resolve_omlx_env(backend: &LocalCoderBackend) -> (String, String) {
             .clone()
             .unwrap_or_else(|| OLLAMA_OPENAI_BASE_URL.to_string()),
         LocalCoderBackendKind::Omlx => backend.base_url.clone().unwrap_or_default(),
+        // Cloud is NOT a loopback oMLX backend: it resolves to the DEVBOULE_CLOUD_* env set
+        // via `resolve_cloud_env`, never the DEVBOULE_OMLX_* set. Returning EMPTY here means a
+        // caller that wrongly routed a Cloud backend through this resolver sets NO oMLX env
+        // (the binary then runs its safe Mock) rather than mis-pointing the loopback client.
+        LocalCoderBackendKind::Cloud => String::new(),
     };
     (base_url, model)
+}
+
+/// Resolve the CLOUD env (`DEVBOULE_CLOUD_BASE_URL` + `DEVBOULE_CLOUD_MODEL`) the orchestrator
+/// binary should carry for a validated `cloud` backend. Returns `("", "")` for any NON-cloud
+/// kind (the local kinds go through [`resolve_omlx_env`] instead), so the launch can call this
+/// unconditionally and only the matching env set is non-empty.
+///
+/// The API KEY is NOT resolved here: it is a SECRET read from the vault at launch
+/// (`read_cloud_llm_key`) and injected as `DEVBOULE_CLOUD_API_KEY` via the per-launch process
+/// env — never from this struct, never on argv, never logged.
+pub fn resolve_cloud_env(backend: &LocalCoderBackend) -> (String, String) {
+    match backend.kind {
+        LocalCoderBackendKind::Cloud => (
+            backend.base_url.clone().unwrap_or_default(),
+            backend.model.clone().unwrap_or_default(),
+        ),
+        LocalCoderBackendKind::Ollama | LocalCoderBackendKind::Omlx => {
+            (String::new(), String::new())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +417,7 @@ mod tests {
         for (kind, tok) in [
             (LocalCoderBackendKind::Ollama, "ollama"),
             (LocalCoderBackendKind::Omlx, "omlx"),
+            (LocalCoderBackendKind::Cloud, "cloud"),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{tok}\""));
             let back: LocalCoderBackendKind =
@@ -527,6 +712,198 @@ mod tests {
             base_url: Some(long),
         };
         assert!(validate_local_coder_backend(&overlong).is_err());
+    }
+
+    // -- cloud kind ---------------------------------------------------------
+
+    #[test]
+    fn cloud_round_trips_camel_case_and_omits_no_key_field() {
+        // The API key is NEVER a struct field, so a Cloud config serialized to config.json
+        // carries ONLY kind/model/baseUrl — never a key.
+        let cloud = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+        };
+        let json = serde_json::to_string(&cloud).unwrap();
+        assert!(json.contains("\"kind\":\"cloud\""), "json: {json}");
+        assert!(
+            json.contains("\"baseUrl\":\"https://openrouter.ai/api/v1\""),
+            "json: {json}"
+        );
+        // The decisive privacy assertion: no key/secret/apiKey field is ever serialized.
+        assert!(!json.to_lowercase().contains("key"), "no key field: {json}");
+        assert!(!json.to_lowercase().contains("secret"), "no secret field: {json}");
+        let back: LocalCoderBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(cloud, back);
+    }
+
+    #[test]
+    fn cloud_requires_model_and_https_base_url() {
+        let no_model = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: None,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+        };
+        assert!(validate_local_coder_backend(&no_model).is_err());
+
+        let no_base = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            base_url: None,
+        };
+        assert!(validate_local_coder_backend(&no_base).is_err());
+    }
+
+    #[test]
+    fn cloud_accepts_https_public_host_and_normalizes() {
+        let ok = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: Some("  openrouter/auto  ".into()),
+            base_url: Some("  https://openrouter.ai/api/v1/  ".into()),
+        };
+        let n = validate_local_coder_backend(&ok).unwrap();
+        assert_eq!(n.model.as_deref(), Some("openrouter/auto"));
+        assert_eq!(n.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+    }
+
+    #[test]
+    fn cloud_rejects_http_loopback_ip_and_userinfo() {
+        for bad in [
+            "http://openrouter.ai/api/v1",   // http (clear text off-machine)
+            "https://localhost:8000/v1",     // loopback as cloud (misconfig)
+            "https://127.0.0.1/v1",          // loopback IP
+            "https://1.2.3.4/v1",            // bare IPv4 (SSRF)
+            "https://[2001:db8::1]/v1",      // IPv6 literal
+            "https://internal/v1",           // single-label intranet
+            "https://user:pass@openrouter.ai/v1", // userinfo / credentials in URL
+            "https://openrouter.ai@evil.com/v1",  // host-confusion userinfo
+            "ftp://openrouter.ai/v1",        // wrong scheme
+        ] {
+            let b = LocalCoderBackend {
+                kind: LocalCoderBackendKind::Cloud,
+                model: Some("m".into()),
+                base_url: Some(bad.into()),
+            };
+            assert!(
+                validate_local_coder_backend(&b).is_err(),
+                "cloud base URL {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_rejects_overlong_base_url() {
+        let long = format!("https://openrouter.ai/{}", "a".repeat(MINI_BASE_URL_MAX_LEN));
+        let overlong = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: Some("m".into()),
+            base_url: Some(long),
+        };
+        assert!(validate_local_coder_backend(&overlong).is_err());
+    }
+
+    #[test]
+    fn cloud_rejects_numeric_quad_ip_literals_with_leading_zeros() {
+        // Rust's Ipv4Addr parser rejects leading-zero / out-of-range dotted-quads, so the
+        // all-numeric-4-label fallback is required to reject these IP-literal-disguised hosts.
+        for bad in [
+            "https://01.02.03.04/v1",
+            "https://010.0.0.1/v1",
+            "https://0177.0.0.1/v1",
+            "https://999.999.999.999/v1",
+            "https://01.02.03.04:8443/v1",
+        ] {
+            let b = LocalCoderBackend {
+                kind: LocalCoderBackendKind::Cloud,
+                model: Some("m".into()),
+                base_url: Some(bad.into()),
+            };
+            assert!(
+                validate_local_coder_backend(&b).is_err(),
+                "numeric-quad IP literal {bad:?} must be rejected"
+            );
+        }
+        // A real public hostname is still accepted.
+        for ok in ["https://api.openai.com/v1", "https://openrouter.ai/api/v1"] {
+            let b = LocalCoderBackend {
+                kind: LocalCoderBackendKind::Cloud,
+                model: Some("m".into()),
+                base_url: Some(ok.into()),
+            };
+            assert!(
+                validate_local_coder_backend(&b).is_ok(),
+                "real host {ok:?} must still be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_rejects_metadata_and_intranet_suffix_hosts() {
+        // PARTIAL SSRF mitigation: the cloud-metadata FQDN + `.internal` / `.local` suffixes.
+        for bad in [
+            "https://metadata.google.internal/computeMetadata/v1",
+            "https://foo.internal/v1",
+            "https://bar.local/v1",
+            "https://METADATA.GOOGLE.INTERNAL/v1",
+        ] {
+            let b = LocalCoderBackend {
+                kind: LocalCoderBackendKind::Cloud,
+                model: Some("m".into()),
+                base_url: Some(bad.into()),
+            };
+            assert!(
+                validate_local_coder_backend(&b).is_err(),
+                "intranet/metadata host {bad:?} must be rejected"
+            );
+        }
+        let ok = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: Some("m".into()),
+            base_url: Some("https://api.openai.com/v1".into()),
+        };
+        assert!(validate_local_coder_backend(&ok).is_ok());
+    }
+
+    #[test]
+    fn local_kinds_still_reject_https_after_cloud_added() {
+        // Regression guard: adding Cloud must NOT loosen the loopback kinds. omlx/ollama
+        // still reject https + non-loopback (byte-identical to before).
+        for kind in [LocalCoderBackendKind::Omlx, LocalCoderBackendKind::Ollama] {
+            let b = LocalCoderBackend {
+                kind,
+                model: Some("m".into()),
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+            };
+            assert!(
+                validate_local_coder_backend(&b).is_err(),
+                "{kind:?} must still reject an https cloud URL"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_cloud_env_returns_base_and_model_for_cloud_only() {
+        let cloud = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            model: Some("openrouter/auto".into()),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+        };
+        let (base, model) = resolve_cloud_env(&cloud);
+        assert_eq!(base, "https://openrouter.ai/api/v1");
+        assert_eq!(model, "openrouter/auto");
+        // resolve_omlx_env must NOT emit a base URL for a Cloud backend (no mis-pointing the
+        // loopback client at the cloud host).
+        let (omlx_base, _) = resolve_omlx_env(&cloud);
+        assert_eq!(omlx_base, "", "Cloud must not produce an oMLX base URL");
+
+        // And the inverse: a local kind yields no cloud env.
+        let omlx = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Omlx,
+            model: Some("m".into()),
+            base_url: Some("http://localhost:8000/v1".into()),
+        };
+        assert_eq!(resolve_cloud_env(&omlx), (String::new(), String::new()));
     }
 
     // -- resolve_omlx_env ---------------------------------------------------

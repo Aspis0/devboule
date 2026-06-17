@@ -145,19 +145,21 @@ export type DesignEffort = "low" | "medium" | "high";
 // then passes empty oMLX env and the binary falls back to its safe path). It does NOT
 // inherit the mini's value. Mirrors the Rust `LocalCoderBackend`.
 //
-// KIND SET is intentionally NARROWER than the mini: the orchestrator binary drives ONLY a
-// loopback HTTP OpenAI-compatible endpoint, so only the two LOCAL kinds are offered —
-// "ollama" (a local Ollama server) and "omlx" (a local oMLX MLX server). There is no
-// "api"/"codex"/"appleFm" arm (the binary cannot drive a CLI or a non-HTTP runtime).
-export type LocalCoderBackendKind = "ollama" | "omlx";
+// KIND SET: the two LOCAL (loopback, private) kinds — "ollama" (a local Ollama server) and
+// "omlx" (a local oMLX MLX server) — plus the OPT-IN "cloud" kind (an HTTPS OpenAI-compatible
+// endpoint such as OpenRouter). There is no "api"/"codex"/"appleFm" arm (the binary cannot
+// drive a CLI). Local kinds keep the prompt on-device; "cloud" sends it OFF the machine to the
+// configured provider (the card shows a mandatory consent disclosure for it).
+export type LocalCoderBackendKind = "ollama" | "omlx" | "cloud";
 
 export interface LocalCoderBackend {
   kind: LocalCoderBackendKind;
-  // Model tag/name. REQUIRED for both "ollama" and "omlx".
+  // Model tag/name. REQUIRED for "ollama", "omlx" and "cloud".
   model?: string;
-  // The oMLX server base URL (loopback http only, e.g. http://localhost:8000/v1).
-  // Required for "omlx"; unused for "ollama" (which resolves Ollama's fixed loopback
-  // OpenAI endpoint). Stored normalized (no trailing slash).
+  // The server base URL. For "omlx" a loopback http origin (e.g. http://localhost:8000/v1);
+  // for "cloud" an https NON-loopback host (e.g. https://openrouter.ai/api/v1); optional for
+  // "ollama" (resolves Ollama's loopback OpenAI endpoint when absent). Stored normalized (no
+  // trailing slash). The CLOUD API KEY is NEVER stored here — it lives only in the OS vault.
   baseUrl?: string;
 }
 

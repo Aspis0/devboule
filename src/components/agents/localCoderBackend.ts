@@ -15,6 +15,8 @@
 import {
   MINI_BASE_URL_MAX_LENGTH,
   MINI_MODEL_MAX_LENGTH,
+  MODEL_PATTERN,
+  validateCloudBaseUrl,
   validateMiniBackend,
   validateOmlxBaseUrl,
 } from "./miniCoderBackend";
@@ -34,6 +36,7 @@ export const LOCAL_BASE_URL_MAX_LENGTH = MINI_BASE_URL_MAX_LENGTH;
 export const LOCAL_BACKEND_KINDS: readonly LocalCoderBackendKind[] = [
   "ollama",
   "omlx",
+  "cloud",
 ] as const;
 
 export interface LocalBackendDraft {
@@ -71,6 +74,47 @@ export interface LocalBackendValidation {
 export function validateLocalBackend(
   draft: LocalBackendDraft,
 ): LocalBackendValidation {
+  // CLOUD (opt-in) is NOT a mini kind, so handle it HERE before delegating: validate the
+  // model (the same bare-tag rule) + an HTTPS non-loopback base URL (validateCloudBaseUrl,
+  // mirroring the Rust boundary). The API KEY is NOT validated here — it lives in the OS
+  // vault on a separate status surface; this pure helper validates the config SHAPE only, so
+  // a saved Cloud config and a separately-saved key stay independent (the card gates the Save
+  // button on the key's present/absent status from the vault).
+  if (draft.kind === "cloud") {
+    const errors: LocalBackendValidation["errors"] = {};
+    const model = draft.model.trim();
+    if (model.length === 0) {
+      errors.model = "A model id is required.";
+    } else if (model.length > LOCAL_MODEL_MAX_LENGTH) {
+      errors.model = `Model must be at most ${LOCAL_MODEL_MAX_LENGTH} characters.`;
+    } else if (!MODEL_PATTERN.test(model)) {
+      errors.model = "Model must be a bare tag (letters, digits, . _ : / -).";
+    }
+
+    const rawBase = (draft.baseUrl ?? "").trim();
+    let normalizedBase: string | null = null;
+    if (rawBase.length === 0) {
+      errors.baseUrl = "An https base URL is required for Cloud.";
+    } else if (rawBase.length > LOCAL_BASE_URL_MAX_LENGTH) {
+      errors.baseUrl = `Base URL must be at most ${LOCAL_BASE_URL_MAX_LENGTH} characters.`;
+    } else {
+      normalizedBase = validateCloudBaseUrl(rawBase);
+      if (normalizedBase === null) {
+        errors.baseUrl =
+          "Base URL must be an https public host (e.g. https://openrouter.ai/api/v1) — not loopback, not an IP.";
+      }
+    }
+
+    if (Object.keys(errors).length > 0 || normalizedBase === null) {
+      return { ok: false, errors, value: null };
+    }
+    return {
+      ok: true,
+      errors,
+      value: { kind: "cloud", model, baseUrl: normalizedBase },
+    };
+  }
+
   const mini = validateMiniBackend({
     kind: draft.kind,
     model: draft.model,

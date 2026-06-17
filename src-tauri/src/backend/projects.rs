@@ -1493,12 +1493,27 @@ fn prepare_or_launch_project_agent(
     // it deliberately does NOT fall back to the mini's value.
     let orchestrator = if client == "orchestrator" {
         let binary = resolve_orchestrator_binary()?;
-        let (omlx_base_url, omlx_model) = match read_local_coder_backend(&app) {
+        // The orchestrator's OWN dedicated backend (NOT the mini's). For the two LOCAL kinds
+        // (ollama/omlx) this resolves to a loopback oMLX endpoint (DEVBOULE_OMLX_*); for the
+        // opt-in CLOUD kind it resolves to the https cloud endpoint (DEVBOULE_CLOUD_*) + a
+        // vault-held key. Exactly ONE of the two env sets is non-empty for a given launch
+        // (the resolvers return empty for the kind they don't own), so the binary's
+        // `build_model` picks cloud-vs-loopback deterministically.
+        let local_backend = read_local_coder_backend(&app);
+        let (omlx_base_url, omlx_model) = match &local_backend {
             // Both ollama and omlx resolve to a loopback OpenAI-compatible endpoint the
             // binary's OmlxModel client can drive (ollama -> its fixed loopback OpenAI
             // base; omlx -> the configured, validated loopback base). `resolve_omlx_env`
-            // owns that mapping so the launch never hardcodes a URL inline.
-            Some(backend) => super::local_coder::resolve_omlx_env(&backend),
+            // owns that mapping so the launch never hardcodes a URL inline. A Cloud backend
+            // yields EMPTY oMLX env here (it uses the cloud set below instead).
+            Some(backend) => super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        // CLOUD (opt-in) env: non-empty ONLY when the configured kind is `cloud`. The base
+        // URL + model are NON-secret (they ride inline like the oMLX ones); the API KEY is a
+        // SECRET appended to `provider_env` below (off argv, never logged).
+        let (cloud_base_url, cloud_model) = match &local_backend {
+            Some(backend) => super::local_coder::resolve_cloud_env(backend),
             None => (String::new(), String::new()),
         };
         // SECRET 1: the app-issued launch token (the SAME one hashed into the pending
@@ -1516,6 +1531,21 @@ fn prepare_or_launch_project_agent(
                 value: exa_key,
             });
         }
+        // SECRET 3: the Cloud LLM bearer key, set ONLY when the configured backend is
+        // `cloud` AND a key is stored (mirrors the Exa key path). Gating on a non-empty
+        // cloud base URL means a stored cloud key is NEVER injected into a Local-mode
+        // (ollama/omlx) launch — the privacy default stays clean. Env only — off argv,
+        // never logged. A `cloud` backend with NO key stored => no DEVBOULE_CLOUD_API_KEY
+        // => the binary's CloudModel::new fails the empty-key check and falls back to the
+        // safe Mock (it refuses to send an unauthenticated request off-machine).
+        if !cloud_base_url.trim().is_empty() {
+            if let Some(cloud_key) = vault::read_cloud_llm_key()? {
+                provider_env.push(AgentLaunchEnv {
+                    name: "DEVBOULE_CLOUD_API_KEY".into(),
+                    value: cloud_key,
+                });
+            }
+        }
         // FILE BRIDGE: resolve the per-agent activity file (under the projects dir's
         // `.devboule-activity/`). The orchestrator appends its coder-tier milestones
         // here; the host tails it into the live Console. `None` (unsafe id / unwritable
@@ -1527,6 +1557,8 @@ fn prepare_or_launch_project_agent(
             binary,
             omlx_base_url,
             omlx_model,
+            cloud_base_url,
+            cloud_model,
             mcp_python: crate::oracle::oracle_setup::resolve_oracle_python(),
             mcp_root: management_root.clone(),
             mcp_projects_dir: projects_path.clone(),
@@ -4358,10 +4390,20 @@ struct OrchestratorLaunchConfig {
     /// The resolved `devboule-coder` binary path (`resolve_orchestrator_binary`).
     binary: PathBuf,
     /// `DEVBOULE_OMLX_BASE_URL`: the loopback oMLX base URL the binary POSTs to.
-    /// Empty when no oMLX backend is configured (the binary then runs its Mock).
+    /// Empty when no oMLX (local) backend is configured (the binary then runs its Mock or,
+    /// when the cloud set below is present, the CloudModel).
     omlx_base_url: String,
-    /// `DEVBOULE_OMLX_MODEL`: the oMLX model id. Empty when not configured.
+    /// `DEVBOULE_OMLX_MODEL`: the oMLX (local) model id. Empty when not configured.
     omlx_model: String,
+    /// `DEVBOULE_CLOUD_BASE_URL` (opt-in Cloud mode): the https cloud endpoint the binary's
+    /// CloudModel POSTs to. NON-empty ONLY when the configured local-coder backend kind is
+    /// `cloud`; empty for the local kinds (then the oMLX set above is used). NOT a secret —
+    /// it rides inline like the oMLX vars. The matching API KEY is a SECRET injected via
+    /// `provider_env` as `DEVBOULE_CLOUD_API_KEY` (never here, never on argv).
+    cloud_base_url: String,
+    /// `DEVBOULE_CLOUD_MODEL` (opt-in Cloud mode): the cloud model id. Empty for the local
+    /// kinds. NOT a secret.
+    cloud_model: String,
     /// `DEVBOULE_MCP_PYTHON`: the resolved Oracle interpreter the binary spawns the
     /// MCP server with (`resolve_oracle_python`).
     mcp_python: String,
@@ -4425,6 +4467,14 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
             config.project_root.to_string_lossy().into_owned(),
         ),
     ];
+    // CLOUD (opt-in) NON-SECRET vars, appended ONLY when the configured kind is `cloud`
+    // (both are empty for the local kinds, so a Local-mode launch stays byte-identical to a
+    // pre-cloud one). The cloud API KEY is NEVER here — it rides via `provider_env`
+    // (DEVBOULE_CLOUD_API_KEY), off argv (B1 invariant).
+    if !config.cloud_base_url.trim().is_empty() {
+        pairs.push(("DEVBOULE_CLOUD_BASE_URL", config.cloud_base_url.clone()));
+        pairs.push(("DEVBOULE_CLOUD_MODEL", config.cloud_model.clone()));
+    }
     if !config.app_bin.trim().is_empty() {
         pairs.push(("DEVBOULE_APP_BIN", config.app_bin.clone()));
     }
@@ -10091,6 +10141,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             binary: PathBuf::from("/repo/devboule-coder/target/release/devboule-coder"),
             omlx_base_url: "http://localhost:8745/v1".to_string(),
             omlx_model: "qwen-coder-sentinel".to_string(),
+            // Local-mode fixture: the cloud vars are EMPTY (no DEVBOULE_CLOUD_* emitted), so
+            // the launch line/script stays byte-identical to the pre-cloud output.
+            cloud_base_url: String::new(),
+            cloud_model: String::new(),
             mcp_python: "/opt/venv/bin/python3.11".to_string(),
             mcp_root: PathBuf::from("/srv/aspis-mcp-root"),
             mcp_projects_dir: PathBuf::from("/srv/aspis-mcp-root/projects"),
@@ -10212,6 +10266,53 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let with = orchestrator_fixture();
         let names: Vec<&str> = orchestrator_env_pairs(&with).into_iter().map(|(n, _)| n).collect();
         assert!(names.contains(&"DEVBOULE_ACTIVITY_FILE"));
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_local_mode_emits_no_cloud_vars() {
+        // The Local-mode fixture (omlx-backed, empty cloud fields) must NOT emit any
+        // DEVBOULE_CLOUD_* pair — a Local-mode launch stays byte-identical to pre-cloud.
+        let names: Vec<&str> = orchestrator_env_pairs(&orchestrator_fixture())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(!names.contains(&"DEVBOULE_CLOUD_BASE_URL"));
+        assert!(!names.contains(&"DEVBOULE_CLOUD_MODEL"));
+        // And NEVER the secret name in the non-secret pairs (it rides via provider_env).
+        assert!(!names.contains(&"DEVBOULE_CLOUD_API_KEY"));
+        // The oMLX (local) vars ARE present.
+        assert!(names.contains(&"DEVBOULE_OMLX_BASE_URL"));
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_cloud_mode_emits_base_and_model_but_never_the_key() {
+        // A Cloud-mode launch: the NON-SECRET base/model ride inline; the API KEY is NEVER
+        // in the env pairs (it goes through provider_env, off argv, B1 invariant). The oMLX
+        // vars are still present but EMPTY (the binary's build_model picks cloud by the
+        // PRESENCE of DEVBOULE_CLOUD_BASE_URL).
+        let mut cloud = orchestrator_fixture();
+        cloud.omlx_base_url = String::new();
+        cloud.omlx_model = String::new();
+        cloud.cloud_base_url = "https://openrouter.ai/api/v1".to_string();
+        cloud.cloud_model = "openrouter/auto".to_string();
+
+        let pairs = orchestrator_env_pairs(&cloud);
+        let base = pairs.iter().find(|(n, _)| *n == "DEVBOULE_CLOUD_BASE_URL");
+        let model = pairs.iter().find(|(n, _)| *n == "DEVBOULE_CLOUD_MODEL");
+        assert_eq!(base.map(|(_, v)| v.as_str()), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(model.map(|(_, v)| v.as_str()), Some("openrouter/auto"));
+        // The KEY env var must NEVER be one of the inline (non-secret) pairs.
+        assert!(
+            !pairs.iter().any(|(n, _)| *n == "DEVBOULE_CLOUD_API_KEY"),
+            "the cloud API key must never appear in the inline launch env pairs"
+        );
+        // The rendered script also never contains the key var (it is provider_env only).
+        let script = orchestrator_launch_script(&cloud);
+        assert!(script.contains("$env:DEVBOULE_CLOUD_BASE_URL = "));
+        assert!(
+            !script.contains("DEVBOULE_CLOUD_API_KEY"),
+            "the cloud key var must not be set on the launch script (provider_env only): {script}"
+        );
     }
 
     #[test]
