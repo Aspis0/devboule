@@ -160,11 +160,7 @@ impl OmlxModel {
     /// Build from a base URL + model id + the plan-first bias. The base URL is
     /// validated to be a loopback http endpoint (privacy); an invalid endpoint is an
     /// error so a misconfiguration never silently routes the prompt off-machine.
-    pub fn new(
-        base_url: &str,
-        model: impl Into<String>,
-        plan_first: bool,
-    ) -> Result<Self, String> {
+    pub fn new(base_url: &str, model: impl Into<String>, plan_first: bool) -> Result<Self, String> {
         let base_url = validate_omlx_base_url(base_url)?;
         let model = model.into();
         if model.trim().is_empty() {
@@ -178,7 +174,12 @@ impl OmlxModel {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-        Ok(Self { base_url, model, client, plan_first })
+        Ok(Self {
+            base_url,
+            model,
+            client,
+            plan_first,
+        })
     }
 
     /// The chat-completions endpoint URL.
@@ -226,7 +227,11 @@ fn build_messages(transcript: &Transcript, plan_first: bool) -> Value {
             // assistant-side history is faithful to its own prior output.
             TranscriptEntry::Action(action) => ("assistant", render_action_block(action)),
             TranscriptEntry::Result(result) => {
-                let tag = if result.ok { "TOOL RESULT" } else { "TOOL ERROR" };
+                let tag = if result.ok {
+                    "TOOL RESULT"
+                } else {
+                    "TOOL ERROR"
+                };
                 ("user", format!("{tag}:\n{}", result.output))
             }
             TranscriptEntry::FormatFeedback(feedback) => ("user", feedback.clone()),
@@ -251,9 +256,7 @@ fn build_messages(transcript: &Transcript, plan_first: bool) -> Value {
     // such leading orphans so the window opens on an assistant action (or is
     // empty). The newest round is always a full pair (action then result), so the
     // tail is never affected.
-    let first_action = kept_rev
-        .iter()
-        .position(|(role, _)| *role == "assistant");
+    let first_action = kept_rev.iter().position(|(role, _)| *role == "assistant");
     let window: &[&(&'static str, String)] = match first_action {
         Some(idx) => &kept_rev[idx..],
         None => &[],
@@ -278,6 +281,7 @@ fn render_action_block(action: &crate::action::AgentAction) -> String {
             None => json!({"tool":"oracle_context","query":query}),
         },
         A::Plan { steps } => json!({"tool":"plan","steps":steps}),
+        A::RunPlan {} => json!({"tool":"run_plan"}),
         A::SpawnMini { task, files, write } => {
             json!({"tool":"spawn_mini","task":task,"files":files,"write":write})
         }
@@ -421,7 +425,10 @@ mod tests {
     #[test]
     fn validator_rejects_empty_and_overlong() {
         assert!(validate_omlx_base_url("   ").is_err());
-        let long = format!("http://127.0.0.1:8000/{}", "a".repeat(OMLX_BASE_URL_MAX_LEN));
+        let long = format!(
+            "http://127.0.0.1:8000/{}",
+            "a".repeat(OMLX_BASE_URL_MAX_LEN)
+        );
         assert!(validate_omlx_base_url(&long).is_err());
     }
 
@@ -438,7 +445,10 @@ mod tests {
         let messages = body["messages"].as_array().expect("messages array");
         assert_eq!(messages[0]["role"], json!("system"));
         assert!(
-            messages[0]["content"].as_str().unwrap().contains("oracle_ask"),
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("oracle_ask"),
             "system prompt is the orchestrator prompt"
         );
         assert_eq!(messages[1]["role"], json!("user"));
@@ -544,11 +554,27 @@ mod tests {
         use crate::action::{parse_action, AgentAction};
         let cases = vec![
             AgentAction::OracleAsk { query: "q".into() },
-            AgentAction::OracleContext { query: "q".into(), limit: Some(4) },
-            AgentAction::OracleContext { query: "q".into(), limit: None },
-            AgentAction::SpawnMini { task: "t".into(), files: vec!["a.rs".into()], write: true },
-            AgentAction::Read { path: "src/a.rs".into() },
-            AgentAction::Grep { pattern: "TODO".into(), glob: Some("*.rs".into()) },
+            AgentAction::OracleContext {
+                query: "q".into(),
+                limit: Some(4),
+            },
+            AgentAction::OracleContext {
+                query: "q".into(),
+                limit: None,
+            },
+            AgentAction::RunPlan {},
+            AgentAction::SpawnMini {
+                task: "t".into(),
+                files: vec!["a.rs".into()],
+                write: true,
+            },
+            AgentAction::Read {
+                path: "src/a.rs".into(),
+            },
+            AgentAction::Grep {
+                pattern: "TODO".into(),
+                glob: Some("*.rs".into()),
+            },
             AgentAction::Done { reply: "ok".into() },
         ];
         for a in cases {

@@ -50,6 +50,10 @@ from oracle.server.aspis_mcp import (
     dispatch_oracle_ask,
     dispatch_oracle_context,
     dispatch_project_structure,
+    dispatch_steer_mini_coder,
+    write_agents_state,
+    MINI_CODER_MAX_STEER_LEN,
+    MINI_CODER_MAX_STEER_QUEUE,
     dispose_censor_finding,
     ensure_oracle_index_ready,
     handle_tool_call,
@@ -68,6 +72,9 @@ from oracle.server.aspis_mcp import (
     scaleway_resource_action,
     strip_invisible_and_bidi,
     validate_launch_token_for_registration,
+    validate_project_state,
+    validate_task_dependency_dag,
+    MAX_PLAN_TASKS,
 )
 from oracle.store.sqlite_store import SQLiteStore
 
@@ -3544,10 +3551,12 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_update_status",
                 "project_append_note",
                 "project_create_followup",
+                "project_create_plan_tasks",
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
                 "spawn_mini_coder",
+                "steer_mini_coder",
                 "request_git_push",
                 "plan_submit",
                 "plan_status",
@@ -3719,6 +3728,289 @@ class OrchestratorRoleTests(unittest.TestCase):
             with self.assertRaises(McpError) as ctx:
                 require_registered_role(projects, "orch", "coder", "oracle_ask")
             self.assertIn("mismatch", str(ctx.exception).lower())
+
+
+class PlanTaskSchemaTests(unittest.TestCase):
+    """Phase 11.5-B (Piece 1a): the unified task store. validate_project_state must
+    accept the new optional task fields (dependsOn/scope/acceptance/planId) AND keep
+    loading old blocks that have none of them, and the dependsOn graph must reference
+    existing ids + be acyclic (Kahn port from devboule-coder/src/planner.rs)."""
+
+    @staticmethod
+    def _task(task_id: str, **extra) -> dict:
+        base = {
+            "id": task_id,
+            "title": "Task",
+            "status": "todo",
+            "updatedAt": "2026-05-28T00:00:00Z",
+        }
+        base.update(extra)
+        return base
+
+    def _state(self, *tasks: dict) -> dict:
+        return {"version": 1, "tasks": list(tasks), "notes": []}
+
+    def test_validate_accepts_new_fields(self):
+        # A task carrying every new field validates and is untouched.
+        state = self._state(
+            self._task(
+                "T1",
+                scope=["src/a.ts", "src/b.ts"],
+                acceptance="cargo build passes",
+                planId="plan-123",
+            ),
+            self._task("T2", dependsOn=["T1"], scope=["src/c.ts"], acceptance="tests green"),
+        )
+        validate_project_state(state)  # must not raise
+        self.assertEqual(state["tasks"][1]["dependsOn"], ["T1"])
+
+    def test_old_block_without_new_fields_still_validates(self):
+        # BACKWARD COMPAT: a task with NONE of the new fields (an old `.md` block)
+        # loads with no error and is not mutated.
+        state = self._state(self._task("T1"))
+        validate_project_state(state)  # must not raise
+        self.assertNotIn("dependsOn", state["tasks"][0])
+        self.assertNotIn("scope", state["tasks"][0])
+        self.assertNotIn("acceptance", state["tasks"][0])
+        self.assertNotIn("planId", state["tasks"][0])
+
+    def test_dangling_dependsOn_is_rejected(self):
+        state = self._state(self._task("T1", dependsOn=["T9"]))
+        with self.assertRaises(McpError) as ctx:
+            validate_project_state(state)
+        self.assertIn("unknown task id", str(ctx.exception))
+
+    def test_self_dependency_is_rejected(self):
+        state = self._state(self._task("T1", dependsOn=["T1"]))
+        with self.assertRaises(McpError) as ctx:
+            validate_project_state(state)
+        self.assertIn("itself", str(ctx.exception))
+
+    def test_cycle_is_rejected(self):
+        # T1 -> T2 -> T1 is a cycle.
+        state = self._state(
+            self._task("T1", dependsOn=["T2"]),
+            self._task("T2", dependsOn=["T1"]),
+        )
+        with self.assertRaises(McpError) as ctx:
+            validate_project_state(state)
+        self.assertIn("cycle", str(ctx.exception).lower())
+
+    def test_valid_dag_is_accepted(self):
+        # Diamond: T1 <- T2, T1 <- T3, T2/T3 <- T4. Acyclic.
+        state = self._state(
+            self._task("T1"),
+            self._task("T2", dependsOn=["T1"]),
+            self._task("T3", dependsOn=["T1"]),
+            self._task("T4", dependsOn=["T2", "T3"]),
+        )
+        validate_project_state(state)  # must not raise
+
+    def test_wrong_typed_fields_are_rejected(self):
+        with self.assertRaises(McpError):
+            validate_project_state(self._state(self._task("T1", dependsOn="T2")))
+        with self.assertRaises(McpError):
+            validate_project_state(self._state(self._task("T1", scope="src/a.ts")))
+        with self.assertRaises(McpError):
+            validate_project_state(self._state(self._task("T1", acceptance=123)))
+        with self.assertRaises(McpError):
+            validate_project_state(self._state(self._task("T1", planId=7)))
+
+    def test_helper_detects_cycle_directly(self):
+        # The reusable Kahn helper rejects a cycle and accepts a DAG on its own.
+        with self.assertRaises(McpError):
+            validate_task_dependency_dag({"A": ["B"], "B": ["A"]})
+        validate_task_dependency_dag({"A": [], "B": ["A"], "C": ["A", "B"]})
+
+
+class ProjectCreatePlanTasksTests(unittest.TestCase):
+    """Phase 11.5-B (Piece 1a): the project_create_plan_tasks MCP tool. Bulk-creates
+    an approved plan's tasks on the shared Kanban as todo+planId, allocating fresh
+    T<n> ids that never collide with manual tasks and remapping the planner-internal
+    dependsOn ids onto the allocated ids."""
+
+    def setUp(self):
+        self._old = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
+        else:
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old
+
+    def _setup(self, tmp: str) -> Path:
+        root = Path(tmp)
+        projects = root / "projects"
+        projects.mkdir()
+        sample_project(projects)  # ships one manual task T1
+        handle_tool_call(
+            "agent_register",
+            {"agent_id": "orch", "role": "orchestrator", "model": "opus", "message": "planning"},
+            root=root,
+        )
+        return root
+
+    def test_creates_todo_planid_tasks_with_fresh_ids_and_remapped_deps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            # Plan uses INTERNAL ids "a"/"b" with b depending on a. The project
+            # already has a manual T1, so allocation must start at T2.
+            result = handle_tool_call(
+                "project_create_plan_tasks",
+                {
+                    "project_id": "scrna-seq",
+                    "plan_id": "plan-xyz",
+                    "tasks": [
+                        {"id": "a", "title": "Scaffold module", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": []},
+                        {"id": "b", "title": "Wire it up", "scope": ["src/b.ts"], "acceptance": "tests pass", "dependsOn": ["a"]},
+                    ],
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                },
+                root=root,
+            )
+            self.assertEqual(result["planId"], "plan-xyz")
+            # Fresh, non-colliding ids: T1 is the manual task, plan gets T2/T3.
+            self.assertEqual(result["idMap"], {"a": "T2", "b": "T3"})
+            created = result["tasks"]
+            self.assertEqual([t["id"] for t in created], ["T2", "T3"])
+            for t in created:
+                self.assertEqual(t["status"], "todo")
+                self.assertEqual(t["planId"], "plan-xyz")
+            # dependsOn remapped through the id map: b("a") -> T3 depends on T2.
+            # No-churn: a root task's EMPTY dependsOn is OMITTED (mirrors the Rust
+            # skip_serializing_if), so assert the semantic via .get AND pin the omission.
+            self.assertEqual(created[0].get("dependsOn", []), [])
+            self.assertNotIn("dependsOn", created[0])  # empty field omitted (no churn)
+            self.assertEqual(created[1]["dependsOn"], ["T2"])
+            self.assertEqual(created[0]["scope"], ["src/a.ts"])
+            self.assertEqual(created[1]["acceptance"], "tests pass")
+
+            # Persisted: re-reading the project shows the manual task UNTOUCHED
+            # (no planId) and the two plan tasks present.
+            got = handle_tool_call(
+                "project_get",
+                {"project_id": "scrna-seq", "agent_id": "orch", "role": "orchestrator"},
+                root=root,
+            )
+            tasks = {t["id"]: t for t in got["state"]["tasks"]}
+            self.assertEqual(set(tasks), {"T1", "T2", "T3"})
+            self.assertNotIn("planId", tasks["T1"])  # manual task is plan-free
+            self.assertEqual(tasks["T3"]["dependsOn"], ["T2"])
+
+    def test_rejects_cyclic_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": "plan-cycle",
+                        "tasks": [
+                            {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": ["b"]},
+                            {"id": "b", "title": "B", "scope": ["src/b.ts"], "acceptance": "x", "dependsOn": ["a"]},
+                        ],
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                    },
+                    root=root,
+                )
+            self.assertIn("cycle", str(ctx.exception).lower())
+            # NOTHING was written: the project still has only the manual T1.
+            got = handle_tool_call(
+                "project_get",
+                {"project_id": "scrna-seq", "agent_id": "orch", "role": "orchestrator"},
+                root=root,
+            )
+            self.assertEqual([t["id"] for t in got["state"]["tasks"]], ["T1"])
+
+    def test_rejects_dependsOn_not_in_request(self):
+        # A plan must be self-contained: a dep on an id NOT in the batch (even an
+        # existing manual task id) is rejected.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": "plan-ext",
+                        "tasks": [
+                            {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": ["T1"]},
+                        ],
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                    },
+                    root=root,
+                )
+            self.assertIn("not in the request", str(ctx.exception))
+
+    def test_rejects_empty_and_oversized_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {"project_id": "scrna-seq", "plan_id": "p", "tasks": [], "agent_id": "orch", "role": "orchestrator"},
+                    root=root,
+                )
+            too_many = [
+                {"id": f"t{i}", "title": "x", "scope": ["src/x.ts"], "acceptance": "x", "dependsOn": []}
+                for i in range(MAX_PLAN_TASKS + 1)
+            ]
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {"project_id": "scrna-seq", "plan_id": "p", "tasks": too_many, "agent_id": "orch", "role": "orchestrator"},
+                    root=root,
+                )
+            self.assertIn("Too many", str(ctx.exception))
+
+    def test_rejects_unsafe_scope_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": "p",
+                        "tasks": [
+                            {"id": "a", "title": "A", "scope": ["../escape.ts"], "acceptance": "x", "dependsOn": []},
+                        ],
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                    },
+                    root=root,
+                )
+            self.assertIn("..", str(ctx.exception))
+
+    def test_verifier_cannot_create_plan_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "ver", "role": "verifier", "model": "opus", "message": "checking"},
+                root=root,
+            )
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": "p",
+                        "tasks": [{"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": []}],
+                        "agent_id": "ver",
+                        "role": "verifier",
+                    },
+                    root=root,
+                )
+            self.assertIn("verifier agents cannot use project_create_plan_tasks", str(ctx.exception))
 
 
 def _write_legacy_agents_state(projects: Path, state: dict) -> None:
@@ -8303,6 +8595,211 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
                 "concurrent Rust walkers must be bounded by the semaphore",
             )
             self.assertGreater(observed_peak, 0, "the runner must actually have run")
+
+
+class SteerMiniCoderTests(unittest.TestCase):
+    """ASYNC STEERING (a): steer_mini_coder appends a mid-flight correction to a running
+    mini's steerQueue (the SAME channel as the Stop button's killRequested, generalized to
+    a FIFO), maps the `stop` sentinel to the kill path, and rejects an absent / terminal
+    directive. NO-CHURN: an empty steerQueue is never written."""
+
+    def setUp(self):
+        self._old = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        self._old_vault = os.environ.get("ASPIS_MCP_DISABLE_APP_VAULT")
+        os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
+        os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = "1"
+
+    def tearDown(self):
+        for key, old in (
+            ("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", self._old),
+            ("ASPIS_MCP_DISABLE_APP_VAULT", self._old_vault),
+        ):
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    def _setup(self, tmp: str, directives: list[dict]) -> tuple[Path, Path]:
+        """Register a live coder and seed the given miniCoderDirectives. Returns
+        (projects_dir, state_lock)."""
+        root = Path(tmp)
+        projects = prepare_management_root(root)
+        handle_tool_call(
+            "agent_register",
+            {"agent_id": "codex", "role": "coder", "model": "codex", "message": "coding"},
+            root=root,
+        )
+        state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
+        from oracle.server.aspis_mcp import file_lock
+
+        with file_lock(state_lock):
+            state = read_agents_state(projects)
+            state["miniCoderDirectives"] = directives
+            write_agents_state(projects, state)
+        return projects, state_lock
+
+    def test_steer_appends_to_running_directive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(
+                tmp,
+                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+            )
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": "use a HashMap not a Vec",
+                },
+            )
+            self.assertEqual(res["status"], "queued")
+            self.assertEqual(res["queued"], 1)
+            state = read_agents_state(projects)
+            d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
+            self.assertEqual(d["steerQueue"], ["use a HashMap not a Vec"])
+            self.assertNotIn("killRequested", d, "a non-stop steer must not kill")
+
+            # A second append extends the FIFO.
+            res2 = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "add a test"},
+            )
+            self.assertEqual(res2["queued"], 2)
+            state = read_agents_state(projects)
+            d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
+            self.assertEqual(d["steerQueue"], ["use a HashMap not a Vec", "add a test"])
+
+    def test_steer_targets_live_retry_attempt_in_chain(self):
+        # The directive_id the coder holds is the ROOT (which may be awaiting_retry while
+        # the live attempt is a retry child). The steer must land on the LIVE attempt.
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(
+                tmp,
+                [
+                    {"id": "root", "status": "awaiting_retry", "task": "x", "resultPath": "root.json"},
+                    {
+                        "id": "root-r1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "root-r1.json",
+                        "parentDirectiveId": "root",
+                        "attempt": 1,
+                    },
+                ],
+            )
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "root", "message": "fix the live retry"},
+            )
+            self.assertEqual(res["status"], "queued")
+            state = read_agents_state(projects)
+            root = next(x for x in state["miniCoderDirectives"] if x["id"] == "root")
+            retry = next(x for x in state["miniCoderDirectives"] if x["id"] == "root-r1")
+            self.assertNotIn("steerQueue", root, "the parked predecessor must not be steered")
+            self.assertEqual(retry["steerQueue"], ["fix the live retry"])
+
+    def test_stop_sentinel_sets_kill_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(
+                tmp,
+                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+            )
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "  STOP  "},
+            )
+            self.assertEqual(res["status"], "stopped")
+            state = read_agents_state(projects)
+            d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
+            self.assertTrue(d["killRequested"])
+            self.assertNotIn("steerQueue", d, "stop must not queue prose")
+
+    def test_not_found_directive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(tmp, [])
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "nope", "message": "hi"},
+            )
+            self.assertEqual(res["status"], "not_found")
+
+    def test_terminal_directive_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(
+                tmp,
+                [{"id": "d1", "status": "done", "task": "x", "resultPath": "d1.json"}],
+            )
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "too late"},
+            )
+            self.assertEqual(res["status"], "terminal")
+            state = read_agents_state(projects)
+            d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
+            self.assertNotIn("steerQueue", d)
+
+    def test_queue_cap_refuses_without_dropping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            full = [f"msg {i}" for i in range(MINI_CODER_MAX_STEER_QUEUE)]
+            projects, state_lock = self._setup(
+                tmp,
+                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json", "steerQueue": list(full)}],
+            )
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "over the cap"},
+            )
+            self.assertEqual(res["status"], "queue_full")
+            self.assertEqual(res["queued"], MINI_CODER_MAX_STEER_QUEUE)
+            state = read_agents_state(projects)
+            d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
+            self.assertEqual(d["steerQueue"], full, "a full queue must not drop an existing message")
+
+    def test_message_length_is_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(
+                tmp,
+                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+            )
+            long = "x" * (MINI_CODER_MAX_STEER_LEN + 500)
+            dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": long},
+            )
+            state = read_agents_state(projects)
+            d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
+            self.assertEqual(len(d["steerQueue"][0]), MINI_CODER_MAX_STEER_LEN)
+
+    def test_empty_message_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup(
+                tmp,
+                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+            )
+            with self.assertRaises(McpError):
+                dispatch_steer_mini_coder(
+                    projects,
+                    state_lock,
+                    {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "   "},
+                )
+
+    def test_steer_tool_is_registered_in_schema_and_dispatch(self):
+        names = {t["name"] for t in TOOLS}
+        self.assertIn("steer_mini_coder", names)
+        schema = next(t for t in TOOLS if t["name"] == "steer_mini_coder")
+        self.assertEqual(
+            set(schema["parameters"]),
+            {"agent_id", "role", "directive_id", "message", "session_token"},
+        )
 
 
 if __name__ == "__main__":

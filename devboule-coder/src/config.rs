@@ -75,7 +75,11 @@ pub async fn build_runtime() -> Runtime {
     // The executor needs a handle to the SAME model to drive the local planner
     // (Phase 11.2), so build the model first and pass a clone into the executor.
     let (executor, allow_egress) = build_executor(Arc::clone(&model)).await;
-    Runtime { model, executor, allow_egress }
+    Runtime {
+        model,
+        executor,
+        allow_egress,
+    }
 }
 
 /// The model: real loopback oMLX when configured + valid, else the Mock.
@@ -194,15 +198,17 @@ async fn build_executor(model: Arc<dyn CoderModel>) -> (Arc<dyn ToolExecutor>, b
     // a plan against the wrong project.
     let project_id = env_nonempty(ENV_PROJECT_ID).unwrap_or_default();
 
-    let executor = RealExecutor::new(mcp, fs, web, project_root)
-        .with_planner(model, project_id);
+    let executor = RealExecutor::new(mcp, fs, web).with_planner(model, project_id);
     let allow_egress = executor.egress_enabled();
     (Arc::new(executor), allow_egress)
 }
 
 /// Read an env var, treating empty/whitespace as absent.
 fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]

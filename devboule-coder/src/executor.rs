@@ -130,17 +130,21 @@ impl FsBackend {
         // deployment; the proper fix (open `O_NOFOLLOW`/`openat` via `rustix`) is
         // out of scope for L2 and tracked separately.
         let path = self.resolve(rel)?;
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("cannot stat path: {e}"))?;
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(|e| format!("cannot stat path: {e}"))?;
         if meta.is_dir() {
             return Err(format!("`{rel}` is a directory, not a file"));
         }
         // Read at most FILE_READ_CAP+1 bytes so we can detect (and mark) an
         // over-cap file without slurping a giant blob into memory.
-        let bytes = read_capped(&path, FILE_READ_CAP + 1)
-            .map_err(|e| format!("read failed: {e}"))?;
+        let bytes =
+            read_capped(&path, FILE_READ_CAP + 1).map_err(|e| format!("read failed: {e}"))?;
         let truncated = bytes.len() > FILE_READ_CAP;
-        let slice = if truncated { &bytes[..FILE_READ_CAP] } else { &bytes[..] };
+        let slice = if truncated {
+            &bytes[..FILE_READ_CAP]
+        } else {
+            &bytes[..]
+        };
         let mut text = String::from_utf8_lossy(slice).into_owned();
         if truncated {
             text.push_str("\n[…file truncated at read cap]");
@@ -157,9 +161,7 @@ impl FsBackend {
         // Compile here too (the parse layer already validated it compiles); the
         // NFA engine guarantees linear-time matching regardless of input.
         let re = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
-        let matcher = glob
-            .map(|g| build_globset(g))
-            .transpose()?;
+        let matcher = glob.map(|g| build_globset(g)).transpose()?;
 
         let mut out = String::new();
         let mut files_scanned = 0usize;
@@ -421,7 +423,11 @@ impl ExaBackend {
         let text = read_body_capped(resp, HTTP_BODY_CAP).await?;
         if !status.is_success() {
             // Do NOT echo the key; the body may carry an error message, capped.
-            return Err(format!("exa returned HTTP {}: {}", status.as_u16(), elide_line(&text)));
+            return Err(format!(
+                "exa returned HTTP {}: {}",
+                status.as_u16(),
+                elide_line(&text)
+            ));
         }
         Ok(parse_exa_response(&text))
     }
@@ -544,14 +550,17 @@ pub struct RealExecutor {
     mcp: std::sync::Arc<dyn McpBackend>,
     fs: FsBackend,
     web: Option<ExaBackend>,
-    project_root: PathBuf,
     /// The model that drives the LOCAL planner (Phase 11.2). `None` when no model
     /// is configured (the no-config dev path), which disables the `plan` routine
     /// with a clear error rather than running it against a missing model.
     model: Option<std::sync::Arc<dyn CoderModel>>,
-    /// The Oracle-side project key the planner passes to `project_structure` /
-    /// `plan_submit`. Empty when not configured; the planner then escalates with a
-    /// precise message instead of submitting a plan against the wrong project.
+    /// The Oracle-side project key. The planner passes it to `project_structure` /
+    /// `plan_submit` / `project_create_plan_tasks`; the runner passes it to
+    /// `project_get` / `project_claim_task` / `project_update_status` / `spawn_mini_coder`.
+    /// Empty when not configured; the planner/runner then escalate with a precise message
+    /// instead of acting against the wrong project. (Since Piece 1b the runner reads tasks
+    /// off the Kanban by this id, so the executor no longer needs a local project_root —
+    /// the FS backend holds its own canonical root for the read-only navigation tools.)
     project_id: String,
     /// The coder-tier milestone emitter the planner writes its phases through (the
     /// FILE BRIDGE to the host Console). Disabled (no-op) unless the host set
@@ -564,13 +573,11 @@ impl RealExecutor {
         mcp: std::sync::Arc<dyn McpBackend>,
         fs: FsBackend,
         web: Option<ExaBackend>,
-        project_root: PathBuf,
     ) -> Self {
         Self {
             mcp,
             fs,
             web,
-            project_root,
             model: None,
             project_id: String::new(),
             // Disabled by default; `with_planner` resolves the real emitter from env.
@@ -647,14 +654,22 @@ impl ToolExecutor for RealExecutor {
                 });
                 self.mcp_call("spawn_mini_coder", params).await
             }
-            // `plan` triggers the LOCAL planner (Phase 11.2): STRUCTURE -> EXPLORE
-            // -> PLAN -> tasks.json -> plan_submit (the human gate). The goal is the
-            // model's `steps` joined into one framing line — the orchestrator emits
-            // its intent as plan steps, and the planner turns that into an atomic
-            // `tasks.json` for Phase 11.3's runner. The burst model gets back a
-            // COMPACT outcome line ("Plan: N tasks, submitted -> approved/…") so the
-            // outer loop knows the verdict without re-reading the plan.
+            // `plan` triggers the LOCAL planner (Phase 11.2): STRUCTURE -> EXPLORE ->
+            // PLAN -> plan_submit (the human gate) -> on approval, create the plan's
+            // tasks on the project KANBAN (`project_create_plan_tasks`, the single shared
+            // task store). The goal is the model's `steps` joined into one framing line.
+            // The burst model gets back a COMPACT outcome line ("Plan: N tasks, submitted
+            // -> approved (planId …, created on the board)") so the outer loop knows the
+            // verdict without re-reading the plan.
             AgentAction::Plan { steps } => self.run_plan(steps).await,
+
+            // `run_plan` EXECUTES the approved plan (Phase 11.3): the deterministic DAG
+            // runner reads the active plan's tasks off the Kanban (`project_get`, filtered
+            // by planId), delegates each ready task to `spawn_mini_coder` (Censor gate +
+            // retry/escalate) in dependency order, lands finished tasks in `review`, and
+            // stops on the first BLOCKED task. No LLM here — the plan is already produced
+            // + human-approved; this just drives the board.
+            AgentAction::RunPlan {} => self.run_tasks().await,
 
             // --- FS backend: in-process, root-confined, read-only -------------
             // The FS ops do BLOCKING syscalls (`std::fs`, the `ignore` walker), so
@@ -677,10 +692,8 @@ impl ToolExecutor for RealExecutor {
                 let fs = self.fs.clone();
                 let pattern = pattern.clone();
                 let glob = glob.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    fs.grep(&pattern, glob.as_deref())
-                })
-                .await;
+                let res =
+                    tokio::task::spawn_blocking(move || fs.grep(&pattern, glob.as_deref())).await;
                 match res {
                     Ok(Ok(text)) => ToolResult::ok(text),
                     Ok(Err(e)) => ToolResult::err(format!("grep: {e}")),
@@ -719,7 +732,9 @@ impl ToolExecutor for RealExecutor {
             // --- Terminal actions never reach an executor ---------------------
             // The loop returns before dispatching them; if one arrives here it is
             // a logic error.
-            AgentAction::AskUser { .. } | AgentAction::Done { .. } | AgentAction::Escalate { .. } => {
+            AgentAction::AskUser { .. }
+            | AgentAction::Done { .. }
+            | AgentAction::Escalate { .. } => {
                 ToolResult::err("terminal action must not be dispatched")
             }
         }
@@ -730,10 +745,11 @@ impl RealExecutor {
     /// Drive the LOCAL planner for a `plan` action (Phase 11.2). The goal is the
     /// joined plan `steps`. Requires the model + project id wired via
     /// [`RealExecutor::with_planner`]; without them the action is an error the model
-    /// can recover from (never a panic). The planner persists `tasks.json` and
-    /// submits the plan through the human gate; on any planner error (structure
-    /// failure, no valid plan in the retry budget, plan_submit failure) we surface
-    /// the precise reason as a failed result.
+    /// can recover from (never a panic). The planner submits the plan through the human
+    /// gate and, ON APPROVAL, creates the plan's tasks on the project Kanban; on any
+    /// planner error (structure failure, no valid plan in the retry budget, plan_submit
+    /// failure, or the bulk Kanban create failing) we surface the precise reason as a
+    /// failed result.
     async fn run_plan(&self, steps: &[String]) -> ToolResult {
         let Some(model) = self.model.clone() else {
             return ToolResult::err(
@@ -749,13 +765,29 @@ impl RealExecutor {
             self.mcp.as_ref(),
             &self.fs,
             &self.project_id,
-            &self.project_root,
             &self.activity,
         )
         .await
         {
             Ok(outcome) => ToolResult::ok(outcome.compact_summary()),
             Err(e) => ToolResult::err(format!("plan: {e}")),
+        }
+    }
+
+    /// Drive the Phase 11.3 DAG runner for a `run_plan` action. The runner is
+    /// deterministic (no model) and reuses the existing `mcp` (to read the Kanban via
+    /// `project_get` + advance tasks via `project_claim_task`/`project_update_status` +
+    /// delegate via `spawn_mini_coder`), the Oracle-side `project_id` (the board key), and
+    /// `activity` (Console milestones). A run that completes every plan task is an OK
+    /// result; a run that stops on a BLOCKED task is a FAILED result whose text names the
+    /// task + tells the orchestrator to `ask_user` (a block is an expected outcome,
+    /// surfaced as an error the model recovers from, never a panic). No active plan on the
+    /// board, or a backend/transport error, is an error.
+    async fn run_tasks(&self) -> ToolResult {
+        match crate::runner::run_tasks(self.mcp.as_ref(), &self.project_id, &self.activity).await {
+            Ok(report) if report.blocked.is_none() => ToolResult::ok(report.compact_summary()),
+            Ok(report) => ToolResult::err(report.compact_summary()),
+            Err(e) => ToolResult::err(format!("run_plan: {e}")),
         }
     }
 
@@ -785,16 +817,26 @@ mod tests {
     }
     impl MockMcpBackend {
         fn new() -> Self {
-            Self { calls: Mutex::new(Vec::new()) }
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
         }
         fn last(&self) -> (String, serde_json::Value) {
-            self.calls.lock().unwrap().last().cloned().expect("a call was made")
+            self.calls
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("a call was made")
         }
     }
     #[async_trait]
     impl McpBackend for MockMcpBackend {
         async fn call_tool(&self, name: &str, params: serde_json::Value) -> Result<String, String> {
-            self.calls.lock().unwrap().push((name.to_string(), params.clone()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), params.clone()));
             Ok(format!("[mock {name}]"))
         }
     }
@@ -802,7 +844,7 @@ mod tests {
     /// Build a RealExecutor over a tempdir root + the mock MCP backend + no web.
     fn exec_with(root: &Path, mcp: std::sync::Arc<MockMcpBackend>) -> RealExecutor {
         let fs = FsBackend::new(root).expect("tempdir root canonicalizes");
-        RealExecutor::new(mcp, fs, None, root.to_path_buf())
+        RealExecutor::new(mcp, fs, None)
     }
 
     // --- MCP action mapping ---------------------------------------------------
@@ -813,7 +855,9 @@ mod tests {
         let mcp = std::sync::Arc::new(MockMcpBackend::new());
         let exec = exec_with(dir.path(), mcp.clone());
         let r = exec
-            .execute(&AgentAction::OracleAsk { query: "where is the launch path".into() })
+            .execute(&AgentAction::OracleAsk {
+                query: "where is the launch path".into(),
+            })
             .await;
         assert!(r.ok);
         let (name, params) = mcp.last();
@@ -826,8 +870,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let mcp = std::sync::Arc::new(MockMcpBackend::new());
         let exec = exec_with(dir.path(), mcp.clone());
-        exec.execute(&AgentAction::OracleContext { query: "q".into(), limit: Some(3) })
-            .await;
+        exec.execute(&AgentAction::OracleContext {
+            query: "q".into(),
+            limit: Some(3),
+        })
+        .await;
         let (name, params) = mcp.last();
         assert_eq!(name, "oracle_context");
         assert_eq!(params["query"], json!("q"));
@@ -839,10 +886,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let mcp = std::sync::Arc::new(MockMcpBackend::new());
         let exec = exec_with(dir.path(), mcp.clone());
-        exec.execute(&AgentAction::OracleContext { query: "q".into(), limit: None })
-            .await;
+        exec.execute(&AgentAction::OracleContext {
+            query: "q".into(),
+            limit: None,
+        })
+        .await;
         let (_name, params) = mcp.last();
-        assert!(params.get("limit").is_none(), "limit must be omitted when None: {params}");
+        assert!(
+            params.get("limit").is_none(),
+            "limit must be omitted when None: {params}"
+        );
     }
 
     #[tokio::test]
@@ -857,7 +910,10 @@ mod tests {
         })
         .await;
         let (name, params) = mcp.last();
-        assert_eq!(name, "spawn_mini_coder", "spawn_mini maps to spawn_mini_coder");
+        assert_eq!(
+            name, "spawn_mini_coder",
+            "spawn_mini maps to spawn_mini_coder"
+        );
         assert_eq!(params["task"], json!("fix it"));
         assert_eq!(params["files"], json!(["src/a.rs"]));
         assert_eq!(params["write"], json!(true), "the WRITE arm is forwarded");
@@ -873,9 +929,15 @@ mod tests {
         let mcp = std::sync::Arc::new(MockMcpBackend::new());
         let exec = exec_with(dir.path(), mcp.clone());
         let r = exec
-            .execute(&AgentAction::Plan { steps: vec!["a".into(), "b".into()] })
+            .execute(&AgentAction::Plan {
+                steps: vec!["a".into(), "b".into()],
+            })
             .await;
-        assert!(!r.ok, "plan without a wired planner is an error: {}", r.output);
+        assert!(
+            !r.ok,
+            "plan without a wired planner is an error: {}",
+            r.output
+        );
         assert!(
             r.output.contains("not configured"),
             "names the missing-planner cause: {}",
@@ -899,12 +961,20 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), b"fn a() {}\n").unwrap();
 
-        // A planner-aware mock MCP: a one-file spine, grounding, and an approved
-        // plan_submit. (Distinct from MockMcpBackend, which canned every call.)
-        struct PlannerMcp;
+        // A planner-aware mock MCP: a one-file spine, grounding, an approved plan_submit,
+        // and the Kanban bulk-create. It RECORDS whether the create was called + with
+        // which planId so the test can assert the plan landed on the board.
+        // (Distinct from MockMcpBackend, which canned every call.)
+        struct PlannerMcp {
+            created_plan_id: Mutex<Option<String>>,
+        }
         #[async_trait]
         impl McpBackend for PlannerMcp {
-            async fn call_tool(&self, name: &str, _params: serde_json::Value) -> Result<String, String> {
+            async fn call_tool(
+                &self,
+                name: &str,
+                params: serde_json::Value,
+            ) -> Result<String, String> {
                 match name {
                     "project_structure" => Ok(json!({
                         "spine": [{"path": "src/a.rs", "inDegree": 1, "topReferencedSymbols": ["a"]}],
@@ -913,6 +983,21 @@ mod tests {
                     .to_string()),
                     "oracle_context" => Ok("[grounding]".to_string()),
                     "plan_submit" => Ok(json!({"planId": "p1", "status": "approved"}).to_string()),
+                    "project_create_plan_tasks" => {
+                        let plan_id = params
+                            .get("plan_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        *self.created_plan_id.lock().unwrap() = Some(plan_id.clone());
+                        Ok(json!({
+                            "project": {"id": "proj"},
+                            "planId": plan_id,
+                            "idMap": {},
+                            "tasks": [],
+                        })
+                        .to_string())
+                    }
                     other => Err(format!("unexpected {other}")),
                 }
             }
@@ -933,17 +1018,43 @@ mod tests {
             std::sync::Arc::new(ScriptedModel::new(vec![note, plan]));
 
         let fs = FsBackend::new(dir.path()).unwrap();
-        let exec = RealExecutor::new(std::sync::Arc::new(PlannerMcp), fs, None, dir.path().to_path_buf())
-            .with_planner(model, "proj");
+        let mcp = std::sync::Arc::new(PlannerMcp {
+            created_plan_id: Mutex::new(None),
+        });
+        let exec = RealExecutor::new(mcp.clone(), fs, None).with_planner(model, "proj");
 
         let r = exec
-            .execute(&AgentAction::Plan { steps: vec!["do the thing".into()] })
+            .execute(&AgentAction::Plan {
+                steps: vec!["do the thing".into()],
+            })
             .await;
         assert!(r.ok, "the planner succeeded: {}", r.output);
-        assert!(r.output.contains("approved"), "compact result names the verdict: {}", r.output);
-        assert!(r.output.contains("1 task"), "compact result names the task count: {}", r.output);
-        // The atomic artifact was persisted under the project root.
-        assert!(dir.path().join(".devboule/tasks.json").exists(), "tasks.json persisted");
+        assert!(
+            r.output.contains("approved"),
+            "compact result names the verdict: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("1 task"),
+            "compact result names the task count: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("planId p1"),
+            "compact result names the planId: {}",
+            r.output
+        );
+        // The plan's tasks were created ON THE BOARD (no local tasks.json anymore),
+        // tagged with the approved planId from plan_submit.
+        assert_eq!(
+            mcp.created_plan_id.lock().unwrap().as_deref(),
+            Some("p1"),
+            "the plan was created on the Kanban under planId p1"
+        );
+        assert!(
+            !dir.path().join(".devboule/tasks.json").exists(),
+            "no local tasks.json is written anymore"
+        );
     }
 
     // --- FS confinement -------------------------------------------------------
@@ -972,7 +1083,9 @@ mod tests {
         #[cfg(not(unix))]
         return; // symlink creation differs on Windows; the unix path proves the guard
         let fs = FsBackend::new(root.path()).unwrap();
-        let err = fs.read("escape.txt").expect_err("a symlink-out read must be rejected");
+        let err = fs
+            .read("escape.txt")
+            .expect_err("a symlink-out read must be rejected");
         assert!(err.contains("escapes the project root"), "got: {err}");
     }
 
@@ -990,7 +1103,10 @@ mod tests {
         return;
         let fs = FsBackend::new(root.path()).unwrap();
         let listed = fs.glob("**/*.rs").unwrap();
-        assert!(listed.contains("inside.rs"), "the in-root file is listed: {listed}");
+        assert!(
+            listed.contains("inside.rs"),
+            "the in-root file is listed: {listed}"
+        );
         assert!(
             !listed.contains("leak.rs"),
             "the symlinked-out file must NOT be traversed: {listed}"
@@ -1001,7 +1117,11 @@ mod tests {
     async fn grep_finds_a_planted_match() {
         let dir = tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/a.rs"), b"let x = 1;\n// TODO: fix\nok\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            b"let x = 1;\n// TODO: fix\nok\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("src/b.rs"), b"nothing here\n").unwrap();
         let fs = FsBackend::new(dir.path()).unwrap();
         let got = fs.grep("TODO", None).unwrap();
@@ -1055,7 +1175,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let mcp = std::sync::Arc::new(MockMcpBackend::new());
         let exec = exec_with(dir.path(), mcp);
-        let r = exec.execute(&AgentAction::Fetch { url: "https://x.test".into() }).await;
+        let r = exec
+            .execute(&AgentAction::Fetch {
+                url: "https://x.test".into(),
+            })
+            .await;
         assert!(!r.ok);
         assert!(r.output.contains("egress disabled"), "got: {}", r.output);
     }
@@ -1067,12 +1191,7 @@ mod tests {
         let no_web = exec_with(dir.path(), mcp.clone());
         assert!(!no_web.egress_enabled(), "no key -> egress off");
         let fs = FsBackend::new(dir.path()).unwrap();
-        let with_web = RealExecutor::new(
-            mcp,
-            fs,
-            Some(ExaBackend::new("test-key").unwrap()),
-            dir.path().to_path_buf(),
-        );
+        let with_web = RealExecutor::new(mcp, fs, Some(ExaBackend::new("test-key").unwrap()));
         assert!(with_web.egress_enabled(), "key present -> egress on");
     }
 
@@ -1119,7 +1238,10 @@ mod tests {
             !dbg.contains("super-secret-exa-key"),
             "Debug must not leak the key: {dbg}"
         );
-        assert!(dbg.contains("<redacted>"), "Debug marks the key redacted: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug marks the key redacted: {dbg}"
+        );
     }
 
     #[test]
@@ -1188,7 +1310,11 @@ mod tests {
         // loop's cap_result), never by bytes. 5 multibyte chars under a 10-char cap
         // pass through untouched even though they exceed 10 BYTES.
         let multibyte = "élève"; // 5 chars, > 5 bytes
-        assert_eq!(elide_to(multibyte, 10), multibyte, "5 chars under a 10-char cap is untouched");
+        assert_eq!(
+            elide_to(multibyte, 10),
+            multibyte,
+            "5 chars under a 10-char cap is untouched"
+        );
 
         // Over the char cap: keep exactly `cap` chars (a clean char boundary), mark cut.
         let long = "αβγδεζηθικ"; // 10 Greek chars, 20 bytes

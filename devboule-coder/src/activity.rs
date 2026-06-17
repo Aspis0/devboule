@@ -178,7 +178,11 @@ mod tests {
         let line = encode_milestone(&long, Node::Hollow);
         let v: Value = serde_json::from_str(line.trim_end()).unwrap();
         let got = v["text"].as_str().unwrap();
-        assert_eq!(got.chars().count(), MAX_TEXT_CHARS, "capped to MAX_TEXT_CHARS chars");
+        assert_eq!(
+            got.chars().count(),
+            MAX_TEXT_CHARS,
+            "capped to MAX_TEXT_CHARS chars"
+        );
         // Every char is intact 'é' (no replacement char from a split codepoint).
         assert!(got.chars().all(|c| c == 'é'));
     }
@@ -187,7 +191,11 @@ mod tests {
     fn embedded_newline_in_label_stays_on_one_line() {
         // A label with a stray newline must not break the one-event-per-line contract.
         let line = encode_milestone("explor\ning src/a.rs", Node::Hollow);
-        assert_eq!(line.matches('\n').count(), 1, "the only newline is the terminator");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "the only newline is the terminator"
+        );
         let v: Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(v["text"], "explor\ning src/a.rs");
     }

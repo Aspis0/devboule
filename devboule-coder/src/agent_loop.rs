@@ -50,6 +50,15 @@ pub const DEFAULT_BURST_BUDGET: Duration = Duration::from_secs(120);
 /// not to forbid legitimately revisiting a file later in a long burst.
 pub const NO_PROGRESS_WINDOW: usize = 4;
 
+/// Size of the INVALID-output hash window (Phase 11.4 watchdog refinement). The last
+/// N format-error outputs' content hashes are remembered so a model repeating the SAME
+/// unparseable output — even when interleaved with valid actions that reset the
+/// consecutive-format-error counter — is caught as a loop. The `(tool, target)` guard
+/// only covers DISPATCHED actions, and [`MAX_FORMAT_ERRORS`] only catches CONSECUTIVE
+/// failures; this closes the interleaved-repeat gap between them. A touch wider than
+/// [`NO_PROGRESS_WINDOW`] so a longer invalid↔valid oscillation still trips.
+pub const OUTPUT_HASH_WINDOW: usize = 6;
+
 /// Max length (chars) of a single tool result stored in the transcript. A
 /// runaway tool (a giant file read, a huge fetch) would otherwise blow up the
 /// transcript that is re-fed to the model every round; we truncate at a char
@@ -144,6 +153,7 @@ impl ToolExecutor for StubExecutor {
             AgentAction::OracleAsk { .. }
             | AgentAction::OracleContext { .. }
             | AgentAction::Plan { .. }
+            | AgentAction::RunPlan {}
             | AgentAction::SpawnMini { .. }
             | AgentAction::Read { .. }
             | AgentAction::Grep { .. }
@@ -153,7 +163,9 @@ impl ToolExecutor for StubExecutor {
             // Terminal actions are handled by the loop before dispatch; if one
             // ever reaches here it is a logic error, so report it rather than
             // silently succeed.
-            AgentAction::AskUser { .. } | AgentAction::Done { .. } | AgentAction::Escalate { .. } => {
+            AgentAction::AskUser { .. }
+            | AgentAction::Done { .. }
+            | AgentAction::Escalate { .. } => {
                 ToolResult::err("[stub: terminal action must not be dispatched]")
             }
         }
@@ -275,12 +287,26 @@ pub async fn run_burst(
     // no-progress guard. Catches not just an immediate repeat but a short
     // A→B→A→B oscillation. Only a dispatched action pushes here; format errors,
     // terminal actions, and egress-blocked actions do not.
-    let mut executed_window: VecDeque<(String, String)> = VecDeque::with_capacity(NO_PROGRESS_WINDOW);
+    let mut executed_window: VecDeque<(String, String)> =
+        VecDeque::with_capacity(NO_PROGRESS_WINDOW);
+    // A sliding window of the content hashes of recent INVALID (format-error) outputs,
+    // for the 11.4 loop-detector. Only format-error outputs push here; a valid action
+    // is governed by the (tool, target) guard, not this one.
+    let mut invalid_output_hashes: VecDeque<u64> = VecDeque::with_capacity(OUTPUT_HASH_WINDOW);
+    // Time spent inside `run_plan` dispatches, EXCLUDED from the wall-clock budget. The
+    // 11.3 runner executes a human-APPROVED plan deterministically — many minis, each
+    // legitimately minutes long — as ONE `executor.execute` call. That is real work, not
+    // the model "wandering", and it is already bounded independently (task count ×
+    // attempts, each mini by its own server poll). So the burst budget governs the
+    // MODEL's exploration only; we subtract run_plan's duration so a long, successful run
+    // does not get a spurious "time cap reached" the instant it returns.
+    let mut excluded_elapsed = Duration::ZERO;
 
     loop {
         // Wall-clock cap: check BEFORE asking the model so an already-overrun
         // burst stops promptly rather than doing one more (possibly slow) round.
-        if clock.elapsed() >= budget {
+        // `run_plan` execution time is excluded (see `excluded_elapsed`).
+        if clock.elapsed().saturating_sub(excluded_elapsed) >= budget {
             return BurstOutcome::Escalated("time cap reached".to_string());
         }
 
@@ -288,10 +314,30 @@ pub async fn run_burst(
 
         match parse_action(&raw) {
             Err(fe) => {
+                // 11.4 output-hash loop-detector: a model re-emitting the SAME invalid
+                // output — even interleaved with valid actions that reset the
+                // consecutive-error counter below — is stuck in a way neither the
+                // consecutive-format-error guard nor the (tool, target) guard catches.
+                // Hash this invalid output; a repeat within the window escalates.
+                let h = hash_output(&raw);
+                if invalid_output_hashes.contains(&h) {
+                    let reason = "no progress: repeated invalid model output".to_string();
+                    emit(progress_tx, format!("⚠ {reason}")).await;
+                    return BurstOutcome::Escalated(reason);
+                }
+                invalid_output_hashes.push_back(h);
+                if invalid_output_hashes.len() > OUTPUT_HASH_WINDOW {
+                    invalid_output_hashes.pop_front();
+                }
+
                 // A format error is NOT progress: feed precise guidance back and
                 // do NOT consume the round budget. Three in a row aborts.
                 let feedback = fe.feedback();
-                emit(progress_tx, format!("⚠ format error: {}", short_reason(&fe))).await;
+                emit(
+                    progress_tx,
+                    format!("⚠ format error: {}", short_reason(&fe)),
+                )
+                .await;
                 transcript.push(TranscriptEntry::FormatFeedback(feedback));
                 consecutive_format_errors += 1;
                 if consecutive_format_errors >= MAX_FORMAT_ERRORS {
@@ -375,7 +421,20 @@ pub async fn run_burst(
                     ),
                 )
                 .await;
+                // Measure `run_plan`'s deterministic execution time so it is EXCLUDED
+                // from the wall-clock budget (human-approved real work, not the model
+                // wandering — see `excluded_elapsed`). Every other tool counts normally.
+                let is_run_plan = matches!(action, AgentAction::RunPlan {});
+                let dispatch_start = if is_run_plan {
+                    Some(clock.elapsed())
+                } else {
+                    None
+                };
                 let result = cap_result(executor.execute(&action).await);
+                if let Some(start) = dispatch_start {
+                    excluded_elapsed =
+                        excluded_elapsed.saturating_add(clock.elapsed().saturating_sub(start));
+                }
                 emit(progress_tx, format!("   {}", elide(&result.output))).await;
 
                 transcript.push(TranscriptEntry::Action(action));
@@ -439,6 +498,17 @@ fn elide(s: &str) -> String {
     }
     let cut: String = trimmed.chars().take(MAX).collect();
     format!("{cut}…")
+}
+
+/// Stable content hash of a model output, for the 11.4 loop-detector. Uses the std
+/// `DefaultHasher` (SipHash) — no new dependency; we only need equality of identical
+/// strings within ONE process run (not a cryptographic or cross-run-stable digest), so
+/// the default hasher's per-process seed is fine.
+fn hash_output(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -554,7 +624,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("go".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "go".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(outcome, BurstOutcome::Done("ok".into()));
         assert_eq!(
             *exec.0.lock().unwrap(),
@@ -583,7 +662,10 @@ mod tests {
 
         let entries = t.entries();
         assert_eq!(entries.len(), 5);
-        assert!(matches!(entries[0], TranscriptEntry::Action(AgentAction::Read { .. })));
+        assert!(matches!(
+            entries[0],
+            TranscriptEntry::Action(AgentAction::Read { .. })
+        ));
         assert!(matches!(&entries[1], TranscriptEntry::Result(r) if r.ok));
         assert!(matches!(entries[2], TranscriptEntry::FormatFeedback(_)));
         assert!(matches!(&entries[4], TranscriptEntry::Result(r) if !r.ok));
@@ -601,7 +683,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(256);
 
-        let outcome = run_burst("loop".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "loop".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(
             outcome,
             BurstOutcome::Escalated("round cap reached".to_string())
@@ -624,7 +715,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(
             outcome,
             BurstOutcome::Escalated(format!("{MAX_FORMAT_ERRORS} consecutive format errors"))
@@ -643,11 +743,88 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(outcome, BurstOutcome::Done("recovered".to_string()));
         let joined = drain(&mut rx).join("\n");
         assert!(joined.contains("format error"), "the error was surfaced");
         assert!(joined.contains("done"), "then the burst completed");
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_output_escalates_even_when_interleaved() {
+        // 11.4 loop-detector: identical INVALID outputs interleaved with a valid action
+        // (which resets the consecutive-format-error counter) slip past BOTH the
+        // 3-consecutive guard and the (tool,target) guard. The output-hash window catches
+        // the repeat: garbage_A, read foo.rs (valid), garbage_A -> escalate on the 2nd A.
+        let model = ScriptedModel::new(vec![
+            "stuck thought, no action block".to_string(),
+            action_block(serde_json::json!({"tool":"read","path":"foo.rs"})),
+            "stuck thought, no action block".to_string(), // byte-identical invalid output
+            action_block(serde_json::json!({"tool":"done","reply":"unreached"})),
+        ]);
+        let exec = StubExecutor;
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
+        match outcome {
+            BurstOutcome::Escalated(reason) => {
+                assert!(
+                    reason.contains("repeated invalid"),
+                    "reason names the repeated-invalid-output loop: {reason}"
+                );
+            }
+            other => panic!("expected repeated-invalid-output escalation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_invalid_outputs_are_not_falsely_flagged() {
+        // The detector must NOT trip on DISTINCT invalid outputs: three different garbage
+        // strings escalate via the existing 3-consecutive rule, not the hash detector.
+        let model = ScriptedModel::new(vec![
+            "garbage one".to_string(),
+            "garbage two".to_string(),
+            "garbage three".to_string(),
+            action_block(serde_json::json!({"tool":"done","reply":"unreached"})),
+        ]);
+        let exec = StubExecutor;
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            BurstOutcome::Escalated(format!("{MAX_FORMAT_ERRORS} consecutive format errors")),
+            "distinct invalid outputs escalate via the consecutive guard, not the hash detector"
+        );
     }
 
     #[tokio::test]
@@ -662,7 +839,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         match outcome {
             BurstOutcome::Escalated(reason) => {
                 assert!(reason.starts_with("no progress"), "reason: {reason}");
@@ -684,7 +870,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(outcome, BurstOutcome::Done("ok".to_string()));
     }
 
@@ -703,7 +898,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         match outcome {
             BurstOutcome::Escalated(reason) => {
                 assert!(reason.starts_with("no progress"), "reason: {reason}");
@@ -726,7 +930,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(256);
 
-        let outcome = run_burst("loop".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "loop".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(
             outcome,
             BurstOutcome::Escalated("round cap reached".to_string())
@@ -777,10 +990,24 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(outcome, BurstOutcome::Done("done".to_string()));
 
-        let stored = model.captured.lock().unwrap().clone().expect("a result was stored");
+        let stored = model
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a result was stored");
         assert!(
             stored.chars().count() <= MAX_RESULT_LEN + 64,
             "stored output is truncated near the cap, got {} chars",
@@ -823,8 +1050,22 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let _ = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
-        let stored = model.0.lock().unwrap().clone().expect("a result was stored");
+        let _ = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
+        let stored = model
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a result was stored");
         assert_eq!(stored, "just a little output");
         assert!(!stored.contains("truncated"), "no marker on a small result");
     }
@@ -851,15 +1092,29 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let outcome =
-            run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, false, &tx).await;
-        assert_eq!(outcome, BurstOutcome::Done("recovered via oracle".to_string()));
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            false,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            BurstOutcome::Done("recovered via oracle".to_string())
+        );
         assert!(
             exec.0.lock().unwrap().is_empty(),
             "the egress action must NEVER reach the executor"
         );
         let joined = drain(&mut rx).join("\n");
-        assert!(joined.contains("egress disabled"), "the disabled marker streamed: {joined}");
+        assert!(
+            joined.contains("egress disabled"),
+            "the disabled marker streamed: {joined}"
+        );
     }
 
     #[tokio::test]
@@ -878,14 +1133,24 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome =
-            run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, false, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            false,
+            &tx,
+        )
+        .await;
         match outcome {
             BurstOutcome::Escalated(reason) => {
                 assert!(reason.starts_with("no progress"), "reason: {reason}");
                 assert!(reason.contains("fetch"), "names the cycled tool: {reason}");
             }
-            other => panic!("expected no-progress escalation on repeated blocked egress, got {other:?}"),
+            other => {
+                panic!("expected no-progress escalation on repeated blocked egress, got {other:?}")
+            }
         }
     }
 
@@ -909,8 +1174,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome =
-            run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(outcome, BurstOutcome::Done("ok".to_string()));
         assert_eq!(
             *exec.0.lock().unwrap(),
@@ -956,6 +1229,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_plan_execution_time_is_excluded_from_the_wall_clock() {
+        // run_plan executes a human-approved plan deterministically and can take many
+        // minutes; that time must NOT count against the burst budget. The scripted clock
+        // simulates run_plan consuming ~1000s. WITHOUT exclusion the round-2 top-of-loop
+        // check (elapsed 1010 ≥ budget 120) would escalate "time cap reached"; WITH
+        // exclusion (1010 − 1000 = 10 < 120) the burst proceeds to a clean `done`.
+        struct ScriptedClock {
+            values: Vec<u64>,
+            calls: AtomicUsize,
+        }
+        impl Clock for ScriptedClock {
+            fn elapsed(&self) -> Duration {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let secs = self
+                    .values
+                    .get(n)
+                    .copied()
+                    .unwrap_or_else(|| self.values.last().copied().unwrap_or(0));
+                Duration::from_secs(secs)
+            }
+        }
+        let model = ScriptedModel::new(vec![
+            action_block(serde_json::json!({"tool":"run_plan"})),
+            action_block(serde_json::json!({"tool":"done","reply":"plan executed"})),
+        ]);
+        let exec = StubExecutor;
+        // elapsed() calls: [round1-top=0, dispatch-start=10, post-dispatch=1010,
+        // round2-top=1010]. excluded = 1010-10 = 1000; round2 check = 1010-1000 = 10.
+        let clock = ScriptedClock {
+            values: vec![0, 10, 1010, 1010],
+            calls: AtomicUsize::new(0),
+        };
+        let (tx, _rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "go".into(),
+            &model,
+            &exec,
+            &clock,
+            Duration::from_secs(120),
+            true,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            BurstOutcome::Done("plan executed".to_string()),
+            "run_plan's long deterministic execution is excluded from the wall-clock cap"
+        );
+    }
+
+    #[tokio::test]
     async fn ask_user_hands_back() {
         let model = ScriptedModel::new(vec![action_block(
             serde_json::json!({"tool":"ask_user","question":"which env?"}),
@@ -964,7 +1289,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(outcome, BurstOutcome::AskUser("which env?".to_string()));
     }
 
@@ -977,7 +1311,16 @@ mod tests {
         let clock = FixedClock(Duration::ZERO);
         let (tx, _rx) = mpsc::channel(64);
 
-        let outcome = run_burst("x".into(), &model, &exec, &clock, DEFAULT_BURST_BUDGET, true, &tx).await;
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
         assert_eq!(
             outcome,
             BurstOutcome::Escalated("out of my depth".to_string())
@@ -993,14 +1336,37 @@ mod tests {
         let exec = StubExecutor;
         let actions = [
             AgentAction::OracleAsk { query: "q".into() },
-            AgentAction::OracleContext { query: "q".into(), limit: None },
-            AgentAction::Plan { steps: vec!["s".into()] },
-            AgentAction::SpawnMini { task: "t".into(), files: vec!["a.rs".into()], write: true },
-            AgentAction::SpawnMini { task: "t".into(), files: vec!["a.rs".into()], write: false },
-            AgentAction::Read { path: "a.rs".into() },
-            AgentAction::Grep { pattern: "x".into(), glob: None },
-            AgentAction::Glob { pattern: "*.rs".into() },
-            AgentAction::Fetch { url: "https://example.com".into() },
+            AgentAction::OracleContext {
+                query: "q".into(),
+                limit: None,
+            },
+            AgentAction::Plan {
+                steps: vec!["s".into()],
+            },
+            AgentAction::RunPlan {},
+            AgentAction::SpawnMini {
+                task: "t".into(),
+                files: vec!["a.rs".into()],
+                write: true,
+            },
+            AgentAction::SpawnMini {
+                task: "t".into(),
+                files: vec!["a.rs".into()],
+                write: false,
+            },
+            AgentAction::Read {
+                path: "a.rs".into(),
+            },
+            AgentAction::Grep {
+                pattern: "x".into(),
+                glob: None,
+            },
+            AgentAction::Glob {
+                pattern: "*.rs".into(),
+            },
+            AgentAction::Fetch {
+                url: "https://example.com".into(),
+            },
             AgentAction::Websearch { query: "q".into() },
         ];
         for action in &actions {
@@ -1011,7 +1377,8 @@ mod tests {
                 action.tool_name()
             );
             assert_eq!(
-                result.output, STUB_NOT_CONNECTED,
+                result.output,
+                STUB_NOT_CONNECTED,
                 "{} stub result must be the not-connected signal",
                 action.tool_name()
             );

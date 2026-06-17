@@ -78,7 +78,8 @@ impl Conversation {
         if self.streaming {
             return;
         }
-        self.messages.push(Message::new(Role::Assistant, String::new()));
+        self.messages
+            .push(Message::new(Role::Assistant, String::new()));
         self.streaming = true;
     }
 

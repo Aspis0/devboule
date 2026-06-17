@@ -41,11 +41,39 @@ use crate::executor::McpBackend;
 /// turns into the safe Stub fallback.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Wall-clock cap on a single `call_tool`. Oracle / `spawn_mini_coder` can be
-/// genuinely slow (grounded retrieval, a spawned sub-agent), so this is generous
-/// — but FINITE: a hung server turns one tool call into a recoverable
-/// `ToolResult::err` instead of wedging the whole burst on a pending `.await`.
-const CALL_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default wall-clock cap on a single `call_tool` for the FAST, non-blocking tools
+/// (oracle_*, project_*, agent_*): generous for grounded retrieval / a Kanban op, but
+/// FINITE so a hung server turns one call into a recoverable `ToolResult::err` instead
+/// of wedging the whole burst on a pending `.await`.
+const DEFAULT_CALL_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Per-tool wall-clock cap on a single `call_tool`.
+///
+/// CRITICAL INVARIANT: a tool whose SERVER handler BLOCKS on a bounded poll (it waits
+/// for a spawned mini, a human approval gate, or a render) MUST get a CLIENT timeout
+/// that EXCEEDS that server poll — otherwise the client gives up while the server is
+/// still working, surfacing a misleading transport timeout and (for the 11.3 runner) a
+/// FALSE `blocked` task while the mini is still running. A real mini-coder burst easily
+/// takes minutes (owner: "5 minuti, facile"); the old flat 120s was far too short.
+///
+/// These mirror the server's poll constants in `oracle/server/aspis_mcp.py` (+ margin
+/// for the server's final result-stamp + transport). Keep each ≥ its server counterpart
+/// if those change:
+///   spawn_mini_coder : MINI_CODER_POLL_TIMEOUT_SECS  = 1800 -> 1920 (32 min)
+///   plan_submit      : PLAN_POLL_TIMEOUT_SECS        = 600  -> 720
+///   request_git_push : GIT_PUSH_POLL_TIMEOUT_SECS    = 600  -> 720
+///   ask_user         : ASK_USER_POLL_TIMEOUT_SECS    = 600  -> 720
+///   visual_check     : VISUAL_CHECK_POLL_TIMEOUT_SECS = 120 -> 240
+/// Everything else falls back to [`DEFAULT_CALL_TOOL_TIMEOUT`].
+fn call_tool_timeout(tool: &str) -> Duration {
+    let secs = match tool {
+        "spawn_mini_coder" => 1920,
+        "plan_submit" | "request_git_push" | "ask_user" => 720,
+        "visual_check" => 240,
+        _ => return DEFAULT_CALL_TOOL_TIMEOUT,
+    };
+    Duration::from_secs(secs)
+}
 
 /// Config to launch + register against the Oracle MCP server. Nothing is
 /// hardcoded: the L2.4 Devboule launch wiring supplies the interpreter, the
@@ -245,21 +273,24 @@ impl McpBackend for RmcpBackend {
         }
 
         // `name` is a borrowed &str but CallToolRequestParams wants a
-        // Cow<'static, str>, so own it. The call is bounded by CALL_TOOL_TIMEOUT:
+        // Cow<'static, str>, so own it. The call is bounded by the PER-TOOL timeout:
         // a hung server turns a pending `.await` into a recoverable error the burst
         // can feed back to the model, instead of wedging the whole burst (the
-        // wall-clock guard only runs BETWEEN awaits, never during a pending one).
+        // wall-clock guard only runs BETWEEN awaits, never during a pending one). The
+        // per-tool value EXCEEDS the server's blocking poll for slow tools (a mini burst,
+        // a human gate) so a genuinely-working call is never cut short into a false error.
+        let call_timeout = call_tool_timeout(name);
         let call = self
             .service
             .peer()
             .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(args));
-        let result = match timeout(CALL_TOOL_TIMEOUT, call).await {
+        let result = match timeout(call_timeout, call).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return Err(format!("call_tool {name} failed: {e}")),
             Err(_) => {
                 return Err(format!(
                     "call_tool {name} timed out after {}s",
-                    CALL_TOOL_TIMEOUT.as_secs()
+                    call_timeout.as_secs()
                 ))
             }
         };
@@ -343,9 +374,7 @@ fn extract_session_token(text: &str) -> Option<String> {
 fn resolve_session_token(register_text: &str, managed: bool) -> Result<String, String> {
     match extract_session_token(register_text) {
         Some(token) => Ok(token),
-        None if managed => {
-            Err("agent_register did not return a sessionToken".to_string())
-        }
+        None if managed => Err("agent_register did not return a sessionToken".to_string()),
         // Unmanaged: no token is expected and the server accepts tokenless calls.
         None => Ok(String::new()),
     }
@@ -367,6 +396,42 @@ mod tests {
     }
 
     #[test]
+    fn call_tool_timeout_exceeds_server_poll_for_blocking_tools() {
+        // The load-bearing invariant: the CLIENT timeout must exceed the SERVER blocking
+        // poll for each slow tool, so the server's bounded poll returns a real terminal
+        // outcome before the client gives up (no false transport timeout / false block).
+        // Server polls (aspis_mcp.py): mini=1800, plan/push/ask=600, visual=120.
+        assert!(
+            call_tool_timeout("spawn_mini_coder").as_secs() > 1800,
+            "mini > 1800s"
+        );
+        assert!(
+            call_tool_timeout("plan_submit").as_secs() > 600,
+            "plan gate > 600s"
+        );
+        assert!(
+            call_tool_timeout("request_git_push").as_secs() > 600,
+            "push gate > 600s"
+        );
+        assert!(
+            call_tool_timeout("ask_user").as_secs() > 600,
+            "ask_user gate > 600s"
+        );
+        assert!(
+            call_tool_timeout("visual_check").as_secs() > 120,
+            "visual > 120s"
+        );
+        // Fast / unknown tools fall back to the (shorter) default.
+        assert_eq!(call_tool_timeout("oracle_ask"), DEFAULT_CALL_TOOL_TIMEOUT);
+        assert_eq!(
+            call_tool_timeout("project_structure"),
+            DEFAULT_CALL_TOOL_TIMEOUT
+        );
+        // A mini burst of several minutes (owner: "5 minuti, facile") is comfortably under.
+        assert!(call_tool_timeout("spawn_mini_coder").as_secs() >= 300 * 2);
+    }
+
+    #[test]
     fn extract_session_token_rejects_missing_or_empty() {
         assert_eq!(extract_session_token(r#"{"role":"x"}"#), None);
         assert_eq!(extract_session_token(r#"{"sessionToken":""}"#), None);
@@ -378,7 +443,10 @@ mod tests {
         // MANAGED launch (a launch token was supplied): the server mints a
         // sessionToken and enforces it on every call, so it MUST be present.
         let body = r#"{"sessionToken": "tok-managed", "role": "orchestrator"}"#;
-        assert_eq!(resolve_session_token(body, true).as_deref(), Ok("tok-managed"));
+        assert_eq!(
+            resolve_session_token(body, true).as_deref(),
+            Ok("tok-managed")
+        );
     }
 
     #[test]
@@ -394,15 +462,24 @@ mod tests {
         // UNMANAGED dev/CI path: the server returns no sessionToken (no hash stored)
         // and accepts tokenless calls. Tolerate it — store an empty token so
         // subsequent calls omit the key, matching require_session_token's contract.
-        assert_eq!(resolve_session_token(r#"{"role":"orchestrator"}"#, false).as_deref(), Ok(""));
-        assert_eq!(resolve_session_token(r#"{"sessionToken":""}"#, false).as_deref(), Ok(""));
+        assert_eq!(
+            resolve_session_token(r#"{"role":"orchestrator"}"#, false).as_deref(),
+            Ok("")
+        );
+        assert_eq!(
+            resolve_session_token(r#"{"sessionToken":""}"#, false).as_deref(),
+            Ok("")
+        );
     }
 
     #[test]
     fn resolve_session_token_unmanaged_still_honors_a_returned_token() {
         // If an unmanaged server DID return a token, use it (don't discard it).
         let body = r#"{"sessionToken": "tok-unmanaged"}"#;
-        assert_eq!(resolve_session_token(body, false).as_deref(), Ok("tok-unmanaged"));
+        assert_eq!(
+            resolve_session_token(body, false).as_deref(),
+            Ok("tok-unmanaged")
+        );
     }
 
     fn test_config(launch_token: &str) -> RmcpConfig {
@@ -424,9 +501,18 @@ mod tests {
         // (validate_launch_token_for_registration), so it must ride in the register
         // params under that exact field name with the configured value.
         let args = build_register_args(&test_config("tok-xyz-789"));
-        assert_eq!(args.get("launch_token").and_then(|v| v.as_str()), Some("tok-xyz-789"));
-        assert_eq!(args.get("agent_id").and_then(|v| v.as_str()), Some("orchestrator-1"));
-        assert_eq!(args.get("role").and_then(|v| v.as_str()), Some("orchestrator"));
+        assert_eq!(
+            args.get("launch_token").and_then(|v| v.as_str()),
+            Some("tok-xyz-789")
+        );
+        assert_eq!(
+            args.get("agent_id").and_then(|v| v.as_str()),
+            Some("orchestrator-1")
+        );
+        assert_eq!(
+            args.get("role").and_then(|v| v.as_str()),
+            Some("orchestrator")
+        );
     }
 
     #[test]

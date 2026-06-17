@@ -23,6 +23,7 @@ mod model_client;
 mod planner;
 mod prompt;
 mod rmcp_backend;
+mod runner;
 mod terminal;
 
 use std::sync::Arc;
@@ -30,7 +31,9 @@ use std::time::Duration;
 
 use futures::future::OptionFuture;
 use futures::StreamExt;
-use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tui_textarea::Input;
@@ -352,7 +355,10 @@ mod tests {
     use super::*;
 
     fn args(v: &[&str]) -> impl Iterator<Item = String> {
-        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+        v.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     #[test]

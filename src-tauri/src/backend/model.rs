@@ -191,6 +191,32 @@ pub struct ProjectTask {
     /// so old markdown blocks load with [].
     #[serde(default)]
     pub suspect_file_ids: Vec<String>,
+    /// Phase 11.5-B (Piece 1a): prerequisite task ids forming the plan DAG. Empty
+    /// for a manual task with no dependencies. Serde-default + camelCase (`dependsOn`)
+    /// so a `.md` state block written before this field existed loads UNCHANGED;
+    /// `skip_serializing_if` keeps the on-disk JSON byte-stable for manual tasks
+    /// (re-serializing a pre-1a task must NOT inject `"dependsOn":[]` and churn the
+    /// content hash / git-dirty state / Oracle re-index — same discipline as
+    /// `milestones`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Phase 11.5-B (Piece 1a): files this task may MODIFY — the mini's write
+    /// allowlist when the runner executes a plan task. Empty for a manual task.
+    /// Serde-default + camelCase (`scope`) + no-churn skip → backward-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
+    /// Phase 11.5-B (Piece 1a): the deterministic acceptance check (free text).
+    /// Empty for a manual task. Serde-default + camelCase (`acceptance`); omitted
+    /// from on-disk JSON when empty so a manual task never injects `"acceptance":""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub acceptance: String,
+    /// Phase 11.5-B (Piece 1a): the approved plan id this task was created from.
+    /// `Some` ONLY for tasks created via `project_create_plan_tasks`; `None` for
+    /// manual tasks (this is how the runner knows which tasks to auto-execute).
+    /// Serde-default + camelCase (`planId`); omitted from on-disk JSON when `None`
+    /// so a manual task never injects `"planId":null` and churns the content hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

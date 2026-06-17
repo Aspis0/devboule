@@ -569,6 +569,19 @@ pub struct MiniCoderDirective {
     /// co-owner preserves it verbatim (passthrough, like scratchPath/claimedAt).
     #[serde(default, skip_serializing_if = "is_false")]
     pub kill_requested: bool,
+    /// ASYNC STEERING (piece a): a FIFO of mid-flight supervisor corrections, the
+    /// SAME external-signal-to-a-running-directive channel as `kill_requested`
+    /// generalized from one bool to a queue. A supervising coder / the human appends a
+    /// guidance message (Python `steer_mini_coder` MCP tool or the `mini_coder_steer`
+    /// Tauri command); the executor DRAINS it at the next round boundary and folds it
+    /// into the retry's task as a `SUPERVISOR STEERING:` block (the same append path
+    /// Censor feedback uses — see `build_retry_directive`). The reserved sentinel
+    /// [`STEER_STOP_SENTINEL`] maps to the kill path (sets `kill_requested`). NO-CHURN:
+    /// a directive that was never steered omits this entirely (empty Vec skipped), so a
+    /// Python-written directive round-trips byte-identically — exactly like
+    /// `killRequested` skips when false. The Python co-owner preserves it verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steer_queue: Vec<String>,
     /// Relative path (under the project scratch root) the mini writes its result
     /// JSON to. `..`/absolute is rejected by `read_result_file`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -628,6 +641,26 @@ pub struct MiniCoderDirective {
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
+
+/// ASYNC STEERING (a) cap: max chars of a SINGLE steer message folded into the next
+/// round's task. CO-WRITER PARITY: the Python `MINI_CODER_MAX_STEER_LEN` must match —
+/// both writers (`mini_coder_steer` Tauri command + `steer_mini_coder` MCP tool) trim to
+/// this so a pathological message can't bloat the prompt.
+pub const MAX_STEER_MESSAGE_LEN: usize = 2000;
+/// ASYNC STEERING (a) cap: max queued steer messages on one directive (a bounded FIFO).
+/// A steerer that floods past this is silently dropping the OLDEST entries is wrong — we
+/// REFUSE the append instead (the caller gets a clear "queue full" status), so an
+/// already-queued correction is never lost. CO-WRITER PARITY with Python.
+pub const MAX_STEER_QUEUE_LEN: usize = 8;
+/// ASYNC STEERING (a) — P2 (AGGREGATE BLOAT CAP): the per-message [`MAX_STEER_MESSAGE_LEN`]
+/// cap does NOT bound the SUM folded into one fix-pass task. A full queue
+/// ([`MAX_STEER_QUEUE_LEN`] messages × [`MAX_STEER_MESSAGE_LEN`] chars) is 16 000 chars of
+/// steering on top of the original task + Censor feedback — enough to balloon the retry
+/// prompt. So [`fold_steer_block`] caps the ASSEMBLED steer body to this total budget (chars),
+/// truncating at a message boundary and appending a clear `[… steering truncated]` marker so
+/// the model knows corrections were dropped. Generous enough that a realistic handful of
+/// corrections always fits unchanged; it only bites a pathological flood.
+pub const MAX_STEER_BLOCK_LEN: usize = 4000;
 
 // ---------------------------------------------------------------------------
 // Pure state transitions (no double-claim)
@@ -810,12 +843,103 @@ pub fn awaiting_retry_ancestors(
         .collect()
 }
 
+/// ASYNC STEERING (piece a): the reserved `steer_queue` message that maps to the kill
+/// path instead of a queued correction. A steerer who sends this (case-insensitive,
+/// after trimming) is asking to STOP the mini — handled by `mini_coder_steer` /
+/// `dispatch_steer_mini_coder` by setting `kill_requested` (reusing the Stop path)
+/// rather than queueing prose. Documented + shared so both writers and the executor
+/// agree on the one sentinel.
+pub const STEER_STOP_SENTINEL: &str = "stop";
+
+/// ASYNC STEERING (piece a): true iff `message` is the reserved stop sentinel
+/// ([`STEER_STOP_SENTINEL`], case-insensitive, trimmed). A steer that is a stop must
+/// route to the kill path, not the queued-correction path.
+pub fn is_steer_stop(message: &str) -> bool {
+    message.trim().eq_ignore_ascii_case(STEER_STOP_SENTINEL)
+}
+
+/// ASYNC STEERING (piece a) — C2 (BIDI/INVISIBLE PARITY): sanitize a human steer message
+/// before it is queued, folded into the fix-pass prompt AND shown in the Console. CO-WRITER
+/// PARITY with the Python `steer_mini_coder` tool, which routes the message through
+/// `clean_text` -> `strip_invisible_and_bidi` (drop invisible/bidi/control chars) followed by
+/// a whitespace collapse. Without this the Tauri command only trimmed, so a steer could
+/// smuggle a right-to-left override / zero-width joiner / BOM into the prompt or a toast
+/// (spoofing or hiding text). We REUSE the canonical [`is_forbidden_command_char`] blocklist
+/// (the SAME control + Cf bidi/zero-width/invisible set the `api`/oMLX validators reject) as
+/// the drop predicate, then collapse runs of whitespace to single spaces and trim — mirroring
+/// `clean_text`'s `" ".join(text.split()).strip()`. Note U+2028/U+2029 (line/paragraph
+/// separator) are whitespace, so the collapse step removes them exactly as Python's regex does.
+/// Pure + privacy-safe (operates on the supervisor's own prose). The caller still applies the
+/// [`MAX_STEER_MESSAGE_LEN`] char cap AFTER this (so the cap counts only retained chars).
+pub fn sanitize_steer_message(message: &str) -> String {
+    let stripped: String = message
+        .chars()
+        // Drop the invisible/bidi/control blocklist, but DELIBERATELY keep whitespace
+        // control chars (`\t`/`\n`/`\r`/…): Python strips only the invisible/bidi SET and
+        // then `.split()` collapses whitespace to single spaces — so tabs/newlines must
+        // survive this step to become word separators, not vanish (which would glue words
+        // together). Whitespace is never a smuggling vector (it renders as space).
+        .filter(|c| !(is_forbidden_command_char(*c) && !c.is_whitespace()))
+        .collect();
+    // Collapse any run of (remaining) whitespace to a single space, trim the ends — the
+    // SAME normalization as Python's `clean_text` (`" ".join(text.split())`). `split_whitespace`
+    // also folds U+2028/U+2029 (line/paragraph separator), exactly as Python's regex does.
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// ASYNC STEERING (piece a): fold a DRAINED steer queue into a single
+/// `SUPERVISOR STEERING:` block appended to the next round's task — REUSING the exact
+/// `\n\n<HEADER>:\n<body>` append shape `build_retry_directive` uses for Censor
+/// feedback. Returns None when the queue holds no actionable correction (empty, or only
+/// blank/stop entries — a stop is handled by the kill path, never folded into prose), so
+/// the caller can skip the append entirely (no spurious header). One line per message,
+/// in FIFO order. Pure + privacy-safe (the messages are the supervisor's own prose, the
+/// same trust tier as the task itself).
+pub fn fold_steer_block(messages: &[String]) -> Option<String> {
+    let lines: Vec<&str> = messages
+        .iter()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty() && !is_steer_stop(m))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    // P2 (AGGREGATE BLOAT CAP): assemble the body FIFO but stop at a MESSAGE BOUNDARY once
+    // the running char count would exceed MAX_STEER_BLOCK_LEN, so the per-message cap can't
+    // sum into a multi-thousand-char prompt balloon. Whole corrections are kept (never a
+    // half-sentence); a dropped tail is flagged so the model knows steering was truncated.
+    let mut body = String::new();
+    let mut truncated = false;
+    for m in &lines {
+        let line = format!("- {m}");
+        // +1 for the joining newline once the body is non-empty.
+        let added = line.chars().count() + if body.is_empty() { 0 } else { 1 };
+        if !body.is_empty() && body.chars().count() + added > MAX_STEER_BLOCK_LEN {
+            truncated = true;
+            break;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&line);
+    }
+    if truncated {
+        body.push_str("\n- [… additional steering corrections truncated]");
+    }
+    Some(format!("SUPERVISOR STEERING (apply these corrections this round):\n{body}"))
+}
+
 /// P6: build the PENDING retry directive appended when a predecessor goes
 /// `AwaitingRetry`. Inherits the chain's root id (so the whole lineage shares one
 /// root the poll watches), bumps `attempt`, unions the predecessor's declared
 /// `files` with the files it actually touched (so the retry sees the full surface),
 /// appends the Censor feedback to the task, and inherits backend/allowOracle/
 /// parentAgentId. Fresh id/result_path/created_at supplied by the (impure) caller.
+///
+/// ASYNC STEERING (piece a): the predecessor's `steer_queue` is DRAINED here and folded
+/// into the SAME task via [`fold_steer_block`] (the same `\n\n<HEADER>:\n<body>` append
+/// shape the Censor feedback uses) — the retry STARTS with `steer_queue` empty (consumed),
+/// so a steer takes effect exactly once, at this round boundary.
 #[allow(clippy::too_many_arguments)]
 pub fn build_retry_directive(
     predecessor: &MiniCoderDirective,
@@ -833,12 +957,21 @@ pub fn build_retry_directive(
             files.push(f.clone());
         }
     }
-    let task = format!(
+    let mut task = format!(
         "{}\n\nCENSOR FEEDBACK (attempt {}):\n{}",
         predecessor.task,
         predecessor.attempt + 1,
         censor_feedback,
     );
+    // ASYNC STEERING (piece a): DRAIN the predecessor's steer queue into THIS round's
+    // task, REUSING the same `\n\n<HEADER>:\n<body>` append shape as the Censor feedback
+    // above. The retry is born with `steer_queue` empty (the messages were consumed here),
+    // so a correction lands exactly once, at this round boundary. A queue of only blank /
+    // stop entries folds to nothing (the stop sentinel is handled by the kill path).
+    if let Some(steer) = fold_steer_block(&predecessor.steer_queue) {
+        task.push_str("\n\n");
+        task.push_str(&steer);
+    }
     MiniCoderDirective {
         id: new_id.into(),
         parent_agent_id: predecessor.parent_agent_id.clone(),
@@ -850,6 +983,9 @@ pub fn build_retry_directive(
         write_mode: predecessor.write_mode,
         allow_oracle: predecessor.allow_oracle,
         kill_requested: false,
+        // ASYNC STEERING: consumed — the retry starts with an empty queue (omitted on the
+        // wire by the Vec::is_empty serde skip), so steering does not re-apply next round.
+        steer_queue: Vec::new(),
         result_path: result_path.into(),
         agent_id: None,
         created_at: created_at.into(),
@@ -2052,6 +2188,7 @@ mod tests {
             backend: None,
             allow_oracle: false,
             kill_requested: false,
+            steer_queue: Vec::new(),
             result_path: format!("mini/{id}.json"),
             agent_id: None,
             created_at: created_at.into(),
@@ -2080,6 +2217,7 @@ mod tests {
             backend: Some("ollama".into()),
             allow_oracle: true,
             kill_requested: true,
+            steer_queue: Vec::new(),
             result_path: "mini/d1.json".into(),
             agent_id: Some("mini-coder1-abcd1234".into()),
             created_at: "2026-06-06T00:00:00Z".into(),
@@ -2459,6 +2597,153 @@ mod tests {
         let from_python: MiniCoderDirective =
             serde_json::from_str(r#"{ "id": "d3", "task": "x", "resultPath": "m.json" }"#).unwrap();
         assert!(!from_python.kill_requested);
+    }
+
+    #[test]
+    fn steer_queue_round_trips_camel_case_and_skips_when_empty() {
+        // ASYNC STEERING (a): steerQueue round-trips as camelCase when non-empty; is
+        // OMITTED (no churn) when empty so a Python-written directive that was never
+        // steered round-trips byte-identically — exactly the kill_requested pattern.
+        let mut d = directive("d1", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
+        d.steer_queue = vec!["use a HashMap not a Vec".into(), "add a test".into()];
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"steerQueue\""), "json: {json}");
+        assert!(json.contains("use a HashMap not a Vec"), "json: {json}");
+        let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.steer_queue, d.steer_queue);
+
+        // Empty -> skipped (no-churn), and a directive missing the key defaults empty.
+        let d2 = directive("d2", MiniCoderStatus::Pending, "2026-06-06T00:00:00Z");
+        assert!(d2.steer_queue.is_empty());
+        let json2 = serde_json::to_string(&d2).unwrap();
+        assert!(!json2.contains("steerQueue"), "json2: {json2}");
+        let from_python: MiniCoderDirective =
+            serde_json::from_str(r#"{ "id": "d3", "task": "x", "resultPath": "m.json" }"#).unwrap();
+        assert!(from_python.steer_queue.is_empty());
+    }
+
+    #[test]
+    fn fold_steer_block_builds_supervisor_block_or_none() {
+        // Non-empty actionable messages -> a single SUPERVISOR STEERING block, FIFO order.
+        let block = fold_steer_block(&["first fix".into(), "second fix".into()]).unwrap();
+        assert!(block.starts_with("SUPERVISOR STEERING"), "block: {block}");
+        assert!(block.contains("- first fix"), "block: {block}");
+        assert!(block.contains("- second fix"), "block: {block}");
+        // first must precede second (FIFO).
+        assert!(
+            block.find("first fix").unwrap() < block.find("second fix").unwrap(),
+            "FIFO order: {block}"
+        );
+
+        // Empty queue, blank-only, and stop-only all fold to None (no spurious header;
+        // the stop sentinel routes to the kill path, never into the prose).
+        assert!(fold_steer_block(&[]).is_none());
+        assert!(fold_steer_block(&["   ".into(), "".into()]).is_none());
+        assert!(fold_steer_block(&["stop".into(), "  STOP  ".into()]).is_none());
+        // A mix keeps the real correction, drops the stop.
+        let mixed = fold_steer_block(&["stop".into(), "real correction".into()]).unwrap();
+        assert!(mixed.contains("- real correction"), "mixed: {mixed}");
+        assert!(!mixed.contains("- stop"), "stop must not be folded: {mixed}");
+    }
+
+    #[test]
+    fn fold_steer_block_caps_aggregate_size() {
+        // P2 (AGGREGATE BLOAT CAP): a full queue of max-length messages must NOT fold into a
+        // multi-thousand-char block. With MAX_STEER_QUEUE_LEN messages each at
+        // MAX_STEER_MESSAGE_LEN, the naive sum is ~16 000 chars; the cap bounds the body.
+        let big = "x".repeat(MAX_STEER_MESSAGE_LEN);
+        let queue: Vec<String> = (0..MAX_STEER_QUEUE_LEN).map(|_| big.clone()).collect();
+        let block = fold_steer_block(&queue).unwrap();
+        // The body (block minus the header line) stays within budget + the short marker.
+        assert!(
+            block.chars().count() <= "SUPERVISOR STEERING (apply these corrections this round):\n".chars().count()
+                + MAX_STEER_BLOCK_LEN
+                + 64,
+            "folded block must be capped, got {} chars",
+            block.chars().count()
+        );
+        assert!(
+            block.contains("truncated"),
+            "a dropped tail must be flagged: {block}"
+        );
+
+        // A realistic handful of short corrections is NOT truncated (whole messages kept).
+        let small = fold_steer_block(&[
+            "use a HashMap".into(),
+            "add a bounds check".into(),
+            "rename foo to bar".into(),
+        ])
+        .unwrap();
+        assert!(!small.contains("truncated"), "small block untouched: {small}");
+        assert!(small.contains("- use a HashMap"));
+        assert!(small.contains("- rename foo to bar"));
+    }
+
+    #[test]
+    fn is_steer_stop_matches_sentinel_case_insensitively() {
+        assert!(is_steer_stop("stop"));
+        assert!(is_steer_stop("  STOP  "));
+        assert!(is_steer_stop("Stop"));
+        assert!(!is_steer_stop("stop the build")); // only the exact sentinel
+        assert!(!is_steer_stop("please stop"));
+        assert!(!is_steer_stop(""));
+    }
+
+    #[test]
+    fn sanitize_steer_message_strips_invisible_bidi_and_collapses_whitespace() {
+        // C2 (BIDI/INVISIBLE PARITY): the Tauri steer message must be cleaned like Python's
+        // clean_text -> strip_invisible_and_bidi + whitespace collapse before it is queued /
+        // folded into the prompt / shown in a toast.
+
+        // Zero-width joiner, RTL override and BOM are STRIPPED (every char is in the
+        // is_forbidden_command_char blocklist).
+        let dirty = "use a \u{202e}HashMap\u{200d}\u{feff} not a Vec";
+        assert_eq!(
+            sanitize_steer_message(dirty),
+            "use a HashMap not a Vec",
+            "invisible/bidi chars must be dropped"
+        );
+
+        // Whitespace runs (incl. tabs/newlines and U+2028 line separator) collapse to single
+        // spaces and the ends trim — mirroring Python's `\" \".join(text.split())`.
+        let spacey = "  first\t\tline\n\nsecond\u{2028}third  ";
+        assert_eq!(sanitize_steer_message(spacey), "first line second third");
+
+        // A message made ENTIRELY of invisible/bidi/whitespace sanitizes to empty (the
+        // command then rejects it — C3 parity with Python's required-field error).
+        assert_eq!(sanitize_steer_message("\u{200b}\u{feff}  \u{202a}"), "");
+        assert_eq!(sanitize_steer_message("   "), "");
+
+        // Ordinary prose with internal single spaces round-trips unchanged.
+        assert_eq!(
+            sanitize_steer_message("prefer iterators over loops"),
+            "prefer iterators over loops"
+        );
+
+        // The stop sentinel survives sanitize so the kill path still recognizes it.
+        assert!(is_steer_stop(&sanitize_steer_message("  STOP  ")));
+    }
+
+    #[test]
+    fn build_retry_directive_folds_steer_queue_and_clears_it() {
+        // ASYNC STEERING (a): a predecessor carrying a steer_queue produces a retry whose
+        // task carries BOTH the Censor feedback AND the SUPERVISOR STEERING block, and
+        // whose own steer_queue is EMPTY (consumed exactly once at this boundary).
+        let mut pred = directive("root", MiniCoderStatus::Done, "2026-06-06T00:00:00Z");
+        pred.task = "original task".into();
+        pred.steer_queue = vec!["prefer iterators".into()];
+        let retry = build_retry_directive(&pred, &[], "censor says X", "root-r1", "root-r1.json", "t");
+        assert!(retry.task.contains("original task"), "task: {}", retry.task);
+        assert!(retry.task.contains("CENSOR FEEDBACK"), "task: {}", retry.task);
+        assert!(retry.task.contains("SUPERVISOR STEERING"), "task: {}", retry.task);
+        assert!(retry.task.contains("- prefer iterators"), "task: {}", retry.task);
+        assert!(retry.steer_queue.is_empty(), "retry must start drained");
+
+        // No steer queue -> no SUPERVISOR STEERING block (no spurious header).
+        let mut pred2 = directive("root2", MiniCoderStatus::Done, "2026-06-06T00:00:00Z");
+        pred2.task = "original".into();
+        let retry2 = build_retry_directive(&pred2, &[], "fb", "root2-r1", "root2-r1.json", "t");
+        assert!(!retry2.task.contains("SUPERVISOR STEERING"), "task: {}", retry2.task);
     }
 
     #[test]

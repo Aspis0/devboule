@@ -118,10 +118,7 @@ impl App {
         // Clamp to the last-known scrollable height so repeated PageUp cannot
         // accumulate past the top; otherwise PageDown would need as many extra
         // presses to walk the overshoot back down.
-        self.scroll_back = self
-            .scroll_back
-            .saturating_add(lines)
-            .min(self.max_offset);
+        self.scroll_back = self.scroll_back.saturating_add(lines).min(self.max_offset);
         self.dirty = true;
     }
 
@@ -402,7 +399,10 @@ mod tests {
         let mut cache = RenderCache::default();
         let streaming = conversation_text(&conv, &mut cache);
         // Only the finalized human turn is cached; the streaming tail is live.
-        assert_eq!(cache.count, 1, "streaming assistant tail must NOT be cached");
+        assert_eq!(
+            cache.count, 1,
+            "streaming assistant tail must NOT be cached"
+        );
         assert_eq!(streaming, uncached_text(&conv), "live tail must render");
 
         // Tail keeps growing while streaming: the cache must not freeze it.
@@ -414,7 +414,10 @@ mod tests {
         // Finalize: the tail is now stable and must be appended to the cache.
         conv.end_assistant();
         let finalized = conversation_text(&conv, &mut cache);
-        assert_eq!(cache.count, 2, "finalized tail must be appended to the cache");
+        assert_eq!(
+            cache.count, 2,
+            "finalized tail must be appended to the cache"
+        );
         assert_eq!(finalized, uncached_text(&conv));
     }
 
@@ -474,7 +477,10 @@ mod tests {
         // The loop clears `dirty` after painting; a fresh App starts dirty so the
         // first tick paints. mark_dirty re-arms it.
         let mut app = App::new();
-        assert!(app.dirty, "a fresh App must start dirty for the initial paint");
+        assert!(
+            app.dirty,
+            "a fresh App must start dirty for the initial paint"
+        );
         app.dirty = false;
         app.mark_dirty();
         assert!(app.dirty, "mark_dirty must re-arm the repaint");

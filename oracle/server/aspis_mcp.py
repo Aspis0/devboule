@@ -125,6 +125,17 @@ MAX_VISUAL_CHECK_DIRECTIVES = 50
 # Bounds for the `spawn_mini_coder` tool inputs + its bounded result poll.
 MINI_CODER_MAX_TASK_LEN = 4000
 MINI_CODER_MAX_FILES = 64
+# ASYNC STEERING (a): bounds for the `steer_mini_coder` tool. CO-WRITER PARITY with the
+# Rust `MAX_STEER_MESSAGE_LEN` / `MAX_STEER_QUEUE_LEN` in
+# src-tauri/src/backend/mini_coder.rs — change BOTH together. A single mid-flight
+# correction is capped so it cannot bloat the fix-pass prompt; the per-directive FIFO is
+# bounded and a flooding append is REFUSED (never drops an already-queued correction).
+MINI_CODER_MAX_STEER_LEN = 2000
+MINI_CODER_MAX_STEER_QUEUE = 8
+# The reserved steer message that maps to the kill path (case-insensitive, trimmed),
+# mirroring Rust `STEER_STOP_SENTINEL`: a `stop` steer sets `killRequested` instead of
+# queueing prose, so steering generalizes the Stop button rather than bypassing it.
+MINI_CODER_STEER_STOP_SENTINEL = "stop"
 # How a WRITE mini applies its changes. These wire strings MUST EXACTLY MATCH the
 # Rust `WriteMode` serde representation (camelCase) in
 # `src-tauri/src/backend/mini_coder.rs` so a directive this writer emits
@@ -174,6 +185,12 @@ GIT_PUSH_POLL_INTERVAL_SECS = 0.75
 #     as the git-push poll (the lock is taken briefly each pass, NEVER held across sleep).
 MAX_PLAN_APPROVAL_REQUESTS = 20
 PLAN_MAX_MARKDOWN_CHARS = 200_000
+# Phase 11.5-B (Piece 1a): caps for `project_create_plan_tasks`. Mirror the Rust
+# planner's MAX_TASKS / MAX_TASK_SCOPE (devboule-coder/src/planner.rs) so a plan the
+# planner is allowed to emit is also allowed to be bulk-created on the Kanban — the
+# two sides cannot drift into one accepting a plan the other rejects.
+MAX_PLAN_TASKS = 40
+MAX_PLAN_TASK_SCOPE = 3
 PLAN_POLL_TIMEOUT_SECS = 600.0
 PLAN_POLL_INTERVAL_SECS = 0.75
 ASK_USER_POLL_TIMEOUT_SECS = 600.0
@@ -285,6 +302,7 @@ ROLE_RULES = [
             "project_update_status",
             "project_append_note",
             "project_create_followup",
+            "project_create_plan_tasks",
             "provider_credentials_status",
             "cloudflare_list_workers",
             "cloudflare_rotate_worker_secret",
@@ -297,6 +315,7 @@ ROLE_RULES = [
             "censor_dispose",
             "visual_check",
             "spawn_mini_coder",
+            "steer_mini_coder",
             "request_git_push",
             "plan_submit",
             "plan_status",
@@ -354,10 +373,12 @@ ROLE_RULES = [
             "project_update_status",
             "project_append_note",
             "project_create_followup",
+            "project_create_plan_tasks",
             "oracle_ask",
             "oracle_context",
             "project_structure",
             "spawn_mini_coder",
+            "steer_mini_coder",
             "request_git_push",
             "plan_submit",
             "plan_status",
@@ -534,6 +555,31 @@ TOOLS = [
         },
     },
     {
+        "name": "steer_mini_coder",
+        "description": (
+            "Solo coder/orchestrator: steer a RUNNING mini-coder you spawned by appending "
+            "a mid-flight correction to its steer queue. The app folds queued corrections "
+            "into the mini's NEXT fix-pass round (it takes effect at a round boundary, not "
+            "mid-token), reusing the same channel as the Stop button. Send the message "
+            "'stop' to ABORT the mini (it maps to the kill path). Pass the directiveId "
+            "returned by spawn_mini_coder. Returns status=queued|stopped|queue_full|"
+            "not_found|terminal."
+        ),
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "directive_id": {"type": "string"},
+            "message": {
+                "type": "string",
+                "description": (
+                    "The mid-flight correction to fold into the mini's next round, or "
+                    "'stop' to abort the mini (the stop sentinel maps to the kill path)."
+                ),
+            },
+            "session_token": {"type": "string"},
+        },
+    },
+    {
         "name": "visual_check",
         "description": "Ask the app to render a self-contained HTML artifact, run a local visual critique, and return text feedback.",
         "parameters": {
@@ -667,6 +713,36 @@ TOOLS = [
                 "default": "other",
             },
             "description": {"type": "string", "default": ""},
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "project_create_plan_tasks",
+        "description": (
+            "Bulk-crea i task di un piano approvato sul Kanban del progetto come "
+            "todo, taggati col planId. Alloca id T<n> freschi (nessuna collisione coi "
+            "task manuali) e rimappa dependsOn dagli id interni del piano agli id "
+            "allocati; valida che il DAG sia aciclico. Ritorna gli id allocati."
+        ),
+        "parameters": {
+            "project_id": {"type": "string"},
+            "plan_id": {"type": "string"},
+            "tasks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "scope": {"type": "array", "items": {"type": "string"}},
+                        "acceptance": {"type": "string"},
+                        "dependsOn": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["id", "title"],
+                },
+            },
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
@@ -1664,6 +1740,64 @@ def read_project_file(path: Path) -> dict[str, Any]:
     }
 
 
+def validate_task_dependency_dag(deps_by_id: dict[str, list[str]]) -> None:
+    """Phase 11.5-B (Piece 1a): the `dependsOn` graph must reference only EXISTING
+    task ids and be ACYCLIC.
+
+    `deps_by_id` maps EVERY task id -> its (already-normalized) list of `dependsOn`
+    ids. Its keys ARE the complete node set, so the dangling-ref check compares each
+    dep against `deps_by_id` directly (no separate id list — they cannot drift).
+    Splitting extraction from validation lets the bulk-create path validate the
+    REMAPPED graph (post id-allocation) with the same algorithm the on-load
+    `validate_project_state` uses on the stored graph.
+
+    Ported verbatim from the Rust planner's `detect_cycle` (Kahn's algorithm): an
+    edge `dep -> task` means `task` waits on `dep`, so `task`'s in-degree is its
+    `dependsOn` count. We repeatedly remove zero-in-degree nodes; if any remain, they
+    form a cycle. The dangling-ref pass runs FIRST (a dangling dep would otherwise
+    never decrement an in-degree to zero and be misreported as a cycle).
+
+    Manual tasks (empty `dependsOn`) contribute a zero in-degree node and never
+    trigger either failure, so back-compat is preserved.
+    """
+    known_ids = set(deps_by_id.keys())
+    # First pass: every dependsOn entry references an EXISTING task id (no dangling),
+    # is not a self-dependency, and is not duplicated (a dup corrupts the in-degree
+    # bookkeeping). Mirrors the Rust planner's second pass before detect_cycle.
+    for task_id, deps in deps_by_id.items():
+        seen: set[str] = set()
+        for dep in deps:
+            if dep == task_id:
+                raise McpError(f"Task {task_id} dependsOn references itself.")
+            if dep not in known_ids:
+                raise McpError(
+                    f"Task {task_id} dependsOn references unknown task id {dep}."
+                )
+            if dep in seen:
+                raise McpError(
+                    f"Task {task_id} has a duplicate dependsOn entry {dep}."
+                )
+            seen.add(dep)
+    # Second pass: Kahn's algorithm. in_degree[id] = unresolved prerequisites of id;
+    # dependents[dep] = tasks that depend on dep (reverse edges).
+    in_degree: dict[str, int] = {tid: len(deps) for tid, deps in deps_by_id.items()}
+    dependents: dict[str, list[str]] = {}
+    for task_id, deps in deps_by_id.items():
+        for dep in deps:
+            dependents.setdefault(dep, []).append(task_id)
+    queue = [tid for tid, degree in in_degree.items() if degree == 0]
+    resolved = 0
+    while queue:
+        node = queue.pop()
+        resolved += 1
+        for child in dependents.get(node, []):
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+    if resolved != len(known_ids):
+        raise McpError("Project task dependsOn graph has a cycle (it must be acyclic).")
+
+
 def validate_project_state(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         raise McpError("Project state must be a JSON object.")
@@ -1673,6 +1807,10 @@ def validate_project_state(state: dict[str, Any]) -> None:
     if not isinstance(tasks, list):
         raise McpError("Project state tasks must be a list.")
     task_ids: set[str] = set()
+    # Phase 11.5-B (Piece 1a): collect each task's normalized `dependsOn` list so the
+    # whole-graph DAG check runs ONCE after the per-task pass (dangling refs can point
+    # forward to a task not yet seen in this loop).
+    deps_by_id: dict[str, list[str]] = {}
     for task in tasks:
         if not isinstance(task, dict):
             raise McpError("Project state task is invalid.")
@@ -1685,6 +1823,30 @@ def validate_project_state(state: dict[str, Any]) -> None:
         clean_text(task.get("updatedAt"), "Task updatedAt", 80)
         if "linkedResources" in task and not isinstance(task.get("linkedResources"), list):
             raise McpError("Project task linkedResources must be a list.")
+        # Phase 11.5-B (Piece 1a) — new optional fields. Each is OPTIONAL so an old
+        # `.md` block written before they existed validates UNCHANGED (mirrors the
+        # Rust `#[serde(default)]`). When present, enforce the on-disk wire shape:
+        #   dependsOn: list[str]  scope: list[str]  acceptance: str  planId: str|null
+        depends_on = task.get("dependsOn", [])
+        if not isinstance(depends_on, list) or not all(isinstance(d, str) for d in depends_on):
+            raise McpError("Project task dependsOn must be a list of task ids.")
+        if "scope" in task and (
+            not isinstance(task.get("scope"), list)
+            or not all(isinstance(s, str) for s in task.get("scope"))
+        ):
+            raise McpError("Project task scope must be a list of file paths.")
+        if "acceptance" in task and not isinstance(task.get("acceptance"), str):
+            raise McpError("Project task acceptance must be a string.")
+        if task.get("planId") is not None and not isinstance(task.get("planId"), str):
+            raise McpError("Project task planId must be a string or null.")
+        deps_by_id[task_id] = [normalize_task_id(d) for d in depends_on]
+    # Phase 11.5-B (Piece 1a): when ANY task declares dependencies, the whole graph
+    # must reference existing ids and be acyclic. Tasks with no deps are unaffected
+    # (each is a zero-in-degree node), so manual-task projects keep validating as
+    # before. Skip the call entirely when no task has deps to avoid touching the hot
+    # path for the common manual-only project.
+    if any(deps for deps in deps_by_id.values()):
+        validate_task_dependency_dag(deps_by_id)
     notes = state.get("notes", [])
     if not isinstance(notes, list):
         raise McpError("Project state notes must be a list.")
@@ -4113,6 +4275,34 @@ def validate_censor_rel_path(rel: str) -> str:
     return text
 
 
+def validate_plan_scope_path(rel: str) -> str:
+    """Phase 11.5-B (Piece 1a): validate ONE `scope` entry (a file the plan task may
+    MODIFY). Same path-safety class as the Rust planner's `check_rel_path` and the
+    Censor rel-path guard: must be a non-empty RELATIVE repo path with no `..` parent
+    escape and no component starting with `-` (argv-injection guard, since the runner
+    hands the scope to tools). Returns the trimmed path on success."""
+    text = str(rel or "").strip()
+    if not text:
+        raise McpError("Plan task scope path is required.")
+    # Length cap matching the Rust planner's `check_rel_path` MAX_PATH_LEN (1024 chars):
+    # a path Python accepts but the 11.5-B runner's `check_rel_path` would reject would
+    # blow up the task at execution time instead of here, so reject it at creation.
+    if len(text) > 1024:
+        raise McpError(f"Plan scope path too long (max 1024 chars): got {len(text)}")
+    if text.startswith("/") or text.startswith("\\"):
+        raise McpError(f"Plan scope path must be relative, got absolute: {rel}")
+    if len(text) >= 2 and text[1] == ":":
+        raise McpError(f"Plan scope path must be relative, got absolute: {rel}")
+    for component in re.split(r"[\\/]+", text):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            raise McpError(f"Plan scope path must not contain '..': {rel}")
+        if component.startswith("-"):
+            raise McpError(f"Plan scope path component must not start with '-': {rel}")
+    return text
+
+
 def censor_dir(root: Path) -> Path:
     return root / CENSOR_DIR
 
@@ -5009,6 +5199,125 @@ def dispatch_spawn_mini_coder(
         # gets a terminal outcome it can act on.
         pass
     return {"directiveId": directive_id, "result": synthesized}
+
+
+def dispatch_steer_mini_coder(
+    projects_dir: Path,
+    state_lock: Path,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """ASYNC STEERING (a): a supervising coder/orchestrator steers a RUNNING mini it
+    spawned, by APPENDING a mid-flight correction to the directive's `steerQueue` — the
+    SAME external-signal-to-a-running-directive channel as the Stop button's
+    `killRequested`, generalized from one bool to a bounded FIFO. The Rust executor
+    DRAINS the queue at the next fix-pass round boundary and folds it into that round's
+    task (build_retry_directive / fold_steer_block); it never injects mid-token.
+
+    Mirrors the `mini_coder_steer` Tauri command (the HUMAN's Console hook). A `message`
+    equal to the STOP sentinel (`MINI_CODER_STEER_STOP_SENTINEL`, case-insensitive) maps
+    to the kill path — it sets `killRequested` (the SAME field the Stop button sets) so
+    the executor aborts the mini — rather than queueing prose. Everything else is a queued
+    correction.
+
+    Co-writer DISCIPLINE: under `file_lock(state_lock)` find the directive in
+    `miniCoderDirectives` (the live attempt of its chain — `id == directive_id` or
+    `parentDirectiveId == directive_id`, preferring an ACTIVE attempt), reject when absent
+    or already TERMINAL, else mutate + `write_agents_state` (the same find-under-lock +
+    write pattern as `dispatch_spawn_mini_coder`). NO-CHURN: an empty `steerQueue` is never
+    written (omitted exactly like the Rust `Vec::is_empty` serde skip).
+
+    Returns `{directiveId, status, queued?}`:
+      * `status="queued"` (+ `queued`: new length) — correction appended;
+      * `status="stopped"` — the stop sentinel set `killRequested`;
+      * `status="queue_full"` (+ `queued`) — the FIFO is full; the message was REFUSED
+        (never drops an already-queued correction);
+      * `status="not_found"` — no such directive;
+      * `status="terminal"` — the mini already finished (nothing to steer).
+    """
+    # 1) Authn/authz the CALLER (registered coder/orchestrator + valid session token).
+    agent_id, role = require_agent_tool(projects_dir, args, "steer_mini_coder")
+    if "steer_mini_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use steer_mini_coder.")
+
+    directive_id = clean_text(args.get("directive_id"), "Mini-coder directive id", 200)
+    # The message rides the fix-pass prompt; cap it (CO-WRITER PARITY with the Rust
+    # MAX_STEER_MESSAGE_LEN) so a pathological steer cannot bloat the prompt.
+    message = clean_text(args.get("message"), "Steer message", MINI_CODER_MAX_STEER_LEN)
+    is_stop = message.strip().casefold() == MINI_CODER_STEER_STOP_SENTINEL
+
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+        directives = state.get("miniCoderDirectives") or []
+        # Resolve the chain's LIVE attempt: the directive whose id == directive_id, or any
+        # retry child (parentDirectiveId == directive_id), preferring an ACTIVE one (the
+        # attempt whose next round boundary drains the queue). Mirrors Rust
+        # mark_steer_requested's targeting.
+        in_chain = [
+            d
+            for d in directives
+            if isinstance(d, dict)
+            and (
+                str(d.get("id") or "") == directive_id
+                or str(d.get("parentDirectiveId") or "") == directive_id
+            )
+        ]
+        if not in_chain:
+            return {"directiveId": directive_id, "status": "not_found"}
+        active = next(
+            (d for d in in_chain if str(d.get("status") or "") in _MINI_ACTIVE_STATUSES),
+            None,
+        )
+        target = active or next(
+            (d for d in in_chain if str(d.get("id") or "") == directive_id),
+            in_chain[0],
+        )
+        # A whole chain that already reached a TERMINAL state cannot be steered. (An
+        # awaiting_retry predecessor is neither active nor terminal — its chain has a live
+        # retry, which the `active` lookup above already preferred.)
+        if all(str(d.get("status") or "") in _MINI_TERMINAL_STATUSES for d in in_chain):
+            return {"directiveId": directive_id, "status": "terminal"}
+
+        if is_stop:
+            # STOP reuses the kill path: flag killRequested on EVERY non-terminal attempt in
+            # the chain (the executor's EOF-finalize then synthesizes aborted_by_human),
+            # mirroring the Rust mark_kill_requested chain flag. NO prose is queued.
+            for d in in_chain:
+                if str(d.get("status") or "") not in _MINI_TERMINAL_STATUSES:
+                    d["killRequested"] = True
+            add_event(
+                state,
+                agent_id,
+                role,
+                "mini_coder_steer",
+                "Sent a STOP steer to a mini-coder (kill path).",
+            )
+            write_agents_state(projects_dir, state)
+            return {"directiveId": directive_id, "status": "stopped"}
+
+        queue = target.get("steerQueue")
+        if not isinstance(queue, list):
+            queue = []
+        # Bounded FIFO: refuse (do not drop the oldest) when full so a queued correction is
+        # never lost. CO-WRITER PARITY with Rust MAX_STEER_QUEUE_LEN.
+        if len(queue) >= MINI_CODER_MAX_STEER_QUEUE:
+            return {
+                "directiveId": directive_id,
+                "status": "queue_full",
+                "queued": len(queue),
+            }
+        queue.append(message)
+        # NO-CHURN: only write steerQueue when non-empty (it always is here) — an empty
+        # queue is never serialized, matching the Rust Vec::is_empty serde skip.
+        target["steerQueue"] = queue
+        add_event(
+            state,
+            agent_id,
+            role,
+            "mini_coder_steer",
+            f"Queued a steer correction for a mini-coder ({len(queue)} pending).",
+        )
+        write_agents_state(projects_dir, state)
+        return {"directiveId": directive_id, "status": "queued", "queued": len(queue)}
 
 
 def clean_visual_html_path(value: Any) -> str:
@@ -6013,6 +6322,9 @@ def handle_tool_call(
     if name == "spawn_mini_coder":
         return dispatch_spawn_mini_coder(projects_dir, state_lock, args)
 
+    if name == "steer_mini_coder":
+        return dispatch_steer_mini_coder(projects_dir, state_lock, args)
+
     if name == "visual_check":
         return dispatch_visual_check(projects_dir, state_lock, args)
 
@@ -6324,6 +6636,170 @@ def handle_tool_call(
             add_event(state, agent_id, role, "followup", reason, project_id, task["id"], "todo")
             write_agents_state(projects_dir, state)
         return {"project": public_project(saved), "task": task}
+
+    if name == "project_create_plan_tasks":
+        # Phase 11.5-B (Piece 1a): bulk-create an approved plan's tasks ON the project
+        # Kanban (the single shared task store). Authn/authz mirrors the other
+        # project_* write tools; gated to the orchestrator (devboule-coder) via
+        # ROLE_ALLOWED_TOOLS. The planner sends its OWN internal ids in id/dependsOn;
+        # we allocate FRESH T<n> ids (no collision with manual tasks) and remap deps.
+        agent_id = normalize_agent_id(args.get("agent_id"))
+        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        project_id = normalize_project_id(args.get("project_id", ""))
+        plan_id = clean_text(args.get("plan_id"), "Plan id", 200)
+        incoming = args.get("tasks")
+        if not isinstance(incoming, list) or not incoming:
+            raise McpError("project_create_plan_tasks requires a non-empty tasks list.")
+        if len(incoming) > MAX_PLAN_TASKS:
+            raise McpError(f"Too many plan tasks: {len(incoming)} (max {MAX_PLAN_TASKS}).")
+
+        # --- Pre-lock validation of the INCOMING (planner-internal) shape. The plan
+        # must be SELF-CONTAINED: every dependsOn references an id that is also in
+        # this batch (a plan cannot depend on a manual/other task). We validate the
+        # incoming graph here so a malformed plan is rejected BEFORE we take the lock
+        # or allocate any id. ---
+        seen_incoming: set[str] = set()
+        parsed: list[dict[str, Any]] = []
+        for entry in incoming:
+            if not isinstance(entry, dict):
+                raise McpError("Each plan task must be an object.")
+            internal_id = normalize_task_id(entry.get("id", ""))
+            if internal_id in seen_incoming:
+                raise McpError(f"Duplicate plan task id in request: {internal_id}.")
+            seen_incoming.add(internal_id)
+            title = clean_text(entry.get("title"), "Task title", 500)
+            # Sanitize like every other user-facing string (acceptance MAY be empty, so
+            # we cannot use clean_text which rejects empties): strip invisible/BiDi control
+            # chars so a U+202E-obfuscated acceptance can't survive into the field piece 1b
+            # will EXECUTE + the human reads in the project markdown.
+            acceptance = strip_invisible_and_bidi(str(entry.get("acceptance") or "")).strip()[:4000]
+            raw_scope = entry.get("scope", [])
+            if not isinstance(raw_scope, list) or not all(isinstance(s, str) for s in raw_scope):
+                raise McpError("Plan task scope must be a list of file paths.")
+            if len(raw_scope) > MAX_PLAN_TASK_SCOPE:
+                raise McpError(
+                    f"Plan task {internal_id} scope has {len(raw_scope)} files (max {MAX_PLAN_TASK_SCOPE})."
+                )
+            scope = [validate_plan_scope_path(s) for s in raw_scope]
+            raw_deps = entry.get("dependsOn", [])
+            if not isinstance(raw_deps, list) or not all(isinstance(d, str) for d in raw_deps):
+                raise McpError("Plan task dependsOn must be a list of task ids.")
+            deps = [normalize_task_id(d) for d in raw_deps]
+            parsed.append(
+                {
+                    "internal_id": internal_id,
+                    "title": title,
+                    "acceptance": acceptance,
+                    "scope": scope,
+                    "deps": deps,
+                }
+            )
+        # A plan is self-contained: a dependsOn must reference an id PRESENT in this
+        # batch (reject before allocating ids — the planner's ids are not yet remapped).
+        for entry in parsed:
+            for dep in entry["deps"]:
+                if dep not in seen_incoming:
+                    raise McpError(
+                        f"Plan task {entry['internal_id']} dependsOn references id {dep} not in the request."
+                    )
+
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            with file_lock(project_lock_path(projects_dir, project_id)):
+                project = read_project_file(project_path(projects_dir, project_id))
+                if project["metadata"].get("status") in {"paused", "archived", "done"}:
+                    raise McpError("Cannot create plan tasks on paused, done or archived projects.")
+                tasks = project["state"].setdefault("tasks", [])
+                # Allocate a FRESH T<n> per incoming task. next_task_id derives the
+                # next free id from the CURRENT tasks; append each allocated task to a
+                # working list as we go so the next allocation sees it and we never
+                # collide within this batch OR with existing manual tasks.
+                id_map: dict[str, str] = {}
+                allocated: list[dict[str, Any]] = []
+                for entry in parsed:
+                    new_id = next_task_id(tasks + allocated)
+                    id_map[entry["internal_id"]] = new_id
+                    allocated.append({"id": new_id})
+                # Build the final tasks with deps REMAPPED through id_map. Every dep is
+                # guaranteed present in id_map by the self-contained check above.
+                created: list[dict[str, Any]] = []
+                created_deps_by_id: dict[str, list[str]] = {}
+                ts = now()
+                for entry, holder in zip(parsed, allocated):
+                    new_id = holder["id"]
+                    remapped_deps = [id_map[d] for d in entry["deps"]]
+                    task = {
+                        "id": new_id,
+                        "title": entry["title"],
+                        "status": "todo",
+                        "priority": "medium",
+                        "assignee": None,
+                        "due": None,
+                        "linkedResources": [],
+                        "updatedAt": ts,
+                        # Plan provenance: planId tags the task so the runner (piece 1b)
+                        # knows to auto-execute it; scope/acceptance/dependsOn carry the
+                        # mini's write allowlist, the acceptance check, and the DAG.
+                        "planId": plan_id,
+                    }
+                    # OMIT the new fields WHEN EMPTY, mirroring the Rust struct's
+                    # `skip_serializing_if` (Vec::is_empty / String::is_empty). Otherwise
+                    # Python writes `"scope":[]`/`"acceptance":""`/`"dependsOn":[]` and the
+                    # next RUST re-serialize (e.g. a UI task edit) drops them → the content
+                    # hash changes → spurious git-dirty + Oracle re-index. validate_project_state
+                    # handles their absence (its guards are `"x" in task` / `.get(...,[])`).
+                    if entry["scope"]:
+                        task["scope"] = entry["scope"]
+                    if entry["acceptance"]:
+                        task["acceptance"] = entry["acceptance"]
+                    if remapped_deps:
+                        task["dependsOn"] = remapped_deps
+                    created.append(task)
+                    created_deps_by_id[new_id] = remapped_deps
+                # Validate the REMAPPED DAG (within this batch) is acyclic BEFORE
+                # writing — reuse the exact Kahn check used on project load.
+                validate_task_dependency_dag(created_deps_by_id)
+                tasks.extend(created)
+                # The full state must still validate as a whole (e.g. the new tasks'
+                # deps reference only ids that now exist in the project). This also
+                # re-runs the global DAG check across manual + plan tasks together.
+                validate_project_state(project["state"])
+                project["state"].setdefault("notes", []).append(
+                    {
+                        "id": note_id(),
+                        "text": f"{agent_id} ({role}) created {len(created)} task(s) from plan {plan_id}.",
+                        "source": f"agent:{agent_id}",
+                        "createdAt": ts,
+                    }
+                )
+                project["metadata"]["status"] = "active"
+                project["metadata"]["updatedAt"] = now()
+                saved = write_project_file(project)
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status="plan_tasks",
+                message=f"Created {len(created)} plan task(s).",
+                project_id=project_id,
+            )
+            add_event(
+                state,
+                agent_id,
+                role,
+                "plan_tasks",
+                f"Created {len(created)} task(s) from plan {plan_id}.",
+                project_id,
+            )
+            write_agents_state(projects_dir, state)
+        return {
+            "project": public_project(saved),
+            "planId": plan_id,
+            # old (planner-internal) id -> new (allocated Kanban) id, so 1b can wire
+            # the runner to the freshly-created board tasks.
+            "idMap": id_map,
+            "tasks": created,
+        }
 
     if name == "provider_credentials_status":
         agent_id, role = require_agent_tool(projects_dir, args, name)
@@ -6721,6 +7197,37 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
+    def steer_mini_coder(
+        agent_id: str,
+        role: str,
+        directive_id: str,
+        message: str,
+        session_token: str = "",
+    ) -> dict:
+        """Coder/orchestrator-only: steer a RUNNING mini-coder you spawned.
+
+        Append a mid-flight correction to the mini's steer queue; the app folds queued
+        corrections into the mini's NEXT fix-pass round (it takes effect at a round
+        boundary, not mid-token), reusing the same channel as the Stop button. Send the
+        message 'stop' to ABORT the mini (it maps to the kill path). Pass the
+        `directive_id` returned by `spawn_mini_coder`.
+
+        Returns `{directiveId, status}` where status is queued (+ queued length),
+        stopped, queue_full (the FIFO is full — your message was refused, not dropped),
+        not_found, or terminal (the mini already finished).
+        """
+        return call(
+            "steer_mini_coder",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "directive_id": directive_id,
+                "message": message,
+                "session_token": session_token,
+            },
+        )
+
+    @server.tool()
     def visual_check(
         agent_id: str,
         role: str,
@@ -6902,6 +7409,33 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         return call(
             "project_create_followup",
             {"project_id": project_id, "title": title, "reason": reason, "category": category, "description": description, "agent_id": agent_id, "role": role, "session_token": session_token},
+        )
+
+    @server.tool()
+    def project_create_plan_tasks(
+        project_id: str,
+        plan_id: str,
+        tasks: list,
+        agent_id: str,
+        role: str,
+        session_token: str = "",
+    ) -> dict:
+        """Bulk-create an approved plan's tasks on the project Kanban as todo, tagged
+        with planId. Each task is {id, title, scope, acceptance, dependsOn} where id
+        and dependsOn use the planner's INTERNAL ids; fresh T<n> ids are allocated
+        (no collision with manual tasks) and dependsOn is remapped to them. The DAG
+        must be acyclic and self-contained (every dependsOn references an id in the
+        request). Returns {project, planId, idMap (internal->allocated), tasks}."""
+        return call(
+            "project_create_plan_tasks",
+            {
+                "project_id": project_id,
+                "plan_id": plan_id,
+                "tasks": tasks,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()

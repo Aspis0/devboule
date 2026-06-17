@@ -23,9 +23,11 @@
 //!
 //! Then we SUBMIT: render the plan as human-readable markdown, call the MCP
 //! `plan_submit` tool (which BLOCKS for human approval and returns
-//! `approved`/`rejected`/`timeout`), and PERSIST the validated `tasks.json` under
-//! the project root (`.devboule/tasks.json`) so Phase 11.3's DAG runner can
-//! consume it.
+//! `approved`/`rejected`/`timeout` PLUS the `planId`). ONLY on `approved` do we
+//! create the plan's tasks on the project KANBAN via `project_create_plan_tasks`
+//! — the single shared task store the Phase 11.3 runner reads. An unapproved or
+//! rejected plan NEVER touches the board (no `.devboule/tasks.json` is written —
+//! that local path is gone; the Kanban is the single source of truth).
 //!
 //! Reuse, not reinvention: the per-file EXPLORE notes and the PLAN output reuse
 //! the EXACT "model emits ONE fenced JSON block, Rust strict-parses + validates"
@@ -34,7 +36,6 @@
 //! The DAG runner / `spawn_mini` execution is Phase 11.3 and OUT OF SCOPE here.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -125,10 +126,12 @@ pub const MAX_PLAN_ATTEMPTS: usize = 3;
 /// [`crate::action::MAX_TEXT_LEN`] spirit but tighter for plan fields.
 const MAX_FIELD_CHARS: usize = 2_000;
 
-// --- The tasks.json contract (camelCase wire shape for Phase 11.3) ----------
+// --- The plan-draft shape the model emits (camelCase wire shape) -------------
 
-/// The atomic plan artifact persisted as `tasks.json`. This is the CONTRACT the
-/// Phase 11.3 DAG runner consumes: a flat task list with a `dependsOn` DAG.
+/// The plan the model emits in the PLAN phase: a flat task list with a `dependsOn` DAG.
+/// This is the planner's INTERNAL draft — strict-parsed + validated here, then (on
+/// approval) turned into the `project_create_plan_tasks` payload that creates the tasks on
+/// the Kanban. It is NOT persisted to disk anymore (the Kanban is the single task store).
 ///
 /// `deny_unknown_fields`: a typo'd or extra key from the model is a hard parse
 /// error (fed back as a retry message) rather than silently ignored.
@@ -136,7 +139,7 @@ const MAX_FIELD_CHARS: usize = 2_000;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TasksPlan {
     /// The human-facing goal this plan satisfies (echoed from the orchestrator's
-    /// `plan` request so 11.3 has the framing without the burst transcript).
+    /// `plan` request so the rendered markdown + the board create have the framing).
     pub project_goal: String,
     /// The tasks, in author order. Execution order is the `dependsOn` DAG, not
     /// this vector order.
@@ -228,26 +231,37 @@ impl PlanApproval {
 }
 
 /// What `run_planner` returns to the orchestrator: the validated plan, the human
-/// verdict, and where the `tasks.json` was persisted (so 11.3 can find it).
+/// verdict, and — on approval — the `planId` the plan's tasks were created under on
+/// the Kanban (so Phase 11.3's runner can find them; `None` for a non-approved plan,
+/// which never touches the board).
 #[derive(Debug, Clone)]
 pub struct PlanOutcome {
     pub tasks_plan: TasksPlan,
     pub approval: PlanApproval,
-    pub tasks_json_path: PathBuf,
+    /// The `planId` the plan's tasks were tagged with on the Kanban. `Some` ONLY on
+    /// `approved` (the sole path that calls `project_create_plan_tasks`); `None` on a
+    /// rejected/timed-out plan, which is never created on the board.
+    pub plan_id: Option<String>,
 }
 
 impl PlanOutcome {
     /// The COMPACT line the executor feeds back to the burst model so the outer
-    /// loop knows the outcome without re-reading the whole plan. Names the
-    /// persisted `tasks.json` so the human (and Phase 11.3's runner) knows where
-    /// the atomic plan landed.
+    /// loop knows the outcome without re-reading the whole plan. On approval it names
+    /// the `planId` the tasks were created under on the Kanban (so the human and the
+    /// Phase 11.3 runner know where the plan landed); otherwise it just states the
+    /// verdict (nothing was created).
     pub fn compact_summary(&self) -> String {
-        format!(
-            "Plan: {} task(s), submitted -> {} (tasks.json at {})",
-            self.tasks_plan.tasks.len(),
-            self.approval.as_str(),
-            self.tasks_json_path.display()
-        )
+        match (&self.plan_id, self.approval) {
+            (Some(plan_id), PlanApproval::Approved) => format!(
+                "Plan: {} task(s), submitted -> approved (planId {plan_id}, created on the board)",
+                self.tasks_plan.tasks.len(),
+            ),
+            _ => format!(
+                "Plan: {} task(s), submitted -> {} (not created on the board)",
+                self.tasks_plan.tasks.len(),
+                self.approval.as_str(),
+            ),
+        }
     }
 }
 
@@ -299,7 +313,9 @@ fn check_field(field: &str, value: &str) -> Result<(), String> {
     }
     let len = value.chars().count();
     if len > MAX_FIELD_CHARS {
-        return Err(format!("`{field}` too long: {len} chars (max {MAX_FIELD_CHARS})"));
+        return Err(format!(
+            "`{field}` too long: {len} chars (max {MAX_FIELD_CHARS})"
+        ));
     }
     Ok(())
 }
@@ -394,14 +410,23 @@ fn parse_structure(text: &str) -> Result<Structure, String> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        spine.push(SpineEntry { path, in_degree, top_symbols });
+        spine.push(SpineEntry {
+            path,
+            in_degree,
+            top_symbols,
+        });
     }
 
     if spine.is_empty() {
-        return Err("project_structure returned an empty spine; nothing to plan against".to_string());
+        return Err(
+            "project_structure returned an empty spine; nothing to plan against".to_string(),
+        );
     }
 
-    let summary = value.get("summary").cloned().unwrap_or(serde_json::Value::Null);
+    let summary = value
+        .get("summary")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     Ok(Structure { spine, summary })
 }
 
@@ -466,8 +491,8 @@ fn build_explore_prompt(
 /// `key_symbols` capped, `watch_out` bounded.
 fn parse_explore_note(raw: &str, expected_path: &str) -> Result<ExploreNote, String> {
     let body = extract_one_block(raw, "note")?;
-    let mut note: ExploreNote = serde_json::from_str(body)
-        .map_err(|e| format!("note JSON invalid: {e}"))?;
+    let mut note: ExploreNote =
+        serde_json::from_str(body).map_err(|e| format!("note JSON invalid: {e}"))?;
     if note.source.trim() != expected_path {
         return Err(format!(
             "note `source` (`{}`) must be exactly the file under study (`{expected_path}`)",
@@ -500,7 +525,13 @@ fn render_note(note: &ExploreNote) -> String {
     } else {
         format!(" (watch out: {})", note.watch_out.trim())
     };
-    let line = format!("- {}: {}{}{}", note.source, note.role.trim(), symbols, watch);
+    let line = format!(
+        "- {}: {}{}{}",
+        note.source,
+        note.role.trim(),
+        symbols,
+        watch
+    );
     truncate_chars(&line, MAX_NOTE_CHARS)
 }
 
@@ -511,7 +542,12 @@ fn render_note(note: &ExploreNote) -> String {
 /// single PLAN call stays small. `prior_error`, when set, is the precise
 /// validation failure from the previous attempt, prepended so the model can
 /// self-correct.
-fn build_plan_prompt(goal: &str, notes_block: &str, summary: &serde_json::Value, prior_error: Option<&str>) -> String {
+fn build_plan_prompt(
+    goal: &str,
+    notes_block: &str,
+    summary: &serde_json::Value,
+    prior_error: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     if let Some(err) = prior_error {
         // The prior error can quote a large model blob (a serde error echoes the
@@ -561,14 +597,18 @@ fn build_plan_prompt(goal: &str, notes_block: &str, summary: &serde_json::Value,
     truncate_chars(&prompt, MAX_PLAN_PROMPT_CHARS)
 }
 
-/// STRICT-validate a parsed [`TasksPlan`]. Returns a precise, model-facing message
-/// on the first violation (so the PLAN model can be re-prompted with it). Enforces:
-/// non-empty goal; ≥1 task; ≤ [`MAX_TASKS`]; per-task non-empty/bounded title +
-/// acceptance; `scope` non-empty, ≤ [`MAX_TASK_SCOPE`], each a safe relative path;
-/// `contextFiles` ≤ [`MAX_TASK_CONTEXT`], each a safe relative path; unique
-/// non-empty ids; `status == "pending"`; `dependsOn` references EXISTING ids only
-/// (no self-dep, no dangling) and the graph is ACYCLIC.
-fn validate_plan(plan: &TasksPlan) -> Result<(), String> {
+/// STRICT structural validation of a [`TasksPlan`] — the gate the planner runs before
+/// SUBMIT and before the bulk Kanban create, so a malformed plan never reaches the human
+/// gate or the board. (The server's `project_create_plan_tasks` independently re-validates
+/// the DAG, but we reject early here with a precise, model-facing message so a bad plan is
+/// caught at plan time, not at create time.) Enforces: non-empty
+/// goal; ≥1 task; ≤ [`MAX_TASKS`]; per-task non-empty/bounded title + acceptance; `scope`
+/// non-empty, ≤ [`MAX_TASK_SCOPE`], each a safe relative path; `contextFiles` ≤
+/// [`MAX_TASK_CONTEXT`], each a safe relative path; unique non-empty ids; `dependsOn`
+/// references EXISTING ids only (no self-dep, no dangling, no duplicates) and the graph
+/// is ACYCLIC. It deliberately does NOT check the RUNTIME fields (`status`/`attempts`):
+/// the runner mutates those, so only the plan-time wrapper requires `pending`/`0`.
+pub(crate) fn validate_plan_structure(plan: &TasksPlan) -> Result<(), String> {
     check_field("projectGoal", &plan.project_goal)?;
     if plan.tasks.is_empty() {
         return Err("plan has no tasks".to_string());
@@ -603,8 +643,7 @@ fn validate_plan(plan: &TasksPlan) -> Result<(), String> {
             ));
         }
         for p in &task.scope {
-            check_rel_path("scope entry", p)
-                .map_err(|e| format!("task `{}`: {e}", task.id))?;
+            check_rel_path("scope entry", p).map_err(|e| format!("task `{}`: {e}", task.id))?;
         }
         if task.context_files.len() > MAX_TASK_CONTEXT {
             return Err(format!(
@@ -616,20 +655,6 @@ fn validate_plan(plan: &TasksPlan) -> Result<(), String> {
         for p in &task.context_files {
             check_rel_path("contextFiles entry", p)
                 .map_err(|e| format!("task `{}`: {e}", task.id))?;
-        }
-        if task.status != "pending" {
-            return Err(format!(
-                "task `{}` status must be \"pending\", got `{}`",
-                task.id, task.status
-            ));
-        }
-        // The retry budget belongs to the 11.3 runner: a plan-time task MUST start
-        // with a clean counter, else we persist a corrupted initial retry state.
-        if task.attempts != 0 {
-            return Err(format!(
-                "task `{}` attempts must be 0 at plan time, got {}",
-                task.id, task.attempts
-            ));
         }
     }
 
@@ -663,6 +688,33 @@ fn validate_plan(plan: &TasksPlan) -> Result<(), String> {
     Ok(())
 }
 
+/// Plan-time validation: structural validity ([`validate_plan_structure`]) PLUS the
+/// freshness invariants that hold only at plan emission — every task starts `pending`
+/// with a clean `attempts` counter. Those two runtime fields are the model's local
+/// plan-draft state; the Kanban (not these fields) owns the real status once the tasks
+/// are created. This stricter check stays on the PLAN phase so the model never submits a
+/// plan whose draft tasks claim to be already-running.
+fn validate_plan(plan: &TasksPlan) -> Result<(), String> {
+    validate_plan_structure(plan)?;
+    for task in &plan.tasks {
+        if task.status != "pending" {
+            return Err(format!(
+                "task `{}` status must be \"pending\", got `{}`",
+                task.id, task.status
+            ));
+        }
+        // `attempts` is the model's local plan-draft counter: a freshly drafted task MUST
+        // start at 0 (the runner tracks real attempts in-run; the board has no such field).
+        if task.attempts != 0 {
+            return Err(format!(
+                "task `{}` attempts must be 0 at plan time, got {}",
+                task.id, task.attempts
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reject a cyclic `dependsOn` graph via Kahn's algorithm. An edge `dep -> task`
 /// means `task` waits on `dep`; `task`'s in-degree is its `dependsOn` count. We
 /// repeatedly remove zero-in-degree nodes; if any remain, they form a cycle.
@@ -684,15 +736,19 @@ fn detect_cycle(plan: &TasksPlan) -> Result<(), String> {
     // Cheap latent-bug guard: every dep MUST reference a known task id (the
     // dangling-dep pass in `validate_plan` guarantees this). Only runs in debug.
     debug_assert!(
-        plan.tasks
+        plan.tasks.iter().all(|t| t
+            .depends_on
             .iter()
-            .all(|t| t.depends_on.iter().all(|d| in_degree.contains_key(d.as_str()))),
+            .all(|d| in_degree.contains_key(d.as_str()))),
         "detect_cycle precondition violated: a dependsOn references an unknown id \
          (validate_plan must run first)"
     );
     for task in &plan.tasks {
         for dep in &task.depends_on {
-            dependents.entry(dep.as_str()).or_default().push(task.id.as_str());
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(task.id.as_str());
         }
     }
 
@@ -716,9 +772,7 @@ fn detect_cycle(plan: &TasksPlan) -> Result<(), String> {
         }
     }
     if resolved != plan.tasks.len() {
-        return Err(
-            "the dependsOn graph has a cycle (it must be acyclic)".to_string(),
-        );
+        return Err("the dependsOn graph has a cycle (it must be acyclic)".to_string());
     }
     Ok(())
 }
@@ -740,73 +794,70 @@ fn render_plan_markdown(plan: &TasksPlan) -> String {
             md.push_str(&format!("- **Reads:** {}\n", task.context_files.join(", ")));
         }
         if !task.depends_on.is_empty() {
-            md.push_str(&format!("- **Depends on:** {}\n", task.depends_on.join(", ")));
+            md.push_str(&format!(
+                "- **Depends on:** {}\n",
+                task.depends_on.join(", ")
+            ));
         }
         md.push_str(&format!("- **Acceptance:** {}\n\n", task.acceptance.trim()));
     }
     md
 }
 
-// --- Persistence -------------------------------------------------------------
+// --- Kanban bulk-create payload ----------------------------------------------
 
-/// The project-root-relative directory + file the validated plan is persisted to.
-const TASKS_DIR: &str = ".devboule";
-const TASKS_FILE: &str = "tasks.json";
+/// Build the `tasks` array for `project_create_plan_tasks` from a validated
+/// [`TasksPlan`]. Each entry carries the planner's INTERNAL id in `id`/`dependsOn`
+/// (the server allocates fresh `T<n>` ids and REMAPS the deps); `scope`/`acceptance`
+/// ride along so the runner's mini knows the write allowlist + the acceptance bar.
+/// `contextFiles`/`status`/`attempts` are NOT sent: the board owns the runtime
+/// status, and the read-only context files are not part of the 1a wire contract.
+fn build_plan_tasks_payload(plan: &TasksPlan) -> serde_json::Value {
+    let tasks: Vec<serde_json::Value> = plan
+        .tasks
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "title": t.title,
+                "scope": t.scope,
+                "acceptance": t.acceptance,
+                "dependsOn": t.depends_on,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(tasks)
+}
 
-/// Persist the validated plan as `<project_root>/.devboule/tasks.json`, returning
-/// the absolute path. ROOT-CONFINED: the path is built ONLY from the fixed
-/// internal constants above joined to the (canonical) project root — never from
-/// model input — and we re-confirm the resolved parent stays inside the root
-/// before writing, mirroring [`FsBackend`]'s confinement posture. Writes are
-/// crash-safe-ish (temp file + rename) so a partial write never corrupts an
-/// existing `tasks.json`.
-fn persist_tasks_json(project_root: &Path, plan: &TasksPlan) -> Result<PathBuf, String> {
-    // Canonicalize the root so the confinement boundary is well-defined (the same
-    // requirement FsBackend::new enforces).
-    let root = project_root
-        .canonicalize()
-        .map_err(|e| format!("project root is not accessible: {e}"))?;
-    let dir = root.join(TASKS_DIR);
-    // Confinement: the directory we are about to create/write MUST be inside root.
-    // Built from fixed constants, but assert it regardless (defense in depth).
-    if !dir.starts_with(&root) {
-        return Err("tasks dir escapes the project root".to_string());
-    }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create {TASKS_DIR}: {e}"))?;
-
-    let json = serde_json::to_string_pretty(plan)
-        .map_err(|e| format!("could not serialize tasks.json: {e}"))?;
-
-    let final_path = dir.join(TASKS_FILE);
-    // Temp + atomic rename within the SAME dir so a crash mid-write cannot leave a
-    // truncated tasks.json. The temp name is fixed (no model input).
-    let tmp_path = dir.join(".tasks.json.tmp");
-    std::fs::write(&tmp_path, json.as_bytes())
-        .map_err(|e| format!("could not write tasks.json: {e}"))?;
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("could not finalize tasks.json: {e}"))?;
-    Ok(final_path)
+/// Pull the `planId` out of the `project_create_plan_tasks` result so the outcome can
+/// name where the plan landed. The tool echoes the `planId` we sent; a non-JSON or
+/// planId-less body falls back to the `plan_id` we passed in (we know what we sent).
+fn parse_created_plan_id(text: &str, fallback: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("planId").and_then(|s| s.as_str()).map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // --- The routine -------------------------------------------------------------
 
-/// Run the local planner for `goal`: STRUCTURE -> EXPLORE -> PLAN -> SUBMIT.
+/// Run the local planner for `goal`: STRUCTURE -> EXPLORE -> PLAN -> SUBMIT ->
+/// (on approval) create the tasks on the Kanban.
 ///
 /// Drives the injected `model` (small local LLM) + `mcp` (Oracle server) + `fs`
 /// (root-confined reads). `project_id` is the Oracle-side project key the
-/// `project_structure` / `plan_submit` tools require; `project_root` is the
-/// canonical local root the plan is persisted under. Returns a [`PlanOutcome`] on
-/// success, or an Escalated-style error string the caller surfaces to the burst
-/// model (e.g. the model never produced a valid plan within the retry budget, the
-/// structure tool failed, or `plan_submit` errored).
+/// `project_structure` / `plan_submit` / `project_create_plan_tasks` tools require.
+/// Returns a [`PlanOutcome`] on success, or an Escalated-style error string the caller
+/// surfaces to the burst model (e.g. the model never produced a valid plan within the
+/// retry budget, the structure tool failed, `plan_submit` errored, or the bulk Kanban
+/// create failed after an approval).
 pub async fn run_planner(
     goal: &str,
     model: &dyn CoderModel,
     mcp: &dyn McpBackend,
     fs: &FsBackend,
     project_id: &str,
-    project_root: &Path,
     activity: &Activity,
 ) -> Result<PlanOutcome, String> {
     let goal = goal.trim();
@@ -924,7 +975,12 @@ pub async fn run_planner(
     let mut prior_error: Option<String> = None;
     let mut plan: Option<TasksPlan> = None;
     for _ in 0..MAX_PLAN_ATTEMPTS {
-        let prompt = build_plan_prompt(goal, &notes_block, &structure.summary, prior_error.as_deref());
+        let prompt = build_plan_prompt(
+            goal,
+            &notes_block,
+            &structure.summary,
+            prior_error.as_deref(),
+        );
         let transcript = Transcript::new(prompt);
         let raw = model.next_output(&transcript).await;
 
@@ -951,26 +1007,11 @@ pub async fn run_planner(
         )
     })?;
     // PLAN done → how many tasks were drafted (a count label only).
-    activity.milestone(
-        &format!("drafted {} tasks", plan.tasks.len()),
-        Node::Dot,
-    );
+    activity.milestone(&format!("drafted {} tasks", plan.tasks.len()), Node::Dot);
 
-    // --- 4) SUBMIT: persist tasks.json, then plan_submit (human gate) ---
-    // Persist BEFORE submitting so the durable artifact exists even if the human
-    // rejects (11.3's runner only consumes it on approval, but the record is
-    // useful regardless and the persist is the cheap, local step). The persist is
-    // BLOCKING fs work (canonicalize / mkdir / write / rename), so it runs on a
-    // `spawn_blocking` thread rather than stalling the reactor; owned copies move
-    // in and a JoinError becomes a clean error, never a panic.
-    let tasks_json_path = {
-        let root = project_root.to_path_buf();
-        let plan_for_persist = plan.clone();
-        tokio::task::spawn_blocking(move || persist_tasks_json(&root, &plan_for_persist))
-            .await
-            .map_err(|e| format!("tasks.json persist task failed: {e}"))??
-    };
-
+    // --- 4) SUBMIT: plan_submit (human gate). Nothing is persisted locally and
+    // NOTHING is created on the board yet — an unapproved/rejected plan must never
+    // pollute the Kanban, so the bulk create happens ONLY after an `approved` verdict.
     let plan_markdown = render_plan_markdown(&plan);
     let title = format!(
         "Devboule plan: {}",
@@ -992,7 +1033,9 @@ pub async fn run_planner(
         .await
         .map_err(|e| format!("plan_submit failed: {e}"))?;
 
-    let approval = parse_submit_status(&submit_text);
+    // The gate carries BOTH the human verdict (`status`) and the `planId` the plan was
+    // filed under — we need the planId to tag the tasks we create on the board.
+    let SubmitResult { approval, plan_id } = parse_submit_result(&submit_text);
     // Result milestone: approved (sage), rejected/timeout (terra — the warm ring, as
     // the contract has no coral node; the TEXT carries the rejected/timed-out meaning).
     let (result_text, result_node) = match approval {
@@ -1002,34 +1045,91 @@ pub async fn run_planner(
     };
     activity.milestone(result_text, result_node);
 
+    // --- 5) CREATE ON THE BOARD (approved ONLY) ---
+    // On any non-approved verdict we stop here: nothing is created. On `approved` we
+    // bulk-create the plan's tasks on the Kanban via `project_create_plan_tasks`,
+    // passing the planner's INTERNAL ids in id/dependsOn (the server allocates fresh
+    // T<n> ids + remaps the deps) tagged with the approved `planId`. A missing planId
+    // here is a server-contract violation (an approval must carry one): surface it as a
+    // hard error rather than create un-tagged tasks the runner could never find.
+    let created_plan_id = if approval == PlanApproval::Approved {
+        let plan_id = plan_id.ok_or_else(|| {
+            "plan_submit approved the plan but returned no planId; cannot create tasks on the board"
+                .to_string()
+        })?;
+        let create_text = mcp
+            .call_tool(
+                "project_create_plan_tasks",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "plan_id": plan_id,
+                    "tasks": build_plan_tasks_payload(&plan),
+                }),
+            )
+            .await
+            .map_err(|e| format!("project_create_plan_tasks failed: {e}"))?;
+        let created_plan_id = parse_created_plan_id(&create_text, &plan_id);
+        activity.milestone(
+            &format!("{} task(s) created on the board", plan.tasks.len()),
+            Node::Sage,
+        );
+        Some(created_plan_id)
+    } else {
+        None
+    };
+
     Ok(PlanOutcome {
         tasks_plan: plan,
         approval,
-        tasks_json_path,
+        plan_id: created_plan_id,
     })
 }
 
-/// Map the `plan_submit` result text to a [`PlanApproval`]. The tool returns a
-/// JSON object carrying `status`; a non-JSON or status-less body is the
-/// conservative `Timeout` (never a false `Approved`).
-fn parse_submit_status(text: &str) -> PlanApproval {
-    let parsed = serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(PlanApproval::from_status));
-    match parsed {
-        Some(approval) => approval,
+/// The two things the `plan_submit` gate returns: the human verdict + the server's
+/// `planId` for the submitted plan.
+struct SubmitResult {
+    approval: PlanApproval,
+    /// The `planId` the server filed the plan under, when present. `None` for a
+    /// non-JSON / planId-less body (the approval path then hard-errors — see
+    /// `run_planner` step 5 — since an approval MUST carry a planId).
+    plan_id: Option<String>,
+}
+
+/// Parse the `plan_submit` result text into a [`SubmitResult`]. The tool returns a JSON
+/// object `{planId, status}`; a non-JSON or status-less body maps to the conservative
+/// `Timeout` (never a false `Approved`) with no planId.
+fn parse_submit_result(text: &str) -> SubmitResult {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok();
+    let plan_id = value
+        .as_ref()
+        .and_then(|v| v.get("planId").and_then(|s| s.as_str()).map(str::to_string))
+        // P2: trim BEFORE filtering so a whitespace-only planId (e.g. " ") is treated
+        // as absent — not sent to `project_create_plan_tasks` as a blank tag.
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let approval = value.as_ref().and_then(|v| {
+        v.get("status")
+            .and_then(|s| s.as_str())
+            .map(PlanApproval::from_status)
+    });
+    match approval {
+        Some(approval) => SubmitResult { approval, plan_id },
         None => {
             // A non-JSON or status-less body is conservatively a Timeout, but that
             // makes a SERVER ERROR indistinguishable from a genuine human timeout.
             // Emit a bounded diagnostic (a short prefix only — never the whole
             // untrusted body, to keep logs clean) so the operator can tell them
-            // apart. No behavior change: still Timeout.
+            // apart. No behavior change: still Timeout, and (conservatively) no
+            // create on the board.
             eprintln!(
                 "devboule planner: plan_submit returned no usable `status` \
                  (treating as timeout); body prefix: {:?}",
                 truncate_chars(text, 200)
             );
-            PlanApproval::Timeout
+            SubmitResult {
+                approval: PlanApproval::Timeout,
+                plan_id,
+            }
         }
     }
 }
@@ -1123,7 +1223,10 @@ mod tests {
     #[async_trait]
     impl McpBackend for MockMcp {
         async fn call_tool(&self, name: &str, params: serde_json::Value) -> Result<String, String> {
-            self.calls.lock().unwrap().push((name.to_string(), params.clone()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), params.clone()));
             match name {
                 "project_structure" => {
                     let spine: Vec<serde_json::Value> = self
@@ -1146,8 +1249,25 @@ mod tests {
                     .to_string())
                 }
                 "oracle_context" => Ok("[grounding] semantic snippet about the file".to_string()),
-                "plan_submit" => {
-                    Ok(serde_json::json!({"planId": "p1", "status": self.submit_status}).to_string())
+                "plan_submit" => Ok(
+                    serde_json::json!({"planId": "p1", "status": self.submit_status}).to_string(),
+                ),
+                "project_create_plan_tasks" => {
+                    // Echo back the planId we were sent + a minimal tasks array, matching
+                    // the 1a contract's `{project, planId, idMap, tasks}` shape (the
+                    // planner only reads `planId`).
+                    let plan_id = params
+                        .get("plan_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("p1")
+                        .to_string();
+                    Ok(serde_json::json!({
+                        "project": {"id": "proj"},
+                        "planId": plan_id,
+                        "idMap": {},
+                        "tasks": [],
+                    })
+                    .to_string())
                 }
                 other => Err(format!("unexpected tool {other}")),
             }
@@ -1222,14 +1342,11 @@ mod tests {
         )
     }
 
-    // --- Happy path: STRUCTURE -> EXPLORE -> PLAN -> persist -> submit -------
+    // --- Happy path: STRUCTURE -> EXPLORE -> PLAN -> submit -> create on board ---
 
     #[tokio::test]
-    async fn full_planner_run_produces_persists_and_submits() {
-        let (dir, fs) = fs_with_files(&[
-            ("src/a.rs", "fn a() {}\n"),
-            ("src/b.rs", "fn b() {}\n"),
-        ]);
+    async fn full_planner_run_creates_on_the_board_and_submits() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs", "src/b.rs"], "approved");
         // One EXPLORE note per spine file (2), then one PLAN block.
         let model = CapturingModel::new(vec![
@@ -1238,15 +1355,28 @@ mod tests {
             plan_block(one_valid_task()),
         ]);
 
-        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .expect("planner succeeds");
 
         // (1) calls project_structure FIRST.
         let names = mcp.call_names();
         assert_eq!(names.first().map(|s| s.as_str()), Some("project_structure"));
-        // (6) calls plan_submit (and it is the LAST call).
-        assert_eq!(names.last().map(|s| s.as_str()), Some("plan_submit"));
+        // (6) on approval, the LAST call is the Kanban bulk-create (after plan_submit).
+        assert_eq!(
+            names.last().map(|s| s.as_str()),
+            Some("project_create_plan_tasks")
+        );
+        // plan_submit precedes the create (the human gate happens BEFORE the board write).
+        let submit_pos = names.iter().position(|n| n == "plan_submit").unwrap();
+        let create_pos = names
+            .iter()
+            .position(|n| n == "project_create_plan_tasks")
+            .unwrap();
+        assert!(
+            submit_pos < create_pos,
+            "plan_submit precedes the board create: {names:?}"
+        );
 
         // (2) ONE bounded EXPLORE model call PER spine file (2 files) + (3) ONE
         // PLAN call = 3 model calls total.
@@ -1259,9 +1389,15 @@ mod tests {
         let explore_a = &prompts[0];
         let explore_b = &prompts[1];
         assert!(explore_a.contains("src/a.rs") && explore_a.contains("fn a()"));
-        assert!(!explore_a.contains("fn b()"), "explore A must not carry B's body");
+        assert!(
+            !explore_a.contains("fn b()"),
+            "explore A must not carry B's body"
+        );
         assert!(explore_b.contains("src/b.rs") && explore_b.contains("fn b()"));
-        assert!(!explore_b.contains("fn a()"), "explore B must not carry A's body");
+        assert!(
+            !explore_b.contains("fn a()"),
+            "explore B must not carry A's body"
+        );
         assert!(
             explore_a.chars().count() <= MAX_EXPLORE_PROMPT_CHARS,
             "explore prompt is bounded"
@@ -1270,24 +1406,53 @@ mod tests {
         // The PLAN prompt carries the goal + the accumulated notes, NOT raw file
         // bodies.
         let plan_prompt = &prompts[2];
-        assert!(plan_prompt.contains("do the thing"), "plan prompt carries the goal");
-        assert!(plan_prompt.contains("central module"), "plan prompt carries the notes");
-        assert!(!plan_prompt.contains("fn a()"), "plan prompt carries NO raw file body");
+        assert!(
+            plan_prompt.contains("do the thing"),
+            "plan prompt carries the goal"
+        );
+        assert!(
+            plan_prompt.contains("central module"),
+            "plan prompt carries the notes"
+        );
+        assert!(
+            !plan_prompt.contains("fn a()"),
+            "plan prompt carries NO raw file body"
+        );
 
         // (4) a VALID TasksPlan with the expected task.
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
         assert_eq!(outcome.tasks_plan.tasks[0].id, "T001");
         assert_eq!(outcome.approval, PlanApproval::Approved);
+        // The outcome carries the planId the tasks were created under (from plan_submit).
+        assert_eq!(outcome.plan_id.as_deref(), Some("p1"));
 
-        // (5) persisted tasks.json at <root>/.devboule/tasks.json, round-trippable.
-        assert!(outcome.tasks_json_path.ends_with(".devboule/tasks.json"));
-        let persisted = std::fs::read_to_string(&outcome.tasks_json_path).unwrap();
-        let reparsed: TasksPlan = serde_json::from_str(&persisted).unwrap();
-        assert_eq!(reparsed, outcome.tasks_plan, "persisted json round-trips");
-        // camelCase on the wire (the 11.3 contract).
-        assert!(persisted.contains("projectGoal"));
-        assert!(persisted.contains("contextFiles"));
-        assert!(persisted.contains("dependsOn"));
+        // (5) the bulk-create payload tags the tasks with the planId from plan_submit
+        // and sends the planner's INTERNAL ids + scope/acceptance/dependsOn (camelCase).
+        let create = mcp.last_of("project_create_plan_tasks").unwrap();
+        assert_eq!(create["project_id"], serde_json::json!("proj"));
+        assert_eq!(
+            create["plan_id"],
+            serde_json::json!("p1"),
+            "tagged with the planId"
+        );
+        let created_tasks = create["tasks"].as_array().unwrap();
+        assert_eq!(created_tasks.len(), 1);
+        assert_eq!(created_tasks[0]["id"], serde_json::json!("T001"));
+        assert_eq!(created_tasks[0]["scope"], serde_json::json!(["src/a.rs"]));
+        assert_eq!(
+            created_tasks[0]["acceptance"],
+            serde_json::json!("cargo test passes")
+        );
+        assert_eq!(created_tasks[0]["dependsOn"], serde_json::json!([]));
+        // The runtime-only fields are NOT sent: the board owns status/attempts.
+        assert!(
+            created_tasks[0].get("status").is_none(),
+            "no status in the create payload"
+        );
+        assert!(
+            created_tasks[0].get("attempts").is_none(),
+            "no attempts in the create payload"
+        );
 
         // The plan_submit payload carries project_id + title + plan_markdown.
         let submit = mcp.last_of("plan_submit").unwrap();
@@ -1297,17 +1462,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_status_maps_to_rejected_but_still_persists() {
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+    async fn rejected_status_maps_to_rejected_and_creates_nothing() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "rejected");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
 
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .expect("planner succeeds even when the human rejects");
         assert_eq!(outcome.approval, PlanApproval::Rejected);
-        // The tasks.json is persisted regardless of the human verdict.
-        assert!(outcome.tasks_json_path.exists());
+        // A rejected plan never touches the board: no planId, no bulk-create call.
+        assert_eq!(outcome.plan_id, None);
+        assert!(
+            !mcp.call_names()
+                .iter()
+                .any(|n| n == "project_create_plan_tasks"),
+            "a rejected plan must NOT be created on the board"
+        );
     }
 
     // --- Milestone stream (the LIVE Console payoff) --------------------------
@@ -1331,11 +1502,9 @@ mod tests {
     async fn planner_emits_the_expected_milestone_sequence() {
         // Drive a full happy-path plan with a real (file-backed) Activity emitter and
         // assert the EXACT coder-tier milestone sequence the Console will show live:
-        // STRUCTURE -> one EXPLORE per spine file -> PLAN drafted -> SUBMIT -> approved.
-        let (dir, fs) = fs_with_files(&[
-            ("src/a.rs", "fn a() {}\n"),
-            ("src/b.rs", "fn b() {}\n"),
-        ]);
+        // STRUCTURE -> one EXPLORE per spine file -> PLAN drafted -> SUBMIT -> approved ->
+        // tasks created on the board.
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs", "src/b.rs"], "approved");
         let model = CapturingModel::new(vec![
             note_block("src/a.rs"),
@@ -1345,7 +1514,7 @@ mod tests {
         let act_file = dir.path().join("activity.jsonl");
         let activity = Activity::with_path(&act_file);
 
-        run_planner("do the thing", &model, &mcp, &fs, "proj", dir.path(), &activity)
+        run_planner("do the thing", &model, &mcp, &fs, "proj", &activity)
             .await
             .expect("planner succeeds");
 
@@ -1357,8 +1526,15 @@ mod tests {
                 ("exploring a.rs".to_string(), "".to_string()),
                 ("exploring b.rs".to_string(), "".to_string()),
                 ("drafted 1 tasks".to_string(), "dot".to_string()),
-                ("plan submitted — awaiting approval".to_string(), "terra".to_string()),
+                (
+                    "plan submitted — awaiting approval".to_string(),
+                    "terra".to_string()
+                ),
                 ("plan approved".to_string(), "sage".to_string()),
+                (
+                    "1 task(s) created on the board".to_string(),
+                    "sage".to_string()
+                ),
             ],
             "full ordered milestone stream"
         );
@@ -1372,7 +1548,7 @@ mod tests {
         let act_file = dir.path().join("activity.jsonl");
         let activity = Activity::with_path(&act_file);
 
-        run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &activity)
+        run_planner("g", &model, &mcp, &fs, "proj", &activity)
             .await
             .unwrap();
 
@@ -1398,7 +1574,7 @@ mod tests {
         let act_file = dir.path().join("activity.jsonl");
         let activity = Activity::with_path(&act_file);
 
-        run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &activity)
+        run_planner("g", &model, &mcp, &fs, "proj", &activity)
             .await
             .unwrap();
 
@@ -1407,7 +1583,10 @@ mod tests {
             .iter()
             .filter(|(t, _)| t.starts_with("exploring "))
             .count();
-        assert_eq!(explore_count, 1, "only the real file emits an explore milestone");
+        assert_eq!(
+            explore_count, 1,
+            "only the real file emits an explore milestone"
+        );
         // The STRUCTURE milestone still counts BOTH spine files (it is the spine size).
         assert_eq!(milestones[0].0, "Planning: 2 spine files");
     }
@@ -1427,10 +1606,10 @@ mod tests {
     async fn unknown_submit_status_is_conservative_timeout() {
         // Any non-approved/non-rejected status (e.g. a server "vanished") must map
         // to Timeout — never a false Approved.
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "vanished");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .unwrap();
         assert_eq!(outcome.approval, PlanApproval::Timeout);
@@ -1443,27 +1622,31 @@ mod tests {
         // One spine file does NOT exist on disk: its EXPLORE read fails and is
         // skipped (no model call for it), but the plan still gets produced from the
         // other file's note. A skipped read means NO model call for that file.
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs", "src/ghost.rs"], "approved");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .unwrap();
         // Only ONE explore call (ghost skipped) + ONE plan call.
-        assert_eq!(model.prompts().len(), 2, "ghost file => no explore call for it");
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "ghost file => no explore call for it"
+        );
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
     }
 
     #[tokio::test]
     async fn malformed_explore_note_is_skipped_plan_still_made() {
         // A model that emits garbage for one note must not sink the whole plan.
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![
             "not a note block at all".to_string(),
             plan_block(one_valid_task()),
         ]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .unwrap();
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
@@ -1476,14 +1659,14 @@ mod tests {
         // MAX_NOTES_TOTAL_CHARS — the join newlines BETWEEN entries are counted, so
         // the running budget can no longer under-count and overflow.
         const N: usize = MAX_SPINE; // 8 files
-        // Each rendered note line is "- <source>: <role>" + truncation; pick a role
-        // length that pushes several notes near the cap so the budget actually trips
-        // and the join newlines matter.
+                                    // Each rendered note line is "- <source>: <role>" + truncation; pick a role
+                                    // length that pushes several notes near the cap so the budget actually trips
+                                    // and the join newlines matter.
         let role_len = MAX_NOTE_CHARS; // render_note truncates the line to MAX_NOTE_CHARS
 
         let paths: Vec<String> = (0..N).map(|i| format!("src/f{i}.rs")).collect();
         let files: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), "fn x() {}\n")).collect();
-        let (dir, fs) = fs_with_files(&files);
+        let (_dir, fs) = fs_with_files(&files);
         let mcp = MockMcp::new(paths.iter().map(|s| s.as_str()).collect(), "approved");
 
         let mut outputs: Vec<String> = paths
@@ -1493,7 +1676,7 @@ mod tests {
         outputs.push(plan_block(one_valid_task()));
         let model = CapturingModel::new(outputs);
 
-        run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .expect("planner succeeds");
 
@@ -1528,7 +1711,7 @@ mod tests {
 
     #[tokio::test]
     async fn four_file_scope_is_rejected_then_retry_succeeds() {
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let four_scope = serde_json::json!([{
             "id": "T001", "title": "too big",
@@ -1537,10 +1720,10 @@ mod tests {
         }]);
         let model = CapturingModel::new(vec![
             note_block("src/a.rs"),
-            plan_block(four_scope),             // attempt 1: rejected (scope > 3)
-            plan_block(one_valid_task()),       // attempt 2: valid
+            plan_block(four_scope),       // attempt 1: rejected (scope > 3)
+            plan_block(one_valid_task()), // attempt 2: valid
         ]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .expect("retry produces a valid plan");
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
@@ -1559,14 +1742,24 @@ mod tests {
             project_goal: "g".into(),
             tasks: vec![
                 Task {
-                    id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                    context_files: vec![], acceptance: "x".into(),
-                    depends_on: vec!["T002".into()], status: "pending".into(), attempts: 0,
+                    id: "T001".into(),
+                    title: "a".into(),
+                    scope: vec!["a.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec!["T002".into()],
+                    status: "pending".into(),
+                    attempts: 0,
                 },
                 Task {
-                    id: "T002".into(), title: "b".into(), scope: vec!["b.rs".into()],
-                    context_files: vec![], acceptance: "x".into(),
-                    depends_on: vec!["T001".into()], status: "pending".into(), attempts: 0,
+                    id: "T002".into(),
+                    title: "b".into(),
+                    scope: vec!["b.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec!["T001".into()],
+                    status: "pending".into(),
+                    attempts: 0,
                 },
             ],
         };
@@ -1579,13 +1772,21 @@ mod tests {
         let plan = TasksPlan {
             project_goal: "g".into(),
             tasks: vec![Task {
-                id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                context_files: vec![], acceptance: "x".into(),
-                depends_on: vec!["T999".into()], status: "pending".into(), attempts: 0,
+                id: "T001".into(),
+                title: "a".into(),
+                scope: vec!["a.rs".into()],
+                context_files: vec![],
+                acceptance: "x".into(),
+                depends_on: vec!["T999".into()],
+                status: "pending".into(),
+                attempts: 0,
             }],
         };
         let err = validate_plan(&plan).expect_err("a dangling dep must be rejected");
-        assert!(err.contains("unknown task id"), "names the dangling dep: {err}");
+        assert!(
+            err.contains("unknown task id"),
+            "names the dangling dep: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1593,9 +1794,14 @@ mod tests {
         let plan = TasksPlan {
             project_goal: "g".into(),
             tasks: vec![Task {
-                id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                context_files: vec![], acceptance: "   ".into(),
-                depends_on: vec![], status: "pending".into(), attempts: 0,
+                id: "T001".into(),
+                title: "a".into(),
+                scope: vec!["a.rs".into()],
+                context_files: vec![],
+                acceptance: "   ".into(),
+                depends_on: vec![],
+                status: "pending".into(),
+                attempts: 0,
             }],
         };
         let err = validate_plan(&plan).expect_err("empty acceptance must be rejected");
@@ -1608,14 +1814,24 @@ mod tests {
             project_goal: "g".into(),
             tasks: vec![
                 Task {
-                    id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                    context_files: vec![], acceptance: "x".into(),
-                    depends_on: vec![], status: "pending".into(), attempts: 0,
+                    id: "T001".into(),
+                    title: "a".into(),
+                    scope: vec!["a.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec![],
+                    status: "pending".into(),
+                    attempts: 0,
                 },
                 Task {
-                    id: "T001".into(), title: "b".into(), scope: vec!["b.rs".into()],
-                    context_files: vec![], acceptance: "x".into(),
-                    depends_on: vec![], status: "pending".into(), attempts: 0,
+                    id: "T001".into(),
+                    title: "b".into(),
+                    scope: vec!["b.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec![],
+                    status: "pending".into(),
+                    attempts: 0,
                 },
             ],
         };
@@ -1631,32 +1847,49 @@ mod tests {
             project_goal: "g".into(),
             tasks: vec![
                 Task {
-                    id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                    context_files: vec![], acceptance: "x".into(),
-                    depends_on: vec![], status: "pending".into(), attempts: 0,
+                    id: "T001".into(),
+                    title: "a".into(),
+                    scope: vec!["a.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec![],
+                    status: "pending".into(),
+                    attempts: 0,
                 },
                 Task {
-                    id: "T002".into(), title: "b".into(), scope: vec!["b.rs".into()],
-                    context_files: vec![], acceptance: "x".into(),
+                    id: "T002".into(),
+                    title: "b".into(),
+                    scope: vec!["b.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
                     depends_on: vec!["T001".into(), "T001".into()],
-                    status: "pending".into(), attempts: 0,
+                    status: "pending".into(),
+                    attempts: 0,
                 },
             ],
         };
         let err = validate_plan(&plan).expect_err("a duplicate dep must be rejected");
-        assert!(err.contains("duplicate dependsOn"), "names the duplicate dep: {err}");
+        assert!(
+            err.contains("duplicate dependsOn"),
+            "names the duplicate dep: {err}"
+        );
     }
 
     #[tokio::test]
     async fn nonzero_attempts_rejected() {
-        // A plan-time task MUST start with attempts == 0; a non-zero counter would
-        // persist a corrupted initial retry state for 11.3.
+        // A freshly drafted task MUST start with attempts == 0; a non-zero counter is a
+        // corrupted draft (the board has no attempts field; the runner counts in-run).
         let plan = TasksPlan {
             project_goal: "g".into(),
             tasks: vec![Task {
-                id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                context_files: vec![], acceptance: "x".into(),
-                depends_on: vec![], status: "pending".into(), attempts: 1,
+                id: "T001".into(),
+                title: "a".into(),
+                scope: vec!["a.rs".into()],
+                context_files: vec![],
+                acceptance: "x".into(),
+                depends_on: vec![],
+                status: "pending".into(),
+                attempts: 1,
             }],
         };
         let err = validate_plan(&plan).expect_err("attempts != 0 must be rejected");
@@ -1670,9 +1903,14 @@ mod tests {
         let plan = TasksPlan {
             project_goal: "g".into(),
             tasks: vec![Task {
-                id: "T001".into(), title: "a".into(), scope: vec!["../escape.rs".into()],
-                context_files: vec![], acceptance: "x".into(),
-                depends_on: vec![], status: "pending".into(), attempts: 0,
+                id: "T001".into(),
+                title: "a".into(),
+                scope: vec!["../escape.rs".into()],
+                context_files: vec![],
+                acceptance: "x".into(),
+                depends_on: vec![],
+                status: "pending".into(),
+                attempts: 0,
             }],
         };
         let err = validate_plan(&plan).expect_err("a traversal scope path must be rejected");
@@ -1684,9 +1922,14 @@ mod tests {
         let plan = TasksPlan {
             project_goal: "g".into(),
             tasks: vec![Task {
-                id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                context_files: vec![], acceptance: "x".into(),
-                depends_on: vec!["T001".into()], status: "pending".into(), attempts: 0,
+                id: "T001".into(),
+                title: "a".into(),
+                scope: vec!["a.rs".into()],
+                context_files: vec![],
+                acceptance: "x".into(),
+                depends_on: vec!["T001".into()],
+                status: "pending".into(),
+                attempts: 0,
             }],
         };
         let err = validate_plan(&plan).expect_err("a self-dep must be rejected");
@@ -1699,15 +1942,36 @@ mod tests {
         let plan = TasksPlan {
             project_goal: "g".into(),
             tasks: vec![
-                Task { id: "T001".into(), title: "a".into(), scope: vec!["a.rs".into()],
-                    context_files: vec![], acceptance: "x".into(), depends_on: vec![],
-                    status: "pending".into(), attempts: 0 },
-                Task { id: "T002".into(), title: "b".into(), scope: vec!["b.rs".into()],
-                    context_files: vec![], acceptance: "x".into(), depends_on: vec!["T001".into()],
-                    status: "pending".into(), attempts: 0 },
-                Task { id: "T003".into(), title: "c".into(), scope: vec!["c.rs".into()],
-                    context_files: vec![], acceptance: "x".into(), depends_on: vec!["T002".into()],
-                    status: "pending".into(), attempts: 0 },
+                Task {
+                    id: "T001".into(),
+                    title: "a".into(),
+                    scope: vec!["a.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec![],
+                    status: "pending".into(),
+                    attempts: 0,
+                },
+                Task {
+                    id: "T002".into(),
+                    title: "b".into(),
+                    scope: vec!["b.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec!["T001".into()],
+                    status: "pending".into(),
+                    attempts: 0,
+                },
+                Task {
+                    id: "T003".into(),
+                    title: "c".into(),
+                    scope: vec!["c.rs".into()],
+                    context_files: vec![],
+                    acceptance: "x".into(),
+                    depends_on: vec!["T002".into()],
+                    status: "pending".into(),
+                    attempts: 0,
+                },
             ],
         };
         assert!(validate_plan(&plan).is_ok(), "a linear DAG is valid");
@@ -1717,7 +1981,7 @@ mod tests {
     async fn exhausted_retries_returns_escalation_error() {
         // Every PLAN attempt is invalid (4-file scope) -> the planner gives up
         // after MAX_PLAN_ATTEMPTS with an Escalated-style error, and never submits.
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let bad = serde_json::json!([{
             "id": "T001", "title": "too big",
@@ -1729,10 +1993,13 @@ mod tests {
             outputs.push(plan_block(bad.clone()));
         }
         let model = CapturingModel::new(outputs);
-        let err = run_planner("g", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let err = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .expect_err("exhausted retries is an error");
-        assert!(err.contains("could not produce a valid plan"), "escalation msg: {err}");
+        assert!(
+            err.contains("could not produce a valid plan"),
+            "escalation msg: {err}"
+        );
         // It must NOT have submitted a plan.
         assert!(!mcp.call_names().iter().any(|n| n == "plan_submit"));
     }
@@ -1770,7 +2037,11 @@ mod tests {
         let text = serde_json::json!({"spine": spine, "summary": {}}).to_string();
         let s = parse_structure(&text).unwrap();
         let paths: Vec<&str> = s.spine.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["src/good.rs", "src/also_good.rs"], "only safe paths kept: {paths:?}");
+        assert_eq!(
+            paths,
+            vec!["src/good.rs", "src/also_good.rs"],
+            "only safe paths kept: {paths:?}"
+        );
     }
 
     #[test]
@@ -1782,7 +2053,10 @@ mod tests {
             {"path": "/abs.rs", "inDegree": 3, "topReferencedSymbols": []},
         ]);
         let text = serde_json::json!({"spine": spine, "summary": {}}).to_string();
-        assert!(parse_structure(&text).is_err(), "all-unsafe spine is an error");
+        assert!(
+            parse_structure(&text).is_err(),
+            "all-unsafe spine is an error"
+        );
     }
 
     #[test]
@@ -1794,7 +2068,12 @@ mod tests {
         let giant_notes = "x".repeat(100_000);
         let giant_summary = serde_json::json!({ "blob": "y".repeat(100_000) });
         let giant_prior = "z".repeat(50_000);
-        let prompt = build_plan_prompt(&giant_goal, &giant_notes, &giant_summary, Some(&giant_prior));
+        let prompt = build_plan_prompt(
+            &giant_goal,
+            &giant_notes,
+            &giant_summary,
+            Some(&giant_prior),
+        );
         assert!(
             prompt.chars().count() <= MAX_PLAN_PROMPT_CHARS,
             "PLAN prompt must be hard-bounded: got {} chars (max {MAX_PLAN_PROMPT_CHARS})",
@@ -1810,7 +2089,10 @@ mod tests {
     #[test]
     fn missing_project_id_escalates() {
         // Validated synchronously before any tool call.
-        let plan = TasksPlan { project_goal: "g".into(), tasks: vec![] };
+        let plan = TasksPlan {
+            project_goal: "g".into(),
+            tasks: vec![],
+        };
         // (use validate to exercise empty-tasks path too)
         assert!(validate_plan(&plan).is_err());
     }
@@ -1818,25 +2100,66 @@ mod tests {
     #[test]
     fn extract_one_block_requires_exactly_one() {
         assert!(extract_one_block("no block here", "plan").is_err());
-        let two = format!("{}\n{}", plan_block(one_valid_task()), plan_block(one_valid_task()));
+        let two = format!(
+            "{}\n{}",
+            plan_block(one_valid_task()),
+            plan_block(one_valid_task())
+        );
         assert!(extract_one_block(&two, "plan").is_err());
         assert!(extract_one_block(&plan_block(one_valid_task()), "plan").is_ok());
     }
 
     #[test]
     fn approval_from_status_is_case_insensitive_and_conservative() {
-        assert_eq!(PlanApproval::from_status("APPROVED"), PlanApproval::Approved);
-        assert_eq!(PlanApproval::from_status(" rejected "), PlanApproval::Rejected);
-        assert_eq!(PlanApproval::from_status("pending_approval"), PlanApproval::Timeout);
+        assert_eq!(
+            PlanApproval::from_status("APPROVED"),
+            PlanApproval::Approved
+        );
+        assert_eq!(
+            PlanApproval::from_status(" rejected "),
+            PlanApproval::Rejected
+        );
+        assert_eq!(
+            PlanApproval::from_status("pending_approval"),
+            PlanApproval::Timeout
+        );
         assert_eq!(PlanApproval::from_status("whatever"), PlanApproval::Timeout);
+    }
+
+    // P2: whitespace-only planId must be treated as absent.
+    #[test]
+    fn whitespace_only_plan_id_is_treated_as_absent() {
+        // A server that returns `" "` (spaces only) for planId must not be forwarded
+        // to `project_create_plan_tasks` as a blank tag — it must map to None.
+        let result = parse_submit_result(
+            &serde_json::json!({"planId": "  ", "status": "approved"}).to_string(),
+        );
+        assert_eq!(
+            result.plan_id, None,
+            "a whitespace-only planId must be treated as absent"
+        );
+        assert_eq!(result.approval, PlanApproval::Approved);
+    }
+
+    #[test]
+    fn non_empty_plan_id_is_preserved_after_trim() {
+        // A planId with surrounding whitespace is trimmed but retained.
+        let result = parse_submit_result(
+            &serde_json::json!({"planId": "  p1  ", "status": "approved"}).to_string(),
+        );
+        assert_eq!(
+            result.plan_id.as_deref(),
+            Some("p1"),
+            "a non-empty planId is trimmed and kept"
+        );
     }
 
     #[tokio::test]
     async fn empty_goal_escalates() {
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![]);
-        let err = run_planner("   ", &model, &mcp, &fs, "proj", dir.path(), &noop_activity())
+        let err = run_planner("   ", &model, &mcp, &fs, "proj", &noop_activity())
             .await
             .expect_err("an empty goal is rejected before any work");
         assert!(err.contains("non-empty goal"));
@@ -1846,10 +2169,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_project_id_escalates() {
-        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![]);
-        let err = run_planner("g", &model, &mcp, &fs, "", dir.path(), &noop_activity())
+        let err = run_planner("g", &model, &mcp, &fs, "", &noop_activity())
             .await
             .expect_err("an empty project_id is rejected before any work");
         assert!(err.contains("project_id"));

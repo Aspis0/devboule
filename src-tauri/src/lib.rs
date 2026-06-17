@@ -422,6 +422,7 @@ pub fn run() {
             backend::agent_pty::agent_pty_kill,
             backend::agent_pty::agent_pty_list,
             backend::mini_coder_executor::mini_coder_kill,
+            backend::mini_coder_executor::mini_coder_steer,
             backend::mini_activity::mini_activity_snapshot,
             backend::token_usage::get_agent_token_usage,
             backend::commands::get_cloud_dashboard_snapshot,

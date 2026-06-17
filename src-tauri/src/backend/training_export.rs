@@ -907,6 +907,7 @@ mod tests {
             backend: None,
             allow_oracle: false,
             kill_requested: false,
+            steer_queue: Vec::new(),
             result_path: String::new(),
             agent_id: None,
             created_at: String::new(),

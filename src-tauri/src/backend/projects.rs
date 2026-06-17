@@ -236,6 +236,13 @@ pub fn create_project_task(
                 description,
                 // P2 populates suspects from Oracle retrieval; empty for now.
                 suspect_file_ids: Vec::new(),
+                // Phase 11.5-B: a desktop-created manual task carries no plan
+                // metadata (the DAG/scope/acceptance/planId are populated only by
+                // the `project_create_plan_tasks` MCP path). Empty here.
+                depends_on: Vec::new(),
+                scope: Vec::new(),
+                acceptance: String::new(),
+                plan_id: None,
             });
             Ok(())
         },
@@ -7970,6 +7977,10 @@ mod tests {
                 category: Some("bug".into()),
                 description: Some("Worker returns 500 on cold start".into()),
                 suspect_file_ids: vec!["src/worker.ts".into(), "src/db.ts".into()],
+                depends_on: Vec::new(),
+                scope: Vec::new(),
+                acceptance: String::new(),
+                plan_id: None,
             }],
             notes: Vec::new(),
             milestones: Vec::new(),
@@ -8689,6 +8700,10 @@ updated_at: 2026-05-28T00:00:00Z
                     category: Some("feature".into()),
                     description: None,
                     suspect_file_ids: Vec::new(),
+                    depends_on: Vec::new(),
+                    scope: Vec::new(),
+                    acceptance: String::new(),
+                    plan_id: None,
                 }],
                 notes: Vec::new(),
                 milestones: Vec::new(),
@@ -11268,6 +11283,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             category: None,
             description: None,
             suspect_file_ids: Vec::new(),
+            depends_on: Vec::new(),
+            scope: Vec::new(),
+            acceptance: String::new(),
+            plan_id: None,
         }
     }
 
@@ -11285,6 +11304,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             category: Some(category.into()),
             description: None,
             suspect_file_ids: suspects.iter().map(|s| s.to_string()).collect(),
+            depends_on: Vec::new(),
+            scope: Vec::new(),
+            acceptance: String::new(),
+            plan_id: None,
         }
     }
 
@@ -11477,6 +11500,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
                 category: Some("bug".into()),
                 description: None,
                 suspect_file_ids: Vec::new(),
+                depends_on: Vec::new(),
+                scope: Vec::new(),
+                acceptance: String::new(),
+                plan_id: None,
             }],
             notes: Vec::new(),
             milestones: Vec::new(),

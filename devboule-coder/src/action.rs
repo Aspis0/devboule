@@ -71,6 +71,17 @@ pub enum AgentAction {
     },
     /// Lay out a plan as ordered steps.
     Plan { steps: Vec<String> },
+    /// EXECUTE the approved plan (Phase 11.3): run the active plan's tasks straight off
+    /// the project KANBAN (the single shared task store) — each ready task delegated to a
+    /// mini under the Censor gate, in dependency order — until all are done/in-review or
+    /// one is BLOCKED. No arguments: the runner auto-detects the active plan on the board
+    /// (the tasks the prior `plan` action created + the human approved).
+    ///
+    /// Modeled as an EMPTY STRUCT variant (`{}`), NOT a unit variant: serde's
+    /// `deny_unknown_fields` is silently NOT enforced for a UNIT variant of an internally
+    /// tagged enum, so `{"tool":"run_plan","junk":1}` would parse and swallow `junk` with
+    /// no FORMAT ERROR feedback. A struct variant restores the strict-reject contract.
+    RunPlan {},
     /// Spawn a mini sub-agent on a scoped task over `files`. `write` selects the
     /// edit arm (default read-only).
     SpawnMini {
@@ -107,7 +118,10 @@ impl AgentAction {
     /// L2.3's real executor can additionally gate on it. `oracle_*` is PRIVATE
     /// and grounded, so it is deliberately NOT egress.
     pub fn is_egress(&self) -> bool {
-        matches!(self, AgentAction::Fetch { .. } | AgentAction::Websearch { .. })
+        matches!(
+            self,
+            AgentAction::Fetch { .. } | AgentAction::Websearch { .. }
+        )
     }
 
     /// A short stable name for the tool (for progress lines and the no-progress
@@ -117,6 +131,7 @@ impl AgentAction {
             AgentAction::OracleAsk { .. } => "oracle_ask",
             AgentAction::OracleContext { .. } => "oracle_context",
             AgentAction::Plan { .. } => "plan",
+            AgentAction::RunPlan {} => "run_plan",
             AgentAction::SpawnMini { .. } => "spawn_mini",
             AgentAction::Read { .. } => "read",
             AgentAction::Grep { .. } => "grep",
@@ -137,6 +152,12 @@ impl AgentAction {
             AgentAction::OracleAsk { query } => query.clone(),
             AgentAction::OracleContext { query, .. } => query.clone(),
             AgentAction::Plan { steps } => steps.join(" | "),
+            // No natural single target — it operates on the persisted plan. The empty
+            // target means two `run_plan` in ONE burst trip the no-progress guard, which
+            // is correct: the flow is run_plan → done|ask_user (which ends the burst), so
+            // a re-run happens in a FRESH burst (fresh window); an in-burst repeat is a
+            // genuine spin worth escalating.
+            AgentAction::RunPlan {} => String::new(),
             AgentAction::SpawnMini { task, .. } => task.clone(),
             AgentAction::Read { path } => path.clone(),
             AgentAction::Grep { pattern, .. } => pattern.clone(),
@@ -166,6 +187,8 @@ impl AgentAction {
                 }
                 Ok(())
             }
+            // No arguments to validate — it runs the already-persisted, already-approved plan.
+            AgentAction::RunPlan {} => Ok(()),
             AgentAction::SpawnMini { task, files, write } => {
                 check_text("task", task)?;
                 if files.is_empty() {
@@ -181,10 +204,7 @@ impl AgentAction {
                     ));
                 }
                 if files.len() > MAX_FILES {
-                    return Err(format!(
-                        "too many files: {} (max {MAX_FILES})",
-                        files.len()
-                    ));
+                    return Err(format!("too many files: {} (max {MAX_FILES})", files.len()));
                 }
                 for f in files {
                     check_rel_path("files entry", f)?;
@@ -238,7 +258,9 @@ pub(crate) fn check_rel_path(field: &str, raw: &str) -> Result<(), String> {
         return Err(format!("`{field}` must not be empty"));
     }
     if raw.chars().count() > MAX_PATH_LEN {
-        return Err(format!("`{field}` path too long (max {MAX_PATH_LEN} chars)"));
+        return Err(format!(
+            "`{field}` path too long (max {MAX_PATH_LEN} chars)"
+        ));
     }
 
     let normalized = raw.replace('\\', "/");
@@ -248,9 +270,7 @@ pub(crate) fn check_rel_path(field: &str, raw: &str) -> Result<(), String> {
     let mut head = normalized.bytes();
     if let (Some(first), Some(b':')) = (head.next(), head.next()) {
         if first.is_ascii_alphabetic() {
-            return Err(format!(
-                "`{field}` must be relative, got absolute: {raw}"
-            ));
+            return Err(format!("`{field}` must be relative, got absolute: {raw}"));
         }
     }
 
@@ -261,9 +281,7 @@ pub(crate) fn check_rel_path(field: &str, raw: &str) -> Result<(), String> {
                 return Err(format!("`{field}` must not contain '..': {raw}"));
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "`{field}` must be relative, got absolute: {raw}"
-                ));
+                return Err(format!("`{field}` must be relative, got absolute: {raw}"));
             }
             Component::Normal(name) => {
                 // `Path::components` has already split on the separators, so this
@@ -294,11 +312,7 @@ fn check_url(url: &str) -> Result<(), String> {
     // Scheme: everything before the first ':'. Reject anything but http/https.
     let scheme = match url.split_once(':') {
         Some((s, _)) => s.to_ascii_lowercase(),
-        None => {
-            return Err(
-                "url has no scheme; use https:// or http://".to_string(),
-            )
-        }
+        None => return Err("url has no scheme; use https:// or http://".to_string()),
     };
     if scheme != "https" && scheme != "http" {
         return Err(format!(
@@ -311,10 +325,7 @@ fn check_url(url: &str) -> Result<(), String> {
     // `[` we take everything up to the closing `]`; otherwise we split on the
     // first `/`, `:`, `?`, or `#`. The brackets are then stripped so `[::1]` and
     // `::1` normalise to the same blocked host.
-    let after_scheme = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or("");
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
 
     // SSRF via userinfo: `http://evil.com@127.0.0.1/` puts the REAL host after the
     // `@`, but the naive host-span extraction below would take `evil.com@127.0.0.1`
@@ -322,10 +333,7 @@ fn check_url(url: &str) -> Result<(), String> {
     // post-`@` target. Reject ANY `@` in the AUTHORITY (the span before the first
     // `/ ? #`) outright — there is no legitimate need for userinfo in a fetch URL.
     // Mirrors `model_client::validate_omlx_base_url`, which rejects `@` the same way.
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     if authority.contains('@') {
         return Err("url must not contain userinfo (@ in authority)".to_string());
     }
@@ -359,7 +367,9 @@ fn check_url(url: &str) -> Result<(), String> {
             || v4.is_unspecified()
             || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
         {
-            return Err(format!("url host `{host_raw}` is not allowed (internal/loopback)"));
+            return Err(format!(
+                "url host `{host_raw}` is not allowed (internal/loopback)"
+            ));
         }
     } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
         // `::1` (loopback) and `::` (unspecified) directly; plus the IPv4-mapped
@@ -371,7 +381,9 @@ fn check_url(url: &str) -> Result<(), String> {
                 || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
         });
         if v6.is_loopback() || v6.is_unspecified() || mapped_blocked {
-            return Err(format!("url host `{host_raw}` is not allowed (internal/loopback)"));
+            return Err(format!(
+                "url host `{host_raw}` is not allowed (internal/loopback)"
+            ));
         }
     }
 
@@ -387,7 +399,9 @@ fn check_url(url: &str) -> Result<(), String> {
         "169.254.169.254",
     ];
     if BLOCKED_HOSTS.contains(&host.as_str()) {
-        return Err(format!("url host `{host_raw}` is not allowed (internal/loopback)"));
+        return Err(format!(
+            "url host `{host_raw}` is not allowed (internal/loopback)"
+        ));
     }
 
     Ok(())
@@ -627,16 +641,11 @@ pub fn parse_action(model_output: &str) -> Result<AgentAction, FormatError> {
     let mut blocks = action_re().captures_iter(model_output);
     let first = blocks.next().ok_or(FormatError::Missing)?;
 
-    let body = first
-        .get(1)
-        .map(|m| m.as_str().trim())
-        .unwrap_or_default();
+    let body = first.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
 
-    let action: AgentAction = serde_json::from_str(body)
-        .map_err(|e| FormatError::Invalid(e.to_string()))?;
-    action
-        .validate()
-        .map_err(FormatError::Invalid)?;
+    let action: AgentAction =
+        serde_json::from_str(body).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    action.validate().map_err(FormatError::Invalid)?;
     Ok(action)
 }
 
@@ -678,6 +687,7 @@ mod tests {
                     steps: vec!["a".into(), "b".into()],
                 },
             ),
+            (r#"{"tool":"run_plan"}"#, AgentAction::RunPlan {}),
             (
                 r#"{"tool":"spawn_mini","task":"fix it","files":["src/a.rs"],"write":true}"#,
                 AgentAction::SpawnMini {
@@ -804,7 +814,10 @@ mod tests {
         let out = "```json\n```action\n{\"tool\":\"fetch\",\"url\":\"http://169.254.169.254/\"}\n```\n```";
         match parse_action(out) {
             Err(FormatError::Invalid(msg)) => {
-                assert!(msg.contains("nested"), "message must mention nesting: {msg}")
+                assert!(
+                    msg.contains("nested"),
+                    "message must mention nesting: {msg}"
+                )
             }
             other => panic!("nested/wrapped block must be rejected, got {other:?}"),
         }
@@ -830,7 +843,9 @@ mod tests {
         let out = "Here is the snippet:\n```rust\nfn main() {}\n```\n\n```action\n{\"tool\":\"read\",\"path\":\"a.rs\"}\n```";
         assert_eq!(
             parse_action(out).unwrap(),
-            AgentAction::Read { path: "a.rs".into() }
+            AgentAction::Read {
+                path: "a.rs".into()
+            }
         );
     }
 
@@ -845,7 +860,10 @@ mod tests {
         let out = "```json\n```yaml\n```action\n{\"tool\":\"fetch\",\"url\":\"http://169.254.169.254/\"}\n```";
         match parse_action(out) {
             Err(FormatError::Invalid(msg)) => {
-                assert!(msg.contains("nested"), "message must mention nesting: {msg}")
+                assert!(
+                    msg.contains("nested"),
+                    "message must mention nesting: {msg}"
+                )
             }
             other => panic!("even-parity prose-fence evasion must be rejected, got {other:?}"),
         }
@@ -876,6 +894,19 @@ mod tests {
         match parse_action(&out) {
             Err(FormatError::Invalid(_)) => {}
             other => panic!("expected Invalid for unknown field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_plan_rejects_unknown_fields() {
+        // RunPlan is an EMPTY STRUCT variant (not a unit variant) precisely so
+        // deny_unknown_fields fires: a stray field — e.g. a model confusing `plan` with
+        // `run_plan` and attaching `steps` — is a hard parse error with feedback, NOT
+        // silently swallowed (a unit variant in an internally-tagged enum would accept it).
+        let out = block(r#"{"tool":"run_plan","steps":["oops"]}"#);
+        match parse_action(&out) {
+            Err(FormatError::Invalid(_)) => {}
+            other => panic!("expected Invalid for run_plan with extra fields, got {other:?}"),
         }
     }
 
@@ -1030,7 +1061,9 @@ mod tests {
     fn write_spawn_mini_over_ten_files_is_invalid() {
         // FIX 4: the WRITE arm is capped at MAX_WRITE_FILES (10) — the server
         // rejects more, so we reject at parse time for self-correctable feedback.
-        let files: Vec<String> = (0..(MAX_WRITE_FILES + 1)).map(|i| format!("f{i}.rs")).collect();
+        let files: Vec<String> = (0..(MAX_WRITE_FILES + 1))
+            .map(|i| format!("f{i}.rs"))
+            .collect();
         let json = serde_json::json!({
             "tool": "spawn_mini",
             "task": "edit many",
@@ -1049,7 +1082,9 @@ mod tests {
     #[test]
     fn read_spawn_mini_with_eleven_files_is_ok() {
         // FIX 4: the READ arm keeps the 32 cap, so 11 files (write=false) is fine.
-        let files: Vec<String> = (0..(MAX_WRITE_FILES + 1)).map(|i| format!("f{i}.rs")).collect();
+        let files: Vec<String> = (0..(MAX_WRITE_FILES + 1))
+            .map(|i| format!("f{i}.rs"))
+            .collect();
         let json = serde_json::json!({
             "tool": "spawn_mini",
             "task": "read many",
@@ -1236,10 +1271,16 @@ mod tests {
 
     #[test]
     fn egress_marker_is_correct() {
-        assert!(AgentAction::Fetch { url: "https://x".into() }.is_egress());
+        assert!(AgentAction::Fetch {
+            url: "https://x".into()
+        }
+        .is_egress());
         assert!(AgentAction::Websearch { query: "q".into() }.is_egress());
         assert!(!AgentAction::OracleAsk { query: "q".into() }.is_egress());
-        assert!(!AgentAction::Read { path: "a.rs".into() }.is_egress());
+        assert!(!AgentAction::Read {
+            path: "a.rs".into()
+        }
+        .is_egress());
     }
 
     #[test]
@@ -1248,7 +1289,9 @@ mod tests {
         let out = "```action\r\n{\"tool\":\"read\",\"path\":\"a.rs\"}\r\n```";
         assert_eq!(
             parse_action(out).unwrap(),
-            AgentAction::Read { path: "a.rs".into() }
+            AgentAction::Read {
+                path: "a.rs".into()
+            }
         );
     }
 }

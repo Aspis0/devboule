@@ -1737,6 +1737,11 @@ fn finalize_finished_mini_with(
         .map(|p| Path::new(p).join(directive.result_path.replace('\\', "/")));
     let id = directive.id.clone();
     let agent_id = directive.agent_id.clone();
+    // ASYNC STEERING (a): how many steer messages the gate's `build_retry_directive` FOLDED
+    // into the retry — i.e. the length of the predecessor's queue in THIS (off-lock) snapshot.
+    // Used under the lock to carry forward only the LATER arrivals (live queue beyond this
+    // count) without re-folding the ones already in the retry's task.
+    let retry_snapshot_steer_len = directive.steer_queue.len();
 
     // 4) Apply the decision atomically. `applied_outcome` is what we record on the
     //    training rail (the terminal outcome actually stamped; None for AwaitingRetry,
@@ -1745,6 +1750,34 @@ fn finalize_finished_mini_with(
     let applied = agents::mutate_agent_live_state(app, |state| {
         match &decision {
             mini_coder::GateDecision::AwaitingRetryWith { retry } => {
+                // P1 (KILL-WINDOW GAP) — close the inconsistency the steering diff opened.
+                // The `Escalate` + `StampTerminal` arms re-consult the LIVE kill via
+                // `live_kill_override`, but this arm did NOT. A Stop button / `stop` steer that
+                // landed AFTER this pass's off-lock snapshot (so the gate still decided
+                // AwaitingRetry) must WIN here too: `apply_awaiting_retry` only guards on
+                // `Running` (not `kill_requested`), so without this check a fresh retry `R`
+                // would be spawned Pending and run despite the human asserting Stop — and the
+                // carry-forward carries `steer_queue` but NOT `kill_requested`, so `R` would be
+                // born `kill_requested:false` and the abort intent would evaporate. Honor it at
+                // the SAME round boundary as the kill: if the LIVE predecessor is flagged (or a
+                // `stop` sentinel reached its live queue out-of-band — the SAME "aborts" set
+                // `live_kill_override` recognizes), ABORT the chain — stamp the predecessor's
+                // terminal `aborted_by_human` + propagate it (so the root poll unblocks) and
+                // spawn NO retry. P5 killRequested-WINS contract preserved.
+                if awaiting_retry_kill_wins(state, &id) {
+                    let aborted = MiniCoderOutcome::aborted("stopped by human (Stop button)");
+                    let ao = aborted.clone();
+                    stamp_terminal_and_propagate(
+                        state,
+                        &id,
+                        &aborted,
+                        agent_id.as_deref(),
+                        |d| mini_coder::apply_result(d, ao.clone()),
+                    );
+                    applied_outcome = Some(aborted);
+                    // NO retry spawned: the human's Stop aborts the chain here.
+                    return;
+                }
                 // ONE atomic mutate: move the predecessor to AwaitingRetry (stamping the
                 // forward link) AND append the Pending retry. Never half-applied.
                 let stamped = transition_directive_ok(state, &id, |d| {
@@ -1753,7 +1786,30 @@ fn finalize_finished_mini_with(
                 if stamped {
                     // Only append the retry if the predecessor actually transitioned (a
                     // racing kill could have made it terminal first — then no retry).
-                    state.mini_coder_directives.push((**retry).clone());
+                    // ASYNC STEERING (a): the retry the gate built ALREADY folded the
+                    // predecessor's steer_queue (as seen in the off-lock SNAPSHOT) into its
+                    // task (build_retry_directive). Under the lock we now reconcile the LIVE
+                    // predecessor queue:
+                    //   * a steer that arrived in the race window AFTER the snapshot (the live
+                    //     queue is longer than what the retry folded) is NOT lost — it is
+                    //     CARRIED FORWARD onto the fresh retry so the next round consumes it;
+                    //   * then the predecessor's own queue is cleared (it is parked at
+                    //     AwaitingRetry and never re-runs) — NO-CHURN: an empty Vec is omitted
+                    //     on the next serialize, exactly as it was before any steer.
+                    // The retry the gate built carries the snapshot's queue COUNT consumed.
+                    let folded = retry_snapshot_steer_len;
+                    let mut retry = (**retry).clone();
+                    if let Some(pred) = state.mini_coder_directives.iter_mut().find(|d| d.id == id)
+                    {
+                        if pred.steer_queue.len() > folded {
+                            // Late arrivals (beyond what the gate folded) ride the retry.
+                            retry
+                                .steer_queue
+                                .extend(pred.steer_queue.drain(folded..));
+                        }
+                        pred.steer_queue.clear();
+                    }
+                    state.mini_coder_directives.push(retry);
                 }
                 // The predecessor's PTY is gone — close its session row.
                 if let Some(aid) = agent_id.as_deref() {
@@ -1898,6 +1954,29 @@ fn console_finalize(
 
     match decision {
         mini_coder::GateDecision::AwaitingRetryWith { .. } => {
+            // P1 (KILL-WINDOW GAP): the gate DECIDED a retry, but a Stop that landed in the
+            // window WON at apply time — the chain was aborted (`aborted_by_human`) and NO
+            // retry was spawned. If `applied_outcome` reflects that abort, the console must
+            // show the terminal `stop` banner (run finished), NOT open a phantom next round
+            // that would shimmer forever. Only when the retry actually proceeded (no applied
+            // terminal outcome) do we close this round + open the next.
+            if applied_outcome.map(|o| o.status) == Some(MiniCoderStatus::AbortedByHuman) {
+                store.update(app, agent_id, |a| {
+                    for path in files_touched {
+                        console::push_write_action(a, path);
+                    }
+                    // The human cut it short: no Censor verdict to show — just the stop.
+                    console::set_terminal(
+                        a,
+                        console::Banner {
+                            kind: console::BannerKind::Stop,
+                            title: None,
+                            sub: None,
+                        },
+                    );
+                });
+                return;
+            }
             // Dirty with retries left: close THIS round (write rows + dirty verdict), open
             // the next. The applied write rows are the ground-truth files the mini changed.
             store.update(app, agent_id, |a| {
@@ -2040,22 +2119,54 @@ fn transition_directive_ok(
 /// Stop after this pass's snapshot was read) and the proposed `outcome` is not already
 /// an abort, override it to `aborted_by_human` — the human's assertion of control wins
 /// any racing terminal. Returns the outcome to actually stamp.
+///
+/// ASYNC STEERING (a): a live `steer_queue` carrying the STOP sentinel
+/// ([`mini_coder::STEER_STOP_SENTINEL`]) is ALSO an abort. The steer writers
+/// (`mini_coder_steer` / `dispatch_steer_mini_coder`) normally translate a `stop` steer to
+/// `kill_requested=true` at WRITE time (reusing the Stop path), so this is a DEFENSIVE
+/// backstop for a stop that reached the queue out-of-band (e.g. a hand-edited state) — the
+/// SAME generalized external-signal channel, honored at the same round boundary as the kill.
 fn live_kill_override(
     state: &crate::backend::model::AgentLiveState,
     id: &str,
     outcome: MiniCoderOutcome,
 ) -> MiniCoderOutcome {
-    let killed = state
+    let aborts = state
         .mini_coder_directives
         .iter()
         .find(|d| d.id == id)
-        .map(|d| d.kill_requested)
+        .map(|d| {
+            d.kill_requested || d.steer_queue.iter().any(|m| mini_coder::is_steer_stop(m))
+        })
         .unwrap_or(false);
-    if killed && outcome.status != MiniCoderStatus::AbortedByHuman {
+    if aborts && outcome.status != MiniCoderStatus::AbortedByHuman {
         MiniCoderOutcome::aborted("stopped by human (Stop button)")
     } else {
         outcome
     }
+}
+
+/// P1 (KILL-WINDOW GAP): does a LIVE Stop win over the gate's `AwaitingRetryWith` decision?
+/// The `Escalate`/`StampTerminal` arms re-consult the live kill via [`live_kill_override`],
+/// but the retry arm has no terminal outcome to override — so this guard answers the same
+/// question (using the IDENTICAL "aborts" predicate: a flagged `kill_requested` OR a `stop`
+/// sentinel that reached the live `steer_queue` out-of-band) for the retry arm. When true,
+/// the arm aborts the chain (`aborted_by_human` + propagate) and spawns NO retry, instead of
+/// parking the predecessor at `AwaitingRetry` and launching a fresh `Pending` attempt that
+/// would run despite the human's Stop. Pure (reads the live state under the caller's lock) so
+/// the P1 race is directly unit-testable without an AppHandle, mirroring `live_kill_override`.
+fn awaiting_retry_kill_wins(
+    state: &crate::backend::model::AgentLiveState,
+    id: &str,
+) -> bool {
+    state
+        .mini_coder_directives
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| {
+            d.kill_requested || d.steer_queue.iter().any(|m| mini_coder::is_steer_stop(m))
+        })
+        .unwrap_or(false)
 }
 
 /// P6 PROPAGATION: stamp the SAME terminal `outcome` onto every `AwaitingRetry`
@@ -4481,6 +4592,127 @@ fn mark_kill_requested(
     Some(live_pty.unwrap_or_else(|| agent_id.to_string()))
 }
 
+/// ASYNC STEERING (a): outcome of a steer attempt on the in-memory state — what the
+/// `mini_coder_steer` command turns into a result for the human / Console.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SteerOutcome {
+    /// Appended a correction; carries the targeted attempt's agent id when it has one (an
+    /// ACTIVE attempt carries its live PTY id; a `Pending` retry targeted in the handoff
+    /// window has `None` — it has no PTY yet, and the queued path never needs one) and the
+    /// new queue length.
+    Queued { live_agent_id: Option<String>, queued: usize },
+    /// The message was the STOP sentinel — flagged the chain `kill_requested` (reusing
+    /// the Stop path). Carries the live attempt's PTY agent id to kill, like
+    /// `mark_kill_requested`.
+    Stopped { live_agent_id: Option<String> },
+    /// The chain's live attempt already holds the maximum queued corrections
+    /// ([`mini_coder::MAX_STEER_QUEUE_LEN`]); the message was REFUSED (not dropped) so a
+    /// queued correction is never lost. Carries the current (full) queue length.
+    QueueFull { queued: usize },
+    /// No live (non-terminal) mini owns this agent id (non-mini id, already-terminal, or
+    /// the steer message was empty) — a pure no-op.
+    NoOp,
+}
+
+/// ASYNC STEERING (a) — PURE helper mirroring [`mark_kill_requested`]: route a steer
+/// `message` to the mini chain owning `agent_id`. The SAME external-signal channel
+/// generalized from the kill bool to a queue:
+///   * the STOP sentinel ([`mini_coder::STEER_STOP_SENTINEL`]) flags `kill_requested`
+///     across the live chain (REUSING the kill path) and returns `Stopped`;
+///   * any other (non-blank) message is APPENDED to the chain member that WILL run: the
+///     ACTIVE (`Launching|Running`) attempt if any, else (C1) the highest-attempt NON-TERMINAL
+///     member — the `Pending` retry in the retry-handoff window, NOT the dead `AwaitingRetry`
+///     predecessor that owns the matched `agent_id` (whose queue would never be drained). The
+///     attempt whose next round boundary drains the queue into the fix-pass task. Returns
+///     `Queued`. Capped at [`mini_coder::MAX_STEER_QUEUE_LEN`] (refused with `QueueFull` when
+///     full so an already-queued correction is never lost) and each message pre-sanitized +
+///     capped to [`mini_coder::MAX_STEER_MESSAGE_LEN`] by the caller.
+///   * a non-mini id, an already-terminal chain, or a blank message is a `NoOp`.
+/// Mutates the in-memory state only; the caller persists under the state lock. Kept pure so
+/// it is unit-testable without a real AppHandle (no GPU / no live mini needed).
+fn mark_steer_requested(
+    state: &mut crate::backend::model::AgentLiveState,
+    agent_id: &str,
+    message: &str,
+) -> SteerOutcome {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return SteerOutcome::NoOp;
+    }
+
+    // A STOP steer reuses the kill path verbatim (flag the whole live chain, return the
+    // PTY to kill) — steering generalizes the kill, it does not bypass it.
+    if mini_coder::is_steer_stop(trimmed) {
+        return match mark_kill_requested(state, agent_id) {
+            Some(live) => SteerOutcome::Stopped { live_agent_id: Some(live) },
+            None => SteerOutcome::NoOp,
+        };
+    }
+
+    // Locate the chain (root) the way mark_kill_requested does, and bail on a non-mini id
+    // or an already-terminal matched directive.
+    let matched = state
+        .mini_coder_directives
+        .iter()
+        .find(|d| d.agent_id.as_deref() == Some(agent_id))
+        .map(|d| (mini_coder::chain_root_id(d).to_string(), d.status));
+    let Some((root, matched_status)) = matched else {
+        return SteerOutcome::NoOp;
+    };
+    if matched_status.is_terminal() {
+        return SteerOutcome::NoOp;
+    }
+
+    // Append to the chain member that WILL run — the attempt whose NEXT round boundary
+    // (build_retry_directive) drains the queue into the fix-pass task. There is at most
+    // one ACTIVE (`Launching|Running`) attempt in a chain (plan_tick claims one at a time),
+    // so prefer it. C1: when NO attempt is currently active we must NOT fall back to the
+    // matched directive — in the retry-handoff window the matched directive is the DEAD
+    // `AwaitingRetry` predecessor (it carries `agent_id`; the freshly-minted `Pending` retry
+    // has none yet), and appending there would SILENTLY LOSE the steer (the predecessor
+    // never re-runs). Instead target the HIGHEST-attempt NON-TERMINAL chain member — the
+    // Pending retry `R` that plan_tick will claim — mirroring Python's "active preference"
+    // (`_MINI_ACTIVE_STATUSES` includes `pending`). A chain with no non-terminal member at
+    // all (everything terminal) yields None -> NoOp (the matched-status terminal guard above
+    // already covers the common case).
+    let in_chain = |d: &MiniCoderDirective| {
+        d.id == root || d.parent_directive_id.as_deref() == Some(root.as_str())
+    };
+    let target_idx = state
+        .mini_coder_directives
+        .iter()
+        .position(|d| in_chain(d) && d.status.is_active())
+        .or_else(|| {
+            // No active attempt: target the highest-attempt non-terminal member (the
+            // Pending retry that will run), NOT the matched (possibly dead predecessor) id.
+            state
+                .mini_coder_directives
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| in_chain(d) && !d.status.is_terminal())
+                .max_by_key(|(_, d)| d.attempt)
+                .map(|(i, _)| i)
+        });
+    let Some(idx) = target_idx else {
+        return SteerOutcome::NoOp;
+    };
+    let target = &mut state.mini_coder_directives[idx];
+    // Bounded FIFO: refuse (do not silently drop the oldest) when full so a queued
+    // correction is never lost. The caller surfaces this as a clear "queue full" status.
+    if target.steer_queue.len() >= mini_coder::MAX_STEER_QUEUE_LEN {
+        return SteerOutcome::QueueFull {
+            queued: target.steer_queue.len(),
+        };
+    }
+    target
+        .steer_queue
+        .push(trimmed.chars().take(mini_coder::MAX_STEER_MESSAGE_LEN).collect());
+    SteerOutcome::Queued {
+        live_agent_id: target.agent_id.clone(),
+        queued: target.steer_queue.len(),
+    }
+}
+
 /// P5 SAFETY BRAKE — the human Stop button on a mini's terminal. A TRUE override:
 ///   1) RECORD `killRequested=true` on the directive (persisted under the state lock)
 ///      BEFORE anything else, so the EOF-driven `finalize_finished_mini` — and the
@@ -4546,6 +4778,80 @@ pub fn mini_coder_kill(app: AppHandle, agent_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// ASYNC STEERING (a) — the HUMAN's Console hook to steer a RUNNING mini, the sibling of
+/// [`mini_coder_kill`]. The SAME external-signal channel generalized: instead of one Stop
+/// bool, the human APPENDS a mid-flight correction to the live mini chain's `steer_queue`,
+/// which the executor folds into the NEXT fix-pass round's task (`build_retry_directive` /
+/// `fold_steer_block`). A `message` equal to the STOP sentinel
+/// ([`mini_coder::STEER_STOP_SENTINEL`], case-insensitive) REUSES the Stop path: it flags
+/// `kill_requested` across the chain and kills the live PTY, exactly like the Stop button.
+///
+/// CONTRACT (matches `pi-subagents` "interrupts after the current tool execution"):
+/// steering takes effect at a ROUND BOUNDARY (between the mini's fix passes), NOT mid-token.
+/// A single one-shot mini with NO fix pass therefore has no mid-flight injection point
+/// except `stop` — a queued correction on such a mini lands only if/when the verdict gate
+/// opens a retry round. The result reports `status`: `queued` (+ `queued` length) /
+/// `stopped` / `queue_full` (+ `queued`) / `noop`, so the Console can tell the human what
+/// happened.
+///
+/// LOCK DISCIPLINE mirrors `mini_coder_kill`: the queue/flag write happens under the
+/// agent-state file lock; any PTY kill (the stop path) happens AFTER that lock is released.
+/// SELF-DEFENCE: a non-mini id, an already-terminal mini, or an unmatched id is a pure
+/// no-op — this command can never touch an unrelated PTY (it only kills on `stop`, and only
+/// the live mini chain's PTY). NO vault-unlock gate (like Stop): a mid-flight correction
+/// neither reads secrets nor mutates protected config.
+#[tauri::command]
+pub fn mini_coder_steer(
+    app: AppHandle,
+    agent_id: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    crate::backend::agent_pty::validate_agent_id(&agent_id)?;
+    // CO-WRITER PARITY with the Python `steer_mini_coder` tool (clean_text ->
+    // strip_invisible_and_bidi + whitespace collapse, THEN the shared cap): C2 — strip
+    // invisible/bidi/control chars (so a steer can't smuggle an RTL override / zero-width
+    // joiner / BOM into the prompt or a toast) and collapse whitespace BEFORE capping to the
+    // shared MAX_STEER_MESSAGE_LEN, so a pathological message cannot bloat the directive or
+    // the fix-pass prompt regardless of which writer set it. C3: an empty/blank message
+    // (after sanitize) is REJECTED with an error — matching Python's `clean_text` McpError —
+    // rather than silently succeeding as a no-op.
+    let sanitized = mini_coder::sanitize_steer_message(&message);
+    if sanitized.is_empty() {
+        return Err("Steer message is required.".into());
+    }
+    let trimmed: String = sanitized
+        .chars()
+        .take(mini_coder::MAX_STEER_MESSAGE_LEN)
+        .collect();
+
+    // 1) Append the correction (or flag the stop) under the state lock.
+    let outcome = agents::mutate_agent_live_state(&app, |st| {
+        let res = mark_steer_requested(st, &agent_id, &trimmed);
+        cap_pass(st);
+        res
+    })
+    .unwrap_or(SteerOutcome::NoOp);
+
+    // 2) On a STOP steer, drive the live PTY to EOF OUTSIDE the lock — identical to
+    //    `mini_coder_kill` (the executor's EOF-finalize then synthesizes aborted_by_human).
+    let result = match outcome {
+        SteerOutcome::Stopped { live_agent_id } => {
+            if let Some(live_id) = live_agent_id {
+                crate::backend::agent_pty::kill_agent_pty(&app, &live_id);
+            }
+            serde_json::json!({ "status": "stopped" })
+        }
+        SteerOutcome::Queued { queued, .. } => {
+            serde_json::json!({ "status": "queued", "queued": queued })
+        }
+        SteerOutcome::QueueFull { queued } => {
+            serde_json::json!({ "status": "queue_full", "queued": queued })
+        }
+        SteerOutcome::NoOp => serde_json::json!({ "status": "noop" }),
+    };
+    Ok(result)
+}
+
 /// TEST-ONLY headless one-shot: a trivial shell that writes a fixed `done` result
 /// JSON (`{"status":"done","output":"<task>"}`) to `result_target` then exits.
 /// Kept so the `#[ignore]` integration test still exercises spawn -> one-shot ->
@@ -4601,6 +4907,7 @@ mod tests {
             write_mode: mini_coder::WriteMode::EmitEdits,
             allow_oracle: false,
             kill_requested: false,
+            steer_queue: Vec::new(),
             result_path: format!("{id}.json"),
             agent_id: None,
             created_at: "2026-06-06T00:00:00Z".into(),
@@ -5977,6 +6284,154 @@ mod tests {
         assert!(state.mini_coder_directives[1].kill_requested);
     }
 
+    #[test]
+    fn mark_steer_requested_appends_to_live_attempt_and_caps_queue() {
+        // ASYNC STEERING (a): a non-stop steer APPENDS to the live attempt's steer_queue
+        // (the SAME channel as kill, queued) and reports the new length. The mini is not
+        // killed; the executor folds the queue at the next round boundary.
+        let mut state = empty_state();
+        let mut d = directive("d1", "coder-1");
+        d.status = MiniCoderStatus::Running;
+        d.agent_id = Some("mini-c-d1".into());
+        state.mini_coder_directives.push(d);
+
+        match mark_steer_requested(&mut state, "mini-c-d1", "use a HashMap not a Vec") {
+            SteerOutcome::Queued { live_agent_id, queued } => {
+                assert_eq!(live_agent_id.as_deref(), Some("mini-c-d1"));
+                assert_eq!(queued, 1);
+            }
+            other => panic!("expected Queued, got {other:?}"),
+        }
+        assert_eq!(state.mini_coder_directives[0].steer_queue, vec!["use a HashMap not a Vec"]);
+        assert!(
+            !state.mini_coder_directives[0].kill_requested,
+            "a non-stop steer must NOT kill the mini"
+        );
+
+        // FIFO + cap: fill to MAX, then a further append is REFUSED (QueueFull, not dropped).
+        while state.mini_coder_directives[0].steer_queue.len() < mini_coder::MAX_STEER_QUEUE_LEN {
+            mark_steer_requested(&mut state, "mini-c-d1", "more");
+        }
+        let full_len = state.mini_coder_directives[0].steer_queue.len();
+        assert_eq!(full_len, mini_coder::MAX_STEER_QUEUE_LEN);
+        match mark_steer_requested(&mut state, "mini-c-d1", "over the cap") {
+            SteerOutcome::QueueFull { queued } => assert_eq!(queued, mini_coder::MAX_STEER_QUEUE_LEN),
+            other => panic!("expected QueueFull, got {other:?}"),
+        }
+        assert_eq!(
+            state.mini_coder_directives[0].steer_queue.len(),
+            mini_coder::MAX_STEER_QUEUE_LEN,
+            "a full queue refuses the new message (never drops an existing one)"
+        );
+
+        // Per-message length cap is enforced.
+        let mut state2 = empty_state();
+        let mut d2 = directive("d2", "coder-1");
+        d2.status = MiniCoderStatus::Running;
+        d2.agent_id = Some("mini-c-d2".into());
+        state2.mini_coder_directives.push(d2);
+        let long = "x".repeat(mini_coder::MAX_STEER_MESSAGE_LEN + 500);
+        mark_steer_requested(&mut state2, "mini-c-d2", &long);
+        assert_eq!(
+            state2.mini_coder_directives[0].steer_queue[0].chars().count(),
+            mini_coder::MAX_STEER_MESSAGE_LEN
+        );
+    }
+
+    #[test]
+    fn mark_steer_requested_stop_sentinel_reuses_kill_path() {
+        // ASYNC STEERING (a): a `stop` steer REUSES the kill path — flags kill_requested
+        // across the chain and returns the live PTY to kill (like mark_kill_requested),
+        // queueing NOTHING.
+        let mut state = empty_state();
+        let mut d = directive("d1", "coder-1");
+        d.status = MiniCoderStatus::Running;
+        d.agent_id = Some("mini-c-d1".into());
+        state.mini_coder_directives.push(d);
+
+        match mark_steer_requested(&mut state, "mini-c-d1", "  STOP  ") {
+            SteerOutcome::Stopped { live_agent_id } => {
+                assert_eq!(live_agent_id.as_deref(), Some("mini-c-d1"))
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+        assert!(state.mini_coder_directives[0].kill_requested);
+        assert!(
+            state.mini_coder_directives[0].steer_queue.is_empty(),
+            "stop must not queue a prose message"
+        );
+    }
+
+    #[test]
+    fn mark_steer_requested_noop_on_unknown_terminal_or_blank() {
+        let mut state = empty_state();
+        let mut running = directive("d1", "coder-1");
+        running.status = MiniCoderStatus::Running;
+        running.agent_id = Some("mini-c-d1".into());
+        state.mini_coder_directives.push(running);
+        let mut done = directive("d2", "coder-1");
+        done.status = MiniCoderStatus::Done; // terminal
+        done.agent_id = Some("mini-c-d2".into());
+        state.mini_coder_directives.push(done);
+
+        // Unknown (non-mini) id.
+        assert_eq!(mark_steer_requested(&mut state, "mini-c-nope", "hi"), SteerOutcome::NoOp);
+        // Already-terminal mini.
+        assert_eq!(mark_steer_requested(&mut state, "mini-c-d2", "hi"), SteerOutcome::NoOp);
+        assert!(state.mini_coder_directives[1].steer_queue.is_empty());
+        // Blank message on a live mini.
+        assert_eq!(mark_steer_requested(&mut state, "mini-c-d1", "   "), SteerOutcome::NoOp);
+        assert!(state.mini_coder_directives[0].steer_queue.is_empty());
+    }
+
+    #[test]
+    fn mark_steer_requested_lands_on_pending_retry_not_dead_predecessor() {
+        // C1 (silent lost steer on the live path): the RETRY-HANDOFF window. The
+        // predecessor `D` is `AwaitingRetry` and still carries the (now stale) agent_id; the
+        // freshly-minted retry `R` is `Pending` with NO agent_id yet (plan_tick has not
+        // claimed it). A steer keyed by the predecessor's agent_id must target `R` (the
+        // attempt that WILL run and drain the queue), NOT the dead predecessor `D` whose
+        // queue would never be consumed — otherwise the steer is SILENTLY LOST.
+        let mut state = empty_state();
+        let mut pred = directive("root", "coder-1");
+        pred.status = MiniCoderStatus::AwaitingRetry;
+        pred.agent_id = Some("mini-c-root".into()); // stale id from D's finished run
+        pred.retry_directive_id = Some("root-r1".into());
+        let mut retry = directive("root-r1", "coder-1");
+        retry.status = MiniCoderStatus::Pending; // NOT active, NOT terminal
+        retry.attempt = 1;
+        retry.parent_directive_id = Some("root".into());
+        retry.agent_id = None; // no PTY yet
+        state.mini_coder_directives.push(pred);
+        state.mini_coder_directives.push(retry);
+
+        match mark_steer_requested(&mut state, "mini-c-root", "prefer iterators over loops") {
+            SteerOutcome::Queued { live_agent_id, queued } => {
+                // R has no PTY yet — the queued path carries None (only the stop path needs it).
+                assert_eq!(live_agent_id, None);
+                assert_eq!(queued, 1);
+            }
+            other => panic!("expected Queued on the pending retry, got {other:?}"),
+        }
+        let by_id = |st: &crate::backend::model::AgentLiveState, id: &str| {
+            st.mini_coder_directives
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap()
+                .steer_queue
+                .clone()
+        };
+        assert_eq!(
+            by_id(&state, "root-r1"),
+            vec!["prefer iterators over loops"],
+            "steer must land on the Pending retry's queue (it will run)"
+        );
+        assert!(
+            by_id(&state, "root").is_empty(),
+            "steer must NOT land on the dead AwaitingRetry predecessor (it never re-runs)"
+        );
+    }
+
     // -- P6: propagation + kill-chain + retry-lost ---------------------------
 
     /// Build a chain: root (AwaitingRetry) -> r1 (AwaitingRetry) -> r2 (Running leaf).
@@ -6310,6 +6765,95 @@ mod tests {
     }
 
     #[test]
+    fn live_kill_override_honors_stop_sentinel_in_steer_queue() {
+        // ASYNC STEERING (a): a STOP sentinel that reached the live steer_queue out-of-band
+        // (no kill_requested set) is still an abort at the round boundary — the SAME
+        // external-signal channel generalized from the bool.
+        let mut state = empty_state();
+        let mut d = directive("d1", "coder-1");
+        d.status = MiniCoderStatus::Running;
+        d.kill_requested = false;
+        d.steer_queue = vec!["stop".into()];
+        state.mini_coder_directives.push(d);
+        let done = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            ..Default::default()
+        });
+        let overridden = live_kill_override(&state, "d1", done);
+        assert_eq!(overridden.status, MiniCoderStatus::AbortedByHuman);
+
+        // A NON-stop steer message is NOT an abort (it is a queued correction, not a stop).
+        state.mini_coder_directives[0].steer_queue = vec!["use a HashMap".into()];
+        let done2 = MiniCoderOutcome::done(MiniCoderResult {
+            status: "done".into(),
+            ..Default::default()
+        });
+        let kept = live_kill_override(&state, "d1", done2);
+        assert_eq!(kept.status, MiniCoderStatus::Done);
+    }
+
+    #[test]
+    fn awaiting_retry_kill_window_aborts_chain_and_spawns_no_retry() {
+        // P1 (KILL-WINDOW GAP): a Stop that lands in the AwaitingRetryWith window must WIN —
+        // no retry spawned, the predecessor stamped aborted_by_human, the chain root
+        // unblocked. The gate decided AwaitingRetry off-lock (the verdict was a dirty Done),
+        // but `kill_requested` was set BEFORE the locked apply. We reproduce the apply-time
+        // state: the predecessor `D` is still Running (apply has not transitioned it yet) and
+        // freshly flagged; the retry `R` the gate built has NOT been pushed yet. The guard
+        // must report the abort, and the abort path (stamp_terminal_and_propagate) must leave
+        // the chain terminal with NO retry directive appended.
+        let mut state = empty_state();
+        let mut pred = directive("root", "coder-1");
+        pred.status = MiniCoderStatus::Running;
+        pred.agent_id = Some("mini-c-root".into());
+        pred.kill_requested = true; // human hit Stop inside the window
+        state.mini_coder_directives.push(pred);
+
+        // The guard fires (kill wins over the retry decision).
+        assert!(
+            awaiting_retry_kill_wins(&state, "root"),
+            "a flagged predecessor must abort the retry decision"
+        );
+
+        // The abort path the branch runs when the guard fires.
+        let aborted = MiniCoderOutcome::aborted("stopped by human (Stop button)");
+        let ao = aborted.clone();
+        stamp_terminal_and_propagate(&mut state, "root", &aborted, Some("mini-c-root"), |d| {
+            mini_coder::apply_result(d, ao.clone())
+        });
+
+        // Predecessor is terminal aborted_by_human; NO retry directive exists.
+        let root = state
+            .mini_coder_directives
+            .iter()
+            .find(|d| d.id == "root")
+            .unwrap();
+        assert_eq!(root.status, MiniCoderStatus::AbortedByHuman);
+        assert!(
+            !state
+                .mini_coder_directives
+                .iter()
+                .any(|d| d.parent_directive_id.as_deref() == Some("root")),
+            "no retry must be spawned when the human's Stop wins the window"
+        );
+        assert_eq!(
+            state.mini_coder_directives.len(),
+            1,
+            "only the aborted predecessor remains — the retry was never appended"
+        );
+
+        // Contrast: WITHOUT the kill flag the guard does NOT fire (the retry proceeds).
+        let mut state2 = empty_state();
+        let mut pred2 = directive("root", "coder-1");
+        pred2.status = MiniCoderStatus::Running;
+        state2.mini_coder_directives.push(pred2);
+        assert!(
+            !awaiting_retry_kill_wins(&state2, "root"),
+            "an unflagged predecessor proceeds to the normal retry path"
+        );
+    }
+
+    #[test]
     fn plan_result_file_sweep_keeps_live_drops_terminal_and_unknown() {
         // WARNING 5: the pure sweep plan keeps ONLY a live (non-terminal) directive's
         // result file in its scratch dir; a terminal directive's file is NOT kept (it
@@ -6472,6 +7016,7 @@ mod tests {
             write_mode: mini_coder::WriteMode::EmitEdits,
             allow_oracle,
             kill_requested: false,
+            steer_queue: Vec::new(),
             result_path: "d1.json".into(),
             agent_id: None,
             created_at: "2026-06-06T00:00:00Z".into(),
