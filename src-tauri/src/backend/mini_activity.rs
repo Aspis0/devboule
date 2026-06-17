@@ -537,11 +537,102 @@ pub fn set_current_round_verdict(activity: &mut ConsoleActivity, verdict: Verdic
     }
 }
 
+/// Hard cap on the number of `DiffLine`s emitted per write action. A 5000-line generated
+/// file must not flood the Console; everything beyond this limit is replaced by a single
+/// truncation marker so the frontend renders a bounded card.
+const DIFF_LINE_CAP: usize = 200;
+
+/// Build a `Vec<DiffLine>` representing the unified diff of `old` → `new` for `path`.
+///
+/// Algorithm (no LCS crate in tree — simple, correct for the single-replacement case the
+/// mini-coder produces):
+///   1. Split both sides into lines (preserving content without trailing newline).
+///   2. Trim common prefix lines (Ctx) and common suffix lines (Ctx), isolating the changed
+///      middle.
+///   3. Emit: a Meta "@@ path @@" header, prefix Ctx lines (up to CONTEXT), Del lines (old
+///      middle), Add lines (new middle), suffix Ctx lines (up to CONTEXT).
+///   4. Cap at [`DIFF_LINE_CAP`] total lines; append a truncation marker if exceeded.
+///
+/// A pure create (empty `old`) yields all-Add lines. A pure delete (empty `new`) yields
+/// all-Del lines. Identical content yields an empty vec (no diff to show).
+pub fn build_file_diff(path: &str, old: &str, new: &str) -> Vec<DiffLine> {
+    // Number of unchanged context lines shown above/below the changed hunk.
+    const CONTEXT: usize = 3;
+
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Identical content → no diff.
+    if old_lines == new_lines {
+        return Vec::new();
+    }
+
+    // Trim common prefix.
+    let prefix_len = old_lines
+        .iter()
+        .zip(new_lines.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Trim common suffix (never overlaps the prefix).
+    let old_tail = &old_lines[prefix_len..];
+    let new_tail = &new_lines[prefix_len..];
+    let suffix_len = old_tail
+        .iter()
+        .rev()
+        .zip(new_tail.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let old_mid = &old_tail[..old_tail.len() - suffix_len];
+    let new_mid = &new_tail[..new_tail.len() - suffix_len];
+
+    // Context slice helpers (bounded).
+    let ctx_before_start = prefix_len.saturating_sub(CONTEXT);
+    let ctx_before = &old_lines[ctx_before_start..prefix_len];
+
+    let suffix_start = old_lines.len() - suffix_len;
+    let ctx_after_end = (suffix_start + CONTEXT).min(old_lines.len());
+    let ctx_after = &old_lines[suffix_start..ctx_after_end];
+
+    // Assemble the raw diff lines before capping.
+    let mut out: Vec<DiffLine> = Vec::new();
+
+    // Meta header — "@@ path @@" so the view labels each hunk.
+    out.push(DiffLine {
+        t: DiffLineKind::Meta,
+        s: format!("@@ {path} @@"),
+    });
+
+    for line in ctx_before {
+        out.push(DiffLine { t: DiffLineKind::Ctx, s: line.to_string() });
+    }
+    for line in old_mid {
+        out.push(DiffLine { t: DiffLineKind::Del, s: line.to_string() });
+    }
+    for line in new_mid {
+        out.push(DiffLine { t: DiffLineKind::Add, s: line.to_string() });
+    }
+    for line in ctx_after {
+        out.push(DiffLine { t: DiffLineKind::Ctx, s: line.to_string() });
+    }
+
+    // Cap: if we exceed DIFF_LINE_CAP, truncate and append the marker.
+    if out.len() > DIFF_LINE_CAP {
+        out.truncate(DIFF_LINE_CAP);
+        out.push(DiffLine {
+            t: DiffLineKind::Meta,
+            s: "[… diff truncated]".to_string(),
+        });
+    }
+
+    out
+}
+
 /// Append a `write` action (the applied-edit row) to the CURRENT (last) round of the live
-/// mini run. kind=write, verb="Write", emit="emit-edits", target=path, ok=true. No diff hunk
-/// in this first cut — the contract allows detail-free action rows; a real unified-diff is a
-/// follow-up (the executor knows old/new edit bodies and could populate `diff` later).
-pub fn push_write_action(activity: &mut ConsoleActivity, path: &str) {
+/// mini run. kind=write, verb="Write", emit="emit-edits", target=path, ok=true, diff=the
+/// real unified diff of the edit (empty when no diff is available, e.g. for non-write paths).
+pub fn push_write_action(activity: &mut ConsoleActivity, path: &str, diff: Vec<DiffLine>) {
     if let Some(mini) = live_mini_mut(activity) {
         if let Some(round) = mini.rounds.last_mut() {
             round.actions.push(Action {
@@ -551,7 +642,7 @@ pub fn push_write_action(activity: &mut ConsoleActivity, path: &str) {
                 target: Some(path.to_string()),
                 ok: Some(true),
                 status: None,
-                diff: Vec::new(),
+                diff,
                 output: None,
             });
         }
@@ -1094,7 +1185,7 @@ mod tests {
             &["auth.rs".to_string()],
             1,
         );
-        push_write_action(&mut activity, "auth.rs");
+        push_write_action(&mut activity, "auth.rs", vec![]);
         let verdict = verdict_from_findings(
             &[esc("medium", "auth.rs", Some(42), "unchecked unwrap")],
             1,
@@ -1302,7 +1393,7 @@ mod tests {
         // and the predecessor's AwaitingRetry finalize already opened round 2 via append_round.
         // The retry relaunch must RESUME this shared console, not wipe round 1.
         let mut a = build_initial("mini · sonnet-4", "edit auth.rs", &["auth.rs".to_string()], 1);
-        push_write_action(&mut a, "auth.rs");
+        push_write_action(&mut a, "auth.rs", vec![]);
         set_current_round_verdict(
             &mut a,
             verdict_from_findings(&[esc("high", "auth.rs", Some(7), "unchecked unwrap")], 1),
@@ -1853,5 +1944,110 @@ mod tests {
         // A fresh ActivityTailRegistry with no tails: stop_all is a no-op (no panic).
         let empty = ActivityTailRegistry::default();
         empty.stop_all();
+    }
+
+    // ---- build_file_diff tests -----------------------------------------------
+
+    #[test]
+    fn diff_single_changed_line_produces_del_then_add() {
+        let old = "hello\nworld\nfoo\n";
+        let new = "hello\nWORLD\nfoo\n";
+        let diff = build_file_diff("src/a.rs", old, new);
+        // Should have: Meta header, Ctx "hello" (prefix context), Del "world", Add "WORLD",
+        // Ctx "foo" (suffix context).
+        let meta = diff.iter().find(|d| d.t == DiffLineKind::Meta).unwrap();
+        assert!(meta.s.contains("src/a.rs"), "meta header must include the path");
+        let del = diff.iter().find(|d| d.t == DiffLineKind::Del).unwrap();
+        assert_eq!(del.s, "world");
+        let add = diff.iter().find(|d| d.t == DiffLineKind::Add).unwrap();
+        assert_eq!(add.s, "WORLD");
+        // Exactly one Del and one Add.
+        let del_count = diff.iter().filter(|d| d.t == DiffLineKind::Del).count();
+        let add_count = diff.iter().filter(|d| d.t == DiffLineKind::Add).count();
+        assert_eq!(del_count, 1);
+        assert_eq!(add_count, 1);
+    }
+
+    #[test]
+    fn diff_pure_create_yields_all_add() {
+        let old = "";
+        let new = "line1\nline2\nline3\n";
+        let diff = build_file_diff("new_file.rs", old, new);
+        // Every non-Meta line must be Add.
+        let non_meta: Vec<_> = diff.iter().filter(|d| d.t != DiffLineKind::Meta).collect();
+        assert!(!non_meta.is_empty(), "pure create must emit lines");
+        for line in &non_meta {
+            assert_eq!(line.t, DiffLineKind::Add, "pure create lines must all be Add");
+        }
+        // No Del lines.
+        assert!(
+            diff.iter().all(|d| d.t != DiffLineKind::Del),
+            "pure create must have no Del lines"
+        );
+    }
+
+    #[test]
+    fn diff_pure_delete_yields_all_del() {
+        let old = "line1\nline2\n";
+        let new = "";
+        let diff = build_file_diff("old.rs", old, new);
+        let non_meta: Vec<_> = diff.iter().filter(|d| d.t != DiffLineKind::Meta).collect();
+        assert!(!non_meta.is_empty(), "pure delete must emit lines");
+        for line in &non_meta {
+            assert_eq!(line.t, DiffLineKind::Del, "pure delete lines must all be Del");
+        }
+        assert!(
+            diff.iter().all(|d| d.t != DiffLineKind::Add),
+            "pure delete must have no Add lines"
+        );
+    }
+
+    #[test]
+    fn diff_identical_content_yields_empty() {
+        let content = "alpha\nbeta\ngamma\n";
+        let diff = build_file_diff("same.rs", content, content);
+        assert!(diff.is_empty(), "identical old and new must produce an empty diff");
+    }
+
+    #[test]
+    fn diff_large_file_is_capped_with_truncation_marker() {
+        // Build a file with 500 lines; change one line in the middle so the diff
+        // would emit far more than DIFF_LINE_CAP lines (Del + Add alone is 2, but the
+        // unchanged prefix/suffix forces many Ctx lines, and the total could exceed 200).
+        // For a more direct test, make old/new differ on EVERY line so we get 500 Del +
+        // 500 Add = 1000+ raw lines.
+        let old: String = (0..300).map(|i| format!("old line {i}\n")).collect();
+        let new: String = (0..300).map(|i| format!("new line {i}\n")).collect();
+        let diff = build_file_diff("big.rs", &old, &new);
+        assert!(
+            diff.len() <= DIFF_LINE_CAP + 1,
+            "capped diff must not exceed DIFF_LINE_CAP + 1 (truncation marker): got {}",
+            diff.len()
+        );
+        let last = diff.last().expect("must have at least the marker");
+        assert_eq!(last.t, DiffLineKind::Meta, "truncation marker must be Meta kind");
+        assert!(
+            last.s.contains("truncated"),
+            "truncation marker text must mention 'truncated': {:?}",
+            last.s
+        );
+    }
+
+    #[test]
+    fn push_write_action_carries_diff_through_to_action() {
+        let mut activity = build_initial("mini", "edit x.rs", &["x.rs".to_string()], 1);
+        let diffs = vec![
+            DiffLine { t: DiffLineKind::Meta, s: "@@ x.rs @@".to_string() },
+            DiffLine { t: DiffLineKind::Del, s: "old".to_string() },
+            DiffLine { t: DiffLineKind::Add, s: "new".to_string() },
+        ];
+        push_write_action(&mut activity, "x.rs", diffs.clone());
+        let mini = match &activity.entries.as_ref().unwrap()[0] {
+            ConsoleEntry::Spawn { mini, .. } => mini,
+            _ => panic!("expected spawn entry"),
+        };
+        let action = &mini.rounds[0].actions[0];
+        assert_eq!(action.kind, ActionKind::Write);
+        assert_eq!(action.diff, diffs, "diff must be threaded through to the Action");
     }
 }

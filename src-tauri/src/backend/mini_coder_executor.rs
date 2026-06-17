@@ -1244,7 +1244,8 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         .as_deref()
         .filter(|p| !p.trim().is_empty())
         .and_then(|p| Path::new(p).parent().map(|r| r.to_path_buf()));
-    let outcome = apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
+    let (outcome, write_diffs) =
+        apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
 
     // The gate (linters) is needed ONLY for a clean, un-killed `done` on a TRUSTED tree.
     let needs_gate =
@@ -1257,7 +1258,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         // lock or a racing pass) do NOTHING: the existing thread will finalize it.
         if let Some(state) = app.try_state::<MiniCoderState>() {
             if state.claim_verdict(&directive.id) {
-                spawn_verdict_thread(app.clone(), directive.clone(), project_id, outcome);
+                spawn_verdict_thread(app.clone(), directive.clone(), project_id, outcome, write_diffs);
                 return;
             }
             // Could not claim (already in flight) — leave it to the running thread.
@@ -1271,13 +1272,13 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         let stop = AtomicBool::new(true);
         finalize_finished_mini_with(app, directive, outcome, trusted, |root, files| {
             real_censor_verdict(app, pid.as_deref(), root, files, &stop)
-        });
+        }, write_diffs);
         return;
     }
 
     // INLINE (no linters): untrusted / non-done / killed / no-project. The gate is a
     // no-op here (high_findings stays empty), so the verdict closure is never called.
-    finalize_finished_mini_with(app, directive, outcome, trusted, |_root, _files| Vec::new());
+    finalize_finished_mini_with(app, directive, outcome, trusted, |_root, _files| Vec::new(), write_diffs);
 }
 
 /// WARNING 3 (PURE): derive `(project_id, trusted)` from ONE agent-state snapshot. The
@@ -1326,12 +1327,14 @@ fn spawn_verdict_thread(
     directive: MiniCoderDirective,
     project_id: Option<String>,
     outcome: MiniCoderOutcome,
+    write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)>,
 ) {
     // Clones retained for the spawn-failure fallback path (the closure MOVES the originals).
     let fb_app = app.clone();
     let fb_directive = directive.clone();
     let fb_project_id = project_id.clone();
     let fb_outcome = outcome.clone();
+    let fb_write_diffs = write_diffs.clone();
 
     // BLOCKER 2 (RAII) + WARNING 6: resolve the in-flight-set handle AND the executor's
     // real stop flag from the managed state ONCE, before the spawn. The guard releases the
@@ -1351,6 +1354,8 @@ fn spawn_verdict_thread(
             let id = directive.id.clone();
             let pid = project_id.clone();
             let stop = stop_for_thread;
+            // Clone once for the fail-closed closure; the main closure consumes the original.
+            let fc_diffs = write_diffs.clone();
             run_verdict_thread_body(
                 inflight,
                 id,
@@ -1359,7 +1364,7 @@ fn spawn_verdict_thread(
                 || {
                     finalize_finished_mini_with(&app, &directive, outcome.clone(), true, |root, files| {
                         real_censor_verdict(&app, pid.as_deref(), root, files, &stop)
-                    });
+                    }, write_diffs);
                 },
                 // FAIL-CLOSED: a panic in the verdict/apply must not block the mini's
                 // success. Re-finalize as the clean `done` with NO findings (trusted=true
@@ -1368,7 +1373,7 @@ fn spawn_verdict_thread(
                 || {
                     finalize_finished_mini_with(&app, &directive, outcome.clone(), true, |_r, _f| {
                         Vec::new()
-                    });
+                    }, fc_diffs);
                 },
             );
         });
@@ -1381,7 +1386,7 @@ fn spawn_verdict_thread(
         }
         finalize_finished_mini_with(&fb_app, &fb_directive, fb_outcome, true, |root, files| {
             real_censor_verdict(&fb_app, fb_project_id.as_deref(), root, files, &stop)
-        });
+        }, fb_write_diffs);
     }
 }
 
@@ -1627,6 +1632,7 @@ fn finalize_finished_mini_with(
     outcome: MiniCoderOutcome,
     trusted: bool,
     verdict_fn: impl Fn(&Path, &[String]) -> Vec<mini_coder::EscalationFinding>,
+    write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)>,
 ) {
     // 1) VERDICT GATE — only on a clean self-reported `done` that the human did NOT kill,
     //    on a TRUSTED tree (resolved by the caller). For everything else we skip straight
@@ -1907,6 +1913,7 @@ fn finalize_finished_mini_with(
                 &console_findings,
                 directive.attempt,
                 directive.write,
+                &write_diffs,
             );
         }
     }
@@ -1943,6 +1950,9 @@ fn console_finalize(
     // FIX 5: whether the finalized directive was a WRITE directive — gates the done banner's
     // "edits applied" clause (a non-write run never applied edits, even if it touched files).
     is_write: bool,
+    // Per-file `(path, diff_lines)` computed from the pre/post content captured during apply.
+    // Empty for non-write paths and failed applies; the order mirrors `files_touched`.
+    write_diffs: &[(String, Vec<super::mini_activity::DiffLine>)],
 ) {
     use super::mini_activity as console;
 
@@ -1951,6 +1961,16 @@ fn console_finalize(
     };
     let round_number = attempt.saturating_add(1);
     let file_count = files_touched.len();
+
+    // Build a lookup from path → diff lines so we can hand each file's diff to
+    // `push_write_action`. Uses a simple linear scan (at most a handful of files per mini).
+    let diff_for = |path: &str| -> Vec<console::DiffLine> {
+        write_diffs
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default()
+    };
 
     match decision {
         mini_coder::GateDecision::AwaitingRetryWith { .. } => {
@@ -1963,7 +1983,7 @@ fn console_finalize(
             if applied_outcome.map(|o| o.status) == Some(MiniCoderStatus::AbortedByHuman) {
                 store.update(app, agent_id, |a| {
                     for path in files_touched {
-                        console::push_write_action(a, path);
+                        console::push_write_action(a, path, diff_for(path));
                     }
                     // The human cut it short: no Censor verdict to show — just the stop.
                     console::set_terminal(
@@ -1981,7 +2001,7 @@ fn console_finalize(
             // the next. The applied write rows are the ground-truth files the mini changed.
             store.update(app, agent_id, |a| {
                 for path in files_touched {
-                    console::push_write_action(a, path);
+                    console::push_write_action(a, path, diff_for(path));
                 }
                 console::set_current_round_verdict(
                     a,
@@ -1999,7 +2019,7 @@ fn console_finalize(
                 .unwrap_or(MiniCoderStatus::Done);
             store.update(app, agent_id, |a| {
                 for path in files_touched {
-                    console::push_write_action(a, path);
+                    console::push_write_action(a, path, diff_for(path));
                 }
                 match status {
                     MiniCoderStatus::AbortedByHuman => {
@@ -2378,14 +2398,26 @@ const MAX_MINI_ALLOWLIST_FILES: usize = 10;
 /// caller can snapshot the pre-image (training rail). Residual TOCTOU between
 /// the passes is accepted: the threat model is the MODEL's output, not a
 /// concurrent local attacker.
+/// Return type of `apply_emitted_edits`: the ordered list of touched relative paths paired
+/// with the per-file (old_content, new_content) captured during PASS 1. The two `Vec`s are
+/// parallel — `applied[i]` is the path, `snapshots[i]` is its `(old, new)` content pair.
+/// `old_content` is `""` for a file created by this batch (empty `old_string` edit).
+#[derive(Debug)]
+struct ApplyResult {
+    /// Relative paths of the files that were actually written, in apply order.
+    applied: Vec<String>,
+    /// Per-file `(old_content, new_content)` parallel to `applied`.
+    snapshots: Vec<(String, String)>,
+}
+
 fn apply_emitted_edits(
     project_root: &Path,
     allowlist: &[String],
     edits: &[mini_coder::MiniEdit],
     mut pre_write: impl FnMut(&str),
-) -> Result<Vec<String>, String> {
+) -> Result<ApplyResult, String> {
     if edits.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ApplyResult { applied: Vec::new(), snapshots: Vec::new() });
     }
     if edits.len() > MAX_MINI_EDITS {
         return Err(format!(
@@ -2410,6 +2442,10 @@ fn apply_emitted_edits(
     // PASS 1 — validate in memory; nothing touches disk until every edit of
     // every file checks out.
     let mut contents: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    // Parallel map: old content captured at the moment a file is FIRST loaded (before any
+    // edits). Empty string for a CREATE (the file did not exist before this batch).
+    let mut old_contents: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     for (i, edit) in edits.iter().enumerate() {
@@ -2440,6 +2476,8 @@ fn apply_emitted_edits(
                 if !canon_parent.starts_with(&canon_root) {
                     return Err(format!("edit {i}: {rel} escapes the project root"));
                 }
+                // CREATE: old content is empty (file did not exist).
+                old_contents.insert(rel.clone(), String::new());
                 contents.insert(rel.clone(), edit.new_string.clone());
                 order.push(rel.clone());
                 continue;
@@ -2451,6 +2489,8 @@ fn apply_emitted_edits(
             }
             let text = std::fs::read_to_string(&canon_target)
                 .map_err(|e| format!("edit {i}: cannot read {rel}: {e}"))?;
+            // Capture the pre-edit content before any mutations.
+            old_contents.insert(rel.clone(), text.clone());
             contents.insert(rel.clone(), text);
             order.push(rel.clone());
         } else if edit.old_string.is_empty() {
@@ -2477,7 +2517,18 @@ fn apply_emitted_edits(
         std::fs::write(&abs, contents[rel].as_bytes())
             .map_err(|e| format!("write {rel}: {e}"))?;
     }
-    Ok(order)
+
+    // Build parallel (old, new) snapshot vec in the same order as `order`.
+    let snapshots: Vec<(String, String)> = order
+        .iter()
+        .map(|rel| {
+            let old = old_contents.remove(rel).unwrap_or_default();
+            let new = contents.remove(rel).unwrap_or_default();
+            (old, new)
+        })
+        .collect();
+
+    Ok(ApplyResult { applied: order, snapshots })
 }
 
 /// P4: consume a finished mini's emitted edits. Returns the outcome to stamp:
@@ -2492,11 +2543,17 @@ fn apply_emitted_edits(
 ///     `failed` carrying the per-edit error (atomicity means nothing was
 ///     written, so there is no half-applied tree to lint).
 /// Pre-images of every touched file land in the training blob store first.
+///
+/// Returns `(outcome, write_diffs)` where `write_diffs` is a per-file
+/// `(path, Vec<DiffLine>)` list for the Activity Console — one entry per applied file,
+/// in apply order. Empty on every non-apply path (no edits, non-write, failed apply).
 fn apply_write_directive_edits(
     project_root: Option<&Path>,
     directive: &MiniCoderDirective,
     mut outcome: MiniCoderOutcome,
-) -> MiniCoderOutcome {
+) -> (MiniCoderOutcome, Vec<(String, Vec<super::mini_activity::DiffLine>)>) {
+    use super::mini_activity::build_file_diff;
+
     if outcome.edits.is_empty() {
         // P4 (review F6): a write directive that emitted NO edits changed
         // NOTHING — zero the model-claimed files_touched, or the verdict gate
@@ -2504,15 +2561,18 @@ fn apply_write_directive_edits(
         if directive.write && outcome.status == MiniCoderStatus::Done {
             outcome.files_touched = Vec::new();
         }
-        return outcome;
+        return (outcome, Vec::new());
     }
     if !directive.write || outcome.status != MiniCoderStatus::Done {
         outcome.edits = Vec::new();
-        return outcome;
+        return (outcome, Vec::new());
     }
     let Some(root) = project_root else {
-        return MiniCoderOutcome::failed(
-            "write directive finished without a resolvable project root".to_string(),
+        return (
+            MiniCoderOutcome::failed(
+                "write directive finished without a resolvable project root".to_string(),
+            ),
+            Vec::new(),
         );
     };
     let edits = std::mem::take(&mut outcome.edits);
@@ -2526,14 +2586,23 @@ fn apply_write_directive_edits(
             preimages.push((rel.to_string(), hash));
         }
     }) {
-        Ok(applied) => {
+        Ok(ApplyResult { applied, snapshots }) => {
             crate::backend::training_export::record_write_preimages(
                 root, directive, &preimages,
             );
+            // Build per-file diffs from the captured (old, new) content pairs.
+            let write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)> = applied
+                .iter()
+                .zip(snapshots.iter())
+                .map(|(path, (old, new))| (path.clone(), build_file_diff(path, old, new)))
+                .collect();
             outcome.files_touched = applied;
-            outcome
+            (outcome, write_diffs)
         }
-        Err(e) => MiniCoderOutcome::failed(format!("emitted edits rejected: {e}")),
+        Err(e) => (
+            MiniCoderOutcome::failed(format!("emitted edits rejected: {e}")),
+            Vec::new(),
+        ),
     }
 }
 
@@ -5305,13 +5374,13 @@ mod tests {
             p4_edit("a.txt", "beta", "BETA"),
         ];
         let mut pre: Vec<String> = Vec::new();
-        let applied =
+        let result =
             apply_emitted_edits(&root, &allow, &edits, |rel| pre.push(rel.to_string()))
                 .expect("happy path applies");
         // Ground truth: first-touch order, deduped.
-        assert_eq!(applied, vec!["a.txt".to_string(), "new.txt".to_string()]);
+        assert_eq!(result.applied, vec!["a.txt".to_string(), "new.txt".to_string()]);
         // The pre-image hook fired once per touched file, in flush order.
-        assert_eq!(pre, applied);
+        assert_eq!(pre, result.applied);
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "ALPHA BETA\n"
@@ -5555,7 +5624,9 @@ mod tests {
         assert!(err.contains("duplicate create"), "wrong error: {err}");
         // Caps: empty edits is a no-op Ok; >40 edits and an oversized allowlist reject.
         assert_eq!(
-            apply_emitted_edits(&root, &["a.txt".to_string()], &[], |_| {}).unwrap(),
+            apply_emitted_edits(&root, &["a.txt".to_string()], &[], |_| {})
+                .unwrap()
+                .applied,
             Vec::<String>::new()
         );
         let many: Vec<_> = (0..41).map(|_| p4_edit("a.txt", "x", "y")).collect();
@@ -5592,7 +5663,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
         let d = p4_write_directive(&["a.txt"]);
         let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
-        let out = apply_write_directive_edits(Some(&root), &d, outcome);
+        let (out, _diffs) = apply_write_directive_edits(Some(&root), &d, outcome);
         assert_eq!(out.status, MiniCoderStatus::Done);
         // The mini CLAIMED lie.txt; ground truth is what was actually applied.
         assert_eq!(out.files_touched, vec!["a.txt".to_string()]);
@@ -5607,7 +5678,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
         let d = p4_write_directive(&["a.txt"]);
         let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "missing-anchor", "x")]);
-        let out = apply_write_directive_edits(Some(&root), &d, outcome);
+        let (out, _diffs) = apply_write_directive_edits(Some(&root), &d, outcome);
         assert_eq!(out.status, MiniCoderStatus::Failed);
         assert!(
             out.error.as_deref().unwrap_or("").contains("emitted edits rejected"),
@@ -5626,7 +5697,7 @@ mod tests {
         // p4_directive(false) has write=false and files [src/a.rs, src/b.rs].
         let d = p4_directive(false);
         let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
-        let out = apply_write_directive_edits(Some(&root), &d, outcome);
+        let (out, _diffs) = apply_write_directive_edits(Some(&root), &d, outcome);
         assert_eq!(out.status, MiniCoderStatus::Done);
         assert!(out.edits.is_empty(), "untrusted edits must be dropped");
         // The model's claim passes through untouched on the no-write path...
@@ -5640,7 +5711,7 @@ mod tests {
     fn write_apply_without_root_fails_closed() {
         let d = p4_write_directive(&["a.txt"]);
         let outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
-        let out = apply_write_directive_edits(None, &d, outcome);
+        let (out, _diffs) = apply_write_directive_edits(None, &d, outcome);
         assert_eq!(out.status, MiniCoderStatus::Failed);
         assert!(
             out.error
@@ -5702,23 +5773,23 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "one\n").unwrap();
         // Dotted allowlist, clean emitted path.
-        let applied = apply_emitted_edits(
+        let result = apply_emitted_edits(
             &root,
             &["./src/a.rs".to_string()],
             &[p4_edit("src/a.rs", "one", "two")],
             |_| {},
         )
         .expect("dotted allowlist must match clean path");
-        assert_eq!(applied, vec!["src/a.rs".to_string()]);
+        assert_eq!(result.applied, vec!["src/a.rs".to_string()]);
         // Clean allowlist, dotted+doubled emitted path.
-        let applied = apply_emitted_edits(
+        let result = apply_emitted_edits(
             &root,
             &["src/a.rs".to_string()],
             &[p4_edit("./src//a.rs", "two", "three")],
             |_| {},
         )
         .expect("dotted emitted path must match clean allowlist");
-        assert_eq!(applied, vec!["src/a.rs".to_string()]);
+        assert_eq!(result.applied, vec!["src/a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("src/a.rs")).unwrap(), "three\n");
         // An empty path is rejected outright.
         let err = apply_emitted_edits(
