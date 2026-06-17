@@ -104,6 +104,15 @@ tree-sitter-cpp = "0.23"
 tree-sitter-html = "0.23"
 tree-sitter-kotlin-ng = "1.1"
 
+# Aider-style fuzzy-match fallback for the mini-coder's edit application
+# (`apply_emitted_edits` in backend/mini_coder_executor.rs). `TextDiff::ratio()` is a
+# faithful Rust port of Python difflib's `SequenceMatcher.ratio()` — the SAME metric
+# Aider uses for its near-miss splice fallback — so the similarity tier matches that
+# well-trodden behavior rather than a hand-rolled Levenshtein ratio. Pure-Rust,
+# MIT/Apache-2.0, GPU-free. `default-features = false, features = ["text"]` keeps only
+# the line/char diff + ratio machinery (drops bytes/unicode/inline/serde/web-time).
+similar = { version = "2", default-features = false, features = ["text"] }
+
 # Windows-only WinRT/Win32 bindings. All `use windows::` call sites in src/ are
 # `#[cfg(windows)]`-gated, so target-gate the crate too: it is never fetched or
 # built on macOS/Linux.

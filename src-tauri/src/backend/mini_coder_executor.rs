@@ -2374,6 +2374,293 @@ const MAX_MINI_EDITS: usize = 40;
 /// P4: the plan's N<=10 cap on the ordered file-set allowlist of a write directive.
 const MAX_MINI_ALLOWLIST_FILES: usize = 10;
 
+/// Which tier of the apply cascade matched a non-CREATE edit. Recorded per applied
+/// edit so the training-snapshot path can see when (and how confidently) the fuzzy
+/// fallback "saved" an edit — signal for teaching the mini to emit cleaner anchors.
+///
+/// `Fuzzy` carries the winning window's similarity ratio (0..=1) so the flywheel can
+/// distinguish a borderline 0.92 save from a near-exact 0.99 one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MatchTier {
+    /// `old_string` occurred verbatim exactly once (the original contract).
+    Exact,
+    /// 0 exact matches, but exactly one span was whitespace-normalization-equal.
+    Whitespace,
+    /// Last resort: a line-aligned window whose difflib-style ratio cleared the bar.
+    Fuzzy(f32),
+}
+
+impl MatchTier {
+    /// Stable tag for diagnostics / training records. `fuzzy` carries the ratio
+    /// rounded to 2 decimals so the string is compact yet preserves the signal.
+    fn label(&self) -> String {
+        match self {
+            MatchTier::Exact => "exact".to_string(),
+            MatchTier::Whitespace => "whitespace".to_string(),
+            MatchTier::Fuzzy(ratio) => format!("fuzzy:{ratio:.2}"),
+        }
+    }
+}
+
+/// Minimum CHARACTER-level difflib ratio (similar::TextDiff::from_chars(...).ratio())
+/// for the Tier-3 fuzzy fallback to even be considered. 0.92 mirrors Aider's near-miss
+/// threshold — high enough that a window differing only in a few characters/whitespace
+/// passes (e.g. a 75-char block with one changed char scores ~0.99), low enough that a
+/// genuinely different block (different identifiers, reordered/rewritten lines) does
+/// not (a structurally-unrelated block scores well under 0.5).
+const FUZZY_MATCH_MIN_RATIO: f32 = 0.92;
+
+/// Required separation between the best and second-best fuzzy window ratios. Without
+/// it, two near-identical candidate blocks (e.g. two copies of the same helper that
+/// each drifted slightly) could both clear the bar and we'd splice an arbitrary one —
+/// silent corruption. Demanding a clear winner means "two plausible spots" => ERROR,
+/// honoring the conservative "error rather than mis-apply" bias.
+const FUZZY_MATCH_MIN_MARGIN: f32 = 0.05;
+
+/// How far above/below the `old_string` line-count the Tier-3 window size is allowed
+/// to flex. Whitespace/indent drift rarely changes the line COUNT, but a stray added
+/// or removed blank line can; +/-1 covers that without exploding the search space.
+const FUZZY_WINDOW_LINE_DELTA: usize = 1;
+
+/// Above this file size the Tier-3 fuzzy fallback is SKIPPED entirely (the exact and
+/// whitespace tiers still run). Tier 3 is O(windows x Myers-diff); on a large file with a
+/// large mismatched `old_string` that can pin the Tauri backend thread for seconds — a
+/// self-inflicted DoS. A large file needs a precise exact/whitespace anchor; we refuse to
+/// guess across it. 256 KiB comfortably covers normal source files.
+const FUZZY_MAX_FILE_BYTES: usize = 256 * 1024;
+
+/// Per-diff wall-clock cap for a single Tier-3 character diff. `similar`'s Myers
+/// implementation honors this deadline and approximates past it, so one pathological
+/// window cannot run unbounded. 250 ms is far above any normal-size diff (microseconds)
+/// yet bounds the worst case; the `.ratio()` metric is unchanged for normal inputs.
+const FUZZY_DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Byte offset of the start of each line in `text`, plus a trailing sentinel equal to
+/// `text.len()`. So line `k` (0-based) spans `starts[k]..starts[k+1]` INCLUDING its
+/// own `\n`, and there are `starts.len() - 1` lines — matching `text.split('\n')`
+/// semantics: a text ending in `\n` has a final EMPTY line (`"a\nbc\n"` -> offsets
+/// `[0, 2, 5, 5]`, three lines `"a\n"`, `"bc\n"`, `""`). That phantom empty line is
+/// harmless for the matchers (it normalizes to "" and scores ~0 against any non-empty
+/// `old`). An empty `text` yields `[0, 0]` (one empty line).
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts.push(text.len());
+    starts
+}
+
+/// Whitespace-normalize a block for Tier-2 comparison WITHOUT crossing line
+/// boundaries: per line, trim leading/trailing horizontal whitespace and collapse
+/// internal runs of horizontal whitespace (spaces/tabs) to a single space; lines are
+/// rejoined with `\n`. A single trailing `\n` (if any) is dropped FIRST, so a block
+/// that ends in a newline and one that does not normalize identically — the splice
+/// span (not this string) decides whether the trailing newline is consumed. This
+/// neutralizes tabs-vs-spaces, trailing spaces, and indent drift while PRESERVING line
+/// structure (a one-line block can never normalize-equal a two-line block). Only used
+/// to LOCATE the span — the splice uses the original bytes, never this normalized form.
+fn normalize_ws_block(block: &str) -> String {
+    block
+        .strip_suffix('\n')
+        .unwrap_or(block)
+        .split('\n')
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The line-count `old` spans and whether it carries a trailing `\n`. A trailing
+/// newline does NOT add an extra (empty) line: `"a\nb"` and `"a\nb\n"` both span 2
+/// lines; the flag drives whether the matched window's span consumes the last line's
+/// own `\n`. An empty `old` is never passed here (CREATE is handled earlier).
+fn old_block_shape(old: &str) -> (usize, bool) {
+    let ends_nl = old.ends_with('\n');
+    let body = old.strip_suffix('\n').unwrap_or(old);
+    (body.split('\n').count(), ends_nl)
+}
+
+/// ORIGINAL byte span in `text` for the `win`-line window starting at line `first`,
+/// given line-start offsets `starts` (sentinel-terminated, see [`line_start_offsets`]).
+/// When `consume_trailing_nl` the span includes the last line's own `\n`
+/// (`starts[first+win]`); otherwise it ends at that line's content (before its `\n`),
+/// mirroring how an exact `old` without a trailing newline would match a whole-line
+/// block yet leave the following `\n` in place. Caller guarantees `first+win <=
+/// line_count`.
+fn window_span(
+    starts: &[usize],
+    text: &str,
+    first: usize,
+    win: usize,
+    consume_trailing_nl: bool,
+) -> std::ops::Range<usize> {
+    let start = starts[first];
+    let raw_end = starts[first + win];
+    if consume_trailing_nl {
+        return start..raw_end;
+    }
+    // Trim exactly one trailing '\n' (the last line's terminator), if present.
+    let end = if raw_end > start && text.as_bytes()[raw_end - 1] == b'\n' {
+        raw_end - 1
+    } else {
+        raw_end
+    };
+    start..end
+}
+
+/// Tier 2: find the unique line-aligned span of `text` whose whitespace-normalized
+/// form equals the whitespace-normalized `old`. Returns the ORIGINAL byte span
+/// `start..end` (so the caller splices real bytes) only when EXACTLY ONE window
+/// matches; `None` for zero or (ambiguity guard) more than one. `old` is assumed
+/// non-empty (the CREATE branch is handled before any matching).
+fn find_whitespace_span(text: &str, old: &str) -> Option<std::ops::Range<usize>> {
+    let target = normalize_ws_block(old);
+    // A whitespace-only `old` normalizes to "" — and so does the phantom trailing empty
+    // line of a `\n`-terminated file. Without this guard Tier 2 would "match" that empty
+    // line and return an EMPTY span at EOF, turning the splice into an INSERT of
+    // `new_string` at end-of-file (silent corruption: the real target is left untouched).
+    // An all-whitespace anchor is never a valid locator, so decline and let Tier 3 (which
+    // also cannot confidently match) produce the correct "no confident match" error.
+    if target.is_empty() {
+        return None;
+    }
+    let (win, ends_nl) = old_block_shape(old);
+    let starts = line_start_offsets(text);
+    let line_count = starts.len() - 1;
+    if win == 0 || win > line_count {
+        return None;
+    }
+    let mut hit: Option<std::ops::Range<usize>> = None;
+    for first in 0..=(line_count - win) {
+        let span = window_span(&starts, text, first, win, ends_nl);
+        if normalize_ws_block(&text[span.clone()]) == target {
+            if hit.is_some() {
+                // A second normalized match => ambiguous => Tier 2 declines (the
+                // caller then tries Tier 3, which has its own ambiguity guard).
+                return None;
+            }
+            hit = Some(span);
+        }
+    }
+    hit
+}
+
+/// Half-open range overlap: `true` iff `a` and `b` share at least one byte. Two
+/// line-aligned windows that start on the SAME line but use different window sizes
+/// (`base-1`/`base`/`base+1`) overlap — they are the SAME physical region rescored, not
+/// competing match locations, so they must not feed the Tier-3 ambiguity margin.
+fn spans_overlap(a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// Tier 3 (last resort): slide line-aligned windows of `old`'s line-count +/-
+/// [`FUZZY_WINDOW_LINE_DELTA`] over `text`, scoring each with a difflib-style ratio
+/// (`similar::TextDiff` at CHARACTER granularity, so a few differing characters in a
+/// multi-line block still scores near 1.0; a line-granular ratio would top out at ~`1 -
+/// 1/lines` for a single changed line and never clear the 0.92 bar). Each diff is bounded
+/// by [`FUZZY_DIFF_TIMEOUT`], and the whole tier is SKIPPED for files larger than
+/// [`FUZZY_MAX_FILE_BYTES`] (DoS guard). Returns the winning ORIGINAL byte span ONLY when
+/// the best ratio is >= [`FUZZY_MATCH_MIN_RATIO`] AND it beats the best NON-OVERLAPPING
+/// runner-up by >= [`FUZZY_MATCH_MIN_MARGIN`]; otherwise `None` (below threshold OR
+/// ambiguous => the caller errors). The runner-up must be a DISJOINT region, not the same
+/// region rescored at an adjacent window size. Conservative by construction: "no
+/// confident, unambiguous winner" is always a refusal, never a guess.
+fn find_fuzzy_span(text: &str, old: &str) -> Option<(std::ops::Range<usize>, f32)> {
+    // DoS guard: never run the O(windows x Myers) fuzzy scan over a large file. Exact and
+    // whitespace tiers already ran; a large file needs a precise anchor, not a guess.
+    if text.len() > FUZZY_MAX_FILE_BYTES {
+        return None;
+    }
+    let starts = line_start_offsets(text);
+    let line_count = starts.len() - 1;
+    let (base, ends_nl) = old_block_shape(old);
+    if base == 0 || line_count == 0 {
+        return None;
+    }
+    // Candidate window sizes: base, then +/-1 (clamped to >=1 and <= line_count).
+    let lo = base.saturating_sub(FUZZY_WINDOW_LINE_DELTA).max(1);
+    let hi = (base + FUZZY_WINDOW_LINE_DELTA).min(line_count);
+    // Track best and second-best across ALL windows of ALL sizes. `second` only counts
+    // a ratio whose SPAN does NOT OVERLAP the current best's span: an overlapping window
+    // is the SAME physical region rescored at a different size (base / base+/-1 over the
+    // same start line), so letting it feed the margin would make a single genuine match
+    // defeat its own ambiguity guard. Only a disjoint region is a competing location.
+    let mut best: Option<(f32, std::ops::Range<usize>)> = None;
+    let mut second: Option<f32> = None;
+    for win in lo..=hi {
+        if win > line_count {
+            continue;
+        }
+        for first in 0..=(line_count - win) {
+            let span = window_span(&starts, text, first, win, ends_nl);
+            let ratio = similar::TextDiff::configure()
+                .timeout(FUZZY_DIFF_TIMEOUT)
+                .diff_chars(&text[span.clone()], old)
+                .ratio();
+            match best.as_ref() {
+                Some((best_ratio, best_span)) if *best_ratio >= ratio => {
+                    if !spans_overlap(&span, best_span) && second.map(|s| ratio > s).unwrap_or(true)
+                    {
+                        second = Some(ratio);
+                    }
+                }
+                _ => {
+                    // New best. Demote the old best to second-best only if it is a
+                    // NON-OVERLAPPING span (else it was the same region rescored — discard).
+                    if let Some((old_ratio, old_span)) = best.replace((ratio, span.clone())) {
+                        if !spans_overlap(&old_span, &span)
+                            && second.map(|s| old_ratio > s).unwrap_or(true)
+                        {
+                            second = Some(old_ratio);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (best_ratio, best_span) = best?;
+    if best_ratio < FUZZY_MATCH_MIN_RATIO {
+        return None;
+    }
+    // Unambiguity: a clear winner over the runner-up DISTINCT window.
+    if let Some(second_ratio) = second {
+        if best_ratio - second_ratio < FUZZY_MATCH_MIN_MARGIN {
+            return None;
+        }
+    }
+    Some((best_span, best_ratio))
+}
+
+/// The apply cascade for a NON-empty `old_string`: Exact -> Whitespace -> Fuzzy.
+/// Returns the ORIGINAL byte span to splice plus which tier won, or a structured
+/// `Err` (the `i`/`rel` context is added by the caller). The exact tier preserves the
+/// original exact-ONCE contract: >1 verbatim hits is an ambiguity ERROR that does NOT
+/// fall through to fuzzy. Find-then-splice: the caller does `replace_range(span, new)`
+/// on this span — never `replacen`, which would re-find literally and break Tiers 2/3.
+fn locate_edit_span(text: &str, old: &str) -> Result<(std::ops::Range<usize>, MatchTier), String> {
+    // Tier 1 — exact, verbatim, exactly once.
+    let exact = text.matches(old).count();
+    if exact == 1 {
+        let start = text.find(old).expect("count==1 implies find");
+        return Ok((start..start + old.len(), MatchTier::Exact));
+    }
+    if exact > 1 {
+        // Ambiguous exact match: refuse rather than fuzzy-guess which one.
+        return Err(format!("oldString matches {exact} times (need exactly 1)"));
+    }
+    // Tier 2 — whitespace-normalized, unambiguous.
+    if let Some(span) = find_whitespace_span(text, old) {
+        return Ok((span, MatchTier::Whitespace));
+    }
+    // Tier 3 — similarity ratio, confident + unambiguous.
+    if let Some((span, ratio)) = find_fuzzy_span(text, old) {
+        return Ok((span, MatchTier::Fuzzy(ratio)));
+    }
+    Err("oldString matches 0 times (no confident exact, whitespace, or fuzzy match)".to_string())
+}
+
 /// P4: validate and apply the mini's emitted edits inside `project_root`,
 /// bounded by the directive's ordered file-set allowlist. The model NEVER
 /// touches disk — this is the only writer, so every guard lives here:
@@ -2408,6 +2695,12 @@ struct ApplyResult {
     applied: Vec<String>,
     /// Per-file `(old_content, new_content)` parallel to `applied`.
     snapshots: Vec<(String, String)>,
+    /// Observability for the fuzzy fallback: one `(rel, tier_label)` per NON-CREATE
+    /// edit that matched, in edit order. `tier_label` is `exact` | `whitespace` |
+    /// `fuzzy:<ratio>` (see [`MatchTier::label`]). CREATE edits (empty `old_string`)
+    /// produce no entry — there is no anchor to match. The training-snapshot path
+    /// reads this to learn when (and how confidently) fuzzy "saved" an edit.
+    match_tiers: Vec<(String, String)>,
 }
 
 fn apply_emitted_edits(
@@ -2417,7 +2710,11 @@ fn apply_emitted_edits(
     mut pre_write: impl FnMut(&str),
 ) -> Result<ApplyResult, String> {
     if edits.is_empty() {
-        return Ok(ApplyResult { applied: Vec::new(), snapshots: Vec::new() });
+        return Ok(ApplyResult {
+            applied: Vec::new(),
+            snapshots: Vec::new(),
+            match_tiers: Vec::new(),
+        });
     }
     if edits.len() > MAX_MINI_EDITS {
         return Err(format!(
@@ -2448,6 +2745,9 @@ fn apply_emitted_edits(
     let mut old_contents: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
+    // Per-edit match-tier record (NON-CREATE edits only), in edit order — observability
+    // for the fuzzy fallback (which tier saved the edit, at what ratio).
+    let mut match_tiers: Vec<(String, String)> = Vec::new();
     for (i, edit) in edits.iter().enumerate() {
         let rel = normalize_edit_rel(&edit.path);
         if rel.is_empty() {
@@ -2501,13 +2801,16 @@ fn apply_emitted_edits(
             ));
         }
         let text = contents.get_mut(&rel).expect("inserted above");
-        let n = text.matches(&edit.old_string).count();
-        if n != 1 {
-            return Err(format!(
-                "edit {i}: oldString matches {n} times in {rel} (need exactly 1)"
-            ));
-        }
-        *text = text.replacen(&edit.old_string, &edit.new_string, 1);
+        // Tiered match cascade (Exact -> Whitespace-normalized -> Similarity ratio).
+        // Conservative by construction: an ambiguous exact match, or no confident +
+        // unambiguous fuzzy/whitespace span, is an Err here — so PASS 2 never runs and
+        // NOTHING is written (atomicity preserved). Find-then-splice on the located
+        // ORIGINAL byte span via `replace_range` (NOT `replacen`, which would re-find
+        // the literal `old_string` and break the whitespace/fuzzy tiers).
+        let (span, tier) = locate_edit_span(text, &edit.old_string)
+            .map_err(|e| format!("edit {i}: {e} in {rel}"))?;
+        text.replace_range(span, &edit.new_string);
+        match_tiers.push((rel.clone(), tier.label()));
     }
 
     // PASS 2 — flush, one write per touched file, pre-image hook first.
@@ -2528,7 +2831,7 @@ fn apply_emitted_edits(
         })
         .collect();
 
-    Ok(ApplyResult { applied: order, snapshots })
+    Ok(ApplyResult { applied: order, snapshots, match_tiers })
 }
 
 /// P4: consume a finished mini's emitted edits. Returns the outcome to stamp:
@@ -2586,9 +2889,9 @@ fn apply_write_directive_edits(
             preimages.push((rel.to_string(), hash));
         }
     }) {
-        Ok(ApplyResult { applied, snapshots }) => {
+        Ok(ApplyResult { applied, snapshots, match_tiers }) => {
             crate::backend::training_export::record_write_preimages(
-                root, directive, &preimages,
+                root, directive, &preimages, &match_tiers,
             );
             // Build per-file diffs from the captured (old, new) content pairs.
             let write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)> = applied
@@ -5800,6 +6103,350 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("empty path"), "wrong error: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- Aider-style tiered fuzzy-match fallback ----------------------------
+
+    #[test]
+    fn fuzzy_exact_single_match_still_applies_via_exact_tier() {
+        // Regression: the verbatim, exactly-once case is unchanged and records `exact`.
+        let root = p4_temp_project("fz-exact");
+        std::fs::write(root.join("a.txt"), "let x = 1;\nlet y = 2;\n").unwrap();
+        let result = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", "let x = 1;", "let x = 42;")],
+            |_| {},
+        )
+        .expect("exact match applies");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "let x = 42;\nlet y = 2;\n"
+        );
+        assert_eq!(result.match_tiers, vec![("a.txt".to_string(), "exact".to_string())]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_exact_multi_match_still_errors_no_fuzzy_fallthrough() {
+        // An AMBIGUOUS exact match must NOT fall through to fuzzy — it errors, and
+        // the file is untouched (atomicity).
+        let root = p4_temp_project("fz-ambig-exact");
+        std::fs::write(root.join("a.txt"), "dup\ndup\n").unwrap();
+        let err = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", "dup", "X")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("matches 2 times"), "wrong error: {err}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "dup\ndup\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_whitespace_only_difference_applies_splicing_original_bytes() {
+        // The file uses a TAB indent + a trailing space; the emitted anchor uses
+        // 4-space indent and no trailing space. Whitespace-normalization matches them,
+        // and the splice replaces the ORIGINAL bytes (tab indent) with new_string.
+        let root = p4_temp_project("fz-ws");
+        std::fs::write(
+            root.join("a.rs"),
+            "fn f() {\n\tlet a = 1; \n\tlet b = 2;\n}\n",
+        )
+        .unwrap();
+        // Emitted old uses spaces + collapsed whitespace, no trailing space.
+        let old = "fn f() {\n    let a = 1;\n    let b = 2;\n}";
+        let result = apply_emitted_edits(
+            &root,
+            &["a.rs".to_string()],
+            &[p4_edit("a.rs", old, "fn f() {\n    let a = 100;\n    let b = 2;\n}")],
+            |_| {},
+        )
+        .expect("whitespace-normalized match applies");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "fn f() {\n    let a = 100;\n    let b = 2;\n}\n"
+        );
+        assert_eq!(
+            result.match_tiers,
+            vec![("a.rs".to_string(), "whitespace".to_string())]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_whitespace_ambiguous_declines_then_errors() {
+        // Two whitespace-identical spans => Tier 2 declines; Tier 3 also can't pick a
+        // clear winner (two identical ratios) => ERROR, nothing written.
+        let root = p4_temp_project("fz-ws-ambig");
+        // Both anchor lines whitespace-normalize to "foo bar" but NEITHER matches the
+        // emitted "foo  bar" (double space) verbatim — so Tier 1 finds 0, Tier 2 finds
+        // 2 (ambiguous, declines), Tier 3 ties (no margin) => ERROR.
+        std::fs::write(root.join("a.txt"), "  foo bar\nmid\n\tfoo   bar\n").unwrap();
+        let err = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", "foo  bar", "BAZ")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "  foo bar\nmid\n\tfoo   bar\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_near_match_above_threshold_applies_to_correct_span() {
+        // A 5-line block that differs from the file by ONE token (>= 0.92 ratio) and
+        // is uniquely located => Tier 3 splices that window's ORIGINAL bytes.
+        let root = p4_temp_project("fz-near");
+        let file = "alpha line one\nbeta line two\ngamma line three\ndelta line four\nepsilon line five\nzzz unrelated tail\n";
+        std::fs::write(root.join("a.txt"), file).unwrap();
+        // old differs only in "three" -> "thRee" (a near miss, not exact, not pure ws).
+        let old = "alpha line one\nbeta line two\ngamma line thRee\ndelta line four\nepsilon line five";
+        let new = "ALPHA\nBETA\nGAMMA\nDELTA\nEPSILON";
+        let result = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", old, new)],
+            |_| {},
+        )
+        .expect("near match applies");
+        // The first five lines (the matched window's original bytes) are replaced; the
+        // unrelated tail survives byte-for-byte.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "ALPHA\nBETA\nGAMMA\nDELTA\nEPSILON\nzzz unrelated tail\n"
+        );
+        assert_eq!(result.match_tiers.len(), 1);
+        assert_eq!(result.match_tiers[0].0, "a.txt");
+        assert!(
+            result.match_tiers[0].1.starts_with("fuzzy:"),
+            "expected fuzzy tier, got {}",
+            result.match_tiers[0].1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_below_threshold_errors_nothing_written() {
+        // A block that shares structure but is too different (< 0.92) must ERROR — no
+        // guessing. Assert the file is byte-identical afterward (atomicity).
+        let root = p4_temp_project("fz-below");
+        let file = "the quick brown fox\njumps over the lazy dog\nand keeps on running\n";
+        std::fs::write(root.join("a.txt"), file).unwrap();
+        let old = "completely different content here\nnothing alike at all whatsoever\nzero overlap with the file";
+        let err = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", old, "X")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), file);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_ambiguous_two_near_windows_errors_no_corruption() {
+        // TWO windows both clear 0.92 with near-identical ratios => the margin guard
+        // fails => ERROR. A wrong pick here would silently corrupt the file.
+        let root = p4_temp_project("fz-ambig");
+        // Two blocks that each differ from `old` by the SAME single character, so their
+        // ratios tie within the 0.05 margin.
+        let file = "header\nrole alpha config\nvalue one\nseparator\nrole alpha config\nvalue one\nfooter\n";
+        std::fs::write(root.join("a.txt"), file).unwrap();
+        let old = "role alphX config\nvalue one";
+        let err = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", old, "X")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), file);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_create_branch_unchanged() {
+        // Empty old_string is still a CREATE, never a fuzzy match — and records no tier.
+        let root = p4_temp_project("fz-create");
+        let result = apply_emitted_edits(
+            &root,
+            &["new.txt".to_string()],
+            &[p4_edit("new.txt", "", "fresh content\n")],
+            |_| {},
+        )
+        .expect("create applies");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "fresh content\n"
+        );
+        assert_eq!(result.applied, vec!["new.txt".to_string()]);
+        // CREATE has no anchor => no match-tier entry.
+        assert!(result.match_tiers.is_empty(), "CREATE must record no tier");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_batch_atomicity_one_unmatchable_edit_writes_nothing() {
+        // A multi-edit batch where the first edit fuzzy-matches but a LATER edit has no
+        // confident match => PASS 1 fails => PASS 2 never runs => BOTH files untouched.
+        let root = p4_temp_project("fz-batch");
+        let a = "fn alpha() {\n    return 1;\n}\n";
+        let b = "totally unrelated baseline\n";
+        std::fs::write(root.join("a.rs"), a).unwrap();
+        std::fs::write(root.join("b.txt"), b).unwrap();
+        let allow = vec!["a.rs".to_string(), "b.txt".to_string()];
+        let edits = vec![
+            // Whitespace near-miss on a.rs (would apply on its own).
+            p4_edit("a.rs", "fn alpha() {\n  return 1;\n}", "fn alpha() {\n    return 2;\n}"),
+            // No confident match anywhere in b.txt => kills the whole batch.
+            p4_edit("b.txt", "nothing like this content at all here", "X"),
+        ];
+        let err = apply_emitted_edits(&root, &allow, &edits, |_| {}).unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        // Both files byte-identical: the atomic guarantee held.
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), a);
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), b);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_helpers_locate_span_tiers_and_normalization() {
+        // Unit-level: the cascade picks the right tier and span, and normalization
+        // preserves line structure (a 1-line block never normalize-equals 2 lines).
+        // Exact tier.
+        let (span, tier) = locate_edit_span("aXbYc", "bY").expect("exact");
+        assert_eq!(tier, MatchTier::Exact);
+        assert_eq!(&"aXbYc"[span], "bY");
+        // Whitespace tier: original has a tab + trailing spaces. `old` has no trailing
+        // newline, so the span is the matched line's CONTENT (its own `\n` is left in
+        // place — exactly what an exact newline-free match would do).
+        let text = "head\n\tfoo  bar   \ntail\n";
+        let (span, tier) = locate_edit_span(text, "foo bar").expect("ws");
+        assert_eq!(tier, MatchTier::Whitespace);
+        assert_eq!(&text[span], "\tfoo  bar   ");
+        // Normalization preserves line boundaries.
+        assert_eq!(normalize_ws_block("a\t b   c"), "a b c");
+        assert_eq!(normalize_ws_block("  a \n  b  "), "a\nb");
+        assert_ne!(normalize_ws_block("a b"), normalize_ws_block("a\nb"));
+        // Ambiguous exact => Err (no fallthrough).
+        assert!(locate_edit_span("xx", "x").is_err());
+        // line_start_offsets: split('\n') semantics — a trailing `\n` yields a final
+        // empty line (the duplicated sentinel), no trailing `\n` does not.
+        assert_eq!(line_start_offsets("a\nbc\n"), vec![0, 2, 5, 5]);
+        assert_eq!(line_start_offsets("abc"), vec![0, 3]);
+    }
+
+    #[test]
+    fn fuzzy_overlapping_windows_do_not_defeat_margin_single_match_applies() {
+        // Regression for the overlap bug: a SINGLE genuine fuzzy region where the base
+        // (3-line) window scores ~0.987 and the OVERLAPPING base+1 (4-line) window over
+        // the SAME start scores ~0.974 — within the 0.05 margin. Before the fix, that
+        // adjacent-size window of the SAME region was counted as the "second-best" and the
+        // margin guard wrongly REFUSED. Now overlapping windows are excluded from the
+        // margin, so the unique location applies. (Ratios pre-measured against similar
+        // 2.7; the base-1 2-line window scores ~0.78, well below threshold.)
+        let root = p4_temp_project("fz-overlap");
+        let file = "aaaaaaaaaaaaaaaaaaaa one\nbbbbbbbbbbbbbbbbbbbb two\ncccccccccccccccccccc three\nx\n";
+        std::fs::write(root.join("a.txt"), file).unwrap();
+        // Near-miss: line 3 "three" -> "thRee" (one char), no trailing newline on `old`.
+        let old =
+            "aaaaaaaaaaaaaaaaaaaa one\nbbbbbbbbbbbbbbbbbbbb two\ncccccccccccccccccccc thRee";
+        let new = "REPLACED";
+        let result = apply_emitted_edits(
+            &root,
+            &["a.txt".to_string()],
+            &[p4_edit("a.txt", old, new)],
+            |_| {},
+        )
+        .expect("single overlapping-window match must APPLY (margin not defeated by overlap)");
+        // `old` has no trailing newline, so the matched span is the three lines' CONTENT;
+        // line 2's own `\n` is left in place, then the unrelated "x" tail survives.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "REPLACED\nx\n"
+        );
+        assert_eq!(result.match_tiers.len(), 1);
+        assert_eq!(result.match_tiers[0].0, "a.txt");
+        assert!(
+            result.match_tiers[0].1.starts_with("fuzzy:"),
+            "expected fuzzy tier, got {}",
+            result.match_tiers[0].1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_whitespace_only_anchor_errors_no_eof_insertion() {
+        // Regression for the silent-corruption bug: an all-whitespace `old_string` with no
+        // exact match must ERROR, not insert at EOF. The file ends in `\n`, so its phantom
+        // trailing empty line whitespace-normalizes to "" — exactly what the whitespace
+        // anchor normalizes to. Without the guard, Tier 2 returned an EMPTY span at EOF and
+        // the splice INSERTED `new_string` at end-of-file, leaving the real target intact.
+        let root = p4_temp_project("fz-ws-only");
+        let file = "fn main() {\n    let x = 1;\n}\n";
+        std::fs::write(root.join("a.rs"), file).unwrap();
+        // Whitespace-only anchor (spaces + tab), NOT present verbatim as a unique line.
+        let err = apply_emitted_edits(
+            &root,
+            &["a.rs".to_string()],
+            &[p4_edit("a.rs", "   \t  ", "INJECTED\n")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        // File is byte-for-byte unchanged: explicitly NO EOF insertion of "INJECTED".
+        let after = std::fs::read_to_string(root.join("a.rs")).unwrap();
+        assert_eq!(after, file);
+        assert!(!after.contains("INJECTED"), "EOF insertion leaked: {after:?}");
+        // Direct unit check: the whitespace tier itself declines an all-whitespace anchor.
+        assert!(find_whitespace_span(file, "   \t  ").is_none());
+        assert!(find_whitespace_span(file, " ").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_skipped_on_large_file_errors_instead_of_scanning() {
+        // DoS guard: a file larger than FUZZY_MAX_FILE_BYTES skips Tier 3 entirely. A
+        // near-but-not-exact `old_string` (no exact/whitespace anchor) therefore ERRORS
+        // immediately rather than running the O(windows x Myers) scan. Exact/whitespace
+        // tiers still run, so an exact anchor on a large file would still match (not tested
+        // here — the point is that the *fuzzy* tier is bypassed).
+        let root = p4_temp_project("fz-large");
+        // Build a > 256 KiB file of distinct lines so nothing matches verbatim.
+        let mut file = String::with_capacity(FUZZY_MAX_FILE_BYTES + 4096);
+        let mut n = 0usize;
+        while file.len() <= FUZZY_MAX_FILE_BYTES {
+            file.push_str(&format!("line number {n} with some filler text here\n"));
+            n += 1;
+        }
+        assert!(file.len() > FUZZY_MAX_FILE_BYTES, "test file must exceed the cap");
+        std::fs::write(root.join("big.txt"), &file).unwrap();
+        // A near-miss against one real line (one char changed) — would fuzzy-match on a
+        // small file, but the size cap bypasses Tier 3 so it errors.
+        let old = "line number 3 with sNme filler text here";
+        // Sanity: the fuzzy helper itself returns None purely from the size cap.
+        assert!(find_fuzzy_span(&file, old).is_none());
+        let err = apply_emitted_edits(
+            &root,
+            &["big.txt".to_string()],
+            &[p4_edit("big.txt", old, "X")],
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("matches 0 times"), "wrong error: {err}");
+        assert_eq!(std::fs::read_to_string(root.join("big.txt")).unwrap(), file);
         std::fs::remove_dir_all(&root).ok();
     }
 

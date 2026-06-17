@@ -667,10 +667,16 @@ pub fn record_directive_result(
 /// For attempt N these blobs are attempt N-1's OUTPUT (the "rejected" side of
 /// the ORPO pair when the chain later lands clean); for attempt 0 they are the
 /// human baseline. Fire-and-forget like every rail writer.
+/// `match_tiers` is the per-edit `(rel, tier_label)` list from `apply_emitted_edits`
+/// (`exact` | `whitespace` | `fuzzy:<ratio>`) — flywheel signal for HOW each anchor
+/// matched, so training can learn when the fuzzy fallback "saved" an edit (and push
+/// the mini toward cleaner, exact-matchable anchors). Empty when no NON-CREATE edit
+/// applied; recorded only when non-empty.
 pub fn record_write_preimages(
     root: &Path,
     directive: &MiniCoderDirective,
     preimages: &[(String, String)],
+    match_tiers: &[(String, String)],
 ) {
     if preimages.is_empty() {
         return;
@@ -680,6 +686,12 @@ pub fn record_write_preimages(
     for (rel, hash) in preimages {
         blobs.insert(rel.clone(), serde_json::Value::String(hash.clone()));
     }
+    // One entry per applied NON-CREATE edit, in edit order, preserving duplicates (a
+    // file edited twice yields two entries) — the order/multiplicity IS the signal.
+    let tiers: Vec<serde_json::Value> = match_tiers
+        .iter()
+        .map(|(rel, tier)| serde_json::json!({ "path": rel, "tier": tier }))
+        .collect();
     let rec = serde_json::json!({
         "type": "write_preimages",
         "ts": now_rfc3339(),
@@ -687,6 +699,7 @@ pub fn record_write_preimages(
         "rootId": super::mini_coder::chain_root_id(directive),
         "attempt": directive.attempt,
         "blobs": serde_json::Value::Object(blobs),
+        "matchTiers": tiers,
     });
     if let Err(e) = append_jsonl(&pairs_path, &rec) {
         eprintln!(
@@ -1424,6 +1437,7 @@ mod tests {
             &root,
             &d,
             &[("src/a.rs".to_string(), "abc123".to_string())],
+            &[("src/a.rs".to_string(), "fuzzy:0.95".to_string())],
         );
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
         assert_eq!(lines.len(), 1);
@@ -1432,8 +1446,13 @@ mod tests {
         assert_eq!(lines[0]["directiveId"], "dR-r1");
         assert_eq!(lines[0]["attempt"], 1);
         assert_eq!(lines[0]["blobs"]["src/a.rs"], "abc123");
+        // The fuzzy match-tier rides the same record (flywheel signal).
+        let tiers = lines[0]["matchTiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0]["path"], "src/a.rs");
+        assert_eq!(tiers[0]["tier"], "fuzzy:0.95");
         // Empty pre-images are a no-op (no record churn).
-        record_write_preimages(&root, &d, &[]);
+        record_write_preimages(&root, &d, &[], &[]);
         assert_eq!(read_lines(&training_dir(&root).join("pairs.jsonl")).len(), 1);
         std::fs::remove_dir_all(&root).ok();
     }
