@@ -3841,7 +3841,11 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
         else:
             os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old
 
-    def _setup(self, tmp: str) -> Path:
+    # A valid 32-lowercase-hex plan id (uuid4().hex shape) the gate accepts ONLY when its
+    # request is "approved". Tests seed the approval explicitly.
+    APPROVED_PLAN_ID = "a" * 32
+
+    def _setup(self, tmp: str, seed_approved: bool = True) -> Path:
         root = Path(tmp)
         projects = root / "projects"
         projects.mkdir()
@@ -3851,7 +3855,31 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             {"agent_id": "orch", "role": "orchestrator", "model": "opus", "message": "planning"},
             root=root,
         )
+        if seed_approved:
+            self._seed_plan_request(root, self.APPROVED_PLAN_ID, "approved")
         return root
+
+    def _seed_plan_request(self, root: Path, plan_id: str, status: str) -> None:
+        """Append a plan-approval request with the given terminal status to the state, so
+        the B4/W6 gate can resolve a real verdict. Mirrors the queue entry plan_submit
+        writes + the human approve/reject command stamps."""
+        from oracle.server.aspis_mcp import file_lock
+
+        projects = root / "projects"
+        state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
+        with file_lock(state_lock):
+            state = read_agents_state(projects)
+            state.setdefault("planApprovalRequests", []).append(
+                {
+                    "id": plan_id,
+                    "agentId": "orch",
+                    "projectId": "scrna-seq",
+                    "title": "Seeded plan",
+                    "status": status,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                }
+            )
+            write_agents_state(projects, state)
 
     def test_creates_todo_planid_tasks_with_fresh_ids_and_remapped_deps(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3862,7 +3890,7 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                 "project_create_plan_tasks",
                 {
                     "project_id": "scrna-seq",
-                    "plan_id": "plan-xyz",
+                    "plan_id": self.APPROVED_PLAN_ID,
                     "tasks": [
                         {"id": "a", "title": "Scaffold module", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": []},
                         {"id": "b", "title": "Wire it up", "scope": ["src/b.ts"], "acceptance": "tests pass", "dependsOn": ["a"]},
@@ -3872,14 +3900,14 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                 },
                 root=root,
             )
-            self.assertEqual(result["planId"], "plan-xyz")
+            self.assertEqual(result["planId"], self.APPROVED_PLAN_ID)
             # Fresh, non-colliding ids: T1 is the manual task, plan gets T2/T3.
             self.assertEqual(result["idMap"], {"a": "T2", "b": "T3"})
             created = result["tasks"]
             self.assertEqual([t["id"] for t in created], ["T2", "T3"])
             for t in created:
                 self.assertEqual(t["status"], "todo")
-                self.assertEqual(t["planId"], "plan-xyz")
+                self.assertEqual(t["planId"], self.APPROVED_PLAN_ID)
             # dependsOn remapped through the id map: b("a") -> T3 depends on T2.
             # No-churn: a root task's EMPTY dependsOn is OMITTED (mirrors the Rust
             # skip_serializing_if), so assert the semantic via .get AND pin the omission.
@@ -3909,7 +3937,7 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     "project_create_plan_tasks",
                     {
                         "project_id": "scrna-seq",
-                        "plan_id": "plan-cycle",
+                        "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
                             {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": ["b"]},
                             {"id": "b", "title": "B", "scope": ["src/b.ts"], "acceptance": "x", "dependsOn": ["a"]},
@@ -3938,7 +3966,7 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     "project_create_plan_tasks",
                     {
                         "project_id": "scrna-seq",
-                        "plan_id": "plan-ext",
+                        "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
                             {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": ["T1"]},
                         ],
@@ -3955,7 +3983,7 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "project_create_plan_tasks",
-                    {"project_id": "scrna-seq", "plan_id": "p", "tasks": [], "agent_id": "orch", "role": "orchestrator"},
+                    {"project_id": "scrna-seq", "plan_id": self.APPROVED_PLAN_ID, "tasks": [], "agent_id": "orch", "role": "orchestrator"},
                     root=root,
                 )
             too_many = [
@@ -3965,7 +3993,7 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             with self.assertRaises(McpError) as ctx:
                 handle_tool_call(
                     "project_create_plan_tasks",
-                    {"project_id": "scrna-seq", "plan_id": "p", "tasks": too_many, "agent_id": "orch", "role": "orchestrator"},
+                    {"project_id": "scrna-seq", "plan_id": self.APPROVED_PLAN_ID, "tasks": too_many, "agent_id": "orch", "role": "orchestrator"},
                     root=root,
                 )
             self.assertIn("Too many", str(ctx.exception))
@@ -3978,7 +4006,7 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     "project_create_plan_tasks",
                     {
                         "project_id": "scrna-seq",
-                        "plan_id": "p",
+                        "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
                             {"id": "a", "title": "A", "scope": ["../escape.ts"], "acceptance": "x", "dependsOn": []},
                         ],
@@ -4013,6 +4041,78 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     root=root,
                 )
             self.assertIn("verifier agents cannot use project_create_plan_tasks", str(ctx.exception))
+
+    def _create_one_task(self, root: Path, plan_id: str):
+        return handle_tool_call(
+            "project_create_plan_tasks",
+            {
+                "project_id": "scrna-seq",
+                "plan_id": plan_id,
+                "tasks": [
+                    {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": []},
+                ],
+                "agent_id": "orch",
+                "role": "orchestrator",
+            },
+            root=root,
+        )
+
+    def test_rejects_malformed_plan_id(self):
+        # B4/W6: the plan_id must be exactly 32 lowercase hex BEFORE the lock.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp, seed_approved=False)
+            with self.assertRaises(McpError) as ctx:
+                self._create_one_task(root, "plan-xyz")
+            self.assertIn("32 lowercase hexadecimal", str(ctx.exception))
+
+    def test_rejects_unknown_plan_id(self):
+        # A well-formed but NEVER-submitted plan id has no verdict -> rejected.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp, seed_approved=False)
+            with self.assertRaises(McpError) as ctx:
+                self._create_one_task(root, "b" * 32)
+            self.assertIn("requires an approved plan", str(ctx.exception))
+            # Nothing was created (project still has only the manual T1).
+            got = handle_tool_call(
+                "project_get",
+                {"project_id": "scrna-seq", "agent_id": "orch", "role": "orchestrator"},
+                root=root,
+            )
+            self.assertEqual([t["id"] for t in got["state"]["tasks"]], ["T1"])
+
+    def test_rejects_pending_plan(self):
+        # A plan still awaiting the human (pending_approval) cannot have tasks created.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp, seed_approved=False)
+            self._seed_plan_request(root, "c" * 32, "pending_approval")
+            with self.assertRaises(McpError) as ctx:
+                self._create_one_task(root, "c" * 32)
+            self.assertIn("requires an approved plan", str(ctx.exception))
+
+    def test_rejects_rejected_plan(self):
+        # A REJECTED plan cannot have its tasks created.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp, seed_approved=False)
+            self._seed_plan_request(root, "d" * 32, "rejected")
+            with self.assertRaises(McpError) as ctx:
+                self._create_one_task(root, "d" * 32)
+            self.assertIn("requires an approved plan", str(ctx.exception))
+
+    def test_approved_plan_evicted_from_queue_uses_sidecar(self):
+        # If the terminal queue entry was capped/evicted, the durable sidecar still
+        # records "approved" -> the gate passes via the sidecar fallback.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp, seed_approved=False)
+            plan_id = "e" * 32
+            base = root / "projects" / ".aspis-plans" / "scrna-seq"
+            base.mkdir(parents=True, exist_ok=True)
+            (base / f"{plan_id}.json").write_text(
+                json.dumps({"id": plan_id, "projectId": "scrna-seq", "status": "approved"}),
+                encoding="utf-8",
+            )
+            out = self._create_one_task(root, plan_id)
+            self.assertEqual(out["planId"], plan_id)
+            self.assertEqual([t["id"] for t in out["tasks"]], ["T2"])
 
 
 def _write_legacy_agents_state(projects: Path, state: dict) -> None:
@@ -8623,7 +8723,14 @@ class SteerMiniCoderTests(unittest.TestCase):
 
     def _setup(self, tmp: str, directives: list[dict]) -> tuple[Path, Path]:
         """Register a live coder and seed the given miniCoderDirectives. Returns
-        (projects_dir, state_lock)."""
+        (projects_dir, state_lock).
+
+        Default the ROOT directive's `parentAgentId` to the steering caller (`codex`)
+        when the test did not set one: after the W5 fix an UNOWNED directive is NOT
+        steerable by anyone, so these positive-path tests (codex steers its OWN mini)
+        must seed the ownership the production spawn path always records. A retry CHILD
+        (has `parentDirectiveId`) inherits the owner from its root, so we leave it alone.
+        Tests that exercise ownership explicitly set `parentAgentId` themselves."""
         root = Path(tmp)
         projects = prepare_management_root(root)
         handle_tool_call(
@@ -8631,6 +8738,9 @@ class SteerMiniCoderTests(unittest.TestCase):
             {"agent_id": "codex", "role": "coder", "model": "codex", "message": "coding"},
             root=root,
         )
+        for directive in directives:
+            if not directive.get("parentDirectiveId") and "parentAgentId" not in directive:
+                directive["parentAgentId"] = "codex"
         state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
         from oracle.server.aspis_mcp import file_lock
 
@@ -9330,6 +9440,65 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             self.assertEqual(out["status"], "running")
 
 
+class MiniDirectiveRootClimbTests(unittest.TestCase):
+    """B1: _mini_directive_parent_agent_id must CLIMB the parentDirectiveId chain to the
+    true ROOT and return ITS parentAgentId — including when called with a retry CHILD id.
+    The shared _resolve_mini_root_directive must guard against cycles / dangling links."""
+
+    def test_climb_from_child_id_returns_root_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = prepare_management_root(Path(tmp))
+            state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
+            from oracle.server.aspis_mcp import (
+                _mini_directive_parent_agent_id,
+                file_lock,
+            )
+
+            with file_lock(state_lock):
+                state = read_agents_state(projects)
+                state["miniCoderDirectives"] = [
+                    {"id": "root", "status": "awaiting_retry", "parentAgentId": "codex"},
+                    {"id": "root-r1", "status": "awaiting_retry", "parentDirectiveId": "root"},
+                    {"id": "root-r2", "status": "running", "parentDirectiveId": "root-r1"},
+                ]
+                write_agents_state(projects, state)
+            # By the deepest child id — must climb two hops to the root's owner.
+            self.assertEqual(
+                _mini_directive_parent_agent_id(projects, state_lock, "root-r2"), "codex"
+            )
+            # By the root id directly — still the root's owner.
+            self.assertEqual(
+                _mini_directive_parent_agent_id(projects, state_lock, "root"), "codex"
+            )
+            # Unknown id — None (caller treats conservatively).
+            self.assertIsNone(
+                _mini_directive_parent_agent_id(projects, state_lock, "nope")
+            )
+
+    def test_resolve_root_guards_against_cycle(self):
+        from oracle.server.aspis_mcp import _resolve_mini_root_directive
+
+        # a -> b -> a (cycle): must terminate and return a present node, not spin.
+        directives = [
+            {"id": "a", "parentDirectiveId": "b", "parentAgentId": "x"},
+            {"id": "b", "parentDirectiveId": "a"},
+        ]
+        root = _resolve_mini_root_directive(directives, "a")
+        self.assertIsNotNone(root)
+        self.assertIn(root["id"], {"a", "b"})
+
+    def test_resolve_root_dangling_parent_link(self):
+        from oracle.server.aspis_mcp import _resolve_mini_root_directive
+
+        # child's parent was evicted — resolve to the deepest reachable node (the child).
+        directives = [
+            {"id": "child", "parentDirectiveId": "gone", "parentAgentId": "y"},
+        ]
+        root = _resolve_mini_root_directive(directives, "child")
+        self.assertIsNotNone(root)
+        self.assertEqual(root["id"], "child")
+
+
 class OwnershipSteerMiniCoderTests(unittest.TestCase):
     """Fix #3 (steer path): steer_mini_coder must reject a caller that does not own
     the directive's parentAgentId. The OWNER still succeeds."""
@@ -9465,6 +9634,89 @@ class OwnershipSteerMiniCoderTests(unittest.TestCase):
                 },
             )
             self.assertEqual(res["status"], "queued")
+
+    def test_steer_by_retry_child_id_enforces_root_ownership(self):
+        # W5: a coder that learns a retry CHILD id (readable via agent_state) must NOT be
+        # able to steer/stop-kill another agent's mini by targeting the child directly.
+        # Resolving the TRUE ROOT must climb from the child to the root and read the
+        # root's owner — so a non-owner is rejected even when steering by the child id.
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup_two_coders(
+                tmp,
+                [
+                    {
+                        "id": "root",
+                        "status": "awaiting_retry",
+                        "task": "x",
+                        "resultPath": "root.json",
+                        "parentAgentId": "codex",
+                    },
+                    {
+                        "id": "root-r1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "root-r1.json",
+                        "parentDirectiveId": "root",
+                        "attempt": 1,
+                        # No parentAgentId on the child — it inherits from the root.
+                    },
+                ],
+            )
+            # Non-owner steering BY THE CHILD ID is rejected (root ownership enforced).
+            with self.assertRaises(McpError) as cm:
+                dispatch_steer_mini_coder(
+                    projects,
+                    state_lock,
+                    {
+                        "agent_id": "codex2",
+                        "role": "coder",
+                        "directive_id": "root-r1",
+                        "message": "should be rejected",
+                    },
+                )
+            self.assertIn("not owned by this agent", str(cm.exception))
+            # The owner can still steer by the child id.
+            res = dispatch_steer_mini_coder(
+                projects,
+                state_lock,
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "root-r1",
+                    "message": "valid owner steer by child id",
+                },
+            )
+            self.assertEqual(res["status"], "queued")
+
+    def test_steer_rejects_unowned_directive(self):
+        # W5 (the empty-owner hole): a directive whose resolved owner is empty/absent must
+        # NOT be steerable by a non-creator. Before the fix the guard only fired when the
+        # owner was non-empty, so an unowned directive was steerable by anyone.
+        with tempfile.TemporaryDirectory() as tmp:
+            projects, state_lock = self._setup_two_coders(
+                tmp,
+                [
+                    {
+                        "id": "orphan",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "orphan.json",
+                        # Deliberately no parentAgentId — an unowned directive.
+                    }
+                ],
+            )
+            with self.assertRaises(McpError) as cm:
+                dispatch_steer_mini_coder(
+                    projects,
+                    state_lock,
+                    {
+                        "agent_id": "codex2",
+                        "role": "coder",
+                        "directive_id": "orphan",
+                        "message": "nobody owns this, but it must not be steerable",
+                    },
+                )
+            self.assertIn("not owned by this agent", str(cm.exception))
 
 
 if __name__ == "__main__":

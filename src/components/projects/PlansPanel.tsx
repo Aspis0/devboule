@@ -12,6 +12,7 @@ import { ChevronDown, ChevronUp } from "lucide-react";
 
 import { invokeBackendCommand } from "../../context/AppContext";
 import type { PlanApprovalRequest } from "../../types/backend";
+import { PlanExecutionView } from "./PlanExecutionView";
 import { stripSpoofChars } from "../agents/attentionNotifier";
 import { parseMarkdown } from "../../utils/planMarkdown";
 import { MarkdownRenderer } from "./MarkdownRenderer";
@@ -248,5 +249,25 @@ export function PlansDockTab({ projectId }: { projectId: string }) {
       </p>
     );
   }
-  return <PlansPanel plans={plans} />;
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Live plan execution — piece 2. Polls get_project independently on the
+          same 12 s cadence so task state stays fresh without a second aggressive
+          poller. Read-only (action buttons are piece 3). */}
+      <section>
+        <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-cream-400">
+          Plan execution
+        </h3>
+        <PlanExecutionView projectId={projectId} />
+      </section>
+
+      {/* Approval history — unchanged. */}
+      <section>
+        <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-cream-400">
+          Approval history
+        </h3>
+        <PlansPanel plans={plans} />
+      </section>
+    </div>
+  );
 }

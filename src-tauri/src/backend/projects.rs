@@ -569,6 +569,128 @@ fn reject_manual_move_for_claimed_task(
     Ok(())
 }
 
+/// Pure transition resolver for [`plan_task_control`] — DOM/app/IO-free so the
+/// transition rules are unit-testable without a Tauri runtime. Mutates the matched
+/// task IN PLACE (status + `updated_at`) and returns the new status string the caller
+/// hands to [`record_manual_task_status`] for claim reconciliation.
+///
+/// REUSE over reinvention: the wrapping command reuses `mutate_project` (lock +
+/// revision + write) and `record_manual_task_status` (claim cleanup) exactly like
+/// `move_project_task`. This helper only owns the part `move_project_task` CANNOT do:
+///   - `skip` → `done` (a terminal state the verifier-gated `normalize_app_task_status`
+///     rejects, so the runner treats the abandoned task as satisfied and its dependents
+///     unblock); reject when already `done` (idempotent guard, no double-skip churn).
+///   - `retry` → `todo` ONLY from `blocked` (so the runner re-picks the failed task);
+///     reject from any other status (a `wip`/`todo`/`review`/`done` task is not a
+///     failed-and-retryable plan step).
+///
+/// PLAN-RUNNER CONTROL ONLY: the task MUST carry a non-empty `plan_id`. A manual
+/// (non-plan) task is rejected — this command is not a general Kanban move and must
+/// never corrupt a manual card. The caller deliberately does NOT run the
+/// `reject_manual_move_for_claimed_task` gate: a `blocked` plan step legitimately still
+/// carries the failed attempt's claim, and `record_manual_task_status("todo", ...)`
+/// drops that stale claim so the runner can re-pick it. Skip/retry target NON-running
+/// steps; a `wip` task whose mini is live is rejected (to stop a running mini the human
+/// uses the Console Stop control, which is mini-scoped).
+///
+/// TRUST BOUNDARY (W4): this is reached ONLY through the `plan_task_control` Tauri
+/// command — a LOCAL-HUMAN-operator action from the desktop UI, NOT an MCP tool any agent
+/// can call. The `skip → done` transition is therefore an intentional LOCAL-OPERATOR
+/// POWER that bypasses the verifier gate (`normalize_app_task_status` rejects an
+/// agent-driven `done`): the human is explicitly declaring an abandoned step satisfied so
+/// the runner unblocks its dependents. It is scoped to plan-tagged tasks ONLY (the
+/// `plan_id` guard above), so it can never be used to force a manual card to `done`.
+fn apply_plan_task_control(task: &mut ProjectTask, action: &str) -> Result<String, String> {
+    let is_plan_task = task
+        .plan_id
+        .as_deref()
+        .is_some_and(|pid| !pid.trim().is_empty());
+    if !is_plan_task {
+        return Err("Plan controls apply only to plan tasks.".into());
+    }
+    let next_status = match action {
+        "retry" => {
+            if task.status != "blocked" {
+                return Err("Retry applies only to a blocked plan task.".into());
+            }
+            "todo"
+        }
+        "skip" => {
+            if task.status == "done" {
+                return Err("Task is already done.".into());
+            }
+            // B3: a `wip` task has a LIVE mini (PTY) attached. Stamping it `done` here
+            // would (a) orphan that PTY into a zombie, (b) make the runner's later
+            // `set_review` fail on the done-lock, and (c) bypass the verifier gate for a
+            // task that actually ran. Skip targets NON-running steps only; to abandon a
+            // running step the human first stops the mini from the Console (mini-scoped),
+            // which drives the task out of `wip`, THEN skips it.
+            if task.status == "wip" {
+                return Err(
+                    "Cannot skip a running (wip) task — stop the mini from the Console first."
+                        .into(),
+                );
+            }
+            "done"
+        }
+        _ => return Err("Plan control action must be skip or retry.".into()),
+    };
+    task.status = next_status.to_string();
+    task.updated_at = now();
+    Ok(next_status.to_string())
+}
+
+/// Human control of a RUNNING plan from the Plan-execution view (UX piece 3, Part B):
+/// `skip` an abandoned plan step to a terminal `done` (the runner skips it; dependents
+/// unblock) or `retry` a `blocked` step back to `todo` (the runner re-picks it).
+///
+/// Mirrors [`move_project_task`]'s shape (unlock gate → optimistic `expected_revision`
+/// locked read-modify-write via `mutate_project` → `record_manual_task_status`). It does
+/// NOT reuse `move_project_task` because that path (a) routes through
+/// `normalize_app_task_status`, which verifier-gates `done` (so `skip` is impossible),
+/// and (b) runs `reject_manual_move_for_claimed_task`, which would refuse a `blocked`
+/// plan step that still holds its failed attempt's claim. The transition rules +
+/// plan-task gate live in the unit-tested pure [`apply_plan_task_control`]; the claim
+/// reconciliation (drop the claim on `todo`, mark it on `done`) is the SAME
+/// `record_manual_task_status` machinery the manual Kanban move already uses.
+#[tauri::command]
+pub fn plan_task_control(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    project_id: String,
+    task_id: String,
+    action: String,
+    expected_revision: String,
+) -> Result<ProjectDetail, String> {
+    state.ensure_unlocked()?;
+    let action = action.trim().to_ascii_lowercase();
+    if action != "skip" && action != "retry" {
+        return Err("Plan control action must be skip or retry.".into());
+    }
+    let task_id = task_id.trim().to_string();
+    let mut applied_status: Option<String> = None;
+    let detail = mutate_project(
+        &app,
+        &state,
+        &project_id,
+        expected_revision.as_str(),
+        |project| {
+            let task = project
+                .state
+                .tasks
+                .iter_mut()
+                .find(|item| item.id == task_id)
+                .ok_or_else(|| "Task not found.".to_string())?;
+            applied_status = Some(apply_plan_task_control(task, &action)?);
+            Ok(())
+        },
+    )?;
+    // `mutate_project` only returns Ok after the closure succeeded, so the status is set.
+    let next_status = applied_status.ok_or_else(|| "Plan control failed.".to_string())?;
+    record_manual_task_status(&app, &project_id, &task_id, &next_status)?;
+    Ok(detail)
+}
+
 #[tauri::command]
 pub fn append_project_note(
     app: tauri::AppHandle,
@@ -11288,6 +11410,105 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             acceptance: String::new(),
             plan_id: None,
         }
+    }
+
+    /// A plan task fixture: id + status + a non-empty planId so the plan-control
+    /// gate accepts it.
+    fn plan_task(id: &str, status: &str) -> ProjectTask {
+        ProjectTask {
+            plan_id: Some("plan-alpha".into()),
+            ..ProjectTask {
+                id: id.into(),
+                ..task(status)
+            }
+        }
+    }
+
+    #[test]
+    fn plan_control_skip_sends_non_running_plan_task_to_done() {
+        let mut t = plan_task("T1", "todo");
+        let next = apply_plan_task_control(&mut t, "skip").unwrap();
+        assert_eq!(next, "done");
+        assert_eq!(t.status, "done");
+    }
+
+    #[test]
+    fn plan_control_skip_rejects_wip_task() {
+        // B3: a running (wip) task has a live mini/PTY. Skipping it to `done` would
+        // orphan the PTY, break the runner's later set_review (done-lock), and bypass the
+        // verifier gate. The skip must be REJECTED and the task left untouched.
+        let mut t = plan_task("T1", "wip");
+        let err = apply_plan_task_control(&mut t, "skip").unwrap_err();
+        assert!(err.contains("running (wip)"), "got: {err}");
+        assert!(err.contains("Console"), "got: {err}");
+        assert_eq!(t.status, "wip", "a rejected skip must not mutate the task");
+    }
+
+    #[test]
+    fn plan_control_skip_works_from_todo_and_blocked() {
+        for from in ["todo", "blocked", "review"] {
+            let mut t = plan_task("T1", from);
+            assert_eq!(apply_plan_task_control(&mut t, "skip").unwrap(), "done");
+            assert_eq!(t.status, "done");
+        }
+    }
+
+    #[test]
+    fn plan_control_skip_rejects_already_done() {
+        let mut t = plan_task("T1", "done");
+        let err = apply_plan_task_control(&mut t, "skip").unwrap_err();
+        assert!(err.contains("already done"), "got: {err}");
+        // Task must be left untouched on a rejected transition.
+        assert_eq!(t.status, "done");
+    }
+
+    #[test]
+    fn plan_control_retry_sends_blocked_plan_task_to_todo() {
+        let mut t = plan_task("T1", "blocked");
+        let next = apply_plan_task_control(&mut t, "retry").unwrap();
+        assert_eq!(next, "todo");
+        assert_eq!(t.status, "todo");
+    }
+
+    #[test]
+    fn plan_control_retry_rejects_non_blocked_status() {
+        for from in ["todo", "wip", "review", "done"] {
+            let mut t = plan_task("T1", from);
+            let err = apply_plan_task_control(&mut t, "retry").unwrap_err();
+            assert!(err.contains("blocked"), "from {from} got: {err}");
+            // Unchanged on rejection.
+            assert_eq!(t.status, from);
+        }
+    }
+
+    #[test]
+    fn plan_control_rejects_non_plan_task() {
+        // A manual (non-plan) task has plan_id = None — must be refused for BOTH actions
+        // so the command can never corrupt a general Kanban card.
+        for action in ["skip", "retry"] {
+            let mut t = task("blocked"); // plan_id: None
+            let err = apply_plan_task_control(&mut t, action).unwrap_err();
+            assert!(err.contains("plan tasks"), "action {action} got: {err}");
+            assert_eq!(t.status, "blocked");
+        }
+    }
+
+    #[test]
+    fn plan_control_rejects_blank_plan_id_as_non_plan() {
+        let mut t = ProjectTask {
+            plan_id: Some("   ".into()),
+            ..task("blocked")
+        };
+        let err = apply_plan_task_control(&mut t, "retry").unwrap_err();
+        assert!(err.contains("plan tasks"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_control_rejects_unknown_action() {
+        let mut t = plan_task("T1", "blocked");
+        let err = apply_plan_task_control(&mut t, "frobnicate").unwrap_err();
+        assert!(err.contains("skip or retry"), "got: {err}");
+        assert_eq!(t.status, "blocked");
     }
 
     /// A bug-investigation P3 task builder: id + category + status + suspects.

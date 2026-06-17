@@ -5001,37 +5001,79 @@ def _mini_directive_result(
     return False, "", None
 
 
+# Hard cap on the parentDirectiveId climb. A mini retry chain is bounded by the Rust
+# executor (a few retries deep), so any walk beyond this is a corrupt / cyclic state
+# file; we bail to avoid an unbounded loop on hand-edited or partially-written state.
+_MINI_CHAIN_MAX_DEPTH = 256
+
+
+def _resolve_mini_root_directive(
+    directives: list[Any], directive_id: str
+) -> dict[str, Any] | None:
+    """Climb the retry chain from `directive_id` to its ROOT directive (the entry with
+    NO `parentDirectiveId`) and return that root dict, or `None` if `directive_id` is
+    not present at all.
+
+    Shared by the ownership checks in `dispatch_mini_coder_result` (via
+    `_mini_directive_parent_agent_id`) and `dispatch_steer_mini_coder`: both must read
+    the OWNER from the true root, because the Rust executor stores `parentAgentId` only
+    on the root and a retry child inherits it implicitly.
+
+    Walk discipline: start at the entry whose `id == directive_id`, then follow
+    `parentDirectiveId` upward. Guards against cycles/dangling links (a visited set and
+    a depth cap `_MINI_CHAIN_MAX_DEPTH`): on a self-reference, a loop back to a seen id,
+    a parent id that is not present, or the depth cap, we STOP and return the last
+    resolved entry (the deepest non-cyclic ancestor we could reach) rather than spin.
+    A directive_id with no matching entry returns `None`.
+    """
+    by_id: dict[str, dict[str, Any]] = {
+        str(d.get("id") or ""): d for d in directives if isinstance(d, dict)
+    }
+    node = by_id.get(directive_id)
+    if node is None:
+        return None
+    seen: set[str] = set()
+    depth = 0
+    while True:
+        node_id = str(node.get("id") or "")
+        if node_id in seen or depth >= _MINI_CHAIN_MAX_DEPTH:
+            # Cycle or runaway chain (corrupt state) — stop at the current node.
+            return node
+        seen.add(node_id)
+        parent_id = str(node.get("parentDirectiveId") or "")
+        if not parent_id:
+            return node  # true root: no parentDirectiveId.
+        parent = by_id.get(parent_id)
+        if parent is None:
+            # Dangling parent link (the ancestor was evicted) — treat the current node
+            # as the best-resolvable root.
+            return node
+        node = parent
+        depth += 1
+
+
 def _mini_directive_parent_agent_id(
     projects_dir: Path, state_lock: Path, directive_id: str
 ) -> str | None:
     """Return the `parentAgentId` of the ROOT directive for `directive_id`.
 
     For the root itself (`id == directive_id`) this is the value stored directly.
-    For a retry descendant (`parentDirectiveId == directive_id` / any depth), we
-    walk up to the root and read ITS `parentAgentId` — the Rust executor inherits
-    the owner from the root, and a retry child may not carry `parentAgentId` at all.
+    For a retry descendant we CLIMB the `parentDirectiveId` chain to the true root and
+    read ITS `parentAgentId` — the Rust executor inherits the owner from the root, and a
+    retry child may not carry `parentAgentId` at all.
 
-    Returns `None` if the directive (root or chain member) is not found.
+    Returns `None` if the directive (root or chain member) is not found, OR if no owner
+    is recorded on the resolved root. The `dispatch_mini_coder_result` caller treats a
+    `None` owner CONSERVATIVELY for that read-only path (it cannot determine the owner,
+    so it does not hard-fail a same-agent collect on still-propagating state); the
+    steering path (`dispatch_steer_mini_coder`) is stricter — see its ownership check.
     """
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
     directives = state.get("miniCoderDirectives") or []
-    # Build a quick id→directive index.
-    by_id: dict[str, dict] = {
-        str(d.get("id") or ""): d for d in directives if isinstance(d, dict)
-    }
-    # Look for the root: the entry whose id == directive_id.
-    root = by_id.get(directive_id)
+    root = _resolve_mini_root_directive(directives, directive_id)
     if root is None:
-        # directive_id might not be a root — scan for a chain member and walk up.
-        for d in directives:
-            if not isinstance(d, dict):
-                continue
-            if str(d.get("parentDirectiveId") or "") == directive_id:
-                root = by_id.get(directive_id)
-                break
-        if root is None:
-            return None
+        return None
     parent = root.get("parentAgentId")
     return str(parent) if parent else None
 
@@ -5451,14 +5493,19 @@ def dispatch_steer_mini_coder(
         ]
         if not in_chain:
             return {"directiveId": directive_id, "status": "not_found"}
-        # OWNERSHIP CHECK (multi-agent safety): find the ROOT directive (id == directive_id)
-        # and compare its parentAgentId to the caller. Retry children inherit their
-        # parent's ownership from the root; a retry may not carry parentAgentId itself.
-        _root_d = next(
-            (d for d in in_chain if str(d.get("id") or "") == directive_id), in_chain[0]
-        )
-        _root_owner = str(_root_d.get("parentAgentId") or "")
-        if _root_owner and _root_owner != agent_id:
+        # OWNERSHIP CHECK (multi-agent safety, B2/W5): steering is a WRITE that can
+        # mid-flight redirect OR (stop sentinel) KILL a mini, so it must be locked to the
+        # chain's creator. Resolve the TRUE ROOT by climbing `parentDirectiveId` from the
+        # full directives list (NOT just `in_chain`, which only spans `directive_id` + its
+        # direct children — a retry child id would otherwise resolve to itself, which has
+        # no `parentAgentId`, and skip the check). Read the OWNER from the root and reject
+        # any caller that is not that owner. Crucially we reject EVEN WHEN the owner is
+        # empty/absent: an unowned (or owner-stripped) directive must NOT be steerable by a
+        # non-creator. A directive with no resolvable root would have failed the
+        # `not in_chain` guard above, so `directive_id` is present here.
+        _root_d = _resolve_mini_root_directive(directives, directive_id)
+        _root_owner = str((_root_d or {}).get("parentAgentId") or "")
+        if _root_owner != agent_id:
             raise McpError("mini-coder directive is not owned by this agent.")
         active = next(
             (d for d in in_chain if str(d.get("status") or "") in _MINI_ACTIVE_STATUSES),
@@ -5966,6 +6013,46 @@ def _update_plan_sidecar_status(
         pass
 
 
+def _plan_request_outcome_in_state(
+    state: dict[str, Any], plan_id: str
+) -> tuple[bool, str, str | None]:
+    """Scan an ALREADY-READ agents state for a plan request's poll state. No lock.
+
+    Returns `(present, status, note)` exactly like `_plan_request_outcome`. Factored so a
+    caller that ALREADY holds `file_lock(state_lock)` and has the state in hand (e.g. the
+    plan-approval gate in `project_create_plan_tasks`) can read the verdict WITHOUT
+    re-acquiring the lock — `file_lock` is a non-reentrant `flock`, so a second
+    acquisition in the same process/thread would deadlock."""
+    for request in state.get("planApprovalRequests", []):
+        if not isinstance(request, dict):
+            continue
+        if str(request.get("id") or "") == plan_id:
+            status = str(request.get("status") or "")
+            note = request.get("note")
+            return True, status, note if isinstance(note, str) else None
+    return False, "", None
+
+
+def _plan_status_from_sidecar(projects_dir: Path, plan_id: str) -> str | None:
+    """Best-effort durable fallback: read a plan's status from its on-disk sidecar JSON
+    when the live queue entry was evicted (terminal entries are capped). `plan_id` MUST
+    already be validated 32-hex, so the BOUNDED glob `*/{plan_id}.json` only varies the
+    project namespace and cannot escape the plans dir. Returns the status string of the
+    first matching sidecar, or `None` if none is found / readable. No lock (read-only of
+    an immutable-once-decided artifact). Mirrors the fallback in `dispatch_plan_status`."""
+    base = plans_dir(projects_dir)
+    if not base.is_dir():
+        return None
+    for sidecar_path in base.glob(f"*/{plan_id}.json"):
+        try:
+            data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            return str(data.get("status") or "") or None
+    return None
+
+
 def _plan_request_outcome(
     projects_dir: Path, state_lock: Path, plan_id: str
 ) -> tuple[bool, str, str | None]:
@@ -5980,14 +6067,7 @@ def _plan_request_outcome(
     across the caller's sleep (the Rust approve/reject command co-writes this file)."""
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
-    for request in state.get("planApprovalRequests", []):
-        if not isinstance(request, dict):
-            continue
-        if str(request.get("id") or "") == plan_id:
-            status = str(request.get("status") or "")
-            note = request.get("note")
-            return True, status, note if isinstance(note, str) else None
-    return False, "", None
+    return _plan_request_outcome_in_state(state, plan_id)
 
 
 # Plan-approval terminal statuses the poll treats as a final human verdict.
@@ -6846,7 +6926,15 @@ def handle_tool_call(
         agent_id = normalize_agent_id(args.get("agent_id"))
         role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
         project_id = normalize_project_id(args.get("project_id", ""))
-        plan_id = clean_text(args.get("plan_id"), "Plan id", 200)
+        # B4/W6: the plan_id is a SECURITY-CRITICAL identifier here — only an APPROVED
+        # plan may have its tasks bulk-created (the runner auto-executes them). Validate
+        # the SHAPE first (exactly 32 lowercase hex, mirroring dispatch_plan_status /
+        # plan_submit's uuid4().hex) BEFORE the lock so a fabricated/garbage id is rejected
+        # cheaply; the APPROVAL gate itself runs INSIDE the lock below against the live
+        # state we read there.
+        plan_id = str(args.get("plan_id") or "").strip().lower()
+        if not _PLAN_ID_RE.fullmatch(plan_id):
+            raise McpError("plan_id must be exactly 32 lowercase hexadecimal characters.")
         incoming = args.get("tasks")
         if not isinstance(incoming, list) or not incoming:
             raise McpError("project_create_plan_tasks requires a non-empty tasks list.")
@@ -6905,6 +6993,23 @@ def handle_tool_call(
 
         with file_lock(state_lock):
             state = read_agents_state(projects_dir)
+            # B4/W6 PLAN-APPROVAL GATE: only an APPROVED plan may have its tasks created.
+            # Without this, any registered orchestrator could call this with a fabricated
+            # / rejected / never-submitted plan_id and bulk-create auto-executed Kanban
+            # tasks. Read the verdict from the live queue (authoritative for an active /
+            # just-decided plan) using the NON-locking scan on the state we just read
+            # under the lock (file_lock is non-reentrant — re-locking would deadlock);
+            # fall back to the durable on-disk sidecar when the terminal queue entry was
+            # evicted (cap_plan_approval_requests can drop OLD terminal entries). Anything
+            # other than "approved" (pending / rejected / timeout / unknown) is refused.
+            _present, _plan_status, _ = _plan_request_outcome_in_state(state, plan_id)
+            if not _present:
+                _plan_status = _plan_status_from_sidecar(projects_dir, plan_id) or ""
+            if _plan_status != "approved":
+                raise McpError(
+                    "project_create_plan_tasks requires an approved plan "
+                    f"(plan {plan_id} status: {_plan_status or 'not_found'})."
+                )
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
                 if project["metadata"].get("status") in {"paused", "archived", "done"}:

@@ -453,6 +453,7 @@ pub fn run() {
             backend::projects::list_projects,
             backend::saved_workflows::list_saved_workflows,
             backend::projects::move_project_task,
+            backend::projects::plan_task_control,
             backend::projects::project_git_commit,
             backend::projects::project_git_push,
             backend::projects::project_git_pull,

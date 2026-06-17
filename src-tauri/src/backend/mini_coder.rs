@@ -895,6 +895,15 @@ pub fn sanitize_steer_message(message: &str) -> String {
 /// the caller can skip the append entirely (no spurious header). One line per message,
 /// in FIFO order. Pure + privacy-safe (the messages are the supervisor's own prose, the
 /// same trust tier as the task itself).
+///
+/// W3 (TRUST BOUNDARY): the steer text is supervisor/untrusted input folded into the
+/// mini's next-round prompt. Its boundary is the explicit, labelled
+/// `SUPERVISOR STEERING (apply these corrections this round):` HEADER below — the mini
+/// reads the block as bounded supervisor guidance, not as a fresh instruction stream, and
+/// each message is already sanitized (`sanitize_steer_message`: invisible/BiDi strip +
+/// whitespace collapse) and per-message + aggregate length-capped. The mini's own
+/// prompt-injection firewall (it treats the whole delegated task as untrusted) is the
+/// BACKSTOP; this header is the labelling/bounding layer.
 pub fn fold_steer_block(messages: &[String]) -> Option<String> {
     let lines: Vec<&str> = messages
         .iter()

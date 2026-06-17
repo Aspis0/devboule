@@ -781,6 +781,11 @@ export interface ProjectTask {
   description?: string;
   // P1: Oracle-localized suspect files. Empty for now; P2 populates it.
   suspectFileIds: string[];
+  // Plan-execution fields (camelCase from Rust model). Absent on legacy/non-plan tasks.
+  planId?: string;
+  dependsOn?: string[];
+  scope?: string[];
+  acceptance?: string;
 }
 
 export interface ProjectNote {

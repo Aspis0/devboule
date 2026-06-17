@@ -302,14 +302,19 @@ pub async fn run_tasks(
                 if let Err(e) = claim_task(mcp, project_id, &task.id).await {
                     let reason = format!("could not claim the task: {}", elide(&e));
                     // Best-effort: try to mark it blocked so the board reflects the stop.
-                    // If THAT also fails (we never held a claim), surface the block in the
-                    // report regardless — the run still stops cleanly.
-                    let _ = set_blocked(mcp, project_id, &task.id, &reason).await;
-                    activity.milestone(&format!("blocked {}", task.id), Node::Terra);
+                    // If THAT also fails (we never held a claim), `block_best_effort`
+                    // surfaces the discrepancy (W2): a `block-write failed` milestone + a
+                    // note in the reason, and reports the board's REAL status rather than
+                    // a false `blocked`. The run still stops cleanly either way.
+                    let (status, reason) =
+                        block_best_effort(mcp, project_id, activity, &task.id, reason).await;
+                    if status == STATUS_BLOCKED {
+                        activity.milestone(&format!("blocked {}", task.id), Node::Terra);
+                    }
                     let blocked = BlockedTask {
                         id: task.id.clone(),
                         title: task.title.clone(),
-                        status: STATUS_BLOCKED.to_string(),
+                        status,
                         reason,
                     };
                     return Ok(RunReport {
@@ -373,13 +378,19 @@ pub async fn run_tasks(
                     MiniVerdict::Blocked(reason) => {
                         // Best-effort: set the card to blocked. A failure here does NOT
                         // propagate as a transport Err — the mini's block verdict is still
-                        // surfaced to the human via the RunReport.
-                        let _ = set_blocked(mcp, project_id, &task.id, &reason).await;
-                        activity.milestone(&format!("blocked {}", task.id), Node::Terra);
+                        // surfaced to the human via the RunReport. W2: `block_best_effort`
+                        // makes a failed block-write OBSERVABLE (a `block-write failed`
+                        // milestone + a note in the reason) and reports the board's REAL
+                        // status instead of a false `blocked`.
+                        let (status, reason) =
+                            block_best_effort(mcp, project_id, activity, &task.id, reason).await;
+                        if status == STATUS_BLOCKED {
+                            activity.milestone(&format!("blocked {}", task.id), Node::Terra);
+                        }
                         let blocked = BlockedTask {
                             id: task.id.clone(),
                             title: task.title.clone(),
-                            status: STATUS_BLOCKED.to_string(),
+                            status,
                             reason,
                         };
                         return Ok(RunReport {
@@ -640,6 +651,37 @@ async fn set_blocked(
     .map_err(|e| format!("could not set {task_id} to blocked: {e}"))
 }
 
+/// Best-effort block of a task that is ALREADY stopping the run, returning the truthful
+/// `(board_status, reason)` to put in the `RunReport`.
+///
+/// W2: the previous `let _ = set_blocked(...)` swallowed a failed block-transition, so the
+/// run would report the task as `blocked` while the BOARD silently stayed `wip` — a
+/// discrepancy invisible to the human. We keep the call best-effort (a failed block must
+/// NOT escalate to a transport `Err` and abort the whole run — the originating block
+/// reason is the important signal), but we make the failure OBSERVABLE:
+///   * on success → `(STATUS_BLOCKED, reason)`: the board moved, the report matches it;
+///   * on failure → emit a distinct `block-write failed <id>` Console milestone AND fold
+///     the write error into the reason, and report the board's REAL status (`wip` — the
+///     card never left the claimed state) so the report does not falsely claim `blocked`.
+async fn block_best_effort(
+    mcp: &dyn McpBackend,
+    project_id: &str,
+    activity: &Activity,
+    task_id: &str,
+    reason: String,
+) -> (String, String) {
+    match set_blocked(mcp, project_id, task_id, &reason).await {
+        Ok(()) => (STATUS_BLOCKED.to_string(), reason),
+        Err(e) => {
+            activity.milestone(&format!("block-write failed {task_id}"), Node::Terra);
+            (
+                STATUS_WIP.to_string(),
+                format!("{reason} (NOTE: could not update the board to blocked: {})", elide(&e)),
+            )
+        }
+    }
+}
+
 /// Build the `spawn_mini_coder` argument object for one task: the task text is the title +
 /// the deterministic acceptance check (so the mini knows the bar); `files` is the task's
 /// MODIFY scope (the write allowlist); `write: true` selects the edit arm. The whole
@@ -650,9 +692,23 @@ async fn set_blocked(
 /// task carries only ≤3 MODIFY files, so the implementing mini needs read-only codebase
 /// grounding to do the work correctly; `oracle_*` is read-only + project-confined, so this
 /// widens READS only, never the WRITE allowlist (still exactly `files`).
+///
+/// W3 (TRUST MODEL of the folded fields): `title` and `acceptance` are MODEL-GENERATED —
+/// the planner wrote them and they were stored on the Kanban card (already stripped of
+/// invisible/BiDi control chars by the `project_create_plan_tasks` MCP tool before they
+/// could persist). They are the SAME trust tier as the directive task itself (supervisor
+/// prose), NOT a higher-privileged channel: nothing here can widen the mini's write
+/// allowlist (still exactly `task.scope`) or its tool grants. The `title` IS the task (the
+/// primary instruction, placed first); the `acceptance` is appended behind a clearly
+/// LABELLED `Acceptance:` boundary so the mini reads it as the bar to meet, not as a fresh
+/// instruction stream. The mini's own prompt-injection firewall (it treats the whole
+/// delegated task as untrusted input, see `mini_coder.rs`) is the BACKSTOP; this is a
+/// labelling/bounding layer, not the security boundary itself.
 fn build_spawn_params(task: &TaskView) -> serde_json::Value {
     let mut text = task.title.trim().to_string();
     if !task.acceptance.trim().is_empty() {
+        // Bound the model-generated acceptance behind its own LABEL (see the trust-model
+        // note above) so it reads as the success bar, distinct from the title/task above.
         text.push_str("\n\nAcceptance: ");
         text.push_str(task.acceptance.trim());
     }
@@ -909,6 +965,44 @@ mod tests {
         }
     }
 
+    /// W2: a backend whose board reads + claim + delegation work, the mini ESCALATES
+    /// (a block verdict), but the `project_update_status` → `blocked` write FAILS. Proves
+    /// `block_best_effort` keeps the run from erroring, reports the board's REAL status
+    /// (`wip`, not a false `blocked`), and folds the write error into the reason.
+    struct BlockWriteFailsMock {
+        tasks: Vec<serde_json::Value>,
+    }
+    #[async_trait]
+    impl McpBackend for BlockWriteFailsMock {
+        async fn call_tool(
+            &self,
+            name: &str,
+            params: serde_json::Value,
+        ) -> Result<String, String> {
+            match name {
+                "project_get" => Ok(serde_json::json!({
+                    "metadata": {"id": "proj"},
+                    "state": {"tasks": self.tasks.clone()},
+                })
+                .to_string()),
+                "project_claim_task" => Ok("{}".to_string()),
+                "project_update_status" => {
+                    // The ONLY failing transition is the runner's block write.
+                    if params["status"].as_str() == Some(STATUS_BLOCKED) {
+                        return Err("board write rejected (stale revision)".to_string());
+                    }
+                    Ok(serde_json::json!({"metadata": {"id": "proj"}}).to_string())
+                }
+                // Escalate -> a block verdict that drives the runner into set_blocked.
+                "spawn_mini_coder" => Ok(serde_json::json!(
+                    {"directiveId": "d", "result": {"status": "escalated"}}
+                )
+                .to_string()),
+                other => Err(format!("unexpected tool {other}")),
+            }
+        }
+    }
+
     /// Build a plan-tagged Kanban task JSON object.
     fn ktask(
         id: &str,
@@ -1139,6 +1233,55 @@ mod tests {
         assert_eq!(mock.status_of("T001"), STATUS_REVIEW);
         assert_eq!(mock.status_of("T002"), STATUS_BLOCKED);
         assert_eq!(mock.status_of("T003"), STATUS_TODO, "T003 untouched");
+    }
+
+    #[tokio::test]
+    async fn failed_block_write_is_observable_not_swallowed() {
+        // W2: the mini escalates (a block verdict) but the board's blocked write FAILS.
+        // The run must NOT error; instead it returns a RunReport whose blocked entry tells
+        // the truth — the board stayed `wip` (the write failed) and the reason carries the
+        // write error — and a `block-write failed` milestone is emitted to the Console.
+        let activity_file = std::env::temp_dir().join(format!(
+            "devboule-w2-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&activity_file);
+        let activity = Activity::with_path(&activity_file);
+
+        let mock = BlockWriteFailsMock {
+            tasks: vec![ktask("T001", "p1", &[], STATUS_TODO, "2026-06-17T10:00:00Z")],
+        };
+        let report = run_tasks(&mock, "proj", &activity).await.unwrap();
+        let blocked = report.blocked.expect("a block report");
+        assert_eq!(blocked.id, "T001");
+        // The board write failed, so the report must NOT claim `blocked`: the card is
+        // still `wip` (the claim drove it there and it never moved on).
+        assert_eq!(
+            blocked.status, STATUS_WIP,
+            "a failed block write must not be reported as blocked"
+        );
+        assert!(
+            blocked.reason.contains("escalated"),
+            "the original block reason is preserved: {}",
+            blocked.reason
+        );
+        assert!(
+            blocked.reason.contains("could not update the board"),
+            "the write failure must be folded into the reason: {}",
+            blocked.reason
+        );
+
+        // The Console milestone for the failed write must be on disk.
+        let log = std::fs::read_to_string(&activity_file).unwrap_or_default();
+        assert!(
+            log.contains("block-write failed T001"),
+            "a block-write-failed milestone must be emitted, got: {log}"
+        );
+        let _ = std::fs::remove_file(&activity_file);
     }
 
     #[tokio::test]

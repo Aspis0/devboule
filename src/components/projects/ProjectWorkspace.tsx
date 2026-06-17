@@ -46,6 +46,7 @@ import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { AgentQuestionCard } from "./AgentQuestionCard";
 import { CensorPanel } from "./CensorPanel";
+import { MiniSteerBar } from "./MiniSteerBar";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
 import { ProjectWorkspaceAgentRail } from "./ProjectWorkspaceAgentRail";
@@ -553,8 +554,11 @@ export function ProjectWorkspace({
             // timeline scrolls inside the panel. A max-h/min-h pair leaves the
             // flex child without a definite height, so the empty state pins to the
             // top instead of centering.
-            <div className="flex h-[348px] flex-col overflow-y-auto">
-              <AgentConsole activity={consoleActivity} />
+            <div className="flex h-[348px] flex-col">
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <AgentConsole activity={consoleActivity} />
+              </div>
+              <MiniSteerBar agentId={selectedAgentId} />
             </div>
           )}
         </div>
