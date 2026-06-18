@@ -1284,6 +1284,90 @@ mod tests {
             "the raw key must never appear in Debug: {dbg}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Live integration tests — require network + credentials.
+    // Run manually:
+    //   OPENROUTER_KEY=$(cat ~/.openrouter_key) \
+    //     cargo test -p devboule-coder --ignored live_ -- --nocapture
+    // -------------------------------------------------------------------------
+
+    /// Verify that `PublicOnlyResolver` allows a real public host (openrouter.ai)
+    /// while blocking a public DNS name that resolves to 127.0.0.1 (nip.io trick).
+    ///
+    /// The client is built EXACTLY as `CloudModel::new` builds it:
+    ///   timeout(15s) + dns_resolver(PublicOnlyResolver)
+    ///
+    /// Fallback for the private-hostname check: if `127.0.0.1.nip.io` is unavailable,
+    /// `127.0.0.1.localtest.me` also resolves to 127.0.0.1 and exercises the same path.
+    #[tokio::test]
+    #[ignore]
+    async fn live_ssrf_resolver_allows_public_blocks_private() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .dns_resolver(Arc::new(PublicOnlyResolver))
+            .build()
+            .expect("failed to build SSRF-guarded client");
+
+        // A real public endpoint must resolve and connect through the guard.
+        // `.send()` is Ok on any HTTP status; Err only on connect / DNS failure.
+        let pub_res = client.get("https://openrouter.ai/").send().await;
+        assert!(
+            pub_res.is_ok(),
+            "PublicOnlyResolver must allow openrouter.ai (a real public host): {:?}",
+            pub_res.err()
+        );
+
+        // `127.0.0.1.nip.io` is a public FQDN whose DNS answer is 127.0.0.1.
+        // The resolver must block every resolved IP (all loopback) and return Err.
+        // Fallback: `127.0.0.1.localtest.me` has the same property if nip.io is down.
+        let priv_res = client.get("https://127.0.0.1.nip.io/").send().await;
+        eprintln!("blocked-host error: {:?}", priv_res.as_ref().err());
+        assert!(
+            priv_res.is_err(),
+            "PublicOnlyResolver must block 127.0.0.1.nip.io \
+             (FQDN that resolves to a loopback address)"
+        );
+    }
+
+    /// End-to-end cloud-mode completion via OpenRouter.
+    ///
+    /// Requires `OPENROUTER_KEY` to be set in the environment.
+    /// Uses the cheapest available model (`z-ai/glm-5.2`) with a trivial prompt
+    /// to minimise token cost while still exercising the full transport + parsing
+    /// path: `CloudModel::new` → SSRF resolver + TLS → `/chat/completions` →
+    /// `parse_chat_response` → non-empty string.
+    #[tokio::test]
+    #[ignore]
+    async fn live_cloud_model_completion_via_openrouter() {
+        use crate::model::CoderModel;
+
+        let key = std::env::var("OPENROUTER_KEY")
+            .expect("set OPENROUTER_KEY to run this live test");
+
+        let model = CloudModel::new(
+            "https://openrouter.ai/api/v1",
+            "z-ai/glm-5.2",
+            key,
+            false,
+        )
+        .expect("CloudModel::new must accept a valid https FQDN + non-empty key");
+
+        let transcript = Transcript::new(
+            "Reply with exactly the word: ok".to_string(),
+        );
+
+        let completion = model.next_output(&transcript).await;
+        eprintln!("GLM said: {completion}");
+        assert!(
+            !completion.is_empty(),
+            "completion must be non-empty; got an empty string \
+             (possible auth / network failure — check OPENROUTER_KEY)"
+        );
+    }
 }
 
 #[cfg(test)]
