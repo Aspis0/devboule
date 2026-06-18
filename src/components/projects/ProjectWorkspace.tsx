@@ -51,6 +51,7 @@ import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
 import { ProjectWorkspaceAgentRail } from "./ProjectWorkspaceAgentRail";
 import { PushApprovalCard } from "./PushApprovalCard";
+import { ProjectMcpServersCard } from "./ProjectMcpServersCard";
 import {
   DEFAULT_DOCK_TAB,
   DOCK_TABS,
@@ -561,6 +562,15 @@ export function ProjectWorkspace({
               <MiniSteerBar agentId={selectedAgentId} />
             </div>
           )}
+
+          {dockTab === "mcp" &&
+            (project.metadata.rootPath ? (
+              <ProjectMcpServersCard projectRoot={project.metadata.rootPath} />
+            ) : (
+              <p className="text-[11px] text-cream-400">
+                No project root path — cannot load MCP servers.
+              </p>
+            ))}
         </div>
       </div>
     </div>

@@ -719,15 +719,17 @@ describe("dock", () => {
     expect(DOCK_TABS[0].id).toBe("censor");
   });
 
-  it("exposes the five tabs in order (Console is the structured activity timeline)", () => {
+  it("exposes the six tabs in order (MCP tab added in Phase A.3)", () => {
     expect(DOCK_TABS.map((t) => t.id)).toEqual([
       "censor",
       "activity",
       "git",
       "plans",
       "console",
+      "mcp",
     ]);
-    expect(DOCK_TABS[DOCK_TABS.length - 1].label).toBe("Console");
+    expect(DOCK_TABS.find((t) => t.id === "console")!.label).toBe("Console");
+    expect(DOCK_TABS.find((t) => t.id === "mcp")!.label).toBe("MCP");
   });
 });
 

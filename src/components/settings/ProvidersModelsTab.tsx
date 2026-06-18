@@ -21,6 +21,7 @@ import { ExaSearchKeyCard } from "./ExaSearchKeyCard";
 import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
 import { CensorLocalAiCard } from "../views/WorkspaceView";
+import { UserMcpServersCard } from "./UserMcpServersCard";
 
 // Phase 5 — the "Providers & Models" tab: a single home for everything that picks
 // an AI provider/model. A top "Detected on this machine" strip (one
@@ -299,6 +300,13 @@ export function ProvidersModelsTab() {
         description="The model the generative-design module generates node markup with."
       >
         <DesignLlmBackendCard />
+      </RoleSection>
+
+      <RoleSection
+        title="User MCP servers"
+        description="External MCP servers available in every project. These run as your user account and may reach external networks."
+      >
+        <UserMcpServersCard />
       </RoleSection>
     </div>
   );

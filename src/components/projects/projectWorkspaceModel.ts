@@ -446,7 +446,7 @@ export function miniKillCall(session: AgentSession): IpcCall | null {
 
 // ---- bottom dock ------------------------------------------------------------
 
-export type DockTab = "censor" | "activity" | "git" | "plans" | "console";
+export type DockTab = "censor" | "activity" | "git" | "plans" | "console" | "mcp";
 
 /** The dock's default-selected tab. Censor is the star of the Work-mode dock
  *  (the placeholder this phase, real UI in Phase E). */
@@ -460,6 +460,8 @@ export const DOCK_TABS: { id: DockTab; label: string }[] = [
   // The structured agent-activity timeline (the complement to the raw xterm). Its
   // tab shows a spinner + run-count when a mini run is active for the selected agent.
   { id: "console", label: "Console" },
+  // Project-scoped user MCP servers (Phase A.3).
+  { id: "mcp", label: "MCP" },
 ];
 
 // ---- plan approval model ---------------------------------------------------
