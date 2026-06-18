@@ -260,6 +260,202 @@ pub fn validate_cloud_base_url(base_url: &str) -> Result<String, String> {
     Ok(trimmed.strip_suffix('/').unwrap_or(trimmed).to_string())
 }
 
+// ---------------------------------------------------------------------------
+// SSRF guard: pure IP classifier + reqwest DNS resolver
+// ---------------------------------------------------------------------------
+
+/// Returns `true` for any IPv4 address that is not safely routable on the public Internet.
+/// Pure function — no I/O, no allocations, deterministic. Safe to unit-test without network.
+fn is_blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+
+    // 0.0.0.0/8 — "this network" (RFC 1122). Covers `is_unspecified()` (0.0.0.0).
+    if o[0] == 0 {
+        return true;
+    }
+
+    // 10/8, 172.16/12, 192.168/16 — RFC 1918 private.
+    if ip.is_private() {
+        return true;
+    }
+
+    // 127/8 loopback (covers 127.0.0.1).
+    if ip.is_loopback() {
+        return true;
+    }
+
+    // 169.254/16 link-local — also covers 169.254.169.254 cloud metadata.
+    if ip.is_link_local() {
+        return true;
+    }
+
+    // 100.64.0.0/10 CGNAT (RFC 6598) — std has no helper.
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return true;
+    }
+
+    // 192.0.0.0/24 — IETF Protocol Assignments (RFC 6890).
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return true;
+    }
+
+    // 192.88.99.0/24 — 6to4 relay anycast (RFC 3068).
+    if o[0] == 192 && o[1] == 88 && o[2] == 99 {
+        return true;
+    }
+
+    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 — TEST-NET (RFC 5737).
+    if ip.is_documentation() {
+        return true;
+    }
+
+    // 198.18.0.0/15 — benchmarking (RFC 2544). std `is_documentation()` does not cover this.
+    if o[0] == 198 && (18..=19).contains(&o[1]) {
+        return true;
+    }
+
+    // 224.0.0.0/4 multicast (RFC 5771).
+    if ip.is_multicast() {
+        return true;
+    }
+
+    // 240.0.0.0/4 reserved for future use (RFC 1112). Includes broadcast 255.255.255.255.
+    if o[0] >= 240 {
+        return true;
+    }
+
+    false
+}
+
+/// Returns `true` for any IPv6 address that is not safely routable on the public Internet.
+/// Pure function — no I/O, no allocations, deterministic.
+fn is_blocked_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+
+    // IPv4-mapped (::ffff:a.b.c.d) — most common rebinding attack vector. Recurse into the v4
+    // rules so `::ffff:127.0.0.1` and `::ffff:169.254.169.254` are blocked.
+    // `Ipv6Addr::to_ipv4_mapped()` is stable since Rust 1.63.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_blocked_ipv4(v4);
+    }
+
+    // ::1 loopback.
+    if ip.is_loopback() {
+        return true;
+    }
+
+    // :: unspecified.
+    if ip.is_unspecified() {
+        return true;
+    }
+
+    // ff00::/8 multicast (RFC 4291).
+    if ip.is_multicast() {
+        return true;
+    }
+
+    // fc00::/7 unique-local (RFC 4193). `Ipv6Addr::is_unique_local()` only stabilized in
+    // Rust 1.84 — implement manually for portability across toolchains.
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return true;
+    }
+
+    // fe80::/10 unicast link-local (RFC 4291). `Ipv6Addr::is_unicast_link_local()` only
+    // stabilized in Rust 1.84 — implement manually for portability.
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return true;
+    }
+
+    // fec0::/10 site-local (RFC 3879, deprecated). Not globally routable.
+    if (s[0] & 0xffc0) == 0xfec0 {
+        return true;
+    }
+
+    // 2001:db8::/32 — IPv6 documentation (RFC 3849).
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return true;
+    }
+
+    // 64:ff9b::/96 — NAT64 (RFC 6052). Decode the embedded IPv4 from the low 32 bits
+    // and recurse so `64:ff9b::169.254.169.254` is blocked.
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        let v4 = std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        );
+        return is_blocked_ipv4(v4);
+    }
+
+    // IPv4-compatible (::a.b.c.d, RFC 4291, deprecated). First 96 bits are zero; the trailing
+    // 32 bits form a v4. (`to_ipv4_mapped()` does NOT match these — they lack the `::ffff:`
+    // marker.) Apply the v4 rules. Note: ::1 and :: already short-circuit above.
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        let v4 = std::net::Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        );
+        return is_blocked_ipv4(v4);
+    }
+
+    false
+}
+
+/// Exhaustive SSRF guard for the cloud LLM HTTP client: returns `true` for any IP address
+/// that must never be connected to (loopback, private, link-local incl. cloud metadata,
+/// CGNAT, documentation, benchmarking, multicast, reserved, IPv4-mapped-into-IPv6 forms,
+/// IPv4-compatible IPv6, ULA, site-local, etc.).
+/// Pure & allocation-free — fully unit-testable without network access.
+pub fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        std::net::IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+/// Stateless DNS resolver that drops any address `is_blocked_ip` flags as non-public.
+/// Reqwest's connector connects ONLY to the `SocketAddr`s this returns, so a public-looking
+/// hostname that resolves (at request time, via DNS rebinding / internal DNS / CNAME) to a
+/// private/loopback/metadata IP cannot be reached. Fails closed.
+#[derive(Clone, Debug)]
+pub struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            // `tokio::net::lookup_host` requires a host:port pair; port 0 is a placeholder —
+            // reqwest's connector supplies the real per-request port when dialing.
+            let resolved: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0u16))
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("SSRF resolver: DNS lookup failed for '{host}': {e}").into()
+                    })?
+                    .collect();
+
+            let survivors: Vec<std::net::SocketAddr> =
+                resolved.into_iter().filter(|sa| !is_blocked_ip(sa.ip())).collect();
+
+            if survivors.is_empty() {
+                // Fail closed: an attacker-controlled DNS record that resolves only to
+                // private/metadata IPs must NOT produce a connection.
+                return Err(format!(
+                    "SSRF resolver: every resolved IP for '{host}' is blocked \
+                     (private/loopback/link-local/metadata/CGNAT/reserved/ULA)"
+                )
+                .into());
+            }
+
+            Ok(Box::new(survivors.into_iter())
+                as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
+        })
+    }
+}
+
 /// The real loopback chat-completions model. Holds the validated+normalized base
 /// URL, the model id, a rustls reqwest client, and the plan-first prompt bias.
 pub struct OmlxModel {
@@ -586,6 +782,7 @@ impl CloudModel {
             // the burst's wall-clock check. A cloud round-trip can be slower than
             // loopback, but 60s still caps a hung connection.
             .timeout(std::time::Duration::from_secs(60))
+            .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         Ok(Self {
@@ -1086,5 +1283,423 @@ mod tests {
             !dbg.contains("sk-super-secret"),
             "the raw key must never appear in Debug: {dbg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ssrf_classifier_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+    fn v6(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h))
+    }
+    /// ::ffff:a.b.c.d — segments: [0,0,0,0,0,0xffff, (a<<8)|b, (c<<8)|d]
+    fn mapped(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0xffff,
+            ((a as u16) << 8) | b as u16,
+            ((c as u16) << 8) | d as u16,
+        ))
+    }
+
+    // --- Must be blocked: required by spec ---
+    #[test]
+    fn blocks_127_0_0_1() {
+        assert!(is_blocked_ip(v4(127, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_loopback_v6() {
+        assert!(is_blocked_ip(v6(0, 0, 0, 0, 0, 0, 0, 1))); // ::1
+    }
+    #[test]
+    fn blocks_10_0_0_1() {
+        assert!(is_blocked_ip(v4(10, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_172_16_0_1() {
+        assert!(is_blocked_ip(v4(172, 16, 0, 1)));
+    }
+    #[test]
+    fn blocks_172_31_255_255() {
+        assert!(is_blocked_ip(v4(172, 31, 255, 255)));
+    }
+    #[test]
+    fn blocks_192_168_1_1() {
+        assert!(is_blocked_ip(v4(192, 168, 1, 1)));
+    }
+    #[test]
+    fn blocks_metadata_169_254_169_254() {
+        assert!(is_blocked_ip(v4(169, 254, 169, 254)));
+    }
+    #[test]
+    fn blocks_0_0_0_0() {
+        assert!(is_blocked_ip(v4(0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_unspecified_v6() {
+        assert!(is_blocked_ip(v6(0, 0, 0, 0, 0, 0, 0, 0))); // ::
+    }
+    #[test]
+    fn blocks_fe80_1() {
+        assert!(is_blocked_ip(v6(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_fc00_1() {
+        assert!(is_blocked_ip(v6(0xfc00, 0, 0, 0, 0, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_fd00_1() {
+        assert!(is_blocked_ip(v6(0xfd00, 0, 0, 0, 0, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_cgnat_100_64_0_1() {
+        assert!(is_blocked_ip(v4(100, 64, 0, 1)));
+    }
+    #[test]
+    fn blocks_mapped_127_0_0_1() {
+        assert!(is_blocked_ip(mapped(127, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_mapped_10_0_0_1() {
+        assert!(is_blocked_ip(mapped(10, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_mapped_metadata() {
+        assert!(is_blocked_ip(mapped(169, 254, 169, 254)));
+    }
+
+    // --- Must NOT be blocked: required by spec ---
+    #[test]
+    fn allows_8_8_8_8() {
+        assert!(!is_blocked_ip(v4(8, 8, 8, 8)));
+    }
+    #[test]
+    fn allows_1_1_1_1() {
+        assert!(!is_blocked_ip(v4(1, 1, 1, 1)));
+    }
+    #[test]
+    fn allows_93_184_216_34() {
+        assert!(!is_blocked_ip(v4(93, 184, 216, 34)));
+    }
+    #[test]
+    fn allows_2606_4700_1111() {
+        assert!(!is_blocked_ip(v6(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)));
+    }
+
+    // --- Edge cases: CGNAT (100.64.0.0/10) boundaries ---
+    #[test]
+    fn allows_100_63_255_255_below_cgnat() {
+        assert!(!is_blocked_ip(v4(100, 63, 255, 255)));
+    }
+    #[test]
+    fn allows_100_128_0_0_above_cgnat() {
+        assert!(!is_blocked_ip(v4(100, 128, 0, 0)));
+    }
+    #[test]
+    fn blocks_100_64_0_0_cgnat_start() {
+        assert!(is_blocked_ip(v4(100, 64, 0, 0)));
+    }
+    #[test]
+    fn blocks_100_127_255_255_cgnat_end() {
+        assert!(is_blocked_ip(v4(100, 127, 255, 255)));
+    }
+
+    // --- Edge cases: RFC 1918 boundaries ---
+    #[test]
+    fn allows_172_15_255_255_below_private() {
+        assert!(!is_blocked_ip(v4(172, 15, 255, 255)));
+    }
+    #[test]
+    fn allows_172_32_0_0_above_private() {
+        assert!(!is_blocked_ip(v4(172, 32, 0, 0)));
+    }
+    #[test]
+    fn allows_11_0_0_1_above_10() {
+        assert!(!is_blocked_ip(v4(11, 0, 0, 1)));
+    }
+    #[test]
+    fn allows_9_255_255_255_below_10() {
+        assert!(!is_blocked_ip(v4(9, 255, 255, 255)));
+    }
+    #[test]
+    fn allows_192_167_255_255_below_private() {
+        assert!(!is_blocked_ip(v4(192, 167, 255, 255)));
+    }
+    #[test]
+    fn allows_192_169_0_0_above_private() {
+        assert!(!is_blocked_ip(v4(192, 169, 0, 0)));
+    }
+
+    // --- 0.0.0.0/8 "this network" beyond just 0.0.0.0 ---
+    #[test]
+    fn blocks_0_0_0_1() {
+        assert!(is_blocked_ip(v4(0, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_0_255_255_255() {
+        assert!(is_blocked_ip(v4(0, 255, 255, 255)));
+    }
+
+    // --- Loopback variants ---
+    #[test]
+    fn blocks_127_0_0_0() {
+        assert!(is_blocked_ip(v4(127, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_127_255_255_254() {
+        assert!(is_blocked_ip(v4(127, 255, 255, 254)));
+    }
+
+    // --- Link-local boundaries ---
+    #[test]
+    fn blocks_169_254_0_0() {
+        assert!(is_blocked_ip(v4(169, 254, 0, 0)));
+    }
+    #[test]
+    fn blocks_169_254_255_255() {
+        assert!(is_blocked_ip(v4(169, 254, 255, 255)));
+    }
+    #[test]
+    fn allows_169_253_255_255_below_linklocal() {
+        assert!(!is_blocked_ip(v4(169, 253, 255, 255)));
+    }
+    #[test]
+    fn allows_169_255_255_255_above_linklocal() {
+        assert!(!is_blocked_ip(v4(169, 255, 255, 255)));
+    }
+
+    // --- Multicast ---
+    #[test]
+    fn blocks_224_0_0_1() {
+        assert!(is_blocked_ip(v4(224, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_239_255_255_255() {
+        assert!(is_blocked_ip(v4(239, 255, 255, 255)));
+    }
+    #[test]
+    fn allows_223_255_255_255_below_multicast() {
+        assert!(!is_blocked_ip(v4(223, 255, 255, 255)));
+    }
+    #[test]
+    fn blocks_v6_multicast_ff02_1() {
+        assert!(is_blocked_ip(v6(0xff02, 0, 0, 0, 0, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_v6_multicast_ff00_0() {
+        assert!(is_blocked_ip(v6(0xff00, 0, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_v6_multicast_fffe_high() {
+        assert!(is_blocked_ip(v6(0xffff, 0xffff, 0, 0, 0, 0, 0, 1)));
+    }
+
+    // --- Reserved / broadcast (240.0.0.0/4) ---
+    #[test]
+    fn blocks_240_0_0_0() {
+        assert!(is_blocked_ip(v4(240, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_250_0_0_1() {
+        assert!(is_blocked_ip(v4(250, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_255_255_255_255_broadcast() {
+        assert!(is_blocked_ip(v4(255, 255, 255, 255)));
+    }
+
+    // --- Documentation (RFC 5737) and benchmarking (RFC 2544) ---
+    #[test]
+    fn blocks_doc_192_0_2_x() {
+        assert!(is_blocked_ip(v4(192, 0, 2, 123)));
+    }
+    #[test]
+    fn blocks_doc_198_51_100_x() {
+        assert!(is_blocked_ip(v4(198, 51, 100, 5)));
+    }
+    #[test]
+    fn blocks_doc_203_0_113_x() {
+        assert!(is_blocked_ip(v4(203, 0, 113, 99)));
+    }
+    #[test]
+    fn blocks_benchmark_198_18_x() {
+        assert!(is_blocked_ip(v4(198, 18, 0, 1)));
+    }
+    #[test]
+    fn blocks_benchmark_198_19_x() {
+        assert!(is_blocked_ip(v4(198, 19, 255, 255)));
+    }
+    #[test]
+    fn allows_198_17_255_255_below_benchmark() {
+        assert!(!is_blocked_ip(v4(198, 17, 255, 255)));
+    }
+    #[test]
+    fn allows_198_20_0_0_above_benchmark() {
+        assert!(!is_blocked_ip(v4(198, 20, 0, 0)));
+    }
+
+    // --- IETF Protocol Assignments (192.0.0.0/24, RFC 6890) ---
+    #[test]
+    fn blocks_192_0_0_1() {
+        assert!(is_blocked_ip(v4(192, 0, 0, 1)));
+    }
+    #[test]
+    fn blocks_192_0_0_171() {
+        assert!(is_blocked_ip(v4(192, 0, 0, 171)));
+    }
+    #[test]
+    fn allows_192_0_1_1_boundary() {
+        assert!(!is_blocked_ip(v4(192, 0, 1, 1)));
+    }
+
+    // --- 6to4 relay anycast (192.88.99.0/24, RFC 3068) ---
+    #[test]
+    fn blocks_192_88_99_1() {
+        assert!(is_blocked_ip(v4(192, 88, 99, 1)));
+    }
+    #[test]
+    fn allows_192_89_0_0_boundary() {
+        assert!(!is_blocked_ip(v4(192, 89, 0, 0)));
+    }
+
+    // --- IPv4-mapped (::ffff:a.b.c.d): public maps allowed, private maps blocked ---
+    #[test]
+    fn allows_mapped_8_8_8_8() {
+        assert!(!is_blocked_ip(mapped(8, 8, 8, 8)));
+    }
+    #[test]
+    fn allows_mapped_1_1_1_1() {
+        assert!(!is_blocked_ip(mapped(1, 1, 1, 1)));
+    }
+    #[test]
+    fn blocks_mapped_0_0_0_0() {
+        assert!(is_blocked_ip(mapped(0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_mapped_192_168_1_1() {
+        assert!(is_blocked_ip(mapped(192, 168, 1, 1)));
+    }
+    #[test]
+    fn blocks_mapped_100_64_0_1_cgnat() {
+        assert!(is_blocked_ip(mapped(100, 64, 0, 1)));
+    }
+    #[test]
+    fn blocks_mapped_172_31_255_255() {
+        assert!(is_blocked_ip(mapped(172, 31, 255, 255)));
+    }
+    #[test]
+    fn blocks_mapped_255_255_255_255() {
+        assert!(is_blocked_ip(mapped(255, 255, 255, 255)));
+    }
+
+    // --- IPv4-compatible (::a.b.c.d, deprecated) ---
+    #[test]
+    fn blocks_v4_compatible_127_0_0_1() {
+        // ::127.0.0.1 -> segments [0,0,0,0,0,0,0x7f00,0x0001]
+        assert!(is_blocked_ip(v6(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001)));
+    }
+    #[test]
+    fn blocks_v4_compatible_10_0_0_1() {
+        assert!(is_blocked_ip(v6(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001)));
+    }
+    #[test]
+    fn allows_v4_compatible_8_8_8_8() {
+        assert!(!is_blocked_ip(v6(0, 0, 0, 0, 0, 0, 0x0808, 0x0808)));
+    }
+
+    // --- NAT64 (64:ff9b::/96, RFC 6052) ---
+    #[test]
+    fn blocks_nat64_metadata() {
+        // 64:ff9b::169.254.169.254
+        assert!(is_blocked_ip(v6(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe)));
+    }
+
+    // --- IPv6 ULA (fc00::/7) & link-local (fe80::/10) boundaries ---
+    #[test]
+    fn blocks_fc00_0_0() {
+        assert!(is_blocked_ip(v6(0xfc00, 0, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_fdff_ff_ff() {
+        assert!(is_blocked_ip(v6(0xfdff, 0xffff, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn allows_fbff_ffff_below_ula() {
+        assert!(!is_blocked_ip(v6(0xfbff, 0xffff, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_fe80_0_0() {
+        assert!(is_blocked_ip(v6(0xfe80, 0, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_febf_ffff() {
+        assert!(is_blocked_ip(v6(0xfebf, 0xffff, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn allows_fe7f_ffff_below_linklocal() {
+        assert!(!is_blocked_ip(v6(0xfe7f, 0xffff, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_fec0_0_0_site_local() {
+        // fec0::/10 is its own (deprecated site-local) block — intentionally blocked.
+        assert!(is_blocked_ip(v6(0xfec0, 0, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_site_local_feff_high() {
+        assert!(is_blocked_ip(v6(0xfeff, 0xffff, 0, 0, 0, 0, 0, 0)));
+    }
+    #[test]
+    fn blocks_2001_db8_1_doc_prefix() {
+        // 2001:db8::/32 is IPv6 documentation (RFC 3849) — now blocked.
+        assert!(is_blocked_ip(v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+    }
+
+    // --- Smoke test: spec-required full block list all TRUE ---
+    #[test]
+    fn required_blocklist_all_true() {
+        let blocked = [
+            v4(127, 0, 0, 1),
+            v6(0, 0, 0, 0, 0, 0, 0, 1), // ::1
+            v4(10, 0, 0, 1),
+            v4(172, 16, 0, 1),
+            v4(172, 31, 255, 255),
+            v4(192, 168, 1, 1),
+            v4(169, 254, 169, 254),
+            v4(0, 0, 0, 0),
+            v6(0, 0, 0, 0, 0, 0, 0, 0), // ::
+            v6(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            v6(0xfc00, 0, 0, 0, 0, 0, 0, 1),
+            v6(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            v4(100, 64, 0, 1),
+            mapped(127, 0, 0, 1),
+            mapped(10, 0, 0, 1),
+            mapped(169, 254, 169, 254),
+        ];
+        for ip in blocked {
+            assert!(is_blocked_ip(ip), "{ip} should be blocked");
+        }
+    }
+
+    // --- Smoke test: spec-required full allow list all FALSE ---
+    #[test]
+    fn required_allowlist_all_false() {
+        let allowed = [
+            v4(8, 8, 8, 8),
+            v4(1, 1, 1, 1),
+            v4(93, 184, 216, 34),
+            v6(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111),
+        ];
+        for ip in allowed {
+            assert!(!is_blocked_ip(ip), "{ip} should be allowed");
+        }
     }
 }
