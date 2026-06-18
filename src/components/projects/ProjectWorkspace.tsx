@@ -138,6 +138,7 @@ export function ProjectWorkspace({
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
+  const [costTotalUsd, setCostTotalUsd] = useState<number | null>(null);
 
   // The previous sessions snapshot, so reconcile can tell whether a now-gone
   // selection WAS a mini (and thus fall back to its parent, not the freshest).
@@ -208,6 +209,21 @@ export function ProjectWorkspace({
   const consoleActivity = useAgentConsole(selectedAgentId);
   const consoleRunning = Boolean(consoleActivity.running);
   const consoleCount = consoleRunCount(consoleActivity);
+
+  // P2 cost: fetch running cost total on mount and whenever a new task estimate arrives.
+  useEffect(() => {
+    let cancelled = false;
+    invokeBackendCommand<{ totalUsd: number; byModel: Record<string, number> }>(
+      "get_cost_summary"
+    )
+      .then((summary) => {
+        if (!cancelled) setCostTotalUsd(summary.totalUsd);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [consoleActivity?.taskCostEstimateUsd]);
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
   // two-step confirm): `mini_coder_kill` records killRequested THEN kills the PTY so
@@ -559,6 +575,18 @@ export function ProjectWorkspace({
               <div className="min-h-0 flex-1 overflow-y-auto">
                 <AgentConsole activity={consoleActivity} />
               </div>
+              {(consoleActivity?.taskCostEstimateUsd != null || costTotalUsd != null) && (
+                <div className="flex items-center justify-end gap-3 border-t border-cream-100 px-3 py-1 text-[11px] text-cream-500">
+                  {consoleActivity?.taskCostEstimateUsd != null && (
+                    <span>
+                      est. task ~${consoleActivity.taskCostEstimateUsd.toFixed(4)}
+                    </span>
+                  )}
+                  {costTotalUsd != null && (
+                    <span>total ~${costTotalUsd.toFixed(2)} (est)</span>
+                  )}
+                </div>
+              )}
               <MiniSteerBar agentId={selectedAgentId} />
             </div>
           )}

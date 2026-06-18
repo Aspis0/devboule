@@ -257,7 +257,7 @@ pub enum ConsoleEntry {
 /// The whole console state for ONE agent — the exact shape `mini_activity_snapshot` returns
 /// and the shape every `MiniActivityEvent` is applied INTO. All fields optional so an
 /// absent/partial snapshot degrades to the calm empty state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleActivity {
     /// A run is in flight => the Console tab shows a spinner + `runCount`.
@@ -272,6 +272,10 @@ pub struct ConsoleActivity {
     /// The timeline, oldest-first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<ConsoleEntry>>,
+    /// Estimated USD cost for the current task (P2 cost tracking).
+    /// `None` when the model is unpriced/free or unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_cost_estimate_usd: Option<f64>,
 }
 
 impl ConsoleActivity {
@@ -298,7 +302,7 @@ impl ConsoleActivity {
 /// header): a full replace is idempotent under the hook's buffer-and-replay, append deltas
 /// are not. Tagged exactly like the TS `MiniActivityEvent` snapshot member:
 /// `{"type":"snapshot","activity":{...}}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum MiniActivityEvent {
     Snapshot { activity: ConsoleActivity },
@@ -511,6 +515,7 @@ pub fn build_initial(model: &str, label: &str, scope: &[String], round_n: u32) -
             time: String::new(),
             mini,
         }]),
+        task_cost_estimate_usd: None,
     }
 }
 
@@ -2049,5 +2054,26 @@ mod tests {
         let action = &mini.rounds[0].actions[0];
         assert_eq!(action.kind, ActionKind::Write);
         assert_eq!(action.diff, diffs, "diff must be threaded through to the Action");
+    }
+
+    #[test]
+    fn task_cost_estimate_usd_serializes_camel_case() {
+        let activity = ConsoleActivity {
+            task_cost_estimate_usd: Some(0.03),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&activity).unwrap();
+        assert!(
+            json.contains("\"taskCostEstimateUsd\""),
+            "expected camelCase key in: {json}"
+        );
+        assert!(!json.contains("task_cost_estimate_usd"));
+    }
+
+    #[test]
+    fn task_cost_estimate_usd_omitted_when_none() {
+        let activity = ConsoleActivity::default();
+        let json = serde_json::to_string(&activity).unwrap();
+        assert!(!json.contains("taskCostEstimateUsd"));
     }
 }

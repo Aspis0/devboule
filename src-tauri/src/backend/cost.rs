@@ -238,6 +238,7 @@ pub fn estimate_task_cost(
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct CostLedger {
     #[serde(default)]
     pub total_usd: f64,

@@ -1206,18 +1206,27 @@ fn claim_and_launch(
         let label = console_run_label(directive);
         let scope = directive.files.clone();
         let round_n = directive.attempt.saturating_add(1);
+
+        // P2 cost: estimate + record on new tasks (attempt 0); persist across retries.
+        // Out of scope (P2b): capturing real usage.cost from the model client —
+        // for now the ledger accumulates ESTIMATES.
+        let est = backend
+            .model
+            .as_deref()
+            .and_then(|m| super::cost::estimate_task_cost(app.clone(), m.to_string()).ok().flatten());
+        if directive.attempt == 0 {
+            if let (Some(usd), Some(m)) = (est, backend.model.as_deref()) {
+                let _ = super::cost::record_cost(app.clone(), m.to_string(), usd);
+            }
+        }
+
         store.update(app, &agent_id, |a| {
-            // FIX 3: a retry CHAIN shares ONE agent_id (mini_agent_id collapses `{root}-r{N}`
-            // to the root id), so a blanket `build_initial` on EVERY launch would WIPE the
-            // predecessor's rounds (round 1's dirty verdict that caused the retry). Branch on
-            // `attempt`: the fresh original (attempt==0) ALWAYS reseeds (also re-arms an
-            // agent_id reused across unrelated originals); a retry (attempt>0) resumes the
-            // shared console additively, preserving the predecessor's closed rounds.
             if directive.attempt == 0 {
                 *a = super::mini_activity::build_initial(&model, &label, &scope, round_n);
             } else {
                 super::mini_activity::resume_retry_round(a, &model, &label, &scope, round_n);
             }
+            a.task_cost_estimate_usd = est;
         });
     }
 }

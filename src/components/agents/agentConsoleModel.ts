@@ -167,6 +167,8 @@ export interface ConsoleActivity {
   empty?: boolean;
   /** The timeline, oldest-first (the view marks the first/last for the gutter). */
   entries?: ConsoleEntry[];
+  /** Estimated USD cost for the current task (P2). Null/absent when model is unpriced. */
+  taskCostEstimateUsd?: number | null;
 }
 
 // ---- pure helpers (unit-tested in node) -------------------------------------
