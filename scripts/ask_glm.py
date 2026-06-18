@@ -150,7 +150,16 @@ def main() -> int:
     pout = usage.get("completion_tokens", 0)
     rtok = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
     cin, cout = PRICING.get(args.model, (0.0, 0.0))
-    cost = pin / 1e6 * cin + pout / 1e6 * cout
+    est_cost = pin / 1e6 * cin + pout / 1e6 * cout
+    # OpenRouter returns the ACTUAL charge in usage.cost — prefer it over the (often stale)
+    # hardcoded PRICING estimate. The estimate under-reported by ~2x for glm-5.2.
+    real_cost = usage.get("cost")
+    if isinstance(real_cost, (int, float)):
+        cost = float(real_cost)
+        cost_src = "real"
+    else:
+        cost = est_cost
+        cost_src = "est"
 
     if args.out:
         with open(args.out, "w") as f:
@@ -158,7 +167,7 @@ def main() -> int:
 
     print(
         f"[ask_glm] model={args.model} effort={args.effort or 'default'} finish={finish} "
-        f"in={pin} out={pout} (reasoning={rtok}) cost~${cost:.4f} time={dt:.1f}s -> {args.out or 'stdout'}",
+        f"in={pin} out={pout} (reasoning={rtok}) cost=${cost:.4f}({cost_src}, est=${est_cost:.4f}) time={dt:.1f}s -> {args.out or 'stdout'}",
         file=sys.stderr,
     )
     if not args.out:
