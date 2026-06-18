@@ -87,7 +87,6 @@ export function ChangesDockTab({ project }: ChangesDockTabProps) {
       // No root: cancel any in-flight fetch and reset.
       requestToken.current++;
       setDiff("");
-      setEditors([]);
       setError(null);
       setLoading(false);
       return;
@@ -106,20 +105,8 @@ export function ChangesDockTab({ project }: ChangesDockTabProps) {
         if (token !== requestToken.current) return;
         setError(e instanceof Error ? e.message : String(e));
         setDiff("");
-      }
-
-      // WARNING 6: clear loading only after BOTH the diff and the editor probe have
-      // resolved, so the spinner doesn't stop mid-render (brief layout shift).
-      try {
-        const eds = await invokeBackendCommand<string[]>("list_external_editors", {});
-        if (token !== requestToken.current) return;
-        setEditors(eds ?? []);
-        setEditorError(null);
-      } catch (e) {
-        if (token !== requestToken.current) return;
-        setEditorError(e instanceof Error ? e.message : String(e));
-        setEditors([]);
       } finally {
+        // WARNING 6: only the latest fetch clears the loading flag.
         if (token === requestToken.current) setLoading(false);
       }
     })();
@@ -130,6 +117,29 @@ export function ChangesDockTab({ project }: ChangesDockTabProps) {
       requestToken.current++;
     };
   }, [projectId, rootPath]);
+
+  // External editors are global (independent of the project / diff), so probe them
+  // exactly once on mount with their own cancel guard. Keeping this OUT of the diff
+  // effect means the Refresh button (which only refetches the diff) can never starve
+  // the editor probe — the "Open in <editor>" buttons always appear once resolved.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const eds = await invokeBackendCommand<string[]>("list_external_editors", {});
+        if (cancelled) return;
+        setEditors(eds ?? []);
+        setEditorError(null);
+      } catch (e) {
+        if (cancelled) return;
+        setEditorError(e instanceof Error ? e.message : String(e));
+        setEditors([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleOpenEditor = useCallback(
     async (editor: string) => {
@@ -182,7 +192,11 @@ export function ChangesDockTab({ project }: ChangesDockTabProps) {
         {prUrl && (
           <button
             type="button"
-            onClick={() => safeOpenExternal(prUrl)}
+            onClick={() => {
+              safeOpenExternal(prUrl).catch((e: unknown) =>
+                setEditorError(e instanceof Error ? e.message : "Could not open PR URL.")
+              );
+            }}
             className="flex items-center gap-1 rounded border border-cream-200 px-1.5 py-0.5 text-[11px] text-terracotta hover:bg-cream-100"
           >
             <SquareArrowOutUpRight size={11} />

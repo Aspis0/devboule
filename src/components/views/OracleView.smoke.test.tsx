@@ -96,4 +96,103 @@ describe("OracleView (restored standalone page)", () => {
     // limit 8 per the shared ask-flow contract.
     expect(askOracle.mock.calls[0][1]).toBe(8);
   });
+
+  // Regression (migrated from the deleted dashboard/OraclePanel.test.tsx): the
+  // ask flow must ignore a second submit while a query is already in flight. In
+  // OracleView the guard is the Ask button's `disabled={querying || …}` — once a
+  // query is running the button is disabled, so React drops the click and
+  // askOracle fires exactly once.
+  it("ignores a second submit while a query is in flight (one askOracle call)", async () => {
+    // Hold the first call pending so `querying` stays true across the 2nd click.
+    let resolveFirst!: (v: { answer: string; citations: never[] }) => void;
+    askOracle.mockReturnValueOnce(
+      new Promise((res) => {
+        resolveFirst = res;
+      }),
+    );
+
+    const { OracleView } = await import("./OracleView");
+    await act(async () => {
+      createRoot(container).render(createElement(OracleView));
+    });
+
+    const askBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Ask",
+    )! as HTMLButtonElement;
+
+    // First click → query starts, button becomes disabled.
+    await act(async () => {
+      askBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+    expect(askBtn.disabled).toBe(true);
+
+    // Second click while in flight → ignored (disabled button drops the event).
+    await act(async () => {
+      askBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    // Resolve the first call.
+    await act(async () => {
+      resolveFirst({ answer: "ok", citations: [] });
+      await Promise.resolve();
+    });
+
+    expect(askOracle).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression (migrated from the deleted dashboard/OraclePanel.test.tsx): the
+  // mountedRef guard must prevent any setState after unmount. Unmounting mid-query
+  // and then resolving the in-flight promise must not throw or emit an act()
+  // warning (which would be a setState-after-unmount).
+  it("does not setState after unmount when a query resolves post-unmount", async () => {
+    let resolveQ!: (v: { answer: string; citations: never[] }) => void;
+    askOracle.mockReturnValueOnce(
+      new Promise((res) => {
+        resolveQ = res;
+      }),
+    );
+
+    // Spy on console.error so a setState-after-unmount (which React reports via
+    // an act()/"unmounted component" warning, NOT a throw) fails this test. With
+    // the mountedRef guard in place there must be zero such warnings.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const { OracleView } = await import("./OracleView");
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(createElement(OracleView));
+      });
+
+      const askBtn = Array.from(container.querySelectorAll("button")).find(
+        (b) => b.textContent?.trim() === "Ask",
+      )! as HTMLButtonElement;
+
+      await act(async () => {
+        askBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+
+      // Unmount while the query is still in flight.
+      await act(async () => {
+        root.unmount();
+      });
+
+      // Resolving after unmount must be a no-op (mountedRef === false): no throw.
+      await expect(
+        act(async () => {
+          resolveQ({ answer: "ok", citations: [] });
+          await Promise.resolve();
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(askOracle).toHaveBeenCalledTimes(1);
+      // No setState-after-unmount / act() warning was emitted.
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });

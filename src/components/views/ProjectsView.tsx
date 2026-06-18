@@ -1559,7 +1559,7 @@ export function ProjectsView() {
   // handlers/state (moveTask, createTask, appendNote, noteDraft, …). The `?`-guard
   // narrows currentProject to non-null inside each branch, so the moved JSX's
   // existing currentProject uses still type-check; absent → null renders nothing.
-  const notesNode = currentProject ? (
+  const notesNode = workMode && currentProject ? (
     <ProjectNotes
       notes={currentProject.state.notes}
       noteDraft={noteDraft}
@@ -1575,7 +1575,7 @@ export function ProjectsView() {
     />
   ) : null;
 
-  const taskBoardNode = currentProject ? (
+  const taskBoardNode = workMode && currentProject ? (
     <CollapsibleSection
       icon={FolderKanban}
       title="Tasks"
