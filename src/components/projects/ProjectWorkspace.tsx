@@ -57,6 +57,7 @@ import { PlansDockTab } from "./PlansPanel";
 import { ProjectWorkspaceAgentRail } from "./ProjectWorkspaceAgentRail";
 import { PushApprovalCard } from "./PushApprovalCard";
 import { ProjectMcpServersCard } from "./ProjectMcpServersCard";
+import { ChangesDockTab } from "./ChangesDockTab";
 import {
   DEFAULT_DOCK_TAB,
   DOCK_TABS,
@@ -718,6 +719,8 @@ export function ProjectWorkspace({
                 No project root path — cannot load MCP servers.
               </p>
             ))}
+
+          {dockTab === "changes" && <ChangesDockTab project={project} />}
         </div>
       </div>
 

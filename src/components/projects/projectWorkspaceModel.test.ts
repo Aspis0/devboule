@@ -719,16 +719,18 @@ describe("dock", () => {
     expect(DOCK_TABS[0].id).toBe("censor");
   });
 
-  it("exposes the five tabs in order (MCP tab added in Phase A.3)", () => {
+  it("exposes the six tabs in order (Changes tab added in Fase 2)", () => {
     expect(DOCK_TABS.map((t) => t.id)).toEqual([
       "censor",
       "git",
       "plans",
       "console",
       "mcp",
+      "changes",
     ]);
     expect(DOCK_TABS.find((t) => t.id === "console")!.label).toBe("Console");
     expect(DOCK_TABS.find((t) => t.id === "mcp")!.label).toBe("MCP");
+    expect(DOCK_TABS.find((t) => t.id === "changes")!.label).toBe("Changes");
   });
 });
 

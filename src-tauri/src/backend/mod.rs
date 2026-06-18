@@ -4,6 +4,7 @@ pub mod agents;
 pub mod agent_notifications;
 pub mod auth;
 pub mod censor;
+pub mod changes;
 pub mod cli_agents;
 pub mod commands;
 pub mod cost;

@@ -446,7 +446,7 @@ export function miniKillCall(session: AgentSession): IpcCall | null {
 
 // ---- bottom dock ------------------------------------------------------------
 
-export type DockTab = "censor" | "git" | "plans" | "console" | "mcp";
+export type DockTab = "censor" | "git" | "plans" | "console" | "mcp" | "changes";
 
 /** The dock's default-selected tab. Censor is the star of the Work-mode dock
  *  (the placeholder this phase, real UI in Phase E). */
@@ -461,6 +461,9 @@ export const DOCK_TABS: { id: DockTab; label: string }[] = [
   { id: "console", label: "Console" },
   // Project-scoped user MCP servers (Phase A.3).
   { id: "mcp", label: "MCP" },
+  // Read-only working-tree diff + "Open in <editor>" / Open-PR launchers (open the
+  // change in an external reviewer; we do not embed one). Fase 2.
+  { id: "changes", label: "Changes" },
 ];
 
 // ---- plan approval model ---------------------------------------------------
