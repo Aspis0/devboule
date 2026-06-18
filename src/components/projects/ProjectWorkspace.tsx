@@ -46,6 +46,7 @@ import type {
 import type { CustomAgentClient } from "../../types/config";
 import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
 import { AgentConsole } from "../agents/AgentConsole";
+import { AgentTimelineStrip } from "../agents/AgentTimelineStrip";
 import { consoleRunCount } from "../agents/agentConsoleModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
@@ -692,6 +693,7 @@ export function ProjectWorkspace({
             // flex child without a definite height, so the empty state pins to the
             // top instead of centering.
             <div className="flex h-[348px] flex-col">
+              <AgentTimelineStrip activity={consoleActivity} />
               <div className="min-h-0 flex-1 overflow-y-auto">
                 <AgentConsole activity={consoleActivity} />
               </div>
