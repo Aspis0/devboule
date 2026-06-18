@@ -20,6 +20,7 @@
 //! single invalid entry is skipped with a warning, the rest are kept.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -508,12 +509,94 @@ fn validate_server(server: &UserMcpServer) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// §9 allowlist — global command allowlist for project-scoped MCP servers
+// ---------------------------------------------------------------------------
+
+const ALLOWED_COMMANDS_FILENAME: &str = "user-mcp-allowed-commands.json";
+
+/// On-disk shape: `{ "allowedCommands": ["python", "node", "/usr/local/bin/my-mcp"] }`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AllowedCommandsFile {
+    #[serde(default)]
+    allowed_commands: Vec<String>,
+}
+
+/// Resolve `<app-data>/user-mcp-allowed-commands.json` (mirrors `global_config_path`).
+fn global_allowed_commands_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "App data directory is unavailable.".to_string())?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Could not create the app data directory: {e}"))?;
+    Ok(dir.join(ALLOWED_COMMANDS_FILENAME))
+}
+
+/// Load the global command allowlist.
+///
+/// **Fail-open to an EMPTY set on ANY error** (missing / unreadable / oversized /
+/// bad JSON).  An empty set means ALL project-scoped servers are rejected
+/// (fail-secure for project scope) — the user must explicitly allowlist a command
+/// before a project config can use it.  Global-scoped servers are exempt.
+///
+/// Matching is EXACT string match on the trimmed `command` field.
+/// Path canonicalisation is a future refinement.
+fn load_allowed_commands(app: &tauri::AppHandle) -> BTreeSet<String> {
+    let path = match global_allowed_commands_path(app) {
+        Ok(p) => p,
+        Err(_) => return BTreeSet::new(),
+    };
+    load_allowed_commands_from_path(&path)
+}
+
+/// Path-based loader so tests can exercise the logic without an `AppHandle`.
+fn load_allowed_commands_from_path(path: &Path) -> BTreeSet<String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return BTreeSet::new(),
+    };
+    if !meta.is_file() {
+        return BTreeSet::new();
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        return BTreeSet::new();
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return BTreeSet::new(),
+    };
+    let parsed: AllowedCommandsFile = match serde_json::from_str(&contents) {
+        Ok(f) => f,
+        Err(_) => return BTreeSet::new(),
+    };
+    parsed
+        .allowed_commands
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Path-based writer used by the Tauri commands and tests.
+fn write_allowed_commands_to_path(path: &Path, commands: &BTreeSet<String>) -> Result<(), String> {
+    let file = AllowedCommandsFile {
+        allowed_commands: commands.iter().cloned().collect(),
+    };
+    let contents = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("Could not serialize allowed commands: {e}"))?;
+    super::design::atomic_write(path, &contents, "user-mcp-allowed-commands.json")
+}
+
+// ---------------------------------------------------------------------------
 // Merge — the launch-injection entry point
 // ---------------------------------------------------------------------------
 
-/// The merged, enabled set of user MCP servers for a launch (design §2.1, §5.1):
+/// The merged, enabled set of user MCP servers for a launch (design §2.1, §5.1, §9):
 /// `global ∪ project`, PROJECT WINS on a name collision, then filter to `enabled == true`.
-/// Sorted by name for deterministic launch-config output (byte-stable across runs).
+/// Project-scoped servers are additionally gated through the global command allowlist
+/// (§9): a project server whose `command` is not in the allowlist is rejected fail-secure.
+/// Global-scoped servers are exempt from the allowlist (the user owns their global config).
 ///
 /// FAIL-OPEN end to end: every read returns empty on any failure, so a missing/broken
 /// config never blocks a coder launch. The Oracle (`aspis-management`) is NOT included —
@@ -522,19 +605,53 @@ fn validate_server(server: &UserMcpServer) -> Result<(), String> {
 /// `project_root` is the project directory; an empty/unreadable root contributes no project
 /// servers (global still applies). This is the ONE function the MAIN-coder launch path calls.
 pub(crate) fn merged_servers(app: &tauri::AppHandle, project_root: &Path) -> Vec<UserMcpServer> {
-    // Global first, project overlaid on top so project keys WIN on collision.
+    let global_path = global_config_path(app).ok();
+    let project_path = project_root
+        .to_str()
+        .and_then(|s| project_config_path(s).ok());
+    let allowed = load_allowed_commands(app);
+    merged_servers_inner(global_path.as_deref(), project_path.as_deref(), &allowed)
+}
+
+/// Internal merge that takes explicit paths so tests can fabricate global-vs-project
+/// configs without an `AppHandle`.  Scope is distinguished by origin: entries from
+/// `global_path` are GLOBAL (allowlist-exempt); entries from `project_path` are
+/// PROJECT (allowlist-gated).
+fn merged_servers_inner(
+    global_path: Option<&Path>,
+    project_path: Option<&Path>,
+    allowed: &BTreeSet<String>,
+) -> Vec<UserMcpServer> {
     let mut merged: BTreeMap<String, UserMcpServerRecord> = BTreeMap::new();
-    if let Ok(global_path) = global_config_path(app) {
-        merged.extend(read_config_file(&global_path).mcp_servers);
+
+    // GLOBAL scope: the user owns their global config → exempt from the allowlist.
+    if let Some(gp) = global_path {
+        merged.extend(read_config_file(gp).mcp_servers);
     }
-    // Project root may not be canonicalizable (e.g. a transient path) — fail open to "no
-    // project servers" rather than erroring the whole launch.
-    if let Some(root_str) = project_root.to_str() {
-        if let Ok(project_path) = project_config_path(root_str) {
-            // `extend` overwrites existing keys ⇒ project wins on collision.
-            merged.extend(read_config_file(&project_path).mcp_servers);
-        }
+
+    // PROJECT scope: git-versionable, so a malicious collaborator can commit one.
+    // Gate every command through the global allowlist BEFORE merging.
+    //
+    // Fail-secure posture: if the allowlist is absent/empty/malformed (→ empty set),
+    // ALL project-scoped servers are rejected.  The user must explicitly allowlist a
+    // command before a project config can use it.  Global-scoped servers are unaffected.
+    if let Some(pp) = project_path {
+        let mut project_config = read_config_file(pp);
+        project_config.mcp_servers.retain(|name, record| {
+            let cmd = record.command.trim();
+            if allowed.contains(cmd) {
+                true
+            } else {
+                eprintln!(
+                    "[user-mcp] skipping project server '{name}': command not in the global allowlist: {}",
+                    record.command
+                );
+                false
+            }
+        });
+        merged.extend(project_config.mcp_servers); // project wins on collision
     }
+
     merged
         .into_iter()
         .map(|(name, record)| server_from_keyed(name, record))
@@ -749,6 +866,64 @@ pub fn user_mcp_set_enabled(
     let _guard = design_write_guard()?;
     let path = resolve_path(&app, scope, project_root.as_deref())?;
     set_enabled_impl(&path, &name, enabled)
+}
+
+/// List the globally-allowlisted MCP commands. Returns an empty list if the file is absent
+/// or malformed (fail-open semantics match the launch-time loader).
+#[tauri::command]
+pub fn user_mcp_allowed_commands_list(
+    state: State<'_, BackendState>,
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+    state.ensure_unlocked()?;
+    // Fail-open: returns an empty list if the file is absent/malformed.
+    let allowed = load_allowed_commands(&app);
+    Ok(allowed.into_iter().collect())
+}
+
+/// Add a command to the global allowlist. Validates the command is non-empty, has no
+/// control characters, and does not exceed 4096 characters. Deduplicates automatically.
+#[tauri::command]
+pub fn user_mcp_allowed_commands_add(
+    state: State<'_, BackendState>,
+    app: tauri::AppHandle,
+    command: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("Command must not be empty.".to_string());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("Command must not contain control characters.".to_string());
+    }
+    if trimmed.chars().count() > 4096 {
+        return Err("Command must not exceed 4096 characters.".to_string());
+    }
+
+    let path = global_allowed_commands_path(&app)?;
+    let mut allowed = load_allowed_commands(&app);
+    allowed.insert(trimmed.to_string()); // BTreeSet dedupes
+    write_allowed_commands_to_path(&path, &allowed)
+}
+
+/// Remove a command from the global allowlist (idempotent: no-op if absent).
+#[tauri::command]
+pub fn user_mcp_allowed_commands_remove(
+    state: State<'_, BackendState>,
+    app: tauri::AppHandle,
+    command: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+
+    let trimmed = command.trim();
+    let path = global_allowed_commands_path(&app)?;
+    let mut allowed = load_allowed_commands(&app);
+    allowed.remove(trimmed);
+    write_allowed_commands_to_path(&path, &allowed)
 }
 
 #[cfg(test)]
@@ -1334,5 +1509,158 @@ mod tests {
         assert_eq!(listed[0].name, "proj-srv");
         assert!(root.join(".devboule").join("mcp-servers.json").is_file());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("user-mcp-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a config file with the given `(name, command)` pairs.
+    /// Assumes the standard MCP JSON shape `{ "mcpServers": { … } }` and that
+    /// `UserMcpServerRecord` accepts `command`, `args`, `env` (extra fields are
+    /// ignored by serde; missing optional fields fall back to `#[serde(default)]`).
+    fn write_test_config(path: &Path, servers: &[(&str, &str)]) {
+        let mut map = serde_json::Map::new();
+        for (name, cmd) in servers {
+            map.insert(
+                name.to_string(),
+                serde_json::json!({ "command": cmd, "args": [], "env": {}, "transport": "stdio" }),
+            );
+        }
+        let json = serde_json::json!({ "mcpServers": map });
+        std::fs::write(path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    fn write_test_allowlist(path: &Path, commands: &[&str]) {
+        let json = serde_json::json!({ "allowedCommands": commands });
+        std::fs::write(path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    /// Collect server names from a merge result for easy assertion.
+    fn names_of(servers: &[UserMcpServer]) -> Vec<String> {
+        servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn project_server_with_allowed_command_is_kept() {
+        let dir = temp_dir();
+        let project = dir.join("project.json");
+        let allowlist = dir.join("allowlist.json");
+
+        write_test_config(&project, &[("my-server", "python")]);
+        write_test_allowlist(&allowlist, &["python"]);
+
+        let allowed = load_allowed_commands_from_path(&allowlist);
+        let servers = merged_servers_inner(None, Some(&project), &allowed);
+
+        assert_eq!(names_of(&servers), vec!["my-server".to_string()]);
+    }
+
+    #[test]
+    fn project_server_with_unallowed_command_is_skipped() {
+        let dir = temp_dir();
+        let project = dir.join("project.json");
+        let allowlist = dir.join("allowlist.json");
+
+        write_test_config(&project, &[("allowed-srv", "python"), ("blocked-srv", "bash")]);
+        write_test_allowlist(&allowlist, &["python"]);
+
+        let allowed = load_allowed_commands_from_path(&allowlist);
+        let servers = merged_servers_inner(None, Some(&project), &allowed);
+
+        // "blocked-srv" is skipped; "allowed-srv" survives.
+        assert_eq!(names_of(&servers), vec!["allowed-srv".to_string()]);
+    }
+
+    #[test]
+    fn global_server_is_exempt_from_allowlist() {
+        let dir = temp_dir();
+        let global = dir.join("global.json");
+        let project = dir.join("project.json");
+        let allowlist = dir.join("allowlist.json");
+
+        write_test_config(&global, &[("global-server", "bash")]);
+        write_test_config(&project, &[("project-server", "bash")]);
+        write_test_allowlist(&allowlist, &["python"]); // "bash" NOT allowed
+
+        let allowed = load_allowed_commands_from_path(&allowlist);
+        let servers = merged_servers_inner(Some(&global), Some(&project), &allowed);
+
+        // Global server kept (exempt); project server rejected.
+        assert_eq!(names_of(&servers), vec!["global-server".to_string()]);
+    }
+
+    #[test]
+    fn empty_allowlist_rejects_all_project_servers() {
+        let dir = temp_dir();
+        let global = dir.join("global.json");
+        let project = dir.join("project.json");
+
+        write_test_config(&global, &[("global-server", "bash")]);
+        write_test_config(&project, &[("proj-a", "python"), ("proj-b", "node")]);
+
+        // No allowlist file → empty set → fail-secure for project scope.
+        let allowed: BTreeSet<String> = BTreeSet::new();
+        let servers = merged_servers_inner(Some(&global), Some(&project), &allowed);
+
+        // All project servers rejected; global server still kept.
+        assert_eq!(names_of(&servers), vec!["global-server".to_string()]);
+    }
+
+    #[test]
+    fn malformed_allowlist_failopens_to_empty() {
+        let dir = temp_dir();
+        let project = dir.join("project.json");
+        let allowlist = dir.join("allowlist.json");
+
+        write_test_config(&project, &[("server", "python")]);
+        std::fs::write(&allowlist, "{ this is not valid json").unwrap();
+
+        let allowed = load_allowed_commands_from_path(&allowlist);
+        assert!(allowed.is_empty(), "malformed allowlist must fail-open to empty");
+
+        let servers = merged_servers_inner(None, Some(&project), &allowed);
+        assert!(servers.is_empty(), "project servers must be rejected when allowlist is empty");
+    }
+
+    #[test]
+    fn allowed_commands_round_trip() {
+        let dir = temp_dir();
+        let path = dir.join("allowlist.json");
+
+        // File absent → empty.
+        assert!(load_allowed_commands_from_path(&path).is_empty());
+
+        // Add "python" and "node".
+        let mut allowed = load_allowed_commands_from_path(&path);
+        allowed.insert("python".to_string());
+        allowed.insert("node".to_string());
+        write_allowed_commands_to_path(&path, &allowed).unwrap();
+
+        let list = load_allowed_commands_from_path(&path);
+        assert_eq!(list.len(), 2);
+        assert!(list.contains("python"));
+        assert!(list.contains("node"));
+
+        // Remove "python".
+        let mut allowed = load_allowed_commands_from_path(&path);
+        allowed.remove("python");
+        write_allowed_commands_to_path(&path, &allowed).unwrap();
+
+        let list = load_allowed_commands_from_path(&path);
+        assert_eq!(list.len(), 1);
+        assert!(list.contains("node"));
+        assert!(!list.contains("python"));
     }
 }
