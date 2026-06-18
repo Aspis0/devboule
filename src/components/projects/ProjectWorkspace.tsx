@@ -17,9 +17,12 @@
 import {
   ArrowLeft,
   GitBranch,
+  LifeBuoy,
   Minimize2,
   OctagonX,
   PanelRightOpen,
+  Square,
+  Terminal,
 } from "lucide-react";
 import {
   Suspense,
@@ -102,6 +105,17 @@ export interface ProjectWorkspaceProps {
   onCommit: (message: string) => void;
   onPush: () => void;
   onPull: () => void;
+  /** Stop a NORMAL (non-mini) agent: kills its process tree via the backend's
+   *  `stop_agent` flow (the same one the removed board-mode panel used). The mini
+   *  safety brake (`mini_coder_kill`) is a SEPARATE, in-component path — the two
+   *  never apply to the same selected agent. */
+  onStopAgent: (agentId: string) => void;
+  /** Focus the dedicated external-console window of an agent that runs OUTSIDE the
+   *  app (no in-app PTY). Backend `focus_agent_terminal`. */
+  onFocusCli: (agentId: string) => void;
+  /** Copy a client-side recovery prompt for the selected agent (no backend call,
+   *  no secret). The parent resolves the live session from this agent id. */
+  onCopyRecovery: (agentId: string) => void;
   /** Inline status message for the last commit/push/pull (success or git stderr). */
   gitActionMessage: string | null;
   gitActionError: boolean;
@@ -131,6 +145,9 @@ export function ProjectWorkspace({
   onCommit,
   onPush,
   onPull,
+  onStopAgent,
+  onFocusCli,
+  onCopyRecovery,
   gitActionMessage,
   gitActionError,
   gitActionBusy,
@@ -182,12 +199,29 @@ export function ProjectWorkspace({
   );
 
   // MC-P5: the Stop (kill) safety brake is gated to a SELECTED mini session only —
-  // a mini is a session with a parentAgentId. A normal agent's stop is the existing
-  // external/stop_agent flow, NOT this 1-click brake.
+  // a mini is a session with a parentAgentId. A normal agent's stop is the
+  // separate `stop_agent` flow wired through onStopAgent below, NOT this 1-click
+  // brake.
   const selectedIsMini = useMemo(
     () => (selectedSession ? isMiniSession(selectedSession) : false),
     [selectedSession],
   );
+
+  // The Stop control for a NORMAL agent (the restored board-mode `stop_agent`
+  // capability): shown ONLY for a selected NON-mini agent with a live session.
+  // Mutually exclusive with the mini brake above — a mini shows the mini brake,
+  // a normal agent shows this. Either, but never both, on the same selection.
+  const selectedShowsNormalStop = Boolean(selectedSession) && !selectedIsMini;
+
+  // Open-CLI is meaningful ONLY for an agent that runs in an EXTERNAL console
+  // (no in-app PTY). This mirrors the same condition that renders the
+  // "runs in an external console" placeholder below: a non-app host with no live
+  // in-app PTY. An app-hosted agent whose PTY exited has no external window to
+  // focus, so it stays hidden (matching agentRowModel.rowActions.showOpenCli).
+  const selectedShowsOpenCli =
+    selectedSession != null &&
+    selectedSession.host !== "app" &&
+    !ptyAgents.has(selectedSession.agentId);
 
   // MC-P7: the Compact action is gated to a SELECTED session whose RESOLVED
   // built-in client is exactly "claude" — `/compact` is a Claude Code slash
@@ -260,6 +294,35 @@ export function ProjectWorkspace({
       /* swallow — Compact is a convenience; a write failure is non-fatal */
     });
   }, [selectedSession]);
+
+  // Stop a NORMAL (non-mini) selected agent via the parent's restored
+  // `stop_agent` flow. Gated to a non-mini selection (the mini brake owns minis),
+  // so a mistaken call on a mini can never fire.
+  const stopSelected = useCallback(() => {
+    if (!selectedSession || isMiniSession(selectedSession)) return;
+    onStopAgent(selectedSession.agentId);
+  }, [selectedSession, onStopAgent]);
+
+  // Focus the selected agent's external console window (parent's
+  // `focus_agent_terminal`). The button is only shown for an external-console
+  // agent, but re-derive the condition here so it can never fire otherwise.
+  const focusCliSelected = useCallback(() => {
+    if (
+      !selectedSession ||
+      selectedSession.host === "app" ||
+      ptyAgents.has(selectedSession.agentId)
+    ) {
+      return;
+    }
+    onFocusCli(selectedSession.agentId);
+  }, [selectedSession, ptyAgents, onFocusCli]);
+
+  // Copy a recovery prompt for the selected agent (parent builds the text from
+  // the live session — pure, no backend call, no secret).
+  const copyRecoverySelected = useCallback(() => {
+    if (!selectedSession) return;
+    onCopyRecovery(selectedSession.agentId);
+  }, [selectedSession, onCopyRecovery]);
 
   const submitCommit = () => {
     const trimmed = commitMessage.trim();
@@ -430,8 +493,8 @@ export function ProjectWorkspace({
                   )}
                   {/* MC-P5: the Stop (kill) safety brake — ONLY for a selected mini.
                       1-click (no two-step confirm): a human Stop is an immediate
-                      override. A non-mini agent never shows this; its stop is the
-                      existing stop_agent flow elsewhere. */}
+                      override. A non-mini agent never shows THIS; it shows the
+                      normal-agent Stop button below (the restored stop_agent flow). */}
                   {selectedIsMini && (
                     <button
                       type="button"
@@ -441,6 +504,55 @@ export function ProjectWorkspace({
                       data-help-lines="Immediately kills this mini-coder; the parent coder will be told it was aborted and must escalate to you.|This is a one-click safety brake — there is no confirm step.|Only mini-coders show this button; a normal agent is stopped from its own controls."
                     >
                       <OctagonX className="h-3 w-3" aria-hidden />
+                      Stop
+                    </button>
+                  )}
+                  {/* Open CLI — ONLY for a selected agent that runs in an EXTERNAL
+                      console (no in-app PTY). Focuses its dedicated OS terminal
+                      window via the parent's focus_agent_terminal. Hidden for an
+                      app-hosted agent (its terminal is the in-app viewer). */}
+                  {selectedShowsOpenCli && (
+                    <button
+                      type="button"
+                      onClick={focusCliSelected}
+                      className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-teal"
+                      data-help-title="This focuses this agent's external terminal window."
+                      data-help-lines="Open CLI restores and brings this agent's dedicated console window to the front.|It applies to externally launched agents (their own OS console).|If the window was closed, you get a friendly error instead.|Relaunch from the Spawn panel if the terminal is gone."
+                    >
+                      <Terminal className="h-3 w-3" aria-hidden />
+                      Open CLI
+                    </button>
+                  )}
+                  {/* Recovery — copy a reconnect prompt for the selected agent.
+                      Pure client-side text (no backend call, no secret). Always
+                      available for a selected agent; most useful when its heartbeat
+                      has gone stale but its terminal may still be alive. */}
+                  {selectedSession && (
+                    <button
+                      type="button"
+                      onClick={copyRecoverySelected}
+                      className="inline-flex items-center gap-1 rounded-md border border-amber/30 bg-amber/[0.08] px-2 py-0.5 text-[10px] font-semibold text-amber-dark hover:bg-amber/[0.14]"
+                      data-help-title="This copies a recovery prompt for this agent."
+                      data-help-lines="Recovery is for an agent whose heartbeat went stale but whose terminal may still be open.|It copies exact reconnect steps without exposing hidden tokens.|If the agent lost its session token, relaunch instead.|Always verify the terminal root before trusting status updates."
+                    >
+                      <LifeBuoy className="h-3 w-3" aria-hidden />
+                      Recovery
+                    </button>
+                  )}
+                  {/* Normal-agent Stop — the restored board-mode stop_agent
+                      capability, the ONLY UI surface to kill a stalled/runaway
+                      NORMAL (non-mini) agent. Mutually exclusive with the mini
+                      brake above: a mini shows that brake, a normal agent shows
+                      this. Kills the agent's process tree via the parent. */}
+                  {selectedShowsNormalStop && (
+                    <button
+                      type="button"
+                      onClick={stopSelected}
+                      className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-coral-dark"
+                      data-help-title="This stops the agent session."
+                      data-help-lines="Stop ends the launched agent.|For an app-hosted agent it kills the PTY child; for an external one it closes its console.|It does not delete the task; it only ends the agent.|Relaunch from the Spawn panel if you still need the work done."
+                    >
+                      <Square className="h-3 w-3" aria-hidden />
                       Stop
                     </button>
                   )}

@@ -63,16 +63,8 @@ import {
   isRecentProjectSession,
 } from "../../utils/agentClaims";
 import { CollapsibleSection } from "../projects/CollapsibleSection";
-import { ProjectAgentPanel } from "../projects/ProjectAgentPanel";
 import type { SpawnRole } from "../agents/roleDisplay";
 
-// Lazy so the xterm runtime stays in its own async chunk (loaded only when a
-// terminal is opened), mirroring the global Agents room.
-const AgentTerminalViewer = lazy(() =>
-  import("../agents/AgentTerminalViewer").then((m) => ({
-    default: m.AgentTerminalViewer,
-  })),
-);
 // Work-mode shell, lazy so its (and the terminal's) chunk loads only when a card
 // is opened into the full-screen IDE view.
 const ProjectWorkspace = lazy(() =>
@@ -201,12 +193,9 @@ export function ProjectsView() {
   const [workflowBusyName, setWorkflowBusyName] = useState<string | null>(null);
   const [agentState, setAgentState] = useState<AgentLiveState | null>(null);
   // agent_ids with a live app-hosted PTY (from agent_pty_list, fetched on the
-  // board poll) + which of their in-app terminal viewers are open. Gates the
-  // shared AgentRow's Terminal toggle exactly like the global Agents room.
+  // board poll). Threaded into Work mode (ProjectWorkspace) to gate the shared
+  // AgentRow's Terminal toggle exactly like the global Agents room.
   const [ptyAgents, setPtyAgents] = useState<Set<string>>(() => new Set());
-  const [openTerminals, setOpenTerminals] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [isBusy, setIsBusy] = useState(false);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
   const [loadingProjectId, setLoadingProjectId] = useState<string | null>(null);
@@ -365,32 +354,6 @@ export function ProjectsView() {
     appliedAgentUpdatedAtRef.current = agentStateSignature(state);
     setAgentState(state);
   }, []);
-
-  // Toggle one agent's in-app terminal viewer open/closed.
-  const toggleTerminal = useCallback((agentId: string) => {
-    setOpenTerminals((prev) => {
-      const next = new Set(prev);
-      if (next.has(agentId)) next.delete(agentId);
-      else next.add(agentId);
-      return next;
-    });
-  }, []);
-
-  // Drop open-terminal entries for agents that no longer have a live PTY (the
-  // agent exited/was stopped) so a dead viewer is not left mounted on its
-  // snapshot-error banner. Rebuild only when something is actually pruned.
-  useEffect(() => {
-    setOpenTerminals((prev) => {
-      if (prev.size === 0) return prev;
-      let changed = false;
-      const next = new Set<string>();
-      for (const agentId of prev) {
-        if (ptyAgents.has(agentId)) next.add(agentId);
-        else changed = true;
-      }
-      return changed ? next : prev;
-    });
-  }, [ptyAgents]);
 
   const loadAgentState = useCallback(async () => {
     const requestSeq = ++loadAgentStateSeqRef.current;
@@ -1840,6 +1803,17 @@ export function ProjectsView() {
             onCommit={(message) => void commitProject(message)}
             onPush={() => void pushProject()}
             onPull={() => void pullProject()}
+            onStopAgent={(agentId) => void stopAgent(agentId)}
+            onFocusCli={(agentId) => void openAgentCli(agentId)}
+            onCopyRecovery={(agentId) => {
+              // The Work-mode controls call by agentId; resolve the live session
+              // (recovery text reads its role/status/task) from this project's
+              // sessions. A miss (e.g. the agent just exited) is a no-op.
+              const session = currentProjectSessions.find(
+                (s) => s.agentId === agentId,
+              );
+              if (session) void copyAgentRecovery(session);
+            }}
             gitActionMessage={gitActionMessage}
             gitActionError={gitActionError}
             gitActionBusy={gitActionBusy}
@@ -1987,15 +1961,21 @@ export function ProjectsView() {
           </main>
         ) : currentProject ? (
           <main className="space-y-4">
+            {/* Fase 1 UI reorg: compact header — only title + status dot +
+                lifecycle actions (Reload / Live status / Pause|Resume /
+                Archive). The stage badge, progress bar, task summary,
+                who's-working line, git-policy badge, and root/file lines are
+                duplicated by ProjectCard + the Work-mode top bar, so they are
+                dropped here. The stage/taskCounts/workingAgent props are no
+                longer rendered in compact mode but stay wired so a future
+                non-compact use needs no re-plumbing. */}
             <ProjectStatusHeader
               project={currentProject}
+              compact
               stageLabel={currentStage ? stageLabel(currentStage) : null}
               stageToneClass={currentStage ? stageTone[currentStage] : null}
               taskCounts={currentSummary?.taskCounts ?? null}
               isBusy={isBusy}
-              // Omit for archived projects so the header's opt-in gate
-              // (workingAgent !== undefined) really hides the agent block —
-              // agents cannot work an archived project.
               workingAgent={
                 currentProject.metadata.status === "archived"
                   ? undefined
@@ -2044,45 +2024,10 @@ export function ProjectsView() {
               </button>
             </div>
 
-            {/* The live agent panel: launch and monitor the real MCP agents
-                (coder / verifier / orchestrator) for this project. Hidden for
-                archived projects — agents cannot work them, and the panel's
-                live-clock interval would tick for nothing. */}
-            {currentProject.metadata.status !== "archived" && (
-            <ProjectAgentPanel
-              sessions={currentProjectSessions}
-              claims={projectClaims}
-              events={projectAgentEvents}
-              tasks={currentProject.state.tasks}
-              canLaunch={canLaunchProjectAgents(currentProject)}
-              launchTitle={projectLaunchTitle(currentProject)}
-              isBusy={isBusy}
-              launchMessage={launchMessage}
-              onLaunch={(role, client, taskId) =>
-                void launchAgent(role, client, taskId)
-              }
-              onCopyPrompt={(role, taskId) =>
-                void copyAgentPrompt(role, taskId)
-              }
-              ptyAgents={ptyAgents}
-              openTerminals={openTerminals}
-              onToggleTerminal={toggleTerminal}
-              renderTerminal={(agentId) => (
-                <Suspense
-                  fallback={
-                    <div className="mt-3 rounded-2xl border border-cream-200 bg-cream-50 px-3 py-6 text-center text-[11px] text-cream-400">
-                      Loading terminal…
-                    </div>
-                  }
-                >
-                  <AgentTerminalViewer agentId={agentId} />
-                </Suspense>
-              )}
-              onOpenCli={(agentId) => void openAgentCli(agentId)}
-              onStop={(agentId) => void stopAgent(agentId)}
-              onRecovery={(session) => void copyAgentRecovery(session)}
-            />
-            )}
+            {/* Fase 1 UI reorg: the live "who's working / Launch another"
+                ProjectAgentPanel was removed from the board-mode overview — it
+                100% duplicated Work mode's agent rail + SpawnPanel + terminal +
+                AgentDetailDrawer. Launch/monitor agents from Work mode instead. */}
 
             {currentProject.metadata.status !== "archived" && (
               <section className="rounded-lg border border-cream-200 bg-white p-3">

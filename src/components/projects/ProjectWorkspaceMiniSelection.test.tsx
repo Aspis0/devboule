@@ -55,6 +55,9 @@ function render(sessions: AgentSession[], ptyAgents: Set<string>) {
       onCommit={noop}
       onPush={noop}
       onPull={noop}
+      onStopAgent={noop}
+      onFocusCli={noop}
+      onCopyRecovery={noop}
       gitActionMessage={null}
       gitActionError={false}
       gitActionBusy={false}
@@ -113,12 +116,17 @@ describe("ProjectWorkspace Stop (kill) safety brake (MC-P5)", () => {
     expect(html).toContain("Loading terminal");
   });
 
-  it("does NOT render the Stop button for a selected non-mini agent", () => {
-    // Only a normal coder (no parentAgentId) — its stop is the external/stop_agent
-    // flow, never this 1-click brake.
+  it("renders the NORMAL-agent Stop (stop_agent) but NOT the mini brake for a non-mini agent", () => {
+    // A normal coder (no parentAgentId): it shows the restored stop_agent Stop
+    // button — the ONLY UI surface to kill a stalled/runaway normal agent — but
+    // NEVER the mini 1-click brake (that is mini-only). The two are mutually
+    // exclusive on the same selection.
     const sessions = [session({ agentId: "coder-1" })];
     const html = render(sessions, new Set(["coder-1"]));
-    expect(html).not.toContain(">Stop<");
+    // The normal Stop button renders, with its own help copy.
+    expect(html).toContain(">Stop<");
+    expect(html).toContain("Stop ends the launched agent.");
+    // …but NOT the mini brake's help copy.
     expect(html).not.toContain("Immediately kills this mini-coder");
   });
 });

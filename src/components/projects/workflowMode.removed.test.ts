@@ -7,7 +7,7 @@ import { describe, it, expect } from "vitest";
 // coder / verifier via MCP).
 //
 // These tests assert the mock modules stay gone (importing them must fail) while
-// the REAL pieces they used to wrap (the live ProjectAgentPanel and the kanban
+// the REAL pieces they used to wrap (the Work-mode agent surface and the kanban
 // stage derivation) are untouched and still importable.
 
 const removedModules = [
@@ -28,9 +28,12 @@ describe("architect-ghost removal", () => {
     },
   );
 
-  it("keeps the REAL live agent panel", async () => {
-    const mod = await import("./ProjectAgentPanel");
-    expect(typeof mod.ProjectAgentPanel).toBe("function");
+  it("keeps the REAL Work-mode agent surface", async () => {
+    // The board-mode ProjectAgentPanel was retired; its real per-agent controls
+    // (stop / focus CLI / recovery) now live in the Work-mode agent surface. Guard
+    // that the rail component is still shipped and importable.
+    const mod = await import("./ProjectWorkspaceAgentRail");
+    expect(typeof mod.ProjectWorkspaceAgentRail).toBe("function");
   });
 
   it("keeps the REAL kanban stage derivation untouched", async () => {

@@ -99,6 +99,13 @@ const statusLabel: Record<string, string> = {
 // status dot/label + stage badge, a thin progress bar with a one-line task
 // summary, and the existing lifecycle actions. Presentational only — every
 // action is delegated to the callbacks owned by ProjectsView.
+//
+// `compact` (Fase 1 UI reorg): the board-mode overview now shows ONLY the
+// lifecycle ACTIONS here (the stage badge, progress bar, task summary,
+// who's-working line, git-policy badge, and root/file lines are duplicated by
+// the ProjectCard + Work-mode top bar, so they are dropped in compact mode).
+// When true the header renders just the title + status dot + action buttons.
+// Default false keeps every other rendering byte-identical.
 export function ProjectStatusHeader({
   project,
   stageLabel,
@@ -106,6 +113,7 @@ export function ProjectStatusHeader({
   taskCounts,
   isBusy,
   workingAgent,
+  compact = false,
   onReload,
   onRefreshLiveStatus,
   onPause,
@@ -120,6 +128,8 @@ export function ProjectStatusHeader({
   // The agent currently working this project (who · CLI · live status). Null
   // when nobody is working it.
   workingAgent?: AgentSession | null;
+  // When true, render only the title + status dot + lifecycle action buttons.
+  compact?: boolean;
   onReload: () => void;
   onRefreshLiveStatus: () => void;
   onPause: () => void;
@@ -128,8 +138,11 @@ export function ProjectStatusHeader({
 }) {
   const status = project.metadata.status;
   // Live clock so the working-agent line's age + health recompute between data
-  // polls (#3).
-  const now = useNow();
+  // polls (#3). Compact mode renders NO agent line (and no age/health), so the
+  // 10s tick is pure wasted re-render there — disable the interval when compact.
+  // The hook is still called unconditionally (Rules of Hooks); `now` simply stops
+  // advancing, which is harmless because nothing in the compact branch reads it.
+  const now = useNow(10000, !compact);
 
   // Prefer the summary task counts (same source the macro board uses); fall back
   // to the detail task list when the summary is not loaded yet. Memoized (#14)
@@ -153,6 +166,94 @@ export function ProjectStatusHeader({
   );
   const donePercent =
     counts.total > 0 ? Math.round((counts.done / counts.total) * 100) : 0;
+
+  // Lifecycle action buttons (Reload / Live status / Pause|Resume / Archive).
+  // The UNIQUE feature kept in the board-mode overview; shared verbatim between
+  // the compact and full headers so the two never drift.
+  const actionButtons = (
+    <div className="flex flex-wrap gap-2">
+      <button
+        onClick={onReload}
+        disabled={isBusy}
+        data-help-title="This reloads the selected project from disk."
+        data-help-lines="Reload reads the Markdown file again.|Use it after a CLI agent or another tool edits the project.|It does not change tasks by itself.|If the file changed while you edited, reload helps avoid overwriting new work."
+        className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-terracotta disabled:opacity-60"
+      >
+        <RefreshCw className="h-3.5 w-3.5" />
+        Reload
+      </button>
+      <button
+        onClick={onRefreshLiveStatus}
+        disabled={isBusy}
+        data-help-title="This refreshes live cloud status linked to the project."
+        data-help-lines="Live status checks provider resources mentioned by the project when possible.|It is meant to show whether Cloudflare or Scaleway resources still match the task state.|It should be a read operation, not a provider mutation.|Use it before launching verifier or closing work."
+        className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-sage-dark disabled:opacity-60"
+      >
+        <ShieldCheck className="h-3.5 w-3.5" />
+        Live status
+      </button>
+      {status === "active" ? (
+        <button
+          onClick={onPause}
+          disabled={isBusy}
+          data-help-title="This pauses the project lifecycle."
+          data-help-lines="Paused means agents should not start new work from this project.|It updates local project Markdown, not provider infrastructure.|Use it when the goal is waiting for a decision or external key.|Resume makes it launchable again."
+          className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-amber-dark disabled:opacity-60"
+        >
+          <PauseCircle className="h-3.5 w-3.5" />
+          Pause
+        </button>
+      ) : status !== "done" ? (
+        <button
+          onClick={onResume}
+          disabled={isBusy}
+          data-help-title="This resumes an inactive project."
+          data-help-lines="Active projects can launch agents and receive normal task updates.|It only changes the local project file.|Before resuming, check whether old tokens, roots, or assumptions expired.|Agents will read the current Markdown state through MCP."
+          className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-teal disabled:opacity-60"
+        >
+          <Activity className="h-3.5 w-3.5" />
+          Resume
+        </button>
+      ) : null}
+      {status !== "archived" && status !== "done" && (
+        <button
+          onClick={onArchive}
+          disabled={isBusy}
+          data-help-title="This archives the project locally."
+          data-help-lines="Archived projects are treated as inactive work history.|It does not delete the Markdown file or provider resources.|Use it only when you do not want agents to continue that goal.|Oracle can still find archived notes unless indexing rules exclude them."
+          className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-coral-dark disabled:opacity-60"
+        >
+          <Archive className="h-3.5 w-3.5" />
+          Archive
+        </button>
+      )}
+    </div>
+  );
+
+  // Compact (board-mode overview): only the project title + status dot/label +
+  // the lifecycle actions. The display details below are duplicated elsewhere
+  // (ProjectCard + Work-mode top bar) and intentionally omitted here.
+  if (compact) {
+    return (
+      <section className="flex flex-col gap-3 rounded-lg border border-cream-200 bg-white p-4 md:flex-row md:items-center md:justify-between">
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+              statusDotTone[status] ?? "bg-cream-400"
+            }`}
+            aria-hidden
+          />
+          <h2 className="truncate text-xl font-semibold text-cream-900">
+            {project.metadata.title}
+          </h2>
+          <span className="shrink-0 text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+            {statusLabel[status] ?? status}
+          </span>
+        </div>
+        {actionButtons}
+      </section>
+    );
+  }
 
   return (
     <section className="rounded-lg border border-cream-200 bg-white p-4">
@@ -225,63 +326,7 @@ export function ProjectStatusHeader({
           </p>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={onReload}
-            disabled={isBusy}
-            data-help-title="This reloads the selected project from disk."
-            data-help-lines="Reload reads the Markdown file again.|Use it after a CLI agent or another tool edits the project.|It does not change tasks by itself.|If the file changed while you edited, reload helps avoid overwriting new work."
-            className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-terracotta disabled:opacity-60"
-          >
-            <RefreshCw className="h-3.5 w-3.5" />
-            Reload
-          </button>
-          <button
-            onClick={onRefreshLiveStatus}
-            disabled={isBusy}
-            data-help-title="This refreshes live cloud status linked to the project."
-            data-help-lines="Live status checks provider resources mentioned by the project when possible.|It is meant to show whether Cloudflare or Scaleway resources still match the task state.|It should be a read operation, not a provider mutation.|Use it before launching verifier or closing work."
-            className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-sage-dark disabled:opacity-60"
-          >
-            <ShieldCheck className="h-3.5 w-3.5" />
-            Live status
-          </button>
-          {status === "active" ? (
-            <button
-              onClick={onPause}
-              disabled={isBusy}
-              data-help-title="This pauses the project lifecycle."
-              data-help-lines="Paused means agents should not start new work from this project.|It updates local project Markdown, not provider infrastructure.|Use it when the goal is waiting for a decision or external key.|Resume makes it launchable again."
-              className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-amber-dark disabled:opacity-60"
-            >
-              <PauseCircle className="h-3.5 w-3.5" />
-              Pause
-            </button>
-          ) : status !== "done" ? (
-            <button
-              onClick={onResume}
-              disabled={isBusy}
-              data-help-title="This resumes an inactive project."
-              data-help-lines="Active projects can launch agents and receive normal task updates.|It only changes the local project file.|Before resuming, check whether old tokens, roots, or assumptions expired.|Agents will read the current Markdown state through MCP."
-              className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-teal disabled:opacity-60"
-            >
-              <Activity className="h-3.5 w-3.5" />
-              Resume
-            </button>
-          ) : null}
-          {status !== "archived" && status !== "done" && (
-            <button
-              onClick={onArchive}
-              disabled={isBusy}
-              data-help-title="This archives the project locally."
-              data-help-lines="Archived projects are treated as inactive work history.|It does not delete the Markdown file or provider resources.|Use it only when you do not want agents to continue that goal.|Oracle can still find archived notes unless indexing rules exclude them."
-              className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-600 hover:text-coral-dark disabled:opacity-60"
-            >
-              <Archive className="h-3.5 w-3.5" />
-              Archive
-            </button>
-          )}
-        </div>
+        {actionButtons}
       </div>
 
       <p
