@@ -3866,6 +3866,13 @@ $prompt = Get-Content -Raw -LiteralPath $promptFile\n"
                     &roots.management_root,
                     &roots.projects_dir,
                     app_bin.as_deref(),
+                    // MINI-EXCLUSION (design §6, HARD): the mini NEVER receives user MCP
+                    // servers. It reuses this shared Oracle-only builder and passes an
+                    // EMPTY slice, so its codex `-c` flags stay Oracle-only (narrowed
+                    // server-side by role "mini"). This bare empty literal names no
+                    // user-MCP type, so this file keeps ZERO references to the user-MCP
+                    // config code.
+                    &[],
                 ));
             }
             if let Some(model) = backend.model.as_deref() {
@@ -4660,6 +4667,13 @@ fn build_mini_command_impl(
                     &roots.management_root,
                     &roots.projects_dir,
                     app_bin.as_deref(),
+                    // MINI-EXCLUSION (design §6, HARD): the mini NEVER receives user MCP
+                    // servers. It reuses this shared Oracle-only builder and passes an
+                    // EMPTY slice, so its codex `-c` flags stay Oracle-only (narrowed
+                    // server-side by role "mini"). This bare empty literal names no
+                    // user-MCP type, so this file keeps ZERO references to the user-MCP
+                    // config code.
+                    &[],
                 ));
             }
             if let Some(model) = backend.model.as_deref() {

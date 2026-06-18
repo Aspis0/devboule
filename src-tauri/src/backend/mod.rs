@@ -33,6 +33,7 @@ pub mod state;
 pub mod structure;
 pub mod token_usage;
 pub mod training_export;
+pub mod user_mcp_config;
 pub mod util;
 pub mod vault;
 pub mod visual_check;

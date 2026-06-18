@@ -13,6 +13,7 @@ use super::model::{
     ProjectTask, ProjectTaskCounts, ProjectTaskInput, ProviderId,
 };
 use super::state::BackendState;
+use super::user_mcp_config;
 use super::vault;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -1587,6 +1588,18 @@ fn prepare_or_launch_project_agent(
     } else {
         None
     };
+    // Phase A.2: the merged, enabled user MCP servers (global ∪ project, project wins),
+    // injected into the codex/claude launch config below. Resolved ONCE here where both
+    // the AppHandle and the project root are in hand. Only the built-in codex/claude
+    // clients consume it (the launch builders inject only for those); custom/orchestrator
+    // launches ignore the slice, so we only pay the (fail-open) config read for them.
+    // The MINI never reaches this path — design §6 mini-exclusion holds by construction.
+    let user_servers: Vec<user_mcp_config::UserMcpServer> =
+        if client == "codex" || client == "claude" {
+            user_mcp_config::merged_servers(&app, &root_path)
+        } else {
+            Vec::new()
+        };
     if launch_terminal && host == HOST_APP {
         // APP-HOSTED: spawn under our in-app PTY. There is no OS console pid/title
         // to record — stop_agent routes by the ledger host to agent_pty_kill — so
@@ -1606,6 +1619,7 @@ fn prepare_or_launch_project_agent(
             input.model.as_deref(),
             &provider_env,
             orchestrator.as_ref(),
+            &user_servers,
         )?;
         if let Err(record_err) = record_agent_launch(
             &app,
@@ -1650,6 +1664,7 @@ fn prepare_or_launch_project_agent(
             input.model.as_deref(),
             &provider_env,
             orchestrator.as_ref(),
+            &user_servers,
         )?;
         let prompt_file_label = spawned
             .prompt_file
@@ -3155,6 +3170,8 @@ fn spawn_agent_terminal(
     provider_env: &[AgentLaunchEnv],
     // L2.4: Some for the local Devboule orchestrator client.
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    // Phase A.2: merged, enabled user MCP servers for this launch (main coder only).
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<SpawnedAgent, String> {
     // A custom client runs an arbitrary, operator-configured command line, so there
     // is no single executable on PATH to pre-check; the built-ins still are checked.
@@ -3185,6 +3202,7 @@ fn spawn_agent_terminal(
         model,
         provider_env,
         orchestrator,
+        user_servers,
     )
 }
 
@@ -3216,6 +3234,8 @@ fn spawn_agent_terminal_app(
     provider_env: &[AgentLaunchEnv],
     // L2.4: Some for the local Devboule orchestrator client.
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    // Phase A.2: merged, enabled user MCP servers for this launch (main coder only).
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<Option<String>, String> {
     // The orchestrator's executable is the resolved binary (already existence-checked
     // by resolve_orchestrator_binary at assembly time), so it stays empty here.
@@ -3244,6 +3264,7 @@ fn spawn_agent_terminal_app(
         model,
         provider_env,
         orchestrator,
+        user_servers,
     )
 }
 
@@ -3262,6 +3283,7 @@ fn spawn_agent_terminal_app_impl(
     model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<Option<String>, String> {
     use portable_pty::CommandBuilder;
 
@@ -3276,6 +3298,7 @@ fn spawn_agent_terminal_app_impl(
         projects_dir,
         model,
         orchestrator,
+        user_servers,
     )?;
 
     // PTY host: run powershell directly (NO conhost — the PTY IS the console). Same
@@ -3321,6 +3344,7 @@ fn spawn_agent_terminal_app_impl(
     model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<Option<String>, String> {
     use portable_pty::CommandBuilder;
 
@@ -3341,6 +3365,7 @@ fn spawn_agent_terminal_app_impl(
         // builder must NOT re-export them in-script (that would put them on argv).
         // There is no temp file to self-delete here either. -> false.
         false,
+        user_servers,
     )?;
 
     // Prefer the user's login shell; fall back to /bin/zsh (macOS default), then
@@ -3380,6 +3405,7 @@ fn spawn_agent_terminal_app_impl(
     _model: Option<&str>,
     _provider_env: &[AgentLaunchEnv],
     _orchestrator: Option<&OrchestratorLaunchConfig>,
+    _user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<Option<String>, String> {
     Err("App-hosted agent terminals are supported on Windows and macOS only.".into())
 }
@@ -3416,6 +3442,10 @@ fn build_windows_agent_script(
     // byte-identical. Dispatched FIRST so the orchestrator (whose `executable` is
     // empty) is not swallowed by the bare-client branch.
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    // Phase A.2: the merged, enabled user MCP servers, injected into the codex/claude
+    // config. EMPTY ⇒ command_line byte-identical to before. NEVER reaches the mini
+    // (this is the MAIN-coder launch path only — design §6).
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<(PathBuf, String), String> {
     let is_custom = custom_command.is_some();
     let command_line = if let Some(orchestrator) = orchestrator {
@@ -3444,11 +3474,11 @@ fn build_windows_agent_script(
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref())
+        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref(), user_servers)
     } else if client == "claude" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref())
+        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref(), user_servers)
     } else {
         executable.to_string()
     };
@@ -3561,6 +3591,7 @@ fn spawn_agent_terminal_impl(
     model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<SpawnedAgent, String> {
     let (prompt_file, script) = build_windows_agent_script(
         agent_id,
@@ -3573,6 +3604,7 @@ fn spawn_agent_terminal_impl(
         projects_dir,
         model,
         orchestrator,
+        user_servers,
     )?;
     // Launch through conhost.exe so the agent always gets its OWN dedicated
     // CLASSIC console window (tagged with the unique title above), not a shared
@@ -3669,6 +3701,9 @@ fn build_macos_agent_script(
     //     (visible via `ps`/argv to other processes) — the exact B1 leak. So we SKIP the
     //     in-script `provider_env` export here; there is no temp file to self-delete.
     runs_from_temp_file: bool,
+    // Phase A.2: the merged, enabled user MCP servers injected into the codex/claude
+    // config. EMPTY ⇒ cli_line byte-identical to before. NEVER reaches the mini (design §6).
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<(PathBuf, String), String> {
     // Same temp-file delivery contract as Windows: keep the launch-token-bearing
     // prompt off the child argv. The generated shell script reads it, copies it to
@@ -3695,11 +3730,11 @@ fn build_macos_agent_script(
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref())
+        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref(), user_servers)
     } else if client == "claude" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref())
+        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref(), user_servers)
     } else {
         sh_single_quote(executable)
     };
@@ -3852,6 +3887,7 @@ fn spawn_agent_terminal_impl(
     model: Option<&str>,
     provider_env: &[AgentLaunchEnv],
     orchestrator: Option<&OrchestratorLaunchConfig>,
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<SpawnedAgent, String> {
     let (prompt_file, script) = build_macos_agent_script(
         agent_id,
@@ -3871,6 +3907,7 @@ fn spawn_agent_terminal_impl(
         // builder also injects the `rm -f "$0"` self-delete (first line) to remove that
         // secrets file the moment bash starts. -> true.
         true,
+        user_servers,
     )?;
 
     // Write the generated script to its own restricted temp file and have Terminal
@@ -3927,6 +3964,7 @@ fn spawn_agent_terminal_impl(
     _model: Option<&str>,
     _provider_env: &[AgentLaunchEnv],
     _orchestrator: Option<&OrchestratorLaunchConfig>,
+    _user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Result<SpawnedAgent, String> {
     Err("Agent terminal launch is supported on Windows and macOS only.".into())
 }
@@ -4308,6 +4346,8 @@ fn macos_codex_launch_line(
     projects_dir: &Path,
     model: Option<&str>,
     app_bin: Option<&str>,
+    // User-declared MCP servers (design Phase A.2). EMPTY ⇒ byte-identical to before.
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let management_root_s = management_root.to_string_lossy().into_owned();
@@ -4359,6 +4399,10 @@ fn macos_codex_launch_line(
             "mcp_servers.aspis-management.env.ASPIS_APP_BIN={}",
             toml_string(app_bin)
         ));
+    }
+    // User servers AFTER the Oracle config args (design §5.1). EMPTY ⇒ no change.
+    for server in user_servers {
+        config_args.extend(codex_user_server_config_settings(server));
     }
     let mut line = String::from("printf '%s' \"$PROMPT\" | codex --cd ");
     line.push_str(&sh_single_quote(&root_s));
@@ -4553,8 +4597,8 @@ fn orchestrator_launch_script(config: &OrchestratorLaunchConfig) -> String {
 /// `--mcp-config` and pipes the prompt over STDIN.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
-fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>) -> String {
-    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin);
+fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>, user_servers: &[user_mcp_config::UserMcpServer]) -> String {
+    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers);
     let model_flag = match model {
         Some(model) => format!("--model {} ", sh_single_quote(model)),
         None => String::new(),
@@ -4584,6 +4628,10 @@ pub(crate) fn codex_mcp_config_args(
     management_root: &Path,
     projects_dir: &Path,
     app_bin: Option<&str>,
+    // User-declared MCP servers (design Phase A.2): emitted as `-c mcp_servers.<name>.*`
+    // tokens AFTER the Oracle tokens. EMPTY ⇒ byte-identical to the pre-A.2 token list.
+    // The mini wires the SAME server but passes an empty slice (mini-exclusion §6).
+    user_servers: &[user_mcp_config::UserMcpServer],
 ) -> Vec<String> {
     let management_root_s = management_root.to_string_lossy().into_owned();
     let projects_dir_s = projects_dir.to_string_lossy().into_owned();
@@ -4645,17 +4693,63 @@ pub(crate) fn codex_mcp_config_args(
             toml_string(app_bin)
         ));
     }
+    // User servers AFTER the Oracle tokens (design §5.1: Oracle first). Each emits a
+    // `-c mcp_servers.<name>.*` block. With NO user servers this loop adds nothing, so the
+    // token list is byte-identical to before A.2 (regression guard).
+    for server in user_servers {
+        out.extend(codex_user_server_config_tokens(server));
+    }
     out
 }
 
-fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>) -> String {
+/// Build the codex config KEY=VALUE strings for ONE user server (no `-c` prefix; the
+/// caller interleaves `-c`). Shared by the Windows `codex_mcp_config_args` (which wraps
+/// each in a `-c` pair) and the macOS `macos_codex_launch_line` (which shell-quotes each
+/// and prefixes `-c`), so the two codex paths cannot drift. Reuses the SAME
+/// `toml_string`/`toml_array` helpers as the Oracle tokens. `name` is guarded
+/// (no reserved prefix, never `aspis-management`) before it reaches here.
+fn codex_user_server_config_settings(server: &user_mcp_config::UserMcpServer) -> Vec<String> {
+    let name = &server.name;
+    // `command` is always emitted. `args` is emitted ONLY when non-empty — matching the
+    // Oracle tokens (which never emit an empty `args=[]`) and keeping the launch line
+    // smaller; codex defaults a missing `args` to no arguments, same as `args=[]`.
+    let mut settings = vec![format!(
+        "mcp_servers.{name}.command={}",
+        toml_string(&server.command)
+    )];
+    if !server.args.is_empty() {
+        let arg_refs: Vec<&str> = server.args.iter().map(|s| s.as_str()).collect();
+        settings.push(format!("mcp_servers.{name}.args={}", toml_array(&arg_refs)));
+    }
+    // env keys come from the (deterministically-ordered) BTreeMap so the token order is stable.
+    for (key, value) in &server.env {
+        settings.push(format!(
+            "mcp_servers.{name}.env.{key}={}",
+            toml_string(value)
+        ));
+    }
+    settings
+}
+
+/// The Windows `codex_mcp_config_args` form: each setting wrapped as a `-c <setting>` pair
+/// (the caller quotes the whole arg vector via `ps_single_quote` later).
+fn codex_user_server_config_tokens(server: &user_mcp_config::UserMcpServer) -> Vec<String> {
+    let mut out = Vec::new();
+    for setting in codex_user_server_config_settings(server) {
+        out.push("-c".to_string());
+        out.push(setting);
+    }
+    out
+}
+
+fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>, user_servers: &[user_mcp_config::UserMcpServer]) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let mut args = vec!["--cd".to_string(), root_s];
     if let Some(model) = model {
         args.push("-m".to_string());
         args.push(model.to_string());
     }
-    args.extend(codex_mcp_config_args(python, management_root, projects_dir, app_bin));
+    args.extend(codex_mcp_config_args(python, management_root, projects_dir, app_bin, user_servers));
     let args = args
         .iter()
         .map(|value| ps_single_quote(value))
@@ -4675,8 +4769,8 @@ fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, p
     format!("$codexArgs = @({args})\n$prompt | & codex @codexArgs")
 }
 
-fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>) -> String {
-    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin).replace("'@", "' @");
+fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>, user_servers: &[user_mcp_config::UserMcpServer]) -> String {
+    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers).replace("'@", "' @");
     let model_flag = match model {
         Some(model) => format!("--model {} ", ps_single_quote(model)),
         None => String::new(),
@@ -4692,7 +4786,17 @@ fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Pat
     format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig")
 }
 
-fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &Path, app_bin: Option<&str>) -> String {
+fn mcp_client_config_json(
+    python: &str,
+    management_root: &Path,
+    projects_dir: &Path,
+    app_bin: Option<&str>,
+    // User-declared MCP servers (design Phase A.2). Injected into the `mcpServers` map
+    // AFTER the Oracle entry. An EMPTY slice yields a config byte-identical to before this
+    // param existed (the Oracle map is unchanged), so the no-user-servers path is a clean
+    // regression. The MINI never gets these — this builder is the MAIN-coder launch path.
+    user_servers: &[user_mcp_config::UserMcpServer],
+) -> String {
     let mut env = serde_json::Map::new();
     env.insert("PYTHONPATH".into(), management_root.to_string_lossy().into_owned().into());
     env.insert("PYTHONIOENCODING".into(), "utf-8".into());
@@ -4706,24 +4810,55 @@ fn mcp_client_config_json(python: &str, management_root: &Path, projects_dir: &P
     if let Some(app_bin) = app_bin.filter(|s| !s.trim().is_empty()) {
         env.insert("ASPIS_APP_BIN".into(), app_bin.to_string().into());
     }
-    serde_json::to_string_pretty(&serde_json::json!({
-        "mcpServers": {
-            "aspis-management": {
-                "command": python,
-                "args": [
-                    "-m",
-                    "oracle.server.aspis_mcp",
-                    "--root",
-                    management_root.to_string_lossy(),
-                    "--projects-dir",
-                    projects_dir.to_string_lossy(),
-                ],
-                "cwd": management_root.to_string_lossy(),
-                "env": env,
-            }
+    // Oracle FIRST and unaffected (design §5.1). Build the map, then append user servers.
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        "aspis-management".into(),
+        serde_json::json!({
+            "command": python,
+            "args": [
+                "-m",
+                "oracle.server.aspis_mcp",
+                "--root",
+                management_root.to_string_lossy(),
+                "--projects-dir",
+                projects_dir.to_string_lossy(),
+            ],
+            "cwd": management_root.to_string_lossy(),
+            "env": env,
+        }),
+    );
+    for server in user_servers {
+        // Defense in depth: a reserved name can never have reached here (the add command and
+        // the fail-open reader both reject it), but skip it anyway so the Oracle entry can
+        // never be overwritten by a user server keyed `aspis-management`.
+        if servers.contains_key(&server.name) {
+            continue;
         }
-    }))
-    .unwrap_or_default()
+        let env: serde_json::Map<String, serde_json::Value> = server
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        servers.insert(
+            server.name.clone(),
+            serde_json::json!({
+                "command": server.command,
+                "args": server.args,
+                "env": env,
+            }),
+        );
+    }
+    // Worst-case fallback: serializing this `serde_json::Map` of string-keyed JSON values
+    // effectively never fails, but if it ever did, `.unwrap_or_default()` would yield `""` —
+    // and claude launched with `--mcp-config ""` starts with NO MCP servers AT ALL (no
+    // Oracle), silently losing every tool. Fall back to a VALID-JSON empty config instead so
+    // the worst case is "claude launches degraded (no servers)" rather than a malformed flag
+    // value. (This builder returns String and threads through several launch-line callers; a
+    // Result would cascade into a large signature change for a path that cannot realistically
+    // fail, so the valid-JSON fallback is the proportionate fix.)
+    serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))
+        .unwrap_or_else(|_| "{\"mcpServers\":{}}".to_string())
 }
 
 fn cloudflare_agent_provider_env_for_role(role: &str) -> Result<Vec<AgentLaunchEnv>, String> {
@@ -10087,8 +10222,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None);
-        let claude = mcp_client_config_json("python3", &root, &projects, None);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
+        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]);
 
         assert!(codex.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(claude.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
@@ -10107,8 +10242,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let app_bin = "/opt/aspis/aspis-management";
 
-        let codex_with = codex_mcp_config_args("python3", &root, &projects, Some(app_bin)).join(" ");
-        let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin));
+        let codex_with = codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).join(" ");
+        let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]);
         assert!(
             codex_with.contains("mcp_servers.aspis-management.env.ASPIS_APP_BIN="),
             "codex args must set ASPIS_APP_BIN: {codex_with}"
@@ -10121,12 +10256,125 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         assert!(claude_with.contains(app_bin), "claude env must carry the binary path");
 
         // None / empty → the key is omitted entirely.
-        let codex_none = codex_mcp_config_args("python3", &root, &projects, None).join(" ");
-        let claude_none = mcp_client_config_json("python3", &root, &projects, None);
-        let codex_blank = codex_mcp_config_args("python3", &root, &projects, Some("   ")).join(" ");
+        let codex_none = codex_mcp_config_args("python3", &root, &projects, None, &[]).join(" ");
+        let claude_none = mcp_client_config_json("python3", &root, &projects, None, &[]);
+        let codex_blank = codex_mcp_config_args("python3", &root, &projects, Some("   "), &[]).join(" ");
         assert!(!codex_none.contains("ASPIS_APP_BIN"), "absent app bin ⇒ no codex key");
         assert!(!claude_none.contains("ASPIS_APP_BIN"), "absent app bin ⇒ no claude key");
         assert!(!codex_blank.contains("ASPIS_APP_BIN"), "blank app bin ⇒ no codex key");
+    }
+
+    // --- Phase A.2: user MCP server injection into claude/codex configs --------
+
+    /// A user server fixture with distinctive command/args/env so presence assertions
+    /// are unambiguous.
+    #[cfg(test)]
+    fn user_server_fixture() -> user_mcp_config::UserMcpServer {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("DB_URL".to_string(), "postgres://x".to_string());
+        user_mcp_config::UserMcpServer {
+            name: "my-db".to_string(),
+            transport: "stdio".to_string(),
+            command: "python".to_string(),
+            args: vec!["-m".to_string(), "mydb_mcp".to_string()],
+            env,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn user_server_appears_in_claude_and_codex_configs_after_oracle() {
+        // Phase A.2 acceptance: a configured "my-db" server appears in BOTH the claude
+        // `.mcp.json` and the codex `-c mcp_servers.*` args, AFTER the Oracle entry.
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+        let servers = [user_server_fixture()];
+
+        let claude = mcp_client_config_json("python3", &root, &projects, None, &servers);
+        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).join(" ");
+
+        // Oracle ALWAYS first (design §5.1): its key precedes the user server's in both.
+        let oracle_pos_claude = claude.find("\"aspis-management\"").expect("oracle key present");
+        let user_pos_claude = claude.find("\"my-db\"").expect("user key present");
+        assert!(oracle_pos_claude < user_pos_claude, "Oracle must come before the user server");
+        // The user server carries its command, args, and env into the claude config.
+        assert!(claude.contains("\"my-db\""));
+        assert!(claude.contains("\"mydb_mcp\""));
+        assert!(claude.contains("\"DB_URL\""));
+        assert!(claude.contains("postgres://x"));
+
+        // Codex: Oracle tokens come first, then the user-server tokens.
+        let oracle_pos_codex = codex.find("mcp_servers.aspis-management.command").expect("oracle command");
+        let user_pos_codex = codex.find("mcp_servers.my-db.command").expect("user command");
+        assert!(oracle_pos_codex < user_pos_codex, "Oracle tokens must precede the user server's");
+        assert!(codex.contains("mcp_servers.my-db.args="));
+        assert!(codex.contains("mydb_mcp"));
+        assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
+        assert!(codex.contains("postgres://x"));
+    }
+
+    #[test]
+    fn no_user_servers_yields_byte_identical_configs() {
+        // Regression guard: with NO user servers the generated configs must be
+        // byte-identical to passing an empty slice (the only call shape after A.2).
+        // We assert the empty-slice output equals a hand-built Oracle-only expectation
+        // by checking it contains exactly the Oracle key and no stray user keys.
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+
+        let claude_empty = mcp_client_config_json("python3", &root, &projects, None, &[]);
+        let codex_empty = codex_mcp_config_args("python3", &root, &projects, None, &[]).join(" ");
+
+        // Exactly ONE server key in the claude config (the Oracle), no user-server noise.
+        assert_eq!(claude_empty.matches("\"command\":").count(), 1, "only the Oracle command");
+        assert!(claude_empty.contains("\"aspis-management\""));
+        // The codex args carry only `mcp_servers.aspis-management.*` tokens.
+        assert!(codex_empty.contains("mcp_servers.aspis-management.command"));
+        assert!(!codex_empty.contains("mcp_servers.my-db"));
+        // And the Oracle is unaffected: its standard env keys are all present.
+        assert!(claude_empty.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+        assert!(codex_empty.contains("mcp_servers.aspis-management.env.PYTHONPATH"));
+    }
+
+    #[test]
+    fn user_server_with_empty_args_omits_the_args_token() {
+        // FIX 5: a user server with NO args must NOT emit `mcp_servers.<name>.args=[]` (matches
+        // the Oracle, which never emits an empty args token). `command` is always present.
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+        let mut server = user_server_fixture();
+        server.args = Vec::new();
+        let servers = [server];
+
+        let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).join(" ");
+        assert!(
+            codex.contains("mcp_servers.my-db.command="),
+            "command token must still be present: {codex}"
+        );
+        assert!(
+            !codex.contains("mcp_servers.my-db.args="),
+            "empty args must NOT emit an args token: {codex}"
+        );
+        // env is unaffected (still emitted).
+        assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
+
+        // And the same for the macOS launch line (it shares codex_user_server_config_settings).
+        let macos = macos_codex_launch_line("python3", &root, &root, &projects, None, None, &servers);
+        assert!(macos.contains("mcp_servers.my-db.command="));
+        assert!(!macos.contains("mcp_servers.my-db.args="), "macOS line must omit empty args: {macos}");
+    }
+
+    #[test]
+    fn disabled_user_servers_are_not_in_the_merged_set_so_not_injected() {
+        // A disabled server is filtered out by merged_servers BEFORE it reaches the
+        // builders, so the builder never sees it. We assert the builder, given only the
+        // enabled subset, injects exactly those — the merge filter is unit-tested in
+        // user_mcp_config. Here: passing an empty slice (the disabled-only case) yields
+        // no user keys.
+        let root = PathBuf::from("C:\\Aspis Management");
+        let projects = root.join("projects");
+        let claude = mcp_client_config_json("python3", &root, &projects, None, &[]);
+        assert!(!claude.contains("\"my-db\""));
     }
 
     // --- L2.4 local Devboule orchestrator launch -----------------------------
@@ -10383,8 +10631,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let claude_json = mcp_client_config_json(python, &root, &projects, None);
-        let codex_args = codex_mcp_config_args(python, &root, &projects, None).join(" ");
+        let claude_json = mcp_client_config_json(python, &root, &projects, None, &[]);
+        let codex_args = codex_mcp_config_args(python, &root, &projects, None, &[]).join(" ");
 
         // The resolved interpreter is what actually runs the MCP server.
         assert!(claude_json.contains("\"command\": \"/opt/venv/bin/python3.11\""));
@@ -10404,8 +10652,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let python = "/opt/venv/bin/python3.11";
 
-        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None, None);
-        let macos_claude = macos_claude_launch_line(python, &root, &projects, None, None);
+        let macos_codex = macos_codex_launch_line(python, &root, &root, &projects, None, None, &[]);
+        let macos_claude = macos_claude_launch_line(python, &root, &projects, None, None, &[]);
 
         assert!(macos_codex.contains("/opt/venv/bin/python3.11"));
         assert!(macos_claude.contains("/opt/venv/bin/python3.11"));
@@ -10424,10 +10672,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
-        let codex_with = codex_launch_script("python3", &root, &root, &projects, Some(model), None);
-        let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None);
-        let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None);
-        let claude_none = claude_launch_script("python3", &root, &projects, None, None);
+        let codex_with = codex_launch_script("python3", &root, &root, &projects, Some(model), None, &[]);
+        let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None, &[]);
+        let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
+        let claude_none = claude_launch_script("python3", &root, &projects, None, None, &[]);
 
         // Selected model reaches the CLI.
         assert!(claude_with.contains("--model"));
@@ -10448,10 +10696,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
-        let codex_with = macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None);
-        let claude_with = macos_claude_launch_line("python3", &root, &projects, Some(model), None);
-        let codex_none = macos_codex_launch_line("python3", &root, &root, &projects, None, None);
-        let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None);
+        let codex_with = macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None, &[]);
+        let claude_with = macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[]);
+        let codex_none = macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[]);
+        let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None, &[]);
 
         assert!(claude_with.contains("--model"));
         assert!(claude_with.contains(model));
@@ -10467,7 +10715,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
 
         // The prompt must be piped into codex via STDIN so PowerShell never
         // word-splits it (which would mangle `<`/`>` and leak the launch token).
@@ -10482,7 +10730,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let claude = claude_launch_script("python3", &root, &projects, None, None);
+        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]);
 
         assert!(claude.contains("$prompt | & claude --mcp-config $mcpConfig"));
         assert!(!claude.contains("--mcp-config $mcpConfig $prompt"));
@@ -10500,8 +10748,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         let root = PathBuf::from("C:\\Aspis Management");
         let projects = root.join("projects");
 
-        let codex = codex_launch_script("python3", &root, &root, &projects, None, None);
-        let claude = claude_launch_script("python3", &root, &projects, None, None);
+        let codex = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
+        let claude = claude_launch_script("python3", &root, &projects, None, None, &[]);
 
         // The literal prompt text is never embedded in either launch script: it
         // is supplied at runtime through the `$prompt` variable piped over STDIN.
@@ -10532,9 +10780,11 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             &root,
             &projects,
             None,
+            None,
+            &[],
         )
         .expect("script builds");
-        // The prompt is delivered to the user via the clipboard only.
+        // CLIPBOARD: the prompt is delivered to the user via the clipboard only.
         assert!(script.contains("Set-Clipboard -Value $prompt"));
         // It is NEVER echoed to the terminal stream.
         assert!(
@@ -10564,6 +10814,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
                 &root,
                 &projects,
                 None,
+                None,
+                &[],
             )
             .expect("script builds");
             assert!(
@@ -10603,6 +10855,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             &root,
             &projects,
             None,
+            None,
+            &[],
         )
         .expect("script builds");
         // GIT_TERMINAL_PROMPT=0 → never block on an interactive credential prompt.
@@ -10798,6 +11052,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             None,
             // External Terminal.app semantics (in-script env export path).
             true,
+            &[],
         )
         .expect("script builds");
         assert!(
@@ -11044,6 +11299,8 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             &root,
             &projects,
             None,
+            None,
+            &[],
         )
         .expect("script builds");
 
@@ -11123,6 +11380,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             None,
             // External Terminal.app path (custom client reads $ASPIS_AGENT_PROMPT_FILE).
             true,
+            &[],
         )
         .expect("script builds");
 
@@ -11195,6 +11453,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             None,
             // PTY path: secrets via cmd.env, NOT in-script.
             false,
+            &[],
         )
         .expect("script builds");
 
@@ -11256,8 +11515,27 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             &envs,
             None,
             false,
+            // Phase A.2: a configured user server must appear in this codex cli_line.
+            &[user_mcp_config::UserMcpServer {
+                name: "my-db".to_string(),
+                transport: "stdio".to_string(),
+                command: "python".to_string(),
+                args: vec!["-m".to_string(), "mydb_mcp".to_string()],
+                env: std::collections::BTreeMap::new(),
+                enabled: true,
+            }],
         )
         .expect("script builds");
+
+        // Phase A.2: the user server name + command reach the codex `-c mcp_servers.*` args.
+        assert!(
+            script.contains("mcp_servers.my-db.command="),
+            "user server must appear in the codex cli_line: {script}"
+        );
+        assert!(
+            script.contains("mydb_mcp"),
+            "user server args must appear in the codex cli_line: {script}"
+        );
 
         // codex consumes $PROMPT via its pipe → it MUST NOT be unset.
         assert!(
@@ -11296,6 +11574,7 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             None,
             // External Terminal.app path: in-script env + self-delete.
             true,
+            &[],
         )
         .expect("script builds");
 
