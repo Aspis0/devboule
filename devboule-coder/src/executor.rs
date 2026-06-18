@@ -74,6 +74,33 @@ pub(crate) const HTTP_BODY_CAP: usize = 4 * MAX_RESULT_LEN;
 #[async_trait]
 pub trait McpBackend: Send + Sync {
     async fn call_tool(&self, name: &str, params: serde_json::Value) -> Result<String, String>;
+
+    /// Route an [`AgentAction::McpTool`] to the named USER MCP server (Phase B). The
+    /// Oracle-only backend ([`crate::rmcp_backend::RmcpBackend`]) uses the DEFAULT,
+    /// which errors (there is no user-server surface on a plain Oracle connection);
+    /// [`crate::multi_mcp::MultiMcpBackend`] overrides it to dispatch to the named
+    /// backend, returning a recoverable `Err` for an unknown server (never a panic —
+    /// the burst recovers). Kept as a SEPARATE method (not folded into `call_tool`)
+    /// so Oracle dispatch — fixed tool names through `call_tool` — is unchanged and a
+    /// user server can never be reached except through this explicit user path.
+    async fn call_user_tool(
+        &self,
+        server: &str,
+        _tool: &str,
+        _params: serde_json::Value,
+    ) -> Result<String, String> {
+        Err(format!(
+            "no user MCP servers are configured (cannot call server `{server}`)"
+        ))
+    }
+
+    /// The CONFIGURED user-MCP server names this backend can route to. Empty for the
+    /// Oracle-only backend; [`crate::multi_mcp::MultiMcpBackend`] returns its user
+    /// server names. Surfaced up through [`RealExecutor`] so the burst can validate an
+    /// `mcp_tool` server name at parse time.
+    fn user_server_names(&self) -> &[String] {
+        &[]
+    }
 }
 
 // =============================================================================
@@ -614,6 +641,14 @@ impl RealExecutor {
 
 #[async_trait]
 impl ToolExecutor for RealExecutor {
+    /// The configured user-MCP server names, surfaced from the MCP backend (the
+    /// `MultiMcpBackend` when user servers are wired; empty for the plain Oracle
+    /// backend). The burst validates an `mcp_tool` server name against this at parse
+    /// time, so an unknown server is an immediate format error.
+    fn known_mcp_servers(&self) -> &[String] {
+        self.mcp.user_server_names()
+    }
+
     async fn execute(&self, action: &AgentAction) -> ToolResult {
         match action {
             // --- MCP backend: private/grounded Oracle + write delegation ------
@@ -727,6 +762,22 @@ impl ToolExecutor for RealExecutor {
                     Err(e) => ToolResult::err(format!("websearch: {e}")),
                 },
                 None => ToolResult::err("websearch reached the executor with egress disabled"),
+            },
+
+            // --- User MCP server: routed through the MCP backend --------------
+            // `mcp_tool` is DECOUPLED from web egress (`is_egress() == false`, design
+            // §5.2): a user server is its own opt-in capability, so the web-egress gate
+            // never blocks it — it reaches here whether or not `allow_egress` is set. Its
+            // gate is the KNOWN-SERVER set, checked at PARSE time (validate_with_servers);
+            // here we route to the named user backend via the MultiMcpBackend. A plain
+            // Oracle backend (no user servers) returns a recoverable error, never a panic.
+            AgentAction::McpTool {
+                server,
+                tool,
+                params,
+            } => match self.mcp.call_user_tool(server, tool, params.clone()).await {
+                Ok(text) => ToolResult::ok(text),
+                Err(e) => ToolResult::err(format!("mcp_tool {server}.{tool}: {e}")),
             },
 
             // --- Terminal actions never reach an executor ---------------------
@@ -1182,6 +1233,119 @@ mod tests {
             .await;
         assert!(!r.ok);
         assert!(r.output.contains("egress disabled"), "got: {}", r.output);
+    }
+
+    // --- McpTool routing (Phase B) -------------------------------------------
+
+    /// A backend that records `call_user_tool(server, tool, params)` and returns a
+    /// labelled result so the executor's McpTool arm can be asserted end-to-end. It
+    /// also knows a fixed set of user-server names (so `known_mcp_servers` is exercised).
+    struct UserRoutingMock {
+        user_calls: Mutex<Vec<(String, String, serde_json::Value)>>,
+        names: Vec<String>,
+        unknown: bool,
+    }
+    impl UserRoutingMock {
+        fn new(names: &[&str], unknown: bool) -> Self {
+            Self {
+                user_calls: Mutex::new(Vec::new()),
+                names: names.iter().map(|s| s.to_string()).collect(),
+                unknown,
+            }
+        }
+    }
+    #[async_trait]
+    impl McpBackend for UserRoutingMock {
+        async fn call_tool(&self, name: &str, _params: serde_json::Value) -> Result<String, String> {
+            // The Oracle path must NOT be hit by an mcp_tool dispatch.
+            Err(format!("oracle call_tool unexpectedly invoked for {name}"))
+        }
+        async fn call_user_tool(
+            &self,
+            server: &str,
+            tool: &str,
+            params: serde_json::Value,
+        ) -> Result<String, String> {
+            self.user_calls
+                .lock()
+                .unwrap()
+                .push((server.to_string(), tool.to_string(), params));
+            if self.unknown {
+                return Err(format!("unknown user MCP server `{server}`"));
+            }
+            Ok(format!("[user {server}.{tool}]"))
+        }
+        fn user_server_names(&self) -> &[String] {
+            &self.names
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_routes_through_call_user_tool_not_the_oracle() {
+        let dir = tempdir().unwrap();
+        let mcp = std::sync::Arc::new(UserRoutingMock::new(&["my-db"], false));
+        let fs = FsBackend::new(dir.path()).unwrap();
+        let exec = RealExecutor::new(mcp.clone(), fs, None);
+        let r = exec
+            .execute(&AgentAction::McpTool {
+                server: "my-db".into(),
+                tool: "query".into(),
+                params: json!({"sql": "SELECT 1"}),
+            })
+            .await;
+        assert!(r.ok, "mcp_tool dispatched ok: {}", r.output);
+        assert!(r.output.contains("user my-db.query"), "routed to the user backend: {}", r.output);
+        let calls = mcp.user_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one user-tool call");
+        assert_eq!(calls[0].0, "my-db");
+        assert_eq!(calls[0].1, "query");
+        assert_eq!(calls[0].2, json!({"sql": "SELECT 1"}));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_unknown_server_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let mcp = std::sync::Arc::new(UserRoutingMock::new(&["my-db"], true));
+        let fs = FsBackend::new(dir.path()).unwrap();
+        let exec = RealExecutor::new(mcp, fs, None);
+        let r = exec
+            .execute(&AgentAction::McpTool {
+                server: "ghost".into(),
+                tool: "query".into(),
+                params: json!({}),
+            })
+            .await;
+        assert!(!r.ok, "unknown server is a failed result");
+        assert!(r.output.contains("mcp_tool ghost.query"), "names the call: {}", r.output);
+        assert!(r.output.contains("unknown user MCP server"), "carries the cause: {}", r.output);
+    }
+
+    #[tokio::test]
+    async fn known_mcp_servers_surfaces_the_backend_names() {
+        // The executor surfaces the backend's user-server names so the burst can
+        // validate an mcp_tool server at parse time.
+        let dir = tempdir().unwrap();
+        let mcp = std::sync::Arc::new(UserRoutingMock::new(&["my-db", "api"], false));
+        let fs = FsBackend::new(dir.path()).unwrap();
+        let exec = RealExecutor::new(mcp, fs, None);
+        assert_eq!(
+            exec.known_mcp_servers(),
+            &["my-db".to_string(), "api".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_oracle_backend_has_no_user_servers() {
+        // The no-user-servers path: a plain MockMcpBackend (Oracle only) reports an
+        // EMPTY user-server set, so every mcp_tool is rejected at parse time and the
+        // existing executor wiring is unchanged.
+        let dir = tempdir().unwrap();
+        let mcp = std::sync::Arc::new(MockMcpBackend::new());
+        let exec = exec_with(dir.path(), mcp);
+        assert!(
+            exec.known_mcp_servers().is_empty(),
+            "a plain Oracle backend exposes no user servers"
+        );
     }
 
     #[tokio::test]

@@ -1584,6 +1584,15 @@ fn prepare_or_launch_project_agent(
             } else {
                 String::new()
             },
+            // Phase B — the merged, ENABLED user MCP servers for the LOCAL MAIN coder's
+            // MultiMcpBackend, as the DEVBOULE_USER_MCP_SERVERS JSON array. Computed
+            // here (AppHandle + project root in hand) ONLY for the orchestrator; EMPTY
+            // when no user servers are configured (the var is then omitted → byte-
+            // identical launch). The MINI launch path NEVER computes or carries this
+            // (design §6 mini-exclusion).
+            user_mcp_servers_json: user_mcp_config::orchestrator_env_json(
+                &user_mcp_config::merged_servers(&app, &root_path),
+            ),
         })
     } else {
         None
@@ -4485,6 +4494,17 @@ struct OrchestratorLaunchConfig {
     /// plan-before-acting directive. Empty/absent leaves the prompt unchanged, so a
     /// non-plan-first launch is byte-identical. NOT a secret.
     plan_first: String,
+    /// `DEVBOULE_USER_MCP_SERVERS` (Phase B): the merged, ENABLED user MCP servers
+    /// (global ∪ project, project wins) as a JSON array of `{name,command,args,env}`,
+    /// which the LOCAL MAIN coder wires into its `MultiMcpBackend`. EMPTY when no user
+    /// servers are configured, so `orchestrator_env_pairs` omits the var entirely and
+    /// the launch is byte-identical to a pre-B one. NOT a secret (no key) — but the
+    /// `env` values CAN carry user-supplied credentials, so this rides inline like the
+    /// other non-secret config only because it is the user's OWN declared config (the
+    /// same values already injected into the codex/claude launch config in Phase A.2).
+    /// CRITICAL (design §6 mini-exclusion): this is set ONLY for the orchestrator; the
+    /// MINI launch path never carries it.
+    user_mcp_servers_json: String,
 }
 
 /// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
@@ -4539,6 +4559,16 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     // byte-identical to a pre-3b one. Non-secret.
     if !config.plan_first.trim().is_empty() {
         pairs.push(("DEVBOULE_PLAN_FIRST", config.plan_first.clone()));
+    }
+    // Phase B — the user MCP servers JSON array (DEVBOULE_USER_MCP_SERVERS), appended
+    // ONLY when non-empty (no user servers ⇒ the field is "" ⇒ the pair is omitted, so
+    // the launch is byte-identical to a pre-B one). This is the ORCHESTRATOR launch
+    // (the local MAIN coder); the mini launch NEVER carries this var (design §6).
+    if !config.user_mcp_servers_json.trim().is_empty() {
+        pairs.push((
+            "DEVBOULE_USER_MCP_SERVERS",
+            config.user_mcp_servers_json.clone(),
+        ));
     }
     pairs
 }
@@ -10364,6 +10394,123 @@ You decide per task; default to 'emitEdits' when unsure.\n";
         assert!(!macos.contains("mcp_servers.my-db.args="), "macOS line must omit empty args: {macos}");
     }
 
+    // --- Phase B: orchestrator DEVBOULE_USER_MCP_SERVERS wiring --------------
+
+    #[test]
+    fn orchestrator_env_json_serializes_enabled_servers_slim() {
+        // The orchestrator payload is a JSON array of slim {name,command,args,env}
+        // objects (no transport/enabled), one per merged ENABLED server.
+        let servers = [user_server_fixture()];
+        let json = user_mcp_config::orchestrator_env_json(&servers);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON array");
+        let arr = value.as_array().expect("an array");
+        assert_eq!(arr.len(), 1);
+        let s = &arr[0];
+        assert_eq!(s["name"], serde_json::json!("my-db"));
+        assert_eq!(s["command"], serde_json::json!("python"));
+        assert_eq!(s["args"], serde_json::json!(["-m", "mydb_mcp"]));
+        assert_eq!(s["env"]["DB_URL"], serde_json::json!("postgres://x"));
+        // The slim payload OMITS transport/enabled (the binary needs neither).
+        assert!(s.get("transport").is_none(), "transport omitted: {s}");
+        assert!(s.get("enabled").is_none(), "enabled omitted: {s}");
+    }
+
+    #[test]
+    fn orchestrator_env_json_is_empty_for_no_servers() {
+        // No servers ⇒ empty string ⇒ the env pair is omitted (byte-identical launch).
+        assert_eq!(user_mcp_config::orchestrator_env_json(&[]), "");
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_emits_user_mcp_servers_only_when_present() {
+        // WITH servers: DEVBOULE_USER_MCP_SERVERS is present and carries the JSON array.
+        let mut with = orchestrator_fixture();
+        with.user_mcp_servers_json =
+            user_mcp_config::orchestrator_env_json(&[user_server_fixture()]);
+        let pairs = orchestrator_env_pairs(&with);
+        let found = pairs
+            .iter()
+            .find(|(n, _)| *n == "DEVBOULE_USER_MCP_SERVERS")
+            .expect("the var is set when servers exist");
+        assert!(found.1.contains("\"my-db\""), "carries the server: {}", found.1);
+
+        // WITHOUT servers (the base fixture has it empty): the var is OMITTED entirely,
+        // so a no-user-servers orchestrator launch is byte-identical to a pre-B one.
+        let names: Vec<&str> = orchestrator_env_pairs(&orchestrator_fixture())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            !names.contains(&"DEVBOULE_USER_MCP_SERVERS"),
+            "no servers ⇒ no DEVBOULE_USER_MCP_SERVERS pair"
+        );
+    }
+
+    #[test]
+    fn orchestrator_launch_line_carries_user_servers_when_present() {
+        // End-to-end through the launch SCRIPT: the var name + the server appear.
+        let mut config = orchestrator_fixture();
+        config.user_mcp_servers_json =
+            user_mcp_config::orchestrator_env_json(&[user_server_fixture()]);
+        let script = orchestrator_launch_script(&config);
+        assert!(script.contains("DEVBOULE_USER_MCP_SERVERS"), "var on the script: {script}");
+        assert!(script.contains("my-db"), "server name on the script: {script}");
+
+        // And the base (no-servers) launch script must NOT mention it.
+        let plain = orchestrator_launch_script(&orchestrator_fixture());
+        assert!(
+            !plain.contains("DEVBOULE_USER_MCP_SERVERS"),
+            "no-servers launch must omit the var: {plain}"
+        );
+    }
+
+    #[test]
+    fn mini_launch_path_never_wires_user_mcp_servers() {
+        // MINI-EXCLUSION (design §6): the mini coder is a separate launch path
+        // (mini_coder_executor.rs) that must never WIRE user MCP servers IN. This test
+        // asserts the invariant at the source-text level: the mini module never references
+        // any Phase B wiring symbol (the backend, the action, the merge/serialize helpers).
+        let mini_src = include_str!("mini_coder_executor.rs");
+        for forbidden in [
+            "MultiMcpBackend",
+            "McpTool",
+            "merged_servers",
+            "orchestrator_env_json",
+        ] {
+            assert!(
+                !mini_src.contains(forbidden),
+                "mini_coder_executor.rs must not reference `{forbidden}` (mini-exclusion §6)"
+            );
+        }
+        // FIX 6: the var name MAY appear, but ONLY as the DEFENSIVE SCRUB (`env_remove`) that
+        // strips an inherited host-env value OUT of the mini command — never to SET it.
+        // Every line mentioning the var must be either the const definition or an
+        // `env_remove(...)` call; none may pass it to `.env(` (which would WIRE it in).
+        let var = "DEVBOULE_USER_MCP_SERVERS";
+        for line in mini_src.lines().filter(|l| l.contains(var)) {
+            let t = line.trim();
+            let is_const_def = t.starts_with("const FORBIDDEN_USER_MCP_ENV");
+            let is_doc = t.starts_with("//") || t.starts_with("///");
+            assert!(
+                is_const_def || is_doc,
+                "the only literal `{var}` lines may be the const def or a comment; the \
+                 scrub itself must reference the const, not the literal: {line}"
+            );
+        }
+        // The defensive scrub IS present (the runtime enforcement), and the var is removed,
+        // never set, on the mini command.
+        assert!(
+            mini_src.contains("env_remove(FORBIDDEN_USER_MCP_ENV)"),
+            "the mini command must defensively env_remove the user-MCP var (FIX 6)"
+        );
+        // `.env(` (with the leading dot, distinct from `.get_env(` / `.env_remove(`) is the
+        // SETTER. The mini must never SET the user-MCP var — only env_remove it.
+        assert!(
+            !mini_src.contains(".env(FORBIDDEN_USER_MCP_ENV"),
+            "the mini command must NEVER set the user-MCP var (mini-exclusion §6)"
+        );
+    }
+
     #[test]
     fn disabled_user_servers_are_not_in_the_merged_set_so_not_injected() {
         // A disabled server is filtered out by merged_servers BEFORE it reaches the
@@ -10403,6 +10550,10 @@ You decide per task; default to 'emitEdits' when unsure.\n";
             // 3c — the project key the planner submits under. 3b — plan-first ON.
             project_id: "the-project-sentinel".to_string(),
             plan_first: "1".to_string(),
+            // Phase B — no user MCP servers in the base fixture, so the launch line/
+            // script stays byte-identical to the pre-B output. The dedicated B tests
+            // build a config WITH servers to assert the var is emitted only then.
+            user_mcp_servers_json: String::new(),
         }
     }
 

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::action::{parse_action, AgentAction, FormatError};
+use crate::action::{parse_action_with_servers, AgentAction, FormatError};
 use crate::model::CoderModel;
 
 /// Max number of EXECUTED tool actions in one burst before the loop gives up.
@@ -121,6 +121,19 @@ impl ToolResult {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, action: &AgentAction) -> ToolResult;
+
+    /// The CONFIGURED user-MCP server names this executor can route an
+    /// [`AgentAction::McpTool`] to. The burst passes these to
+    /// [`crate::action::parse_action_with_servers`] so an `mcp_tool` naming an
+    /// unknown server is rejected at PARSE time (immediate model feedback) rather
+    /// than reaching dispatch as a late error. The default is EMPTY: an executor
+    /// with no user servers (the Stub, the test mocks, the plain `RmcpBackend`
+    /// path) rejects every `mcp_tool`, which is the correct no-user-servers
+    /// behavior. [`crate::executor::RealExecutor`] overrides this with the names
+    /// its `MultiMcpBackend` knows.
+    fn known_mcp_servers(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// The result every [`StubExecutor`] tool dispatch returns: an UNMISTAKABLE
@@ -159,7 +172,8 @@ impl ToolExecutor for StubExecutor {
             | AgentAction::Grep { .. }
             | AgentAction::Glob { .. }
             | AgentAction::Fetch { .. }
-            | AgentAction::Websearch { .. } => ToolResult::err(STUB_NOT_CONNECTED),
+            | AgentAction::Websearch { .. }
+            | AgentAction::McpTool { .. } => ToolResult::err(STUB_NOT_CONNECTED),
             // Terminal actions are handled by the loop before dispatch; if one
             // ever reaches here it is a logic error, so report it rather than
             // silently succeed.
@@ -201,7 +215,10 @@ impl Clock for SystemClock {
 }
 
 /// One entry in the burst transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` is not derived: the `Action` arm holds an `AgentAction`, which dropped `Eq`
+// (its `McpTool.params` is a non-`Eq` `serde_json::Value`). `PartialEq` is all the
+// transcript tests need.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
     /// The model's parsed action for a round.
     Action(AgentAction),
@@ -312,7 +329,10 @@ pub async fn run_burst(
 
         let raw = model.next_output(&transcript).await;
 
-        match parse_action(&raw) {
+        // Validate against the executor's configured user-MCP server names so an
+        // `mcp_tool` naming an unknown server is an immediate format error (the
+        // default empty set rejects every `mcp_tool` when no user servers exist).
+        match parse_action_with_servers(&raw, executor.known_mcp_servers()) {
             Err(fe) => {
                 // 11.4 output-hash loop-detector: a model re-emitting the SAME invalid
                 // output — even interleaved with valid actions that reset the
@@ -1281,6 +1301,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tool_with_no_known_servers_is_a_format_error() {
+        // The default executor exposes NO user servers (`known_mcp_servers() == &[]`),
+        // so an `mcp_tool` is rejected at PARSE time as a format error — it never
+        // reaches the executor. Three such errors escalate via the consecutive guard.
+        // Three DISTINCT mcp_tool blocks (different server names) so each is a fresh
+        // unknown-server format error — escalating via the consecutive-format-error
+        // guard rather than the repeated-identical-output loop detector.
+        let model = ScriptedModel::new(vec![
+            action_block(serde_json::json!({"tool":"mcp_tool","server":"db-a","name":"query","params":{}})),
+            action_block(serde_json::json!({"tool":"mcp_tool","server":"db-b","name":"query","params":{}})),
+            action_block(serde_json::json!({"tool":"mcp_tool","server":"db-c","name":"query","params":{}})),
+            action_block(serde_json::json!({"tool":"done","reply":"unreached"})),
+        ]);
+        let exec = StubExecutor;
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            BurstOutcome::Escalated(format!("{MAX_FORMAT_ERRORS} consecutive format errors")),
+            "an mcp_tool with no configured servers is a format error each time"
+        );
+        let joined = drain(&mut rx).join("\n");
+        assert!(
+            joined.contains("format error"),
+            "the unknown-server rejection surfaced as a format error: {joined}"
+        );
+        assert!(
+            joined.contains("unknown MCP server"),
+            "the format error names the unknown-server cause: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_with_a_known_server_dispatches() {
+        // An executor that reports a known user server lets the model call it: the
+        // burst parses the mcp_tool (server is in the set) and dispatches it.
+        use std::sync::Mutex;
+        struct UserExec(Mutex<Vec<String>>, Vec<String>);
+        #[async_trait]
+        impl ToolExecutor for UserExec {
+            async fn execute(&self, action: &AgentAction) -> ToolResult {
+                self.0.lock().unwrap().push(action.tool_name().to_string());
+                ToolResult::ok("user tool ran")
+            }
+            fn known_mcp_servers(&self) -> &[String] {
+                &self.1
+            }
+        }
+        let model = ScriptedModel::new(vec![
+            action_block(serde_json::json!({"tool":"mcp_tool","server":"my-db","name":"query","params":{"q":1}})),
+            action_block(serde_json::json!({"tool":"done","reply":"ok"})),
+        ]);
+        let exec = UserExec(Mutex::new(Vec::new()), vec!["my-db".to_string()]);
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
+        assert_eq!(outcome, BurstOutcome::Done("ok".to_string()));
+        assert_eq!(
+            *exec.0.lock().unwrap(),
+            vec!["mcp_tool".to_string()],
+            "the mcp_tool was dispatched to the executor"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_to_known_server_is_allowed_with_web_egress_off() {
+        // DECOUPLING (design §5.2): a user MCP server is its OWN opt-in capability,
+        // separate from the web-search (Exa) opt-in. So a `mcp_tool` naming a KNOWN
+        // configured server MUST be dispatched even when web egress is OFF
+        // (`allow_egress=false`) — the web-egress gate (is_egress && !allow_egress)
+        // only blocks fetch/websearch. The known-server set is the user-MCP gate.
+        use std::sync::Mutex;
+        struct UserExec(Mutex<Vec<String>>, Vec<String>);
+        #[async_trait]
+        impl ToolExecutor for UserExec {
+            async fn execute(&self, action: &AgentAction) -> ToolResult {
+                self.0.lock().unwrap().push(action.tool_name().to_string());
+                ToolResult::ok("user tool ran")
+            }
+            fn known_mcp_servers(&self) -> &[String] {
+                &self.1
+            }
+        }
+        let model = ScriptedModel::new(vec![
+            action_block(serde_json::json!({"tool":"mcp_tool","server":"my-db","name":"query","params":{}})),
+            action_block(serde_json::json!({"tool":"done","reply":"ok"})),
+        ]);
+        let exec = UserExec(Mutex::new(Vec::new()), vec!["my-db".to_string()]);
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            false, // WEB egress OFF — must NOT block a known-server mcp_tool
+            &tx,
+        )
+        .await;
+        assert_eq!(outcome, BurstOutcome::Done("ok".to_string()));
+        assert_eq!(
+            *exec.0.lock().unwrap(),
+            vec!["mcp_tool".to_string()],
+            "a known-server mcp_tool must be dispatched even with web egress disabled"
+        );
+        // The web-egress "disabled" recovery message must NEVER fire for mcp_tool.
+        let joined = drain(&mut rx).join("\n");
+        assert!(
+            !joined.contains("egress disabled"),
+            "mcp_tool must not surface the web-egress-disabled message: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_is_still_blocked_when_egress_disabled() {
+        // The WEB tools stay gated on allow_egress (UNCHANGED): with egress OFF a fetch
+        // is never dispatched and the model gets the recovery message.
+        use std::sync::Mutex;
+        struct WebExec(Mutex<Vec<String>>);
+        #[async_trait]
+        impl ToolExecutor for WebExec {
+            async fn execute(&self, action: &AgentAction) -> ToolResult {
+                self.0.lock().unwrap().push(action.tool_name().to_string());
+                ToolResult::ok("should not run")
+            }
+        }
+        let model = ScriptedModel::new(vec![
+            action_block(serde_json::json!({"tool":"fetch","url":"https://example.com"})),
+            action_block(serde_json::json!({"tool":"done","reply":"recovered"})),
+        ]);
+        let exec = WebExec(Mutex::new(Vec::new()));
+        let clock = FixedClock(Duration::ZERO);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let outcome = run_burst(
+            "x".into(),
+            &model,
+            &exec,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            false, // egress OFF
+            &tx,
+        )
+        .await;
+        assert_eq!(outcome, BurstOutcome::Done("recovered".to_string()));
+        assert!(
+            exec.0.lock().unwrap().is_empty(),
+            "a web fetch must never reach the executor when egress is disabled"
+        );
+        let joined = drain(&mut rx).join("\n");
+        assert!(joined.contains("egress disabled"), "the disabled marker streamed: {joined}");
+    }
+
+    #[tokio::test]
     async fn ask_user_hands_back() {
         let model = ScriptedModel::new(vec![action_block(
             serde_json::json!({"tool":"ask_user","question":"which env?"}),
@@ -1368,6 +1565,11 @@ mod tests {
                 url: "https://example.com".into(),
             },
             AgentAction::Websearch { query: "q".into() },
+            AgentAction::McpTool {
+                server: "my-db".into(),
+                tool: "query".into(),
+                params: serde_json::json!({}),
+            },
         ];
         for action in &actions {
             let result = exec.execute(action).await;

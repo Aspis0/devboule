@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use crate::agent_loop::{Transcript, TranscriptEntry};
 use crate::model::CoderModel;
-use crate::prompt::build_system_prompt;
+use crate::prompt::{build_system_prompt, UserMcpServerTools};
 
 /// Max length of the oMLX base URL. Mirrors `mini_coder::MINI_BASE_URL_MAX_LEN`.
 const OMLX_BASE_URL_MAX_LEN: usize = 200;
@@ -271,6 +271,12 @@ pub struct OmlxModel {
     /// standing prompt gains the PLAN-FIRST directive when set. `false` keeps the
     /// prompt byte-identical to the pre-3b default.
     plan_first: bool,
+    /// B.3 — the connected user MCP servers + their tools, appended to the system
+    /// prompt as the external-tools catalog. EMPTY (the default) keeps the prompt
+    /// byte-identical to the pre-B default. Set via [`OmlxModel::with_user_mcp_tools`]
+    /// after the executor connects (the tool list is fetched at connect time).
+    /// `Arc<[…]>` so a `Clone` of the model is cheap and the slice is shared.
+    user_mcp: std::sync::Arc<[UserMcpServerTools]>,
 }
 
 impl OmlxModel {
@@ -296,7 +302,16 @@ impl OmlxModel {
             model,
             client,
             plan_first,
+            user_mcp: std::sync::Arc::from(Vec::new()),
         })
+    }
+
+    /// Attach the connected user MCP servers' tool catalog (B.3) for the system prompt.
+    /// Builder-style so the default (no user servers) construction stays unchanged and
+    /// byte-identical. Called from `config.rs` after the `MultiMcpBackend` connects.
+    pub fn with_user_mcp_tools(mut self, user_mcp: Vec<UserMcpServerTools>) -> Self {
+        self.user_mcp = std::sync::Arc::from(user_mcp);
+        self
     }
 
     /// The chat-completions endpoint URL.
@@ -308,7 +323,7 @@ impl OmlxModel {
     /// OpenAI-compatible `messages` and a small request envelope. Separated from
     /// the live POST so the request shape is unit-testable without inference.
     pub fn build_request_body(&self, transcript: &Transcript) -> Value {
-        build_chat_body(&self.model, transcript, self.plan_first)
+        build_chat_body(&self.model, transcript, self.plan_first, &self.user_mcp)
     }
 }
 
@@ -318,10 +333,15 @@ impl OmlxModel {
 /// transport (loopback http vs. https + Authorization header) differs. Centralizing
 /// it here guarantees the cloud path sends EXACTLY the body the loopback path builds,
 /// so a body change can never drift between the two backends.
-fn build_chat_body(model: &str, transcript: &Transcript, plan_first: bool) -> Value {
+fn build_chat_body(
+    model: &str,
+    transcript: &Transcript,
+    plan_first: bool,
+    user_mcp: &[UserMcpServerTools],
+) -> Value {
     json!({
         "model": model,
-        "messages": build_messages(transcript, plan_first),
+        "messages": build_messages(transcript, plan_first, user_mcp),
         "max_tokens": MAX_TOKENS,
         "temperature": 0.2,
         "stream": false,
@@ -332,12 +352,17 @@ fn build_chat_body(model: &str, transcript: &Transcript, plan_first: bool) -> Va
 /// human message, then each prior action (as an assistant turn carrying its
 /// emitted action block) and its tool result / format feedback (as a user turn).
 /// The model thus sees the full local burst context the way it produced it.
-fn build_messages(transcript: &Transcript, plan_first: bool) -> Value {
+fn build_messages(
+    transcript: &Transcript,
+    plan_first: bool,
+    user_mcp: &[UserMcpServerTools],
+) -> Value {
     // The system prompt + the human message are NON-evictable framing: the model
     // must always see who it is and what was asked. `plan_first` (3b) appends the
-    // PLAN-FIRST directive to the standing prompt when the operator requested it.
+    // PLAN-FIRST directive to the standing prompt when the operator requested it;
+    // `user_mcp` (B.3) appends the external user-MCP tool catalog when non-empty.
     let mut messages = vec![
-        json!({ "role": "system", "content": build_system_prompt(plan_first) }),
+        json!({ "role": "system", "content": build_system_prompt(plan_first, user_mcp) }),
         json!({ "role": "user", "content": transcript.human_message() }),
     ];
 
@@ -420,6 +445,11 @@ fn render_action_block(action: &crate::action::AgentAction) -> String {
         A::Glob { pattern } => json!({"tool":"glob","pattern":pattern}),
         A::Fetch { url } => json!({"tool":"fetch","url":url}),
         A::Websearch { query } => json!({"tool":"websearch","query":query}),
+        A::McpTool {
+            server,
+            tool,
+            params,
+        } => json!({"tool":"mcp_tool","server":server,"name":tool,"params":params}),
         A::AskUser { question } => json!({"tool":"ask_user","question":question}),
         A::Done { reply } => json!({"tool":"done","reply":reply}),
         A::Escalate { reason } => json!({"tool":"escalate","reason":reason}),
@@ -511,6 +541,10 @@ pub struct CloudModel {
     api_key: String,
     client: reqwest::Client,
     plan_first: bool,
+    /// B.3 — the connected user MCP servers + their tools (see [`OmlxModel`] field).
+    /// EMPTY (default) keeps the prompt byte-identical; set via
+    /// [`CloudModel::with_user_mcp_tools`].
+    user_mcp: std::sync::Arc<[UserMcpServerTools]>,
 }
 
 impl std::fmt::Debug for CloudModel {
@@ -560,7 +594,15 @@ impl CloudModel {
             api_key,
             client,
             plan_first,
+            user_mcp: std::sync::Arc::from(Vec::new()),
         })
+    }
+
+    /// Attach the connected user MCP servers' tool catalog (B.3) for the system prompt.
+    /// Builder-style; the default (no user servers) construction stays byte-identical.
+    pub fn with_user_mcp_tools(mut self, user_mcp: Vec<UserMcpServerTools>) -> Self {
+        self.user_mcp = std::sync::Arc::from(user_mcp);
+        self
     }
 
     /// The chat-completions endpoint URL.
@@ -571,7 +613,7 @@ impl CloudModel {
     /// PURE request-body builder: identical shape to the loopback client's, via the
     /// shared [`build_chat_body`]. Unit-testable without inference or a network.
     pub fn build_request_body(&self, transcript: &Transcript) -> Value {
-        build_chat_body(&self.model, transcript, self.plan_first)
+        build_chat_body(&self.model, transcript, self.plan_first, &self.user_mcp)
     }
 
     /// POST one chat-completions request (https + bearer) and return the assistant
@@ -836,6 +878,26 @@ mod tests {
             let parsed = parse_action(&block).expect("rendered block re-parses");
             assert_eq!(parsed, a, "round-trip mismatch for {a:?}");
         }
+    }
+
+    #[test]
+    fn render_mcp_tool_round_trips_through_the_parser() {
+        // The mcp_tool wire form uses `name` (not `tool`) for the tool-to-call (the enum
+        // is tagged on `tool`). Assert render→parse symmetry, validating against a known
+        // server so the unknown-server gate does not reject it.
+        use crate::action::{parse_action_with_servers, AgentAction};
+        let a = AgentAction::McpTool {
+            server: "my-db".into(),
+            tool: "query".into(),
+            params: serde_json::json!({"sql": "SELECT 1", "limit": 5}),
+        };
+        let block = render_action_block(&a);
+        // The rendered block carries the `name` wire key, not a second `tool` key.
+        assert!(block.contains("\"name\":\"query\""), "uses the `name` wire key: {block}");
+        let servers = vec!["my-db".to_string()];
+        let parsed =
+            parse_action_with_servers(&block, &servers).expect("rendered mcp_tool re-parses");
+        assert_eq!(parsed, a, "mcp_tool round-trip mismatch");
     }
 
     // --- response parsing -----------------------------------------------------

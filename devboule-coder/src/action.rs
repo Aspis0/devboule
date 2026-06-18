@@ -58,7 +58,12 @@ pub const MAX_GREP_PATTERN_LEN: usize = 512;
 /// or extra key a hard parse error (surfaced as [`FormatError::Invalid`]) rather
 /// than being silently ignored — the model gets feedback instead of a wrong
 /// dispatch.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+// NOTE: `Eq` is intentionally NOT derived. The `McpTool { params: serde_json::Value }`
+// field carries an arbitrary JSON value, and `serde_json::Value` is `PartialEq` but NOT
+// `Eq` (it can hold an `f64`). `PartialEq` is all the codebase needs (assert_eq! in
+// tests, the no-progress guard compares `(tool_name, target)` strings, not the action),
+// so dropping `Eq` is sound and keeps the variant's params unconstrained.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentAction {
     /// PRIMARY: ask the private, grounded oracle a question.
@@ -104,6 +109,26 @@ pub enum AgentAction {
     Fetch { url: String },
     /// EGRESS: run a web search.
     Websearch { query: String },
+    /// Call a tool on a USER-configured MCP server (Phase B). `server` is the routing
+    /// key (a configured user-server name); `tool` is the tool to call on it; `params`
+    /// is the tool's argument object. User MCP servers are external child processes the
+    /// user OPTED INTO at config time, so a `mcp_tool` call is its OWN capability —
+    /// DECOUPLED from the WEB-egress gate (`fetch`/`websearch`): a user may call a
+    /// KNOWN configured server even with web egress OFF. Its gate is the
+    /// KNOWN-SERVER set (the server must be configured/connected), enforced at PARSE
+    /// time (see [`AgentAction::validate_with_servers`]) so an unknown server is
+    /// rejected with immediate feedback rather than a late call-time error. Routed by
+    /// the `MultiMcpBackend` to the named user backend.
+    McpTool {
+        server: String,
+        // The wire key is `name` (NOT `tool`): the enum is internally tagged on
+        // `"tool"` (the action TYPE), so the tool-to-call must use a different key or
+        // serde rejects the `tool` field as colliding with the tag. The Rust field
+        // stays `tool` for readability.
+        #[serde(rename = "name")]
+        tool: String,
+        params: serde_json::Value,
+    },
     /// TERMINAL: hand back to the human with a question.
     AskUser { question: String },
     /// TERMINAL: the final answer to the human.
@@ -113,10 +138,18 @@ pub enum AgentAction {
 }
 
 impl AgentAction {
-    /// `true` for actions that leave the machine (network egress). The loop
-    /// annotates these distinctly in the progress stream so egress is visible;
-    /// L2.3's real executor can additionally gate on it. `oracle_*` is PRIVATE
-    /// and grounded, so it is deliberately NOT egress.
+    /// `true` for actions that leave the machine via the PUBLIC WEB through the
+    /// external provider (`fetch`/`websearch`). The loop annotates these distinctly in
+    /// the progress stream and STRUCTURALLY gates them on `allow_egress` (the Exa key).
+    /// `oracle_*` is PRIVATE and grounded, so it is deliberately NOT egress.
+    ///
+    /// `mcp_tool` is deliberately NOT web-egress (design §5.2, decoupled): a user MCP
+    /// server is a capability the user OPTED INTO at config time, separate from the
+    /// web-search opt-in. It is gated instead by the KNOWN-SERVER set in
+    /// [`AgentAction::validate_with_servers`] (the server must be configured/connected),
+    /// so a configured server is callable even when web egress is OFF. Keeping it out of
+    /// this set is what lets the `run_burst` gate (`is_egress() && !allow_egress`) block
+    /// the web tools WITHOUT blocking user-MCP.
     pub fn is_egress(&self) -> bool {
         matches!(
             self,
@@ -138,6 +171,7 @@ impl AgentAction {
             AgentAction::Glob { .. } => "glob",
             AgentAction::Fetch { .. } => "fetch",
             AgentAction::Websearch { .. } => "websearch",
+            AgentAction::McpTool { .. } => "mcp_tool",
             AgentAction::AskUser { .. } => "ask_user",
             AgentAction::Done { .. } => "done",
             AgentAction::Escalate { .. } => "escalate",
@@ -164,6 +198,17 @@ impl AgentAction {
             AgentAction::Glob { pattern } => pattern.clone(),
             AgentAction::Fetch { url } => url.clone(),
             AgentAction::Websearch { query } => query.clone(),
+            // The target is `server.tool` PLUS a compact form of `params`, so the
+            // no-progress guard catches a truly identical repeated call but does NOT
+            // falsely flag the same tool invoked with DIFFERENT arguments (e.g. a
+            // paginated query). `params` is canonical-ish (serde_json renders object
+            // keys in insertion order; identical JSON ⇒ identical string here, which is
+            // all the guard needs — it compares for equality within one burst).
+            AgentAction::McpTool {
+                server,
+                tool,
+                params,
+            } => format!("{server}.{tool} {params}"),
             AgentAction::AskUser { question } => question.clone(),
             AgentAction::Done { reply } => reply.clone(),
             AgentAction::Escalate { reason } => reason.clone(),
@@ -174,7 +219,14 @@ impl AgentAction {
     /// the first violation so the loop can feed it back. Enforces text-length
     /// caps, the files-count cap, and that every path argument is a SAFE relative
     /// path (no absolute, no `..`, no `-`-leading component).
-    fn validate(&self) -> Result<(), String> {
+    ///
+    /// `known_servers` is the set of CONFIGURED user-MCP server names (loaded at
+    /// startup). It is consulted ONLY by the [`AgentAction::McpTool`] arm: a call
+    /// naming a server NOT in this set is rejected here, at parse time, so the model
+    /// gets an immediate `FormatError::Invalid` instead of a late call-time error.
+    /// For every other action the set is irrelevant. When no user servers are
+    /// configured the set is empty, so any `mcp_tool` is rejected.
+    fn validate_with_servers(&self, known_servers: &[String]) -> Result<(), String> {
         match self {
             AgentAction::OracleAsk { query } => check_text("query", query),
             AgentAction::OracleContext { query, .. } => check_text("query", query),
@@ -225,11 +277,52 @@ impl AgentAction {
                 check_url(url)
             }
             AgentAction::Websearch { query } => check_text("query", query),
+            AgentAction::McpTool {
+                server,
+                tool,
+                params,
+            } => check_mcp_tool(server, tool, params, known_servers),
             AgentAction::AskUser { question } => check_text("question", question),
             AgentAction::Done { reply } => check_text("reply", reply),
             AgentAction::Escalate { reason } => check_text("reason", reason),
         }
     }
+}
+
+/// Validate an [`AgentAction::McpTool`] (design §2.4). All three checks give the
+/// model a precise, self-correctable message at PARSE time:
+/// * `server` non-empty AND in the configured `known_servers` set — an unknown
+///   server (a typo, or one the user never configured) is rejected here instead of
+///   reaching the dispatcher as a late call-time error;
+/// * `tool` non-empty and within the standard [`MAX_TEXT_LEN`] text bound;
+/// * `params` is a JSON OBJECT — a scalar/array top-level is rejected (the MCP
+///   `call_tool` contract takes a named-argument object; a non-object would also be
+///   rejected by the backend, so we reject it early).
+fn check_mcp_tool(
+    server: &str,
+    tool: &str,
+    params: &serde_json::Value,
+    known_servers: &[String],
+) -> Result<(), String> {
+    if server.trim().is_empty() {
+        return Err("`server` must not be empty".to_string());
+    }
+    // Known-server gate: the set is the CONFIGURED user-server names. An exact match
+    // is required (the names are validated at config time to a safe charset, so a
+    // plain `==` is the right comparison). Empty set ⇒ no user servers ⇒ always
+    // rejected, which is correct (a no-user-servers launch must never run mcp_tool).
+    if !known_servers.iter().any(|s| s == server) {
+        return Err(format!(
+            "unknown MCP server `{server}` — it is not a configured user MCP server"
+        ));
+    }
+    check_text("tool", tool)?;
+    // `params` MUST be a JSON object: the MCP call_tool contract takes a named-arg
+    // map. Reject a scalar / array / null top-level with a precise message.
+    if !params.is_object() {
+        return Err("`params` must be a JSON object".to_string());
+    }
+    Ok(())
 }
 
 /// A free-text field must be non-empty and within the char cap.
@@ -613,7 +706,28 @@ fn count_action_fences(input: &str) -> (usize, usize) {
 ///
 /// On success the returned action is already validated, so the caller may
 /// dispatch it directly.
+///
+/// This is the zero-user-servers form: it validates against an EMPTY known-server
+/// set, so any [`AgentAction::McpTool`] is rejected. The burst loop calls
+/// [`parse_action_with_servers`] with the configured user-server names; every other
+/// (test / non-burst) call site keeps using this unchanged.
+// The burst loop now calls `parse_action_with_servers`; this convenience wrapper is
+// exercised only by the unit tests across the crate, so it reads as dead code in a
+// non-test build of this binary crate. Kept as the documented zero-servers entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_action(model_output: &str) -> Result<AgentAction, FormatError> {
+    parse_action_with_servers(model_output, &[])
+}
+
+/// Parse the model's raw output into exactly one [`AgentAction`], validating any
+/// [`AgentAction::McpTool`] against the configured user-MCP server names in
+/// `known_servers`. Identical to [`parse_action`] except for the `mcp_tool`
+/// known-server gate (see [`AgentAction::validate_with_servers`]). The burst loop
+/// uses this so an unknown server name is an immediate `FormatError::Invalid`.
+pub fn parse_action_with_servers(
+    model_output: &str,
+    known_servers: &[String],
+) -> Result<AgentAction, FormatError> {
     // Anti-evasion fence scan, independent of the capture regex. A model can WRAP
     // a well-formed block inside an OUTER fence so the inner closing ``` ends the
     // captured block early and `captures_iter` sees exactly ONE — bypassing the
@@ -645,7 +759,9 @@ pub fn parse_action(model_output: &str) -> Result<AgentAction, FormatError> {
 
     let action: AgentAction =
         serde_json::from_str(body).map_err(|e| FormatError::Invalid(e.to_string()))?;
-    action.validate().map_err(FormatError::Invalid)?;
+    action
+        .validate_with_servers(known_servers)
+        .map_err(FormatError::Invalid)?;
     Ok(action)
 }
 
@@ -1293,5 +1409,136 @@ mod tests {
                 path: "a.rs".into()
             }
         );
+    }
+
+    // --- B.1: AgentAction::McpTool -------------------------------------------
+
+    #[test]
+    fn mcp_tool_with_known_server_round_trips() {
+        // A valid mcp_tool block whose server is in the configured set parses and
+        // round-trips, params preserved as an arbitrary JSON object.
+        let out = block(r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":{"sql":"SELECT 1","limit":10}}"#);
+        let servers = vec!["my-db".to_string()];
+        let parsed = parse_action_with_servers(&out, &servers).expect("known server parses");
+        assert_eq!(
+            parsed,
+            AgentAction::McpTool {
+                server: "my-db".into(),
+                tool: "query".into(),
+                params: serde_json::json!({"sql": "SELECT 1", "limit": 10}),
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_tool_unknown_server_is_invalid() {
+        // A server NOT in the configured set is rejected at parse time with a precise
+        // message — the model gets immediate feedback, not a late call-time error.
+        let out = block(r#"{"tool":"mcp_tool","server":"typo-db","name":"query","params":{}}"#);
+        let servers = vec!["my-db".to_string()];
+        match parse_action_with_servers(&out, &servers) {
+            Err(FormatError::Invalid(msg)) => {
+                assert!(msg.contains("unknown MCP server"), "{msg}");
+                assert!(msg.contains("typo-db"), "names the bad server: {msg}");
+            }
+            other => panic!("expected Invalid for unknown server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_with_no_servers_configured_is_invalid() {
+        // The default `parse_action` validates against an EMPTY set, so ANY mcp_tool
+        // is rejected when no user servers are configured (the no-user-servers path).
+        let out = block(r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":{}}"#);
+        match parse_action(&out) {
+            Err(FormatError::Invalid(msg)) => assert!(msg.contains("unknown MCP server"), "{msg}"),
+            other => panic!("expected Invalid with no servers configured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_non_object_params_is_invalid() {
+        // A top-level scalar or array `params` is rejected (the call_tool contract is a
+        // named-argument object). The server is known so this isolates the params check.
+        let servers = vec!["my-db".to_string()];
+        for bad in [
+            r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":[1,2,3]}"#,
+            r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":"a string"}"#,
+            r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":42}"#,
+            r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":null}"#,
+        ] {
+            match parse_action_with_servers(&block(bad), &servers) {
+                Err(FormatError::Invalid(msg)) => {
+                    assert!(msg.contains("`params` must be a JSON object"), "{bad}: {msg}")
+                }
+                other => panic!("expected Invalid for non-object params {bad}, got {other:?}"),
+            }
+        }
+        // An empty object IS valid params (a no-argument tool call).
+        let ok = block(r#"{"tool":"mcp_tool","server":"my-db","name":"query","params":{}}"#);
+        assert!(
+            matches!(
+                parse_action_with_servers(&ok, &servers),
+                Ok(AgentAction::McpTool { .. })
+            ),
+            "an empty params object is valid"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_empty_server_or_tool_is_invalid() {
+        let servers = vec!["my-db".to_string(), "".to_string()];
+        // Empty server: rejected before the known-set check (and "" is never a real
+        // configured name regardless).
+        let empty_server =
+            block(r#"{"tool":"mcp_tool","server":"","name":"query","params":{}}"#);
+        match parse_action_with_servers(&empty_server, &servers) {
+            Err(FormatError::Invalid(msg)) => assert!(msg.contains("`server` must not be empty"), "{msg}"),
+            other => panic!("expected Invalid for empty server, got {other:?}"),
+        }
+        // Empty tool on a known server: rejected by the text check.
+        let empty_tool =
+            block(r#"{"tool":"mcp_tool","server":"my-db","name":"   ","params":{}}"#);
+        match parse_action_with_servers(&empty_tool, &servers) {
+            Err(FormatError::Invalid(msg)) => assert!(msg.contains("`tool` must not be empty"), "{msg}"),
+            other => panic!("expected Invalid for empty tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_is_not_web_egress() {
+        // DECOUPLING (design §5.2): a user MCP server is its OWN opt-in capability, NOT
+        // the web-search opt-in. So `mcp_tool` is deliberately NOT web-egress — the
+        // `run_burst` gate (`is_egress() && !allow_egress`) must NOT block it. Its gate
+        // is the known-server set (validate_with_servers), not `allow_egress`.
+        assert!(!AgentAction::McpTool {
+            server: "my-db".into(),
+            tool: "query".into(),
+            params: serde_json::json!({}),
+        }
+        .is_egress());
+        // The WEB tools stay egress (gated on allow_egress) — unchanged.
+        assert!(AgentAction::Fetch { url: "https://x".into() }.is_egress());
+        assert!(AgentAction::Websearch { query: "q".into() }.is_egress());
+    }
+
+    #[test]
+    fn mcp_tool_name_and_target() {
+        let action = AgentAction::McpTool {
+            server: "my-db".into(),
+            tool: "query".into(),
+            params: serde_json::json!({}),
+        };
+        assert_eq!(action.tool_name(), "mcp_tool");
+        // target is `server.tool <params>`: identical repeats (same server+tool+params)
+        // trip the no-progress guard, but the same tool with DIFFERENT params does not.
+        assert_eq!(action.target(), "my-db.query {}");
+        // Different params ⇒ a DIFFERENT target (no false no-progress trip).
+        let other = AgentAction::McpTool {
+            server: "my-db".into(),
+            tool: "query".into(),
+            params: serde_json::json!({"page": 2}),
+        };
+        assert_ne!(action.target(), other.target(), "differing params ⇒ distinct targets");
     }
 }

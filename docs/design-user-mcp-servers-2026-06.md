@@ -99,8 +99,11 @@ Validation rules (parse time):
   immediate `FormatError::Invalid` feedback on a typo instead of a late call-time error).
 - `tool` non-empty, within `MAX_TEXT_LEN`.
 - `params` is a JSON object (not a scalar or array at the top level).
-- `is_egress()` = `true` (conservative: user servers may reach external networks; the
-  burst's `allow_egress` gate applies, same as `fetch`/`websearch`).
+- `is_egress()` = `false` (DECOUPLED — see §5.2). A user MCP server is the user's OWN
+  opt-in capability, configured + consented at config time, SEPARATE from the web-search
+  (Exa) opt-in. So `mcp_tool` is NOT subject to the web-egress gate (`is_egress() &&
+  !allow_egress`, which gates only `fetch`/`websearch`). Its gate is the KNOWN-SERVER set
+  (`validate_with_servers`): a configured server is callable even when web egress is OFF.
 - `tool_name()` = `"mcp_tool"`.
 
 ### 2.5 Phase B additions: MultiMcpBackend
@@ -183,7 +186,7 @@ Files:
 - `devboule-coder/src/action.rs`: add `McpTool` variant; extend `validate()`,
   `tool_name()`, `target()`, `is_egress()`.
 - `devboule-coder/src/action.rs` tests: parse round-trip; unknown server rejected;
-  non-object params rejected; `is_egress()` = true.
+  non-object params rejected; `is_egress()` = false (decoupled from web egress, §5.2).
 
 Acceptance criteria:
 - `cargo test --lib` green.
@@ -231,13 +234,29 @@ present and always first — in the merged MCP client config (Phase A), in `Mult
 dispatch ordering (Phase B). User servers are appended after it and never given higher
 routing priority.
 
-### 5.2 Privacy and egress
+### 5.2 Privacy and egress (user-MCP enablement is DECOUPLED from web egress)
 
-User MCP servers are external processes that may reach external networks. The model is told
-this in the system prompt (user MCP = egress-adjacent). `AgentAction::McpTool.is_egress()`
-returns `true`; the burst's `allow_egress` gate applies. When egress is off (no Exa key),
-user-MCP calls are blocked. This is the safe default; a per-server `"local": true` egress-
-exemption flag is a v2 nicety.
+User MCP servers are external processes that may reach external networks, and the model is
+told this in the system prompt (the catalog is fenced, untrusted external metadata). BUT a
+user MCP server is the user's OWN capability: enabling it = **configured + consented at
+config time** (the user added the server in the MCP panel / committed it to
+`.devboule/mcp-servers.json`). That is a SEPARATE opt-in from web search (the Exa key /
+`fetch`/`websearch`).
+
+So user-MCP is **decoupled from the web-egress gate** (owner decision, 2026-06):
+- `AgentAction::McpTool.is_egress()` returns **`false`** — it is NOT a web-egress action, so
+  the burst's web-egress gate (`is_egress() && !allow_egress`, which blocks `fetch`/
+  `websearch` when there is no Exa key) does **not** block it.
+- The user-MCP gate is the **known-server set**: `validate_with_servers` rejects any
+  `mcp_tool` naming a server that is not in the configured/connected set (at parse time).
+  A configured server is therefore callable **even when web egress is OFF**.
+- Web egress (`fetch`/`websearch`) stays gated on `allow_egress` — **unchanged**.
+- The connect-time spawn of user servers at startup is likewise NOT gated on web egress
+  (the user opted into those servers); it is the `MultiMcpBackend::connect` path.
+
+The web-egress "egress disabled … answer from the Oracle instead" recovery message therefore
+**never fires for `mcp_tool`** (a user-MCP failure surfaces its own accurate error instead).
+A per-server `"local": true` flag (e.g. to mark a loopback-only server) remains a v2 nicety.
 
 ### 5.3 Name collision guard
 
@@ -274,13 +293,37 @@ User MCP servers are wired ONLY into MAIN-coder tool surfaces:
 
 ### 6.1 Mini-exclusion: enforcement (code-level evidence)
 
-**The boundary is clean by construction.** No guard needs to be added. Evidence:
+**The boundary holds, but the enforcement is NUANCED — not pure binary separation.**
+An earlier draft claimed "physical separation IS the enforcement" for the whole boundary.
+That is correct for the `MultiMcpBackend` (it is crate-separated), but **OVERSTATED for the
+src-tauri side**: `user_mcp_config.rs` (which reads/serializes user servers) and
+`mini_coder_executor.rs` (the mini launch path) live in the **same `src-tauri` crate**, so
+crate separation does NOT keep the user-MCP config types away from the mini path. The real,
+layered enforcement is:
 
-**Binary separation (the primary mechanism).**
+**1. Binary separation — covers the BACKEND only.**
 `devboule-coder/` and `src-tauri/` are separate binary crates with no shared Cargo
-workspace. The types `RealExecutor`, `McpBackend`, `MultiMcpBackend` (Phase B) in
-`devboule-coder/src/executor.rs` are not accessible from `src-tauri/src/backend/` at
-compile time. Physical separation IS the enforcement.
+workspace. The `MultiMcpBackend` / `RealExecutor` (Phase B) in `devboule-coder/src/` are not
+accessible from `src-tauri/src/backend/` at compile time. So the mini can never hold the
+*backend*. This does NOT, by itself, keep the in-crate `user_mcp_config` helpers or the
+`DEVBOULE_USER_MCP_SERVERS` env var away from the mini path — hence the next two layers.
+
+**2. Source-text test (the in-crate gate).**
+`projects.rs::mini_launch_path_never_wires_user_mcp_servers` asserts, at the source-text
+level, that `mini_coder_executor.rs` references NONE of the Phase B wiring symbols
+(`MultiMcpBackend`, `McpTool`, `merged_servers`, `orchestrator_env_json`), and that the
+`DEVBOULE_USER_MCP_SERVERS` var name appears ONLY as the defensive `env_remove` scrub (never
+to SET it). This is the in-crate equivalent of the cross-crate separation.
+
+**3. Runtime `env_remove` (the defensive scrub).**
+`portable_pty::CommandBuilder::new()` SNAPSHOTS the host process env. If the app were
+launched from a shell that already had `DEVBOULE_USER_MCP_SERVERS` set, the mini child would
+otherwise INHERIT it. `build_mini_command_impl` (both real arms) calls
+`cmd.env_remove(FORBIDDEN_USER_MCP_ENV)` so the mini NEVER carries the var regardless of the
+host env. This makes "the mini must not RECEIVE it" (§6) **runtime-enforced**, not merely an
+absence-of-code property.
+
+**4. Code-review gate (the maintenance rule, below).**
 
 **The mini's MCP surface is fully typed as `Option<&McpRoots>` — a struct that cannot
 encode a user server.**
@@ -305,11 +348,13 @@ has no call site in `resolve_mcp_roots` and none will be added there.
 Grep of `src-tauri/src` for `MultiMcpBackend` returns zero matches. Phase B adds it only
 to `devboule-coder/src/`.
 
-**Maintenance rule (enforced at Phase B code review).**
-After Phase B lands, the code review must verify that `src-tauri/src/backend/mini_coder_executor.rs`
-still contains zero references to `MultiMcpBackend`, `McpTool`, or
-`user_mcp_config::merged_servers`. This is the one invariant check required — not a runtime
-guard, but a diff-review gate.
+**Maintenance rule (enforced at Phase B code review + the source-text test).**
+The code review must verify that `src-tauri/src/backend/mini_coder_executor.rs` still
+contains zero references to `MultiMcpBackend`, `McpTool`, `merged_servers`, or
+`orchestrator_env_json`, and that `DEVBOULE_USER_MCP_SERVERS` appears there ONLY as the
+defensive `env_remove` scrub. This is now ALSO checked automatically by
+`mini_launch_path_never_wires_user_mcp_servers` (layer 2 above) — the diff-review gate and
+the test are belt-and-suspenders.
 
 ## 7. Dependency graph
 
@@ -352,9 +397,10 @@ dialog covers panel-add; hand-edit is trusted.
 **Deferred: `http`/SSE transport.** v1 supports `stdio` only. SSE transport needs a
 `reqwest`-based MCP client transport distinct from `RmcpBackend` and is a separate phase.
 
-**Deferred: per-server egress exemption flag.** In v1 all user-MCP calls are treated as
-egress. A `"local": true` field exempting a loopback-only server from the egress gate is
-a v2 opt-in.
+**Deferred: per-server egress exemption flag.** In v1 user-MCP enablement is DECOUPLED from
+the web-egress gate (§5.2): a configured + consented server is callable regardless of the
+Exa/web-search key. A per-server `"local": true` flag (e.g. to MARK a server as loopback-
+only, or to re-introduce a per-server network gate) is a v2 opt-in.
 
 **Deferred: `params` schema validation.** Phase B validates `params` as a JSON object but
 not against the server's declared `inputSchema`. Full schema validation (fetching the

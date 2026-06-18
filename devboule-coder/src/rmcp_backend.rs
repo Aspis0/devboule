@@ -125,6 +125,13 @@ pub struct RmcpBackend {
     /// the server issues no token and accepts tokenless calls; `call_tool` then omits
     /// the `session_token` key entirely.
     session_token: String,
+    /// Inject the Oracle session identity (`role` / `agent_id` / `session_token`)
+    /// into every `call_tool`? TRUE for the Oracle backend ([`RmcpBackend::connect`]),
+    /// which registers an identity the server enforces. FALSE for a USER MCP server
+    /// ([`RmcpBackend::connect_generic`], Phase B): a third-party server has its own
+    /// argument contract, so we must NOT smuggle Devboule identity keys into its tool
+    /// params — pass the model's params through verbatim.
+    inject_identity: bool,
     cancel: Option<RunningServiceCancellationToken>,
 }
 
@@ -239,9 +246,165 @@ impl RmcpBackend {
             agent_id: config.agent_id,
             role: config.role,
             session_token,
+            // Oracle backend: inject the registered identity into every call.
+            inject_identity: true,
             cancel: Some(cleanup),
         })
     }
+
+    /// Connect to a USER-configured MCP server (Phase B) over a stdio child process,
+    /// running the MCP `initialize` handshake but NOT the Oracle-specific
+    /// `agent_register` ceremony — a third-party server has no notion of Devboule
+    /// roles / session tokens. The resulting backend carries no identity and
+    /// [`McpBackend::call_tool`] passes the model's params through verbatim
+    /// (`inject_identity == false`).
+    ///
+    /// SECURITY: `command`/`args`/`env` come from the user's own validated MCP config
+    /// (`user_mcp_config` in `src-tauri`, charset-guarded at add/read time). The child
+    /// gets a SANITIZED environment: we `env_clear()` the inherited orchestrator env
+    /// (which holds Devboule SECRETS — `EXA_API_KEY`, `DEVBOULE_MCP_LAUNCH_TOKEN`, a
+    /// cloud key) so a semi-untrusted user server (a shared-repo binary, design §5.4)
+    /// can NEVER read them, then re-add only a minimal SYSTEM baseline (`PATH`/`HOME`,
+    /// `SYSTEMROOT`/`SystemDrive`/`TEMP` on Windows) needed to locate + run the
+    /// interpreter, plus the user's OWN declared `env`. stderr is inherited for
+    /// diagnostics (never parsed). On any post-spawn failure the child is torn down
+    /// before returning (no orphan), exactly like the Oracle connect path.
+    pub async fn connect_generic(
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<Self, String> {
+        // The minimal system env vars a child needs to find its interpreter / runtime,
+        // forwarded from the parent ONLY when present. Devboule's own DEVBOULE_*/EXA_*/
+        // cloud secrets are NOT in this allowlist, so `env_clear` strips them and they
+        // are never re-added — the user server sees only system basics + its own env.
+        const SYSTEM_ENV_ALLOWLIST: &[&str] = &[
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            // Windows runtime basics.
+            "SYSTEMROOT",
+            "SystemRoot",
+            "SystemDrive",
+            "TEMP",
+            "TMP",
+            "PATHEXT",
+            "WINDIR",
+        ];
+        let cmd = Command::new(command).configure(|c| {
+            for a in args {
+                c.arg(a);
+            }
+            // HARDENING: reap the user-server child if THIS process exits abnormally (a
+            // panic / abort that skips `Drop`). `kill_on_drop` makes tokio send SIGKILL when
+            // the `Child` handle drops, so a semi-untrusted user server can never outlive us
+            // as an orphan. The normal teardown path is still the transport's cancellation
+            // token in `Drop` (below); this is the belt-and-suspenders for the abnormal path.
+            c.kill_on_drop(true);
+            // SECURITY: drop the inherited (secret-bearing) orchestrator env entirely…
+            c.env_clear();
+            // …re-add only the system baseline that is actually set in our env…
+            for key in SYSTEM_ENV_ALLOWLIST {
+                if let Ok(val) = std::env::var(key) {
+                    c.env(key, val);
+                }
+            }
+            // …then the user's OWN declared env (wins over a same-named baseline key).
+            for (k, v) in env {
+                c.env(k, v);
+            }
+        });
+
+        let transport = TokioChildProcess::new(cmd)
+            .map_err(|e| format!("failed to spawn user MCP child: {e}"))?;
+
+        // Bound the handshake exactly like the Oracle path: a hung user server must not
+        // wedge startup. On elapse the transport is dropped (terminating the child).
+        let service = match timeout(CONNECT_TIMEOUT, ().serve(transport)).await {
+            Ok(Ok(service)) => service,
+            Ok(Err(e)) => return Err(format!("user MCP initialize handshake failed: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "user MCP initialize handshake timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            }
+        };
+
+        let cancel = service.cancellation_token();
+        Ok(Self {
+            service,
+            agent_id: String::new(),
+            role: String::new(),
+            session_token: String::new(),
+            // User server: NEVER inject Devboule identity into its tool params.
+            inject_identity: false,
+            cancel: Some(cancel),
+        })
+    }
+
+    /// List the tools this backend exposes as `(name, description)` pairs, for the
+    /// system-prompt catalog (Phase B.3). Bounded by [`CONNECT_TIMEOUT`] so a slow /
+    /// hung server cannot stall startup; on timeout or error returns `Err`, and the
+    /// caller proceeds with no tool list for this server (the burst still runs). The
+    /// names + descriptions are SEMI-UNTRUSTED (they come from the user's MCP server)
+    /// — the prompt builder DELIMITS them as external metadata (see `crate::prompt`).
+    ///
+    /// HARDENING: a hostile / buggy server could advertise a HUGE tool list or enormous
+    /// descriptions, bloating the system prompt and the catalog's memory. So the catalog
+    /// is bounded HERE, at the trust boundary: at most [`MAX_TOOLS_PER_SERVER`] tools, and
+    /// each description truncated to [`MAX_TOOL_DESC_LEN`] chars (a `…` marks a truncation).
+    /// The tool NAME is the routing key (already validated short by the action layer), so it
+    /// is not truncated, but an over-long name is dropped rather than carried.
+    pub async fn list_tools(&self) -> Result<Vec<(String, Option<String>)>, String> {
+        let fut = self.service.peer().list_all_tools();
+        match timeout(CONNECT_TIMEOUT, fut).await {
+            Ok(Ok(tools)) => Ok(tools
+                .into_iter()
+                // Cap the COUNT first so we never even materialize an unbounded list.
+                .take(MAX_TOOLS_PER_SERVER)
+                // Drop a pathologically long tool NAME (it is the routing key; an absurd
+                // length is never a real tool and would only bloat the prompt).
+                .filter(|t| t.name.chars().count() <= MAX_TOOL_NAME_LEN)
+                .map(|t| {
+                    let desc = t.description.map(|d| truncate_chars(&d, MAX_TOOL_DESC_LEN));
+                    (t.name.to_string(), desc)
+                })
+                .collect()),
+            Ok(Err(e)) => Err(format!("list_tools failed: {e}")),
+            Err(_) => Err(format!(
+                "list_tools timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
+/// Max tools advertised by ONE user server that we carry into the prompt catalog. A
+/// hostile/buggy server returning thousands of tools would otherwise bloat the system
+/// prompt unboundedly; the model only needs a sane, bounded menu.
+const MAX_TOOLS_PER_SERVER: usize = 64;
+
+/// Max chars of a user tool's NAME we will carry (it is the routing key; an absurdly long
+/// name is never a real tool). A longer name causes the tool to be DROPPED from the catalog.
+const MAX_TOOL_NAME_LEN: usize = 128;
+
+/// Max chars of a user tool's DESCRIPTION carried into the prompt catalog. Bounds prompt
+/// bloat / memory from a hostile server while leaving room for a genuinely useful summary.
+const MAX_TOOL_DESC_LEN: usize = 512;
+
+/// Truncate `s` to at most `max` CHARS (not bytes — never split a UTF-8 boundary),
+/// appending a single `…` marker when truncated so the catalog shows the description was
+/// clipped. Used to bound semi-untrusted user-tool descriptions (Phase B.3 hardening).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 #[async_trait]
@@ -263,15 +426,22 @@ impl McpBackend for RmcpBackend {
                 ));
             }
         };
-        args.insert("role".into(), json!(self.role));
-        args.insert("agent_id".into(), json!(self.agent_id));
-        // Inject the session token only when we HAVE one (the managed path). On the
-        // unmanaged path the token is empty: leave the key ABSENT so the server sees
-        // a tokenless call, which `require_session_token` accepts for an unmanaged
-        // (no-hash) session. Sending `""` would also be accepted there, but omitting
-        // the key is the honest representation of "no session token".
-        if !self.session_token.is_empty() {
-            args.insert("session_token".into(), json!(self.session_token));
+        // Identity injection is ORACLE-ONLY. A user MCP server (`inject_identity ==
+        // false`, via `connect_generic`) has its own argument contract, so we pass the
+        // model's params through VERBATIM — never smuggle Devboule `role`/`agent_id`/
+        // `session_token` keys into a third-party tool call (they could collide with a
+        // real parameter or leak our identity scheme).
+        if self.inject_identity {
+            args.insert("role".into(), json!(self.role));
+            args.insert("agent_id".into(), json!(self.agent_id));
+            // Inject the session token only when we HAVE one (the managed path). On the
+            // unmanaged path the token is empty: leave the key ABSENT so the server sees
+            // a tokenless call, which `require_session_token` accepts for an unmanaged
+            // (no-hash) session. Sending `""` would also be accepted there, but omitting
+            // the key is the honest representation of "no session token".
+            if !self.session_token.is_empty() {
+                args.insert("session_token".into(), json!(self.session_token));
+            }
         }
 
         // `name` is a borrowed &str but CallToolRequestParams wants a
@@ -390,6 +560,23 @@ mod tests {
     // connect()/call_tool() path needs a Python server and is integration-
     // deferred; the action->params mapping it serves is unit-tested via
     // MockMcpBackend in crate::executor.
+
+    #[test]
+    fn truncate_chars_bounds_length_and_marks_truncation() {
+        // FIX 8 hardening: a user tool's description is bounded to MAX_TOOL_DESC_LEN chars
+        // (counted by CHARS, never splitting a UTF-8 boundary) with a `…` marker on clip.
+        // Short string is returned verbatim (no marker).
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("exactly10!", 10), "exactly10!", "at the cap, no marker");
+        // Over the cap: clipped to `max` chars + a single `…`.
+        let clipped = truncate_chars("0123456789ABC", 10);
+        assert_eq!(clipped, "0123456789…");
+        assert_eq!(clipped.chars().count(), 11, "max chars + the marker");
+        // Multi-byte chars are clipped on a CHAR boundary (no panic / no broken UTF-8).
+        let multi = truncate_chars("héllo wörld 😀😀😀", 5);
+        assert_eq!(multi.chars().count(), 6, "5 chars + marker");
+        assert!(multi.ends_with('…'));
+    }
 
     #[test]
     fn extract_session_token_reads_camelcase_field() {

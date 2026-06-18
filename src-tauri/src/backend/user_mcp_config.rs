@@ -86,6 +86,16 @@ const ORACLE_TOOL_NAMES: &[&str] = &[
 /// map and a token in the codex `-c mcp_servers.<name>.*` flags — keep it short and sane.
 const MAX_NAME_LEN: usize = 64;
 
+/// Max user MCP servers serialized into the orchestrator's `DEVBOULE_USER_MCP_SERVERS`
+/// env payload (Phase B). This MUST stay in lock-step with the CONSUMER cap
+/// `MAX_USER_MCP_SERVERS` in `devboule-coder/src/config.rs` (currently 20): the binary
+/// only wires the first N it parses, so emitting MORE would (a) bloat the env value
+/// toward the OS `E2BIG` argv/env limit on a runaway/hand-edited config and (b) be
+/// silently dropped by the binary anyway. The two crates cannot share a const, so this
+/// is a documented parallel — keep both at the same value. If it ever truncates, that is
+/// logged (the launch proceeds with the first N, never failing on an oversized list).
+const MAX_ORCHESTRATOR_SERVERS: usize = 20;
+
 // ---------------------------------------------------------------------------
 // On-the-wire shapes (camelCase over IPC + on disk, matching `.mcp.json`)
 // ---------------------------------------------------------------------------
@@ -432,6 +442,19 @@ fn validate_env(env: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the COMMAND of a server (defense in depth, mirrors [`validate_args`]). The
+/// command is the child-process program (TOML-escaped for codex / JSON-escaped for claude
+/// downstream), but a control char / newline in it is never a legitimate program name and
+/// is exactly the kind of payload a hostile hand-edited / shared-repo config would carry
+/// (the §9 threat). Reject it at ADD time and on READ. Non-emptiness is checked by the
+/// callers ([`validate_entry`] / [`validate_server`]); this guards the CONTENT.
+fn validate_command(command: &str) -> Result<(), String> {
+    if command.chars().any(|c| c.is_control()) {
+        return Err("server command must not contain control characters or newlines".to_string());
+    }
+    Ok(())
+}
+
 /// Validate the ARGS of a server (defense in depth). Args are TOML-escaped (codex) /
 /// JSON-escaped (claude) before they reach a launch line, so a metacharacter cannot break
 /// out — but a control char / newline in an arg is never a legitimate launch argument and
@@ -465,6 +488,7 @@ fn validate_entry(name: &str, record: &UserMcpServerRecord) -> Result<(), String
     if record.command.trim().is_empty() {
         return Err("server command must not be empty".to_string());
     }
+    validate_command(&record.command)?;
     validate_args(&record.args)?;
     validate_env(&record.env)?;
     Ok(())
@@ -477,6 +501,7 @@ fn validate_server(server: &UserMcpServer) -> Result<(), String> {
     if server.command.trim().is_empty() {
         return Err("server command must not be empty".to_string());
     }
+    validate_command(&server.command)?;
     validate_args(&server.args)?;
     validate_env(&server.env)?;
     Ok(())
@@ -515,6 +540,64 @@ pub(crate) fn merged_servers(app: &tauri::AppHandle, project_root: &Path) -> Vec
         .map(|(name, record)| server_from_keyed(name, record))
         .filter(|s| s.enabled)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Phase B — orchestrator launch payload (DEVBOULE_USER_MCP_SERVERS)
+// ---------------------------------------------------------------------------
+
+/// The slim per-server shape the LOCAL MAIN coder (`devboule-coder`) reads from the
+/// `DEVBOULE_USER_MCP_SERVERS` env var (Phase B): just `{name, command, args, env}`.
+/// `transport`/`enabled` are intentionally OMITTED — the launch wiring only ever emits
+/// ENABLED, stdio servers, so the binary needs neither. The binary's parser ignores
+/// any extra field, but emitting the minimal shape keeps the payload small and the
+/// contract explicit (matches design §2.4 / §4 Phase B).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorServerPayload<'a> {
+    name: &'a str,
+    command: &'a str,
+    args: &'a [String],
+    env: &'a BTreeMap<String, String>,
+}
+
+/// Serialize the merged ENABLED user servers into the `DEVBOULE_USER_MCP_SERVERS`
+/// JSON ARRAY the orchestrator launch sets (Phase B, design §4). Returns an EMPTY
+/// string when there are no servers, so the launch wiring can omit the env var
+/// entirely (byte-identical to a pre-B launch). Compact JSON (no pretty-print) — it
+/// is an env value, not a hand-edited file. Deterministic order (the input is already
+/// name-sorted by [`merged_servers`]; `env` is a `BTreeMap`) for stable launch lines.
+///
+/// MINI-EXCLUSION (design §6): this is called ONLY from the ORCHESTRATOR launch path
+/// in `projects.rs`. The mini launch never invokes it and never carries the var.
+pub(crate) fn orchestrator_env_json(servers: &[UserMcpServer]) -> String {
+    if servers.is_empty() {
+        return String::new();
+    }
+    // Cap the emitted set at exactly what the binary consumes (MAX_ORCHESTRATOR_SERVERS,
+    // matching the binary's MAX_USER_MCP_SERVERS): emitting more would only bloat the env
+    // value toward the OS E2BIG limit and be dropped by the binary regardless. Truncate
+    // (never fail the launch) and log so an oversized list is visible.
+    if servers.len() > MAX_ORCHESTRATOR_SERVERS {
+        eprintln!(
+            "[user-mcp] {} enabled servers exceeds the {MAX_ORCHESTRATOR_SERVERS}-server \
+             launch cap; emitting only the first {MAX_ORCHESTRATOR_SERVERS}",
+            servers.len()
+        );
+    }
+    let payload: Vec<OrchestratorServerPayload<'_>> = servers
+        .iter()
+        .take(MAX_ORCHESTRATOR_SERVERS)
+        .map(|s| OrchestratorServerPayload {
+            name: &s.name,
+            command: &s.command,
+            args: &s.args,
+            env: &s.env,
+        })
+        .collect();
+    // Serialization of a Vec of plain structs cannot fail; fall back to empty (which
+    // disables user servers for this launch) rather than ever panicking a launch.
+    serde_json::to_string(&payload).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1129,84 @@ mod tests {
         std::fs::write(&path, raw).unwrap();
         assert!(list_impl(&path).is_empty(), "the newline-arg entry is skipped on read");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_rejects_command_with_control_chars_and_read_skips_it() {
+        // FIX 2: the `command` field had only a non-empty check; a control char / newline
+        // in it is never a legitimate program name (the §9 hand-edit / shared-repo threat),
+        // so reject it at ADD time and skip it on READ, mirroring the args/env-value guard.
+        let dir = fresh_dir("cmd-ctrl");
+        let path = dir.join("c.json");
+
+        // \n in the command (newline injection via hand-edit).
+        let mut server = srv("cmd-nl", "python\n--evil", true);
+        let err = add_validated(&path, server.clone()).unwrap_err();
+        assert!(
+            err.contains("control characters"),
+            "\\n in command should be rejected, got: {err}"
+        );
+
+        // \r (Windows paste) and an arbitrary control char are also rejected.
+        server.command = "python\r".to_string();
+        let err = add_validated(&path, server.clone()).unwrap_err();
+        assert!(err.contains("control characters"), "\\r in command: {err}");
+        server.command = "py\x01thon".to_string();
+        let err = add_validated(&path, server).unwrap_err();
+        assert!(err.contains("control characters"), "\\x01 in command: {err}");
+
+        // Nothing was stored by any rejected add.
+        assert!(list_impl(&path).is_empty(), "no entry should have been stored");
+
+        // A clean command (incl. an absolute path with spaces, which is legitimate) is OK.
+        add_validated(&path, srv("cmd-ok", "/usr/bin/python3", true)).unwrap();
+        assert_eq!(list_impl(&path).len(), 1);
+
+        // READ skips a hand-edited entry whose command carries a \n (the bypass path).
+        let raw = "{\"mcpServers\":{\"clean\":{\"transport\":\"stdio\",\"command\":\"python\"},\"dirty\":{\"transport\":\"stdio\",\"command\":\"py\\nthon\"}}}";
+        std::fs::write(&path, raw).unwrap();
+        let names: Vec<String> = list_impl(&path).into_iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec!["clean".to_string()],
+            "the control-char-command entry must be skipped on read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orchestrator_env_json_caps_at_the_consumer_limit() {
+        // FIX 3: the serializer must emit AT MOST MAX_ORCHESTRATOR_SERVERS (the same cap
+        // the binary parser consumes), so the DEVBOULE_USER_MCP_SERVERS env payload can
+        // never grow unbounded toward E2BIG. Build more than the cap and assert exactly the
+        // first cap-many ride into the JSON (the input is name-sorted by merged_servers).
+        let over = MAX_ORCHESTRATOR_SERVERS + 5;
+        let servers: Vec<UserMcpServer> = (0..over)
+            // Zero-padded names so lexical (BTreeMap-style) order == numeric order, matching
+            // the name-sorted input merged_servers produces.
+            .map(|i| srv(&format!("srv-{i:03}"), "python", true))
+            .collect();
+        let json = orchestrator_env_json(&servers);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().expect("an array");
+        assert_eq!(
+            arr.len(),
+            MAX_ORCHESTRATOR_SERVERS,
+            "serializer must cap at the consumer limit"
+        );
+        // The FIRST cap-many (by sorted name) are the ones emitted; the overflow is dropped.
+        assert_eq!(arr[0]["name"], "srv-000");
+        assert_eq!(
+            arr[MAX_ORCHESTRATOR_SERVERS - 1]["name"],
+            format!("srv-{:03}", MAX_ORCHESTRATOR_SERVERS - 1)
+        );
+        // A set AT the cap emits all of them (no spurious truncation at the boundary).
+        let exactly: Vec<UserMcpServer> = (0..MAX_ORCHESTRATOR_SERVERS)
+            .map(|i| srv(&format!("ok-{i:03}"), "python", true))
+            .collect();
+        let json2 = orchestrator_env_json(&exactly);
+        let arr2: serde_json::Value = serde_json::from_str(&json2).unwrap();
+        assert_eq!(arr2.as_array().unwrap().len(), MAX_ORCHESTRATOR_SERVERS);
     }
 
     #[test]

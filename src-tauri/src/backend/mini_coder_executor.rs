@@ -74,6 +74,15 @@ const VISUAL_CHECK_TIMEOUT_SECS: i64 = 120;
 /// uncfg'd so the platform-agnostic macOS-script test can reference it on Windows.
 const OMLX_KEY_FILE_ENV: &str = "OMLX_KEY_FILE";
 
+/// MINI-EXCLUSION (design §6): the Phase-B user-MCP env var the ORCHESTRATOR launch sets.
+/// The mini coder must NEVER receive it. The mini is a separate launch path that never SETS
+/// it, but `CommandBuilder::new()` SNAPSHOTS the host process env — so if the app itself was
+/// launched from a shell that already had this var set, the mini child would otherwise
+/// INHERIT it. We `env_remove` it on every built mini command (both real arms) so the mini
+/// never carries it regardless of the host env. This is a DEFENSIVE SCRUB (strip OUT), NOT
+/// wiring user servers IN: the mini still gets zero user-MCP capability.
+const FORBIDDEN_USER_MCP_ENV: &str = "DEVBOULE_USER_MCP_SERVERS";
+
 /// Env var carrying the oMLX HTTP request timeout (seconds) to the launch script
 /// (macOS python `urlopen`). Non-secret. Derived from `DEFAULT_WALL_CLOCK_CAP_SECS`
 /// (the executor's PTY wall-clock kill) MINUS `OMLX_HTTP_TIMEOUT_MARGIN_SECS`, so a
@@ -3996,6 +4005,9 @@ finally {{\n\
         &script,
     ]);
     cmd.cwd(project_root);
+    // MINI-EXCLUSION (design §6): scrub the orchestrator-only user-MCP env var so the mini
+    // child can NEVER inherit it from the host process env (CommandBuilder snapshots it).
+    cmd.env_remove(FORBIDDEN_USER_MCP_ENV);
     // oMLX-P2: pass the OPTIONAL key file PATH via env (never argv/PTY). The script
     // reads the token from this file and sends `Authorization: Bearer <token>`; if
     // unset (no key configured) it omits the header entirely.
@@ -4788,6 +4800,9 @@ fn build_mini_command_impl(
         }
     };
     cmd.cwd(project_root);
+    // MINI-EXCLUSION (design §6): scrub the orchestrator-only user-MCP env var so the mini
+    // child can NEVER inherit it from the host process env (CommandBuilder snapshots it).
+    cmd.env_remove(FORBIDDEN_USER_MCP_ENV);
     // oMLX-P2: the OPTIONAL key file PATH rides in env (never argv/PTY). python reads
     // the token from this file and sends `Authorization: Bearer <token>`; unset ⇒ no
     // header. The base URL + prompt path are exported inline inside the `$run` block.
@@ -8221,6 +8236,41 @@ mod tests {
             !without_line.contains("mcp_servers"),
             "ungranted codex must carry NO MCP flags"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mini_command_never_carries_user_mcp_env_even_when_host_has_it() {
+        // FIX 6 (mini-exclusion, runtime): CommandBuilder::new() snapshots the HOST process
+        // env. If the app was launched from a shell that already had
+        // DEVBOULE_USER_MCP_SERVERS set, the mini child would otherwise INHERIT it. The
+        // defensive `cmd.env_remove(FORBIDDEN_USER_MCP_ENV)` must strip it so the built mini
+        // command never carries it. We SET it on this process's env, build the command, and
+        // assert it is absent from the command's env (get_env reads the env map the child
+        // would inherit). Env is process-global; this test owns + restores the exact var.
+        let prev = std::env::var(FORBIDDEN_USER_MCP_ENV).ok();
+        std::env::set_var(FORBIDDEN_USER_MCP_ENV, "[{\"name\":\"evil\",\"command\":\"x\"}]");
+
+        let root = std::env::temp_dir();
+        let result_target = root.join("r.json");
+        let prompt_file = root.join("p.txt");
+        // An oMLX (local-loopback) backend builds a real command on macOS (the sandboxed arm).
+        let b = omlx_backend("qwen2.5-coder", "http://127.0.0.1:8000/v1");
+        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+            .expect("oMLX mini command builds")
+            .0;
+
+        assert!(
+            cmd.get_env(FORBIDDEN_USER_MCP_ENV).is_none(),
+            "the mini command must NOT carry the user-MCP env var even when the host \
+             env has it set (mini-exclusion §6, runtime env_remove via FORBIDDEN_USER_MCP_ENV)"
+        );
+
+        // Restore the host env regardless of the assertion outcome path above.
+        match prev {
+            Some(v) => std::env::set_var(FORBIDDEN_USER_MCP_ENV, v),
+            None => std::env::remove_var(FORBIDDEN_USER_MCP_ENV),
+        }
     }
 
     #[cfg(windows)]
