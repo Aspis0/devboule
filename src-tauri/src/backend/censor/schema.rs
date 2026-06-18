@@ -11,8 +11,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Finding severity. REUSES the dashboard `RiskFlags` vocab (`high|medium|low`,
-/// see `src/components/dashboard/RiskFlags.tsx`) — there is intentionally NO
+/// Finding severity. `high|medium|low` vocab — there is intentionally NO
 /// critical/info bucket. Serialized lowercase to match the TS union.
 ///
 /// `Default` is `Medium` so a shard missing the key (newer/hand-edited build)

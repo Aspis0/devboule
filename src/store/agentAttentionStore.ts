@@ -5,7 +5,7 @@
 // ONE active feeder at any moment (the "single feeder" invariant):
 //   - When the Projects view is active: ProjectsView's existing agent-live-state
 //     poll (loadAgentState, ~5s) pushes here via setFromLiveState.
-//   - Everywhere else (Dashboard/Polis/Oracle/Cloudflare/...): the GLOBAL
+//   - Everywhere else (the Projects Board/Polis/Oracle/Cloudflare/...): the GLOBAL
 //     attention poller in App.tsx (AppShell) takes over, on the same ~5s cadence,
 //     visibility-gated + in-flight-guarded. It SKIPS its tick while activeView ===
 //     "projects" so the two never both fetch get_agent_live_state at once.

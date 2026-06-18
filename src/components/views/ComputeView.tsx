@@ -43,7 +43,7 @@ import { scalewayActionChoices } from "../../utils/scalewayActions";
 import {
   ScalewayActionConfirm,
   type PendingScalewayAction,
-} from "../dashboard/ScalewayActionConfirm";
+} from "../compute/ScalewayActionConfirm";
 
 // Resource-type selector. Each entry maps a short UI key to the exact backend
 // strings emitted by sync_provider_inventory for Scaleway (verified against

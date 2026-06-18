@@ -1,7 +1,6 @@
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { Header } from "./components/Header";
-import { Dashboard } from "./components/Dashboard";
 import { CloudflareView } from "./components/views/CloudflareView";
 import { ProvidersView } from "./components/views/ProvidersView";
 import { ProjectsView } from "./components/views/ProjectsView";
@@ -169,8 +168,6 @@ function AppShell() {
       );
     }
     switch (activeView) {
-      case "dashboard":
-        return <Dashboard config={config} />;
       case "providers":
         return <ProvidersView config={config} />;
       case "cloudflare":
@@ -224,7 +221,7 @@ function AppShell() {
           </ErrorBoundary>
         );
       default:
-        return <Dashboard config={config} />;
+        return <ProjectsView />;
     }
   };
 

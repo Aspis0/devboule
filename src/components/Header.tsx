@@ -19,7 +19,6 @@ import { combineBadgeCount } from "./headerBadge";
 import { useNow } from "../hooks/useNow";
 
 const viewTitles: Record<string, string> = {
-  dashboard: "Dashboard",
   providers: "Providers & Cloud",
   projects: "Projects & Agents",
   settings: "Settings",
@@ -47,7 +46,6 @@ const JUMP_TARGETS: { label: string; target: string }[] = [
   { label: "Oracle", target: "oracle" },
   // The Polis parchment ask panel is an additional way to ask Oracle from the map.
   { label: "Oracle (Ask)", target: "polis" },
-  { label: "Dashboard", target: "dashboard" },
   { label: "Providers", target: "providers" },
   { label: "Cloudflare", target: "providers#cloudflare" },
   { label: "Scaleway / Compute", target: "providers#scaleway" },
@@ -84,7 +82,7 @@ function viewForRisk(flag: RiskFlag): string {
   if (source.includes("cloudflare") || source.includes("worker")) {
     return "providers#cloudflare";
   }
-  return "dashboard";
+  return "providers";
 }
 
 // Compact "how long ago" label for an agent's needsUser.since timestamp. Returns
@@ -189,7 +187,7 @@ export function Header() {
   return (
     <header className="relative z-40 flex min-h-16 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-cream-200 bg-cream-50/80 px-4 py-3 backdrop-blur-sm md:h-16 md:flex-nowrap md:px-8 md:py-0">
       <h2 className="min-w-0 truncate text-base font-semibold text-cream-800">
-        {viewTitles[activeView] || "Dashboard"}
+        {viewTitles[activeView] || "Projects"}
       </h2>
 
       <div className="flex min-w-0 flex-1 items-center justify-end gap-2 md:flex-none md:gap-3">

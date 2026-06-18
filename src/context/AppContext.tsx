@@ -79,7 +79,6 @@ const EMPTY_CONFIG: AppConfig = {
   // Secrets/Devices/Workspace→Settings (opened from the user area).
   navigation: [
     { id: "projects", label: "Projects", icon: "FolderKanban" },
-    { id: "dashboard", label: "Dashboard", icon: "LayoutDashboard" },
     { id: "providers", label: "Providers", icon: "Boxes" },
     { id: "oracle", label: "Oracle", icon: "BrainCircuit" },
   ],

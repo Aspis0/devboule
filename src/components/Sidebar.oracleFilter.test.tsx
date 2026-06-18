@@ -16,7 +16,6 @@ const config: AppConfig = {
   navigation: [
     { id: "projects", label: "Projects", icon: "FolderKanban" } as NavItem,
     { id: "oracle", label: "Oracle", icon: "BrainCircuit" } as NavItem,
-    { id: "dashboard", label: "Dashboard", icon: "LayoutDashboard" } as NavItem,
   ],
   providers: [],
   bookmarks: [],
@@ -65,7 +64,7 @@ describe("Sidebar oracle nav (restored standalone view)", () => {
 
     // The other entries still render.
     expect(container.textContent).toContain("Projects");
-    expect(container.textContent).toContain("Dashboard");
+    expect(container.textContent).toContain("Oracle");
 
     // Oracle now appears as a nav button and navigates to the "oracle" view.
     const buttons = Array.from(container.querySelectorAll("button"));

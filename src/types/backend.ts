@@ -1491,7 +1491,7 @@ export interface OracleResult {
 // these are the types + command names the dock/board will consume.
 // ---------------------------------------------------------------------------
 
-/** Finding severity — REUSES the dashboard RiskFlags vocab (no critical/info). */
+/** Finding severity — `high | medium | low` vocab (no critical/info). */
 export type CensorSeverity = "high" | "medium" | "low";
 
 /** Finding category. `dead-code` is kebab-cased over the wire. */

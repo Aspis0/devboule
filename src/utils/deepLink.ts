@@ -173,7 +173,8 @@ export function shouldClearWorkEntryBridge(args: {
  * The standalone "oracle" view was RESTORED, so it is no longer remapped — it
  * passes through verbatim like any real view. This guard is kept (composed at
  * the top of requestView) so a future removed view id can be added here without
- * per-call awareness; today it has no entries and every view passes through.
+ * per-call awareness. The only entry today: the removed Dashboard page redirects
+ * to Projects (the cloud-ops overview returns later with the notifications rewrite).
  *
  * Note: "settings" with tab "oracle" is a separate concern handled downstream by
  * mapLegacySettingsTab (the Oracle LLM settings sub-tab → "providers"); this
@@ -184,6 +185,10 @@ export function mapLegacyViewTarget(
   tab?: string | null,
 ): { view: string; tab: string | null } {
   const cleanTab = tab !== undefined && tab !== null ? tab : null;
+  // Dashboard was removed; redirect any lingering "dashboard" deep-link/notification
+  // to Projects so it lands somewhere real instead of falling through App.tsx's
+  // `default:` with no active nav item highlighted.
+  if (view === "dashboard") return { view: "projects", tab: null };
   return { view, tab: cleanTab };
 }
 

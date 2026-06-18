@@ -1,7 +1,7 @@
 // Pure, DOM-free badge model for the Censor findings list (Phase E2).
 //
-// REUSES the dashboard `RiskFlags` severity vocab + palette shape
-// (`high | medium | low`, see src/components/dashboard/RiskFlags.tsx:4-29) so the
+// REUSES the `RiskFlags` severity vocab + palette shape
+// (`high | medium | low`: cream/terracotta/teal tokens) so the
 // findings list reads visually identical to the rest of the app — there is
 // intentionally NO critical/info bucket. Category and source get their own small
 // neutral badges. Everything here is total and null-safe (an unknown severity /

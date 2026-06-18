@@ -44,9 +44,22 @@ describe("mapLegacyViewTarget", () => {
     });
   });
 
+  it('redirects the removed "dashboard" view to projects (tab dropped)', () => {
+    // Dashboard was removed (returns later with the notifications rewrite); a
+    // lingering deep-link/notification must land on Projects, not fall through
+    // App.tsx's `default:` with no active nav item.
+    expect(mapLegacyViewTarget("dashboard")).toEqual({
+      view: "projects",
+      tab: null,
+    });
+    expect(mapLegacyViewTarget("dashboard", "anyTab")).toEqual({
+      view: "projects",
+      tab: null,
+    });
+  });
+
   it("passes all other known views through unchanged", () => {
     const passThrough = [
-      "dashboard",
       "providers",
       "projects",
       "cloudflare",

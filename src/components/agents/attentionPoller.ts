@@ -4,7 +4,7 @@
 // notifications are the PRIMARY "an agent needs you" signal. The bell is fed by
 // the agentAttentionStore, which is a passive sink. ProjectsView's existing
 // agent-live-state poll feeds it — but ONLY while the Projects view is open. So a
-// needsUser raised while the user sits on Dashboard / Polis / Oracle / Cloudflare
+// needsUser raised while the user sits on the Projects Board / Polis / Oracle / Cloudflare
 // would never light the bell (nor fire a toast) until they wandered into Projects.
 //
 // This poller closes that gap with full, everywhere coverage while preserving the

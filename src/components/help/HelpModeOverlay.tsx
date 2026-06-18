@@ -15,8 +15,6 @@ const HELP_HEIGHT = 238;
 const HELP_MAX_LINES = 8;
 
 const pageUseLines: Record<string, string> = {
-  dashboard:
-    "For Aspis Bio, this is the morning check: cloud health, active compute, risks, Oracle readiness, and recent provider activity.",
   cloudflare:
     "For Aspis Bio, Cloudflare is the edge layer: Workers, routes, R2/KV/D1/queues, secrets, smoke checks, and agent-safe provider operations.",
   compute:

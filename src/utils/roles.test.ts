@@ -15,7 +15,7 @@ describe("isViewAllowedForRole", () => {
   it("lets collaborators open the compressed top-level nav", () => {
     // The standalone "oracle" view was restored and is visible to all roles
     // (it is not in the admin-only denylist).
-    for (const view of ["dashboard", "projects", "providers", "polis", "oracle", "settings"]) {
+    for (const view of ["projects", "providers", "polis", "oracle", "settings"]) {
       expect(isViewAllowedForRole("collaborator", view)).toBe(true);
     }
   });
@@ -29,7 +29,7 @@ describe("isViewAllowedForRole", () => {
 
 describe("navIdsForRole", () => {
   // The standalone "oracle" view was restored to the top-level nav.
-  const TOP_LEVEL = ["dashboard", "projects", "providers", "polis", "oracle"];
+  const TOP_LEVEL = ["projects", "providers", "polis", "oracle"];
 
   it("returns the full top-level nav for admin", () => {
     expect(navIdsForRole("admin", TOP_LEVEL)).toEqual(TOP_LEVEL);

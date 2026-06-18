@@ -14,7 +14,7 @@ describe("shouldAttentionTick (global attention poller gate)", () => {
     unlocked: true,
     visible: true,
     inFlight: false,
-    activeView: "dashboard",
+    activeView: "providers",
   };
 
   it("fetches when unlocked, visible, idle, and NOT on the Projects view", () => {
@@ -39,7 +39,7 @@ describe("shouldAttentionTick (global attention poller gate)", () => {
   });
 
   it("DOES fetch on every non-projects view", () => {
-    for (const view of ["dashboard", "polis", "oracle", "cloudflare", "settings"]) {
+    for (const view of ["providers", "polis", "oracle", "cloudflare", "settings"]) {
       expect(shouldAttentionTick({ ...base, activeView: view })).toBe(true);
     }
   });
@@ -51,7 +51,7 @@ describe("startAttentionPoller live-lock gate (BLOCKER: never tick while locked)
     const fetchLiveState = vi.fn(async () => liveState());
     const feed = vi.fn();
     const stop = startAttentionPoller({
-      getActiveView: () => "dashboard",
+      getActiveView: () => "providers",
       isUnlocked,
       fetchLiveState,
       feed,
@@ -101,7 +101,7 @@ describe("startAttentionPoller live-lock gate (BLOCKER: never tick while locked)
     const feed = vi.fn();
     let intervalCb: (() => void) | undefined;
     const stop = startAttentionPoller({
-      getActiveView: () => "dashboard",
+      getActiveView: () => "providers",
       isUnlocked: () => !locked,
       fetchLiveState,
       feed,
@@ -167,7 +167,7 @@ describe("startAttentionPoller glue", () => {
   }
 
   it("fetches and feeds on a tick off the Projects view", async () => {
-    const h = harness("dashboard");
+    const h = harness("providers");
     h.tick();
     await Promise.resolve();
     await Promise.resolve();
@@ -195,7 +195,7 @@ describe("startAttentionPoller glue", () => {
     const feed = vi.fn();
     let intervalCb: (() => void) | undefined;
     const stop = startAttentionPoller({
-      getActiveView: () => "dashboard",
+      getActiveView: () => "providers",
       fetchLiveState,
       feed,
       isVisible: () => true,
@@ -218,7 +218,7 @@ describe("startAttentionPoller glue", () => {
   it("clears the interval on teardown", () => {
     const clearIntervalFn = vi.fn();
     const stop = startAttentionPoller({
-      getActiveView: () => "dashboard",
+      getActiveView: () => "providers",
       fetchLiveState: async () => liveState(),
       feed: () => {},
       isVisible: () => true,

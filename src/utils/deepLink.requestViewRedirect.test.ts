@@ -22,8 +22,9 @@ describe("requestView oracle pass-through (via mapLegacyViewTarget)", () => {
   });
 
   it("a non-oracle view passes through to the real requestView unchanged", () => {
-    // Covers: dashboard, projects, polis, providers
-    for (const v of ["dashboard", "projects", "polis", "providers"]) {
+    // Covers: projects, polis, providers (the removed "dashboard" now redirects
+    // → asserted in deepLink.legacyRedirect.test.ts, not here).
+    for (const v of ["projects", "polis", "providers"]) {
       const result = mapLegacyViewTarget(v);
       expect(result.view).toBe(v);
     }
