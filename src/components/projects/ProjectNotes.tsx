@@ -9,6 +9,9 @@ export interface ProjectNotesProps {
   onNoteDraftChange: (value: string) => void;
   onAppend: () => void;
   isBusy: boolean;
+  /** READ-ONLY (archived project): the existing notes stay fully visible, but the
+   *  draft textarea + Append button are disabled. Defaults to false. */
+  readOnly?: boolean;
   revision: string;
   modifiedAt: string;
   updatedAt: string;
@@ -20,6 +23,7 @@ export function ProjectNotes({
   onNoteDraftChange,
   onAppend,
   isBusy,
+  readOnly = false,
   revision,
   modifiedAt,
   updatedAt,
@@ -41,15 +45,18 @@ export function ProjectNotes({
         <textarea
           value={noteDraft}
           onChange={(event) => onNoteDraftChange(event.target.value)}
-          placeholder="Append a project note"
+          placeholder={
+            readOnly ? "Archived project is read-only." : "Append a project note"
+          }
           rows={3}
+          disabled={readOnly}
           data-help-title="A note is durable project memory."
           data-help-lines="Notes are written into the project Markdown file.|Use notes for decisions, evidence, smoke results, and blocked reasons.|Oracle can retrieve notes after indexing catches the change.|Do not paste raw secrets or private tokens into notes."
-          className="min-w-0 flex-1 resize-none rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+          className="min-w-0 flex-1 resize-none rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200 disabled:opacity-60"
         />
         <button
           onClick={() => void onAppend()}
-          disabled={isBusy || !noteDraft.trim()}
+          disabled={isBusy || !noteDraft.trim() || readOnly}
           data-help-title="This appends the note to the project file."
           data-help-lines="Appending is a local Markdown write.|It is useful for human decisions and agent evidence.|The note becomes searchable by Oracle after incremental indexing.|Do not use it for secret values or temporary API keys."
           className="self-start rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"

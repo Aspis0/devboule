@@ -95,6 +95,16 @@ export interface ProjectWorkspaceProps {
   ptyAgents: Set<string>;
   isBusy: boolean;
   canLaunch: boolean;
+  /** READ-ONLY mode: the project is archived. The page stays fully VIEWABLE
+   *  (tasks, notes, console, git diff, terminal) but EVERY mutating control is
+   *  disabled + guarded. A prominent banner with an [Unarchive] action is shown
+   *  at the top. Defaults to false so a non-archived project behaves identically
+   *  to today (byte-identical render). */
+  readOnly?: boolean;
+  /** Restore an archived project to "active" (only meaningful when readOnly).
+   *  Wired by ProjectsView to the same updateProjectStatus("active") path the
+   *  Resume button uses. Optional so existing call sites without it still type. */
+  onUnarchive?: () => void;
   launchMessage: string | null;
   rules?: AgentRoleRule[];
   customClients?: CustomAgentClient[];
@@ -137,6 +147,8 @@ export function ProjectWorkspace({
   ptyAgents,
   isBusy,
   canLaunch,
+  readOnly = false,
+  onUnarchive,
   launchMessage,
   rules = [],
   customClients = [],
@@ -289,13 +301,14 @@ export function ProjectWorkspace({
   // `compactWriteCall` returning null for any non-claude session, so a stray call
   // on a wrong client can never fire. Best-effort; a failed invoke is swallowed.
   const compactSelected = useCallback(() => {
+    if (readOnly) return; // archived project: no mutations.
     if (!selectedSession) return;
     const call = compactWriteCall(selectedSession);
     if (!call) return; // not a claude client — no Compact for it.
     void invokeBackendCommand(call.command, call.args).catch(() => {
       /* swallow — Compact is a convenience; a write failure is non-fatal */
     });
-  }, [selectedSession]);
+  }, [readOnly, selectedSession]);
 
   // Stop a NORMAL (non-mini) selected agent via the parent's restored
   // `stop_agent` flow. Gated to a non-mini selection (the mini brake owns minis),
@@ -327,6 +340,7 @@ export function ProjectWorkspace({
   }, [selectedSession, onCopyRecovery]);
 
   const submitCommit = () => {
+    if (readOnly) return; // archived project: no mutations.
     const trimmed = commitMessage.trim();
     if (!trimmed || gitActionBusy) return;
     onCommit(trimmed);
@@ -336,6 +350,25 @@ export function ProjectWorkspace({
 
   return (
     <div className="flex w-full flex-col gap-4">
+      {/* ---- Read-only (archived) banner ---- */}
+      {readOnly && (
+        <div className="flex flex-col gap-2 rounded-2xl border border-amber/30 bg-amber/[0.06] p-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-[12px] font-semibold text-amber-dark">
+            📦 Project archived — read only
+          </p>
+          <button
+            type="button"
+            onClick={() => onUnarchive?.()}
+            disabled={isBusy || onUnarchive === undefined}
+            data-help-title="This restores the project to active."
+            data-help-lines="Unarchiving sets the project back to active and editable.|It returns to the stage board and the calendar.|Agents can be launched again once it is active.|Archiving is fully reversible."
+            className="shrink-0 self-start rounded-lg bg-terracotta px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60 sm:self-auto"
+          >
+            Unarchive
+          </button>
+        </div>
+      )}
+
       {/* ---- Top bar ---- */}
       <div className="flex flex-col gap-2 rounded-2xl border border-cream-200 bg-white p-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex min-w-0 items-center gap-3">
@@ -367,7 +400,7 @@ export function ProjectWorkspace({
           <button
             type="button"
             onClick={onPull}
-            disabled={!gitLine.isGitRepo || gitActionBusy}
+            disabled={!gitLine.isGitRepo || gitActionBusy || readOnly}
             data-help-title="This pulls the latest changes from origin (fast-forward only)."
             data-help-lines="Pull downloads the current branch's new commits from origin and fast-forwards.|It never merges or rebases: if your branch has diverged, it stops and shows the git error.|Resolve a divergence yourself (commit/stash, then merge or rebase) before pulling again.|The working tree is left untouched when a fast-forward is not possible."
             className="inline-flex items-center gap-1.5 rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 disabled:opacity-60"
@@ -377,7 +410,7 @@ export function ProjectWorkspace({
           <button
             type="button"
             onClick={() => setCommitOpen((open) => !open)}
-            disabled={!gitLine.isGitRepo || gitActionBusy}
+            disabled={!gitLine.isGitRepo || gitActionBusy || readOnly}
             data-help-title="This commits the tracked changes on the current branch."
             data-help-lines="A commit records the modified, tracked files on the current branch only.|Untracked files are not swept in; stage them in your editor if needed.|Enter a short message describing the change.|The app never force-anything; on failure the git error is shown."
             className="inline-flex items-center gap-1.5 rounded-lg bg-terracotta px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
@@ -387,7 +420,7 @@ export function ProjectWorkspace({
           <button
             type="button"
             onClick={onPush}
-            disabled={!gitLine.isGitRepo || gitActionBusy}
+            disabled={!gitLine.isGitRepo || gitActionBusy || readOnly}
             data-help-title="This pushes the current branch to origin."
             data-help-lines="Push uploads the current branch's commits to the origin remote.|It never force-pushes, so it can only fast-forward the remote.|If there is no upstream or the push is rejected, the git error is shown.|Commit first if you have local changes you want to push."
             className="inline-flex items-center gap-1.5 rounded-lg bg-teal px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
@@ -398,7 +431,7 @@ export function ProjectWorkspace({
       </div>
 
       {/* Commit message input (small, inline — no modal). */}
-      {commitOpen && (
+      {commitOpen && !readOnly && (
         <div className="flex flex-col gap-2 rounded-2xl border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
           <input
             value={commitMessage}
@@ -414,7 +447,7 @@ export function ProjectWorkspace({
           <button
             type="button"
             onClick={submitCommit}
-            disabled={!commitMessage.trim() || gitActionBusy}
+            disabled={!commitMessage.trim() || gitActionBusy || readOnly}
             className="shrink-0 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
           >
             Commit
@@ -436,13 +469,16 @@ export function ProjectWorkspace({
       )}
 
       {/* GH-P4: agent push-approval gate — agents commit freely, the human approves
-          every push. Surfaces this project's pending request(s) with Approve/Deny. */}
-      <PushApprovalCard projectId={project.metadata.id} />
+          every push. Surfaces this project's pending request(s) with Approve/Deny.
+          Hidden when archived (read-only): an archived project has no live agents to
+          push, and approving a push is a mutation — gate it defensively by hiding. */}
+      {!readOnly && <PushApprovalCard projectId={project.metadata.id} />}
 
       {/* Plan approval gate — surfaces pending plan-approval requests for the current
           project. Rendered beside the push card; always visible when pending requests
-          exist, regardless of the active dock tab. */}
-      <PlanApprovalCard projectId={project.metadata.id} />
+          exist, regardless of the active dock tab. Hidden when archived for the same
+          reason as the push card (approve/reject are mutations). */}
+      {!readOnly && <PlanApprovalCard projectId={project.metadata.id} />}
 
       {/* ---- Main: rail + center terminal ---- */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
@@ -485,7 +521,8 @@ export function ProjectWorkspace({
                     <button
                       type="button"
                       onClick={compactSelected}
-                      className="inline-flex items-center gap-1 rounded-2xl border border-teal bg-teal px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-teal/90"
+                      disabled={readOnly}
+                      className="inline-flex items-center gap-1 rounded-2xl border border-teal bg-teal px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
                       data-help-title="Runs /compact in this Claude agent to shrink its context."
                       data-help-lines="Sends the /compact slash command to this Claude agent's terminal.|Claude Code summarizes the conversation so far, freeing context window so the agent can keep working longer.|Only Claude agents show this button — /compact is a Claude Code command.|It is a one-click convenience; you can also type /compact yourself in the reply bar."
                     >
@@ -501,7 +538,7 @@ export function ProjectWorkspace({
                     <button
                       type="button"
                       onClick={stopMini}
-                      className="inline-flex items-center gap-1 rounded-2xl border border-coral bg-coral px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-coral-dark"
+                      className="inline-flex items-center gap-1 rounded-2xl border border-coral bg-coral px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-coral-dark disabled:opacity-60"
                       data-help-title="Stop this mini-coder now."
                       data-help-lines="Immediately kills this mini-coder; the parent coder will be told it was aborted and must escalate to you.|This is a one-click safety brake — there is no confirm step.|Only mini-coders show this button; a normal agent is stopped from its own controls."
                     >
@@ -550,7 +587,7 @@ export function ProjectWorkspace({
                     <button
                       type="button"
                       onClick={stopSelected}
-                      className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-coral-dark"
+                      className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-coral-dark disabled:opacity-60"
                       data-help-title="This stops the agent session."
                       data-help-lines="Stop ends the launched agent.|For an app-hosted agent it kills the PTY child; for an external one it closes its console.|It does not delete the task; it only ends the agent.|Relaunch from the Spawn panel if you still need the work done."
                     >
@@ -610,7 +647,7 @@ export function ProjectWorkspace({
 
               {/* Question card: shown when the selected agent is waiting for a
                   human reply to a question it raised via ask_user / pendingQuestion. */}
-              <AgentQuestionCard session={selectedSession} />
+              {!readOnly && <AgentQuestionCard session={selectedSession} />}
             </div>
           ) : (
             <div className="flex h-72 items-center justify-center rounded-2xl border border-dashed border-cream-200 bg-cream-50 text-center text-[12px] text-cream-400">
@@ -709,7 +746,7 @@ export function ProjectWorkspace({
                   )}
                 </div>
               )}
-              <MiniSteerBar agentId={selectedAgentId} />
+              <MiniSteerBar agentId={selectedAgentId} disabled={readOnly} />
             </div>
           )}
 

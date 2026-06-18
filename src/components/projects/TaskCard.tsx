@@ -40,6 +40,7 @@ export function TaskCard({
   moveDisabled,
   manualMoveTitle,
   showLaunch,
+  launchDisabled,
   launchTitle,
   coderDisabled,
   coderTitle,
@@ -57,6 +58,7 @@ export function TaskCard({
   moveDisabled: boolean;
   manualMoveTitle: string;
   showLaunch: boolean;
+  launchDisabled: boolean;
   launchTitle: string;
   coderDisabled: boolean;
   coderTitle: string;
@@ -214,6 +216,7 @@ export function TaskCard({
               <MiniMenu
                 label="Launch"
                 items={launchItems}
+                disabled={launchDisabled}
                 align="right"
                 aria-label={`Launch agent for task ${task.id}`}
               />

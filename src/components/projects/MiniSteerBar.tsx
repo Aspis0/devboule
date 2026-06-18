@@ -47,9 +47,12 @@ export function steerStatusLabel(result: SteerResult): string {
 export interface MiniSteerBarProps {
   /** The selected agent id (the running mini). Null disables the whole bar. */
   agentId: string | null;
+  /** Force the whole bar disabled regardless of selection — used to lock steering
+   *  on a read-only (archived) project. Steering is a mutation. Defaults to false. */
+  disabled?: boolean;
 }
 
-export function MiniSteerBar({ agentId }: MiniSteerBarProps) {
+export function MiniSteerBar({ agentId, disabled: forcedDisabled = false }: MiniSteerBarProps) {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -85,7 +88,7 @@ export function MiniSteerBar({ agentId }: MiniSteerBarProps) {
   // Single steer path for BOTH Send (the typed message) and Stop (message:"stop").
   const steer = useCallback(
     async (rawMessage: string, clearInputOnSuccess: boolean) => {
-      if (agentId === null || busy) return;
+      if (agentId === null || busy || forcedDisabled) return;
       const text = rawMessage.trim().slice(0, MAX_STEER_MESSAGE_LEN);
       if (text.length === 0) return;
       setBusy(true);
@@ -110,10 +113,10 @@ export function MiniSteerBar({ agentId }: MiniSteerBarProps) {
         if (mountedRef.current) setBusy(false);
       }
     },
-    [agentId, busy, flashStatus],
+    [agentId, busy, forcedDisabled, flashStatus],
   );
 
-  const disabled = agentId === null || busy;
+  const disabled = agentId === null || busy || forcedDisabled;
   const sendDisabled = disabled || message.trim().length === 0;
 
   return (

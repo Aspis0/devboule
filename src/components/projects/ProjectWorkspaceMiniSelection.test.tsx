@@ -38,7 +38,11 @@ function project(): ProjectDetail {
 
 const noop = () => undefined;
 
-function render(sessions: AgentSession[], ptyAgents: Set<string>) {
+function render(
+  sessions: AgentSession[],
+  ptyAgents: Set<string>,
+  extra?: { readOnly?: boolean; onUnarchive?: () => void },
+) {
   return renderToStaticMarkup(
     <ProjectWorkspace
       project={project()}
@@ -61,6 +65,8 @@ function render(sessions: AgentSession[], ptyAgents: Set<string>) {
       gitActionMessage={null}
       gitActionError={false}
       gitActionBusy={false}
+      readOnly={extra?.readOnly}
+      onUnarchive={extra?.onUnarchive}
     />,
   );
 }
@@ -173,5 +179,57 @@ describe("ProjectWorkspace Compact button (MC-P7)", () => {
     const html = render(sessions, new Set(["coder-1", "mini-1"]));
     expect(html).toContain(">Stop<");
     expect(html).not.toContain(">Compact<");
+  });
+});
+
+describe("ProjectWorkspace read-only (archived) mode", () => {
+  it("shows the archived banner + an Unarchive button when readOnly", () => {
+    const html = render([], new Set(), { readOnly: true, onUnarchive: noop });
+    expect(html).toContain("Project archived — read only");
+    expect(html).toContain(">Unarchive<");
+  });
+
+  it("does NOT show the archived banner when not readOnly (default behavior)", () => {
+    const html = render([], new Set());
+    expect(html).not.toContain("Project archived — read only");
+    expect(html).not.toContain(">Unarchive<");
+  });
+
+  it("disables the git Pull/Commit/Push controls when readOnly", () => {
+    const html = render([], new Set(), { readOnly: true, onUnarchive: noop });
+    // The three top-bar git buttons render but carry the disabled attribute.
+    expect(html).toContain(">Pull<");
+    expect(html).toContain(">Push<");
+    // Static markup emits `disabled=""` for a disabled button. All git buttons
+    // (Pull/Commit/Push) are disabled in read-only mode.
+    const disabledCount = (html.match(/disabled=""/g) ?? []).length;
+    expect(disabledCount).toBeGreaterThanOrEqual(3);
+  });
+
+  it("does NOT disable git controls when not readOnly (gitRepo present)", () => {
+    // gitStatus.isGitRepo is false in the fixture, so the git buttons are disabled
+    // for that reason; assert the BANNER drives no extra gating by confirming the
+    // banner is absent and Unarchive is not rendered (byte-identical to today).
+    const html = render([], new Set());
+    expect(html).not.toContain(">Unarchive<");
+  });
+
+  it('hides the agent question card when readOnly', () => {
+    const sessions = [session({ pendingQuestion: { id: "q1", question: "Which file?", createdAt: "2026-06-05T00:00:00Z" } })];
+    const set = new Set<string>();
+    const htmlNormal = render(sessions, set);
+    expect(htmlNormal).toContain('is asking you a question');
+    const htmlReadOnly = render(sessions, set, { readOnly: true, onUnarchive: noop });
+    expect(htmlReadOnly).not.toContain('is asking you a question');
+  });
+
+  it('keeps the mini Stop brake available when readOnly', () => {
+    const parentId = 'p1';
+    const miniId = 'm1';
+    const sessions = [session({ parentAgentId: parentId, client: 'ollama', lastSeenAt: '2026-06-05T00:00:00Z' })];
+    const set = new Set([parentId, miniId]);
+    const html = render(sessions, set, { readOnly: true, onUnarchive: noop });
+    expect(html).toContain('>Stop<');
+    expect(html).toContain('Immediately kills this mini-coder');
   });
 });

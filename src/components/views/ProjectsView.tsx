@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  Archive,
   CheckCircle2,
   Circle,
   Clock3,
@@ -63,6 +64,7 @@ import {
   isRecentProjectSession,
 } from "../../utils/agentClaims";
 import { CollapsibleSection } from "../projects/CollapsibleSection";
+import { formatDateTime } from "../projects/projectFormat";
 import type { SpawnRole } from "../agents/roleDisplay";
 
 // Work-mode shell, lazy so its (and the terminal's) chunk loads only when a card
@@ -164,6 +166,10 @@ export function ProjectsView() {
   // flips this on and renders ProjectWorkspace full-bleed; `← Board` flips it off
   // while KEEPING selectedId so the card stays selected on the board.
   const [workMode, setWorkMode] = useState(false);
+  // Overview (board-mode) segmented toggle: the active stage board + calendar
+  // (default) vs. a simple read-only list of archived projects. Purely a view
+  // sub-state of board mode; it never affects Work mode or the selection.
+  const [overviewTab, setOverviewTab] = useState<"board" | "archived">("board");
   const [project, setProject] = useState<ProjectDetail | null>(null);
   // Inline status for the Work-mode Commit/Push controls (success or git stderr).
   const [gitActionMessage, setGitActionMessage] = useState<string | null>(null);
@@ -257,6 +263,11 @@ export function ProjectsView() {
     () => (project?.metadata.id === selectedId ? project : null),
     [project, selectedId],
   );
+
+  // READ-ONLY gate: the selected project is archived. Every mutation handler
+  // early-returns on this, and the Work-mode page renders in read-only mode with
+  // an [Unarchive] banner. Derived from the loaded detail's metadata status.
+  const isArchived = currentProject?.metadata.status === "archived";
 
   const loadSavedWorkflows = useCallback(async (projectId: string) => {
     setWorkflowError(null);
@@ -618,6 +629,26 @@ export function ProjectsView() {
     return grouped;
   }, [agentState?.sessions, currentProject]);
 
+  // Active board feed: archived projects LEAVE the active stage board + macro
+  // calendar (an archived project is read-only and out of the active workflow).
+  // Computed once and fed to BOTH projectsByStage and ProjectCalendar so the two
+  // stay consistent. The full `projects` array is kept untouched for the archived
+  // list/count below. Paused/done stay on the board — only `archived` is excluded.
+  const activeProjects = useMemo(
+    () => projects.filter((p) => p.status !== "archived"),
+    [projects],
+  );
+
+  // The archived projects, surfaced via the overview "Archived (N)" toggle. Most
+  // recently updated first so the freshest archive is at the top of the list.
+  const archivedProjects = useMemo(
+    () =>
+      projects
+        .filter((p) => p.status === "archived")
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+    [projects],
+  );
+
   const projectsByStage = useMemo(() => {
     const grouped: Record<ProjectStageId, ProjectSummary[]> = {
       planned: [],
@@ -627,7 +658,7 @@ export function ProjectsView() {
       blocked: [],
       verified: [],
     };
-    for (const item of projects) {
+    for (const item of activeProjects) {
       grouped[
         projectStage(
           item,
@@ -637,7 +668,16 @@ export function ProjectsView() {
       ].push(item);
     }
     return grouped;
-  }, [claimsByProject, projects, sessionsByProject]);
+  }, [activeProjects, claimsByProject, sessionsByProject]);
+
+  // Keep the overview toggle coherent: if the last archived project is
+  // unarchived (or none exist), snap back to the board so the user is never left
+  // staring at an empty "Archived" pane with no archived projects.
+  useEffect(() => {
+    if (archivedProjects.length === 0 && overviewTab === "archived") {
+      setOverviewTab("board");
+    }
+  }, [archivedProjects.length, overviewTab]);
 
   const currentSummary = useMemo(() => {
     if (!currentProject) return null;
@@ -860,6 +900,7 @@ export function ProjectsView() {
   };
 
   const createTask = async () => {
+    if (isArchived) return; // archived project is read-only.
     // Category is mandatory on create (the button is disabled until picked, but
     // guard here too). A bug card carries its description as the P2 Oracle query.
     if (!currentProject || !taskDraft.trim() || !taskCategory || busyRef.current)
@@ -923,6 +964,7 @@ export function ProjectsView() {
   };
 
   const moveTask = async (task: ProjectTask, status: ColumnId) => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject || task.status === status || busyRef.current) return;
     await runMutation(() =>
       invokeBackendCommand<ProjectDetail>("move_project_task", {
@@ -935,6 +977,7 @@ export function ProjectsView() {
   };
 
   const appendNote = async () => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject || !noteDraft.trim() || busyRef.current) return;
     const text = noteDraft.trim();
     const detail = await runMutation(() =>
@@ -975,6 +1018,7 @@ export function ProjectsView() {
   // agents fall back to a default root with no recovery path. Routes through
   // runMutation so it shares the same conflict-recovery + reload behaviour.
   const setProjectRoot = async () => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject || busyRef.current) return;
     const trimmed = rootDraft.trim();
     const nextRoot = trimmed === "" ? null : trimmed;
@@ -994,6 +1038,7 @@ export function ProjectsView() {
     role: SpawnRole,
     taskId?: string,
   ) => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject || busyRef.current) return;
     if (!canLaunchProjectAgents(currentProject)) {
       setError(projectLaunchTitle(currentProject));
@@ -1043,6 +1088,7 @@ export function ProjectsView() {
     client: "codex" | "claude",
     taskId?: string,
   ) => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject || busyRef.current) return;
     if (!canLaunchProjectAgents(currentProject)) {
       setError(projectLaunchTitle(currentProject));
@@ -1085,6 +1131,7 @@ export function ProjectsView() {
   };
 
   const runSavedWorkflow = async (workflow: SavedWorkflow) => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject || busyRef.current) return;
     if (!canLaunchProjectAgents(currentProject)) {
       setWorkflowError(projectLaunchTitle(currentProject));
@@ -1334,6 +1381,7 @@ export function ProjectsView() {
   // Rail launch (app/external): thread the SpawnPanel-built input into the same
   // launch_project_agent_terminal command used everywhere (host + advisory model).
   const launchFromSpawnPanel = async (input: SpawnLaunchInput) => {
+    if (isArchived) return; // archived project is read-only.
     if (busyRef.current) return;
     busyRef.current = true;
     setIsBusy(true);
@@ -1384,6 +1432,7 @@ export function ProjectsView() {
   // Rail copy-prompt: SpawnPanel selection → prepare_project_agent_prompt
   // (normalizes the advisory model hint identically to the launch path).
   const copyFromSpawnPanel = async (selection: SpawnSelection) => {
+    if (isArchived) return; // archived project is read-only.
     if (busyRef.current) return;
     busyRef.current = true;
     setIsBusy(true);
@@ -1425,6 +1474,7 @@ export function ProjectsView() {
   // backend never force-anything and surfaces git stderr on failure; we show the
   // result inline (no modal). The refreshed gitStatus updates the top bar in place.
   const commitProject = async (message: string) => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject) return;
     const projectId = currentProject.metadata.id;
     let succeeded = false;
@@ -1474,6 +1524,7 @@ export function ProjectsView() {
 
   // Work-mode Push: push the current branch to origin (never force).
   const pushProject = async () => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject) return;
     const projectId = currentProject.metadata.id;
     let succeeded = false;
@@ -1517,6 +1568,7 @@ export function ProjectsView() {
   // the backend leaves the tree clean and surfaces git's "resolve manually" message
   // (no auto-merge in v1). Mirrors pushProject's guard/busy/error handling exactly.
   const pullProject = async () => {
+    if (isArchived) return; // archived project is read-only.
     if (!currentProject) return;
     const projectId = currentProject.metadata.id;
     let succeeded = false;
@@ -1566,6 +1618,7 @@ export function ProjectsView() {
       onNoteDraftChange={setNoteDraft}
       onAppend={appendNote}
       isBusy={isBusy}
+      readOnly={isArchived}
       revision={currentProject.revision}
       // ProjectDetail.modifiedAt is `string | null`; ProjectNotes expects a
       // string and renders it via formatDate, whose falsy-guard maps "" → "no
@@ -1585,6 +1638,9 @@ export function ProjectsView() {
       helpTitle="Board is for tasks and quick coder/verifier launches."
       helpLines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
     >
+      {/* Create-task form: hidden when the project is archived (read-only). The
+          task COLUMNS below stay visible so archived tasks remain inspectable. */}
+      {!isArchived && (
       <div className="mb-4 space-y-2">
         <div className="flex gap-2">
           <input
@@ -1650,6 +1706,7 @@ export function ProjectsView() {
           />
         )}
       </div>
+      )}
       <div className="overflow-x-auto pb-2">
         <div className="grid min-w-[1080px] grid-cols-5 gap-3">
           {columns.map((column) => {
@@ -1697,9 +1754,11 @@ export function ProjectsView() {
                       const taskAgentControlled =
                         taskClaims.length > 0 ||
                         taskSessions.length > 0;
-                      const manualMoveTitle = taskAgentControlled
-                        ? "An open agent claim or session controls this task; let MCP update status or wait for expiry."
-                        : "Move task";
+                      const manualMoveTitle = isArchived
+                        ? "Archived project is read-only."
+                        : taskAgentControlled
+                          ? "An open agent claim or session controls this task; let MCP update status or wait for expiry."
+                          : "Move task";
                       const launchable =
                         canLaunchProjectAgents(currentProject);
                       return (
@@ -1708,7 +1767,7 @@ export function ProjectsView() {
                           task={task}
                           agentControlled={taskAgentControlled}
                           moveTargets={taskMoveTargets(task)}
-                          moveDisabled={isBusy || taskAgentControlled}
+                          moveDisabled={isBusy || taskAgentControlled || isArchived}
                           manualMoveTitle={manualMoveTitle}
                           showLaunch={task.status !== "done"}
                           launchTitle={projectLaunchTitle(
@@ -1739,6 +1798,7 @@ export function ProjectsView() {
                                 : "Verifier can claim Review or Blocked tasks"
                           }
                           manualDisabled={!launchable}
+                          launchDisabled={isBusy || !launchable}
                           onMove={(status) =>
                             void moveTask(task, status)
                           }
@@ -1793,6 +1853,8 @@ export function ProjectsView() {
             ptyAgents={ptyAgents}
             isBusy={isBusy}
             canLaunch={canLaunchProjectAgents(currentProject)}
+            readOnly={isArchived}
+            onUnarchive={() => void updateProjectStatus("active")}
             launchMessage={launchMessage}
             rules={agentState?.rules ?? []}
             customClients={config.customAgentClients ?? []}
@@ -1927,24 +1989,104 @@ export function ProjectsView() {
         </section>
       )}
 
-      <ProjectsBoard
-        projectsByStage={projectsByStage}
-        claimsByProject={claimsByProject}
-        sessionsByProject={sessionsByProject}
-        censorCountByProject={censorCountByProject}
-        selectedId={selectedId}
-        isLoading={isLoadingProjects}
-        onSelect={enterWorkMode}
-      />
+      {/* Overview segmented toggle: the active stage board (default) vs. a simple
+          read-only list of archived projects. The "Archived (N)" segment is shown
+          disabled when there is nothing archived, so the control stays predictable
+          without cluttering the header when N === 0. */}
+      <div className="flex items-center gap-1 rounded-lg border border-cream-200 bg-white p-1 w-fit">
+        <button
+          type="button"
+          onClick={() => setOverviewTab("board")}
+          aria-pressed={overviewTab === "board"}
+          data-help-title="Show the active stage board and calendar."
+          data-help-lines="The board is the active project workflow.|Archived projects leave the board and the calendar.|Use the Archived tab to find and reopen them.|This toggle only changes the overview, not the selection."
+          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+            overviewTab === "board"
+              ? "bg-terracotta text-white"
+              : "text-cream-600 hover:bg-cream-50"
+          }`}
+        >
+          Board
+        </button>
+        <button
+          type="button"
+          onClick={() => setOverviewTab("archived")}
+          aria-pressed={overviewTab === "archived"}
+          disabled={archivedProjects.length === 0}
+          data-help-title="Show archived projects."
+          data-help-lines="Archived projects are read-only and out of the active workflow.|They do not appear on the board or the calendar.|Open one to view it, then Unarchive from its page to make it active again.|Archiving is reversible."
+          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors disabled:opacity-40 ${
+            overviewTab === "archived"
+              ? "bg-terracotta text-white"
+              : "text-cream-600 hover:bg-cream-50"
+          }`}
+        >
+          Archived ({archivedProjects.length})
+        </button>
+      </div>
 
-      {/* Calendar / organizer BELOW the board (Board mode only: this whole block
-          is skipped in Work mode). Aggregates milestones across every project;
-          add/remove reload via the existing loadProjects path. */}
-      <ProjectCalendar
-        projects={projects}
-        onSelectProject={selectProjectOnly}
-        onChanged={() => void loadProjects()}
-      />
+      {overviewTab === "archived" ? (
+        // Archived list: a calm read-only list of archived projects, each with an
+        // [Open] button that enters the same single-project Work mode a board card
+        // does (enterWorkMode). Unarchive lives in the page banner (Part 2).
+        <section className="rounded-lg border border-cream-200 bg-white p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <Archive className="h-4 w-4 text-cream-500" aria-hidden />
+            <h3 className="text-sm font-semibold text-cream-800">
+              Archived projects
+            </h3>
+          </div>
+          {archivedProjects.length === 0 ? (
+            <p className="text-[12px] text-cream-400">No archived projects.</p>
+          ) : (
+            <ul className="space-y-2">
+              {archivedProjects.map((item) => (
+                <li
+                  key={item.id}
+                  className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-cream-50 p-3 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-[12px] font-semibold text-cream-800">
+                      {item.title}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-cream-400">
+                      Updated {formatDateTime(item.updatedAt)}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => enterWorkMode(item.id)}
+                    className="shrink-0 self-start rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 sm:self-auto"
+                  >
+                    Open
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      ) : (
+        <>
+          <ProjectsBoard
+            projectsByStage={projectsByStage}
+            claimsByProject={claimsByProject}
+            sessionsByProject={sessionsByProject}
+            censorCountByProject={censorCountByProject}
+            selectedId={selectedId}
+            isLoading={isLoadingProjects}
+            onSelect={enterWorkMode}
+          />
+
+          {/* Calendar / organizer BELOW the board (Board mode only: this whole
+              block is skipped in Work mode). Fed from activeProjects so archived
+              projects leave the calendar exactly as they leave the stage board. */}
+          <ProjectCalendar
+            projects={activeProjects}
+            onSelectProject={selectProjectOnly}
+            onChanged={() => void loadProjects()}
+          />
+        </>
+      )}
 
       <div className="grid grid-cols-1 gap-5">
         {selectedId && loadingProjectId === selectedId && !currentProject ? (
@@ -1990,7 +2132,9 @@ export function ProjectsView() {
 
             {/* Project root editor (#6): the only remaining UI to set the agent
                 root after the GitHub panel was removed. Unobtrusive single
-                input + button, prefilled with the current root. */}
+                input + button, prefilled with the current root. Hidden for an
+                archived (read-only) project — setting the root is a mutation. */}
+            {currentProject.metadata.status !== "archived" && (
             <div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
               <label
                 htmlFor="project-root-input"
@@ -2023,6 +2167,7 @@ export function ProjectsView() {
                 Set root
               </button>
             </div>
+            )}
 
             {/* Fase 1 UI reorg: the live "who's working / Launch another"
                 ProjectAgentPanel was removed from the board-mode overview — it

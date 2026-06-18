@@ -19,12 +19,12 @@ import { MiniSteerBar, steerStatusLabel } from "./MiniSteerBar";
 let container: HTMLDivElement;
 let root: Root;
 
-function mount(agentId: string | null) {
+function mount(agentId: string | null, disabled?: boolean) {
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => {
-    root.render(createElement(MiniSteerBar, { agentId }));
+    root.render(createElement(MiniSteerBar, { agentId, disabled }));
   });
 }
 
@@ -141,6 +141,20 @@ describe("MiniSteerBar", () => {
     expect((clickButton("Stop") as HTMLButtonElement).disabled).toBe(true);
     const input = container.querySelector("input") as HTMLInputElement;
     expect(input.disabled).toBe(true);
+    await act(async () => {
+      clickButton("Stop").click();
+      await Promise.resolve();
+    });
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it("disabled prop (archived read-only) locks all controls even with a live agentId", async () => {
+    mount("mini-7", true);
+    expect((clickButton("Send") as HTMLButtonElement).disabled).toBe(true);
+    expect((clickButton("Stop") as HTMLButtonElement).disabled).toBe(true);
+    const input = container.querySelector("input") as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    // Force-clicking Stop must not invoke when forcibly disabled.
     await act(async () => {
       clickButton("Stop").click();
       await Promise.resolve();
