@@ -719,10 +719,9 @@ describe("dock", () => {
     expect(DOCK_TABS[0].id).toBe("censor");
   });
 
-  it("exposes the six tabs in order (MCP tab added in Phase A.3)", () => {
+  it("exposes the five tabs in order (MCP tab added in Phase A.3)", () => {
     expect(DOCK_TABS.map((t) => t.id)).toEqual([
       "censor",
-      "activity",
       "git",
       "plans",
       "console",

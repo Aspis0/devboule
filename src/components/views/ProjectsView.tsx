@@ -3,7 +3,6 @@ import {
   CheckCircle2,
   Circle,
   Clock3,
-  FileText,
   FolderKanban,
   GitBranch,
   Play,
@@ -88,13 +87,13 @@ import {
 } from "../agents/agentRowModel";
 import { buildWorkflowLaunchInput } from "../agents/savedWorkflowModel";
 import { ProjectStatusHeader } from "../projects/ProjectStatusHeader";
+import { ProjectNotes } from "../projects/ProjectNotes";
 import { TaskCard } from "../projects/TaskCard";
 import {
   TASK_CATEGORIES,
   categoryLabel,
 } from "../projects/taskCategory";
 import type { ColumnId } from "../projects/taskBoard";
-import { formatDate } from "../projects/projectFormat";
 import { freshestSession } from "../projects/agentLiveStatus";
 import {
   commitProjectCall,
@@ -119,9 +118,9 @@ export function agentStateSignature(
 }
 
 const columns: { id: ColumnId; label: string; icon: typeof Circle }[] = [
-  { id: "todo", label: "Todo", icon: Circle },
-  { id: "wip", label: "WIP", icon: Clock3 },
-  { id: "review", label: "Review", icon: ShieldCheck },
+  { id: "todo", label: "To do", icon: Circle },
+  { id: "wip", label: "In progress", icon: Clock3 },
+  { id: "review", label: "In review", icon: ShieldCheck },
   { id: "blocked", label: "Blocked", icon: AlertCircle },
   { id: "done", label: "Done", icon: CheckCircle2 },
 ];
@@ -1591,6 +1590,224 @@ export function ProjectsView() {
     if (succeeded) await reloadSelectedProjectSafe();
   };
 
+  // Work-mode slots (Fase 1 UI reorg): the per-project task board and the Notes
+  // section, relocated out of the board-mode detail panel and into ProjectWorkspace
+  // via its taskBoardSlot / notesSlot. Built here so they keep ProjectsView's own
+  // handlers/state (moveTask, createTask, appendNote, noteDraft, …). The `?`-guard
+  // narrows currentProject to non-null inside each branch, so the moved JSX's
+  // existing currentProject uses still type-check; absent → null renders nothing.
+  const notesNode = currentProject ? (
+    <ProjectNotes
+      notes={currentProject.state.notes}
+      noteDraft={noteDraft}
+      onNoteDraftChange={setNoteDraft}
+      onAppend={appendNote}
+      isBusy={isBusy}
+      revision={currentProject.revision}
+      // ProjectDetail.modifiedAt is `string | null`; ProjectNotes expects a
+      // string and renders it via formatDate, whose falsy-guard maps "" → "no
+      // date" — identical to the prior inline block that passed null straight in.
+      modifiedAt={currentProject.modifiedAt ?? ""}
+      updatedAt={currentProject.metadata.updatedAt}
+    />
+  ) : null;
+
+  const taskBoardNode = currentProject ? (
+    <CollapsibleSection
+      icon={FolderKanban}
+      title="Tasks"
+      purpose="Tasks for this project"
+      summary={`${tasksByColumn.done.length} done · ${tasksByColumn.wip.length} in progress · ${tasksByColumn.review.length} in review`}
+      defaultOpen
+      helpTitle="Board is for tasks and quick coder/verifier launches."
+      helpLines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+    >
+      <div className="mb-4 space-y-2">
+        <div className="flex gap-2">
+          <input
+            value={taskDraft}
+            onChange={(event) => setTaskDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void createTask();
+            }}
+            placeholder="Add task"
+            data-help-title="A task is one concrete piece of project work."
+            data-help-lines="Tasks appear in Todo, WIP, Review, Blocked, or Done.|Coders should move work toward Review; verifiers decide whether it can close.|Keep tasks small enough for one agent session.|Agents can update task state through MCP instead of editing the UI."
+            className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+          />
+          <button
+            onClick={() => void createTask()}
+            disabled={isBusy || !taskDraft.trim() || !taskCategory}
+            data-help-title="This adds a Todo task to the project."
+            data-help-lines="The task is written to the project Markdown file.|A category is required so the orchestrator and Oracle know how to treat it.|It starts in Todo and can later be claimed by a coder or orchestrator.|If an agent is already working, reload before adding overlapping tasks."
+            className="inline-flex items-center gap-2 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Task
+          </button>
+        </div>
+        <div
+          className="flex flex-wrap items-center gap-1.5"
+          data-help-title="A category is required for every new Todo card."
+          data-help-lines="feature, hardening, bug, or other.|It tells the orchestrator how to treat the card and seeds Oracle's suspect files.|A bug card asks for a short description used to localize the suspect files.|Pick one before the Task button enables."
+        >
+          <span className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+            Category
+          </span>
+          {TASK_CATEGORIES.map((category) => {
+            const active = taskCategory === category;
+            return (
+              <button
+                key={category}
+                type="button"
+                onClick={() => setTaskCategory(category)}
+                aria-pressed={active}
+                className={`rounded-md px-2 py-1 text-[10px] font-semibold transition-colors ${
+                  active
+                    ? "bg-teal text-white"
+                    : "bg-cream-100 text-cream-600 hover:bg-cream-200"
+                }`}
+              >
+                {categoryLabel(category)}
+              </button>
+            );
+          })}
+        </div>
+        {taskCategory === "bug" && (
+          <textarea
+            value={taskBugDescription}
+            onChange={(event) =>
+              setTaskBugDescription(event.target.value)
+            }
+            rows={3}
+            placeholder="Describe the bug — what is wrong, where you see it. This seeds Oracle's suspect files."
+            data-help-title="The bug description is used to localize suspect files."
+            data-help-lines="Oracle (P2) retrieves the most relevant files from the codebase index using this text.|Be specific: symptoms, error messages, the area of the app.|It is stored on the card and visible to the agent that claims it.|Optional, but a good description makes the suspect list far more useful."
+            className="w-full resize-y rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+          />
+        )}
+      </div>
+      <div className="overflow-x-auto pb-2">
+        <div className="grid min-w-[1080px] grid-cols-5 gap-3">
+          {columns.map((column) => {
+            const Icon = column.icon;
+            const items = tasksByColumn[column.id];
+            return (
+              <div
+                key={column.id}
+                className="rounded-lg border border-cream-200 bg-cream-50 p-3"
+                data-help-title={`${column.label} is a task status column.`}
+                data-help-lines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+              >
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Icon className="h-4 w-4 text-cream-500" />
+                    <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+                      {column.label}
+                    </h3>
+                  </div>
+                  <span className="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-cream-500">
+                    {items.length}
+                  </span>
+                </div>
+                {column.id === "done" && (
+                  <p className="mb-2 rounded-md bg-white/70 px-2 py-1 text-[10px] font-semibold text-cream-400">
+                    Verifier gated
+                  </p>
+                )}
+
+                <div className="space-y-2">
+                  {items.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-cream-200 bg-white/70 p-3 text-[11px] text-cream-400">
+                      Empty
+                    </div>
+                  ) : (
+                    items.map((task) => {
+                      // All gating is computed here (unchanged) and
+                      // passed to TaskCard as plain booleans/titles. The
+                      // card invokes the SAME moveTask / launchAgent /
+                      // copyAgentPrompt handlers with identical args; it
+                      // only changes presentation (button rows -> menus).
+                      const taskClaims = claimsByTask[task.id] ?? [];
+                      const taskSessions =
+                        sessionsByTask[task.id] ?? [];
+                      const taskAgentControlled =
+                        taskClaims.length > 0 ||
+                        taskSessions.length > 0;
+                      const manualMoveTitle = taskAgentControlled
+                        ? "An open agent claim or session controls this task; let MCP update status or wait for expiry."
+                        : "Move task";
+                      const launchable =
+                        canLaunchProjectAgents(currentProject);
+                      return (
+                        <TaskCard
+                          key={task.id}
+                          task={task}
+                          agentControlled={taskAgentControlled}
+                          moveTargets={taskMoveTargets(task)}
+                          moveDisabled={isBusy || taskAgentControlled}
+                          manualMoveTitle={manualMoveTitle}
+                          showLaunch={task.status !== "done"}
+                          launchTitle={projectLaunchTitle(
+                            currentProject,
+                          )}
+                          coderDisabled={
+                            isBusy ||
+                            !launchable ||
+                            !canCoderClaimTask(task)
+                          }
+                          coderTitle={
+                            !launchable
+                              ? projectLaunchTitle(currentProject)
+                              : canCoderClaimTask(task)
+                                ? "Launch coder"
+                                : "Coder cannot claim a review task"
+                          }
+                          verifierDisabled={
+                            isBusy ||
+                            !launchable ||
+                            !canVerifierClaimTask(task)
+                          }
+                          verifierTitle={
+                            !launchable
+                              ? projectLaunchTitle(currentProject)
+                              : canVerifierClaimTask(task)
+                                ? "Launch verifier"
+                                : "Verifier can claim Review or Blocked tasks"
+                          }
+                          manualDisabled={!launchable}
+                          onMove={(status) =>
+                            void moveTask(task, status)
+                          }
+                          onLaunchCoder={() =>
+                            void launchAgent("coder", "codex", task.id)
+                          }
+                          onLaunchVerifier={() =>
+                            void launchAgent(
+                              "verifier",
+                              "codex",
+                              task.id,
+                            )
+                          }
+                          onCopyManualPrompt={() =>
+                            void copyAgentPrompt(
+                              recommendedTaskRole(task),
+                              task.id,
+                            )
+                          }
+                        />
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </CollapsibleSection>
+  ) : null;
+
   return (
     <div className="w-full space-y-6">
       {/* WORK MODE (sub-state of the board): full-bleed IDE shell. The kanban /
@@ -1626,6 +1843,8 @@ export function ProjectsView() {
             gitActionMessage={gitActionMessage}
             gitActionError={gitActionError}
             gitActionBusy={gitActionBusy}
+            taskBoardSlot={taskBoardNode}
+            notesSlot={notesNode}
           />
         </Suspense>
       ) : (
@@ -1948,273 +2167,8 @@ export function ProjectsView() {
               </section>
             )}
 
-            <CollapsibleSection
-              icon={FolderKanban}
-              title="Board"
-              purpose="Tasks for this project"
-              summary={`${tasksByColumn.done.length} done / ${tasksByColumn.wip.length} wip / ${tasksByColumn.review.length} review`}
-              defaultOpen
-              helpTitle="Board is for tasks and quick coder/verifier launches."
-              helpLines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
-            >
-              <div className="mb-4 space-y-2">
-                <div className="flex gap-2">
-                  <input
-                    value={taskDraft}
-                    onChange={(event) => setTaskDraft(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") void createTask();
-                    }}
-                    placeholder="Add task"
-                    data-help-title="A task is one concrete piece of project work."
-                    data-help-lines="Tasks appear in Todo, WIP, Review, Blocked, or Done.|Coders should move work toward Review; verifiers decide whether it can close.|Keep tasks small enough for one agent session.|Agents can update task state through MCP instead of editing the UI."
-                    className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
-                  />
-                  <button
-                    onClick={() => void createTask()}
-                    disabled={isBusy || !taskDraft.trim() || !taskCategory}
-                    data-help-title="This adds a Todo task to the project."
-                    data-help-lines="The task is written to the project Markdown file.|A category is required so the orchestrator and Oracle know how to treat it.|It starts in Todo and can later be claimed by a coder or orchestrator.|If an agent is already working, reload before adding overlapping tasks."
-                    className="inline-flex items-center gap-2 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    Task
-                  </button>
-                </div>
-                <div
-                  className="flex flex-wrap items-center gap-1.5"
-                  data-help-title="A category is required for every new Todo card."
-                  data-help-lines="feature, hardening, bug, or other.|It tells the orchestrator how to treat the card and seeds Oracle's suspect files.|A bug card asks for a short description used to localize the suspect files.|Pick one before the Task button enables."
-                >
-                  <span className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
-                    Category
-                  </span>
-                  {TASK_CATEGORIES.map((category) => {
-                    const active = taskCategory === category;
-                    return (
-                      <button
-                        key={category}
-                        type="button"
-                        onClick={() => setTaskCategory(category)}
-                        aria-pressed={active}
-                        className={`rounded-md px-2 py-1 text-[10px] font-semibold transition-colors ${
-                          active
-                            ? "bg-teal text-white"
-                            : "bg-cream-100 text-cream-600 hover:bg-cream-200"
-                        }`}
-                      >
-                        {categoryLabel(category)}
-                      </button>
-                    );
-                  })}
-                </div>
-                {taskCategory === "bug" && (
-                  <textarea
-                    value={taskBugDescription}
-                    onChange={(event) =>
-                      setTaskBugDescription(event.target.value)
-                    }
-                    rows={3}
-                    placeholder="Describe the bug — what is wrong, where you see it. This seeds Oracle's suspect files."
-                    data-help-title="The bug description is used to localize suspect files."
-                    data-help-lines="Oracle (P2) retrieves the most relevant files from the codebase index using this text.|Be specific: symptoms, error messages, the area of the app.|It is stored on the card and visible to the agent that claims it.|Optional, but a good description makes the suspect list far more useful."
-                    className="w-full resize-y rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
-                  />
-                )}
-              </div>
-              <div className="overflow-x-auto pb-2">
-                <div className="grid min-w-[1080px] grid-cols-5 gap-3">
-                  {columns.map((column) => {
-                    const Icon = column.icon;
-                    const items = tasksByColumn[column.id];
-                    return (
-                      <div
-                        key={column.id}
-                        className="rounded-lg border border-cream-200 bg-cream-50 p-3"
-                        data-help-title={`${column.label} is a task status column.`}
-                        data-help-lines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
-                      >
-                        <div className="mb-3 flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <Icon className="h-4 w-4 text-cream-500" />
-                            <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
-                              {column.label}
-                            </h3>
-                          </div>
-                          <span className="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-cream-500">
-                            {items.length}
-                          </span>
-                        </div>
-                        {column.id === "done" && (
-                          <p className="mb-2 rounded-md bg-white/70 px-2 py-1 text-[10px] font-semibold text-cream-400">
-                            Verifier gated
-                          </p>
-                        )}
-
-                        <div className="space-y-2">
-                          {items.length === 0 ? (
-                            <div className="rounded-lg border border-dashed border-cream-200 bg-white/70 p-3 text-[11px] text-cream-400">
-                              Empty
-                            </div>
-                          ) : (
-                            items.map((task) => {
-                              // All gating is computed here (unchanged) and
-                              // passed to TaskCard as plain booleans/titles. The
-                              // card invokes the SAME moveTask / launchAgent /
-                              // copyAgentPrompt handlers with identical args; it
-                              // only changes presentation (button rows -> menus).
-                              const taskClaims = claimsByTask[task.id] ?? [];
-                              const taskSessions =
-                                sessionsByTask[task.id] ?? [];
-                              const taskAgentControlled =
-                                taskClaims.length > 0 ||
-                                taskSessions.length > 0;
-                              const manualMoveTitle = taskAgentControlled
-                                ? "An open agent claim or session controls this task; let MCP update status or wait for expiry."
-                                : "Move task";
-                              const launchable =
-                                canLaunchProjectAgents(currentProject);
-                              return (
-                                <TaskCard
-                                  key={task.id}
-                                  task={task}
-                                  agentControlled={taskAgentControlled}
-                                  moveTargets={taskMoveTargets(task)}
-                                  moveDisabled={isBusy || taskAgentControlled}
-                                  manualMoveTitle={manualMoveTitle}
-                                  showLaunch={task.status !== "done"}
-                                  launchTitle={projectLaunchTitle(
-                                    currentProject,
-                                  )}
-                                  coderDisabled={
-                                    isBusy ||
-                                    !launchable ||
-                                    !canCoderClaimTask(task)
-                                  }
-                                  coderTitle={
-                                    !launchable
-                                      ? projectLaunchTitle(currentProject)
-                                      : canCoderClaimTask(task)
-                                        ? "Launch coder"
-                                        : "Coder cannot claim a review task"
-                                  }
-                                  verifierDisabled={
-                                    isBusy ||
-                                    !launchable ||
-                                    !canVerifierClaimTask(task)
-                                  }
-                                  verifierTitle={
-                                    !launchable
-                                      ? projectLaunchTitle(currentProject)
-                                      : canVerifierClaimTask(task)
-                                        ? "Launch verifier"
-                                        : "Verifier can claim Review or Blocked tasks"
-                                  }
-                                  manualDisabled={!launchable}
-                                  onMove={(status) =>
-                                    void moveTask(task, status)
-                                  }
-                                  onLaunchCoder={() =>
-                                    void launchAgent("coder", "codex", task.id)
-                                  }
-                                  onLaunchVerifier={() =>
-                                    void launchAgent(
-                                      "verifier",
-                                      "codex",
-                                      task.id,
-                                    )
-                                  }
-                                  onCopyManualPrompt={() =>
-                                    void copyAgentPrompt(
-                                      recommendedTaskRole(task),
-                                      task.id,
-                                    )
-                                  }
-                                />
-                              );
-                            })
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </CollapsibleSection>
-
-            <CollapsibleSection
-              icon={FileText}
-              title="Notes"
-              purpose="The project's running log — what agents did, plus reminders"
-              summary={`${currentProject.state.notes.length} notes`}
-              helpTitle="Notes keep project memory and decisions."
-              helpLines="Notes are written into the project Markdown file.|Use notes for decisions, evidence, smoke results, and blocked reasons.|Oracle can retrieve notes after indexing catches the change.|Do not paste raw secrets or private tokens into notes."
-            >
-              <p className="mb-3 text-[12px] text-cream-500">
-                Every important action or reminder an agent leaves lands here —
-                it's what a verifier reads before marking work Done.
-              </p>
-              <div className="flex gap-2">
-                <textarea
-                  value={noteDraft}
-                  onChange={(event) => setNoteDraft(event.target.value)}
-                  placeholder="Append a project note"
-                  rows={3}
-                  data-help-title="A note is durable project memory."
-                  data-help-lines="Notes are written into the project Markdown file.|Use notes for decisions, evidence, smoke results, and blocked reasons.|Oracle can retrieve notes after indexing catches the change.|Do not paste raw secrets or private tokens into notes."
-                  className="min-w-0 flex-1 resize-none rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
-                />
-                <button
-                  onClick={() => void appendNote()}
-                  disabled={isBusy || !noteDraft.trim()}
-                  data-help-title="This appends the note to the project file."
-                  data-help-lines="Appending is a local Markdown write.|It is useful for human decisions and agent evidence.|The note becomes searchable by Oracle after incremental indexing.|Do not use it for secret values or temporary API keys."
-                  className="self-start rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-                >
-                  Append
-                </button>
-              </div>
-              <div className="mt-4 space-y-2">
-                {currentProject.state.notes.length === 0 ? (
-                  <p className="text-[12px] text-cream-400">No notes yet.</p>
-                ) : (
-                  [...currentProject.state.notes]
-                    .reverse()
-                    .slice(0, 8)
-                    .map((note) => (
-                      <div
-                        key={note.id}
-                        className="rounded-lg bg-cream-50 px-3 py-2"
-                      >
-                        <p className="break-words text-[12px] leading-5 text-cream-700">
-                          {note.text}
-                        </p>
-                        <p className="mt-1 text-[10px] text-cream-400">
-                          {note.source} / {formatDate(note.createdAt)}
-                        </p>
-                      </div>
-                    ))
-                )}
-              </div>
-              <div className="mt-4 border-t border-cream-200 pt-3">
-                <div className="mb-2 flex items-center gap-2">
-                  <FileText className="h-4 w-4 text-teal" />
-                  <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
-                    Sync
-                  </h3>
-                </div>
-                <div className="space-y-2 text-[12px] text-cream-600">
-                  <p>
-                    Revision:{" "}
-                    <span className="font-mono text-[10px]">
-                      {currentProject.revision.slice(0, 12)}
-                    </span>
-                  </p>
-                  <p>Modified: {formatDate(currentProject.modifiedAt)}</p>
-                  <p>Updated: {formatDate(currentProject.metadata.updatedAt)}</p>
-                </div>
-              </div>
-            </CollapsibleSection>
+            {/* Tasks + Notes relocated (Fase 1 UI reorg) into ProjectWorkspace's
+                taskBoardSlot / notesSlot — see taskBoardNode / notesNode above. */}
           </main>
         ) : (
           <main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">

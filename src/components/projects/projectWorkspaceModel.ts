@@ -446,7 +446,7 @@ export function miniKillCall(session: AgentSession): IpcCall | null {
 
 // ---- bottom dock ------------------------------------------------------------
 
-export type DockTab = "censor" | "activity" | "git" | "plans" | "console" | "mcp";
+export type DockTab = "censor" | "git" | "plans" | "console" | "mcp";
 
 /** The dock's default-selected tab. Censor is the star of the Work-mode dock
  *  (the placeholder this phase, real UI in Phase E). */
@@ -454,7 +454,6 @@ export const DEFAULT_DOCK_TAB: DockTab = "censor";
 
 export const DOCK_TABS: { id: DockTab; label: string }[] = [
   { id: "censor", label: "Censor" },
-  { id: "activity", label: "Activity" },
   { id: "git", label: "Git" },
   { id: "plans", label: "Plans" },
   // The structured agent-activity timeline (the complement to the raw xterm). Its

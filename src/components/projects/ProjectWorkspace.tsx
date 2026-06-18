@@ -1,13 +1,14 @@
 // Work-mode full-screen IDE shell (Phase D). Rendered full-bleed by ProjectsView
-// when `workMode && currentProject`; the kanban / calendar / board chrome are
-// skipped. Layout:
+// when `workMode && currentProject`; the kanban / calendar chrome is skipped
+// (the per-project task board + Notes now live HERE, via slots). Layout:
 //   - Top bar: ← Board, project name, git status (from project.gitStatus) +
 //     [Commit]/[Push] wired to the new backend commands.
 //   - Left rail: ProjectWorkspaceAgentRail (the project's agents, selectable).
 //   - Center: the SELECTED agent's live terminal (AgentTerminalViewer, lazy
 //     chunk, KEYED by agentId so switching agents remounts cleanly) + a
 //     [drawer ▸] control opening AgentDetailDrawer for that agent.
-//   - Bottom dock: Censor (default placeholder) / Activity / Git tabs.
+//   - Task board (taskBoardSlot) above the dock; bottom dock: Censor (default)
+//     / Git / Plans / Console / MCP; Notes (notesSlot) below the dock.
 //
 // CRITICAL: this component adds NO agent-state poller. It consumes the sessions /
 // claims / events ProjectsView already polls (passed as props). The terminal is
@@ -28,6 +29,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { invokeBackendCommand } from "../../context/AppContext";
 import { useNow } from "../../hooks/useNow";
@@ -63,7 +65,6 @@ import {
   shouldShowCompact,
   workspaceGitLine,
 } from "./projectWorkspaceModel";
-import { formatStamp } from "../agents/agentRowModel";
 import { TokenUsageBadge } from "../agents/TokenUsageBadge";
 import { useAgentTokenUsage } from "../agents/useAgentTokenUsage";
 import type { AgentTokenUsage } from "../../types/backend";
@@ -105,6 +106,11 @@ export interface ProjectWorkspaceProps {
   gitActionMessage: string | null;
   gitActionError: boolean;
   gitActionBusy: boolean;
+  /** The per-project task board, built by ProjectsView (reusing its handlers) and
+   *  rendered here ABOVE the dock tabs. Optional → absent renders nothing. */
+  taskBoardSlot?: ReactNode;
+  /** The per-project Notes section, built by ProjectsView, rendered BELOW the dock. */
+  notesSlot?: ReactNode;
 }
 
 export function ProjectWorkspace({
@@ -128,6 +134,8 @@ export function ProjectWorkspace({
   gitActionMessage,
   gitActionError,
   gitActionBusy,
+  taskBoardSlot,
+  notesSlot,
 }: ProjectWorkspaceProps) {
   const now = useNow();
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(() =>
@@ -500,6 +508,9 @@ export function ProjectWorkspace({
         </section>
       </div>
 
+      {/* ---- Task board (relocated from the board-mode panel), above the dock ---- */}
+      {taskBoardSlot}
+
       {/* ---- Bottom dock ---- */}
       <div className="rounded-2xl border border-cream-200 bg-white">
         <div className="flex w-fit gap-1 border-b border-cream-200 p-1">
@@ -555,10 +566,6 @@ export function ProjectWorkspace({
             />
           )}
 
-          {dockTab === "activity" && (
-            <DockActivity claims={claims} events={events} />
-          )}
-
           {dockTab === "git" && <DockGit project={project} />}
 
           {dockTab === "plans" && (
@@ -601,79 +608,9 @@ export function ProjectWorkspace({
             ))}
         </div>
       </div>
-    </div>
-  );
-}
 
-// ---- Activity tab: claims + recent events for this project ------------------
-// Reuses the same claim/event shapes ProjectsView already scopes to the project.
-
-function DockActivity({
-  claims,
-  events,
-}: {
-  claims: AgentClaim[];
-  events: AgentEvent[];
-}) {
-  return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <div>
-        <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-500">
-          Open claims
-        </p>
-        {claims.length === 0 ? (
-          <p className="text-[11px] text-cream-400">No open claims.</p>
-        ) : (
-          <ul className="space-y-1">
-            {claims.map((claim) => (
-              <li
-                key={`${claim.projectId}:${claim.taskId}:${claim.agentId}:${claim.status}:${claim.updatedAt ?? claim.claimedAt}`}
-                className="rounded-md bg-cream-50 px-2 py-1"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-[11px] font-semibold text-cream-800">
-                    {claim.taskTitle ?? claim.taskId}
-                  </span>
-                  <span className="shrink-0 text-[9px] font-semibold text-cream-500">
-                    {claim.status}
-                  </span>
-                </div>
-                <p className="truncate text-[9px] text-cream-400">
-                  {claim.agentId} · {claim.role} · {formatStamp(claim.updatedAt)}
-                </p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      <div>
-        <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-500">
-          Recent events
-        </p>
-        {events.length === 0 ? (
-          <p className="text-[11px] text-cream-400">No recent events.</p>
-        ) : (
-          <ul className="space-y-1">
-            {events.map((event) => (
-              <li
-                key={event.id}
-                className="rounded-md bg-cream-50 px-2 py-1 text-[10px]"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold text-cream-600">
-                    {event.eventType}
-                  </span>
-                  <span className="text-cream-400">
-                    {formatStamp(event.timestamp)}
-                  </span>
-                </div>
-                <p className="break-words text-cream-500">{event.message}</p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+      {/* ---- Notes (relocated from the board-mode panel), below the dock ---- */}
+      {notesSlot}
     </div>
   );
 }
