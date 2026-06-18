@@ -6,6 +6,7 @@ pub mod auth;
 pub mod censor;
 pub mod cli_agents;
 pub mod commands;
+pub mod cost;
 pub mod design;
 pub mod design_generate;
 pub mod design_llm;
