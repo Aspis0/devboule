@@ -16,9 +16,13 @@ const ARROW_COLOR = 0xc4623f; // terracotta
 export function TaskDependencyArrows({
   tasks,
   visible,
+  colorByTask,
 }: {
   tasks: ProjectTask[];
   visible: boolean;
+  // R7: per-task arrow hue (taskId → hex of the agent working it) so parallel tracks read as
+  // distinct colors. Absent/unmatched tasks fall back to the default terracotta.
+  colorByTask?: Record<string, number>;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   // Refs carry the latest props into the single long-lived ticker without re-creating Pixi.
@@ -26,6 +30,8 @@ export function TaskDependencyArrows({
   tasksRef.current = tasks;
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
+  const colorByTaskRef = useRef(colorByTask);
+  colorByTaskRef.current = colorByTask;
   const sigRef = useRef("");
 
   useEffect(() => {
@@ -93,8 +99,9 @@ export function TaskDependencyArrows({
             const f = rects.get(e.from);
             const t = rects.get(e.to);
             if (!f || !t) continue;
+            const col = colorByTaskRef.current?.[e.to] ?? ARROW_COLOR;
             sig +=
-              `${e.from},${e.to}:` +
+              `${e.from},${e.to},${col}:` +
               `${Math.round(f.x)},${Math.round(f.y)},${Math.round(f.w)},${Math.round(f.h)};` +
               `${Math.round(t.x)},${Math.round(t.y)},${Math.round(t.w)},${Math.round(t.h)}|`;
           }
@@ -129,12 +136,15 @@ export function TaskDependencyArrows({
             const [sx, sy, cx, cy, ex, ey, ae] = arrow;
             if ([sx, sy, cx, cy, ex, ey, ae].some(Number.isNaN)) continue;
 
+            // R7: the arrow takes the hue of the agent working the TARGET task (the parallel
+            // track), falling back to the default terracotta when no agent is on it.
+            const color = colorByTaskRef.current?.[edge.to] ?? ARROW_COLOR;
             g.moveTo(sx, sy);
             g.quadraticCurveTo(cx, cy, ex, ey);
-            g.stroke({ width: 2, color: ARROW_COLOR, alpha: 0.85 });
+            g.stroke({ width: 2, color, alpha: 0.85 });
 
             g.poly(arrowheadPoints(ex, ey, ae, 9));
-            g.fill({ color: ARROW_COLOR, alpha: 0.9 });
+            g.fill({ color, alpha: 0.9 });
           }
         };
 

@@ -18,13 +18,27 @@ const PALETTE = [
   "bg-cream-500/15 text-cream-700",
 ] as const;
 
-export function agentColorClass(agentId: string): string {
+// Hex twin of PALETTE (index-aligned) for the WebGL dependency arrows, so the SAME agent gets
+// the SAME hue on its card badge AND on its arrow track. Approximate the app's palette colors.
+const HEX_PALETTE = [
+  0x2f8f86, 0xc4623f, 0x6f8f5a, 0xb07d2b, 0xc0504d, 0x8a7d6a,
+] as const;
+
+function agentColorIndex(agentId: string): number {
   let hash = 5381;
   for (let i = 0; i < agentId.length; i++) {
     hash = (hash << 5) + hash + agentId.charCodeAt(i);
   }
-  const index = Math.abs(hash) % PALETTE.length;
-  return PALETTE[index];
+  return Math.abs(hash) % PALETTE.length;
+}
+
+export function agentColorClass(agentId: string): string {
+  return PALETTE[agentColorIndex(agentId)];
+}
+
+// The WebGL arrow color (hex) for an agent — the parallel-track hue, matching its badge.
+export function agentColorHex(agentId: string): number {
+  return HEX_PALETTE[agentColorIndex(agentId)];
 }
 
 export function deriveWorkers(

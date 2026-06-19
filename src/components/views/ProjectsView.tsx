@@ -90,7 +90,7 @@ import {
   categoryLabel,
 } from "../projects/taskCategory";
 import type { ColumnId } from "../projects/taskBoard";
-import { deriveWorkers } from "../projects/agentBadge";
+import { deriveWorkers, agentColorHex } from "../projects/agentBadge";
 import { freshestSession } from "../projects/agentLiveStatus";
 import {
   commitProjectCall,
@@ -639,6 +639,20 @@ export function ProjectsView() {
     }
     return grouped;
   }, [agentState?.sessions, currentProject]);
+
+  // R7 vision: per-task arrow hue (taskId → the hex of the agent working it) so the dependency
+  // arrows of parallel tracks read as distinct colors (same hue as the card's worker badge).
+  const arrowColorByTask = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const task of currentProject?.state.tasks ?? []) {
+      const workers = deriveWorkers(
+        claimsByTask[task.id] ?? [],
+        sessionsByTask[task.id] ?? [],
+      );
+      if (workers.length > 0) map[task.id] = agentColorHex(workers[0].agentId);
+    }
+    return map;
+  }, [currentProject, claimsByTask, sessionsByTask]);
 
   // Active board feed: archived projects LEAVE the active stage board + macro
   // calendar (an archived project is read-only and out of the active workflow).
@@ -1803,6 +1817,7 @@ export function ProjectsView() {
           <TaskDependencyArrows
             tasks={currentProject?.state.tasks ?? []}
             visible={showArrows && !isArchived}
+            colorByTask={arrowColorByTask}
           />
           {columns.map((column) => {
             const Icon = column.icon;
