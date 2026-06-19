@@ -93,18 +93,13 @@ afterEach(() => {
 });
 
 describe("SpawnPanel — orchestrator model surfacing", () => {
-  it("prefills the model field and names the configured model in the note", async () => {
+  it("shows the configured model READ-ONLY and points at Settings (P1)", async () => {
     await mount("qwen2.5-coder");
     await selectOrchestrator();
 
-    const modelInput = container.querySelector(
-      'input[type="text"]',
-    ) as HTMLInputElement | null;
-    expect(modelInput).not.toBeNull();
-    // The advisory model field is no longer empty — it is prefilled with the configured
-    // local-coder model.
-    expect(modelInput!.value).toBe("qwen2.5-coder");
-    // And the note names the configured model + points at Settings.
+    // P1: the orchestrator model is READ-ONLY (the binary uses the Settings value), so there is
+    // no editable advisory input for it — the configured local-coder model is shown instead, with
+    // a note pointing at Settings.
     expect(container.innerHTML).toContain("qwen2.5-coder");
     expect(container.innerHTML).toContain("Settings → Local main coder");
   });
@@ -113,12 +108,7 @@ describe("SpawnPanel — orchestrator model surfacing", () => {
     await mount(null);
     await selectOrchestrator();
 
-    const modelInput = container.querySelector(
-      'input[type="text"]',
-    ) as HTMLInputElement | null;
-    // No configured model => field stays empty (nothing to prefill) ...
-    expect(modelInput!.value).toBe("");
-    // ... and the note guides the user to Settings.
+    // P1: read-only — with no configured model it shows the guidance + points at Settings.
     expect(container.innerHTML).toContain("no model configured");
     expect(container.innerHTML).toContain("Settings → Local main coder");
   });

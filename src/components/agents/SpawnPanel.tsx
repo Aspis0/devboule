@@ -160,9 +160,11 @@ export function SpawnPanel({
     if (prevSuggestions.includes(model.trim().toLowerCase())) {
       nextModel = "";
     }
-    // Prefill the orchestrator's configured model when the field would otherwise be empty.
+    // P1: the orchestrator's model is READ-ONLY = the Settings value (the binary uses that
+    // regardless), so force it to the configured local-coder model on switch — not just when
+    // empty — so the launch/fleet never carries a stale hand-typed model for the orchestrator.
     const localModel = (localCoderModel ?? "").trim();
-    if (client === "orchestrator" && nextModel.trim().length === 0 && localModel.length > 0) {
+    if (client === "orchestrator" && localModel.length > 0) {
       nextModel = localModel;
     }
     if (nextModel !== model) setModel(nextModel);
@@ -274,36 +276,52 @@ export function SpawnPanel({
       <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
         Model <span className="font-normal normal-case">(advisory)</span>
       </p>
-      <input
-        type="text"
-        value={model}
-        onChange={(e) => setModel(e.target.value)}
-        placeholder="model name (optional)"
-        maxLength={64}
-        data-help-title="This is the advisory model the new agent should use."
-        data-help-lines="It is only a hint that seeds the launch prompt and fleet counts; the agent still reports its real model.|Leave it blank to let the agent self-report.|Quick-fill chips appear for the Claude CLI; for other CLIs, type the model name yourself.|Switching CLI clears the field only if it still held that CLI's suggestion."
-        className="mb-2 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-700 outline-none focus:border-terracotta/30"
-      />
-      {modelSuggestions.length > 0 && (
-        <div className="mb-3 flex flex-wrap gap-1.5">
-          {modelSuggestions.map((suggestion) => {
-            const active = model.trim().toLowerCase() === suggestion;
-            return (
-              <button
-                key={suggestion}
-                type="button"
-                onClick={() => setModel(suggestion)}
-                className={`rounded-md px-2.5 py-1 text-[11px] font-semibold capitalize transition-colors ${
-                  active
-                    ? "bg-teal/10 text-teal"
-                    : "border border-cream-200 bg-white text-cream-500 hover:text-cream-800"
-                }`}
-              >
-                {suggestion}
-              </button>
-            );
-          })}
+      {client === "orchestrator" ? (
+        // P1: the local main coder's model is configured in Settings (Local main coder) and the
+        // Devboule binary uses THAT model regardless (DEVBOULE_OMLX_MODEL) — so show it READ-ONLY
+        // here instead of a free-text field that could drift from the real setting.
+        <div className="mb-3 rounded-md border border-cream-200 bg-cream-50 px-3 py-2 text-[12px]">
+          <span className="font-mono font-semibold text-cream-800">
+            {localCoderModel || "no model configured"}
+          </span>
+          <span className="ml-2 text-[10px] text-cream-400">
+            set in Settings → Local main coder
+          </span>
         </div>
+      ) : (
+        <>
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="model name (optional)"
+            maxLength={64}
+            data-help-title="This is the advisory model the new agent should use."
+            data-help-lines="It is only a hint that seeds the launch prompt and fleet counts; the agent still reports its real model.|Leave it blank to let the agent self-report.|Quick-fill chips appear for the Claude CLI; for other CLIs, type the model name yourself.|Switching CLI clears the field only if it still held that CLI's suggestion."
+            className="mb-2 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-700 outline-none focus:border-terracotta/30"
+          />
+          {modelSuggestions.length > 0 && (
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {modelSuggestions.map((suggestion) => {
+                const active = model.trim().toLowerCase() === suggestion;
+                return (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    onClick={() => setModel(suggestion)}
+                    className={`rounded-md px-2.5 py-1 text-[11px] font-semibold capitalize transition-colors ${
+                      active
+                        ? "bg-teal/10 text-teal"
+                        : "border border-cream-200 bg-white text-cream-500 hover:text-cream-800"
+                    }`}
+                  >
+                    {suggestion}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
 
       {/* Task. */}
