@@ -332,6 +332,30 @@ pub fn admit_local_spawn(
     SpawnDecision::Admit
 }
 
+/// Phase 4b — the spawn-gate on LIVE data, as a command. Polls the current global budget
+/// and returns the admission decision for a local mini of `model_footprint_bytes`, given
+/// the caller's current local-decode count and compute cap. Async (safe), reuses the
+/// already-correct `poll_backend_memory` + the pure `admit_local_spawn`.
+///
+/// NOTE: this is the COMMAND-level gate (the coder/UI consults it before spawning). Deep
+/// HARD enforcement INSIDE `mini_coder_executor::claim_and_launch` (which is sync + already
+/// holds the claim lock, so it needs a per-pass budget snapshot threaded in, not an inline
+/// async probe) is a separate, careful follow-up.
+#[tauri::command]
+pub async fn evaluate_local_spawn(
+    model_footprint_bytes: u64,
+    active_local_decodes: u32,
+    max_concurrent_decodes: u32,
+) -> Result<SpawnDecision, String> {
+    let snapshot = poll_backend_memory().await?;
+    Ok(admit_local_spawn(
+        model_footprint_bytes,
+        &snapshot.budget,
+        active_local_decodes,
+        max_concurrent_decodes,
+    ))
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;

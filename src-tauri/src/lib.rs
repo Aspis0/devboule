@@ -620,6 +620,7 @@ pub fn run() {
             backend::provider_detect::detect_providers,
             backend::hardware::detect_hardware,
             backend::budget::poll_backend_memory,
+            backend::budget::evaluate_local_spawn,
             backend::model_registry::get_model_registry,
             backend::model_registry::set_model_registry,
             backend::model_registry::discover_installed_models,
