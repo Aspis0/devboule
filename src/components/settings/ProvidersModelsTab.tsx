@@ -18,6 +18,7 @@ import {
 import type { DetectedProvider } from "../../types/config";
 import { LocalCoderBackendCard } from "./LocalCoderBackendCard";
 import { MainCoderClientCard } from "./MainCoderClientCard";
+import { RecommendedConfigCard } from "./RecommendedConfigCard";
 import { ModelRegistryCard } from "./ModelRegistryCard";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
@@ -298,6 +299,8 @@ export function ProvidersModelsTab() {
   return (
     <div className="max-w-3xl space-y-6">
       <DetectedProvidersStrip />
+
+      <RecommendedConfigCard />
 
       <CollapsibleGroup title="Coders">
         <RoleSection
