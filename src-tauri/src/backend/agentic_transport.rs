@@ -60,7 +60,24 @@ pub fn build_chat_request(
     let msgs: Vec<Value> = messages
         .iter()
         .map(|m| {
-            let mut obj = json!({ "role": m.role, "content": m.content });
+            // An assistant turn that made tool calls MUST carry the `tool_calls` array
+            // (content null) — otherwise the following `tool` messages are protocol-invalid.
+            let mut obj = if let Some(tcs) = &m.tool_calls {
+                json!({
+                    "role": m.role,
+                    "content": Value::Null,
+                    "tool_calls": tcs
+                        .iter()
+                        .map(|tc| json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": { "name": tc.name, "arguments": tc.arguments },
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            } else {
+                json!({ "role": m.role, "content": m.content })
+            };
             if let Some(id) = &m.tool_call_id {
                 obj["tool_call_id"] = json!(id);
             }
@@ -115,11 +132,10 @@ pub fn parse_llm_turn(resp: &Value) -> Result<LlmTurn, String> {
         }
     }
 
-    if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-        return Ok(LlmTurn::Message(content.to_string()));
-    }
-
-    Err("message had neither tool_calls nor content".to_string())
+    // A null/absent content with no VALID tool calls = an empty final message (graceful),
+    // NOT an abort — a malformed turn from a quantized local model shouldn't kill the loop.
+    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(LlmTurn::Message(content.to_string()))
 }
 
 /// Blocking OpenAI-compatible `AgentLlm` (oMLX/Ollama loopback). `base_url` includes the
@@ -248,5 +264,38 @@ mod tests {
         assert_eq!(p.top_p, 0.95); // fallback to tuned()
         assert_eq!(p.top_k, 40); // from entry
         assert_eq!(p.thinking_budget, 2000); // fallback to tuned()
+    }
+
+    #[test]
+    fn build_request_serializes_assistant_tool_calls() {
+        use crate::backend::agentic_loop::{ChatMsg, ToolCall};
+        let msgs = vec![
+            ChatMsg {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }]),
+            },
+            ChatMsg {
+                role: "tool".into(),
+                content: "data".into(),
+                tool_call_id: Some("c1".into()),
+                tool_calls: None,
+            },
+        ];
+        let body = build_chat_request("m", &msgs, &Value::Null, &SamplingParams::tuned(), false);
+        let arr = body["messages"].as_array().unwrap();
+        // Assistant turn carries the tool_calls array with content null (protocol-valid).
+        assert_eq!(arr[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(arr[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(arr[0]["tool_calls"][0]["function"]["name"], "read_file");
+        assert!(arr[0]["content"].is_null());
+        // Tool result references the call id.
+        assert_eq!(arr[1]["role"], "tool");
+        assert_eq!(arr[1]["tool_call_id"], "c1");
     }
 }

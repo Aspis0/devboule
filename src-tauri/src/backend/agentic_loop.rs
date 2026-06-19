@@ -25,6 +25,10 @@ pub struct ChatMsg {
     pub role: String,
     pub content: String,
     pub tool_call_id: Option<String>,
+    /// Set on an ASSISTANT turn that made tool calls — the transport serializes these as the
+    /// OpenAI `tool_calls` array so the following `tool` messages (by `tool_call_id`) are
+    /// valid. Without this the server rejects the conversation (tool msg with no prior call).
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,8 +58,18 @@ pub fn run_agent_loop(
     max_rounds: u32,
 ) -> LoopOutcome {
     let mut messages = vec![
-        ChatMsg { role: "system".to_string(), content: system.to_string(), tool_call_id: None },
-        ChatMsg { role: "user".to_string(), content: task.to_string(), tool_call_id: None },
+        ChatMsg {
+            role: "system".to_string(),
+            content: system.to_string(),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMsg {
+            role: "user".to_string(),
+            content: task.to_string(),
+            tool_call_id: None,
+            tool_calls: None,
+        },
     ];
 
     let mut rounds = 0u32;
@@ -78,15 +92,13 @@ pub fn run_agent_loop(
                 }
                 // Record the assistant's tool-call turn, then each tool result, so the next
                 // turn sees the full transcript.
-                let summary = calls
-                    .iter()
-                    .map(|c| format!("{}({})", c.name, c.arguments))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                // The assistant turn must carry the tool_calls array (OpenAI protocol) so the
+                // following tool messages are valid — NOT a text summary.
                 messages.push(ChatMsg {
                     role: "assistant".to_string(),
-                    content: summary,
+                    content: String::new(),
                     tool_call_id: None,
+                    tool_calls: Some(calls.clone()),
                 });
                 for call in calls {
                     let result = tools
@@ -96,6 +108,7 @@ pub fn run_agent_loop(
                         role: "tool".to_string(),
                         content: result,
                         tool_call_id: Some(call.id.clone()),
+                        tool_calls: None,
                     });
                 }
             }

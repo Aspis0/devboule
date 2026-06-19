@@ -194,8 +194,8 @@ pub async fn poll_backend_memory() -> Result<BackendMemorySnapshot, String> {
     let client = crate::backend::provider_detect::probe_client()
         .ok_or_else(|| "probe client unavailable".to_string())?;
 
-    let omlx = probe_omlx_health(&client).await;
-    let ollama = probe_ollama_ps(&client).await;
+    // The two probes are independent (different backends/ports) — run them concurrently.
+    let (omlx, ollama) = tokio::join!(probe_omlx_health(&client), probe_ollama_ps(&client));
     // collect_hardware() shells out to system_profiler (macOS) / DXGI (Windows) — a
     // blocking call; keep it OFF the async worker thread.
     let hardware = tauri::async_runtime::spawn_blocking(crate::backend::hardware::collect_hardware)
@@ -300,21 +300,23 @@ pub fn admit_local_spawn(
     active_local_decodes: u32,
     max_concurrent_decodes: u32,
 ) -> SpawnDecision {
-    if max_concurrent_decodes > 0 && active_local_decodes >= max_concurrent_decodes {
-        return SpawnDecision::Queue {
-            reason: format!(
-                "compute cap reached ({}/{} active)",
-                active_local_decodes, max_concurrent_decodes
-            ),
-        };
-    }
-
+    // Never-fits FIRST: a model bigger than the whole budget goes to cloud regardless of the
+    // compute cap (otherwise it would Queue forever — retry, hit the cap, re-queue).
     if model_footprint_bytes > budget.budget_bytes {
         return SpawnDecision::RouteToCloud {
             reason: format!(
                 "needs {} vs budget {}",
                 gib(model_footprint_bytes),
                 gib(budget.budget_bytes)
+            ),
+        };
+    }
+
+    if max_concurrent_decodes > 0 && active_local_decodes >= max_concurrent_decodes {
+        return SpawnDecision::Queue {
+            reason: format!(
+                "compute cap reached ({}/{} active)",
+                active_local_decodes, max_concurrent_decodes
             ),
         };
     }
@@ -539,7 +541,9 @@ pub fn plan_placement(
     order.sort_by_key(|&i| requests[i].priority); // stable: ties keep input order
 
     let mut by_id = std::collections::HashMap::new();
-    let mut used: u64 = 0;
+    // Start from what the backends ALREADY hold (consistent with admit_local_spawn's
+    // free_bytes denominator) — not 0, which would over-commit the budget.
+    let mut used: u64 = budget.used_bytes;
     let mut local_count: u32 = 0;
 
     for &idx in &order {
@@ -562,8 +566,17 @@ pub fn plan_placement(
         by_id.insert(req.id.clone(), decision);
     }
 
-    // Return in the ORIGINAL request order.
-    requests.iter().map(|r| by_id.get(&r.id).cloned().unwrap()).collect()
+    // Return in the ORIGINAL request order. Safe fallback (no unwrap) for a duplicate id.
+    requests
+        .iter()
+        .map(|r| {
+            by_id.get(&r.id).cloned().unwrap_or_else(|| PlacementDecision {
+                id: r.id.clone(),
+                placement: "cloud".to_string(),
+                reason: "unresolved placement (duplicate id?)".to_string(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -602,5 +615,19 @@ mod placement_tests {
         let d = plan_placement(&reqs, &budget(100), 0);
         assert!(d.iter().all(|x| x.placement == "cloud"));
         assert!(d[0].reason.contains("compute cap 0"));
+    }
+
+    #[test]
+    fn accounts_for_live_backend_usage() {
+        // 28 GiB budget but 20 GiB already held by the backends → only 8 free.
+        let b = BudgetSummary {
+            budget_bytes: 28 * GIB_U64,
+            used_bytes: 20 * GIB_U64,
+            free_bytes: 8 * GIB_U64,
+            ..Default::default()
+        };
+        let reqs = vec![PlacementRequest { id: "p".into(), footprint_bytes: 12 * GIB_U64, priority: 0 }];
+        // 20 (live) + 12 = 32 > 28 → cloud, even though 12 < the 28 budget.
+        assert_eq!(plan_placement(&reqs, &b, 4)[0].placement, "cloud");
     }
 }

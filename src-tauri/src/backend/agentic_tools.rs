@@ -199,6 +199,9 @@ impl ScopedAgentTools {
             return Err("old_string cannot be empty".to_string());
         }
         let p = self.write_resolve(path)?;
+        if !p.exists() {
+            return Err("file not found".to_string());
+        }
         // OOM guard: don't read an arbitrarily large in-scope file into memory.
         if fs::metadata(&p).map(|m| m.len() > MAX_WRITE_BYTES as u64).unwrap_or(true) {
             return Err("file too large to edit".to_string());
