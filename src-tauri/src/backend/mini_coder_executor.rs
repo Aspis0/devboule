@@ -1093,14 +1093,25 @@ fn should_run_agentic(
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
 ) -> bool {
-    directive.write
-        && directive.write_mode == mini_coder::WriteMode::AgenticIterative
-        && backend.base_url.as_deref().is_some_and(|u| !u.is_empty())
-        && super::projects::read_mini_write_behavior(app) != mini_coder::MiniWriteBehavior::Safe
-        // S2: a model the registry classifies as emit-edits-only can NEVER run the agentic
-        // loop, regardless of the directive — capability (the registry tier) drives the mode.
-        // An unregistered or agentic-tier model keeps the prior behavior.
-        && mini_model_tier(app, backend).as_deref() != Some("emitEdits")
+    if !directive.write
+        || directive.write_mode != mini_coder::WriteMode::AgenticIterative
+        || !backend.base_url.as_deref().is_some_and(|u| !u.is_empty())
+    {
+        return false;
+    }
+
+    // S2 — the toggle STAYS (always give the user the choice); capability drives only the
+    // AUTO default, it never removes a choice:
+    //   Safe           => never agentic (force emit-edits).
+    //   Auto (default) => capability-driven — a registry emit-edits-tier model stays one-shot.
+    //   AgenticAllowed => the user's explicit override wins — agentic even for a small model.
+    match super::projects::read_mini_write_behavior(app) {
+        mini_coder::MiniWriteBehavior::Safe => false,
+        mini_coder::MiniWriteBehavior::Auto => {
+            mini_model_tier(app, backend).as_deref() != Some("emitEdits")
+        }
+        mini_coder::MiniWriteBehavior::AgenticAllowed => true,
+    }
 }
 
 /// Launch the AGENTIC tool-loop coder on a detached worker thread — the peer of

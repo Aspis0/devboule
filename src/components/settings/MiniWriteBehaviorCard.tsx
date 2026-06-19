@@ -38,13 +38,13 @@ const POLICY_OPTIONS: ReadonlyArray<{
     value: "auto",
     label: "Auto",
     description:
-      "The coder decides per task by model and language — agentic-iterative where the language is gate-covered and the model is capable, emit-edits otherwise. (Default.)",
+      "Capability-driven (default): the model's registry tier decides — agentic-iterative for an agentic-tier (large) model on a gate-covered language, emit-edits for an emit-edits-tier (small) model. The right mode per model, no manual tuning.",
   },
   {
     value: "agenticAllowed",
     label: "Agentic allowed",
     description:
-      "Agentic-iterative is encouraged for capable models on gate-covered languages; emit-edits remains the fallback for uncovered languages or a weak model.",
+      "Override: allow agentic-iterative even for a model the registry marks emit-edits-only — your explicit choice. Emit-edits stays the fallback for uncovered languages.",
   },
 ];
 
@@ -171,7 +171,7 @@ export function MiniWriteBehaviorCard() {
     <section
       className="rounded-2xl border border-cream-200 bg-white p-4"
       data-help-title="The write-behavior policy is the ceiling for how the coder delegates writes to the local mini."
-      data-help-lines="Safe = emit-edits only (one write + one fix).|Auto = the coder decides by model and language (default).|Agentic allowed = agentic-iterative is encouraged for capable models on covered languages.|Within the ceiling, the coder still chooses per task.|Stored in your local config.json."
+      data-help-lines="Safe = emit-edits only (one write + one fix), no agentic loop.|Auto (default) = capability-driven: the model's registry tier decides — agentic for large agentic-tier models, emit-edits for small ones.|Agentic allowed = your override: agentic even for a model the registry marks emit-edits-only.|The choice is always yours; Auto just picks the right default per model.|Stored in your local config.json."
     >
       <div className="mb-3 flex items-center gap-2">
         <Layers className="h-4 w-4 text-teal" />
