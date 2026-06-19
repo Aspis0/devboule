@@ -116,7 +116,7 @@ pub async fn probe_ollama_ps(client: &reqwest::Client) -> Option<OllamaPs> {
 /// Global budget accountant (Phase 2). The app owns this because each backend only
 /// reports its own pool — `used` = oMLX resident bytes + Σ Ollama loaded bytes, and
 /// `budget` = total RAM minus a reserve (OS + app + Oracle headroom). All saturating.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetSummary {
     pub total_ram_bytes: u64,
@@ -508,5 +508,99 @@ mod recommend_tests {
         assert_eq!(c.censor, "cloud");
         assert_eq!(c.main_coder, "cloud");
         assert_eq!(c.oracle, "local");
+    }
+}
+
+/// Phase 8 (L1) — multi-project placement: when several projects each want a LOCAL main
+/// coder, fit the highest-priority ones locally under the global budget + compute cap; the
+/// rest are routed to cloud. PURE.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementRequest {
+    pub id: String,
+    pub footprint_bytes: u64,
+    pub priority: u32, // lower = higher priority
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementDecision {
+    pub id: String,
+    pub placement: String, // "local" | "cloud"
+    pub reason: String,
+}
+
+pub fn plan_placement(
+    requests: &[PlacementRequest],
+    budget: &BudgetSummary,
+    max_local: u32,
+) -> Vec<PlacementDecision> {
+    let mut order: Vec<usize> = (0..requests.len()).collect();
+    order.sort_by_key(|&i| requests[i].priority); // stable: ties keep input order
+
+    let mut by_id = std::collections::HashMap::new();
+    let mut used: u64 = 0;
+    let mut local_count: u32 = 0;
+
+    for &idx in &order {
+        let req = &requests[idx];
+        let fits_compute = local_count < max_local;
+        let fits_budget = used.saturating_add(req.footprint_bytes) <= budget.budget_bytes;
+        let decision = if fits_compute && fits_budget {
+            used = used.saturating_add(req.footprint_bytes);
+            local_count += 1;
+            PlacementDecision { id: req.id.clone(), placement: "local".into(), reason: "within budget and compute cap".into() }
+        } else {
+            let reason = if !fits_compute {
+                format!("compute cap {max_local} reached")
+            } else {
+                let free = budget.budget_bytes.saturating_sub(used);
+                format!("would exceed budget: needs {}, {} free", gib(req.footprint_bytes), gib(free))
+            };
+            PlacementDecision { id: req.id.clone(), placement: "cloud".into(), reason }
+        };
+        by_id.insert(req.id.clone(), decision);
+    }
+
+    // Return in the ORIGINAL request order.
+    requests.iter().map(|r| by_id.get(&r.id).cloned().unwrap()).collect()
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    const GIB_U64: u64 = 1024 * 1024 * 1024;
+
+    fn budget(budget_gib: u64) -> BudgetSummary {
+        BudgetSummary { budget_bytes: budget_gib * GIB_U64, free_bytes: budget_gib * GIB_U64, ..Default::default() }
+    }
+
+    #[test]
+    fn greedy_by_priority_under_budget_and_cap() {
+        let reqs = vec![
+            PlacementRequest { id: "p0".into(), footprint_bytes: 18 * GIB_U64, priority: 0 },
+            PlacementRequest { id: "p1".into(), footprint_bytes: 12 * GIB_U64, priority: 1 },
+            PlacementRequest { id: "p2".into(), footprint_bytes: 6 * GIB_U64, priority: 2 },
+        ];
+        // p0(18) local; p1: 18+12=30>28 → cloud; p2: 18+6=24<=28 & count 1<2 → local.
+        let d = plan_placement(&reqs, &budget(28), 2);
+        assert_eq!(d[0].placement, "local"); // p0
+        assert_eq!(d[1].placement, "cloud"); // p1
+        assert!(d[1].reason.contains("would exceed budget"));
+        assert_eq!(d[2].placement, "local"); // p2
+        // order preserved
+        assert_eq!((d[0].id.as_str(), d[1].id.as_str(), d[2].id.as_str()), ("p0", "p1", "p2"));
+    }
+
+    #[test]
+    fn zero_max_local_is_all_cloud() {
+        let reqs = vec![
+            PlacementRequest { id: "p0".into(), footprint_bytes: 10 * GIB_U64, priority: 0 },
+            PlacementRequest { id: "p1".into(), footprint_bytes: 10 * GIB_U64, priority: 1 },
+        ];
+        let d = plan_placement(&reqs, &budget(100), 0);
+        assert!(d.iter().all(|x| x.placement == "cloud"));
+        assert!(d[0].reason.contains("compute cap 0"));
     }
 }
