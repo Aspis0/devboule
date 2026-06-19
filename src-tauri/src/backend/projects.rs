@@ -2975,6 +2975,12 @@ You decide per task; lean agentic on covered languages, fall back to 'emitEdits'
             cl = covered_list()
         ),
     };
+    // Nanophase calibration (shared across policies): size task GRANULARITY to the configured
+    // mini's capability. A "nanophase" is just a smaller task — it reuses the existing task DAG
+    // (project_create_plan_tasks + dependsOn + the parallel runner), no new mechanism.
+    let block = format!(
+        "{block}TASK SIZING: calibrate each task to '{model}'. A smaller or less-capable mini needs SMALLER, tightly-scoped tasks — split a big phase into several 'nanophase' tasks (each with its own files + dependsOn) so the mini can finish each one; a more capable mini can take a bigger task.\n"
+    );
     Some(block)
 }
 
@@ -9456,7 +9462,8 @@ updated_at: 2026-05-28T00:00:00Z
         let expected = "MINI-CODER DELEGATION write_mode: your local mini is 'qwen3.6-27b' (a local Ollama model). When you delegate a WRITE task via spawn_mini_coder, set write_mode:\n\
 - 'agenticIterative' (agentic-iterative) = the mini fixes over multiple rounds against the deterministic gate. Use it ONLY for files in a language with gate coverage (this project: Python, TypeScript/JavaScript) AND when 'qwen3.6-27b' is capable enough to iterate usefully.\n\
 - 'emitEdits' (emit-edits, default) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
-You decide per task; default to 'emitEdits' when unsure.\n";
+You decide per task; default to 'emitEdits' when unsure.\n\
+TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable mini needs SMALLER, tightly-scoped tasks — split a big phase into several 'nanophase' tasks (each with its own files + dependsOn) so the mini can finish each one; a more capable mini can take a bigger task.\n";
         assert_eq!(block, expected, "Auto block must match the pinned camelCase-token string");
     }
 
