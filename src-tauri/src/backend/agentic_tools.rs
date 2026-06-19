@@ -57,11 +57,36 @@ pub fn safe_rel_path(rel: &str) -> Result<String, String> {
 
 pub struct ScopedAgentTools {
     root: PathBuf,
+    /// Relative paths the loop wrote/edited — feeds the result file's `filesTouched`.
+    touched: Vec<String>,
+    /// If non-empty, WRITES (write_file/edit_file) are restricted to these NORMALIZED relative
+    /// paths (the directive's file scope). Reads stay project-wide for context. Empty = no
+    /// extra restriction beyond the scope root.
+    write_allowlist: Vec<String>,
 }
 
 impl ScopedAgentTools {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, touched: Vec::new(), write_allowlist: Vec::new() }
+    }
+
+    /// Restrict WRITES to `files` (the directive's allowlist). Empty leaves writes confined
+    /// only by the scope root.
+    pub fn with_write_allowlist(mut self, files: Vec<String>) -> Self {
+        // Normalize through safe_rel_path so the allowlist matches what write_file/edit_file
+        // compare against (e.g. a directive's "./src/a.rs" → "src/a.rs"). Drops invalid entries.
+        self.write_allowlist = files.into_iter().filter_map(|f| safe_rel_path(&f).ok()).collect();
+        self
+    }
+
+    /// The (deduped) relative paths written/edited so far.
+    pub fn touched(&self) -> &[String] {
+        &self.touched
+    }
+
+    /// Whether writing `safe` (a normalized rel path) is permitted by the write allowlist.
+    fn write_allowed(&self, safe: &str) -> bool {
+        self.write_allowlist.is_empty() || self.write_allowlist.iter().any(|f| f == safe)
     }
 
     fn canon_root(&self) -> Result<PathBuf, String> {
@@ -185,18 +210,27 @@ impl ScopedAgentTools {
         Ok(full)
     }
 
-    fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
+    fn write_file(&mut self, path: &str, content: &str) -> Result<String, String> {
         if content.len() > MAX_WRITE_BYTES {
             return Err("content too large".to_string());
         }
+        let safe = safe_rel_path(path)?;
+        if !self.write_allowed(&safe) {
+            return Err(format!("'{safe}' is outside this task's write scope"));
+        }
         let p = self.write_resolve(path)?;
         fs::write(&p, content).map_err(|e| e.to_string())?;
+        self.record_touched(safe);
         Ok(format!("wrote {} bytes to {}", content.len(), p.display()))
     }
 
-    fn edit_file(&self, path: &str, old: &str, new: &str) -> Result<String, String> {
+    fn edit_file(&mut self, path: &str, old: &str, new: &str) -> Result<String, String> {
         if old.is_empty() {
             return Err("old_string cannot be empty".to_string());
+        }
+        let safe = safe_rel_path(path)?;
+        if !self.write_allowed(&safe) {
+            return Err(format!("'{safe}' is outside this task's write scope"));
         }
         let p = self.write_resolve(path)?;
         if !p.exists() {
@@ -215,7 +249,14 @@ impl ScopedAgentTools {
             return Err(format!("old_string is not unique ({n} matches)"));
         }
         fs::write(&p, content.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+        self.record_touched(safe);
         Ok(format!("edited {}", p.display()))
+    }
+
+    fn record_touched(&mut self, safe: String) {
+        if !self.touched.contains(&safe) {
+            self.touched.push(safe);
+        }
     }
 }
 
@@ -443,6 +484,31 @@ mod write_tests {
         assert!(res.unwrap_err().contains("hardlink"));
         // The outside inode must be untouched.
         assert_eq!(fs::read_to_string(&secret).unwrap(), "SECRET");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn touched_records_deduped_paths() {
+        let (root, tmp) = unique_root();
+        let mut tools = ScopedAgentTools::new(root);
+        tools.call("write_file", r#"{"path":"test.txt","content":"hello"}"#).unwrap();
+        tools.call("edit_file", r#"{"path":"test.txt","oldString":"hello","newString":"world"}"#).unwrap();
+        assert_eq!(tools.touched(), &["test.txt".to_string()]); // written + edited → one entry
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_allowlist_blocks_out_of_scope_writes() {
+        let (root, tmp) = unique_root();
+        // "./allowed.txt" exercises normalization: it must match a write to "allowed.txt".
+        let mut tools =
+            ScopedAgentTools::new(root).with_write_allowlist(vec!["./allowed.txt".to_string()]);
+        // A path on the allowlist writes fine (despite the "./" prefix in the allowlist).
+        assert!(tools.call("write_file", r#"{"path":"allowed.txt","content":"x"}"#).is_ok());
+        // A path INSIDE the root but NOT on the allowlist is refused.
+        let res = tools.call("write_file", r#"{"path":"other.txt","content":"x"}"#);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("write scope"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }

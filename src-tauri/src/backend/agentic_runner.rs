@@ -18,6 +18,26 @@ use crate::backend::agentic_loop::{run_agent_loop, LoopOutcome};
 use crate::backend::agentic_tools::ScopedAgentTools;
 use crate::backend::agentic_transport::{HttpAgentLlm, SamplingParams};
 
+/// House rules for the local agentic coder (anti-loop, scope discipline). Embedded as a const
+/// because the working doc (docs/local-coder-AGENTS.md) is not bundled with the app.
+pub const AGENTIC_SYSTEM_PROMPT: &str = "\
+You are a focused coding agent working DIRECTLY in a project via tools. Rules:\n\
+- Use read_file/list_dir/grep to UNDERSTAND before you change anything. Never guess a file's\n\
+  contents or invent APIs — read them.\n\
+- Stay strictly inside the task's scope. Make MINIMAL, targeted edits with edit_file (exact\n\
+  unique oldString) or write_file. Do not reformat or touch unrelated code.\n\
+- edit_file's oldString must match EXACTLY and be unique; read the file first to get it right.\n\
+- Work in small steps: read → edit → (read back if unsure). Do not repeat the same tool call.\n\
+- When the task is complete, STOP and reply with a one-line plain-text summary (NO tool call).\n\
+  Do not keep calling tools after the work is done.\n\
+- If you cannot proceed (missing info, ambiguous task), say so plainly in a final message.";
+
+/// DEFAULT round budget for the agentic loop (the runaway guard — replaces the one-shot token
+/// cap). Generous on purpose: a real multi-file task needs many read→edit→verify cycles, and
+/// the loop normally ends on its own (a final message). Overridable per the user's config
+/// (`miniAgenticMaxRounds`). The loop is additionally bounded by the per-turn HTTP timeout.
+pub const AGENTIC_MAX_ROUNDS: u32 = 40;
+
 /// OpenAI-style `tools` array offered to the agentic coder (read + edit + search).
 pub fn default_tool_definitions() -> Value {
     json!([
@@ -106,12 +126,38 @@ pub fn run_agentic_coder(
     system: &str,
     task: &str,
     root: PathBuf,
+    write_allowlist: Vec<String>,
     max_rounds: u32,
-) -> Result<LoopOutcome, String> {
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(LoopOutcome, Vec<String>), String> {
     let tools = default_tool_definitions();
     let mut llm = HttpAgentLlm::new(base_url, model, tools, params, enable_thinking)?;
-    let mut fs_tools = ScopedAgentTools::new(root);
-    Ok(run_agent_loop(&mut llm, &mut fs_tools, system, task, max_rounds))
+    // Reads are project-wide (for context); WRITES are confined to the directive's file
+    // allowlist (empty = no extra restriction beyond the root).
+    let mut fs_tools = ScopedAgentTools::new(root).with_write_allowlist(write_allowlist);
+    let outcome = run_agent_loop(&mut llm, &mut fs_tools, system, task, max_rounds, cancel);
+    let touched = fs_tools.touched().to_vec();
+    Ok((outcome, touched))
+}
+
+/// Serialize an agentic run into the MiniCoderResult wire JSON the executor's finalize path
+/// reads. A finished loop → status "done" + the files the tools wrote (NO `edits` key — the
+/// tools already applied them on disk). An aborted loop (runaway / LLM error) →
+/// "needs_clarification" so it ESCALATES rather than falsely claiming success.
+pub fn agentic_result_json(outcome: &LoopOutcome, touched: &[String]) -> String {
+    let value = match outcome {
+        LoopOutcome::Done { output, .. } => json!({
+            "status": "done",
+            "output": if output.is_empty() { "agentic loop complete" } else { output.as_str() },
+            "filesTouched": touched,
+        }),
+        LoopOutcome::Aborted { reason, .. } => json!({
+            "status": "needs_clarification",
+            "question": format!("agentic coder did not finish: {reason}"),
+            "filesTouched": touched,
+        }),
+    };
+    value.to_string()
 }
 
 #[cfg(test)]
@@ -153,5 +199,26 @@ mod tests {
             required,
             ["path", "oldString", "newString"].iter().map(|s| s.to_string()).collect()
         );
+    }
+
+    #[test]
+    fn agentic_result_json_done_and_aborted() {
+        let done = agentic_result_json(
+            &LoopOutcome::Done { output: "ok".into(), rounds: 2 },
+            &["src/a.rs".to_string()],
+        );
+        let v: Value = serde_json::from_str(&done).unwrap();
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["output"], "ok");
+        assert_eq!(v["filesTouched"][0], "src/a.rs");
+        assert!(v.get("edits").is_none()); // agentic path applied edits itself
+
+        let aborted = agentic_result_json(
+            &LoopOutcome::Aborted { reason: "max rounds (8) exceeded".into(), rounds: 8 },
+            &[],
+        );
+        let v2: Value = serde_json::from_str(&aborted).unwrap();
+        assert_eq!(v2["status"], "needs_clarification");
+        assert!(v2["question"].as_str().unwrap().contains("max rounds"));
     }
 }

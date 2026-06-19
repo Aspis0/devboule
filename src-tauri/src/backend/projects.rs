@@ -2683,6 +2683,20 @@ pub fn read_mini_write_behavior(
     serde_json::from_value::<MiniWriteBehavior>(entry.clone()).unwrap_or(default)
 }
 
+/// Read the configurable agentic-loop round budget (`miniAgenticMaxRounds`) from config.json.
+/// Missing/malformed → the generous default [`super::agentic_runner::AGENTIC_MAX_ROUNDS`].
+/// Clamped to a sane range so a hand-edited 0 (instant abort) or an absurd value can't break
+/// the runaway guard. Never errors.
+pub fn read_agentic_max_rounds(app: &tauri::AppHandle) -> u32 {
+    let default = super::agentic_runner::AGENTIC_MAX_ROUNDS;
+    locate_config_path(app)
+        .and_then(|path| fs::read_to_string(&path).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.get("miniAgenticMaxRounds").and_then(|v| v.as_u64()))
+        .map(|n| (n as u32).clamp(1, 200))
+        .unwrap_or(default)
+}
+
 /// Read the Censor local-AI provider config (`censorLocalAi`) from config.json. A
 /// missing key / missing file / malformed value, OR a present-but-INVALID config (e.g.
 /// a non-loopback oMLX base, an oMLX config with no model) FALLS BACK to the safe

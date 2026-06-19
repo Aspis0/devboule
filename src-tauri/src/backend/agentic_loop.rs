@@ -56,6 +56,7 @@ pub fn run_agent_loop(
     system: &str,
     task: &str,
     max_rounds: u32,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> LoopOutcome {
     let mut messages = vec![
         ChatMsg {
@@ -73,6 +74,9 @@ pub fn run_agent_loop(
     ];
 
     let mut rounds = 0u32;
+    // Whether the model has actually done anything (executed ≥1 tool call). Guards against a
+    // degenerate model returning a blank message on turn 1 being treated as a successful Done.
+    let mut made_progress = false;
     loop {
         rounds += 1;
         if rounds > max_rounds {
@@ -81,14 +85,35 @@ pub fn run_agent_loop(
                 rounds: rounds - 1,
             };
         }
+        // User Stop / kill: bail before starting another (expensive) model turn.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return LoopOutcome::Aborted { reason: "cancelled".to_string(), rounds: rounds - 1 };
+        }
 
         match llm.next_turn(&messages) {
             Err(e) => return LoopOutcome::Aborted { reason: format!("llm error: {e}"), rounds },
-            Ok(LlmTurn::Message(content)) => return LoopOutcome::Done { output: content, rounds },
+            Ok(LlmTurn::Message(content)) => {
+                // A blank final message before ANY tool call = the model produced nothing
+                // useful → abort (escalate), don't report a false success.
+                if content.trim().is_empty() && !made_progress {
+                    return LoopOutcome::Aborted {
+                        reason: "model returned no content and made no tool calls".to_string(),
+                        rounds,
+                    };
+                }
+                return LoopOutcome::Done { output: content, rounds };
+            }
             Ok(LlmTurn::ToolCalls(calls)) => {
                 if calls.is_empty() {
-                    // Defensive: a turn with neither a message nor any call = finished.
-                    return LoopOutcome::Done { output: String::new(), rounds };
+                    // A turn with neither a message nor any call: finished only if real work
+                    // already happened; otherwise it's a degenerate empty response → abort.
+                    if made_progress {
+                        return LoopOutcome::Done { output: String::new(), rounds };
+                    }
+                    return LoopOutcome::Aborted {
+                        reason: "model returned an empty turn before doing any work".to_string(),
+                        rounds,
+                    };
                 }
                 // Record the assistant's tool-call turn, then each tool result, so the next
                 // turn sees the full transcript.
@@ -101,6 +126,10 @@ pub fn run_agent_loop(
                     tool_calls: Some(calls.clone()),
                 });
                 for call in calls {
+                    // Stop between tool calls too, so a kill can't fire one more write.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return LoopOutcome::Aborted { reason: "cancelled".to_string(), rounds };
+                    }
                     let result = tools
                         .call(&call.name, &call.arguments)
                         .unwrap_or_else(|e| format!("ERROR: {e}"));
@@ -111,6 +140,7 @@ pub fn run_agent_loop(
                         tool_calls: None,
                     });
                 }
+                made_progress = true;
             }
         }
     }
@@ -156,7 +186,7 @@ mod tests {
             ]),
         };
         let mut tools = MockTools { calls: vec![], response: "file content".to_string() };
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5);
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false));
         assert_eq!(outcome, LoopOutcome::Done { output: "done".to_string(), rounds: 2 });
         assert_eq!(tools.calls.len(), 1);
         assert_eq!(tools.calls[0].0, "read_file");
@@ -174,7 +204,7 @@ mod tests {
             ]),
         };
         let mut tools = MockTools { calls: vec![], response: "ok".to_string() };
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 3);
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 3, &std::sync::atomic::AtomicBool::new(false));
         assert_eq!(
             outcome,
             LoopOutcome::Aborted { reason: "max rounds (3) exceeded".to_string(), rounds: 3 }
@@ -186,7 +216,7 @@ mod tests {
     fn llm_error_aborts() {
         let mut llm = MockLlm { turns: VecDeque::from(vec![Err("api down".to_string())]) };
         let mut tools = MockTools { calls: vec![], response: String::new() };
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5);
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false));
         assert_eq!(
             outcome,
             LoopOutcome::Aborted { reason: "llm error: api down".to_string(), rounds: 1 }
@@ -209,7 +239,38 @@ mod tests {
             ]),
         };
         let mut tools = FailingTools;
-        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5);
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &std::sync::atomic::AtomicBool::new(false));
         assert_eq!(outcome, LoopOutcome::Done { output: "recovered".to_string(), rounds: 2 });
+    }
+
+    #[test]
+    fn cancel_flag_aborts_before_running_a_tool() {
+        let mut llm = MockLlm {
+            turns: VecDeque::from(vec![Ok(LlmTurn::ToolCalls(vec![call("read_file")]))]),
+        };
+        let mut tools = MockTools { calls: vec![], response: "x".to_string() };
+        let cancel = std::sync::atomic::AtomicBool::new(true); // already cancelled
+        let outcome = run_agent_loop(&mut llm, &mut tools, "sys", "task", 5, &cancel);
+        assert_eq!(outcome, LoopOutcome::Aborted { reason: "cancelled".to_string(), rounds: 0 });
+        assert_eq!(tools.calls.len(), 0); // never executed a tool
+    }
+
+    #[test]
+    fn blank_first_message_aborts_not_false_done() {
+        let mut llm =
+            MockLlm { turns: VecDeque::from(vec![Ok(LlmTurn::Message("   ".to_string()))]) };
+        let mut tools = MockTools { calls: vec![], response: String::new() };
+        let outcome = run_agent_loop(
+            &mut llm,
+            &mut tools,
+            "sys",
+            "task",
+            5,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        match outcome {
+            LoopOutcome::Aborted { reason, .. } => assert!(reason.contains("no content")),
+            other => panic!("expected Aborted, got {other:?}"),
+        }
     }
 }

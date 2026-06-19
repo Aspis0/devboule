@@ -179,6 +179,18 @@ pub struct MiniCoderState {
     /// wall-cap-timeout a directive that is Running-but-awaiting-its-verdict-thread. The
     /// thread always clears its id (success, error, or panic — fail-closed).
     verdict_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Process-wide set of directive ids whose AGENTIC tool-loop worker thread is currently
+    /// running. The agentic path has NO PTY, so `run_pass`'s PTY-gone completion check can't
+    /// see it; this set keeps such a directive "live" (not prematurely finalized) until the
+    /// worker writes its result + releases the id, AND excludes it from `plan_tick`'s
+    /// wall-clock timeout (the loop is bounded by its own max_rounds + per-turn HTTP timeout;
+    /// there is no PTY to kill). The worker clears its id on EVERY exit path (RAII).
+    agentic_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-directive cancel flags for in-flight agentic workers (directive id → flag). The
+    /// agentic loop checks its flag between rounds + before each tool call, so a user Stop
+    /// (`mini_coder_kill`) actually halts the worker (it has no PTY to kill). The worker
+    /// removes its entry on every exit path (same RAII guard as the in-flight set).
+    agentic_cancel: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl Default for MiniCoderState {
@@ -193,6 +205,8 @@ impl MiniCoderState {
             running: Arc::new(AtomicBool::new(true)),
             thread: Mutex::new(None),
             verdict_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            agentic_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            agentic_cancel: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -316,6 +330,59 @@ impl MiniCoderState {
         Arc::clone(&self.verdict_inflight)
     }
 
+    /// Mark an agentic worker as in-flight. Returns true iff newly inserted (so only ONE
+    /// worker per directive starts). Recovers from a poisoned lock (plain HashSet, no
+    /// invariant) so the claim always lands.
+    fn claim_agentic(&self, id: &str) -> bool {
+        let mut set = self.agentic_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(id.to_string())
+    }
+
+    /// Release an agentic worker's id from BOTH the in-flight set and the cancel map (on spawn
+    /// failure, mirroring the RAII guard's drop). A leaked id would keep the directive
+    /// un-finalizable forever; a leaked cancel flag would misfire on a future same-id worker.
+    fn release_agentic(&self, inflight_id: &str, cancel_id: &str) {
+        self.agentic_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(inflight_id);
+        self.agentic_cancel.lock().unwrap_or_else(|e| e.into_inner()).remove(cancel_id);
+    }
+
+    /// Snapshot the in-flight agentic ids (for `run_pass`'s completion check + the timeout
+    /// exclusion). Recovers from poison and returns the LIVE set.
+    fn agentic_inflight_ids(&self) -> std::collections::HashSet<String> {
+        let set = self.agentic_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        set.clone()
+    }
+
+    /// A clone of the in-flight-set handle for the worker thread's RAII drop guard.
+    fn agentic_inflight_handle(&self) -> Arc<Mutex<std::collections::HashSet<String>>> {
+        Arc::clone(&self.agentic_inflight)
+    }
+
+    /// Register a fresh cancel flag for an agentic worker (directive id → flag); returns a
+    /// clone for the worker to check each round. Recovers from poison.
+    fn register_agentic_cancel(&self, id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut map = self.agentic_cancel.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(id.to_string(), Arc::clone(&flag));
+        flag
+    }
+
+    /// Signal an in-flight agentic worker to stop (user Stop / kill). No-op if the directive
+    /// has no agentic worker (e.g. a one-shot mini).
+    fn cancel_agentic(&self, id: &str) {
+        let map = self.agentic_cancel.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(flag) = map.get(id) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A clone of the cancel-map handle for the worker thread's RAII drop guard.
+    fn agentic_cancel_handle(
+        &self,
+    ) -> Arc<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>> {
+        Arc::clone(&self.agentic_cancel)
+    }
+
     /// WARNING 6: a clone of the executor's REAL running/stop flag, threaded into the
     /// verdict thread so an in-flight linter run honors app exit (instead of a throwaway
     /// `AtomicBool(true)` that never signals shutdown → zombie linter subprocesses).
@@ -339,6 +406,23 @@ impl Drop for VerdictInflightGuard {
     fn drop(&mut self) {
         let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
         set.remove(&self.id);
+    }
+}
+
+/// RAII guard releasing an AGENTIC worker's in-flight id on EVERY exit path (done/abort/
+/// panic). Mirrors [`VerdictInflightGuard`]: a leaked id would keep the directive forever
+/// "live" (never finalized) and forever excluded from the timeout sweep.
+struct AgenticInflightGuard {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    inflight_key: String, // directive.id — what run_pass + plan_tick key on
+    cancel_map: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    cancel_key: String, // agent_id — what mini_coder_kill keys on
+}
+
+impl Drop for AgenticInflightGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.inflight_key);
+        self.cancel_map.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.cancel_key);
     }
 }
 
@@ -672,6 +756,17 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         .try_state::<MiniCoderState>()
         .map(|s| s.verdict_inflight_ids())
         .unwrap_or_default();
+    // Agentic tool-loop workers have NO PTY: track them so a running worker is neither
+    // prematurely finalized (its PTY is "gone" the whole time) NOR wall-clock-timed-out
+    // mid-run (it is bounded by its own max_rounds + per-turn HTTP timeout; there is no PTY
+    // to kill).
+    let agentic_inflight = app
+        .try_state::<MiniCoderState>()
+        .map(|s| s.agentic_inflight_ids())
+        .unwrap_or_default();
+    // plan_tick excludes BOTH in-flight kinds from the timeout sweep.
+    let timeout_exclusions: std::collections::HashSet<String> =
+        verdict_inflight.union(&agentic_inflight).cloned().collect();
 
     let now = Utc::now().to_rfc3339();
     let plan = mini_coder::plan_tick_excluding(
@@ -681,7 +776,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         mini_coder::DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
         DEFAULT_LAUNCH_CAP_SECS,
         max_concurrent,
-        &verdict_inflight,
+        &timeout_exclusions,
     );
 
     // 2) Timeouts FIRST (reap blown-cap minis regardless of concurrency): kill the
@@ -818,10 +913,14 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         // `pty_session_exists` is fail-safe (a poisoned/absent map reports "exists"),
         // so we only finalize when we can POSITIVELY confirm the session is gone —
         // never reading a result file for a mini that is still running.
-        let still_live = match &pty_sessions {
-            Some(sessions) => crate::backend::agent_pty::pty_session_exists(sessions, agent_id),
-            None => true, // state unavailable -> assume live, re-check next pass.
-        };
+        // An agentic worker has no PTY; it keeps the directive live until it writes its
+        // result file and releases the in-flight id. Only then does the PTY-gone path below
+        // finalize (reading that result), so the agentic + one-shot finalize paths converge.
+        let still_live = agentic_inflight.contains(&directive.id)
+            || match &pty_sessions {
+                Some(sessions) => crate::backend::agent_pty::pty_session_exists(sessions, agent_id),
+                None => true, // state unavailable -> assume live, re-check next pass.
+            };
         if !still_live {
             finalize_finished_mini(app, directive);
         }
@@ -959,6 +1058,111 @@ fn finish_visual_check(
         });
         cap_pass(state);
     });
+}
+
+/// Whether `directive` should run via the AGENTIC tool-loop instead of the one-shot path:
+/// it explicitly requested `AgenticIterative` write mode, is a write directive, has an
+/// OpenAI-compatible loopback HTTP endpoint (oMLX/api → a non-empty, already-validated
+/// `base_url`), and the user's safety policy permits agentic writes (not `Safe`).
+fn should_run_agentic(
+    app: &AppHandle,
+    backend: &MiniCoderBackend,
+    directive: &MiniCoderDirective,
+) -> bool {
+    directive.write
+        && directive.write_mode == mini_coder::WriteMode::AgenticIterative
+        && backend.base_url.as_deref().is_some_and(|u| !u.is_empty())
+        && super::projects::read_mini_write_behavior(app) != mini_coder::MiniWriteBehavior::Safe
+}
+
+/// Launch the AGENTIC tool-loop coder on a detached worker thread — the peer of
+/// `spawn_one_shot_mini`, but a multi-turn HTTP loop (read/edit/grep via sandboxed tools)
+/// instead of a one-shot PTY. The worker runs the loop, then writes the MiniCoderResult JSON
+/// to `scratch_root/result_rel` so the SAME finalize→Censor→retry path picks it up. The
+/// in-flight guard keeps the directive "live" until then (it has no PTY for run_pass to see).
+/// Returns immediately; holds no lock.
+fn spawn_agentic_worker(
+    app: &AppHandle,
+    project_root: &Path,
+    scratch_root: &Path,
+    result_rel: &str,
+    backend: &MiniCoderBackend,
+    directive: &MiniCoderDirective,
+) -> Result<(), String> {
+    let state = app
+        .try_state::<MiniCoderState>()
+        .ok_or_else(|| "executor state unavailable".to_string())?;
+    // Key on directive.id — the SAME key run_pass's completion check + plan_tick's timeout
+    // exclusion use (the agent_id is a different string and would never match).
+    let id = directive.id.clone();
+    // agent_id (= mini_agent_id) is the key mini_coder_kill cancels on (it has the live agent
+    // id, not the directive id); directive.id is the key run_pass + plan_tick use.
+    let agent_id = mini_agent_id(directive);
+    // Claim BEFORE spawning so the next run_pass sees the directive as live (it has no PTY).
+    if !state.claim_agentic(&id) {
+        return Err("agentic worker already in flight".to_string());
+    }
+    let cancel = state.register_agentic_cancel(&agent_id);
+    let guard_set = state.agentic_inflight_handle();
+    let guard_cancel = state.agentic_cancel_handle();
+
+    // should_run_agentic guarantees base_url Some + non-empty; defaults are defensive (an
+    // empty model just makes oMLX error → the loop aborts → escalates, never a false done).
+    let base_url = backend.base_url.clone().unwrap_or_default();
+    let model = backend.model.clone().unwrap_or_default();
+    let task = directive.task.clone();
+    let root = project_root.to_path_buf();
+    // WRITES confined to the directive's file allowlist (reads stay project-wide for context).
+    let allowlist = directive.files.clone();
+    let max_rounds = super::projects::read_agentic_max_rounds(app);
+    let result_path = scratch_root.join(result_rel);
+
+    let spawned = std::thread::Builder::new()
+        .name("agentic-coder-worker".into())
+        .spawn(move || {
+            // RAII: release the in-flight id + cancel flag on EVERY exit (done/abort/panic).
+            // Created FIRST so it drops LAST — AFTER the result file is written below.
+            let _guard = AgenticInflightGuard {
+                set: guard_set,
+                inflight_key: id,
+                cancel_map: guard_cancel,
+                cancel_key: agent_id,
+            };
+            let json = match crate::backend::agentic_runner::run_agentic_coder(
+                base_url,
+                model,
+                crate::backend::agentic_transport::SamplingParams::tuned(),
+                true, // thinking on — the MoE coders write best with reasoning
+                crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT,
+                &task,
+                root,
+                allowlist,
+                max_rounds,
+                &cancel,
+            ) {
+                Ok((outcome, touched)) => {
+                    crate::backend::agentic_runner::agentic_result_json(&outcome, &touched)
+                }
+                // Transport/init failure → escalate (NOT a false "done").
+                Err(e) => crate::backend::agentic_runner::agentic_result_json(
+                    &crate::backend::agentic_loop::LoopOutcome::Aborted { reason: e, rounds: 0 },
+                    &[],
+                ),
+            };
+            // Write the result the finalize path reads, BEFORE the guard releases the in-flight
+            // id (so run_pass never finalizes against a missing file). A write failure leaves no
+            // result → read_result_outcome synthesizes a failed outcome on the next pass.
+            if let Err(e) = std::fs::write(&result_path, &json) {
+                eprintln!("agentic worker: failed to write result {result_path:?}: {e}");
+            }
+            // _guard drops here → id + cancel flag released → next run_pass finalizes.
+        });
+    if let Err(e) = spawned {
+        // spawn failed → don't leak the claim or the cancel flag.
+        state.release_agentic(&directive.id, &mini_agent_id(directive));
+        return Err(format!("could not spawn agentic worker: {e}"));
+    }
+    Ok(())
 }
 
 /// Atomically claim a pending directive (under the lock, re-checking status so a
@@ -1142,17 +1346,32 @@ fn claim_and_launch(
         });
     }
 
-    if let Err(e) = spawn_one_shot_mini(
-        app,
-        &agent_id,
-        &project_root,
-        &scratch_root,
-        &result_rel,
-        &backend,
-        directive,
-        mcp_roots.as_ref(),
-        oracle_grant.as_ref().map(|(token, _)| token.as_str()),
-    ) {
+    // Capable (>20B) models with write_mode=AgenticIterative run the multi-turn tool loop
+    // (they write files themselves via sandboxed tools); everything else uses the one-shot
+    // emit-edits PTY. Both produce the SAME result-file contract for finalize→Censor→retry.
+    let spawn_result = if should_run_agentic(app, &backend, directive) {
+        spawn_agentic_worker(
+            app,
+            &project_root,
+            &scratch_root,
+            &result_rel,
+            &backend,
+            directive,
+        )
+    } else {
+        spawn_one_shot_mini(
+            app,
+            &agent_id,
+            &project_root,
+            &scratch_root,
+            &result_rel,
+            &backend,
+            directive,
+            mcp_roots.as_ref(),
+            oracle_grant.as_ref().map(|(token, _)| token.as_str()),
+        )
+    };
+    if let Err(e) = spawn_result {
         // The pre-spawn session (if any) must not linger as a live "mini" row
         // for a PTY that never existed.
         if oracle_grant.is_some() {
@@ -2876,10 +3095,15 @@ fn apply_write_directive_edits(
     use super::mini_activity::build_file_diff;
 
     if outcome.edits.is_empty() {
-        // P4 (review F6): a write directive that emitted NO edits changed
-        // NOTHING — zero the model-claimed files_touched, or the verdict gate
-        // would lint (and spuriously retry on) files the mini never touched.
-        if directive.write && outcome.status == MiniCoderStatus::Done {
+        // P4 (review F6): a one-shot emit-edits write directive that emitted NO edits changed
+        // NOTHING — zero the model-claimed files_touched, or the verdict gate would lint (and
+        // spuriously retry on) files the mini never touched.
+        // EXCEPTION: the AGENTIC path applies its edits via tools, so empty `edits` is EXPECTED
+        // and its files_touched (set from the loop's own tracking) is real — keep it for Censor.
+        if directive.write
+            && directive.write_mode != mini_coder::WriteMode::AgenticIterative
+            && outcome.status == MiniCoderStatus::Done
+        {
             outcome.files_touched = Vec::new();
         }
         return (outcome, Vec::new());
@@ -5177,6 +5401,15 @@ pub fn mini_coder_kill(app: AppHandle, agent_id: String) -> Result<(), String> {
     //    aborted_by_human (WARNING 2: we do NOT close the session here — doing so
     //    raced the executor's "done" close, yielding a non-deterministic final session
     //    status and a redundant/early write).
+    // An AGENTIC worker has no PTY to kill — signal its cancel flag so the loop actually
+    // halts (checked between rounds + before each tool call). No-op for one-shot minis.
+    if let Some(state) = app.try_state::<MiniCoderState>() {
+        state.cancel_agentic(&agent_id);
+        if let Some(live_id) = &pty_to_kill {
+            state.cancel_agentic(live_id);
+        }
+    }
+
     match pty_to_kill {
         Some(live_id) => crate::backend::agent_pty::kill_agent_pty(&app, &live_id),
         None => {
