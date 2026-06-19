@@ -110,6 +110,20 @@ pub fn default_tool_definitions() -> Value {
                     "required": ["path", "content"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run",
+                "description": "Run an allowlisted build/test/lint command in the project (any language: e.g. cargo test, go test ./..., pytest, npm test, make, gradle test, npx tsc --noEmit, dotnet test). No shell, no chaining/redirection, no escaping the project dir.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "e.g. 'cargo test', 'pytest', 'go test ./...', 'npm test'." }
+                    },
+                    "required": ["command"]
+                }
+            }
         }
     ])
 }
@@ -169,7 +183,7 @@ mod tests {
     fn default_tool_definitions_are_well_formed() {
         let tools = default_tool_definitions();
         let arr = tools.as_array().expect("tools must be a JSON array");
-        assert_eq!(arr.len(), 5);
+        assert_eq!(arr.len(), 6);
 
         let mut names = HashSet::new();
         for tool in arr {
@@ -179,7 +193,7 @@ mod tests {
             names.insert(func["name"].as_str().unwrap().to_string());
         }
         let expected: HashSet<String> =
-            ["read_file", "list_dir", "grep", "edit_file", "write_file"]
+            ["read_file", "list_dir", "grep", "edit_file", "write_file", "run"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();

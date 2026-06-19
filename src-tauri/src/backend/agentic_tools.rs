@@ -21,6 +21,8 @@ const MAX_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_GREP_DEPTH: usize = 50;
 const MAX_GREP_FILES: usize = 2000;
 const MAX_GREP_MATCHES: usize = 100;
+const MAX_RUN_OUTPUT: usize = 64 * 1024;
+const RUN_TIMEOUT_SECS: u64 = 600; // generous: real test/build runs are slow; bounds a hang
 
 /// PURE security core: normalize a model-supplied relative path and reject anything that
 /// could escape the scope (absolute, drive/scheme `:`, `..`). `.` and empty components are
@@ -53,6 +55,97 @@ pub fn safe_rel_path(rel: &str) -> Result<String, String> {
         return Ok(".".to_string()); // resolved to the scope root
     }
     Ok(parts.join("/"))
+}
+
+/// LANGUAGE-AGNOSTIC dev/build/test programs the `run` tool may execute. Running the
+/// PROJECT's own build/test via these (cargo build.rs, npm/make/gradle scripts, pytest, …)
+/// runs project code by design — that's the agent's purpose, accepted uniformly across
+/// languages. The security boundary is NOT "which tool" but: no shell-chaining, no scope
+/// escape, env hygiene, resource bounds (see `parse_run_command` + `ScopedAgentTools::run`).
+const RUN_PROGRAMS: &[&str] = &[
+    // Rust
+    "cargo", "rustc", "rustfmt", "clippy-driver",
+    // Go
+    "go", "gofmt", "golangci-lint",
+    // C / C++ / native
+    "make", "cmake", "ninja", "ctest", "meson",
+    // JVM
+    "gradle", "./gradlew", "mvn", "./mvnw",
+    // .NET
+    "dotnet",
+    // JS / TS
+    "npm", "npx", "yarn", "pnpm", "node", "deno", "bun", "tsc", "eslint", "vitest", "jest",
+    "biome",
+    // Python
+    "python", "python3", "pytest", "tox", "ruff", "mypy", "pip", "pip3", "poetry", "uv",
+    "black", "flake8",
+    // Ruby
+    "ruby", "rake", "rspec", "bundle", "rubocop",
+    // PHP
+    "php", "composer", "phpunit",
+    // Swift / others
+    "swift", "zig", "dart", "flutter", "elixir", "mix",
+];
+
+/// PURE RCE gate for the `run` tool: validate a command into an argv vector for a NO-SHELL
+/// exec. (1) rejects shell metacharacters (no chaining/substitution/redirection — also defangs
+/// `python -c "…"` etc. since quotes/parens are blocked); (2) requires the program (token 0) to
+/// be a known dev/build/test tool — LANGUAGE-AGNOSTIC, not a Rust/JS-only pair list; (3) safe
+/// charset on every token; (4) blocks scope-escape in args (parent-`..` segments, absolute
+/// paths, `--flag=/abs`). Running the project's own build/test is accepted; this stops shell
+/// injection + escaping the scope root, not the project running its own code.
+pub fn parse_run_command(input: &str) -> Result<Vec<String>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Input is empty".to_string());
+    }
+
+    const META: &[char] = &[
+        ';', '|', '&', '$', '`', '>', '<', '(', ')', '{', '}', '[', ']', '!', '*', '?', '~',
+        '\\', '"', '\'', '\n', '\r', '\t',
+    ];
+    if let Some(c) = input.chars().find(|c| META.contains(c)) {
+        return Err(format!("Forbidden shell metacharacter: {c:?}"));
+    }
+
+    let tokens: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
+    if tokens.is_empty() {
+        return Err("No command".to_string());
+    }
+    if !RUN_PROGRAMS.contains(&tokens[0].as_str()) {
+        return Err(format!("Program not in the dev-tool allowlist: {}", tokens[0]));
+    }
+
+    for (i, token) in tokens.iter().enumerate() {
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '=' | '-'))
+        {
+            return Err(format!("Token has an invalid character: {token}"));
+        }
+        if i > 0 {
+            // Scope-escape: a `..` PATH SEGMENT (not the literal substring — keeps Go's
+            // `./...`), an absolute path, or a `--flag=/abs` value.
+            let as_path = token.replace('=', "/");
+            if as_path.split('/').any(|seg| seg == "..") {
+                return Err(format!("Parent-dir traversal not allowed in arg: {token}"));
+            }
+            if token.starts_with('/') || token.contains("=/") {
+                return Err(format!("Absolute path not allowed in arg: {token}"));
+            }
+            // Absolute path ATTACHED to a flag with no '=' (e.g. `make -C/etc`,
+            // `go build -o/tmp/x`, `rustc -o/abs`): strip the leading flag chars, and if the
+            // remainder is an absolute path, reject (it escapes the scope cwd).
+            if token.starts_with('-') {
+                let rest = token.trim_start_matches(|c: char| c != '/');
+                if rest.starts_with('/') {
+                    return Err(format!("Absolute path embedded in flag not allowed: {token}"));
+                }
+            }
+        }
+    }
+
+    Ok(tokens)
 }
 
 pub struct ScopedAgentTools {
@@ -258,6 +351,138 @@ impl ScopedAgentTools {
             self.touched.push(safe);
         }
     }
+
+    /// Execute an allowlisted command (validated by `parse_run_command`) as an argv vector with
+    /// NO shell, in the scope root. Drains stdout/stderr on threads (so a full pipe can't
+    /// deadlock), kills on timeout, and returns capped output. The argv-exec + allowlist + safe
+    /// charset are the RCE gate; the scope-root cwd confines side effects.
+    fn run(&self, command: &str) -> Result<String, String> {
+        let mut argv = parse_run_command(command)?;
+        // F6: npx must not fetch+exec a REMOTE package — only locally-installed tools.
+        // `--prefer-offline` is honored on npm 6 AND 7+ (uses cache only); combined with the
+        // null stdin (no interactive install prompt) it won't pull a package from the network.
+        if argv[0] == "npx" {
+            argv.insert(1, "--prefer-offline".to_string());
+        }
+
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // F4: don't leak the app's env (API keys/tokens) to a project build script of ANY
+        // language — clear it, pass only what build tools genuinely need.
+        cmd.env_clear();
+        for key in [
+            "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL", "CARGO_HOME",
+            "RUSTUP_HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "NODE_PATH", "JAVA_HOME",
+            "ANDROID_HOME", "PYENV_ROOT", "VIRTUAL_ENV",
+            // native-toolchain vars (else cargo crates like openssl-sys/libpq-sys fail to build)
+            "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+        ] {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
+        }
+        // F2: own process group so a timeout SIGKILLs the WHOLE tree (cargo→rustc→test bin,
+        // npm→node, make→…). Killing only the direct child orphans descendants AND can deadlock
+        // the output drain (a surviving child keeps the pipe write end open).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| format!("failed to start '{}': {e}", argv[0]))?;
+        let pid = child.id() as i32;
+
+        // F1: drain each stream CAPPED (never read an unbounded firehose into memory → OOM).
+        let mut out = child.stdout.take().expect("stdout piped");
+        let mut err = child.stderr.take().expect("stderr piped");
+        let (tx_o, rx_o) = std::sync::mpsc::channel();
+        let (tx_e, rx_e) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx_o.send(drain_capped(&mut out));
+        });
+        std::thread::spawn(move || {
+            let _ = tx_e.send(drain_capped(&mut err));
+        });
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(RUN_TIMEOUT_SECS);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        kill_process_group(pid, &mut child);
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("run wait failed: {e}")),
+            }
+        };
+
+        // Normally the exit/group-kill closes the pipe writers → the drains finish at once. But
+        // a daemonized grandchild could setsid() out of the killed group and hold a pipe open;
+        // bound the wait so run() can NEVER hang (a stuck drain thread is then abandoned).
+        let jt = std::time::Duration::from_secs(5);
+        let stdout = rx_o.recv_timeout(jt).unwrap_or_default();
+        let stderr = rx_e.recv_timeout(jt).unwrap_or_default();
+        let mut body = match status {
+            Some(s) => format!("exit: {}\n", s.code().unwrap_or(-1)),
+            None => format!("TIMEOUT after {RUN_TIMEOUT_SECS}s (process group killed)\n"),
+        };
+        body.push_str(&String::from_utf8_lossy(&stdout));
+        if !stderr.is_empty() {
+            body.push_str("\n--- stderr ---\n");
+            body.push_str(&String::from_utf8_lossy(&stderr));
+        }
+        if body.len() > MAX_RUN_OUTPUT {
+            let mut end = MAX_RUN_OUTPUT;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
+            body.push_str("\n…[truncated]");
+        }
+        Ok(body)
+    }
+}
+
+/// Read a child stream, keeping at most `MAX_RUN_OUTPUT` bytes but CONTINUING to read+discard
+/// past the cap so the child's pipe never blocks (bounded memory, no writer deadlock).
+fn drain_capped(r: &mut impl std::io::Read) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < MAX_RUN_OUTPUT {
+                    let take = n.min(MAX_RUN_OUTPUT - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// SIGKILL the child's whole process group (negative pid) on timeout, so descendants
+/// (rustc/test-bin/node/…) die too — they can't orphan or hold the output pipes open. Also
+/// kills + reaps the direct child (covers non-unix + belt-and-suspenders).
+fn kill_process_group(pid: i32, child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: kill(2) with a negative pid targets the process group; SIGKILL is async-safe.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,6 +565,11 @@ impl AgentTools for ScopedAgentTools {
                     args["newString"].as_str().ok_or_else(|| "missing 'newString'".to_string())?;
                 self.edit_file(path, old, new)
             }
+            "run" => {
+                let command =
+                    args["command"].as_str().ok_or_else(|| "missing 'command'".to_string())?;
+                self.run(command)
+            }
             other => Err(format!("tool not available: {other}")),
         }
     }
@@ -364,6 +594,52 @@ mod tests {
         assert_eq!(safe_rel_path("dir//sub"), Ok("dir/sub".to_string()));
         assert_eq!(safe_rel_path("."), Ok(".".to_string()));
         assert_eq!(safe_rel_path("./"), Ok(".".to_string()));
+    }
+
+    #[test]
+    fn parse_run_command_multilang_safe_and_escapes_blocked() {
+        assert_eq!(parse_run_command("cargo test").unwrap(), vec!["cargo", "test"]);
+        // allowed: dev/build/test tools ACROSS languages (running the project's own build/test)
+        for ok in [
+            "cargo build --release",
+            "go test ./...", // the `..` check must NOT trip on `./...`
+            "pytest",
+            "make",
+            "npm run build",
+            "npx tsc --noEmit",
+            "gradle test",
+            "python -m pytest",
+            "ruff check .",
+        ] {
+            assert!(parse_run_command(ok).is_ok(), "{ok} should be allowed");
+        }
+        // rejected: shell injection / chaining / substitution / redirection
+        for bad in [
+            "cargo test; rm -rf /",
+            "cargo test && curl evil",
+            "cargo test | sh",
+            "cargo test `whoami`",
+            "cargo test $(whoami)",
+            "npx tsc > out",
+            "cargo test\ncargo build",
+        ] {
+            assert!(parse_run_command(bad).is_err(), "{bad} must be rejected (injection)");
+        }
+        // rejected: program not a known dev tool
+        for bad in ["rm -rf /", "git push", "bash script.sh", "curl x", "", "   "] {
+            assert!(parse_run_command(bad).is_err(), "{bad} must be rejected (program)");
+        }
+        // rejected: scope escape via args (absolute paths, parent traversal, --flag=/abs)
+        for bad in [
+            "cargo test --manifest-path=/etc/x",
+            "cargo build --target-dir=/tmp/e",
+            "make -C ../../other",
+            "go test ../../../etc",
+            "make -C/etc",            // abs path attached to a flag (no '=')
+            "go build -o/tmp/evil",   // -o<abs> output escape
+        ] {
+            assert!(parse_run_command(bad).is_err(), "{bad} must be rejected (escape)");
+        }
     }
 
     // FS tests: build a temp scope with an INSIDE file and an OUTSIDE secret reachable only
