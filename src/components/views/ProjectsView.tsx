@@ -90,6 +90,7 @@ import {
   categoryLabel,
 } from "../projects/taskCategory";
 import type { ColumnId } from "../projects/taskBoard";
+import { deriveWorkers } from "../projects/agentBadge";
 import { freshestSession } from "../projects/agentLiveStatus";
 import {
   commitProjectCall,
@@ -1838,6 +1839,9 @@ export function ProjectsView() {
                       const taskAgentControlled =
                         taskClaims.length > 0 ||
                         taskSessions.length > 0;
+                      // R7: the agent(s) working this card — internal mini OR external
+                      // Claude/codex — each a color-coded badge (the parallel-track viz).
+                      const workers = deriveWorkers(taskClaims, taskSessions);
                       const manualMoveTitle = isArchived
                         ? "Archived project is read-only."
                         : taskAgentControlled
@@ -1866,6 +1870,7 @@ export function ProjectsView() {
                           <TaskCard
                             task={task}
                             agentControlled={taskAgentControlled}
+                            workers={workers}
                             moveTargets={taskMoveTargets(task)}
                             moveDisabled={moveDisabled}
                           manualMoveTitle={manualMoveTitle}

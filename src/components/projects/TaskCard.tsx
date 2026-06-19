@@ -1,6 +1,7 @@
 import { Bot } from "lucide-react";
 import { useMemo } from "react";
 import type { ColumnId, MoveTarget } from "./taskBoard";
+import type { WorkerBadge } from "./agentBadge";
 import { MiniMenu, type MiniMenuItem } from "./MiniMenu";
 import type { ProjectTask } from "../../types/backend";
 import {
@@ -36,6 +37,7 @@ function taskTone(task: ProjectTask) {
 export function TaskCard({
   task,
   agentControlled,
+  workers,
   moveTargets,
   moveDisabled,
   manualMoveTitle,
@@ -54,6 +56,7 @@ export function TaskCard({
 }: {
   task: ProjectTask;
   agentControlled: boolean;
+  workers: WorkerBadge[];
   moveTargets: MoveTarget[];
   moveDisabled: boolean;
   manualMoveTitle: string;
@@ -182,15 +185,30 @@ export function TaskCard({
               {categoryLabel(task.category)}
             </span>
           )}
-          {agentControlled && (
-            <span
-              className="inline-flex items-center gap-1 rounded-md bg-terracotta/10 px-2 py-0.5 text-[10px] font-semibold text-terracotta"
-              title="An open agent claim or session controls this task; let MCP update status or wait for expiry."
-            >
-              <Bot className="h-3 w-3 shrink-0" aria-hidden />
-              Agent
-            </span>
-          )}
+          {workers.length > 0
+            ? workers.map((w) => (
+                // R7: one color-coded badge per agent working this card (internal mini OR
+                // external Claude/codex). The color keys off the agentId = the parallel-track
+                // hue; "↗" marks an external CLI.
+                <span
+                  key={w.agentId}
+                  className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold ${w.colorClass}`}
+                  title={`${w.label}${w.external ? " — external CLI" : " — in-app"} (agent ${w.agentId})`}
+                >
+                  <Bot className="h-3 w-3 shrink-0" aria-hidden />
+                  {w.label}
+                  {w.external ? " ↗" : ""}
+                </span>
+              ))
+            : agentControlled && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-md bg-terracotta/10 px-2 py-0.5 text-[10px] font-semibold text-terracotta"
+                  title="An open agent claim or session controls this task; let MCP update status or wait for expiry."
+                >
+                  <Bot className="h-3 w-3 shrink-0" aria-hidden />
+                  Agent
+                </span>
+              )}
           {metaParts.length > 0 && (
             <span className="min-w-0 truncate text-[10px] text-cream-400">
               {metaParts.join(" · ")}
