@@ -11,6 +11,7 @@ use tauri::State;
 
 use crate::backend::fs_replace::replace_file_with_backup;
 use crate::backend::projects::{config_write_lock, locate_config_path};
+use crate::backend::provider_detect::{probe_client, probe_get};
 use crate::backend::state::BackendState;
 
 /// One curated model the coders may choose from. `tier` selects execution mode
@@ -168,4 +169,75 @@ pub fn set_model_registry(
     replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")
         .map_err(|e| format!("{e}. In a packaged build this file is read-only."))?;
     Ok(normalized)
+}
+
+/// A model actually INSTALLED on a local backend (for the Settings UI to offer for
+/// curation into the registry). oMLX `/v1/models` has no size; Ollama `/api/tags` does.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub backend: String,
+    pub size_bytes: u64,
+    pub param_size: Option<String>,
+    pub quant: Option<String>,
+}
+
+/// Discover installed models across the local backends. UNGATED (like `detect_providers`
+/// / `poll_backend_memory`): a non-secret installed-model list. A down backend contributes
+/// nothing (not an error); parsing is tolerant (entries missing id/name are skipped).
+#[tauri::command]
+pub async fn discover_installed_models() -> Result<Vec<DiscoveredModel>, String> {
+    let client = probe_client().ok_or_else(|| "probe client unavailable".to_string())?;
+    let mut discovered = Vec::new();
+
+    // oMLX /v1/models -> {"data":[{"id": "..."}]}
+    if let Some(body) = probe_get(&client, "http://127.0.0.1:8000/v1/models").await {
+        if let Ok(json) = body.parse::<serde_json::Value>() {
+            if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                for item in data {
+                    if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                        discovered.push(DiscoveredModel {
+                            id: id.to_string(),
+                            backend: "omlx".to_string(),
+                            size_bytes: 0,
+                            param_size: None,
+                            quant: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Ollama /api/tags -> {"models":[{"name","size","details":{parameter_size,quantization_level}}]}
+    if let Some(body) = probe_get(&client, "http://127.0.0.1:11434/api/tags").await {
+        if let Ok(json) = body.parse::<serde_json::Value>() {
+            if let Some(models) = json.get("models").and_then(|m| m.as_array()) {
+                for model in models {
+                    if let Some(name) = model.get("name").and_then(|n| n.as_str()) {
+                        let size = model.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                        let details = model.get("details");
+                        let param_size = details
+                            .and_then(|d| d.get("parameter_size"))
+                            .and_then(|p| p.as_str())
+                            .map(str::to_string);
+                        let quant = details
+                            .and_then(|d| d.get("quantization_level"))
+                            .and_then(|q| q.as_str())
+                            .map(str::to_string);
+                        discovered.push(DiscoveredModel {
+                            id: name.to_string(),
+                            backend: "ollama".to_string(),
+                            size_bytes: size,
+                            param_size,
+                            quant,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(discovered)
 }
