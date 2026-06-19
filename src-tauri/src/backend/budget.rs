@@ -272,3 +272,106 @@ mod tests {
         assert_eq!(s.free_bytes, 16 * GIB_U64 - reserve);
     }
 }
+
+/// Phase 4 spawn-gate decision (PURE — the live executor calls this before launching a
+/// LOCAL mini). The app is the hard admission authority: an LLM can't be trusted to do the
+/// RAM/compute arithmetic itself.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum SpawnDecision {
+    /// Fits now — launch it.
+    Admit,
+    /// Would fit eventually (compute cap or transient memory pressure) — wait and retry.
+    Queue { reason: String },
+    /// Never fits locally (footprint exceeds the whole budget) — send to a cloud backend.
+    RouteToCloud { reason: String },
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
+}
+
+/// Decide whether a local mini of `model_footprint_bytes` may launch now, given the live
+/// `budget`, the count of `active_local_decodes`, and the `max_concurrent_decodes` cap
+/// (0 = no compute cap). Order: compute cap → never-fits → not-now → admit.
+pub fn admit_local_spawn(
+    model_footprint_bytes: u64,
+    budget: &BudgetSummary,
+    active_local_decodes: u32,
+    max_concurrent_decodes: u32,
+) -> SpawnDecision {
+    if max_concurrent_decodes > 0 && active_local_decodes >= max_concurrent_decodes {
+        return SpawnDecision::Queue {
+            reason: format!(
+                "compute cap reached ({}/{} active)",
+                active_local_decodes, max_concurrent_decodes
+            ),
+        };
+    }
+
+    if model_footprint_bytes > budget.budget_bytes {
+        return SpawnDecision::RouteToCloud {
+            reason: format!(
+                "needs {} vs budget {}",
+                gib(model_footprint_bytes),
+                gib(budget.budget_bytes)
+            ),
+        };
+    }
+
+    if model_footprint_bytes > budget.free_bytes {
+        return SpawnDecision::Queue {
+            reason: format!(
+                "needs {} vs free {}",
+                gib(model_footprint_bytes),
+                gib(budget.free_bytes)
+            ),
+        };
+    }
+
+    SpawnDecision::Admit
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const GIB_U64: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn admit_local_spawn_covers_each_branch() {
+        let budget = BudgetSummary {
+            total_ram_bytes: 32 * GIB_U64,
+            reserve_bytes: 4 * GIB_U64,
+            budget_bytes: 28 * GIB_U64,
+            omlx_used_bytes: 0,
+            ollama_used_bytes: 0,
+            used_bytes: 10 * GIB_U64,
+            free_bytes: 18 * GIB_U64,
+        };
+
+        // fits now
+        assert_eq!(admit_local_spawn(5 * GIB_U64, &budget, 0, 1), SpawnDecision::Admit);
+
+        // footprint > free but <= budget -> Queue
+        match admit_local_spawn(25 * GIB_U64, &budget, 0, 1) {
+            SpawnDecision::Queue { reason } => assert!(reason.contains("vs free")),
+            other => panic!("expected Queue, got {other:?}"),
+        }
+
+        // footprint > budget -> RouteToCloud
+        match admit_local_spawn(40 * GIB_U64, &budget, 0, 1) {
+            SpawnDecision::RouteToCloud { reason } => assert!(reason.contains("vs budget")),
+            other => panic!("expected RouteToCloud, got {other:?}"),
+        }
+
+        // compute cap reached -> Queue
+        match admit_local_spawn(5 * GIB_U64, &budget, 2, 2) {
+            SpawnDecision::Queue { reason } => assert_eq!(reason, "compute cap reached (2/2 active)"),
+            other => panic!("expected Queue (cap), got {other:?}"),
+        }
+
+        // max_concurrent_decodes == 0 disables the cap
+        assert_eq!(admit_local_spawn(5 * GIB_U64, &budget, 5, 0), SpawnDecision::Admit);
+    }
+}
