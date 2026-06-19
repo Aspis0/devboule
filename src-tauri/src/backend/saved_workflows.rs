@@ -28,8 +28,20 @@ pub fn list_saved_workflows(
     project_id: String,
 ) -> Result<Vec<SavedWorkflow>, String> {
     state.ensure_unlocked()?;
-    let root = crate::backend::projects::resolve_project_root_by_id(&app, &project_id)?;
-    Ok(list_saved_workflows_for_root(&root))
+    // A-F4: a project with no working folder still has GLOBAL workflows (~/.claude/workflows),
+    // which need no project root — list those instead of erroring the whole panel out.
+    match crate::backend::projects::resolve_project_root_by_id(&app, &project_id) {
+        Ok(root) => Ok(list_saved_workflows_for_root(&root)),
+        Err(_) => Ok(list_global_saved_workflows()),
+    }
+}
+
+fn list_global_saved_workflows() -> Vec<SavedWorkflow> {
+    let mut by_name = BTreeMap::new();
+    if let Some(home) = home_dir() {
+        scan_workflow_dir(&home.join(".claude").join("workflows"), "global", &mut by_name);
+    }
+    by_name.into_values().collect()
 }
 
 pub fn list_saved_workflows_for_root(project_root: &Path) -> Vec<SavedWorkflow> {

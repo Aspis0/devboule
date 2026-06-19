@@ -279,7 +279,10 @@ function CollapsibleGroup({
           <ChevronRight className="h-4 w-4 text-cream-400" />
         )}
       </button>
-      {isOpen && <div className="mt-4 space-y-6">{children}</div>}
+      {/* B-F4: keep children MOUNTED when collapsed (display-toggle, not unmount) so a
+          half-filled form — an Oracle API key, an in-progress MCP consent dialog — is not
+          silently destroyed when the group is collapsed. Matches pre-S1 mount behaviour. */}
+      <div className={isOpen ? "mt-4 space-y-6" : "hidden"}>{children}</div>
     </section>
   );
 }

@@ -153,7 +153,7 @@ describe("SpawnPanel — Plan first toggle (3b)", () => {
     expect(launches[0].planFirst).toBe(true);
   });
 
-  it("omits planFirst from the launch input when toggled OFF", async () => {
+  it("sends planFirst=false when toggled OFF (the user's OFF choice is respected)", async () => {
     await mount("qwen2.5-coder");
     await selectOrchestrator();
 
@@ -170,8 +170,9 @@ describe("SpawnPanel — Plan first toggle (3b)", () => {
     await clickLaunchInApp();
 
     expect(launches).toHaveLength(1);
-    // Off => undefined, so the IPC payload is byte-identical to a pre-3b launch.
-    expect(launches[0].planFirst).toBeUndefined();
+    // A-F1: OFF now sends an EXPLICIT false (Rust defaults an ABSENT value to plan-first,
+    // so omitting it would let that default override the user's OFF choice).
+    expect(launches[0].planFirst).toBe(false);
   });
 
   it("never carries planFirst for a non-orchestrator client", async () => {

@@ -1012,10 +1012,13 @@ export function ProjectsView() {
   };
   const handleColumnDrop = (status: ColumnId) => {
     const task = dragTaskRef.current;
-    if (task && task.status !== status) {
+    dragTaskRef.current = null;
+    // B-F2: "done" is verifier-gated — a drag must never move a task INTO done (mirrors the
+    // Move menu, which omits done as a target). Done-SOURCE cards are non-draggable (see
+    // `moveDisabled` below), so guarding the target here closes both directions.
+    if (task && status !== "done" && task.status !== status) {
       void moveTask(task, status);
     }
-    dragTaskRef.current = null;
   };
 
   const appendNote = async () => {
@@ -1165,6 +1168,10 @@ export function ProjectsView() {
       setLaunchMessage(
         `${result.client} launched in the in-app terminal at ${result.rootPath}. MCP config and prompt attached.`,
       );
+      // B-F3: host:"app" runs the agent in the IN-APP PTY, whose viewer only renders in the
+      // workspace — enter work mode so the user actually SEES the terminal (otherwise the
+      // launch is invisible from the board, the very symptom R4 set out to fix).
+      enterWorkMode(currentProject.metadata.id);
       await loadAgentState();
       await loadProjects();
     } catch (e) {
@@ -1789,7 +1796,10 @@ export function ProjectsView() {
                 key={column.id}
                 className="rounded-lg border border-cream-200 bg-cream-50 p-3"
                 onDragOver={(event) => event.preventDefault()}
-                onDrop={() => handleColumnDrop(column.id)}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  handleColumnDrop(column.id);
+                }}
                 data-help-title={`${column.label} is a task status column.`}
                 data-help-lines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
               >
@@ -1836,7 +1846,12 @@ export function ProjectsView() {
                       const launchable =
                         canLaunchProjectAgents(currentProject);
                       const moveDisabled =
-                        isBusy || taskAgentControlled || isArchived;
+                        isBusy ||
+                        taskAgentControlled ||
+                        isArchived ||
+                        // B-F2: a "done" task is verifier-terminal — not draggable (the Move
+                        // menu already offers it no targets).
+                        task.status === "done";
                       return (
                         // B17: the card is draggable only when movable; the column's
                         // onDrop routes the dropped card through moveTask.
@@ -1844,6 +1859,9 @@ export function ProjectsView() {
                           key={task.id}
                           draggable={!moveDisabled}
                           onDragStart={() => handleCardDragStart(task)}
+                          onDragEnd={() => {
+                            dragTaskRef.current = null;
+                          }}
                         >
                           <TaskCard
                             task={task}

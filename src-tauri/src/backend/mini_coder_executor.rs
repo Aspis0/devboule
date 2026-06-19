@@ -1103,12 +1103,15 @@ fn should_run_agentic(
     // S2 — the toggle STAYS (always give the user the choice); capability drives only the
     // AUTO default, it never removes a choice:
     //   Safe           => never agentic (force emit-edits).
-    //   Auto (default) => capability-driven — a registry emit-edits-tier model stays one-shot.
+    //   Auto (default) => capability-driven, OPT-IN: agentic ONLY for a model the registry
+    //                     confirms is agentic-tier. An unregistered/unknown model (tier None)
+    //                     stays one-shot — the safe default (never assume an unknown model can
+    //                     drive the multi-turn loop).
     //   AgenticAllowed => the user's explicit override wins — agentic even for a small model.
     match super::projects::read_mini_write_behavior(app) {
         mini_coder::MiniWriteBehavior::Safe => false,
         mini_coder::MiniWriteBehavior::Auto => {
-            mini_model_tier(app, backend).as_deref() != Some("emitEdits")
+            mini_model_tier(app, backend).as_deref() == Some("agentic")
         }
         mini_coder::MiniWriteBehavior::AgenticAllowed => true,
     }

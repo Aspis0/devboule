@@ -385,14 +385,14 @@ export function buildLaunchInput(
     taskId: selection.taskId.trim().length > 0 ? selection.taskId : null,
     host,
     model: normalizeModelHint(selection.model),
-    // 3b — "Plan first" is a LOCAL-orchestrator-only bias. Gate it on the client
-    // here (belt-and-suspenders alongside SpawnPanel forcing it off for non-
-    // orchestrator clients) so a stale selection flag can never ride a codex/claude
-    // launch. Only emit `true`; leave it undefined otherwise so the launch input —
-    // and the IPC payload — is byte-identical to a pre-3b launch when off.
+    // 3b — "Plan first" is a LOCAL-orchestrator-only bias. Gate it on the client here so a
+    // stale flag can never ride a codex/claude launch. A-F1: for the orchestrator emit the
+    // EXPLICIT boolean (true OR false) — Rust defaults an ABSENT value to plan-first, so
+    // sending `undefined` when the toggle is OFF let that default silently override the
+    // user's choice. Non-orchestrator clients carry no plan-first flag (undefined).
     planFirst:
-      selection.client === "orchestrator" && selection.planFirst === true
-        ? true
+      selection.client === "orchestrator"
+        ? selection.planFirst === true
         : undefined,
   };
 }
