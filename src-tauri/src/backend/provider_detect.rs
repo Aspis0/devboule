@@ -347,7 +347,7 @@ fn parse_omlx_models(body: &str) -> Vec<String> {
 /// A dedicated, redirect-free probe client: loopback-only targets, short timeouts, NO
 /// redirect-following (a compromised local server cannot 3xx us off-box). Built fresh per
 /// `detect_providers` call (detection is infrequent, so caching is not worth a `OnceLock`).
-fn probe_client() -> Option<reqwest::Client> {
+pub(crate) fn probe_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("Aspis-Management/0.1")
         .redirect(reqwest::redirect::Policy::none())
@@ -372,7 +372,7 @@ const MAX_PROBE_BODY_BYTES: usize = 256 * 1024;
 /// `Content-Length` over the cap (cheap, before buffering), then buffer the full bytes
 /// (`PROBE_TIMEOUT` already bounds wall-time) and reject if the actual length exceeds the
 /// cap, before any UTF-8 decode / JSON parse.
-async fn probe_get(client: &reqwest::Client, url: &str) -> Option<String> {
+pub(crate) async fn probe_get(client: &reqwest::Client, url: &str) -> Option<String> {
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;

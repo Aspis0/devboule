@@ -619,6 +619,7 @@ pub fn run() {
             backend::design_generate::design_cancel_generation,
             backend::provider_detect::detect_providers,
             backend::hardware::detect_hardware,
+            backend::budget::poll_backend_memory,
             backend::api_fuzz::api_fuzz_run,
         ])
         .build(tauri::generate_context!())

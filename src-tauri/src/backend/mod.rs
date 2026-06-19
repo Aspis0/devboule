@@ -3,6 +3,7 @@ pub mod api_fuzz;
 pub mod agents;
 pub mod agent_notifications;
 pub mod auth;
+pub mod budget;
 pub mod censor;
 pub mod changes;
 pub mod cli_agents;
