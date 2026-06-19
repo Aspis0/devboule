@@ -26,7 +26,24 @@ impl SamplingParams {
             top_p: 0.95,
             top_k: 20,
             thinking_budget: 2000,
+            // Per-TURN output budget. Phase 7: the agentic path intentionally does NOT use
+            // the one-shot caps (MAX_PROMPT_FILE_BYTES=32K front-load / OMLX_MAX_TOKENS_DEFAULT
+            // =6144) — it reads files on demand and the runaway guard is `max_rounds`, not a
+            // truncating token cap. 8192/turn is ample for one tool call or a final message.
             max_tokens: 8192,
+        }
+    }
+
+    /// Phase 7: use a registry model's per-model tuned sampling, falling back to `tuned()`
+    /// for any unset field. Connects the Phase-3 registry to the Phase-6 agentic transport.
+    pub fn from_registry(entry: &crate::backend::model_registry::ModelRegistryEntry) -> Self {
+        let d = Self::tuned();
+        Self {
+            temperature: entry.temperature.unwrap_or(d.temperature),
+            top_p: entry.top_p.unwrap_or(d.top_p),
+            top_k: entry.top_k.unwrap_or(d.top_k),
+            thinking_budget: entry.thinking_budget.unwrap_or(d.thinking_budget),
+            max_tokens: d.max_tokens,
         }
     }
 }
@@ -209,5 +226,27 @@ mod tests {
         assert_eq!(body["tool_choice"], json!("auto"));
         assert_eq!(body["thinking_budget"], json!(2000));
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+    }
+
+    #[test]
+    fn from_registry_uses_per_model_params_with_fallback() {
+        use crate::backend::model_registry::ModelRegistryEntry;
+        let entry = ModelRegistryEntry {
+            id: "m".into(),
+            backend: "omlx".into(),
+            size_bytes: 0,
+            tier: "agentic".into(),
+            roles: vec![],
+            enabled: true,
+            temperature: Some(0.3),
+            top_p: None,
+            top_k: Some(40),
+            thinking_budget: None,
+        };
+        let p = SamplingParams::from_registry(&entry);
+        assert_eq!(p.temperature, 0.3); // from entry
+        assert_eq!(p.top_p, 0.95); // fallback to tuned()
+        assert_eq!(p.top_k, 40); // from entry
+        assert_eq!(p.thinking_budget, 2000); // fallback to tuned()
     }
 }
