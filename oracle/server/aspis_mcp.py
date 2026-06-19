@@ -277,6 +277,8 @@ ROLE_RULES = [
         # stallare nel terminale.
         "plan": [
             "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare l'implementazione prima di status=\"approved\".",
+            "APPENA approvato (status=\"approved\") chiama SUBITO project_create_plan_tasks con la lista strutturata dei task: il Kanban ha ZERO task finche' non lo fai, quindi NON iniziare a scrivere codice prima. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per FASE del piano, ognuna {title, acceptance, scope:[file], dependsOn:[id dei task]}.",
+            "Calibra le domande sulla complessita': per un task non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per task semplici/ovvi salta le domande e pianifica direttamente. Non sovra-consultare su lavori banali.",
             "Se il piano viene rifiutato (status=\"rejected\") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.",
             "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
         ],
@@ -354,6 +356,8 @@ ROLE_RULES = [
         # l'approvazione umana — "mai full-auto non presidiato".
         "plan": [
             "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare la delega prima di status=\"approved\".",
+            "APPENA approvato (status=\"approved\") chiama SUBITO project_create_plan_tasks con UNA targhetta per FASE del piano: il Kanban ha ZERO task finche' non lo fai. Crea i task PRIMA di delegare, poi delega in ordine di dipendenza. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per fase, ognuna {title, acceptance, scope:[file], dependsOn:[id]}.",
+            "Calibra le domande sulla complessita': per un obiettivo non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per richieste semplici/ovvie pianifica direttamente senza sovra-consultare.",
             "Se il piano viene rifiutato (status=\"rejected\") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.",
             "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
         ],

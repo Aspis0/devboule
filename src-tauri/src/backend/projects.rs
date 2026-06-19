@@ -1579,10 +1579,10 @@ fn prepare_or_launch_project_agent(
             // id the PlansPanel queries (`project.metadata.id`), already normalized at
             // project creation. Without it the planner escalates instead of planning.
             project_id: project.metadata.id.clone(),
-            // 3b — "1" only when the launch input requested plan-first; empty otherwise
-            // so `orchestrator_env_pairs` omits DEVBOULE_PLAN_FIRST and the launch is
-            // byte-identical to a non-plan-first one.
-            plan_first: if input.plan_first.unwrap_or(false) {
+            // 3b — B5: plan-first defaults ON for the orchestrator (its PURPOSE is to plan,
+            // not to behave like a worker pulling existing tasks). The Spawn panel can still
+            // turn it OFF explicitly (Some(false)); only an unset input now defaults to ON.
+            plan_first: if input.plan_first.unwrap_or(true) {
                 "1".to_string()
             } else {
                 String::new()
@@ -2951,7 +2951,7 @@ fn project_agent_prompt(
             "Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence."
         }
         _ => {
-            "Plan and code. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck."
+            "Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Pass plan_id = the `planId` field returned by plan_submit, and tasks = one entry per plan PHASE, each {title, acceptance, scope:[files], dependsOn:[task ids]}. Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck."
         }
     };
     // Phase H — Censor launch-prompt addendum (complementary to the ROLE_RULES
