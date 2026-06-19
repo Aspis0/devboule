@@ -621,6 +621,7 @@ pub fn run() {
             backend::hardware::detect_hardware,
             backend::budget::poll_backend_memory,
             backend::budget::evaluate_local_spawn,
+            backend::budget::recommend_resource_config,
             backend::model_registry::get_model_registry,
             backend::model_registry::set_model_registry,
             backend::model_registry::discover_installed_models,

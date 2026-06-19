@@ -399,3 +399,114 @@ mod admission_tests {
         assert_eq!(admit_local_spawn(5 * GIB_U64, &budget, 5, 0), SpawnDecision::Admit);
     }
 }
+
+/// Phase 5 — recommended role→placement by hardware tier (PURE). The broker proposes a
+/// sensible default the user can apply/override: discrete-GPU machines are bounded by VRAM,
+/// unified/integrated by the RAM budget. Oracle (lightest) stays local in every tier.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendedConfig {
+    pub tier: String,
+    pub main_coder: String,
+    pub mini_coder: String,
+    pub censor: String,
+    pub oracle: String,
+    pub rationale: String,
+}
+
+pub fn recommend_config(hardware: &HardwareInfo, budget: &BudgetSummary) -> RecommendedConfig {
+    // discrete GPU → bounded by VRAM; unified/integrated/unknown → bounded by the RAM budget.
+    let avail_gib = if hardware.gpu_kind == "discrete" {
+        hardware.vram_gb.unwrap_or(0.0)
+    } else {
+        budget.budget_bytes as f64 / 1_073_741_824.0
+    };
+
+    let (tier, main_coder, mini_coder, censor, oracle) = if avail_gib < 6.0 {
+        ("minimal", "cloud", "cloud", "cloud", "local")
+    } else if avail_gib < 14.0 {
+        ("low", "cloud", "cloud", "local", "local")
+    } else if avail_gib < 40.0 {
+        ("mid", "cloud", "local", "local", "local")
+    } else {
+        ("high", "local", "local", "local", "local")
+    };
+
+    let rationale = format!(
+        "{tier} tier ({}, {avail_gib:.1} GiB usable): main={main_coder}, mini={mini_coder}, censor={censor}, oracle={oracle}",
+        hardware.gpu_kind
+    );
+
+    RecommendedConfig {
+        tier: tier.to_string(),
+        main_coder: main_coder.to_string(),
+        mini_coder: mini_coder.to_string(),
+        censor: censor.to_string(),
+        oracle: oracle.to_string(),
+        rationale,
+    }
+}
+
+/// Phase 5 command: the recommended config for THIS machine (polls the live budget).
+#[tauri::command]
+pub async fn recommend_resource_config() -> Result<RecommendedConfig, String> {
+    let snapshot = poll_backend_memory().await?;
+    Ok(recommend_config(&snapshot.hardware, &snapshot.budget))
+}
+
+#[cfg(test)]
+mod recommend_tests {
+    use super::*;
+
+    const GIB_U64: u64 = 1_073_741_824;
+
+    fn bud(total_gib: u64, budget_gib: u64) -> BudgetSummary {
+        BudgetSummary {
+            total_ram_bytes: total_gib * GIB_U64,
+            reserve_bytes: (total_gib.saturating_sub(budget_gib)) * GIB_U64,
+            budget_bytes: budget_gib * GIB_U64,
+            omlx_used_bytes: 0,
+            ollama_used_bytes: 0,
+            used_bytes: 0,
+            free_bytes: budget_gib * GIB_U64,
+        }
+    }
+
+    fn hw(gpu_kind: &str, vram_gb: Option<f64>, ram_total_gb: f64) -> HardwareInfo {
+        HardwareInfo {
+            cpu_cores: 8,
+            ram_total_gb,
+            ram_available_gb: ram_total_gb,
+            gpu_name: "test".to_string(),
+            vram_gb,
+            gpu_kind: gpu_kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn discrete_6gb_vram_is_low() {
+        let c = recommend_config(&hw("discrete", Some(6.0), 16.0), &bud(16, 8));
+        assert_eq!(c.tier, "low");
+        assert_eq!(c.censor, "local");
+        assert_eq!(c.main_coder, "cloud");
+    }
+
+    #[test]
+    fn unified_64gib_is_high_all_local() {
+        let c = recommend_config(&hw("integrated", None, 64.0), &bud(64, 56));
+        assert_eq!(c.tier, "high");
+        assert_eq!(c.main_coder, "local");
+        assert_eq!(c.mini_coder, "local");
+        assert_eq!(c.censor, "local");
+        assert_eq!(c.oracle, "local");
+    }
+
+    #[test]
+    fn tiny_is_minimal_censor_cloud() {
+        let c = recommend_config(&hw("integrated", None, 8.0), &bud(8, 5));
+        assert_eq!(c.tier, "minimal");
+        assert_eq!(c.censor, "cloud");
+        assert_eq!(c.main_coder, "cloud");
+        assert_eq!(c.oracle, "local");
+    }
+}
