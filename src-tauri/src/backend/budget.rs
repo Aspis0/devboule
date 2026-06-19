@@ -1,4 +1,4 @@
-//! Resource broker — live backend memory sensing (Phase 1).
+//! Resource broker — live backend memory sensing + global budget (Phase 1–2).
 //!
 //! Read-only probes of the local inference backends so the app can aggregate a
 //! global memory picture across oMLX + Ollama (each backend only knows its own
@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::hardware::HardwareInfo;
 use crate::backend::provider_detect::probe_get;
+
+/// 1 GiB in bytes (binary). sysinfo / oMLX / Ollama all denominate in binary units,
+/// so all RAM math here is GiB-based — NOT SI 1e9.
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Default RAM reserved for OS + app + Oracle (the non-model headroom): 8 GiB. Observe-only
+/// default; becomes a Settings value in Phase 3.
+const DEFAULT_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// oMLX engine-pool snapshot from `GET :8000/health` → `engine_pool`. oMLX keeps
 /// multiple models resident under a self-imposed `final_ceiling`; these are the
@@ -105,18 +113,77 @@ pub async fn probe_ollama_ps(client: &reqwest::Client) -> Option<OllamaPs> {
     Some(OllamaPs { models })
 }
 
-/// Aggregated, app-owned view across BOTH local backends + the machine. The app is
-/// the global accountant because each backend only knows its own pool (oMLX `/health`
-/// vs Ollama `/api/ps`); a down backend is `None`, not an error.
+/// Global budget accountant (Phase 2). The app owns this because each backend only
+/// reports its own pool — `used` = oMLX resident bytes + Σ Ollama loaded bytes, and
+/// `budget` = total RAM minus a reserve (OS + app + Oracle headroom). All saturating.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetSummary {
+    pub total_ram_bytes: u64,
+    pub reserve_bytes: u64,
+    pub budget_bytes: u64,
+    pub omlx_used_bytes: u64,
+    pub ollama_used_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// PURE: compute the global budget from the measured backend memory. No I/O.
+pub fn compute_budget(
+    hardware: &HardwareInfo,
+    omlx: &Option<OmlxHealth>,
+    ollama: &Option<OllamaPs>,
+    reserve_bytes: u64,
+) -> BudgetSummary {
+    // ram_total_gb is GiB (sysinfo bytes / 1024^3) → multiply by GiB, NOT 1e9. Guard
+    // against a non-finite/negative value (would otherwise cast to u64::MAX / 0).
+    let total_ram_bytes = if hardware.ram_total_gb.is_finite() && hardware.ram_total_gb >= 0.0 {
+        (hardware.ram_total_gb * GIB) as u64
+    } else {
+        0
+    };
+    let omlx_used_bytes = omlx
+        .as_ref()
+        .map(|o| o.current_model_memory_bytes)
+        .unwrap_or(0);
+    // saturating fold (not sum()) so a hostile/buggy Ollama size can't overflow-panic in debug.
+    let ollama_used_bytes = ollama
+        .as_ref()
+        .map(|o| {
+            o.models
+                .iter()
+                .fold(0u64, |acc, m| acc.saturating_add(m.size_bytes))
+        })
+        .unwrap_or(0);
+
+    let used_bytes = omlx_used_bytes.saturating_add(ollama_used_bytes);
+    let budget_bytes = total_ram_bytes.saturating_sub(reserve_bytes);
+    let free_bytes = budget_bytes.saturating_sub(used_bytes);
+
+    BudgetSummary {
+        total_ram_bytes,
+        reserve_bytes,
+        budget_bytes,
+        omlx_used_bytes,
+        ollama_used_bytes,
+        used_bytes,
+        free_bytes,
+    }
+}
+
+/// Aggregated, app-owned view across BOTH local backends + the machine + the budget.
+/// The app is the global accountant because each backend only knows its own pool
+/// (oMLX `/health` vs Ollama `/api/ps`); a down backend is `None`, not an error.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendMemorySnapshot {
     pub hardware: HardwareInfo,
     pub omlx: Option<OmlxHealth>,
     pub ollama: Option<OllamaPs>,
+    pub budget: BudgetSummary,
 }
 
-/// Live resource snapshot for the UI: hardware + whatever each local backend reports.
+/// Live resource snapshot for the UI: hardware + per-backend status + the global budget.
 /// Only a missing probe client is an error; a backend being down just yields `None`.
 ///
 /// UNGATED (like `detect_hardware`/`detect_providers`): returns non-secret machine +
@@ -135,9 +202,73 @@ pub async fn poll_backend_memory() -> Result<BackendMemorySnapshot, String> {
         .await
         .map_err(|e| format!("hardware probe failed: {e}"))?;
 
+    let budget = compute_budget(&hardware, &omlx, &ollama, DEFAULT_RESERVE_BYTES);
+
     Ok(BackendMemorySnapshot {
         hardware,
         omlx,
         ollama,
+        budget,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hw(ram_total_gb: f64) -> HardwareInfo {
+        HardwareInfo {
+            cpu_cores: 10,
+            ram_total_gb,
+            ram_available_gb: ram_total_gb,
+            gpu_name: "test".to_string(),
+            vram_gb: None,
+            gpu_kind: "integrated".to_string(),
+        }
+    }
+
+    const GIB_U64: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn compute_budget_uses_binary_gib_and_saturates() {
+        let omlx = Some(OmlxHealth {
+            loaded_count: 0,
+            model_count: 0,
+            final_ceiling_bytes: 0,
+            current_model_memory_bytes: 40_000_000_000,
+        });
+        let ollama = Some(OllamaPs {
+            models: vec![
+                OllamaLoadedModel { name: "m1".into(), size_bytes: 8_000_000_000, size_vram_bytes: 0 },
+                OllamaLoadedModel { name: "m2".into(), size_bytes: 2_000_000_000, size_vram_bytes: 0 },
+            ],
+        });
+        let reserve = 8 * GIB_U64;
+        let s = compute_budget(&hw(64.0), &omlx, &ollama, reserve);
+        // 64 GiB in BYTES — not 64e9. This assertion is the GiB-vs-GB regression guard.
+        assert_eq!(s.total_ram_bytes, 64 * GIB_U64);
+        assert_eq!(s.used_bytes, 50_000_000_000);
+        assert_eq!(s.budget_bytes, 64 * GIB_U64 - reserve);
+        assert_eq!(s.free_bytes, 64 * GIB_U64 - reserve - 50_000_000_000);
+
+        // used > budget → free saturates to 0
+        let heavy = Some(OmlxHealth {
+            loaded_count: 0,
+            model_count: 0,
+            final_ceiling_bytes: 0,
+            current_model_memory_bytes: 60_000_000_000,
+        });
+        let s2 = compute_budget(&hw(64.0), &heavy, &ollama, reserve);
+        assert_eq!(s2.free_bytes, 0);
+    }
+
+    #[test]
+    fn compute_budget_handles_down_backends() {
+        let reserve = 8 * GIB_U64;
+        let s = compute_budget(&hw(16.0), &None, &None, reserve);
+        assert_eq!(s.used_bytes, 0);
+        assert_eq!(s.total_ram_bytes, 16 * GIB_U64);
+        assert_eq!(s.budget_bytes, 16 * GIB_U64 - reserve);
+        assert_eq!(s.free_bytes, 16 * GIB_U64 - reserve);
+    }
 }
