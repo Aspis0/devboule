@@ -2,6 +2,7 @@ pub mod agent_pty;
 pub mod api_fuzz;
 pub mod agents;
 pub mod agent_notifications;
+pub mod agentic_loop;
 pub mod auth;
 pub mod budget;
 pub mod censor;
