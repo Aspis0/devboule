@@ -264,11 +264,15 @@ function CollapsibleGroup({
   children: React.ReactNode;
 }) {
   const [isOpen, setIsOpen] = useState(defaultOpen);
+  // B-F8 (a11y): stable id linking the header button to the content it toggles.
+  const contentId = `group-${title.replace(/\s+/g, "-").toLowerCase()}`;
   return (
     <section className="space-y-2">
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
+        aria-controls={contentId}
         className="flex w-full items-center justify-between gap-2 rounded-2xl border border-cream-200 bg-cream-50/60 px-4 py-3 text-left"
       >
         <span className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
@@ -283,7 +287,9 @@ function CollapsibleGroup({
       {/* B-F4: keep children MOUNTED when collapsed (display-toggle, not unmount) so a
           half-filled form — an Oracle API key, an in-progress MCP consent dialog — is not
           silently destroyed when the group is collapsed. Matches pre-S1 mount behaviour. */}
-      <div className={isOpen ? "mt-4 space-y-6" : "hidden"}>{children}</div>
+      <div id={contentId} className={isOpen ? "mt-4 space-y-6" : "hidden"}>
+        {children}
+      </div>
     </section>
   );
 }

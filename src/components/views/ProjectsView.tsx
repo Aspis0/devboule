@@ -2064,7 +2064,9 @@ export function ProjectsView() {
           />
           <button
             onClick={() => void pickProjectFolder()}
-            disabled={isBusy}
+            // B-F7: the native folder dialog only exists in the Tauri runtime — disable in the
+            // browser harness (where the dynamic import would silently no-op).
+            disabled={isBusy || !isTauriRuntime()}
             title={newProjectRootDraft || "Choose the working folder the agent reads/writes in"}
             data-help-title="Choose the project's working folder."
             data-help-lines="The agent reads + writes code in THIS folder.|Without a working folder the project can't run tools — project_structure, visual_check, and Censor all need a root.|Pick the repo/folder the coder should work in.|This is the one thing to set here; the rest is configured in Settings."
