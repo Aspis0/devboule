@@ -3,6 +3,7 @@ pub mod api_fuzz;
 pub mod agents;
 pub mod agent_notifications;
 pub mod agentic_loop;
+pub mod agentic_runner;
 pub mod agentic_tools;
 pub mod agentic_transport;
 pub mod auth;
