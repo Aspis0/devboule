@@ -159,6 +159,7 @@ describe("ProvidersModelsTab", () => {
 
   it("renders all per-role card sections", async () => {
     await mount();
+    // S1: the default-open groups render their cards immediately.
     expect(
       container.querySelector('[data-testid="censor-model-card"]'),
     ).not.toBeNull();
@@ -175,13 +176,20 @@ describe("ProvidersModelsTab", () => {
       container.querySelector('[data-testid="mini-write-behavior-card"]'),
     ).not.toBeNull();
     expect(
+      container.querySelector('[data-testid="exa-search-key-card"]'),
+    ).not.toBeNull();
+    // The "Oracle & design" group is collapsed by default — expand it, then assert.
+    const btn = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("Oracle & design"),
+    );
+    await act(async () => {
+      btn?.click();
+    });
+    expect(
       container.querySelector('[data-testid="oracle-llm-card"]'),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="design-llm-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="exa-search-key-card"]'),
     ).not.toBeNull();
   });
 
