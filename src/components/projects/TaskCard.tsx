@@ -149,6 +149,7 @@ export function TaskCard({
 
   return (
     <article
+      data-task-id={task.id}
       className={`rounded-lg border bg-white p-3 shadow-soft-sm ${taskTone(task)}`}
     >
       <div className="flex items-start justify-between gap-2">

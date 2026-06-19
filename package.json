@@ -23,6 +23,7 @@
     "dompurify": "^3.4.8",
     "gsap": "^3.15.0",
     "lucide-react": "^0.460.0",
+    "perfect-arrows": "^0.3.7",
     "pixi-filters": "^6.1.5",
     "pixi-viewport": "^6.0.3",
     "pixi.js": "^8.18.1",

@@ -83,6 +83,7 @@ import { buildWorkflowLaunchInput } from "../agents/savedWorkflowModel";
 import { ProjectStatusHeader } from "../projects/ProjectStatusHeader";
 import { ProjectNotes } from "../projects/ProjectNotes";
 import { TaskCard } from "../projects/TaskCard";
+import { TaskDependencyArrows } from "../projects/TaskDependencyArrows";
 import {
   TASK_CATEGORIES,
   categoryLabel,
@@ -170,6 +171,8 @@ export function ProjectsView() {
   // (default) vs. a simple read-only list of archived projects. Purely a view
   // sub-state of board mode; it never affects Work mode or the selection.
   const [overviewTab, setOverviewTab] = useState<"board" | "archived">("board");
+  // Frecce (Phase 17): show/hide the dependency-arrow overlay on the task board.
+  const [showArrows, setShowArrows] = useState(true);
   const [project, setProject] = useState<ProjectDetail | null>(null);
   // Inline status for the Work-mode Commit/Push controls (success or git stderr).
   const [gitActionMessage, setGitActionMessage] = useState<string | null>(null);
@@ -1707,8 +1710,29 @@ export function ProjectsView() {
         )}
       </div>
       )}
+      {!isArchived && (
+        <div className="mb-2 flex items-center justify-end">
+          <button
+            type="button"
+            onClick={() => setShowArrows((v) => !v)}
+            aria-pressed={showArrows}
+            title="Toggle the dependency arrows on the board"
+            className={`rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+              showArrows
+                ? "border-terracotta bg-terracotta text-white"
+                : "border-cream-200 text-cream-600 hover:bg-cream-50"
+            }`}
+          >
+            {showArrows ? "Arrows: on" : "Arrows: off"}
+          </button>
+        </div>
+      )}
       <div className="overflow-x-auto pb-2">
-        <div className="grid min-w-[1080px] grid-cols-5 gap-3">
+        <div className="relative grid min-w-[1080px] grid-cols-5 gap-3">
+          <TaskDependencyArrows
+            tasks={currentProject?.state.tasks ?? []}
+            visible={showArrows && !isArchived}
+          />
           {columns.map((column) => {
             const Icon = column.icon;
             const items = tasksByColumn[column.id];
