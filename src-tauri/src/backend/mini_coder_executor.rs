@@ -3766,6 +3766,21 @@ struct MiniOracleAccess<'a> {
     launch_token: &'a str,
 }
 
+/// Q1 — the per-MODEL-FAMILY thinking-control line injected into the mini prompt. Gemma and
+/// Cohere/North-Mini have NO `thinking_budget` param (passing it is a no-op), so their reasoning
+/// is bounded HERE, in the prompt (a brevity instruction — docs/local-model-sampling-defaults
+/// measured −42% reasoning on gemma). Qwen is bounded via the `enable_thinking` request-body
+/// param (see build_omlx_run_*), so it gets NO prompt line. Unknown models: none.
+pub(crate) fn mini_thinking_directive(model: Option<&str>) -> &'static str {
+    let m = model.unwrap_or("").to_ascii_lowercase();
+    if m.contains("gemma") || m.contains("north") {
+        "Think BRIEFLY before acting — at most a short paragraph of reasoning, then do the task. \
+         Do not produce a long chain of thought.\n\n"
+    } else {
+        ""
+    }
+}
+
 fn build_mini_prompt(
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
@@ -3788,6 +3803,11 @@ You will be given a TASK at the END of this prompt. Do EXACTLY that task, on \
 ONLY the listed files, then finish. You run once and exit; you cannot ask \
 follow-up questions interactively.\n\n",
     );
+    // Q1: per-MODEL-FAMILY thinking control. Gemma + Cohere/North have no thinking_budget
+    // param (it's a no-op), so we bound their reasoning HERE in the prompt; Qwen is bounded via
+    // the enable_thinking request-body param, so it gets no line. (Right after the stable
+    // identity sentence so the cache-prefix is unaffected; the directive is model-stable.)
+    prompt.push_str(mini_thinking_directive(backend.model.as_deref()));
 
     // FIX 4 (prompt cache-friendliness): the STABLE blocks come first so the
     // mlx-lm/oMLX server can auto-cache the longest stable prefix across the
@@ -8576,6 +8596,19 @@ mod tests {
             build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
                 .unwrap_err();
         assert_eq!(err, "Apple on-device requires macOS 27+.");
+    }
+
+    #[test]
+    fn mini_thinking_directive_branches_by_family() {
+        // Q1: Gemma + North-Mini (no thinking_budget param) get the in-prompt brevity directive.
+        assert!(
+            mini_thinking_directive(Some("gemma-4-26B-A4B-it-OptiQ-4bit")).contains("BRIEFLY")
+        );
+        assert!(mini_thinking_directive(Some("North-Mini-Code-1.0-4bit")).contains("BRIEFLY"));
+        // Qwen (bounded via the enable_thinking param) + unknown + None get NO prompt line.
+        assert_eq!(mini_thinking_directive(Some("Qwen3.6-35B-A3B-4bit-DWQ")), "");
+        assert_eq!(mini_thinking_directive(Some("llama3.1")), "");
+        assert_eq!(mini_thinking_directive(None), "");
     }
 
     #[cfg(windows)]

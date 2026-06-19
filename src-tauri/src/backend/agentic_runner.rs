@@ -145,11 +145,28 @@ pub fn run_agentic_coder(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(LoopOutcome, Vec<String>), String> {
     let tools = default_tool_definitions();
+    // Q1: append the per-MODEL-FAMILY thinking directive to the house-rules system prompt.
+    // Gemma/North have no thinking_budget param, so their reasoning is bounded in the prompt;
+    // Qwen (param-controlled) gets an empty directive → system unchanged. Computed from `&model`
+    // BEFORE it is moved into HttpAgentLlm.
+    let dir = crate::backend::mini_coder_executor::mini_thinking_directive(Some(&model));
+    let effective_system = if dir.is_empty() {
+        system.to_string()
+    } else {
+        format!("{system}\n{dir}")
+    };
     let mut llm = HttpAgentLlm::new(base_url, model, tools, params, enable_thinking)?;
     // Reads are project-wide (for context); WRITES are confined to the directive's file
     // allowlist (empty = no extra restriction beyond the root).
     let mut fs_tools = ScopedAgentTools::new(root).with_write_allowlist(write_allowlist);
-    let outcome = run_agent_loop(&mut llm, &mut fs_tools, system, task, max_rounds, cancel);
+    let outcome = run_agent_loop(
+        &mut llm,
+        &mut fs_tools,
+        &effective_system,
+        task,
+        max_rounds,
+        cancel,
+    );
     let touched = fs_tools.touched().to_vec();
     Ok((outcome, touched))
 }
