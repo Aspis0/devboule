@@ -139,6 +139,83 @@ impl ScopedAgentTools {
     }
 }
 
+const MAX_WRITE_BYTES: usize = 1024 * 1024;
+
+impl ScopedAgentTools {
+    /// WRITE-safe resolver (stricter than `resolve`): the parent dir MUST exist and
+    /// canonicalize UNDER the root (blocks writing through a symlinked-out ancestor), and
+    /// an existing target must NOT be a symlink (blocks overwriting through a symlink-out).
+    fn write_resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        let safe = safe_rel_path(rel)?;
+        if safe == "." {
+            return Err("cannot write to the scope root".to_string());
+        }
+        let full = self.root.join(&safe);
+        let parent = full.parent().ok_or_else(|| "invalid path".to_string())?;
+        if !parent.exists() {
+            return Err("parent directory does not exist".to_string());
+        }
+        let canon_root = self.canon_root()?;
+        let canon_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        if !canon_parent.starts_with(&canon_root) {
+            return Err("path escapes scope".to_string());
+        }
+        if full.exists() {
+            if fs::symlink_metadata(&full).map(|m| m.is_symlink()).unwrap_or(true) {
+                return Err("refusing to write through a symlink".to_string());
+            }
+            let canon_full = full.canonicalize().map_err(|e| e.to_string())?;
+            if !canon_full.starts_with(&canon_root) {
+                return Err("path escapes scope".to_string());
+            }
+            // A hardlink (nlink > 1) shares an inode with a possibly out-of-scope file;
+            // canonicalize resolves dir symlinks, NOT inode aliases, so it can't detect it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if fs::metadata(&full).map(|m| m.nlink() > 1).unwrap_or(true) {
+                    return Err("refusing to write to a hardlinked file".to_string());
+                }
+            }
+        }
+        // Residual TOCTOU: a concurrent rename of the verified parent between this check and
+        // the actual fs::write could defeat the scope (low risk in a single-user desktop app;
+        // not the semi-trusted-LLM threat model). cap-std / openat(O_NOFOLLOW) is the
+        // structural fix — a documented follow-up before multi-tenant use.
+        Ok(full)
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> Result<String, String> {
+        if content.len() > MAX_WRITE_BYTES {
+            return Err("content too large".to_string());
+        }
+        let p = self.write_resolve(path)?;
+        fs::write(&p, content).map_err(|e| e.to_string())?;
+        Ok(format!("wrote {} bytes to {}", content.len(), p.display()))
+    }
+
+    fn edit_file(&self, path: &str, old: &str, new: &str) -> Result<String, String> {
+        if old.is_empty() {
+            return Err("old_string cannot be empty".to_string());
+        }
+        let p = self.write_resolve(path)?;
+        // OOM guard: don't read an arbitrarily large in-scope file into memory.
+        if fs::metadata(&p).map(|m| m.len() > MAX_WRITE_BYTES as u64).unwrap_or(true) {
+            return Err("file too large to edit".to_string());
+        }
+        let content = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+        let n = content.matches(old).count();
+        if n == 0 {
+            return Err("old_string not found".to_string());
+        }
+        if n > 1 {
+            return Err(format!("old_string is not unique ({n} matches)"));
+        }
+        fs::write(&p, content.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+        Ok(format!("edited {}", p.display()))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_grep(
     dir: &Path,
@@ -204,6 +281,20 @@ impl AgentTools for ScopedAgentTools {
                 let pattern =
                     args["pattern"].as_str().ok_or_else(|| "missing 'pattern'".to_string())?;
                 self.grep(pattern, args["path"].as_str().unwrap_or("."))
+            }
+            "write_file" => {
+                let path = args["path"].as_str().ok_or_else(|| "missing 'path'".to_string())?;
+                let content =
+                    args["content"].as_str().ok_or_else(|| "missing 'content'".to_string())?;
+                self.write_file(path, content)
+            }
+            "edit_file" => {
+                let path = args["path"].as_str().ok_or_else(|| "missing 'path'".to_string())?;
+                let old =
+                    args["oldString"].as_str().ok_or_else(|| "missing 'oldString'".to_string())?;
+                let new =
+                    args["newString"].as_str().ok_or_else(|| "missing 'newString'".to_string())?;
+                self.edit_file(path, old, new)
             }
             other => Err(format!("tool not available: {other}")),
         }
@@ -271,5 +362,84 @@ mod tests {
         assert!(out.contains("…[truncated]"));
         assert!(out.len() < big.len());
         let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod write_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    // Unique temp dir per call (atomic counter, NOT line!() — tests run in parallel).
+    fn unique_root() -> (PathBuf, PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("aspis_aw_{}_{}", std::process::id(), n));
+        let root = tmp.join("root");
+        let outside = tmp.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        (root, tmp)
+    }
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let (root, tmp) = unique_root();
+        let mut tools = ScopedAgentTools::new(root);
+        tools.call("write_file", r#"{"path":"test.txt","content":"hello world"}"#).unwrap();
+        let back = tools.call("read_file", r#"{"path":"test.txt"}"#).unwrap();
+        assert_eq!(back, "hello world");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_replaces_unique_occurrence() {
+        let (root, tmp) = unique_root();
+        fs::write(root.join("edit.txt"), "original content").unwrap();
+        let mut tools = ScopedAgentTools::new(root.clone());
+        tools
+            .call("edit_file", r#"{"path":"edit.txt","oldString":"original","newString":"updated"}"#)
+            .unwrap();
+        assert_eq!(fs::read_to_string(root.join("edit.txt")).unwrap(), "updated content");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_rejects_non_unique() {
+        let (root, tmp) = unique_root();
+        fs::write(root.join("multi.txt"), "a a a").unwrap();
+        let mut tools = ScopedAgentTools::new(root);
+        let res = tools.call("edit_file", r#"{"path":"multi.txt","oldString":"a","newString":"b"}"#);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not unique"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_through_symlink_out_is_refused() {
+        let (root, tmp) = unique_root();
+        std::os::unix::fs::symlink(tmp.join("outside"), root.join("link")).unwrap();
+        let mut tools = ScopedAgentTools::new(root);
+        let res = tools.call("write_file", r#"{"path":"link/escaped.txt","content":"data"}"#);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("escapes scope"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_to_hardlinked_file_is_refused() {
+        let (root, tmp) = unique_root();
+        let secret = tmp.join("outside").join("secret.txt");
+        fs::write(&secret, "SECRET").unwrap();
+        // A hardlink inside the scope sharing the outside file's inode.
+        std::fs::hard_link(&secret, root.join("inside_link.txt")).unwrap();
+        let mut tools = ScopedAgentTools::new(root);
+        let res = tools.call("write_file", r#"{"path":"inside_link.txt","content":"clobber"}"#);
+        assert!(res.is_err(), "writing a hardlinked file must be refused");
+        assert!(res.unwrap_err().contains("hardlink"));
+        // The outside inode must be untouched.
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "SECRET");
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
