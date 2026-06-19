@@ -381,17 +381,30 @@ pub async fn run_tasks(
     Err("runner exceeded its iteration bound (internal invariant violated)".to_string())
 }
 
+/// The set of FINISHED (review/done) task ids — the dependency-satisfaction basis.
+fn finished_ids(plan: &[TaskView]) -> HashSet<&str> {
+    plan.iter()
+        .filter(|t| t.status == STATUS_REVIEW || t.status == STATUS_DONE)
+        .map(|t| t.id.as_str())
+        .collect()
+}
+
+/// W3: the ONE dependency rule, shared by `next_runnable` (one ready) and `ready_batch` (all
+/// ready) so they can never diverge. A task is READY when its status is `todo`/`wip` AND every
+/// `depends_on` id resolves to a finished (review/done) task. A dep id absent from the plan is
+/// UNSATISFIED (cannot be confirmed finished), so the task waits.
+fn task_is_ready(t: &TaskView, finished: &HashSet<&str>) -> bool {
+    (t.status == STATUS_TODO || t.status == STATUS_WIP)
+        && t.depends_on.iter().all(|d| finished.contains(d.as_str()))
+}
+
+/// All indices that are READY — the multi-result peer of `next_runnable`'s Ready case.
 fn ready_batch(plan: &[TaskView]) -> Vec<usize> {
+    let finished = finished_ids(plan);
     plan.iter()
         .enumerate()
-        .filter_map(|(i, t)| {
-            if t.status == STATUS_TODO || t.status == STATUS_WIP {
-                let deps_met = t.depends_on
-                    .iter()
-                    .all(|dep_id| plan.iter().any(|t2| t2.id == *dep_id && (t2.status == STATUS_REVIEW || t2.status == STATUS_DONE)));
-                if deps_met { Some(i) } else { None }
-            } else { None }
-        })
+        .filter(|(_, t)| task_is_ready(t, &finished))
+        .map(|(i, _)| i)
         .collect()
 }
 
@@ -549,11 +562,7 @@ fn select_active_plan(views: &[TaskView]) -> Option<String> {
 /// never ready. A dep id not present in the plan is treated as UNSATISFIED (it cannot be
 /// confirmed finished), so the task waits rather than runs prematurely.
 fn next_runnable(plan: &[TaskView]) -> Frontier {
-    let finished: HashSet<&str> = plan
-        .iter()
-        .filter(|t| t.status == STATUS_REVIEW || t.status == STATUS_DONE)
-        .map(|t| t.id.as_str())
-        .collect();
+    let finished = finished_ids(plan);
 
     let mut non_finished_exists = false;
     let mut first_blocked: Option<usize> = None;
@@ -563,9 +572,7 @@ fn next_runnable(plan: &[TaskView]) -> Frontier {
             continue;
         }
         non_finished_exists = true;
-        let runnable_status = t.status == STATUS_TODO || t.status == STATUS_WIP;
-        let deps_ok = t.depends_on.iter().all(|d| finished.contains(d.as_str()));
-        if runnable_status && deps_ok {
+        if task_is_ready(t, &finished) {
             return Frontier::Ready(i);
         }
         if t.status == STATUS_BLOCKED && first_blocked.is_none() {
