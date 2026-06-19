@@ -156,8 +156,11 @@ pub fn create_project(
         title,
         status,
         updated_at: now.clone(),
-        root_path: validate_project_root_for_save(input.root_path.as_deref())?
-            .or_else(|| default_agent_root().map(|path| path.to_string_lossy().into_owned())),
+        // R1: store ONLY the explicitly-chosen working folder (the create folder picker). NO
+        // silent default — a no-folder project stays root_path=None and the user is prompted to
+        // set one before launch (resolve_project_agent_root errors clearly), instead of getting
+        // a surprise default (~/Desktop/aspis bio) or the app's own dir.
+        root_path: validate_project_root_for_save(input.root_path.as_deref())?,
         // BLOCKER B: a freshly created project is UNTRUSTED for Censor by default;
         // the user must explicitly opt in via `set_censor_trusted`.
         censor_trusted: false,
@@ -2352,18 +2355,14 @@ fn resolve_project_agent_root(project: &ParsedProject) -> Result<PathBuf, String
             .map(PathBuf::from)
             .ok_or_else(|| "Agent root could not be resolved.".to_string());
     }
-    let root = default_agent_root()
-        .or_else(|| {
-            project
-                .path
-                .parent()
-                .and_then(|path| path.parent())
-                .map(PathBuf::from)
-        })
-        .ok_or_else(|| "Agent root could not be resolved.".to_string())?;
-    validate_project_root_for_save(root.to_str())?
-        .map(PathBuf::from)
-        .ok_or_else(|| "Agent root could not be resolved.".to_string())
+    // R1: do NOT silently fall back to a default or to the app's OWN directory — that fallback
+    // wrote project artifacts into the app repo and left project_structure/visual_check/Censor
+    // inert ("no working root"). Require an explicit working folder (set at project creation via
+    // the folder picker, or later in the project settings).
+    Err("This project has no working folder configured. Open the project and choose its working \
+         folder — the directory the agent reads from and writes to (project_structure, \
+         visual_check, and Censor all require it)."
+        .to_string())
 }
 
 /// Resolve a project's agent working root by project id. Used by the mini-coder
@@ -7052,6 +7051,25 @@ fn reject_broad_project_root(path: &Path) -> Result<(), String> {
             return Err("Agent working root cannot be a Windows system folder.".into());
         }
     }
+    // R1/F5: on macOS/Linux refuse the filesystem root or the whole home/Desktop as a working
+    // root (the folder picker makes these one-click reachable; USERPROFILE above is Windows-only).
+    #[cfg(not(windows))]
+    {
+        if raw == "/" {
+            return Err("Agent working root is too broad.".into());
+        }
+        if let Some(home) =
+            std::env::var_os("HOME").map(PathBuf::from).and_then(|p| p.canonicalize().ok())
+        {
+            if same_path(path, &home) {
+                return Err("Agent working root cannot be the whole home directory.".into());
+            }
+            let desktop = home.join("Desktop");
+            if desktop.is_dir() && same_path(path, &desktop) {
+                return Err("Agent working root cannot be the whole Desktop.".into());
+            }
+        }
+    }
     // FIX 4 (defense-in-depth confinement): refuse a clone/working-root that lands
     // inside a per-user or system data location. A caller-supplied dest_parent under
     // e.g. %APPDATA%\...\Startup could drop an auto-run repo; %TEMP% is world-ish and
@@ -7129,21 +7147,6 @@ fn path_is_under_forbidden_ancestor(path: &Path, forbidden: &[PathBuf]) -> bool 
 fn same_path(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
-fn default_agent_root() -> Option<PathBuf> {
-    // `USERPROFILE` is Windows-only; macOS/Linux use `HOME`. Without the fallback
-    // the Desktop probe is silently empty on Mac (mirrors vault.rs / python_oracle.rs).
-    let profile = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)?;
-    for name in ["aspis bio", "Aspis Bio", "aspis-bio"] {
-        let path = profile.join("Desktop").join(name);
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-    None
 }
 
 fn normalize_task_status(value: &str) -> Result<String, String> {

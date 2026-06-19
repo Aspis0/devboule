@@ -5,6 +5,7 @@ import {
   Circle,
   Clock3,
   FolderKanban,
+  FolderOpen,
   GitBranch,
   Play,
   Plus,
@@ -179,6 +180,8 @@ export function ProjectsView() {
   const [gitActionError, setGitActionError] = useState(false);
   const [gitActionBusy, setGitActionBusy] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
+  // R1: the project's working folder, chosen at creation (the agent reads/writes here).
+  const [newProjectRootDraft, setNewProjectRootDraft] = useState("");
   // Clone-from-GitHub dialog (board): open flag, pasted URL draft, busy + error.
   const [cloneOpen, setCloneOpen] = useState(false);
   const [cloneUrlDraft, setCloneUrlDraft] = useState("");
@@ -847,15 +850,36 @@ export function ProjectsView() {
     }
   };
 
+  // R1: native folder picker for the project working root (mirrors SkillsView/DesignView).
+  const pickProjectFolder = async () => {
+    let picked: string | null = null;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const result = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose the project working folder",
+      });
+      if (typeof result === "string" && result.trim()) picked = result.trim();
+    } catch {
+      // Dialog unavailable or dismissed — no-op (no feedback needed for a cancel).
+    }
+    if (picked !== null) setNewProjectRootDraft(picked);
+  };
+
   const createProject = async () => {
     const title = titleDraft.trim();
     if (!title || busyRef.current) return;
     const detail = await runMutation(() =>
       invokeBackendCommand<ProjectDetail>("create_project", {
-        input: { title, status: "active" },
+        // R1: pass the chosen working folder so tools/agents key off it (not the app dir).
+        input: { title, status: "active", rootPath: newProjectRootDraft.trim() || null },
       }),
     );
-    if (detail) setTitleDraft("");
+    if (detail) {
+      setTitleDraft("");
+      setNewProjectRootDraft("");
+    }
   };
 
   // Board: clone a GitHub repo and register it as a project, then dive into Work
@@ -1951,10 +1975,25 @@ export function ProjectsView() {
             className="min-w-0 w-full rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200 sm:w-60"
           />
           <button
+            onClick={() => void pickProjectFolder()}
+            disabled={isBusy}
+            title={newProjectRootDraft || "Choose the working folder the agent reads/writes in"}
+            data-help-title="Choose the project's working folder."
+            data-help-lines="The agent reads + writes code in THIS folder.|Without a working folder the project can't run tools — project_structure, visual_check, and Censor all need a root.|Pick the repo/folder the coder should work in.|This is the one thing to set here; the rest is configured in Settings."
+            className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 disabled:opacity-60"
+          >
+            <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+            <span className="max-w-[12rem] truncate">
+              {newProjectRootDraft
+                ? (newProjectRootDraft.split(/[\\/]/).filter(Boolean).pop() ?? newProjectRootDraft)
+                : "Choose folder"}
+            </span>
+          </button>
+          <button
             onClick={() => void createProject()}
             disabled={isBusy || !titleDraft.trim()}
             data-help-title="This creates a new project Markdown file."
-            data-help-lines="The new project starts active and appears on the stage board.|It does not launch agents by itself.|After creation, set the agent root if coding should happen outside this app folder.|Oracle can index the project file after the watcher sees it."
+            data-help-lines="The new project starts active and appears on the stage board.|It does not launch agents by itself.|Choose the working folder (button at left) before creating — agents cannot run without one; there is no app-folder fallback.|Oracle can index the project file after the watcher sees it."
             className="inline-flex items-center gap-2 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
           >
             <Plus className="h-3.5 w-3.5" />
