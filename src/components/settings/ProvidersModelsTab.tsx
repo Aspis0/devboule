@@ -15,6 +15,7 @@ import {
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
 import { LocalCoderBackendCard } from "./LocalCoderBackendCard";
+import { ModelRegistryCard } from "./ModelRegistryCard";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
 import { ExaSearchKeyCard } from "./ExaSearchKeyCard";
@@ -265,6 +266,13 @@ export function ProvidersModelsTab() {
         description="The model the local Devboule orchestrator — your MAIN coder — runs on. A separate tier from the Mini-coder below (the worker it delegates to)."
       >
         <LocalCoderBackendCard />
+      </RoleSection>
+
+      <RoleSection
+        title="Model registry"
+        description="The curated list of local models the coders may choose from per role, each with a tier (agentic / emit-edits) and tuned defaults."
+      >
+        <ModelRegistryCard />
       </RoleSection>
 
       <RoleSection

@@ -227,6 +227,33 @@ export interface TrustAnchor {
   issuedAt: string;
 }
 
+// One curated model the coders may choose from (Settings → Providers & Models). A 1:1
+// mirror of the Rust `ModelRegistryEntry` (camelCase over IPC). `tier` selects execution
+// mode ("agentic" = >20B tool-loop, "emitEdits" = one-shot). Sampling params are the
+// per-model tuned values (omitted = backend/model defaults).
+export interface ModelRegistryEntry {
+  id: string;
+  backend: "omlx" | "ollama";
+  sizeBytes: number;
+  tier: "agentic" | "emitEdits";
+  roles: Array<"mainCoder" | "miniCoder" | "censor">;
+  enabled: boolean;
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  thinkingBudget?: number;
+}
+
+// A model actually installed on a local backend, from the read-only
+// `discover_installed_models` command. Mirror of the Rust `DiscoveredModel`.
+export interface DiscoveredModel {
+  id: string;
+  backend: "omlx" | "ollama";
+  sizeBytes: number;
+  paramSize?: string;
+  quant?: string;
+}
+
 export interface AppConfig {
   project: ProjectConfig;
   trustAnchor?: TrustAnchor;
@@ -262,4 +289,8 @@ export interface AppConfig {
   // older config.json without the key still parses; ABSENT means "auto" — the coder-
   // decides default, ZERO migration. See MiniWriteBehavior.
   miniWriteBehavior?: MiniWriteBehavior;
+  // The user-curated model registry (Settings → Providers & Models). Optional so an older
+  // config.json without the key still parses; readers default it to []. The coders choose
+  // which local model to run per role from this list. See ModelRegistryEntry.
+  modelRegistry?: ModelRegistryEntry[];
 }

@@ -37,6 +37,10 @@ vi.mock("./LocalCoderBackendCard", () => ({
   LocalCoderBackendCard: () =>
     createElement("div", { "data-testid": "local-coder-card" }),
 }));
+vi.mock("./ModelRegistryCard", () => ({
+  ModelRegistryCard: () =>
+    createElement("div", { "data-testid": "model-registry-card" }),
+}));
 vi.mock("./MiniCoderBackendCard", () => ({
   MiniCoderBackendCard: () =>
     createElement("div", { "data-testid": "mini-coder-card" }),
@@ -160,6 +164,9 @@ describe("ProvidersModelsTab", () => {
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="local-coder-card"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="model-registry-card"]'),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="mini-coder-card"]'),
