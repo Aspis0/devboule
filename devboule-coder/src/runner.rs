@@ -1,13 +1,15 @@
-//! Phase 11.3 — the deterministic linear DAG runner, over the shared KANBAN.
+//! Phase 11.3 / R7 — the deterministic CONCURRENT DAG runner, over the shared KANBAN.
 //!
 //! Reads the active plan's tasks straight off the project Kanban (the single shared
 //! task store — Phase 11.5-B Piece 1; `.devboule/tasks.json` is GONE) and runs them in
 //! dependency order, delegating each to the `spawn_mini_coder` MCP tool (which already
-//! carries the deterministic Censor gate + the mini's retry/escalate chain). LINEAR-
-//! blocking by design (DAG-parallel is a future v2): one ready task at a time; on the
-//! FIRST task the mini does not complete cleanly (any terminal status other than `done`)
-//! the runner STOPS and reports the block so the orchestrator can `ask_user` rather than
-//! blindly retrying.
+//! carries the deterministic Censor gate + the mini's retry/escalate chain). R7: each
+//! iteration runs the whole READY BATCH (all tasks whose deps are satisfied) up to
+//! `MAX_PARALLEL_TASKS` CONCURRENTLY — independent tasks (e.g. a diamond's two arms) run
+//! in parallel; a linear chain still runs serially (one ready at a time). When any task in
+//! a batch does not complete cleanly the runner finishes the in-flight batch (every Done
+//! sibling still lands in `review`), then STOPS and reports the first block so the
+//! orchestrator can `ask_user` rather than blindly retrying.
 //!
 //! DETERMINISTIC: there is NO LLM here. The planner already produced the plan, the human
 //! already approved it (`plan_submit` gate), and the approved plan's tasks were created
@@ -32,6 +34,7 @@ use std::collections::HashSet;
 
 use crate::activity::{Activity, Node};
 use crate::executor::McpBackend;
+use futures::StreamExt;
 
 /// Max times the runner will delegate a SINGLE task WITHIN ONE RUN before giving up and
 /// marking it `blocked`. The check fires BEFORE the (MAX_TASK_ATTEMPTS+1)th delegation,
@@ -170,24 +173,15 @@ pub async fn run_tasks(
         return Err("runner needs a project_id (DEVBOULE_PROJECT_ID not set?)".to_string());
     }
 
-    // --- Active-plan detection (one read) ---
     let first = read_plan_views(mcp, project_id).await?;
     let active_plan_id = match select_active_plan(&first) {
         Some(id) => id,
         None => {
-            // Distinguish two terminal cases:
-            // (a) No plan-tagged tasks on the board at all → the human has not run
-            //     `plan` yet; return an error so the orchestrator knows it must plan
-            //     first (returning Ok here would make it look like a successful run).
-            // (b) Plan tasks EXIST but every one is already finished (review/done) →
-            //     that is a legitimate idempotent no-op: report the REAL finished count
-            //     so the orchestrator can see "all done" without re-planning.
             if !has_plan_tasks(&first) {
                 return Err(format!(
                     "no active plan on the board for project '{project_id}'; run `plan` first"
                 ));
             }
-            // Case (b): all plan tasks are finished. Count them from the live read.
             let finished = first
                 .iter()
                 .filter(|t| t.status == STATUS_REVIEW || t.status == STATUS_DONE)
@@ -205,208 +199,220 @@ pub async fn run_tasks(
         Node::Dot,
     );
 
-    // IN-RUN attempt counter, keyed by task id. The Kanban has no `attempts` field, so
-    // this lives only for the duration of this run (see MAX_TASK_ATTEMPTS).
     let mut attempts: HashMap<String, u32> = HashMap::new();
-
-    // Belt-and-suspenders iteration bound: even a logic bug (or a hostile concurrent
-    // mutator flipping a card back to todo) cannot spin forever. Each successful loop turn
-    // either returns or advances one task to a terminal/`review`/`wip` state. We use a
-    // generous static bound here because `total` is now read fresh every iteration (W3
-    // fix); MAX_TASKS × attempt budget + slack is never hit in correct operation.
     const MAX_ITER_BOUND: usize = crate::planner::MAX_TASKS
         .saturating_mul(MAX_TASK_ATTEMPTS as usize + 1)
         .saturating_add(1);
+    const MAX_PARALLEL_TASKS: usize = 2;
 
     for _ in 0..MAX_ITER_BOUND {
-        // Re-read the board EVERY iteration: it is shared + concurrently mutable, so the
-        // latest read is the source of truth (a human/Claude could have moved a card).
         let views = read_plan_views(mcp, project_id).await?;
         let plan: Vec<TaskView> = views
             .into_iter()
             .filter(|t| t.plan_id == active_plan_id)
             .collect();
 
-        // W3: compute BOTH `completed` and `total` from the SAME latest read so that
-        // `completed ≤ total` always holds and the report reflects the live board.
         let completed = count_finished(&plan);
         let total = plan.len();
 
-        match next_runnable(&plan) {
-            Frontier::AllDone => {
-                return Ok(RunReport {
-                    completed,
-                    total,
-                    blocked: None,
-                });
-            }
-            Frontier::Stalled(idx) => {
-                let t = &plan[idx];
-                let reason = match t.status.as_str() {
-                    STATUS_BLOCKED => "previously blocked".to_string(),
-                    STATUS_WIP => {
-                        "interrupted (left wip) and depends on a task that did not finish"
-                            .to_string()
-                    }
-                    _ => "depends on a task that did not finish".to_string(),
-                };
-                let blocked = BlockedTask {
-                    id: t.id.clone(),
-                    title: t.title.clone(),
-                    status: t.status.clone(),
-                    reason,
-                };
-                return Ok(RunReport {
-                    completed,
-                    total,
-                    blocked: Some(blocked),
-                });
-            }
-            Frontier::Ready(idx) => {
-                let task = plan[idx].clone();
-
-                // IN-RUN attempt budget for THIS task id. A todo task's first attempt is
-                // count=0→1; a wip task re-attempted in this run keeps incrementing.
-                // The cap is EXACTLY MAX_TASK_ATTEMPTS delegations: we CHECK BEFORE
-                // incrementing (`count >= MAX_TASK_ATTEMPTS`) so the block fires on the
-                // (MAX_TASK_ATTEMPTS+1)th ENTRY without ever running that delegation.
-                // Example with MAX=2: entry 1 → count=0 (<2, increment to 1, runs);
-                // entry 2 → count=1 (<2, increment to 2, runs); entry 3 → count=2
-                // (>=2, blocks). Two delegations, never three.
-                let count = attempts.entry(task.id.clone()).or_insert(0);
-                if *count >= MAX_TASK_ATTEMPTS {
-                    let reason =
-                        format!("exceeded {MAX_TASK_ATTEMPTS} in-run attempts without finishing");
-                    set_blocked(mcp, project_id, &task.id, &reason).await?;
-                    activity.milestone(&format!("blocked {}", task.id), Node::Terra);
+        let batch = ready_batch(&plan);
+        if batch.is_empty() {
+            match next_runnable(&plan) {
+                Frontier::AllDone => {
+                    return Ok(RunReport {
+                        completed,
+                        total,
+                        blocked: None,
+                    });
+                }
+                Frontier::Stalled(idx) => {
+                    let t = &plan[idx];
+                    let reason = match t.status.as_str() {
+                        STATUS_BLOCKED => "previously blocked".to_string(),
+                        STATUS_WIP => {
+                            "interrupted (left wip) and depends on a task that did not finish"
+                                .to_string()
+                        }
+                        _ => "depends on a task that did not finish".to_string(),
+                    };
                     let blocked = BlockedTask {
-                        id: task.id.clone(),
-                        title: task.title.clone(),
-                        status: STATUS_BLOCKED.to_string(),
+                        id: t.id.clone(),
+                        title: t.title.clone(),
+                        status: t.status.clone(),
                         reason,
                     };
                     return Ok(RunReport {
-                        completed: count_finished(&plan),
+                        completed,
                         total,
                         blocked: Some(blocked),
                     });
                 }
-                *count += 1;
+                Frontier::Ready(_) => unreachable!("batch is empty but next_runnable says Ready"),
+            }
+        }
 
-                // Claim the task: `project_claim_task` auto-advances a `todo` task to `wip`
-                // AND establishes the claim/lease the subsequent `project_update_status`
-                // requires (the server gates status updates on an active claim). For a task
-                // already `wip` (interrupted/concurrent) it re-claims, re-establishing the
-                // lease. A claim failure (a human grabbed it, project paused) blocks the
-                // task: we cannot safely drive a card we do not hold.
-                if let Err(e) = claim_task(mcp, project_id, &task.id).await {
-                    let reason = format!("could not claim the task: {}", elide(&e));
-                    // Best-effort: try to mark it blocked so the board reflects the stop.
-                    // If THAT also fails (we never held a claim), `block_best_effort`
-                    // surfaces the discrepancy (W2): a `block-write failed` milestone + a
-                    // note in the reason, and reports the board's REAL status rather than
-                    // a false `blocked`. The run still stops cleanly either way.
+        // B2: SELECT up to MAX_PARALLEL_TASKS ready tasks. Do NOT touch the attempt counter
+        // here — only READ it for the cap check; we charge an attempt below, ONLY for tasks we
+        // actually dispatch, so a task that is selected-but-never-run (the batch cut short by
+        // an over-cap sibling) is never charged an attempt it didn't use.
+        let mut selected_indices = Vec::new();
+        let mut blocked_report: Option<RunReport> = None;
+        for &idx in &batch {
+            let task = &plan[idx];
+            let count = *attempts.get(&task.id).unwrap_or(&0);
+            if count >= MAX_TASK_ATTEMPTS {
+                let reason =
+                    format!("exceeded {MAX_TASK_ATTEMPTS} in-run attempts without finishing");
+                // W4: best-effort (consistent with the post-batch block path) — a failed board
+                // write must surface the block reason, not abort the whole run with a transport
+                // Err, and must report the board's REAL status.
+                let (status, reason) =
+                    block_best_effort(mcp, project_id, activity, &task.id, reason).await;
+                if status == STATUS_BLOCKED {
+                    activity.milestone(&format!("blocked {}", task.id), Node::Terra);
+                }
+                blocked_report = Some(RunReport {
+                    completed,
+                    total,
+                    blocked: Some(BlockedTask {
+                        id: task.id.clone(),
+                        title: task.title.clone(),
+                        status,
+                        reason,
+                    }),
+                });
+                break;
+            }
+            selected_indices.push(idx);
+            if selected_indices.len() >= MAX_PARALLEL_TASKS {
+                break;
+            }
+        }
+
+        if let Some(report) = blocked_report {
+            return Ok(report);
+        }
+
+        // B2: charge exactly one attempt per task we are about to dispatch (now that the
+        // selection is final and no over-cap sibling cut it short).
+        for &idx in &selected_indices {
+            *attempts.entry(plan[idx].id.clone()).or_insert(0) += 1;
+        }
+
+        // Run the selected ready tasks CONCURRENTLY (bounded by MAX_PARALLEL_TASKS). Each
+        // future OWNS a cloned TaskView (an `async move` borrowing &plan[idx] would move the
+        // whole `plan` Vec into the closure, and we still need `plan` afterwards); TaskView is
+        // Clone + cheap. mcp/activity are shared refs (Send+Sync), copied into each future. Sort
+        // by idx so the post-batch processing + any block report is deterministic.
+        let selected: Vec<(usize, TaskView)> = selected_indices
+            .iter()
+            .map(|&idx| (idx, plan[idx].clone()))
+            .collect();
+        let mut results: Vec<(usize, MiniVerdict)> = futures::stream::iter(selected)
+            .map(|(idx, task)| async move {
+                (idx, run_one_task(mcp, project_id, &task, activity).await)
+            })
+            .buffer_unordered(MAX_PARALLEL_TASKS)
+            .collect()
+            .await;
+        results.sort_by_key(|(idx, _)| *idx);
+
+        // B1: process ALL results before stopping. Every Done sibling MUST reach `review` even
+        // if another task in the same batch blocked — otherwise the Done task is silently left
+        // `wip` (work lost + re-delegated next run, and its dependents stall). Record the FIRST
+        // block (idx order) and return it AFTER the loop. W5: count the set_reviews applied this
+        // batch (`newly_reviewed`) — the in-memory `plan` is not mutated, so the report's
+        // `completed` must add them to the start-of-iteration count.
+        let mut first_block: Option<BlockedTask> = None;
+        let mut newly_reviewed = 0usize;
+        for (idx, verdict) in results {
+            let task = &plan[idx];
+            match verdict {
+                MiniVerdict::Done => {
+                    if let Err(e) = set_review(mcp, project_id, &task.id).await {
+                        let reason = format!(
+                            "mini finished but could not set the task to review: {}; \
+                             please update it manually",
+                            elide(&e)
+                        );
+                        activity.milestone(
+                            &format!("review-update failed {}", task.id),
+                            Node::Terra,
+                        );
+                        if first_block.is_none() {
+                            first_block = Some(BlockedTask {
+                                id: task.id.clone(),
+                                title: task.title.clone(),
+                                status: STATUS_WIP.to_string(),
+                                reason,
+                            });
+                        }
+                        continue;
+                    }
+                    newly_reviewed += 1;
+                    activity.milestone(&format!("review {}", task.id), Node::Sage);
+                }
+                MiniVerdict::Blocked(reason) => {
                     let (status, reason) =
                         block_best_effort(mcp, project_id, activity, &task.id, reason).await;
                     if status == STATUS_BLOCKED {
                         activity.milestone(&format!("blocked {}", task.id), Node::Terra);
                     }
-                    let blocked = BlockedTask {
-                        id: task.id.clone(),
-                        title: task.title.clone(),
-                        status,
-                        reason,
-                    };
-                    return Ok(RunReport {
-                        completed: count_finished(&plan),
-                        total,
-                        blocked: Some(blocked),
-                    });
-                }
-                activity.milestone(
-                    &format!("running {}: {}", task.id, elide(&task.title)),
-                    Node::Hollow,
-                );
-
-                // Delegate. The MCP backend injects the session identity
-                // (role/agent_id/session_token); we pass only the task-specific args,
-                // exactly like the orchestrator's own `spawn_mini` dispatch.
-                let params = build_spawn_params(&task);
-                let verdict = match mcp.call_tool("spawn_mini_coder", params).await {
-                    Ok(text) => parse_mini_status(&text),
-                    Err(e) => {
-                        MiniVerdict::Blocked(format!("spawn_mini_coder failed: {}", elide(&e)))
-                    }
-                };
-
-                match verdict {
-                    MiniVerdict::Done => {
-                        // Finished tasks land in REVIEW (not done): `done` is verifier/
-                        // human-gated, same as Claude. The human reviews the batch + the
-                        // push gate.
-                        //
-                        // W1: a `set_review` failure after a successful mini MUST NOT
-                        // propagate as a transport Err — that would leave the task `wip`
-                        // and risk re-delegation on the next run. Instead, surface it as a
-                        // blocked report so the mini's work is preserved and the human is
-                        // told to update the card manually.
-                        if let Err(e) = set_review(mcp, project_id, &task.id).await {
-                            let reason = format!(
-                                "mini finished but could not set the task to review: {}; \
-                                 please update it manually",
-                                elide(&e)
-                            );
-                            activity.milestone(
-                                &format!("review-update failed {}", task.id),
-                                Node::Terra,
-                            );
-                            let blocked = BlockedTask {
-                                id: task.id.clone(),
-                                title: task.title.clone(),
-                                status: STATUS_WIP.to_string(),
-                                reason,
-                            };
-                            return Ok(RunReport {
-                                completed: count_finished(&plan),
-                                total,
-                                blocked: Some(blocked),
-                            });
-                        }
-                        activity.milestone(&format!("review {}", task.id), Node::Sage);
-                        // loop: re-read the board, pick the next ready task.
-                    }
-                    MiniVerdict::Blocked(reason) => {
-                        // Best-effort: set the card to blocked. A failure here does NOT
-                        // propagate as a transport Err — the mini's block verdict is still
-                        // surfaced to the human via the RunReport. W2: `block_best_effort`
-                        // makes a failed block-write OBSERVABLE (a `block-write failed`
-                        // milestone + a note in the reason) and reports the board's REAL
-                        // status instead of a false `blocked`.
-                        let (status, reason) =
-                            block_best_effort(mcp, project_id, activity, &task.id, reason).await;
-                        if status == STATUS_BLOCKED {
-                            activity.milestone(&format!("blocked {}", task.id), Node::Terra);
-                        }
-                        let blocked = BlockedTask {
+                    if first_block.is_none() {
+                        first_block = Some(BlockedTask {
                             id: task.id.clone(),
                             title: task.title.clone(),
                             status,
                             reason,
-                        };
-                        return Ok(RunReport {
-                            completed: count_finished(&plan),
-                            total,
-                            blocked: Some(blocked),
                         });
                     }
                 }
             }
         }
+        if let Some(blocked) = first_block {
+            return Ok(RunReport {
+                completed: completed + newly_reviewed,
+                total,
+                blocked: Some(blocked),
+            });
+        }
     }
 
-    // Unreachable in correct operation (the iteration bound dominates the work); surface
-    // it as an error rather than silently returning a half-truth.
     Err("runner exceeded its iteration bound (internal invariant violated)".to_string())
+}
+
+fn ready_batch(plan: &[TaskView]) -> Vec<usize> {
+    plan.iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            if t.status == STATUS_TODO || t.status == STATUS_WIP {
+                let deps_met = t.depends_on
+                    .iter()
+                    .all(|dep_id| plan.iter().any(|t2| t2.id == *dep_id && (t2.status == STATUS_REVIEW || t2.status == STATUS_DONE)));
+                if deps_met { Some(i) } else { None }
+            } else { None }
+        })
+        .collect()
+}
+
+async fn run_one_task(
+    mcp: &dyn McpBackend,
+    project_id: &str,
+    task: &TaskView,
+    activity: &Activity,
+) -> MiniVerdict {
+    if let Err(e) = claim_task(mcp, project_id, &task.id).await {
+        return MiniVerdict::Blocked(format!("could not claim the task: {}", elide(&e)));
+    }
+    activity.milestone(
+        &format!("running {}: {}", task.id, elide(&task.title)),
+        Node::Hollow,
+    );
+    let params = build_spawn_params(task);
+    match mcp.call_tool("spawn_mini_coder", params).await {
+        Ok(text) => parse_mini_status(&text),
+        Err(e) => MiniVerdict::Blocked(format!("spawn_mini_coder failed: {}", elide(&e))),
+    }
 }
 
 /// Read the board via `project_get` and build the VIEW list of all plan-tagged tasks
@@ -1354,6 +1360,111 @@ mod tests {
                 .all(|id| mock.status_of(id) == STATUS_REVIEW),
             "every diamond task lands in review"
         );
+    }
+
+    /// A Kanban mock whose `spawn_mini_coder` verdict is keyed by TASK ID (parsed from the
+    /// delegated `task` text's "title T00X"), so a CONCURRENT batch — whose call order is
+    /// non-deterministic — stays deterministic per task. Board mutated in place like KanbanMock.
+    struct ByIdMock {
+        tasks: Mutex<Vec<serde_json::Value>>,
+        statuses: std::collections::HashMap<String, String>,
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+    impl ByIdMock {
+        fn new(tasks: Vec<serde_json::Value>, statuses: &[(&str, &str)]) -> Self {
+            Self {
+                tasks: Mutex::new(tasks),
+                statuses: statuses
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn status_of(&self, id: &str) -> String {
+            self.tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"].as_str() == Some(id))
+                .and_then(|t| t["status"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        }
+        fn set_status(&self, id: &str, status: &str) {
+            let mut tasks = self.tasks.lock().unwrap();
+            if let Some(t) = tasks.iter_mut().find(|t| t["id"].as_str() == Some(id)) {
+                t["status"] = serde_json::json!(status);
+            }
+        }
+        fn count(&self, name: &str) -> usize {
+            self.calls.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+        }
+    }
+    #[async_trait]
+    impl McpBackend for ByIdMock {
+        async fn call_tool(&self, name: &str, params: serde_json::Value) -> Result<String, String> {
+            self.calls.lock().unwrap().push((name.to_string(), params.clone()));
+            match name {
+                "project_get" => Ok(serde_json::json!({
+                    "metadata": {"id": "proj"},
+                    "state": {"tasks": self.tasks.lock().unwrap().clone()},
+                })
+                .to_string()),
+                "project_claim_task" => {
+                    let id = params["task_id"].as_str().unwrap_or("");
+                    if self.status_of(id) == STATUS_TODO {
+                        self.set_status(id, STATUS_WIP);
+                    }
+                    Ok("{}".to_string())
+                }
+                "project_update_status" => {
+                    let id = params["task_id"].as_str().unwrap_or("").to_string();
+                    let status = params["status"].as_str().unwrap_or("").to_string();
+                    self.set_status(&id, &status);
+                    Ok(serde_json::json!({"metadata": {"id": "proj"}}).to_string())
+                }
+                "spawn_mini_coder" => {
+                    // The delegated `task` text leads with the title "title T00X" — match it to
+                    // the per-id scripted status (unmatched => done, so an over-run still ends).
+                    let text = params["task"].as_str().unwrap_or("");
+                    let status = self
+                        .statuses
+                        .iter()
+                        .find(|(id, _)| text.contains(id.as_str()))
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_else(|| "done".to_string());
+                    Ok(serde_json::json!({"directiveId": "d", "result": {"status": status}})
+                        .to_string())
+                }
+                other => Err(format!("unexpected tool {other}")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_batch_mate_does_not_skip_a_done_siblings_review() {
+        // B1 regression: two INDEPENDENT ready tasks run in ONE concurrent batch. T001 (lower
+        // board idx) BLOCKS, T002 (higher idx) is DONE. The Done sibling MUST still reach
+        // review — the pre-fix code processed results in idx order, hit T001's block first, and
+        // returned WITHOUT applying T002's set_review (silent work loss + re-delegation).
+        let mock = ByIdMock::new(
+            vec![
+                ktask("T001", "p1", &[], STATUS_TODO, "2026-06-17T10:00:00Z"),
+                ktask("T002", "p1", &[], STATUS_TODO, "2026-06-17T10:00:01Z"),
+            ],
+            &[("T001", "escalated"), ("T002", "done")],
+        );
+        let report = run_tasks(&mock, "proj", &disabled()).await.unwrap();
+        let blocked = report.blocked.expect("T001 blocks");
+        assert_eq!(blocked.id, "T001");
+        assert_eq!(mock.status_of("T001"), STATUS_BLOCKED);
+        assert_eq!(
+            mock.status_of("T002"),
+            STATUS_REVIEW,
+            "the Done batch-mate must reach review even though T001 blocked"
+        );
+        assert_eq!(report.completed, 1, "T002's review is counted");
+        assert_eq!(mock.count("spawn_mini_coder"), 2, "both ran in the batch");
     }
 
     #[tokio::test]
