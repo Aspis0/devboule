@@ -183,6 +183,10 @@ export function ProjectsView() {
   const [titleDraft, setTitleDraft] = useState("");
   // R1: the project's working folder, chosen at creation (the agent reads/writes here).
   const [newProjectRootDraft, setNewProjectRootDraft] = useState("");
+  // S5: the configured default external main-coder CLI for task-card launches (claude|codex).
+  const [mainCoderClient, setMainCoderClient] = useState<"claude" | "codex">(
+    "codex",
+  );
   // Clone-from-GitHub dialog (board): open flag, pasted URL draft, busy + error.
   const [cloneOpen, setCloneOpen] = useState(false);
   const [cloneUrlDraft, setCloneUrlDraft] = useState("");
@@ -882,6 +886,17 @@ export function ProjectsView() {
       setNewProjectRootDraft("");
     }
   };
+
+  // S5: load the configured default main-coder CLI once (the task-card launches use it).
+  useEffect(() => {
+    void invokeBackendCommand<"claude" | "codex">("get_main_coder_client")
+      .then((c) => {
+        if (c === "claude" || c === "codex") setMainCoderClient(c);
+      })
+      .catch(() => {
+        /* leave the "codex" default on any error */
+      });
+  }, []);
 
   // Board: clone a GitHub repo and register it as a project, then dive into Work
   // mode on it. The token is NEVER passed here — the backend injects it via
@@ -1908,12 +1923,12 @@ export function ProjectsView() {
                             void moveTask(task, status)
                           }
                           onLaunchCoder={() =>
-                            void launchAgent("coder", "codex", task.id)
+                            void launchAgent("coder", mainCoderClient, task.id)
                           }
                           onLaunchVerifier={() =>
                             void launchAgent(
                               "verifier",
-                              "codex",
+                              mainCoderClient,
                               task.id,
                             )
                           }

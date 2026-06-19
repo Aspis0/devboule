@@ -17,6 +17,7 @@ import {
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
 import { LocalCoderBackendCard } from "./LocalCoderBackendCard";
+import { MainCoderClientCard } from "./MainCoderClientCard";
 import { ModelRegistryCard } from "./ModelRegistryCard";
 import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
@@ -293,6 +294,13 @@ export function ProvidersModelsTab() {
       <DetectedProvidersStrip />
 
       <CollapsibleGroup title="Coders">
+        <RoleSection
+          title="Default main coder CLI"
+          description="Which external CLI the task-board launches use as the main coder (Codex or Claude). The per-task Launch buttons use this by default."
+        >
+          <MainCoderClientCard />
+        </RoleSection>
+
         <RoleSection
           title="Local main coder (Devboule)"
           description="The model the local Devboule orchestrator — your MAIN coder — runs on. A separate tier from the Mini-coder below (the worker it delegates to)."

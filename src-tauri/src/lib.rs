@@ -450,6 +450,8 @@ pub fn run() {
             backend::projects::get_mini_coder_backend,
             backend::projects::get_mini_write_behavior,
             backend::projects::set_mini_write_behavior,
+            backend::projects::get_main_coder_client,
+            backend::projects::set_main_coder_client,
             backend::projects::get_agentic_coverage_languages,
             backend::projects::get_project,
             backend::projects::launch_project_agent_terminal,

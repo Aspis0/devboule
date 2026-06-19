@@ -289,6 +289,9 @@ export interface AppConfig {
   // older config.json without the key still parses; ABSENT means "auto" — the coder-
   // decides default, ZERO migration. See MiniWriteBehavior.
   miniWriteBehavior?: MiniWriteBehavior;
+  // S5 — the default EXTERNAL main-coder CLI launched from the task board (Settings →
+  // Providers & Models). Optional; ABSENT means "codex" (today's hardcoded default).
+  mainCoderClient?: "claude" | "codex";
   // The user-curated model registry (Settings → Providers & Models). Optional so an older
   // config.json without the key still parses; readers default it to []. The coders choose
   // which local model to run per role from this list. See ModelRegistryEntry.
