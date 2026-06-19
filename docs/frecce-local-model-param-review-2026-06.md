@@ -1,5 +1,16 @@
 # Local-model parameter review — frecce v1 (2026-06-19)
 
+> **⚠️ CORRECTION (2026-06-19) — do NOT read "gemma > qwen" from this.** Published benchmarks
+> say the OPPOSITE: **Qwen3.6-35B-A3B is the stronger coder** — LiveCodeBench v6 **80.4** vs
+> Gemma-4-26B-A4B **77.1**, SWE-bench 73.4, and it's explicitly tuned for *agentic* coding (a
+> public head-to-head gives Qwen **+21** on coding). This review was **n=1 per config on a single
+> chunk** → it measured one dice-roll, not capability, and the differentiator I picked (a React
+> `useEffect` cleanup-placement nuance) is orthogonal to what coding benchmarks test. Gemma also
+> had the matrix's WORST run (the temp-0.6 runaway). **The PARAMETER finding below still holds**
+> (temp 0.3 > 0.6 for determinism; keep max_tokens generous) — the **MODEL ranking does not**.
+> A real verdict needs n≥3–5/config judged by a deterministic gate (compile + sonnet pass), not
+> one eyeball. (GPU was taken by training before a re-run; deferred.)
+
 Goal (the owner): build the "frecce" (task-board dependency arrows) **with local models**, trying
 **different parameters**, then **review each model × parameter and pick the best**.
 
