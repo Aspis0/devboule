@@ -302,9 +302,16 @@ export function LocalCoderBackendCard() {
           Backend
           <select
             value={kind}
-            onChange={(event) =>
-              setKind(event.target.value as LocalCoderBackendKind)
-            }
+            onChange={(event) => {
+              const next = event.target.value as LocalCoderBackendKind;
+              setKind(next);
+              // S8: omlx REQUIRES a base URL — prefill the standard loopback default when
+              // the field is empty so it doesn't block Save with a "required" error
+              // (still fully editable). Never overwrite a URL the user already typed.
+              if (next === "omlx" && baseUrl.trim() === "") {
+                setBaseUrl("http://localhost:8000/v1");
+              }
+            }}
             className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
           >
             <option value="ollama">Ollama (local model)</option>
