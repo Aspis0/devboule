@@ -1082,7 +1082,11 @@ export function ProjectsView() {
           input: {
             projectId: currentProject.metadata.id,
             role,
-            client: "powershell",
+            // R4/B20: the manual copy-prompt was hardcoded to "powershell" (Windows-only
+            // shell), which surfaced "PowerShell" on macOS. Use a platform-neutral CLI
+            // client — "claude" works on mac + Windows; the user pastes the prompt into
+            // their own terminal regardless of OS.
+            client: "claude",
             agentId,
             taskId: taskId ?? null,
           },
@@ -1135,11 +1139,16 @@ export function ProjectsView() {
             client,
             agentId: `${role}-${Date.now()}`,
             taskId: taskId ?? null,
+            // R4/B19: the task-card quick-launch uses the IN-APP PTY terminal — reliable
+            // on macOS AND Windows (the external osascript→Terminal.app path silently
+            // fails on mac → no CLI appears). External CLIs remain available via the
+            // Spawn panel, which passes its own host choice.
+            host: "app",
           },
         },
       );
       setLaunchMessage(
-        `${result.client} launched at ${result.rootPath}. MCP config and prompt attached.`,
+        `${result.client} launched in the in-app terminal at ${result.rootPath}. MCP config and prompt attached.`,
       );
       await loadAgentState();
       await loadProjects();
