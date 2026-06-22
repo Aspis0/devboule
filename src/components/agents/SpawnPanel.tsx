@@ -21,6 +21,11 @@ import {
   type SpawnSelection,
 } from "./agentRowModel";
 import type { SpawnRole } from "./roleDisplay";
+import { invokeBackendCommand } from "../../context/AppContext";
+
+// Phase 6 — the persona languages a launch can target (mirrors the Rust KNOWN_LANGS + the
+// registry tiers). "" = auto-detect (the panel uses the backend-detected primary).
+const PERSONA_LANGS = ["rust", "node", "python", "go", "cpp", "kotlin"] as const;
 
 // Phase B role merge: only coder/verifier are spawnable. A coder PLANS and CODES
 // (and may fan out to subagents, which surfaces a derived "orchestrator" badge);
@@ -109,6 +114,11 @@ export function SpawnPanel({
   // only THREADED into the launch for the orchestrator (see `selection` below), so
   // toggling to codex/claude can never carry the flag.
   const [planFirst, setPlanFirst] = useState<boolean>(true);
+  // Phase 6 — the project's auto-detected primary persona language (from the backend), an optional
+  // per-launch override, and whether the (non-invasive by default) editor row is expanded.
+  const [detectedLang, setDetectedLang] = useState<string>("");
+  const [langOverride, setLangOverride] = useState<string>("");
+  const [langExpanded, setLangExpanded] = useState<boolean>(false);
 
   // The selector options: built-ins first, then each configured custom client
   // (label shown, id is the value). Deduped/validated upstream; rendered as-is.
@@ -127,6 +137,34 @@ export function SpawnPanel({
       setClient("codex");
     }
   }, [clientOptions, client]);
+
+  // Phase 6 — detect the project's PRIMARY persona language whenever the project changes, to seed
+  // the language indicator + override selector. Best-effort: an error / no working root ⇒ "".
+  const activeProjectId = lockedProjectId ?? selectedProjectId;
+  useEffect(() => {
+    // Reset SYNCHRONOUSLY on project change so a stale override OR a stale detected-language
+    // indicator from the previous project can never ride / mislead the new selection (#3); the
+    // async detect result then fills in the new project's language.
+    setLangOverride("");
+    setLangExpanded(false);
+    setDetectedLang("");
+    if (!activeProjectId) {
+      return;
+    }
+    let alive = true;
+    invokeBackendCommand<string>("detect_project_language", {
+      projectId: activeProjectId,
+    })
+      .then((lang) => {
+        if (alive) setDetectedLang(lang ?? "");
+      })
+      .catch(() => {
+        if (alive) setDetectedLang("");
+      });
+    return () => {
+      alive = false;
+    };
+  }, [activeProjectId]);
 
   // Per-CLI quick-fill model suggestions (claude -> opus/sonnet/haiku; orchestrator ->
   // the configured local-coder model when known; everything else -> none — we never
@@ -199,6 +237,8 @@ export function SpawnPanel({
     // never threads into a codex/claude launch, and no consumer mistakes a not-applicable
     // field for a deliberately-disabled one.
     planFirst: client === "orchestrator" ? planFirst : undefined,
+    // Phase 6 — the per-launch language-persona override (empty ⇒ the backend auto-detects).
+    languageOverride: langOverride.trim().length > 0 ? langOverride : undefined,
   };
 
   const roleSummary = ROLE_OPTIONS.find((r) => r.id === role)?.summary ?? "";
@@ -403,6 +443,55 @@ export function SpawnPanel({
             before doing any other work.
           </span>
         </label>
+      )}
+
+      {/* Phase 6 — language-persona indicator. NON-INVASIVE: shown only when a language was
+          detected, collapsed by default. Click to expand the override selector when the system
+          picked the wrong language. The persona is composed server-side at launch + injected on
+          EVERY backend; the override only chooses which language. */}
+      {detectedLang && (
+        <div className="mb-3">
+          <button
+            type="button"
+            onClick={() => setLangExpanded((v) => !v)}
+            aria-expanded={langExpanded}
+            data-testid="language-persona-toggle"
+            className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-widest text-cream-400 hover:text-cream-700"
+          >
+            <span>
+              Language persona:{" "}
+              <span className="font-mono lowercase text-cream-600">
+                {langOverride || detectedLang}
+              </span>
+              {langOverride && langOverride !== detectedLang ? " (override)" : ""}
+            </span>
+            <span>{langExpanded ? "▴" : "▾"}</span>
+          </button>
+          {langExpanded && (
+            <div className="mt-1.5 rounded-md border border-cream-200 bg-cream-50 px-3 py-2">
+              <label className="block text-[10px] leading-4 text-cream-500">
+                The (role × language) coder persona is auto-detected and injected on every backend.
+                If it picked the wrong language, override it here:
+                <select
+                  value={langOverride}
+                  onChange={(e) => setLangOverride(e.target.value)}
+                  data-testid="language-override-select"
+                  className="mt-1.5 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold lowercase text-cream-700 outline-none focus:border-terracotta/30"
+                >
+                  <option value="">Auto-detected ({detectedLang})</option>
+                  {PERSONA_LANGS.map((l) => (
+                    <option key={l} value={l}>
+                      {l}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="mt-1.5 text-[10px] leading-4 text-cream-400">
+                Use “Copy prompt” to see the full prompt with this persona.
+              </p>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Launch actions. */}

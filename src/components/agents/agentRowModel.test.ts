@@ -318,6 +318,18 @@ describe("buildLaunchInput", () => {
     // unchanged.
     expect(buildLaunchInput(sel, "app").censorReview).toBeUndefined();
   });
+
+  it("forwards a non-empty languageOverride and omits an empty/absent one", () => {
+    // The user-picked language rides into the launch; "" / whitespace / absent ⇒ undefined so the
+    // backend auto-detects (a no-override launch stays byte-identical).
+    expect(
+      buildLaunchInput({ ...sel, languageOverride: "rust" }, "app").languageOverride,
+    ).toBe("rust");
+    expect(
+      buildLaunchInput({ ...sel, languageOverride: "  " }, "app").languageOverride,
+    ).toBeUndefined();
+    expect(buildLaunchInput(sel, "app").languageOverride).toBeUndefined();
+  });
 });
 
 describe("canRoleLaunchTask / spawnDisabledReason", () => {

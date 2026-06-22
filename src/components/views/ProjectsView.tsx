@@ -1496,6 +1496,9 @@ export function ProjectsView() {
             // launch, so the backend omits DEVBOULE_PLAN_FIRST and the env is
             // byte-identical to a pre-3b launch.
             planFirst: input.planFirst,
+            // Phase 6: the per-launch language-persona override (absent ⇒ backend auto-detects).
+            // buildLaunchInput already emits undefined when the user picked no override.
+            languageOverride: input.languageOverride,
           },
         },
       );
@@ -1536,6 +1539,9 @@ export function ProjectsView() {
             agentId: `${selection.role}-${Date.now()}`,
             taskId: selection.taskId || null,
             model: normalizeModelHint(selection.model),
+            // Phase 6: forward the language-persona override so the COPIED prompt (preview) matches
+            // what a launch would compose. Empty/absent ⇒ null ⇒ backend auto-detects.
+            languageOverride: selection.languageOverride || null,
           },
         },
       );

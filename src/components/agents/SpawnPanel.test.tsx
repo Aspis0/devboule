@@ -3,10 +3,17 @@
 // proving the additive change: codex + claude are untouched and "orchestrator" is
 // offered as a selectable coder client labelled "Local (Devboule)".
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { SpawnPanel } from "./SpawnPanel";
 import type { SpawnLaunchInput, SpawnSelection } from "./agentRowModel";
+
+// SpawnPanel statically imports invokeBackendCommand for its detect_project_language effect.
+// These tests use renderToStaticMarkup (SSR ⇒ effects never run), so the command is never called
+// here — but mock it defensively so the suite stays hermetic if it is ever moved to jsdom.
+vi.mock("../../context/AppContext", () => ({
+  invokeBackendCommand: vi.fn(async () => ""),
+}));
 
 function render(extra?: Partial<React.ComponentProps<typeof SpawnPanel>>) {
   return renderToStaticMarkup(

@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use crate::agent_loop::{Transcript, TranscriptEntry};
 use crate::model::CoderModel;
-use crate::prompt::{build_system_prompt, UserMcpServerTools};
+use crate::prompt::{build_system_prompt_with_lang, UserMcpServerTools};
 
 /// Max length of the oMLX base URL. Mirrors `mini_coder::MINI_BASE_URL_MAX_LEN`.
 const OMLX_BASE_URL_MAX_LEN: usize = 200;
@@ -473,6 +473,10 @@ pub struct OmlxModel {
     /// after the executor connects (the tool list is fetched at connect time).
     /// `Arc<[…]>` so a `Clone` of the model is cheap and the slice is shared.
     user_mcp: std::sync::Arc<[UserMcpServerTools]>,
+    /// The host-rendered LANGUAGE persona block (from `DEVBOULE_LANG_SKILL`, resolved in
+    /// `config.rs`) — already fenced + sentinel-neutralized by the trusted app. Appended to the
+    /// system prompt after the user-MCP catalog. `None` keeps the prompt byte-identical.
+    lang_skill: Option<String>,
 }
 
 impl OmlxModel {
@@ -499,6 +503,7 @@ impl OmlxModel {
             client,
             plan_first,
             user_mcp: std::sync::Arc::from(Vec::new()),
+            lang_skill: None,
         })
     }
 
@@ -507,6 +512,13 @@ impl OmlxModel {
     /// byte-identical. Called from `config.rs` after the `MultiMcpBackend` connects.
     pub fn with_user_mcp_tools(mut self, user_mcp: Vec<UserMcpServerTools>) -> Self {
         self.user_mcp = std::sync::Arc::from(user_mcp);
+        self
+    }
+
+    /// Attach the host-rendered LANGUAGE persona block (DEVBOULE_LANG_SKILL). Builder-style; the
+    /// default (`None`) construction stays byte-identical.
+    pub fn with_lang_skill(mut self, lang_skill: Option<String>) -> Self {
+        self.lang_skill = lang_skill;
         self
     }
 
@@ -519,7 +531,13 @@ impl OmlxModel {
     /// OpenAI-compatible `messages` and a small request envelope. Separated from
     /// the live POST so the request shape is unit-testable without inference.
     pub fn build_request_body(&self, transcript: &Transcript) -> Value {
-        build_chat_body(&self.model, transcript, self.plan_first, &self.user_mcp)
+        build_chat_body(
+            &self.model,
+            transcript,
+            self.plan_first,
+            &self.user_mcp,
+            self.lang_skill.as_deref(),
+        )
     }
 }
 
@@ -534,10 +552,11 @@ fn build_chat_body(
     transcript: &Transcript,
     plan_first: bool,
     user_mcp: &[UserMcpServerTools],
+    lang_skill: Option<&str>,
 ) -> Value {
     json!({
         "model": model,
-        "messages": build_messages(transcript, plan_first, user_mcp),
+        "messages": build_messages(transcript, plan_first, user_mcp, lang_skill),
         "max_tokens": MAX_TOKENS,
         "temperature": 0.2,
         "stream": false,
@@ -552,13 +571,14 @@ fn build_messages(
     transcript: &Transcript,
     plan_first: bool,
     user_mcp: &[UserMcpServerTools],
+    lang_skill: Option<&str>,
 ) -> Value {
     // The system prompt + the human message are NON-evictable framing: the model
     // must always see who it is and what was asked. `plan_first` (3b) appends the
     // PLAN-FIRST directive to the standing prompt when the operator requested it;
     // `user_mcp` (B.3) appends the external user-MCP tool catalog when non-empty.
     let mut messages = vec![
-        json!({ "role": "system", "content": build_system_prompt(plan_first, user_mcp) }),
+        json!({ "role": "system", "content": build_system_prompt_with_lang(plan_first, user_mcp, lang_skill) }),
         json!({ "role": "user", "content": transcript.human_message() }),
     ];
 
@@ -741,6 +761,9 @@ pub struct CloudModel {
     /// EMPTY (default) keeps the prompt byte-identical; set via
     /// [`CloudModel::with_user_mcp_tools`].
     user_mcp: std::sync::Arc<[UserMcpServerTools]>,
+    /// The host-rendered LANGUAGE persona block (from `DEVBOULE_LANG_SKILL`) — see the
+    /// [`OmlxModel`] field. `None` keeps the prompt byte-identical.
+    lang_skill: Option<String>,
 }
 
 impl std::fmt::Debug for CloudModel {
@@ -792,6 +815,7 @@ impl CloudModel {
             client,
             plan_first,
             user_mcp: std::sync::Arc::from(Vec::new()),
+            lang_skill: None,
         })
     }
 
@@ -799,6 +823,13 @@ impl CloudModel {
     /// Builder-style; the default (no user servers) construction stays byte-identical.
     pub fn with_user_mcp_tools(mut self, user_mcp: Vec<UserMcpServerTools>) -> Self {
         self.user_mcp = std::sync::Arc::from(user_mcp);
+        self
+    }
+
+    /// Attach the host-rendered LANGUAGE persona block (DEVBOULE_LANG_SKILL). Builder-style; the
+    /// default (`None`) construction stays byte-identical.
+    pub fn with_lang_skill(mut self, lang_skill: Option<String>) -> Self {
+        self.lang_skill = lang_skill;
         self
     }
 
@@ -810,7 +841,13 @@ impl CloudModel {
     /// PURE request-body builder: identical shape to the loopback client's, via the
     /// shared [`build_chat_body`]. Unit-testable without inference or a network.
     pub fn build_request_body(&self, transcript: &Transcript) -> Value {
-        build_chat_body(&self.model, transcript, self.plan_first, &self.user_mcp)
+        build_chat_body(
+            &self.model,
+            transcript,
+            self.plan_first,
+            &self.user_mcp,
+            self.lang_skill.as_deref(),
+        )
     }
 
     /// POST one chat-completions request (https + bearer) and return the assistant

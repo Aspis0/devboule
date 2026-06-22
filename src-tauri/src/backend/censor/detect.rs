@@ -140,6 +140,143 @@ pub fn detect_project_kinds(root: &Path) -> HashSet<ProjectKind> {
     kinds
 }
 
+/// Canonical persona-language keys, HIGHEST priority first. Picks ONE primary language for
+/// the (role × language) prompt persona from the (possibly multi-kind) project detection or
+/// a task's file set.
+const LANG_PRIORITY: &[(ProjectKind, &str)] = &[
+    (ProjectKind::Rust, "rust"),
+    (ProjectKind::Node, "node"),
+    (ProjectKind::Python, "python"),
+    (ProjectKind::Go, "go"),
+    (ProjectKind::Cpp, "cpp"),
+    (ProjectKind::Kotlin, "kotlin"),
+];
+
+/// Map a per-file language to a canonical persona key, or None for languages with no persona
+/// layer (HTML/Shell/YAML/SQL/CSS/Dockerfile/GithubActions/Other). `Ts` → "node" (the JS/TS
+/// ecosystem shares the Node persona).
+fn file_lang_to_key(l: FileLang) -> Option<&'static str> {
+    match l {
+        FileLang::Rust => Some("rust"),
+        FileLang::Ts => Some("node"),
+        FileLang::Py => Some("python"),
+        FileLang::Go => Some("go"),
+        FileLang::Cpp => Some("cpp"),
+        FileLang::Kotlin => Some("kotlin"),
+        // No per-language persona for these (covered by the role/base prompt, not a coder
+        // persona). EXHAUSTIVE on purpose: a future FileLang variant must be classified here
+        // (compile error) instead of being silently swallowed by a `_` wildcard.
+        FileLang::Html
+        | FileLang::Shell
+        | FileLang::Yaml
+        | FileLang::Sql
+        | FileLang::Dockerfile
+        | FileLang::GithubActions
+        | FileLang::Css
+        | FileLang::Other => None,
+    }
+}
+
+/// The project's PRIMARY persona language: the highest-priority detected kind, or None when
+/// no persona-backed kind is present (fail-open ⇒ no language layer).
+pub fn primary_language_from_kinds(kinds: &HashSet<ProjectKind>) -> Option<&'static str> {
+    LANG_PRIORITY
+        .iter()
+        .find_map(|(kind, key)| kinds.contains(kind).then_some(*key))
+}
+
+/// The persona language of a TASK's file set: the most frequent per-file language, ties
+/// broken by `LANG_PRIORITY`. None when no file maps to a persona key.
+pub fn primary_language_from_files(files: &[String]) -> Option<&'static str> {
+    let mut counts: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    for f in files {
+        if let Some(key) = file_lang_to_key(FileLang::from_path(Path::new(f))) {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let max_count = counts.values().max().copied()?;
+    LANG_PRIORITY
+        .iter()
+        .find_map(|(_, key)| (counts.get(key).copied() == Some(max_count)).then_some(*key))
+}
+
+#[cfg(test)]
+mod lang_key_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn primary_language_from_kinds_uses_priority() {
+        let mut kinds = HashSet::new();
+        kinds.insert(ProjectKind::Rust);
+        kinds.insert(ProjectKind::Node);
+        assert_eq!(primary_language_from_kinds(&kinds), Some("rust"));
+        let mut py = HashSet::new();
+        py.insert(ProjectKind::Python);
+        assert_eq!(primary_language_from_kinds(&py), Some("python"));
+        assert_eq!(primary_language_from_kinds(&HashSet::new()), None);
+    }
+
+    #[test]
+    fn primary_language_from_files_mode_and_tiebreak() {
+        assert_eq!(
+            primary_language_from_files(&["a.py".into(), "b.py".into(), "c.rs".into()]),
+            Some("python")
+        );
+        assert_eq!(primary_language_from_files(&["x.ts".into()]), Some("node"));
+        assert_eq!(
+            primary_language_from_files(&["r.md".into(), "n.txt".into()]),
+            None
+        );
+        assert_eq!(
+            primary_language_from_files(&["a.rs".into(), "b.py".into()]),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn primary_language_from_files_empty_and_balanced_tie() {
+        assert_eq!(primary_language_from_files(&[]), None);
+        // 2-vs-2 tie → broken by priority (rust > node).
+        assert_eq!(
+            primary_language_from_files(&[
+                "a.rs".into(),
+                "b.rs".into(),
+                "a.ts".into(),
+                "b.ts".into()
+            ]),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn gradle_kts_build_script_is_not_counted_as_kotlin() {
+        // `*.gradle.kts` classifies as Other in FileLang::from_path, so it must NOT cast a
+        // "kotlin" vote — the two real .kt files decide it.
+        assert_eq!(
+            primary_language_from_files(&[
+                "build.gradle.kts".into(),
+                "Main.kt".into(),
+                "Lib.kt".into()
+            ]),
+            Some("kotlin")
+        );
+    }
+
+    #[test]
+    fn lang_priority_covers_every_project_kind() {
+        // Future-proofing: a new ProjectKind added to ALL must also get a LANG_PRIORITY entry,
+        // else primary_language_from_kinds would silently never return it.
+        assert_eq!(LANG_PRIORITY.len(), ProjectKind::ALL.len());
+        for k in ProjectKind::ALL {
+            assert!(
+                LANG_PRIORITY.iter().any(|(pk, _)| *pk == k),
+                "ProjectKind::{k:?} missing from LANG_PRIORITY"
+            );
+        }
+    }
+}
+
 /// Language of a single file, by extension. `Other` covers everything the
 /// per-language runners don't apply to (the cross-cutting runners still apply).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

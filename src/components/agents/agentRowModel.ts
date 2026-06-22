@@ -283,6 +283,10 @@ export interface SpawnSelection {
   // Optional so existing callers (e.g. the Censor final-review path) type-check
   // without setting it; absent is treated as off everywhere downstream.
   planFirst?: boolean;
+  // Phase 6 — per-launch LANGUAGE-persona override (the panel's language selector). "" / absent
+  // ⇒ the backend auto-detects the project's primary language for the (role × language) persona;
+  // a non-empty value (rust/node/python/go/cpp/kotlin) forces that persona instead.
+  languageOverride?: string;
 }
 
 // The exact ProjectAgentLaunchInput sent over IPC, built from a selection plus a
@@ -308,6 +312,10 @@ export interface SpawnLaunchInput {
   // orchestrator binary (and omits it when false/absent so a non-plan-first launch
   // is byte-identical). Always absent for codex/claude — the toggle is not shown.
   planFirst?: boolean;
+  // Phase 6 — the per-launch language-persona override, threaded to ProjectAgentLaunchInput
+  // .languageOverride over IPC. Absent ⇒ the backend auto-detects; a non-empty value forces that
+  // language's persona. Backend-agnostic (applies on whatever backend the role runs on).
+  languageOverride?: string;
 }
 
 // Max length of an advisory model hint that rides into the prompt. A model name
@@ -393,6 +401,12 @@ export function buildLaunchInput(
     planFirst:
       selection.client === "orchestrator"
         ? selection.planFirst === true
+        : undefined,
+    // Phase 6 — forward the language-persona override only when the user actually picked one
+    // (non-empty). Absent ⇒ the backend auto-detects; applies on any backend the role runs on.
+    languageOverride:
+      selection.languageOverride && selection.languageOverride.trim().length > 0
+        ? selection.languageOverride.trim()
         : undefined,
   };
 }

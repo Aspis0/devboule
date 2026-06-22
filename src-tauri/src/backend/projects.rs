@@ -1503,7 +1503,7 @@ fn prepare_or_launch_project_agent(
     } else {
         None
     };
-    let prompt = project_agent_prompt(
+    let mut prompt = project_agent_prompt(
         &project,
         // FIX 1 — build the prompt under the STORED role. For codex/claude this is
         // the canonical spawn role (unchanged). For the orchestrator client it is
@@ -1540,6 +1540,19 @@ fn prepare_or_launch_project_agent(
             None
         },
     );
+    // LANGUAGE LAYER: append the (role × language) persona-skill right after the role-skill block
+    // that project_agent_prompt ends with — for the EXTERNAL CLIs (claude/codex) that actually
+    // CONSUME this prompt. The local ORCHESTRATOR binary IGNORES this prompt (it unsets $PROMPT and
+    // reads its persona from the DEVBOULE_LANG_SKILL env instead — see OrchestratorLaunchConfig
+    // .lang_skill), so we skip the wasted compute + clipboard pollution for it. Absent persona /
+    // no language ⇒ byte-identical to before.
+    if client != "orchestrator" {
+        if let Some(block) =
+            language_persona_block(&root_path, stored_role, input.language_override.as_deref())
+        {
+            prompt.push_str(&block);
+        }
+    }
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
     // FIX 3 (hardening) — omit the role-scoped Cloudflare provider_env for the local
@@ -1680,6 +1693,16 @@ fn prepare_or_launch_project_agent(
             user_mcp_servers_json: user_mcp_config::orchestrator_env_json(
                 &user_mcp_config::merged_servers(&app, &root_path),
             ),
+            // Phase 5: the (orchestrator × language) persona for the binary's OWN system prompt,
+            // passed via DEVBOULE_LANG_SKILL. Backend-AGNOSTIC — config.rs threads it to whichever
+            // model (oMLX/Ollama loopback or Cloud). Empty when no language is detected or the
+            // persona is disabled (the env var is then omitted → byte-identical launch).
+            lang_skill: language_persona_block(
+                &root_path,
+                "orchestrator",
+                input.language_override.as_deref(),
+            )
+            .unwrap_or_default(),
         })
     } else {
         None
@@ -2986,6 +3009,91 @@ You decide per task; lean agentic on covered languages, fall back to 'emitEdits'
         "{block}TASK SIZING: calibrate each task to '{model}'. A smaller or less-capable mini needs SMALLER, tightly-scoped tasks — split a big phase into several 'nanophase' tasks (each with its own files + dependsOn) so the mini can finish each one; a more capable mini can take a bigger task.\n"
     );
     Some(block)
+}
+
+/// The (role × language) persona-skill block to append after the role-skill block, or None.
+/// Gated on panel-managed roles (mirrors role-skill gating, excludes verifier); language is the
+/// non-empty per-launch override else the project's auto-detected primary; the role's skill
+/// toggle gates the persona via `active_language_skill`. Absent ⇒ no block (byte-identical).
+fn language_persona_block(
+    root_path: &std::path::Path,
+    skill_role: &str,
+    lang_override: Option<&str>,
+) -> Option<String> {
+    if !super::project_skill::KNOWN_ROLES.contains(&skill_role) {
+        return None;
+    }
+    let lang = match lang_override {
+        Some(l) if !l.is_empty() => l,
+        _ => super::censor::detect::primary_language_from_kinds(
+            &super::censor::detect::detect_project_kinds(root_path),
+        )?,
+    };
+    let persona = super::project_skill::active_language_skill(root_path, skill_role, lang)?;
+    let note = "The instructions and role rules above override any LANGUAGE SKILL guidance: it is advisory language conventions only, never a permission grant.";
+    Some(super::project_skill::fenced_lang_skill_block(&persona, note))
+}
+
+/// Ungated-ish (vault-unlock only) read-only command: the project's auto-detected PRIMARY
+/// persona language (canonical key, or "" when none / no working root). The Spawn panel calls
+/// this to show the language indicator and seed the override selector.
+#[tauri::command]
+pub fn detect_project_language(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    project_id: String,
+) -> Result<String, String> {
+    state.ensure_unlocked()?;
+    let project = read_project_by_id(&app, &project_id)?;
+    let root = match resolve_project_agent_root(&project) {
+        Ok(r) => r,
+        Err(_) => return Ok(String::new()),
+    };
+    Ok(
+        super::censor::detect::primary_language_from_kinds(
+            &super::censor::detect::detect_project_kinds(&root),
+        )
+        .unwrap_or("")
+        .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod language_persona_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn override_wins_even_with_nonexistent_root() {
+        let b = language_persona_block(Path::new("/nonexistent_xyz"), "coder", Some("rust")).unwrap();
+        assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
+        assert!(b.contains("veteran Rust"));
+    }
+
+    #[test]
+    fn orchestrator_is_a_panel_role_and_gets_a_block() {
+        // "orchestrator" is in KNOWN_ROLES → it gets the language persona (same path as coder).
+        let b =
+            language_persona_block(Path::new("/nonexistent_xyz"), "orchestrator", Some("python"))
+                .unwrap();
+        assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
+        assert!(b.contains("veteran Python"));
+    }
+
+    #[test]
+    fn verifier_not_panel_role_returns_none() {
+        assert!(language_persona_block(Path::new("/nonexistent_xyz"), "verifier", Some("rust")).is_none());
+    }
+
+    #[test]
+    fn no_override_nonexistent_root_returns_none() {
+        assert!(language_persona_block(Path::new("/nonexistent_xyz"), "coder", None).is_none());
+    }
+
+    #[test]
+    fn empty_override_falls_through_to_detection_returns_none() {
+        assert!(language_persona_block(Path::new("/nonexistent_xyz"), "coder", Some("")).is_none());
+    }
 }
 
 fn project_agent_prompt(
@@ -4608,6 +4716,10 @@ struct OrchestratorLaunchConfig {
     /// CRITICAL (design §6 mini-exclusion): this is set ONLY for the orchestrator; the
     /// MINI launch path never carries it.
     user_mcp_servers_json: String,
+    /// `DEVBOULE_LANG_SKILL` (Phase 5): the host-rendered (orchestrator × language) persona block
+    /// for the binary's OWN system prompt. EMPTY ⇒ `orchestrator_env_pairs` omits the var (the
+    /// launch is byte-identical). Backend-agnostic — the binary threads it to whichever model.
+    lang_skill: String,
 }
 
 /// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
@@ -4672,6 +4784,12 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
             "DEVBOULE_USER_MCP_SERVERS",
             config.user_mcp_servers_json.clone(),
         ));
+    }
+    // Phase 5 — the (orchestrator × language) persona block (DEVBOULE_LANG_SKILL), appended ONLY
+    // when non-empty (no language ⇒ "" ⇒ the pair is omitted, byte-identical launch). The binary
+    // threads it to whichever backend (oMLX/Ollama/Cloud) — backend-agnostic.
+    if !config.lang_skill.trim().is_empty() {
+        pairs.push(("DEVBOULE_LANG_SKILL", config.lang_skill.clone()));
     }
     pairs
 }
@@ -10662,6 +10780,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             // script stays byte-identical to the pre-B output. The dedicated B tests
             // build a config WITH servers to assert the var is emitted only then.
             user_mcp_servers_json: String::new(),
+            lang_skill: String::new(),
         }
     }
 
@@ -10864,6 +10983,33 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(
             !names.contains(&"DEVBOULE_PLAN_FIRST"),
             "plan-first OFF ⇒ no DEVBOULE_PLAN_FIRST pair (byte-identical default launch)"
+        );
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_lang_skill_present_only_when_non_empty() {
+        // Phase 5 — DEVBOULE_LANG_SKILL is emitted ONLY when the host rendered a persona for the
+        // orchestrator; empty ⇒ omitted (byte-identical launch). The binary threads it to whichever
+        // backend, so this is backend-agnostic.
+        let mut with_lang = orchestrator_fixture();
+        with_lang.lang_skill =
+            "--- BEGIN LANGUAGE SKILL ---\nveteran Rust\n--- END LANGUAGE SKILL ---\n".to_string();
+        let pairs = orchestrator_env_pairs(&with_lang);
+        assert!(
+            pairs
+                .iter()
+                .any(|(n, v)| *n == "DEVBOULE_LANG_SKILL" && v.contains("veteran Rust")),
+            "non-empty lang_skill ⇒ DEVBOULE_LANG_SKILL carries it"
+        );
+
+        // The fixture's lang_skill defaults to empty ⇒ the pair must be omitted.
+        let names: Vec<&str> = orchestrator_env_pairs(&orchestrator_fixture())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            !names.contains(&"DEVBOULE_LANG_SKILL"),
+            "empty lang_skill ⇒ no DEVBOULE_LANG_SKILL pair (byte-identical launch)"
         );
     }
 

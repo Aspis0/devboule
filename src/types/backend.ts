@@ -1062,6 +1062,11 @@ export interface ProjectAgentLaunchInput {
   // is byte-identical). Ignored for codex/claude. Mirrors the #[serde(default)]
   // plan_first on ProjectAgentLaunchInput in model.rs.
   planFirst?: boolean | null;
+  // Phase 6: per-launch LANGUAGE-persona override (rust/node/python/go/cpp/kotlin). Absent ⇒ the
+  // backend auto-detects the project's primary language for the (role × language) persona; a value
+  // forces that language's persona on whatever backend the role runs on. Optional + lenient:
+  // mirrors the #[serde(default)] language_override on ProjectAgentLaunchInput in model.rs.
+  languageOverride?: string | null;
   // Saved Claude Code workflow launch. The backend validates name against
   // list_saved_workflows(projectId) before building the fixed prompt addendum.
   workflowRun?: {

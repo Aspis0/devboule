@@ -6,12 +6,21 @@
 // because the orchestrator branch only renders for the selected client (the static-render
 // SpawnPanel.test.tsx covers the always-present option list).
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
 import { SpawnPanel } from "./SpawnPanel";
 import type { SpawnLaunchInput } from "./agentRowModel";
+
+// Phase 6 — the panel's mount effect calls detect_project_language; mock the IPC layer so the
+// effect resolves DETERMINISTICALLY in jsdom (no Tauri runtime ⇒ the real call would reject and
+// fire setState outside act). "rust" makes the language indicator render for assertions.
+vi.mock("../../context/AppContext", () => ({
+  invokeBackendCommand: vi.fn(async (cmd: string) =>
+    cmd === "detect_project_language" ? "rust" : "",
+  ),
+}));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;

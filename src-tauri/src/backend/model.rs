@@ -584,6 +584,12 @@ pub struct ProjectAgentLaunchInput {
     /// per-step Censor addendum is unconditional). camelCase over IPC.
     #[serde(default)]
     pub censor_review: Option<bool>,
+    /// Per-launch LANGUAGE-PERSONA override (the Spawn panel's language selector). When
+    /// `Some(non-empty)` it bypasses the project's auto-detected primary language for the
+    /// (role × language) persona-skill layer; `None`/empty ⇒ auto-detect. camelCase over IPC;
+    /// the lenient default keeps every existing caller byte-identical.
+    #[serde(default)]
+    pub language_override: Option<String>,
     /// 3b: when `Some(true)` AND `client == "orchestrator"`, the local Devboule coder is
     /// launched in PLAN-FIRST mode — the launch adds `DEVBOULE_PLAN_FIRST=1` to the
     /// orchestrator binary's env so its system prompt biases toward producing a plan

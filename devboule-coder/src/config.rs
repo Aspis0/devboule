@@ -74,6 +74,10 @@ const ENV_PROJECT_ID: &str = "DEVBOULE_PROJECT_ID";
 /// directive (`prompt::build_system_prompt(true)`) so the model's first action for a
 /// non-trivial goal is `plan`. NOT a secret.
 const ENV_PLAN_FIRST: &str = "DEVBOULE_PLAN_FIRST";
+/// The host-rendered LANGUAGE persona block (role × language), set by the app launch. Appended
+/// to the binary's system prompt for ANY backend (loopback oMLX / Ollama / Cloud — it threads
+/// through the SHARED `build_chat_body`). Absent ⇒ the prompt is byte-identical.
+const ENV_LANG_SKILL: &str = "DEVBOULE_LANG_SKILL";
 /// Phase B — the merged, ENABLED user MCP servers the launch wiring injects for the
 /// devboule-coder ORCHESTRATOR (a JSON array of `{name,command,args,env}`). Read ONLY
 /// here (the local MAIN coder). The MINI coder is a separate binary that NEVER sets or
@@ -121,6 +125,9 @@ pub async fn build_runtime() -> Runtime {
 /// real models (each POSTs the system prompt); the Mock never plans.
 fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dyn CoderModel> {
     let plan_first = env_nonempty(ENV_PLAN_FIRST).is_some();
+    // Backend-AGNOSTIC: read the host-rendered language persona once and pass it to whichever
+    // model (Cloud or oMLX/Ollama loopback) build_model selects below.
+    let lang_skill = env_nonempty(ENV_LANG_SKILL);
 
     // 1. CLOUD first (opt-in). The PRESENCE of the cloud base URL selects this path;
     // a misconfiguration (bad https/host, empty model, missing key) fails LOUD to the
@@ -131,7 +138,12 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
         let cloud_key = std::env::var(ENV_CLOUD_API_KEY).unwrap_or_default();
         match CloudModel::new(&cloud_base, cloud_model, cloud_key, plan_first) {
             // B.3: attach the user-MCP tool catalog (empty ⇒ prompt byte-identical).
-            Ok(m) => return Arc::new(m.with_user_mcp_tools(user_mcp_tools)),
+            Ok(m) => {
+                return Arc::new(
+                    m.with_user_mcp_tools(user_mcp_tools)
+                        .with_lang_skill(lang_skill.clone()),
+                )
+            }
             Err(e) => {
                 let plan_note = if plan_first {
                     " (\"Plan first\" was requested but is now INACTIVE — the Mock does not plan)"
@@ -154,7 +166,10 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
     let model_id = std::env::var(ENV_OMLX_MODEL).unwrap_or_default();
     match OmlxModel::new(&base_url, model_id, plan_first) {
         // B.3: attach the user-MCP tool catalog (empty ⇒ prompt byte-identical).
-        Ok(m) => Arc::new(m.with_user_mcp_tools(user_mcp_tools)),
+        Ok(m) => Arc::new(
+            m.with_user_mcp_tools(user_mcp_tools)
+                .with_lang_skill(lang_skill),
+        ),
         Err(e) => {
             // Misconfigured endpoint (non-loopback / https / empty model): refuse
             // to route the prompt off-machine; fall back to the Mock. If "Plan first"

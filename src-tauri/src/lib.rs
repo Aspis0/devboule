@@ -473,6 +473,7 @@ pub fn run() {
             backend::plan_approval::deny_plan_request,
             backend::plan_approval::reply_to_agent,
             backend::projects::prepare_project_agent_prompt,
+            backend::projects::detect_project_language,
             backend::commands::perform_scaleway_resource_action,
             backend::commands::create_scaleway_block_volume,
             backend::commands::resize_scaleway_block_volume,
