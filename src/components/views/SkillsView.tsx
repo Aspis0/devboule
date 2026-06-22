@@ -14,6 +14,7 @@ import {
   useState,
 } from "react";
 import { invokeBackendCommand } from "../../context/AppContext";
+import { MarketplaceInstall } from "./MarketplaceInstall";
 import {
   MAX_SKILL_BYTES,
   type CatalogEntry,
@@ -650,7 +651,15 @@ export function SkillsView() {
           </div>
 
           {view === "discover" ? (
-            <DiscoverView
+            <div className="space-y-4">
+              {folder && (
+                <MarketplaceInstall
+                  folderPath={folder}
+                  invoke={invokeBackendCommand}
+                  onInstalled={() => void refreshLangs(folder)}
+                />
+              )}
+              <DiscoverView
               catalog={catalog ?? []}
               langCatalog={langCatalog}
               query={query}
@@ -688,7 +697,8 @@ export function SkillsView() {
                   ?.some((e) => e.lang === lang && e.source === "project") ??
                 false
               }
-            />
+              />
+            </div>
           ) : (
             <div className="grid gap-4">
               {ROLE_ORDER.map((role) => (

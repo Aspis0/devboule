@@ -79,3 +79,28 @@ export interface LangCatalogEntry {
   source: SkillSource;
   body: string;
 }
+
+// --- Phase 4: external skill MARKETPLACE (fetch → vet-preview → install) ---
+
+export type RiskSeverity = "Info" | "Warn" | "Danger";
+
+/** One risk the static scanner found in a fetched SKILL.md (mirrors backend skill_vet::RiskFinding). */
+export interface RiskFinding {
+  code: string;
+  severity: RiskSeverity;
+  title: string;
+  evidence: string;
+}
+
+/** What `skills_marketplace_preview` returns: the parsed metadata + a body excerpt + the risk
+ *  findings the owner reviews BEFORE confirming an install (mirrors backend MarketplacePreview). */
+export interface MarketplacePreview {
+  name: string | null;
+  description: string | null;
+  allowed_tools: string | null;
+  body_excerpt: string;
+  findings: RiskFinding[];
+  worst: RiskSeverity | null;
+  source_url: string;
+  sha256: string;
+}
