@@ -105,6 +105,10 @@ pub enum AgentAction {
     },
     /// Expand a glob to matching paths.
     Glob { pattern: String },
+    /// Load an installed SKILL.md skill's full body into context (Level-2 progressive disclosure).
+    /// `name` is the skill name from the system-prompt catalog, or `"skill-name/rel/path"` to load a
+    /// supporting file from that skill's dir (path-traversal guarded).
+    LoadSkill { name: String },
     /// EGRESS: fetch a URL.
     Fetch { url: String },
     /// EGRESS: run a web search.
@@ -169,6 +173,7 @@ impl AgentAction {
             AgentAction::Read { .. } => "read",
             AgentAction::Grep { .. } => "grep",
             AgentAction::Glob { .. } => "glob",
+            AgentAction::LoadSkill { .. } => "load_skill",
             AgentAction::Fetch { .. } => "fetch",
             AgentAction::Websearch { .. } => "websearch",
             AgentAction::McpTool { .. } => "mcp_tool",
@@ -196,6 +201,7 @@ impl AgentAction {
             AgentAction::Read { path } => path.clone(),
             AgentAction::Grep { pattern, .. } => pattern.clone(),
             AgentAction::Glob { pattern } => pattern.clone(),
+            AgentAction::LoadSkill { name } => name.clone(),
             AgentAction::Fetch { url } => url.clone(),
             AgentAction::Websearch { query } => query.clone(),
             // The target is `server.tool` PLUS a compact form of `params`, so the
@@ -272,6 +278,17 @@ impl AgentAction {
                 Ok(())
             }
             AgentAction::Glob { pattern } => check_glob_pattern("pattern", pattern),
+            AgentAction::LoadSkill { name } => {
+                check_text("name", name)?;
+                // Defense-in-depth at parse time (the loader also canonical-guards). Normalize `\`→`/`
+                // first (a `\`-escaped `..`, or a future Windows port, must not slip the segment check),
+                // then reject absolute + any `..` segment in the "name/rel/path" supporting-file form.
+                let normalized = name.replace('\\', "/");
+                if normalized.starts_with('/') || normalized.split('/').any(|c| c == "..") {
+                    return Err("load_skill name must be a skill name, optionally with a relative sub-path (no '..' / absolute)".to_string());
+                }
+                Ok(())
+            }
             AgentAction::Fetch { url } => {
                 check_text("url", url)?;
                 check_url(url)

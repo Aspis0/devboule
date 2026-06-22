@@ -171,6 +171,7 @@ impl ToolExecutor for StubExecutor {
             | AgentAction::Read { .. }
             | AgentAction::Grep { .. }
             | AgentAction::Glob { .. }
+            | AgentAction::LoadSkill { .. }
             | AgentAction::Fetch { .. }
             | AgentAction::Websearch { .. }
             | AgentAction::McpTool { .. } => ToolResult::err(STUB_NOT_CONNECTED),

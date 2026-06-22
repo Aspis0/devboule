@@ -577,8 +577,26 @@ fn build_messages(
     // must always see who it is and what was asked. `plan_first` (3b) appends the
     // PLAN-FIRST directive to the standing prompt when the operator requested it;
     // `user_mcp` (B.3) appends the external user-MCP tool catalog when non-empty.
+    // System prompt + the Level-1 SKILLS catalog: discover installed library skills from the project
+    // root (env DEVBOULE_PROJECT_ROOT, else cwd — same source as the FS backend) and append the
+    // catalog so the model knows what it can `load_skill`. Role-skill dirs are excluded (injected
+    // directly). No skills ⇒ nothing appended (byte-identical). Discovered per-turn (a few stats).
+    let mut system_prompt = build_system_prompt_with_lang(plan_first, user_mcp, lang_skill);
+    {
+        let root = std::env::var("DEVBOULE_PROJECT_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let roots = vec![root.join(".claude").join("skills")];
+        let skills = crate::skills::discover_library_skills(
+            &roots,
+            &["mini", "coder", "design", "orchestrator"],
+        );
+        if let Some(catalog) = crate::skills::skills_catalog_block(&skills) {
+            system_prompt.push_str(&catalog);
+        }
+    }
     let mut messages = vec![
-        json!({ "role": "system", "content": build_system_prompt_with_lang(plan_first, user_mcp, lang_skill) }),
+        json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user", "content": transcript.human_message() }),
     ];
 
@@ -659,6 +677,7 @@ fn render_action_block(action: &crate::action::AgentAction) -> String {
             None => json!({"tool":"grep","pattern":pattern}),
         },
         A::Glob { pattern } => json!({"tool":"glob","pattern":pattern}),
+        A::LoadSkill { name } => json!({"tool":"load_skill","name":name}),
         A::Fetch { url } => json!({"tool":"fetch","url":url}),
         A::Websearch { query } => json!({"tool":"websearch","query":query}),
         A::McpTool {

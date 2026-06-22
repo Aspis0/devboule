@@ -166,7 +166,7 @@ fn render_user_mcp_section(user_mcp: &[UserMcpServerTools]) -> String {
 /// (In-band PERSUASION inside a description — "ignore your instructions" — cannot be
 /// sanitized away and is NOT this function's job; it is defended by the untrusted-data
 /// framing in the section header + system prompt. This guard closes the STRUCTURAL escapes.)
-fn sanitize_metadata(value: &str) -> String {
+pub(crate) fn sanitize_metadata(value: &str) -> String {
     value
         .replace(
             ['\n', '\r', '\u{2028}', '\u{2029}', '\u{0085}', '\u{000B}', '\u{000C}'],

@@ -745,6 +745,30 @@ impl ToolExecutor for RealExecutor {
                 }
             }
 
+            // Level-2 progressive disclosure: load an installed library skill's body (or a guarded
+            // supporting file). Library skills live in `<root>/.claude/skills/`; the role-skill dirs
+            // (mini/coder/design/orchestrator) are excluded — they're injected directly. Re-discovers
+            // off-thread at call time (cheap, and picks up a just-installed skill).
+            AgentAction::LoadSkill { name } => {
+                let root = self.fs.root.clone();
+                let req = name.clone();
+                let label = name.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let roots = vec![root.join(".claude").join("skills")];
+                    let skills = crate::skills::discover_library_skills(
+                        &roots,
+                        &["mini", "coder", "design", "orchestrator"],
+                    );
+                    crate::skills::load_skill_content(&skills, &req)
+                })
+                .await
+                {
+                    Ok(Ok(text)) => ToolResult::ok(text),
+                    Ok(Err(e)) => ToolResult::err(format!("load_skill {label}: {e}")),
+                    Err(e) => ToolResult::err(format!("load_skill {label} failed to run: {e}")),
+                }
+            }
+
             // --- Exa backend: egress, gated -----------------------------------
             // The burst's egress gate already blocks these when egress is off, so
             // reaching here with `web == None` is a logic error — report it

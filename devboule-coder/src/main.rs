@@ -25,6 +25,7 @@ mod planner;
 mod prompt;
 mod rmcp_backend;
 mod runner;
+mod skills;
 mod terminal;
 
 use std::sync::Arc;
