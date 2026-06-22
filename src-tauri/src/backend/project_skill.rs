@@ -1374,6 +1374,115 @@ pub fn skills_lang_catalog() -> Vec<LangCatalogEntry> {
     bundled_lang_catalog()
 }
 
+// --- Phase 4d: external skill MARKETPLACE (fetch → vet-preview → owner-confirmed install) ----------
+
+const MARKETPLACE_FETCH_MAX_BYTES: usize = 256 * 1024;
+const MARKETPLACE_FETCH_TIMEOUT_SECS: u64 = 15;
+
+/// What the install-preview shows the owner BEFORE they confirm: the parsed metadata, a body excerpt,
+/// and the [`super::skill_vet`] risk findings. `sha256` pins exactly what was previewed (the install
+/// re-fetches + verifies it, so the owner installs precisely what they vetted).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MarketplacePreview {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub allowed_tools: Option<String>,
+    pub body_excerpt: String,
+    pub findings: Vec<super::skill_vet::RiskFinding>,
+    pub worst: Option<super::skill_vet::RiskSeverity>,
+    pub source_url: String,
+    pub sha256: String,
+}
+
+/// Fetch a marketplace SKILL.md (SSRF-guarded), scan it, and return the preview. NEVER installs.
+#[tauri::command]
+pub async fn skills_marketplace_preview(
+    state: State<'_, BackendState>,
+    url: String,
+) -> Result<MarketplacePreview, String> {
+    state.ensure_unlocked()?;
+    tokio::task::spawn_blocking(move || marketplace_preview_impl(&url))
+        .await
+        .map_err(|e| format!("preview task failed: {e}"))?
+}
+
+fn marketplace_preview_impl(url: &str) -> Result<MarketplacePreview, String> {
+    let (validated, addrs) = super::skill_marketplace::validate_public_url(url)?;
+    let content = super::skill_marketplace::fetch_text_capped(
+        &validated,
+        &addrs,
+        MARKETPLACE_FETCH_MAX_BYTES,
+        MARKETPLACE_FETCH_TIMEOUT_SECS,
+    )?;
+    let (fm, body) = super::skill_format::parse_skill_frontmatter(&content);
+    let findings = super::skill_vet::scan_skill_risks(&content, &[]);
+    let worst = super::skill_vet::worst_severity(&findings);
+    Ok(MarketplacePreview {
+        name: fm.as_ref().and_then(|f| f.name.clone()),
+        description: fm.as_ref().and_then(|f| f.description.clone()),
+        allowed_tools: fm.as_ref().and_then(|f| f.allowed_tools.clone()),
+        body_excerpt: body.chars().take(2000).collect(),
+        findings,
+        worst,
+        source_url: validated.to_string(),
+        sha256: super::skill_marketplace::sha256_hex(&content),
+    })
+}
+
+/// Install a marketplace skill into the project library after the owner confirmed the preview.
+/// Re-fetches + verifies the content still matches `expected_sha256` (so a server can't swap the
+/// payload between preview and install). `fetched_at` is the frontend timestamp (for provenance).
+#[tauri::command]
+pub async fn skills_marketplace_install(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    url: String,
+    skill_name: String,
+    expected_sha256: String,
+    fetched_at: String,
+) -> Result<String, String> {
+    state.ensure_unlocked()?;
+    let canonical = canonical_working_folder(&working_folder_path)?;
+    tokio::task::spawn_blocking(move || {
+        marketplace_install_impl(&canonical, &url, &skill_name, &expected_sha256, &fetched_at)
+    })
+    .await
+    .map_err(|e| format!("install task failed: {e}"))?
+}
+
+fn marketplace_install_impl(
+    root: &Path,
+    url: &str,
+    skill_name: &str,
+    expected_sha256: &str,
+    fetched_at: &str,
+) -> Result<String, String> {
+    let (validated, addrs) = super::skill_marketplace::validate_public_url(url)?;
+    let content = super::skill_marketplace::fetch_text_capped(
+        &validated,
+        &addrs,
+        MARKETPLACE_FETCH_MAX_BYTES,
+        MARKETPLACE_FETCH_TIMEOUT_SECS,
+    )?;
+    let sha = super::skill_marketplace::sha256_hex(&content);
+    if !expected_sha256.is_empty() && sha != expected_sha256 {
+        return Err(
+            "the skill content changed since the preview — re-preview before installing".to_string(),
+        );
+    }
+    let prov = super::skill_marketplace::SkillProvenance {
+        source_url: validated.to_string(),
+        fetched_at: fetched_at.to_string(),
+        sha256: sha,
+    };
+    let lib_root = root.join(".claude").join("skills");
+    std::fs::create_dir_all(&lib_root).map_err(|e| format!("create library failed: {e}"))?;
+    let dest = super::skill_marketplace::install_skill_package(
+        &lib_root, skill_name, &content, &[], &prov,
+    )?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -600,6 +600,8 @@ pub fn run() {
             backend::project_skill::skills_save_lang,
             backend::project_skill::skills_reset_lang,
             backend::project_skill::skills_lang_catalog,
+            backend::project_skill::skills_marketplace_preview,
+            backend::project_skill::skills_marketplace_install,
             backend::user_mcp_config::user_mcp_list,
             backend::user_mcp_config::user_mcp_add,
             backend::user_mcp_config::user_mcp_remove,
