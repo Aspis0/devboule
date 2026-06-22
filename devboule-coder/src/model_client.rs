@@ -582,6 +582,15 @@ fn build_messages(
     // catalog so the model knows what it can `load_skill`. Role-skill dirs are excluded (injected
     // directly). No skills ⇒ nothing appended (byte-identical). Discovered per-turn (a few stats).
     let mut system_prompt = build_system_prompt_with_lang(plan_first, user_mcp, lang_skill);
+    // Project-context (AGENTS.md/CLAUDE.md): host-rendered, ALREADY fenced + sentinel-neutralized,
+    // passed via DEVBOULE_PROJECT_CONTEXT. The "what this repo is" block — appended before the
+    // (mobile) skills catalog. Absent/empty ⇒ nothing added (byte-identical).
+    if let Ok(ctx) = std::env::var("DEVBOULE_PROJECT_CONTEXT") {
+        if !ctx.trim().is_empty() {
+            system_prompt.push('\n');
+            system_prompt.push_str(&ctx);
+        }
+    }
     {
         let root = std::env::var("DEVBOULE_PROJECT_ROOT")
             .map(std::path::PathBuf::from)
