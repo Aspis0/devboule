@@ -320,7 +320,7 @@ fn write_shard_locked(path: &Path, shard: &CensorShard) -> io::Result<()> {
         return Err(e);
     }
     replace_file_with_backup(&temp_path, path, &backup_path, "censor shard")
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 /// Write a shard atomically under its own lock. Creates `.aspis-censor/` if

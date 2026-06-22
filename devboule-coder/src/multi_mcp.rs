@@ -119,58 +119,57 @@ impl MultiMcpBackend {
         // `Option<(name, backend, catalog)>` (None ⇒ this server failed and is skipped),
         // and the futures are joined IN ORDER so the surviving `Some`s preserve the
         // original spec order for deterministic routing + prompt-catalog output.
+        // Each server is bounded INDIVIDUALLY: a per-server timeout means `join_all` always
+        // completes and every server that connected in time is preserved (an aggregate phase
+        // timeout would discard already-connected servers too). A server that fails OR times
+        // out is logged and SKIPPED — the Oracle is up and the burst proceeds.
         let connects = specs.into_iter().map(|spec| async move {
-            match RmcpBackend::connect_generic(&spec.command, &spec.args, &spec.env).await {
-                Ok(backend) => {
-                    // Fetch the tool catalog WHILE we still hold the concrete backend
-                    // (the trait object does not expose list_tools). A failure here is
-                    // non-fatal: the server is still wired; it just lists no tools.
-                    let tools = match backend.list_tools().await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!(
-                                "devboule: user MCP server '{}' list_tools failed ({e}); \
-                                 wired with no advertised tools",
-                                spec.name
-                            );
-                            Vec::new()
-                        }
-                    };
-                    Some((spec.name, Arc::new(backend) as Arc<dyn McpBackend>, tools))
+            let timeout_name = spec.name.clone();
+            let connect = async move {
+                match RmcpBackend::connect_generic(&spec.command, &spec.args, &spec.env).await {
+                    Ok(backend) => {
+                        // Fetch the tool catalog WHILE we still hold the concrete backend
+                        // (the trait object does not expose list_tools). A failure here is
+                        // non-fatal: the server is still wired; it just lists no tools.
+                        let tools = match backend.list_tools().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!(
+                                    "devboule: user MCP server '{}' list_tools failed ({e}); \
+                                     wired with no advertised tools",
+                                    spec.name
+                                );
+                                Vec::new()
+                            }
+                        };
+                        Some((spec.name, Arc::new(backend) as Arc<dyn McpBackend>, tools))
+                    }
+                    Err(e) => {
+                        // Skip, never abort: the Oracle is up and the burst must proceed.
+                        // The server name is non-secret (charset-guarded); the env is NOT
+                        // logged (it may carry the user's own credentials).
+                        eprintln!(
+                            "devboule: user MCP server '{}' failed to connect ({e}); skipping",
+                            spec.name
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    // Skip, never abort: the Oracle is up and the burst must proceed.
-                    // The server name is non-secret (charset-guarded); the env is NOT
-                    // logged (it may carry the user's own credentials).
+            };
+            match tokio::time::timeout(Self::CONNECT_PHASE_DEADLINE, connect).await {
+                Ok(res) => res,
+                Err(_) => {
                     eprintln!(
-                        "devboule: user MCP server '{}' failed to connect ({e}); skipping",
-                        spec.name
+                        "devboule: user MCP server '{}' did not connect within {}s; skipping",
+                        timeout_name,
+                        Self::CONNECT_PHASE_DEADLINE.as_secs()
                     );
                     None
                 }
             }
         });
 
-        // Bound the WHOLE phase: on the overall deadline, drop the still-pending connects
-        // (each child is torn down on its transport drop) and proceed with NONE of the
-        // user servers rather than wedging startup. Per-server timeouts make this rare; it
-        // exists so a pathological set of hangs can never block the Oracle/burst forever.
-        let results = match tokio::time::timeout(
-            Self::CONNECT_PHASE_DEADLINE,
-            futures::future::join_all(connects),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                eprintln!(
-                    "devboule: user MCP servers did not all connect within {}s; \
-                     proceeding without the user servers (Oracle still serves)",
-                    Self::CONNECT_PHASE_DEADLINE.as_secs()
-                );
-                Vec::new()
-            }
-        };
+        let results = futures::future::join_all(connects).await;
 
         let mut user: Vec<(String, Arc<dyn McpBackend>)> = Vec::with_capacity(results.len());
         let mut catalog: Vec<UserServerCatalog> = Vec::with_capacity(results.len());

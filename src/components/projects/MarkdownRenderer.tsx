@@ -40,14 +40,20 @@ function InlineSegments({ segments }: { segments: InlineSegment[] }) {
 // ---- block renderers --------------------------------------------------------
 
 function HeadingBlockView({ block }: { block: HeadingBlock }) {
-  const cls =
-    block.depth === 1
-      ? "text-[15px] font-bold text-cream-900 mt-3 mb-1"
-      : block.depth === 2
-        ? "text-[13px] font-semibold text-cream-800 mt-2.5 mb-1"
-        : block.depth === 3
-          ? "text-[12px] font-semibold text-cream-700 mt-2 mb-0.5"
-          : "text-[11px] font-semibold text-cream-600 mt-1.5 mb-0.5";
+  let cls: string;
+  switch (block.depth) {
+    case 1:
+      cls = "text-[15px] font-bold text-cream-900 mt-3 mb-1";
+      break;
+    case 2:
+      cls = "text-[13px] font-semibold text-cream-800 mt-2.5 mb-1";
+      break;
+    case 3:
+      cls = "text-[12px] font-semibold text-cream-700 mt-2 mb-0.5";
+      break;
+    default:
+      cls = "text-[11px] font-semibold text-cream-600 mt-1.5 mb-0.5";
+  }
   return (
     <p className={cls}>
       <InlineSegments segments={block.segments} />

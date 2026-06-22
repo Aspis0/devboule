@@ -381,16 +381,13 @@ pub struct GithubRepoAccessStatus {
 /// default is the LEAST-privileged role, so any ambiguity fails safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Role {
     Admin,
+    #[default]
     Collaborator,
 }
 
-impl Default for Role {
-    fn default() -> Self {
-        Role::Collaborator
-    }
-}
 
 /// A role assignment the admin issues to a collaborator's device identity. The
 /// admin signs the canonical digest of this with their Ed25519 device signing
@@ -2445,7 +2442,7 @@ mod tests {
     fn oracle_index_preferences_round_trips_without_index_mode() {
         let json = r#"{"autoWatchOnUnlock":true,"indexRoot":null}"#;
         let prefs: OracleIndexPreferences = serde_json::from_str(json).unwrap();
-        assert_eq!(prefs.auto_watch_on_unlock, true);
+        assert!(prefs.auto_watch_on_unlock);
         assert_eq!(prefs.index_root, None);
         assert_eq!(prefs.index_mode, None);
         // Serializing back must NOT emit the key (skip_serializing_if).
@@ -2461,7 +2458,7 @@ mod tests {
     fn oracle_index_preferences_round_trips_with_index_mode_commit() {
         let json = r#"{"autoWatchOnUnlock":false,"indexRoot":null,"indexMode":"commit"}"#;
         let prefs: OracleIndexPreferences = serde_json::from_str(json).unwrap();
-        assert_eq!(prefs.auto_watch_on_unlock, false);
+        assert!(!prefs.auto_watch_on_unlock);
         assert_eq!(prefs.index_mode.as_deref(), Some("commit"));
         let back = serde_json::to_string(&prefs).unwrap();
         assert!(back.contains(r#""indexMode":"commit""#), "key must survive: {back}");

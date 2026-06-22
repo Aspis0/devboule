@@ -146,7 +146,13 @@ pub fn set_model_registry(
     let _config_guard = config_write_lock()
         .lock()
         .map_err(|_| "Config write lock is poisoned.".to_string())?;
-    let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config.json: {e}"))?;
+    // First run: a missing config.json is not an error here — start from an empty object
+    // (get_model_registry already tolerates absence; the setter must too).
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(e) => return Err(format!("Could not read config.json: {e}")),
+    };
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("config.json is not valid JSON: {e}"))?;
     if !value.is_object() {

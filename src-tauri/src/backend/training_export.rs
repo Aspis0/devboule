@@ -250,7 +250,7 @@ pub fn attribute_files_at(
         let mini = directives
             .iter()
             .filter(|d| directive_in_window(d, now) && directive_touches(d, file))
-            .max_by_key(|d| directive_activity_time(*d).unwrap_or(DateTime::<Utc>::MIN_UTC));
+            .max_by_key(|d| directive_activity_time(d).unwrap_or(DateTime::<Utc>::MIN_UTC));
 
         if let Some(d) = mini {
             out.insert(
@@ -442,6 +442,15 @@ fn is_sensitive_blob_name(file_abs: &Path) -> bool {
         || name.starts_with("id_ed25519")
         || name.ends_with(".tfvars")
         || name.ends_with(".tfvars.json")
+        || name == "auth.json"
+        || name == "token.json"
+        || name.ends_with(".token")
+        || name == ".git-credentials"
+        || name == ".dockercfg"
+        || name == ".htpasswd"
+        || name == ".pgpass"
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_dsa")
     {
         return true;
     }
@@ -533,9 +542,16 @@ fn snapshot_blob_capped(root: &Path, file_abs: &Path, cap: u64) -> Option<String
         // Dedupe: identical content already snapshotted, do not rewrite.
         return Some(hash);
     }
-    // Write atomically enough: a torn blob would still hash-mismatch on read, but
-    // the dedupe key is the name, so a plain write is fine for a local rail.
-    if std::fs::write(&blob_path, &bytes).is_err() {
+    // Atomic: write to a unique temp then rename onto the hash-named path, so a torn
+    // write never becomes a hash-named blob (a partial blob would otherwise be
+    // permanently deduped by name and silently mismatch its hash on read).
+    let temp_path = blob_dir.join(format!("{hash}.tmp.{}", std::process::id()));
+    if std::fs::write(&temp_path, &bytes).is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return None;
+    }
+    if std::fs::rename(&temp_path, &blob_path).is_err() {
+        let _ = std::fs::remove_file(&temp_path);
         return None;
     }
     Some(hash)

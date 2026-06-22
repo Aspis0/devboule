@@ -55,7 +55,7 @@ export function CollapsibleSection({
               <span className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
                 {title}
               </span>
-              {summary !== undefined && summary !== null && (
+              {summary != null && (
                 <span className="min-w-0 truncate text-[11px] text-cream-400">
                   {summary}
                 </span>

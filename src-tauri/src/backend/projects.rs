@@ -1,8 +1,12 @@
 use super::agents::{
     agent_window_title, management_root_for_mcp, normalize_agent_host, open_task_claim_summary,
-    process_creation_time, record_agent_launch, record_launch_pending, record_manual_task_status,
-    HOST_APP, HOST_EXTERNAL,
+    record_agent_launch, record_launch_pending, record_manual_task_status, HOST_APP, HOST_EXTERNAL,
 };
+// `process_creation_time` is only called from the Windows agent-spawn path (a #[cfg(windows)]
+// site); importing it unconditionally trips `unused_imports` on non-Windows builds. Keep the
+// import gated so the Windows build resolves it and the macOS build stays clean.
+#[cfg(windows)]
+use super::agents::process_creation_time;
 use super::fs_replace::replace_file_with_backup;
 use super::model::{
     DesignHandoffInput, ProjectAgentLaunchInput, ProjectAgentLaunchResult, ProjectCreateInput,

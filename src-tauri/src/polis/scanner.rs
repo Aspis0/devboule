@@ -1133,7 +1133,7 @@ fn extract_rust_imports(content: &str) -> Vec<String> {
             .or_else(|| trimmed.strip_prefix("pub use "))
         {
             let token = rest
-                .split(|c| c == ';' || c == '{' || c == ' ' || c == ':')
+                .split([';', '{', ' ', ':'])
                 .next()
                 .unwrap_or("")
                 .trim();
@@ -1193,7 +1193,7 @@ fn extract_python_imports(content: &str) -> Vec<String> {
             if let Some(after) = rest.split(" import ").nth(1) {
                 let first_name = after
                     .trim_start_matches('(')
-                    .split(|c| c == ',' || c == ' ' || c == '(')
+                    .split([',', ' ', '('])
                     .find(|s| !s.is_empty() && *s != "(")
                     .unwrap_or("")
                     .trim();
@@ -3249,7 +3249,7 @@ impl ImportResolver {
         }
         // Rust `use crate::foo` / `mod foo` style or bare module name: try the
         // last path segment as a stem suffix match.
-        let last = spec.rsplit(|c| c == '/' || c == ':').next().unwrap_or(spec);
+        let last = spec.rsplit(['/', ':']).next().unwrap_or(spec);
         if last != spec {
             return self.lookup(last);
         }
@@ -7243,7 +7243,7 @@ const y = await import('@/lazy');
         let districts2 = layout(&mut b2, &mut meta, &features, &[]);
 
         // a1 now lives in beta's district, not alpha's.
-        assert_eq!(coord_of(&b2, "a1").x.is_finite(), true);
+        assert!(coord_of(&b2, "a1").x.is_finite());
         let a1 = b2.iter().find(|x| x.file_id == "a1").unwrap();
         assert_eq!(
             a1.district_id, "beta",

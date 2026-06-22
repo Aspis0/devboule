@@ -778,11 +778,24 @@ fn should_debounce_commit_kick(
 /// correctly. If canonicalization fails (e.g. the path no longer exists), falls
 /// back to a normalized lexical `starts_with` on the raw paths so a transient
 /// canonicalize miss never silently drops a legitimate in-scope commit.
+/// True if any component of `p` is a `..` (ParentDir) — used to fail-closed the
+/// lexical scope fallback below so a `..`-bearing path can't falsely match.
+fn has_parent_dir(p: &Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 pub(crate) fn commit_root_in_index_scope(project_root: &Path, index_root: &Path) -> bool {
     match (project_root.canonicalize(), index_root.canonicalize()) {
         (Ok(p), Ok(i)) => p.starts_with(&i),
         _ => {
             // Canonicalize miss: fall back to a lexical compare on cleaned paths.
+            // Fail-closed on `..`: normalize_lexical keeps `..` literal, so a path like
+            // `<root>/sub/../../../outside` would falsely `starts_with(<root>)`. Deny it;
+            // the next supervisor tick re-evaluates once the path canonicalizes.
+            if has_parent_dir(project_root) || has_parent_dir(index_root) {
+                return false;
+            }
             let p = normalize_lexical(project_root);
             let i = normalize_lexical(index_root);
             p.starts_with(&i)
@@ -1107,7 +1120,7 @@ pub(crate) fn restrict_existing_path_to_owner(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok()
     }
 
     #[cfg(windows)]

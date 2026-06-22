@@ -1676,7 +1676,7 @@ mod tests {
         use std::io::Read;
         // A status line + a body far larger than the cap.
         let mut payload: Vec<u8> = b"HTTP/1.1 500 Internal Server Error\r\n\r\n".to_vec();
-        payload.extend(std::iter::repeat(b'x').take(XH_STDOUT_READ_CAP_BYTES as usize + 4096));
+        payload.extend(std::iter::repeat_n(b'x', XH_STDOUT_READ_CAP_BYTES as usize + 4096));
         let reader = std::io::Cursor::new(payload);
 
         // EXACT pattern used by send_via_xh's stdout reader thread.
@@ -1700,7 +1700,7 @@ mod tests {
     fn schemathesis_stdout_read_stops_at_cap() {
         use std::io::Read;
         let payload: Vec<u8> =
-            std::iter::repeat(b'{').take(SCHEMATHESIS_STDOUT_READ_CAP_BYTES as usize + 4096).collect();
+            std::iter::repeat_n(b'{', SCHEMATHESIS_STDOUT_READ_CAP_BYTES as usize + 4096).collect();
         let reader = std::io::Cursor::new(payload);
 
         let mut buf = Vec::new();

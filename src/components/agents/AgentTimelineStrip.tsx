@@ -46,14 +46,13 @@ export function AgentTimelineStrip({ activity }: AgentTimelineStripProps) {
           </span>
         )}
         {shown.map((a, i) => {
-          const Icon =
-            a.kind === "read"
-              ? FileText
-              : a.kind === "write"
-                ? Pencil
-                : a.kind === "search"
-                  ? Search
-                  : Terminal;
+          let Icon: typeof Terminal;
+          switch (a.kind) {
+            case "read":   Icon = FileText; break;
+            case "write":  Icon = Pencil;   break;
+            case "search": Icon = Search;   break;
+            default:       Icon = Terminal;
+          }
 
           // Status precedence: running > fail > ok (mirrors actionStatus).
           let cls = "border border-sage/30 bg-sage/10 text-sage-dark";

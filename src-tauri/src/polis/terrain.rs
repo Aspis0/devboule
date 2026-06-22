@@ -235,7 +235,7 @@ pub fn build_terrain(
             water.push(WaterTile {
                 gx,
                 gy,
-                deep: gx >= sea_x + 1,
+                deep: gx > sea_x,
             });
         }
     }
@@ -289,11 +289,11 @@ pub fn build_terrain(
     // `(gy, gx)` (FIX 5: the `BTreeSet` gave sand/bridges `(gx, gy)` via `Tile`'s
     // Ord, inconsistent with `water`; sort them the same way for one clean,
     // row-major payload the frontend can stream/chunk uniformly).
-    water.sort_by(|a, b| (a.gy, a.gx).cmp(&(b.gy, b.gx)));
+    water.sort_by_key(|a| (a.gy, a.gx));
     let mut sand: Vec<Tile> = sand.into_iter().collect();
-    sand.sort_by(|a, b| (a.gy, a.gx).cmp(&(b.gy, b.gx)));
+    sand.sort_by_key(|a| (a.gy, a.gx));
     let mut bridges: Vec<Tile> = bridges.into_iter().collect();
-    bridges.sort_by(|a, b| (a.gy, a.gx).cmp(&(b.gy, b.gx)));
+    bridges.sort_by_key(|a| (a.gy, a.gx));
 
     TerrainData {
         sea_x,
@@ -644,7 +644,7 @@ mod tests {
             assert!(r.gx_min > min_x, "river not on the west map edge");
             assert!(r.gx_max < t.sea_x, "river west of the sea (flows into it)");
             // Land on both sides: the bank columns exist within the band.
-            assert!(r.gx_min - 1 >= min_x, "left bank is inside the band (land)");
+            assert!(r.gx_min > min_x, "left bank is inside the band (land)");
             assert!(
                 r.gx_max + 1 < t.sea_x,
                 "right bank is inside the band (land)"

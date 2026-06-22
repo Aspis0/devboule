@@ -772,10 +772,7 @@ fn run_capture_stream_with_timeout(
     // Kill closed the pipe (on timeout/overrun); on normal exit the pipe is at EOF
     // — either way the reader thread can now finish.
     join_stderr(stderr_handle);
-    let (stdout_bytes, reader_overran) = match join_quiet(stdout_handle) {
-        Some(r) => r,
-        None => (Vec::new(), false),
-    };
+    let (stdout_bytes, reader_overran) = join_quiet(stdout_handle).unwrap_or_default();
     // Overrun is true if EITHER the poll loop observed the flag OR the reader
     // reported it on join (a race where the child exited before the loop polled).
     let overran = overran || reader_overran;

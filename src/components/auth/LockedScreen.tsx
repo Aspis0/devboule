@@ -20,6 +20,14 @@ export function LockedScreen({
   const helloUnavailable = desktopRuntimeAvailable && helloAvailable === false;
   const unlockDisabled = isLoading || unlockRetryBlocked || !desktopRuntimeAvailable || helloUnavailable;
 
+  function unlockButtonLabel(): string {
+    if (isLoading) return "Waiting for device authentication...";
+    if (unlockRetryBlocked) return "Retry in a moment";
+    if (!desktopRuntimeAvailable) return "Open the desktop app";
+    if (helloUnavailable) return "Device authentication unavailable";
+    return "Unlock";
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-cream-100">
       <div className="text-center">
@@ -55,15 +63,7 @@ export function LockedScreen({
                      disabled:cursor-not-allowed disabled:opacity-70"
         >
           <Fingerprint className="w-5 h-5" />
-          {isLoading
-            ? "Waiting for device authentication..."
-            : unlockRetryBlocked
-              ? "Retry in a moment"
-            : !desktopRuntimeAvailable
-              ? "Open the desktop app"
-              : helloUnavailable
-              ? "Device authentication unavailable"
-              : "Unlock"}
+          {unlockButtonLabel()}
         </button>
 
         {(error || !desktopRuntimeAvailable || helloUnavailable) && (

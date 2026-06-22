@@ -270,7 +270,7 @@ pub(crate) fn validate_node_id(id: &str) -> Result<(), String> {
 /// only gate the NEW fields. Pure + total: unit-testable without a filesystem.
 fn validate_placement(id: &str, p: &DesignNodePlacement) -> Result<(), String> {
     if let Some(r) = p.radius {
-        if !r.is_finite() || r < 0.0 || r > MAX_NODE_RADIUS {
+        if !r.is_finite() || !(0.0..=MAX_NODE_RADIUS).contains(&r) {
             return Err(format!(
                 "node \"{}\" has an invalid radius ({r}); expected 0..={MAX_NODE_RADIUS}",
                 sanitize_id_for_warning(id)
@@ -2840,7 +2840,7 @@ mod tests {
             drop(r2);
         }
         {
-            let w = design_write_guard().expect("write guard");
+            let _w = design_write_guard().expect("write guard");
             assert!(
                 design_rwlock().try_read().is_err(),
                 "a reader must be blocked while a writer holds the lock"

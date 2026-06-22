@@ -14,7 +14,9 @@ pub const MAX_VISUAL_CHECK_DIRECTIVES: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum VisualCheckStatus {
+    #[default]
     Pending,
     Running,
     Done,
@@ -22,11 +24,6 @@ pub enum VisualCheckStatus {
     Timeout,
 }
 
-impl Default for VisualCheckStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 impl VisualCheckStatus {
     pub fn is_terminal(&self) -> bool {

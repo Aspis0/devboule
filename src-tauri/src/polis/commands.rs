@@ -1819,7 +1819,7 @@ mod tests {
                 .external_services
                 .iter()
                 .filter(|s| s.provider == "monument")
-                .last()
+                .next_back()
                 .expect("monument erected");
             seen.push(last.service_type.clone());
         }

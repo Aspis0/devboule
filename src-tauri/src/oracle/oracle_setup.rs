@@ -747,7 +747,7 @@ pub fn run_oracle_runtime_bootstrap(
 
     let mut status = oracle_runtime_setup_status(data_root);
     let mut combined = messages;
-    combined.extend(status.messages.drain(..));
+    combined.append(&mut status.messages);
     status.messages = combined;
     Ok(status)
 }

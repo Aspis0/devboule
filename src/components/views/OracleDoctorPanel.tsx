@@ -200,16 +200,11 @@ function DoctorRow({ check }: { check: OracleDoctorCheck }) {
         <p className="text-[11px] leading-5 text-cream-500">
           {check.detail || (check.ok ? "Healthy." : "Check failed.")}
         </p>
-        {!check.ok &&
-          (check.remediation ? (
-            <p className="mt-1.5 rounded-lg bg-coral/10 px-2 py-1 text-[11px] font-semibold leading-5 text-coral-dark">
-              → {check.remediation}
-            </p>
-          ) : (
-            <p className="mt-1.5 rounded-lg bg-coral/10 px-2 py-1 text-[11px] font-semibold leading-5 text-coral-dark">
-              → Run the doctor again, or open the runtime panel to repair this.
-            </p>
-          ))}
+        {!check.ok && (
+          <p className="mt-1.5 rounded-lg bg-coral/10 px-2 py-1 text-[11px] font-semibold leading-5 text-coral-dark">
+            → {check.remediation ?? "Run the doctor again, or open the runtime panel to repair this."}
+          </p>
+        )}
       </div>
     </div>
   );

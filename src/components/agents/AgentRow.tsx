@@ -114,18 +114,21 @@ export function AgentRow({
   const [confirmingStop, setConfirmingStop] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
+  let rowToneClass: string;
+  if (session.needsUser) {
+    rowToneClass = "border-amber/40 bg-amber/[0.06]";
+  } else if (badges.health === "lost") {
+    rowToneClass = "border-coral/20 bg-coral/[0.03]";
+  } else if (badges.health === "stale" || badges.health === "unknown") {
+    rowToneClass = "border-amber/20 bg-amber/[0.04]";
+  } else {
+    rowToneClass = "border-cream-200 bg-cream-50";
+  }
+
   return (
     <article
       ref={(el) => rowRef?.(el)}
-      className={`rounded-lg border p-3 ${
-        session.needsUser
-          ? "border-amber/40 bg-amber/[0.06]"
-          : badges.health === "lost"
-            ? "border-coral/20 bg-coral/[0.03]"
-            : badges.health === "stale" || badges.health === "unknown"
-              ? "border-amber/20 bg-amber/[0.04]"
-              : "border-cream-200 bg-cream-50"
-      }`}
+      className={`rounded-lg border p-3 ${rowToneClass}`}
       data-help-title={`${session.agentId} is a live ${badges.cli.label} agent.`}
       data-help-lines="Each row is one agent: the dot/word is live status from heartbeat age, the badges show model, role, and CLI, and the right side is when it last checked in.|A subagent chip means this agent reported a fan-out of helpers (advisory, self-reported over MCP).|An amber needs-you badge means the agent is blocked waiting on you; open its terminal to answer.|Read this before launching another agent so work is not duplicated."
     >

@@ -97,7 +97,7 @@ pub fn agent_type_label(slug: &str) -> String {
 /// SAME helper the purpose/agent display labels use — one title-casing rule for
 /// the whole module, no drift.
 pub(crate) fn title_case_slug(slug: &str) -> String {
-    slug.split(|c| c == '_' || c == '-')
+    slug.split(['_', '-'])
         .filter(|w| !w.is_empty())
         .map(|w| {
             let mut chars = w.chars();

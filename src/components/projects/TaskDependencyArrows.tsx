@@ -136,8 +136,6 @@ export function TaskDependencyArrows({
             const [sx, sy, cx, cy, ex, ey, ae] = arrow;
             if ([sx, sy, cx, cy, ex, ey, ae].some(Number.isNaN)) continue;
 
-            // R7: the arrow takes the hue of the agent working the TARGET task (the parallel
-            // track), falling back to the default terracotta when no agent is on it.
             const color = colorByTaskRef.current?.[edge.to] ?? ARROW_COLOR;
             g.moveTo(sx, sy);
             g.quadraticCurveTo(cx, cy, ex, ey);

@@ -21,7 +21,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Returns true iff `name` is in the fixed editor allowlist.
 fn is_allowed_editor(name: &str) -> bool {
-    ALLOWED_EDITORS.iter().any(|e| *e == name)
+    ALLOWED_EDITORS.contains(&name)
 }
 
 /// Truncate `s` to at most `max_bytes` bytes on a UTF-8 char boundary,

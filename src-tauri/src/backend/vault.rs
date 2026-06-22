@@ -1880,14 +1880,14 @@ mod tests {
         // status(present): never the value.
         let status_present = exa_key_status().unwrap();
         assert!(status_present.configured);
-        assert!(serde_json::to_string(&status_present).unwrap().contains(key) == false);
+        assert!(!serde_json::to_string(&status_present).unwrap().contains(key));
         // The backend-internal reader (launch path) DOES see the raw value.
         assert_eq!(read_exa_key().unwrap().as_deref(), Some(key));
 
         let after_clear = delete_exa_key().unwrap();
         assert!(!after_clear.configured, "clear must report absent");
         assert_eq!(after_clear.status, "missing");
-        assert!(exa_key_status().unwrap().configured == false);
+        assert!(!exa_key_status().unwrap().configured);
         assert_eq!(read_exa_key().unwrap(), None);
     }
 

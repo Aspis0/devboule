@@ -757,7 +757,7 @@ mod tests {
         let ok = "0123456789abcdef0123456789abcdef";
         assert_eq!(validate_plan_id(ok).unwrap(), ok);
         // trims surrounding whitespace.
-        assert_eq!(validate_plan_id("  ").is_err(), true);
+        assert!(validate_plan_id("  ").is_err());
         assert_eq!(
             validate_plan_id("  0123456789abcdef0123456789abcdef  ").unwrap(),
             ok

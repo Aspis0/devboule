@@ -46,8 +46,7 @@ pub fn parse_cargo_fmt(stdout: &str, root: &Path) -> Vec<RawFinding> {
                 if let Ok(line_num) = line_str.parse::<u32>() {
                     // Strip root prefix to make path relative
                     let relative_path = if let Some(root_str) = root.to_str() {
-                        if path_str.starts_with(root_str) {
-                            let stripped = &path_str[root_str.len()..];
+                        if let Some(stripped) = path_str.strip_prefix(root_str) {
                             // Normalize backslashes to forward slashes, then drop the
                             // separator left over from the root prefix.
                             stripped.replace('\\', "/").trim_start_matches('/').to_string()

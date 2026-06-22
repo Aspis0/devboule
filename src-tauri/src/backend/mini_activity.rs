@@ -1712,9 +1712,7 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         write!(
             f,
-            "{}\n{}",
-            r#"{"kind":"milestone","text":"old complete","node":"dot"}"#,
-            r#"{"kind":"milestone","text":"old PARTIAL fr"# // no closing / newline
+            "{{\"kind\":\"milestone\",\"text\":\"old complete\",\"node\":\"dot\"}}\n{{\"kind\":\"milestone\",\"text\":\"old PARTIAL fr" // no closing / newline
         )
         .unwrap();
         drop(f);

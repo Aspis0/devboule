@@ -188,7 +188,7 @@ impl FsBackend {
         // Compile here too (the parse layer already validated it compiles); the
         // NFA engine guarantees linear-time matching regardless of input.
         let re = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
-        let matcher = glob.map(|g| build_globset(g)).transpose()?;
+        let matcher = glob.map(build_globset).transpose()?;
 
         let mut out = String::new();
         let mut files_scanned = 0usize;

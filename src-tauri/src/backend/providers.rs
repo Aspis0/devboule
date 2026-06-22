@@ -1307,7 +1307,7 @@ fn cf_envelope_error_message(payload: &Value) -> String {
             errors
                 .iter()
                 .filter_map(|error| error.get("message").and_then(Value::as_str))
-                .map(|message| sanitize_error_message(message))
+                .map(sanitize_error_message)
                 .collect()
         })
         .unwrap_or_default();
@@ -3445,8 +3445,8 @@ fn scaleway_oracle_query(
 ) -> String {
     [name, resource_type, purpose]
         .into_iter()
-        .chain(plan_or_runtime.into_iter())
-        .chain(image.into_iter())
+        .chain(plan_or_runtime)
+        .chain(image)
         .chain(tags.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ")
@@ -7847,7 +7847,7 @@ pub async fn cloudflare_autorag_instance_exists(
             break;
         }
         if let Some(info) = payload.get("result_info") {
-            let seen = (page as u64) * CF_EXISTS_PAGE_SIZE;
+            let seen = page * CF_EXISTS_PAGE_SIZE;
             if let Some(total) = info.get("total_count").and_then(Value::as_u64) {
                 if seen >= total {
                     break;

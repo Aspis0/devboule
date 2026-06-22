@@ -187,9 +187,6 @@ export function TaskCard({
           )}
           {workers.length > 0
             ? workers.map((w) => (
-                // R7: one color-coded badge per agent working this card (internal mini OR
-                // external Claude/codex). The color keys off the agentId = the parallel-track
-                // hue; "↗" marks an external CLI.
                 <span
                   key={w.agentId}
                   className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold ${w.colorClass}`}
