@@ -581,16 +581,14 @@ fn build_messages(
     // root (env DEVBOULE_PROJECT_ROOT, else cwd — same source as the FS backend) and append the
     // catalog so the model knows what it can `load_skill`. Role-skill dirs are excluded (injected
     // directly). No skills ⇒ nothing appended (byte-identical). Discovered per-turn (a few stats).
-    let mut system_prompt = build_system_prompt_with_lang(plan_first, user_mcp, lang_skill);
     // Project-context (AGENTS.md/CLAUDE.md): host-rendered, ALREADY fenced + sentinel-neutralized,
-    // passed via DEVBOULE_PROJECT_CONTEXT. The "what this repo is" block — appended before the
-    // (mobile) skills catalog. Absent/empty ⇒ nothing added (byte-identical).
-    if let Ok(ctx) = std::env::var("DEVBOULE_PROJECT_CONTEXT") {
-        if !ctx.trim().is_empty() {
-            system_prompt.push('\n');
-            system_prompt.push_str(&ctx);
-        }
-    }
+    // passed via DEVBOULE_PROJECT_CONTEXT. It is the FIXED prefix, so it goes BEFORE the (mobile) lang
+    // skill — threaded into build_system_prompt_with_lang, not appended after (which would put it
+    // behind the lang persona + break the cache prefix). Absent/empty ⇒ nothing added.
+    let project_context = std::env::var("DEVBOULE_PROJECT_CONTEXT").ok();
+    let project_context_ref = project_context.as_deref().filter(|c| !c.trim().is_empty());
+    let mut system_prompt =
+        build_system_prompt_with_lang(plan_first, user_mcp, project_context_ref, lang_skill);
     {
         let root = std::env::var("DEVBOULE_PROJECT_ROOT")
             .map(std::path::PathBuf::from)

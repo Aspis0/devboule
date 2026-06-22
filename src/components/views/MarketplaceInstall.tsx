@@ -89,7 +89,7 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && url.trim()) doPreview();
+            if (e.key === "Enter" && url.trim() && !busy) doPreview();
           }}
           className="flex-1 rounded-2xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
         />

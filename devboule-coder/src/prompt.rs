@@ -60,15 +60,23 @@ pub fn build_system_prompt(plan_first: bool, user_mcp: &[UserMcpServerTools]) ->
     out
 }
 
-/// `build_system_prompt` + the optional host-rendered LANGUAGE persona block (passed via
-/// `DEVBOULE_LANG_SKILL` — already fenced + sentinel-neutralized by the trusted app). Appended
-/// LAST with a newline separator. `None`/empty ⇒ BYTE-IDENTICAL to `build_system_prompt`.
+/// `build_system_prompt` + the host-rendered PROJECT-CONTEXT block (AGENTS.md/CLAUDE.md, the FIXED
+/// prefix) and the LANGUAGE persona block (the mobile skill), both already fenced + sentinel-
+/// neutralized by the trusted app. Project-context is the FIXED prefix, so it goes BEFORE the
+/// (mobile) lang skill. `None`/empty for both ⇒ BYTE-IDENTICAL to `build_system_prompt`.
 pub fn build_system_prompt_with_lang(
     plan_first: bool,
     user_mcp: &[UserMcpServerTools],
+    project_context: Option<&str>,
     lang_skill: Option<&str>,
 ) -> String {
     let mut out = build_system_prompt(plan_first, user_mcp);
+    if let Some(ctx) = project_context {
+        if !ctx.is_empty() {
+            out.push('\n');
+            out.push_str(ctx);
+        }
+    }
     if let Some(lang) = lang_skill {
         if !lang.is_empty() {
             out.push('\n');
@@ -85,7 +93,7 @@ mod lang_prompt_tests {
     #[test]
     fn none_is_byte_identical() {
         assert_eq!(
-            build_system_prompt_with_lang(false, &[], None),
+            build_system_prompt_with_lang(false, &[], None, None),
             build_system_prompt(false, &[])
         );
     }
@@ -93,23 +101,32 @@ mod lang_prompt_tests {
     #[test]
     fn empty_is_byte_identical() {
         assert_eq!(
-            build_system_prompt_with_lang(false, &[], Some("")),
+            build_system_prompt_with_lang(false, &[], Some(""), Some("")),
             build_system_prompt(false, &[])
         );
     }
 
     #[test]
     fn some_appends_with_newline_separator() {
-        let p = build_system_prompt_with_lang(false, &[], Some("LANGBLOCK"));
+        let p = build_system_prompt_with_lang(false, &[], None, Some("LANGBLOCK"));
         assert!(p.starts_with(&build_system_prompt(false, &[])));
         assert!(p.contains("\nLANGBLOCK"));
     }
 
     #[test]
     fn plan_first_carried_through() {
-        let p = build_system_prompt_with_lang(true, &[], Some("X"));
+        let p = build_system_prompt_with_lang(true, &[], None, Some("X"));
         assert!(p.starts_with(&build_system_prompt(true, &[])));
         assert!(p.contains("\nX"));
+    }
+
+    #[test]
+    fn project_context_precedes_lang_skill() {
+        // The FIXED prefix (project context) must come BEFORE the mobile lang skill (max-recall fix).
+        let p = build_system_prompt_with_lang(false, &[], Some("CTXBLOCK"), Some("LANGBLOCK"));
+        let ci = p.find("CTXBLOCK").expect("ctx present");
+        let li = p.find("LANGBLOCK").expect("lang present");
+        assert!(ci < li, "project-context must precede the lang skill");
     }
 }
 

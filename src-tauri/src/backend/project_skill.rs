@@ -1465,7 +1465,12 @@ fn marketplace_install_impl(
         MARKETPLACE_FETCH_TIMEOUT_SECS,
     )?;
     let sha = super::skill_marketplace::sha256_hex(&content);
-    if !expected_sha256.is_empty() && sha != expected_sha256 {
+    // The sha gate is ALWAYS on — an empty expected_sha256 is a hard error (the backend never relies
+    // on the frontend always sending it), so a server can't swap the payload between preview+install.
+    if expected_sha256.is_empty() {
+        return Err("expected_sha256 is required — preview the skill before installing".to_string());
+    }
+    if sha != expected_sha256 {
         return Err(
             "the skill content changed since the preview — re-preview before installing".to_string(),
         );

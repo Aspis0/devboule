@@ -650,14 +650,16 @@ export function SkillsView() {
                 </button>
               ))}
             </div>
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Filter languages…"
-              aria-label="Search skills"
-              className="w-full max-w-xs rounded-2xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
-            />
+            {view !== "tools" && (
+              <input
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter languages…"
+                aria-label="Search skills"
+                className="w-full max-w-xs rounded-2xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
+              />
+            )}
           </div>
 
           {view === "tools" ? (
@@ -668,7 +670,9 @@ export function SkillsView() {
                 <MarketplaceInstall
                   folderPath={folder}
                   invoke={invokeBackendCommand}
-                  onInstalled={() => void refreshLangs(folder)}
+                  onInstalled={() => {
+                    if (folder) void refreshLangs(folder);
+                  }}
                 />
               )}
               <DiscoverView
