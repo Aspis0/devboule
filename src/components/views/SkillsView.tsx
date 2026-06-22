@@ -34,19 +34,30 @@ import {
 
 // The three role cards render in this fixed order (the backend returns the same
 // set; we drive the order from here so an absent/extra role can't reshuffle it).
-const ROLE_ORDER: readonly SkillRole[] = ["mini", "coder", "design"];
+const ROLE_ORDER: readonly SkillRole[] = ["mini", "coder", "design", "orchestrator"];
 
 const ROLE_LABELS: Record<SkillRole, string> = {
   mini: "Mini",
   coder: "Coder",
   design: "Design",
+  orchestrator: "Orchestrator",
 };
 
 const ROLE_DESCRIPTIONS: Record<SkillRole, string> = {
   mini: "House conventions injected for the local mini executor.",
   coder: "House conventions injected for the coder agent.",
   design: "House conventions injected for the design generator.",
+  orchestrator: "House conventions injected for the local main-coder orchestrator.",
 };
+
+// A blank per-role record, DERIVED from ROLE_ORDER — so adding a role (above) needs no edits at
+// the ~8 places that previously hardcoded `{ mini: …, coder: …, design: … }` literals.
+function blankRoleRecord<T>(value: T): Record<SkillRole, T> {
+  return Object.fromEntries(ROLE_ORDER.map((role) => [role, value])) as Record<
+    SkillRole,
+    T
+  >;
+}
 
 // A single shared encoder — `byteLength` runs on every keystroke (per-render
 // in each card), so allocating a fresh TextEncoder each call is pure waste.
@@ -65,17 +76,13 @@ export function SkillsView() {
   // The bundled catalog (fetched once on mount). null == not loaded / failed.
   const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
   // Local editor drafts keyed by role. Seeded from each list, edited freely.
-  const [drafts, setDrafts] = useState<Record<SkillRole, string>>({
-    mini: "",
-    coder: "",
-    design: "",
-  });
+  const [drafts, setDrafts] = useState<Record<SkillRole, string>>(
+    blankRoleRecord(""),
+  );
   // Per-role explicit acknowledgement that saving a truncated skill drops the tail.
-  const [ackTruncated, setAckTruncated] = useState<Record<SkillRole, boolean>>({
-    mini: false,
-    coder: false,
-    design: false,
-  });
+  const [ackTruncated, setAckTruncated] = useState<Record<SkillRole, boolean>>(
+    blankRoleRecord(false),
+  );
 
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -101,18 +108,10 @@ export function SkillsView() {
   // The per-role content from the LAST list, so a re-list (after toggling/saving
   // ONE role) only reseeds a draft the user has NOT locally diverged from — an
   // unsaved edit in another role's textarea must never be silently clobbered.
-  const lastLoadedRef = useRef<Record<SkillRole, string>>({
-    mini: "",
-    coder: "",
-    design: "",
-  });
+  const lastLoadedRef = useRef<Record<SkillRole, string>>(blankRoleRecord(""));
   // Live mirror of the drafts so `refresh` can compare against the user's current
   // text without depending on (and re-creating itself for) every keystroke.
-  const draftsRef = useRef<Record<SkillRole, string>>({
-    mini: "",
-    coder: "",
-    design: "",
-  });
+  const draftsRef = useRef<Record<SkillRole, string>>(blankRoleRecord(""));
 
   useEffect(() => {
     mountedRef.current = true;
@@ -185,11 +184,7 @@ export function SkillsView() {
       // value, or the new content, so it is not treated as diverged).
       const prevLoaded = lastLoadedRef.current;
       const liveDrafts = draftsRef.current;
-      const nextLoaded: Record<SkillRole, string> = {
-        mini: "",
-        coder: "",
-        design: "",
-      };
+      const nextLoaded: Record<SkillRole, string> = blankRoleRecord("");
       const nextDrafts: Record<SkillRole, string> = { ...liveDrafts };
       for (const role of ROLE_ORDER) {
         const row = rows.find((r) => r.role === role);
@@ -225,7 +220,7 @@ export function SkillsView() {
       // empty/no-cards state plus this error banner, which is correct.
       if (mountedRef.current && refreshGenRef.current === gen) {
         setEntries(null);
-        setAckTruncated({ mini: false, coder: false, design: false });
+        setAckTruncated(blankRoleRecord(false));
         setError(
           e instanceof Error ? e.message : "Could not load skills for this folder.",
         );
@@ -262,12 +257,12 @@ export function SkillsView() {
     // project even if the new folder's list then fails (a failed list would
     // otherwise leave the old folder's truncated entry + ack, keeping Save
     // enabled on the wrong data).
-    const blank = { mini: "", coder: "", design: "" } as Record<SkillRole, string>;
+    const blank = blankRoleRecord("");
     lastLoadedRef.current = { ...blank };
     draftsRef.current = { ...blank };
     setDrafts({ ...blank });
     setEntries(null);
-    setAckTruncated({ mini: false, coder: false, design: false });
+    setAckTruncated(blankRoleRecord(false));
     setFolder(picked);
     setError(null);
     await refresh(picked);

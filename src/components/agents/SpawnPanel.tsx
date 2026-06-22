@@ -23,8 +23,10 @@ import {
 import type { SpawnRole } from "./roleDisplay";
 import { invokeBackendCommand } from "../../context/AppContext";
 
-// Phase 6 — the persona languages a launch can target (mirrors the Rust KNOWN_LANGS + the
-// registry tiers). "" = auto-detect (the panel uses the backend-detected primary).
+// Phase 6 — the FALLBACK seed for the override selector's languages (the core bundle set). The
+// live list is loaded at runtime from `skills_lang_catalog` so a newly-added bundle language shows
+// up with no code change; this seed only fills the gap while that loads / if it errors. "" in the
+// selector = auto-detect (the panel uses the backend-detected primary).
 const PERSONA_LANGS = ["rust", "node", "python", "go", "cpp", "kotlin"] as const;
 
 // Phase B role merge: only coder/verifier are spawnable. A coder PLANS and CODES
@@ -119,6 +121,10 @@ export function SpawnPanel({
   const [detectedLang, setDetectedLang] = useState<string>("");
   const [langOverride, setLangOverride] = useState<string>("");
   const [langExpanded, setLangExpanded] = useState<boolean>(false);
+  // The override selector's languages — DATA-DRIVEN from the persona bundle (skills_lang_catalog)
+  // so a newly-added bundle language appears here with no code change. Seeded with the core set as
+  // a fallback while the catalog loads / if it errors.
+  const [personaLangs, setPersonaLangs] = useState<string[]>([...PERSONA_LANGS]);
 
   // The selector options: built-ins first, then each configured custom client
   // (label shown, id is the value). Deduped/validated upstream; rendered as-is.
@@ -165,6 +171,22 @@ export function SpawnPanel({
       alive = false;
     };
   }, [activeProjectId]);
+
+  // Load the persona-language catalog ONCE (no project needed) so the override selector lists
+  // whatever the bundle ships, not a hardcoded set. Best-effort: an error keeps the seeded fallback.
+  useEffect(() => {
+    let alive = true;
+    invokeBackendCommand<{ lang: string }[]>("skills_lang_catalog")
+      .then((catalog) => {
+        if (alive && Array.isArray(catalog) && catalog.length > 0) {
+          setPersonaLangs(catalog.map((entry) => entry.lang));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Per-CLI quick-fill model suggestions (claude -> opus/sonnet/haiku; orchestrator ->
   // the configured local-coder model when known; everything else -> none — we never
@@ -479,7 +501,7 @@ export function SpawnPanel({
                   className="mt-1.5 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold lowercase text-cream-700 outline-none focus:border-terracotta/30"
                 >
                   <option value="">Auto-detected ({detectedLang})</option>
-                  {PERSONA_LANGS.map((l) => (
+                  {personaLangs.map((l) => (
                     <option key={l} value={l}>
                       {l}
                     </option>

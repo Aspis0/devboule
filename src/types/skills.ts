@@ -10,8 +10,8 @@
 // never `content.length` (multi-byte chars would under-count and the save would
 // be rejected by the backend with a confusing error).
 
-/** The three skill roles the panel renders, in display order. */
-export type SkillRole = "mini" | "coder" | "design";
+/** The skill roles the panel renders, in display order. Mirrors the Rust `KNOWN_ROLES`. */
+export type SkillRole = "mini" | "coder" | "design" | "orchestrator";
 
 /** Byte ceiling for a single SKILL.md. Mirrors the Rust `MAX_SKILL_BYTES`. */
 export const MAX_SKILL_BYTES = 8192;
@@ -42,5 +42,40 @@ export interface CatalogEntry {
   role: string;
   description: string;
   sourceUrl: string | null;
+  body: string;
+}
+
+/**
+ * Where a skill's content comes from. `bundled` = the app's built-in default; `project` = a
+ * `.claude/skills/...` file forked into the repo (overrides the bundled default). The open
+ * `string` arm reserves `marketplace-<id>` for when external skill sources land (deferred).
+ */
+export type SkillSource = "bundled" | "project" | (string & {});
+
+/**
+ * One (role × language) persona row. `source` is "project" when a
+ * `.claude/skills/<role>/lang-<lang>.md` override exists, else "bundled" (the embedded default).
+ * Same cap / `truncated` semantics as `SkillEntry`. Mirrors the Rust `LangEntry`.
+ */
+export interface LangEntry {
+  role: SkillRole;
+  lang: string;
+  source: SkillSource;
+  content: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+/**
+ * One installable bundled language persona (Discover tab) — role-agnostic, installed into a chosen
+ * role via `skills_save_lang`. Mirrors the Rust `LangCatalogEntry`. The set is DATA-DRIVEN (the
+ * backend derives it from the persona bundle), so the UI must render whatever languages it returns
+ * — NEVER hardcode the language list (it grows as personas are added to the bundle).
+ */
+export interface LangCatalogEntry {
+  lang: string;
+  name: string;
+  description: string;
+  source: SkillSource;
   body: string;
 }

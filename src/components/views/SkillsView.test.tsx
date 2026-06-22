@@ -173,14 +173,16 @@ describe("SkillsView", () => {
     expect(roleSwitches().length).toBe(0);
   });
 
-  it("renders three role cards from skills_list after choosing a folder", async () => {
+  it("renders the role cards from skills_list after choosing a folder", async () => {
     await mount();
     await chooseFolder();
-    expect(roleSwitches().length).toBe(3);
+    // Four roles now (orchestrator joined mini/coder/design).
+    expect(roleSwitches().length).toBe(4);
     const html = container.innerHTML;
     expect(html).toContain("Mini");
     expect(html).toContain("Coder");
     expect(html).toContain("Design");
+    expect(html).toContain("Orchestrator");
     // The status lines reflect the mocked entries.
     expect(html).toContain("active"); // mini exists+enabled
     expect(html).toContain("disabled"); // coder exists+disabled

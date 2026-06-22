@@ -252,81 +252,51 @@ pub(crate) fn active_project_skill(project_root: &Path, role: &str) -> Option<St
     read_project_skill(project_root, role)
 }
 
-/// Canonical language keys a (role × language) persona may target. The READ path validates
-/// `lang` against this (defense-in-depth on top of canonicalize-and-contain) so a future
-/// dynamic caller can never turn `lang` into a path-traversal vector; it is also the explicit
-/// contract for which languages have a persona. Keep in sync with `bundled_lang_body`.
-pub(crate) const KNOWN_LANGS: &[&str] = &["rust", "node", "python", "go", "cpp", "kotlin"];
+/// The bundled LANGUAGE-persona pack — the ONE source of truth for the (role × language) layer.
+/// Add a PERSONA = drop `assets/skills/lang/<key>.md` and add ONE line here (`include_str!` needs
+/// the path at compile time). Everything in THIS module (the allowlist `is_known_lang`, the key
+/// list `bundled_lang_keys`, the Discover catalog, `bundled_lang_body`, the Skills-panel listing)
+/// DERIVES from this slice — so the persona + manual selection scale with no other change.
+/// CAVEAT (be honest): a new language being AUTO-DETECTED also needs its detection wiring in
+/// `censor/detect.rs` (a `FileLang` variant + `file_lang_to_key` arm + `ProjectKind` + a
+/// `LANG_PRIORITY` entry), and showing it in the Spawn launch override needs that selector to be
+/// data-driven (it fetches `skills_lang_catalog`). The bundle is the persona source of truth; those
+/// are separate detection/UI concerns. Bodies are SHORT + high-signal on purpose — long/duplicated
+/// guidance measurably HURTS agent performance (ETH Zurich 2026); each carries only the language's
+/// distinctive toolchain + idioms + hard anti-patterns. Role-AGNOSTIC (idioms are the same whoever
+/// writes them; role differentiation comes from the role layer).
+const LANG_PERSONA_BUNDLE: &[(&str, &str)] = &[
+    ("rust", include_str!("../../assets/skills/lang/rust.md")),
+    ("node", include_str!("../../assets/skills/lang/node.md")),
+    ("python", include_str!("../../assets/skills/lang/python.md")),
+    ("go", include_str!("../../assets/skills/lang/go.md")),
+    ("cpp", include_str!("../../assets/skills/lang/cpp.md")),
+    ("kotlin", include_str!("../../assets/skills/lang/kotlin.md")),
+];
 
-/// The BUNDLED, hand-authored default LANGUAGE persona for `lang` (used when a project has no
-/// `.claude/skills/<role>/lang-<lang>.md` override). Role-AGNOSTIC: a language's idioms are the
-/// same whoever writes them; role differentiation comes from the role layer. Kept SHORT and
-/// high-signal on purpose — long/duplicated guidance measurably HURTS agent performance
-/// (ETH Zurich 2026); the persona only carries the language's distinctive toolchain + idioms +
-/// hard anti-patterns. None for an unknown key.
-fn bundled_lang_body(lang: &str) -> Option<&'static str> {
-    Some(match lang {
-        "rust" => LANG_RUST,
-        "node" => LANG_NODE,
-        "python" => LANG_PYTHON,
-        "go" => LANG_GO,
-        "cpp" => LANG_CPP,
-        "kotlin" => LANG_KOTLIN,
-        _ => return None,
-    })
+/// Every bundled persona language key — the allowlist + UI list, DERIVED from the bundle so
+/// dropping a `.md` (+ its one registry line) extends it everywhere at once.
+pub(crate) fn bundled_lang_keys() -> impl Iterator<Item = &'static str> {
+    LANG_PERSONA_BUNDLE.iter().map(|&(key, _)| key)
 }
 
-const LANG_RUST: &str = r#"You are a veteran Rust engineer. Write idiomatic, memory-safe, zero-cost Rust.
-Toolchain: cargo build/test; cargo fmt; cargo clippy -- -D warnings (zero warnings).
-- Design ownership first; prefer &T/&mut T over cloning; Cow for clone-on-write.
-- Errors: propagate with `?`; thiserror (libs) / anyhow (apps); add context, never discard.
-- Newtype pattern for domain ids; #[must_use] on important returns.
-- Async (tokio): NEVER hold std::sync::Mutex/RwLock across an `.await` (use tokio::sync); no std::thread::sleep in async.
-- Tests in #[cfg(test)] modules + doctests.
-NEVER: .unwrap()/.expect() in non-test code; `unsafe` outside a documented, reviewed abstraction; global mutable state; ignore a Result."#;
+/// Is `lang` a known persona language? It becomes a path segment, so this is the allowlist
+/// (defense-in-depth on top of canonicalize-and-contain). Derived from the bundle.
+pub(crate) fn is_known_lang(lang: &str) -> bool {
+    LANG_PERSONA_BUNDLE.iter().any(|&(key, _)| key == lang)
+}
 
-const LANG_NODE: &str = r#"You are a veteran TypeScript/JavaScript engineer (Node ecosystem). Write type-safe, modern ESM.
-Toolchain: tsc strict (no errors); eslint; the project's test runner (vitest/jest).
-- Strict TypeScript; no `any` — use unknown + narrowing, generics, or precise types.
-- Prefer const + immutable data; async/await over raw Promise chains; always handle rejections.
-- Validate external input at the boundary (zod or explicit guards); never trust it as typed.
-- Small modules, named exports, pure functions where practical.
-NEVER: `any` to silence the compiler; `@ts-ignore` without a justifying comment; floating promises (await or `void` them); `==` (use `===`); mutate shared state."#;
-
-const LANG_PYTHON: &str = r#"You are a veteran Python engineer. Write typed, idiomatic, test-driven Python 3.12+.
-Toolchain: ruff (lint+format); mypy --strict (clean); pytest (+coverage); uv + pyproject.toml.
-- Type-hint every public function (params + return); `X | None` not Optional; `list[str]` not List.
-- `from __future__ import annotations` at file top; dataclass/TypedDict/Protocol over a bare dict.
-- Context managers (`with`) for all resources; pathlib over os.path; f-strings only.
-- Raise specific exceptions; never swallow; custom exception classes for domain errors.
-- Tests: pytest only, name `test_{what}_{condition}_{expected}`, fixtures over setUp.
-NEVER: mutable default args; bare `except:`; print() for logging; relative imports; secrets in source."#;
-
-const LANG_GO: &str = r#"You are a veteran Go engineer. Write simple, explicit, idiomatic Go.
-Toolchain: gofmt; go vet; go test (table-driven); golangci-lint if present.
-- Always handle errors; wrap with fmt.Errorf("...: %w", err); check with errors.Is/As.
-- Accept interfaces, return concrete types; prefer small single-method interfaces (-er).
-- context.Context as the first param of blocking calls; defer cancel().
-- Short names for short scopes; no stuttering (user.ID, not user.UserID).
-- Tests: table-driven with t.Run subtests.
-NEVER: ignore an error with `_`; init() for business logic; global mutable state; goroutines with no termination condition; interface{} where generics fit."#;
-
-const LANG_CPP: &str = r#"You are a veteran C++ engineer. Write modern, RAII-first C++ (C++17/20).
-Toolchain: the project's CMake build; clang-format; clang-tidy/cppcheck; the project's test framework.
-- RAII for every resource; smart pointers (unique_ptr/shared_ptr), never owning raw pointers.
-- std containers over C arrays; std::optional or error codes for expected failures (std::expected only on C++23), exceptions for the unexpected.
-- const-correctness; Rule of Zero (preferred) or Rule of Five; composition over inheritance; SOLID.
-- Tests: Arrange-Act-Assert; clear names (inputX/expectedX).
-NEVER: manual new/delete in application code; raw owning pointers; C-style casts; memory leaks or undefined behavior."#;
-
-const LANG_KOTLIN: &str = r#"You are a veteran Kotlin engineer. Write null-safe, concise, idiomatic Kotlin.
-Toolchain: gradle build/test; ktlint; detekt if present.
-- Lean on null-safety: prefer non-null types; `?.`/`?:`/requireNotNull over `!!`.
-- Immutable by default: `val` over `var`, read-only collections; data classes for models.
-- Expression style: `when`/`if` as expressions; scope functions (let/run/apply) judiciously.
-- Coroutines for async: structured concurrency (coroutineScope); never block a coroutine thread.
-- Tests: JUnit5; given/when/then naming.
-NEVER: `!!` outside provably-safe spots; leak Java platform types unannotated; mutable global state; swallow exceptions."#;
+/// The BUNDLED default persona body for `lang` (used when a project has no
+/// `.claude/skills/<role>/lang-<lang>.md` override). `None` for an unknown key. Returns the file
+/// VERBATIM (no trim) so it is faithful both as a prompt block AND as the raw editor content; the
+/// `.md` files carry NO trailing newline (enforced by `bundled_personas_are_clean_and_bounded`),
+/// so the composed block stays byte-identical to the pre-bundle consts.
+fn bundled_lang_body(lang: &str) -> Option<&'static str> {
+    LANG_PERSONA_BUNDLE
+        .iter()
+        .find(|&&(key, _)| key == lang)
+        .map(|&(_, body)| body)
+}
 
 /// Read `.claude/skills/<role>/lang-<lang>.md` (the per-project LANGUAGE persona override) if
 /// present, else fall back to the BUNDLED default for `lang`. Project file OVERRIDES bundled;
@@ -343,7 +313,7 @@ fn read_project_lang_file(project_root: &Path, role: &str, lang: &str) -> Option
     // Allowlist the lang key (defense-in-depth + explicit contract): a `lang` outside the known
     // set never forms a path and never reads a file — canonicalize-and-contain below is the
     // belt, this is the suspenders.
-    if !KNOWN_LANGS.contains(&lang) {
+    if !is_known_lang(lang) {
         return None;
     }
     // Same allowlist discipline for the role path segment (defense-in-depth): callers already
@@ -414,6 +384,80 @@ mod lang_skill_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn list_langs_falls_back_to_bundled() {
+        let dir = fresh_dir("list_langs_fallback");
+        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
+        assert_eq!(entries.len(), bundled_lang_keys().count());
+        assert!(entries.iter().all(|e| e.source == "bundled"));
+        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
+        assert!(rust.content.contains("veteran Rust"));
+    }
+
+    #[test]
+    fn save_lang_then_list_shows_project_override() {
+        let dir = fresh_dir("save_then_list_lang");
+        skills_save_lang_impl(dir.to_str().unwrap(), "coder", "rust", "PROJECT RUST OVERRIDE")
+            .unwrap();
+        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
+        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
+        assert_eq!(rust.source, "project");
+        assert_eq!(rust.content, "PROJECT RUST OVERRIDE");
+    }
+
+    #[test]
+    fn reset_lang_reverts_to_bundled() {
+        let dir = fresh_dir("reset_lang");
+        skills_save_lang_impl(dir.to_str().unwrap(), "coder", "rust", "PROJECT RUST OVERRIDE")
+            .unwrap();
+        skills_reset_lang_impl(dir.to_str().unwrap(), "coder", "rust").unwrap();
+        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
+        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
+        assert_eq!(rust.source, "bundled");
+    }
+
+    #[test]
+    fn save_lang_rejects_oversized_unknown_lang_and_role() {
+        let dir = fresh_dir("save_lang_rejects");
+        let big = "a".repeat(MAX_SKILL_BYTES + 1);
+        assert!(skills_save_lang_impl(dir.to_str().unwrap(), "coder", "rust", &big).is_err());
+        assert!(skills_save_lang_impl(dir.to_str().unwrap(), "coder", "javascript", "x").is_err());
+        assert!(skills_save_lang_impl(dir.to_str().unwrap(), "bogus_role", "rust", "x").is_err());
+    }
+
+    #[test]
+    fn bundled_lang_catalog_covers_known_langs() {
+        let catalog = bundled_lang_catalog();
+        assert_eq!(catalog.len(), bundled_lang_keys().count());
+        assert!(catalog.iter().all(|e| e.source == "bundled"));
+        let rust = catalog.iter().find(|e| e.lang == "rust").unwrap();
+        assert!(rust.body.contains("veteran Rust"));
+    }
+
+    #[test]
+    fn reset_lang_on_absent_file_is_idempotent_ok() {
+        let dir = fresh_dir("reset_absent");
+        // No project override yet → reset must succeed (already bundled), not error.
+        assert!(skills_reset_lang_impl(dir.to_str().unwrap(), "coder", "rust").is_ok());
+        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
+        assert_eq!(entries.iter().find(|e| e.lang == "rust").unwrap().source, "bundled");
+    }
+
+    #[test]
+    fn list_langs_caps_and_flags_an_oversized_override() {
+        let dir = fresh_dir("lang_truncation");
+        // Write the file DIRECTLY (bypassing the save byte-cap) to simulate an oversized override,
+        // then confirm the raw reader caps + flags it (same contract as read_skill_raw).
+        let skill_dir = dir.join(".claude").join("skills").join("coder");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("lang-rust.md"), "x".repeat(MAX_SKILL_BYTES + 100)).unwrap();
+        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
+        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
+        assert_eq!(rust.source, "project");
+        assert!(rust.truncated);
+        assert!(rust.bytes <= MAX_SKILL_BYTES);
     }
 
     #[test]
@@ -490,7 +534,7 @@ mod lang_skill_tests {
 
     #[test]
     fn bundled_personas_are_clean_and_bounded() {
-        for lang in KNOWN_LANGS {
+        for lang in bundled_lang_keys() {
             let body = bundled_lang_body(lang).expect("a known lang has a bundled persona");
             for marker in [
                 "--- BEGIN LANGUAGE SKILL",
@@ -504,7 +548,41 @@ mod lang_skill_tests {
                 );
             }
             assert!(body.len() < MAX_SKILL_BYTES, "persona '{lang}' must fit the cap");
+            // The bundle is returned VERBATIM (no trim), so a `.md` must carry NO trailing
+            // whitespace/newline — else the composed block would drift from the pre-bundle bytes
+            // and the raw editor would offer to "re-save" a body different from disk.
+            assert_eq!(
+                body,
+                body.trim_end(),
+                "bundled persona '{lang}' (.md file) must have NO trailing whitespace/newline"
+            );
         }
+    }
+
+    #[test]
+    fn bundle_keys_unique_nonempty_and_known() {
+        let keys: Vec<&str> = bundled_lang_keys().collect();
+        assert!(keys.len() >= 6, "the bundle ships at least the 6 core languages");
+        // No duplicate keys (a dup would shadow / double-list a language in the panel).
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "bundle keys must be unique");
+        for key in &keys {
+            assert!(is_known_lang(key), "every bundle key is a known lang");
+            assert!(
+                bundled_lang_body(key).map(|b| !b.is_empty()).unwrap_or(false),
+                "bundle key '{key}' must have a non-empty body"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_lang_body_reads_the_embedded_files() {
+        assert!(bundled_lang_body("rust").unwrap().contains("veteran Rust"));
+        assert!(bundled_lang_body("python").unwrap().contains("veteran Python"));
+        assert!(bundled_lang_body("klingon").is_none());
+        assert!(!is_known_lang("javascript") && is_known_lang("node"));
     }
 }
 
@@ -904,6 +982,232 @@ fn skills_install_from_catalog_impl(
     }
     let canonical = canonical_working_folder(working_folder_path)?;
     write_skill_file(&canonical, role, &entry.body)
+}
+
+// ---------------------------------------------------------------------------
+// LANGUAGE PERSONAS — the (role × language) layer surfaced in the Skills panel.
+// Mirrors the role-SKILL.md commands above: a RAW reader for the editor (project
+// override → bundled fallback), an atomic fork-to-project writer, a reset, and a
+// bundled catalog. Same path-safety / byte-cap discipline; `source` tells the UI
+// whether the row is the bundled default or a forked project override.
+// ---------------------------------------------------------------------------
+
+/// One language-persona row for the panel editor. `source` = "project" when a
+/// `.claude/skills/<role>/lang-<lang>.md` override exists, else "bundled". `pub` because it
+/// is a `#[tauri::command]` return type; fields stay private (nothing outside constructs one).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LangEntry {
+    role: String,
+    lang: String,
+    source: String,
+    content: String,
+    bytes: usize,
+    truncated: bool,
+}
+
+/// One installable bundled language persona (role-agnostic — installed into a chosen role via
+/// `skills_save_lang`). `source` is "bundled" now; an external marketplace would carry its own.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LangCatalogEntry {
+    lang: String,
+    name: String,
+    description: String,
+    source: String,
+    body: String,
+}
+
+/// Read a role's language persona RAW for the editor. MIRRORS `read_skill_raw` for
+/// `.claude/skills/<role>/lang-<lang>.md`: canonicalize-and-contain against the
+/// already-canonical `project_root`, regular-file gate, bounded read, char-boundary cut, NO
+/// trim/marker. Returns ("project", content, truncated) when a contained project file exists,
+/// else ("bundled", bundled_body, false). `project_root` MUST already be canonical (the caller
+/// passes `canonical_working_folder`); `lang` is validated by callers.
+fn read_lang_raw(project_root: &Path, role: &str, lang: &str) -> (String, String, bool) {
+    debug_assert!(
+        is_known_lang(lang),
+        "read_lang_raw called with an unknown lang; callers must pass a bundled-persona key"
+    );
+    let bundled = || {
+        (
+            "bundled".to_string(),
+            bundled_lang_body(lang).map(|b| b.to_string()).unwrap_or_default(),
+            false,
+        )
+    };
+    let target = project_root
+        .join(".claude")
+        .join("skills")
+        .join(role)
+        .join(format!("lang-{lang}.md"));
+    // Canonicalize BOTH the root AND the target (mirrors read_skill_raw): the containment check is
+    // only sound when both sides are resolved — comparing a resolved target against a NON-canonical
+    // root would let a symlinked target escape if a future caller passes a non-canonical root.
+    let (Ok(canon_root), Ok(canon_target)) =
+        (std::fs::canonicalize(project_root), std::fs::canonicalize(&target))
+    else {
+        return bundled();
+    };
+    if !canon_target.starts_with(&canon_root) {
+        return bundled();
+    }
+    match std::fs::metadata(&canon_target) {
+        Ok(meta) if meta.is_file() => {}
+        _ => return bundled(),
+    }
+    let Ok(file) = std::fs::File::open(&canon_target) else {
+        return bundled();
+    };
+    let mut handle = file.take(MAX_SKILL_BYTES as u64 + 1);
+    let mut buf = Vec::new();
+    if handle.read_to_end(&mut buf).is_err() {
+        return bundled();
+    }
+    let truncated = buf.len() > MAX_SKILL_BYTES;
+    let decoded = String::from_utf8_lossy(&buf).into_owned();
+    let cut = floor_char_boundary_at(&decoded, MAX_SKILL_BYTES);
+    ("project".to_string(), decoded[..cut].to_string(), truncated)
+}
+
+/// Atomic-write a role's language persona override. MIRRORS `write_skill_file`. `role`/`lang`
+/// MUST be pre-validated by the caller (they become path segments).
+fn write_lang_file(canonical_root: &Path, role: &str, lang: &str, content: &str) -> Result<(), String> {
+    let dir = canonical_root.join(".claude").join("skills").join(role);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create skills folder for '{role}': {e}"))?;
+    atomic_write(&dir.join(format!("lang-{lang}.md")), content, "lang skill")
+}
+
+/// The bundled language personas as installable catalog cards — one per [`LANG_PERSONA_BUNDLE`]
+/// entry (DERIVED from the bundle, so a dropped `.md` shows up in Discover with no other change).
+/// Built fresh per call (cheap).
+fn bundled_lang_catalog() -> Vec<LangCatalogEntry> {
+    LANG_PERSONA_BUNDLE
+        .iter()
+        .map(|&(lang, _)| LangCatalogEntry {
+            lang: lang.to_string(),
+            name: format!("{lang} idioms"),
+            description: format!("Veteran {lang} conventions."),
+            source: "bundled".to_string(),
+            // Reuse the single body accessor (verbatim) — no second trim site to drift.
+            body: bundled_lang_body(lang).unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+/// Allowlist a language key (it becomes a path segment): Err on anything not in the bundle
+/// ([`bundled_lang_keys`] / [`is_known_lang`]).
+fn validate_lang(lang: &str) -> Result<(), String> {
+    if !is_known_lang(lang) {
+        return Err(format!("unknown language '{lang}'"));
+    }
+    Ok(())
+}
+
+/// List the `role`'s language personas (one per bundled-persona language): project override when present,
+/// else the bundled body, with a `source` flag. Always returns the full set so the panel renders
+/// a stable per-role section.
+#[tauri::command]
+pub fn skills_list_langs(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    role: String,
+) -> Result<Vec<LangEntry>, String> {
+    state.ensure_unlocked()?;
+    skills_list_langs_impl(&working_folder_path, &role)
+}
+
+fn skills_list_langs_impl(working_folder_path: &str, role: &str) -> Result<Vec<LangEntry>, String> {
+    validate_role(role)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    let entries = bundled_lang_keys()
+        .map(|lang| {
+            let (source, content, truncated) = read_lang_raw(&canonical, role, lang);
+            LangEntry {
+                role: role.to_string(),
+                lang: lang.to_string(),
+                bytes: content.len(),
+                source,
+                content,
+                truncated,
+            }
+        })
+        .collect();
+    Ok(entries)
+}
+
+/// Fork a language persona into the project: atomic-write `.claude/skills/<role>/lang-<lang>.md`.
+/// Same byte-cap + role/lang allowlist as `skills_save`; held under the design write guard.
+#[tauri::command]
+pub fn skills_save_lang(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    role: String,
+    lang: String,
+    content: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_save_lang_impl(&working_folder_path, &role, &lang, &content)
+}
+
+fn skills_save_lang_impl(
+    working_folder_path: &str,
+    role: &str,
+    lang: &str,
+    content: &str,
+) -> Result<(), String> {
+    validate_role(role)?;
+    validate_lang(lang)?;
+    if content.len() > MAX_SKILL_BYTES {
+        return Err(format!(
+            "skill too large ({} bytes > {MAX_SKILL_BYTES} max); trim it before saving",
+            content.len()
+        ));
+    }
+    let canonical = canonical_working_folder(working_folder_path)?;
+    write_lang_file(&canonical, role, lang, content)
+}
+
+/// Reset a language persona to the bundled default by deleting the project override file. An
+/// absent file is already-bundled ⇒ success (idempotent). Held under the design write guard.
+#[tauri::command]
+pub fn skills_reset_lang(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    role: String,
+    lang: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_reset_lang_impl(&working_folder_path, &role, &lang)
+}
+
+fn skills_reset_lang_impl(working_folder_path: &str, role: &str, lang: &str) -> Result<(), String> {
+    validate_role(role)?;
+    validate_lang(lang)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    let target = canonical
+        .join(".claude")
+        .join("skills")
+        .join(role)
+        .join(format!("lang-{lang}.md"));
+    // symlink_metadata = lstat (does NOT follow): only remove a REGULAR file at the override path.
+    // A symlink there is not our file (skip it, don't follow+delete its target); a dir/absent ⇒
+    // nothing to reset (idempotent). role+lang are allowlisted, so the path can't traverse out.
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_file() => std::fs::remove_file(&target)
+            .map_err(|e| format!("could not reset language persona: {e}"))?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The installable bundled language personas (Discover tab). No folder/lock needed (pure binary).
+#[tauri::command]
+pub fn skills_lang_catalog() -> Vec<LangCatalogEntry> {
+    bundled_lang_catalog()
 }
 
 #[cfg(test)]
