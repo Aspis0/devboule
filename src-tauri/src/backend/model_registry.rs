@@ -187,6 +187,55 @@ pub struct DiscoveredModel {
     pub size_bytes: u64,
     pub param_size: Option<String>,
     pub quant: Option<String>,
+    /// Size-RECOMMENDED tier ("agentic" >= 20B / "emitEdits" < 20B). A UI hint ONLY —
+    /// the user's curated tier always wins and nothing gates on this.
+    pub recommended_tier: String,
+}
+
+/// Best-effort parameter count in billions: from the Ollama `param_size` ("30B") when
+/// present, else parsed from the model name (the LARGEST `<n>B` token, so an MoE "35B-A3B"
+/// reads 35 not 3, and version numbers like the "3.6" in "Qwen3.6" — not followed by B —
+/// are ignored). Never panics.
+fn model_param_billions(name: &str, param_size: Option<&str>) -> Option<f64> {
+    // Largest `<n>B` token (n = digits with at most one '.') whose 'b'/'B' is followed by a
+    // word boundary. So "35B-A3B" reads 35 (not the 3B active count), while "4bit" (b before a
+    // letter) and "3.6" (no trailing b) are ignored. Manual scan — no regex dependency.
+    fn largest_b(s: &str) -> Option<f64> {
+        let b = s.as_bytes();
+        let mut max: Option<f64> = None;
+        let mut i = 0;
+        while i < b.len() {
+            if !b[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut seen_dot = false;
+            while i < b.len() && (b[i].is_ascii_digit() || (b[i] == b'.' && !seen_dot)) {
+                seen_dot |= b[i] == b'.';
+                i += 1;
+            }
+            if i < b.len() && (b[i] == b'b' || b[i] == b'B') {
+                let boundary = i + 1 >= b.len() || !b[i + 1].is_ascii_alphanumeric();
+                if boundary {
+                    if let Ok(val) = s[start..i].parse::<f64>() {
+                        max = Some(max.map_or(val, |c: f64| c.max(val)));
+                    }
+                }
+            }
+        }
+        max
+    }
+    param_size.and_then(largest_b).or_else(|| largest_b(name))
+}
+
+/// Size-recommended tier (UI hint; the user still chooses). >= 20B -> "agentic",
+/// else (or unknown size) -> the safer "emitEdits".
+fn recommended_tier(name: &str, param_size: Option<&str>) -> String {
+    match model_param_billions(name, param_size) {
+        Some(billions) if billions >= 20.0 => "agentic".to_string(),
+        _ => "emitEdits".to_string(),
+    }
 }
 
 /// Discover installed models across the local backends. UNGATED (like `detect_providers`
@@ -209,6 +258,8 @@ pub async fn discover_installed_models() -> Result<Vec<DiscoveredModel>, String>
                             size_bytes: 0,
                             param_size: None,
                             quant: None,
+                            // oMLX gives no size → recommend from the model name.
+                            recommended_tier: recommended_tier(id, None),
                         });
                     }
                 }
@@ -232,12 +283,15 @@ pub async fn discover_installed_models() -> Result<Vec<DiscoveredModel>, String>
                             .and_then(|d| d.get("quantization_level"))
                             .and_then(|q| q.as_str())
                             .map(str::to_string);
+                        // Compute before `param_size` is moved into the struct.
+                        let rec_tier = recommended_tier(name, param_size.as_deref());
                         discovered.push(DiscoveredModel {
                             id: name.to_string(),
                             backend: "ollama".to_string(),
                             size_bytes: size,
                             param_size,
                             quant,
+                            recommended_tier: rec_tier,
                         });
                     }
                 }
@@ -246,4 +300,31 @@ pub async fn discover_installed_models() -> Result<Vec<DiscoveredModel>, String>
     }
 
     Ok(discovered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recommended_tier_uses_real_param_size() {
+        // oMLX has no param_size → parse from the name; the MoE TOTAL wins (35B, not the 3B
+        // active count), and "4bit" / the version "3.6" are ignored.
+        assert_eq!(recommended_tier("Qwen3.6-35B-A3B-4bit-DWQ", None), "agentic");
+        assert_eq!(recommended_tier("qwen3:30b-a3b", None), "agentic");
+        assert_eq!(recommended_tier("Qwen3.5-9B-MLX-4bit", None), "emitEdits");
+        // Ollama's param_size wins over the name.
+        assert_eq!(recommended_tier("anything", Some("30B")), "agentic");
+        assert_eq!(recommended_tier("anything", Some("7B")), "emitEdits");
+        // Unknown size → the safer default.
+        assert_eq!(recommended_tier("mystery-model", None), "emitEdits");
+    }
+
+    #[test]
+    fn param_billions_parsing() {
+        assert_eq!(model_param_billions("Qwen3.6-35B-A3B-4bit-DWQ", None), Some(35.0));
+        assert_eq!(model_param_billions("Qwen3.5-9B-MLX-4bit", None), Some(9.0));
+        assert_eq!(model_param_billions("no-size", None), None);
+        assert_eq!(model_param_billions("x", Some("405B")), Some(405.0));
+    }
 }

@@ -77,7 +77,9 @@ export function ModelRegistryCard() {
         id: model.id,
         backend: model.backend,
         sizeBytes: model.sizeBytes,
-        tier: "emitEdits",
+        // Default to the size-recommended tier (still editable in the <select> below — the
+        // user's choice always wins; this is only a smart default).
+        tier: (model.recommendedTier as ModelRegistryEntry["tier"]) || "emitEdits",
         roles: [],
         enabled: true,
         // Pre-seed the vendor-recommended sampling for the model's family (editable below).
@@ -177,6 +179,7 @@ export function ModelRegistryCard() {
                       {m.backend}
                       {m.paramSize ? ` • ${m.paramSize}` : ""}
                       {m.quant ? ` • ${m.quant}` : ""}
+                      {m.recommendedTier ? ` • recommended: ${m.recommendedTier}` : ""}
                     </span>
                   </div>
                   <button

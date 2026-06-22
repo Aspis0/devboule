@@ -252,6 +252,9 @@ export interface DiscoveredModel {
   sizeBytes: number;
   paramSize?: string;
   quant?: string;
+  /** Size-recommended tier ("agentic" >= 20B / "emitEdits" < 20B) — a hint only; the
+   * user's curated tier always wins. */
+  recommendedTier: string;
 }
 
 export interface AppConfig {
