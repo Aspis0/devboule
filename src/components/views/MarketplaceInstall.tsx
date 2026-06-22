@@ -11,9 +11,9 @@ interface Props {
 }
 
 const SEVERITY: Record<RiskSeverity, { label: string; chip: string; dot: string }> = {
-  Danger: { label: "Danger", chip: "bg-red-500/15 text-red-300 border-red-500/30", dot: "bg-red-400" },
-  Warn: { label: "Warning", chip: "bg-amber-500/15 text-amber-300 border-amber-500/30", dot: "bg-amber-400" },
-  Info: { label: "Info", chip: "bg-sky-500/15 text-sky-300 border-sky-500/30", dot: "bg-sky-400" },
+  Danger: { label: "Danger", chip: "border-red-300 bg-red-50 text-red-700", dot: "bg-red-500" },
+  Warn: { label: "Warning", chip: "border-amber-300 bg-amber-50 text-amber-700", dot: "bg-amber-500" },
+  Info: { label: "Info", chip: "border-sky-300 bg-sky-50 text-sky-700", dot: "bg-sky-500" },
 };
 
 /**
@@ -74,10 +74,10 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
   }
 
   return (
-    <section className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
-      <h3 className="text-sm font-semibold text-white/90">Install from a marketplace</h3>
-      <p className="mt-1 text-xs text-white/50">
-        Paste a skill&apos;s <code className="text-white/70">SKILL.md</code> URL. Nothing is installed
+    <section className="rounded-2xl border border-cream-200 bg-white p-4">
+      <h3 className="text-[13px] font-semibold text-cream-800">Install from a marketplace</h3>
+      <p className="mt-1 text-[12px] text-cream-500">
+        Paste a skill&apos;s <code className="text-cream-700">SKILL.md</code> URL. Nothing is installed
         until you preview the risks and confirm — the fetch is sandboxed and the content is scanned.
       </p>
 
@@ -91,25 +91,25 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
           onKeyDown={(e) => {
             if (e.key === "Enter" && url.trim()) doPreview();
           }}
-          className="flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-1.5 text-sm text-white/90 outline-none focus:border-white/30"
+          className="flex-1 rounded-2xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
         />
         <button
           onClick={doPreview}
           disabled={!url.trim() || busy}
-          className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-sm text-white/90 hover:bg-white/10 disabled:opacity-40"
+          className="rounded-2xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-800 hover:bg-cream-100 disabled:opacity-40"
         >
           {busy && !preview ? "Previewing…" : "Preview"}
         </button>
       </div>
 
       {error && (
-        <p role="alert" className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <p role="alert" className="mt-3 rounded-2xl border border-red-300 bg-red-50 px-3 py-2 text-[12px] text-red-700">
           {error}
         </p>
       )}
 
       {installed && (
-        <p role="status" className="mt-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+        <p role="status" className="mt-3 rounded-2xl border border-teal/30 bg-teal/10 px-3 py-2 text-[12px] text-teal">
           Installed to <span className="font-mono">{installed}</span>
         </p>
       )}
@@ -118,43 +118,43 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
         <div className="mt-4 space-y-3">
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-white/90">{preview.name ?? "(unnamed skill)"}</span>
+              <span className="text-[13px] font-semibold text-cream-800">{preview.name ?? "(unnamed skill)"}</span>
               {preview.worst && (
                 <span className={`rounded-full border px-2 py-0.5 text-[11px] ${SEVERITY[preview.worst].chip}`}>
                   worst: {SEVERITY[preview.worst].label}
                 </span>
               )}
             </div>
-            {preview.description && <p className="mt-0.5 text-xs text-white/60">{preview.description}</p>}
+            {preview.description && <p className="mt-0.5 text-[12px] text-cream-500">{preview.description}</p>}
           </div>
 
           {preview.allowed_tools && (
-            <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">
-              <div className="text-[11px] uppercase tracking-wide text-white/40">Requests these tools</div>
-              <div className="mt-1 font-mono text-xs text-white/80">{preview.allowed_tools}</div>
+            <div className="rounded-2xl border border-cream-200 bg-cream-50 px-3 py-2">
+              <div className="text-[11px] uppercase tracking-wide text-cream-400">Requests these tools</div>
+              <div className="mt-1 font-mono text-[12px] text-cream-800">{preview.allowed_tools}</div>
             </div>
           )}
 
           <div>
-            <div className="text-[11px] uppercase tracking-wide text-white/40">
+            <div className="text-[11px] uppercase tracking-wide text-cream-400">
               Risk scan — {preview.findings.length} finding{preview.findings.length === 1 ? "" : "s"}
             </div>
             {preview.findings.length === 0 ? (
-              <p className="mt-1 text-xs text-emerald-300/80">No risk patterns detected.</p>
+              <p className="mt-1 text-[12px] text-teal">No risk patterns detected.</p>
             ) : (
               <ul className="mt-1 space-y-1">
                 {preview.findings.map((f, i) => (
                   <li
                     key={`${f.code}-${i}`}
-                    className="flex items-start gap-2 rounded-lg border border-white/10 bg-black/20 px-2.5 py-1.5"
+                    className="flex items-start gap-2 rounded-2xl border border-cream-200 bg-cream-50 px-2.5 py-1.5"
                   >
                     <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${SEVERITY[f.severity].dot}`} />
                     <div className="min-w-0">
-                      <div className="text-xs text-white/85">
-                        <span className="font-mono text-white/50">{f.code}</span> {f.title}
+                      <div className="text-[12px] text-cream-800">
+                        <span className="font-mono text-cream-400">{f.code}</span> {f.title}
                       </div>
                       {f.evidence && (
-                        <div className="truncate font-mono text-[11px] text-white/45" title={f.evidence}>
+                        <div className="truncate font-mono text-[11px] text-cream-400" title={f.evidence}>
                           {f.evidence}
                         </div>
                       )}
@@ -165,26 +165,26 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
             )}
           </div>
 
-          <details className="rounded-lg border border-white/10 bg-black/20">
-            <summary className="cursor-pointer px-3 py-2 text-xs text-white/60">Preview the skill body</summary>
-            <pre className="max-h-48 overflow-auto whitespace-pre-wrap px-3 pb-3 font-mono text-[11px] text-white/70">
+          <details className="rounded-2xl border border-cream-200 bg-cream-50">
+            <summary className="cursor-pointer px-3 py-2 text-[12px] text-cream-500">Preview the skill body</summary>
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap px-3 pb-3 font-mono text-[11px] text-cream-700">
               {preview.body_excerpt}
             </pre>
           </details>
 
           <div className="flex flex-wrap items-center gap-2">
-            <label className="text-xs text-white/50">Install as</label>
+            <label className="text-[12px] text-cream-500">Install as</label>
             <input
               aria-label="Install skill name"
               value={skillName}
               onChange={(e) => setSkillName(e.target.value)}
               placeholder="skill-name"
-              className="w-44 rounded-lg border border-white/10 bg-black/30 px-2.5 py-1 font-mono text-xs text-white/90 outline-none focus:border-white/30"
+              className="w-44 rounded-2xl border border-cream-200 bg-white px-2.5 py-1 font-mono text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
             />
           </div>
 
           {isDanger && (
-            <label className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+            <label className="flex items-start gap-2 rounded-2xl border border-red-300 bg-red-50 px-3 py-2 text-[12px] text-red-700">
               <input type="checkbox" checked={ackRisk} onChange={(e) => setAckRisk(e.target.checked)} className="mt-0.5" />
               <span>
                 This skill triggered a <strong>Danger</strong> finding. I&apos;ve reviewed it and want to
@@ -196,7 +196,7 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
           <button
             onClick={doInstall}
             disabled={!canInstall}
-            className="rounded-lg border border-emerald-500/30 bg-emerald-500/15 px-3 py-1.5 text-sm text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-40"
+            className="rounded-2xl border border-teal/30 bg-teal/10 px-3 py-1.5 text-[12px] font-semibold text-teal hover:bg-teal/20 disabled:opacity-40"
           >
             {busy ? "Installing…" : "Install skill"}
           </button>

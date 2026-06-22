@@ -15,6 +15,7 @@ import {
 } from "react";
 import { invokeBackendCommand } from "../../context/AppContext";
 import { MarketplaceInstall } from "./MarketplaceInstall";
+import { UserMcpServersCard } from "../settings/UserMcpServersCard";
 import {
   MAX_SKILL_BYTES,
   type CatalogEntry,
@@ -94,7 +95,7 @@ export function SkillsView() {
   const [langCatalog, setLangCatalog] = useState<LangCatalogEntry[]>([]);
   // Phase 3c — Installed (manage what the project has) vs Discover (browse + install the bundled
   // catalog), plus a global search that filters language rows + Discover cards across all roles.
-  const [view, setView] = useState<"installed" | "discover">("installed");
+  const [view, setView] = useState<"installed" | "discover" | "tools">("installed");
   const [query, setQuery] = useState<string>("");
   // Local editor drafts keyed by role. Seeded from each list, edited freely.
   const [drafts, setDrafts] = useState<Record<SkillRole, string>>(
@@ -616,6 +617,15 @@ export function SkillsView() {
         </section>
       ) : (
         <>
+          {/* Phase 6 — the two-kinds-of-extensions model, in plain words (owner clarity requirement). */}
+          <div className="rounded-2xl border border-cream-200 bg-cream-50 px-4 py-3 text-[12px] text-cream-600">
+            <span className="font-semibold text-cream-800">Skills</span> are manuals — they change{" "}
+            <em>how</em> the agent works (e.g. “write Rust like a veteran”).{" "}
+            <span className="font-semibold text-cream-800">Tools</span> are machines — MCP servers that
+            give it new <em>actions</em> (e.g. “query Postgres”). Your project&apos;s{" "}
+            <span className="font-mono text-cream-700">AGENTS.md</span> is always-on context; skills are
+            added per task.
+          </div>
           {/* Phase 3c — Installed | Discover switch + a global search. */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div
@@ -623,7 +633,7 @@ export function SkillsView() {
               role="tablist"
               aria-label="Skills view"
             >
-              {(["installed", "discover"] as const).map((v) => (
+              {(["installed", "discover", "tools"] as const).map((v) => (
                 <button
                   key={v}
                   type="button"
@@ -636,7 +646,7 @@ export function SkillsView() {
                       : "text-cream-500 hover:text-cream-800"
                   }`}
                 >
-                  {v === "installed" ? "Installed" : "Discover"}
+                  {v === "installed" ? "Installed" : v === "discover" ? "Discover" : "Tools"}
                 </button>
               ))}
             </div>
@@ -650,7 +660,9 @@ export function SkillsView() {
             />
           </div>
 
-          {view === "discover" ? (
+          {view === "tools" ? (
+            <UserMcpServersCard />
+          ) : view === "discover" ? (
             <div className="space-y-4">
               {folder && (
                 <MarketplaceInstall
