@@ -34,6 +34,7 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
   const canInstall = !!preview && skillName.trim().length > 0 && (!isDanger || ackRisk) && !busy;
 
   async function doPreview() {
+    if (busy) return; // defense-in-depth: the button is disabled + Enter is guarded, but be robust.
     setBusy(true);
     setError(null);
     setPreview(null);
@@ -51,7 +52,7 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
   }
 
   async function doInstall() {
-    if (!preview) return;
+    if (!preview || busy) return;
     setBusy(true);
     setError(null);
     try {
