@@ -10,19 +10,48 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
-import type { CatalogEntry, SkillEntry } from "../../types/skills";
+import type {
+  CatalogEntry,
+  LangCatalogEntry,
+  LangEntry,
+  SkillEntry,
+} from "../../types/skills";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
-  true;
+(
+  globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }
+).IS_REACT_ACT_ENVIRONMENT = true;
 
 // --- mock state --------------------------------------------------------------
 const FOLDER = "/tmp/project";
 
-function makeEntries(overrides: Partial<Record<string, Partial<SkillEntry>>> = {}): SkillEntry[] {
+function makeEntries(
+  overrides: Partial<Record<string, Partial<SkillEntry>>> = {},
+): SkillEntry[] {
   const base: SkillEntry[] = [
-    { role: "mini", exists: true, enabled: true, content: "mini body", bytes: 9, truncated: false },
-    { role: "coder", exists: true, enabled: false, content: "coder body", bytes: 10, truncated: false },
-    { role: "design", exists: false, enabled: true, content: "", bytes: 0, truncated: false },
+    {
+      role: "mini",
+      exists: true,
+      enabled: true,
+      content: "mini body",
+      bytes: 9,
+      truncated: false,
+    },
+    {
+      role: "coder",
+      exists: true,
+      enabled: false,
+      content: "coder body",
+      bytes: 10,
+      truncated: false,
+    },
+    {
+      role: "design",
+      exists: false,
+      enabled: true,
+      content: "",
+      bytes: 0,
+      truncated: false,
+    },
   ];
   return base.map((e) => ({ ...e, ...(overrides[e.role] ?? {}) }));
 }
@@ -46,34 +75,81 @@ const CATALOG: CatalogEntry[] = [
   },
 ];
 
+const LANG_CATALOG: LangCatalogEntry[] = [
+  {
+    lang: "rust",
+    name: "rust idioms",
+    description: "Veteran rust conventions.",
+    source: "bundled",
+    body: "rust body",
+  },
+  {
+    lang: "node",
+    name: "node idioms",
+    description: "Veteran node conventions.",
+    source: "bundled",
+    body: "node body",
+  },
+];
+
+// skills_list_langs(role) → two rows; rust is a PROJECT override for coder, bundled elsewhere.
+function langEntriesFor(role: string): LangEntry[] {
+  const r = role as SkillEntry["role"];
+  return [
+    {
+      role: r,
+      lang: "rust",
+      source: role === "coder" ? "project" : "bundled",
+      content: role === "coder" ? "PROJECT RUST" : "rust body",
+      bytes: 9,
+      truncated: role === "coder", // coder/rust is an oversized override (truncation guard test)
+    },
+    {
+      role: r,
+      lang: "node",
+      source: "bundled",
+      content: "node body",
+      bytes: 9,
+      truncated: false,
+    },
+  ];
+}
+
 let listEntries: SkillEntry[];
 let listThrowsOnce = false;
 let setEnabledThrowsOnce = false;
 const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
 
-const invokeMock = vi.fn(async (name: string, args?: Record<string, unknown>) => {
-  calls.push({ name, args });
-  if (name === "skills_catalog") return CATALOG;
-  if (name === "skills_list") {
-    if (listThrowsOnce) {
-      listThrowsOnce = false;
-      throw new Error("list failed");
+const invokeMock = vi.fn(
+  async (name: string, args?: Record<string, unknown>) => {
+    calls.push({ name, args });
+    if (name === "skills_catalog") return CATALOG;
+    if (name === "skills_list") {
+      if (listThrowsOnce) {
+        listThrowsOnce = false;
+        throw new Error("list failed");
+      }
+      return listEntries;
     }
-    return listEntries;
-  }
-  if (name === "skills_set_enabled") {
-    if (setEnabledThrowsOnce) {
-      setEnabledThrowsOnce = false;
-      throw new Error(
-        "skills-state.json exists but is unreadable or corrupt; fix or delete it before changing a skill toggle",
-      );
+    if (name === "skills_set_enabled") {
+      if (setEnabledThrowsOnce) {
+        setEnabledThrowsOnce = false;
+        throw new Error(
+          "skills-state.json exists but is unreadable or corrupt; fix or delete it before changing a skill toggle",
+        );
+      }
+      return null;
     }
+    if (name === "skills_save") return null;
+    if (name === "skills_install_from_catalog") return null;
+    if (name === "skills_lang_catalog") return LANG_CATALOG;
+    if (name === "skills_list_langs")
+      return langEntriesFor((args?.role as string) ?? "");
+    if (name === "skills_save_lang") return null;
+    if (name === "skills_reset_lang") return null;
     return null;
-  }
-  if (name === "skills_save") return null;
-  if (name === "skills_install_from_catalog") return null;
-  return null;
-});
+  },
+);
 
 vi.mock("../../context/AppContext", () => ({
   invokeBackendCommand: (name: string, args?: Record<string, unknown>) =>
@@ -145,6 +221,19 @@ async function editTextarea(el: HTMLTextAreaElement, value: string) {
   });
 }
 
+const NATIVE_INPUT_VALUE_SETTER = Object.getOwnPropertyDescriptor(
+  window.HTMLInputElement.prototype,
+  "value",
+)!.set!;
+
+async function editInput(el: HTMLInputElement, value: string) {
+  await act(async () => {
+    NATIVE_INPUT_VALUE_SETTER.call(el, value);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    await Promise.resolve();
+  });
+}
+
 function saveButton(): HTMLButtonElement {
   return Array.from(container.querySelectorAll("button")).find(
     (b) => b.textContent === "Save",
@@ -168,7 +257,9 @@ afterEach(() => {
 describe("SkillsView", () => {
   it("shows the empty-state prompt and NO role cards before a folder is chosen", async () => {
     await mount();
-    expect(container.innerHTML).toContain("Choose a project folder to manage its skills");
+    expect(container.innerHTML).toContain(
+      "Choose a project folder to manage its skills",
+    );
     // No role toggles render until a folder is chosen.
     expect(roleSwitches().length).toBe(0);
   });
@@ -299,8 +390,8 @@ describe("SkillsView", () => {
     await chooseFolder();
     calls.length = 0;
     // The mini card exists -> install must confirm before overwriting.
-    const installBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Mini executor — edit discipline"),
+    const installBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Mini executor — edit discipline"),
     ) as HTMLButtonElement;
     expect(installBtn).toBeDefined();
     await act(async () => {
@@ -309,7 +400,9 @@ describe("SkillsView", () => {
     });
     await flush();
     expect(confirmSpy).toHaveBeenCalledTimes(1);
-    const installCall = calls.find((c) => c.name === "skills_install_from_catalog");
+    const installCall = calls.find(
+      (c) => c.name === "skills_install_from_catalog",
+    );
     expect(installCall?.args).toEqual({
       workingFolderPath: FOLDER,
       role: "mini",
@@ -323,8 +416,8 @@ describe("SkillsView", () => {
     await mount();
     await chooseFolder();
     calls.length = 0;
-    const installBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Mini executor — edit discipline"),
+    const installBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Mini executor — edit discipline"),
     ) as HTMLButtonElement;
     await act(async () => {
       installBtn.click();
@@ -332,7 +425,9 @@ describe("SkillsView", () => {
     });
     await flush();
     expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(calls.some((c) => c.name === "skills_install_from_catalog")).toBe(false);
+    expect(calls.some((c) => c.name === "skills_install_from_catalog")).toBe(
+      false,
+    );
     confirmSpy.mockRestore();
   });
 
@@ -353,7 +448,9 @@ describe("SkillsView", () => {
     });
     await flush();
     const coderAreaAfter = (
-      Array.from(container.querySelectorAll("textarea")) as HTMLTextAreaElement[]
+      Array.from(
+        container.querySelectorAll("textarea"),
+      ) as HTMLTextAreaElement[]
     )[1];
     expect(coderAreaAfter.value).toBe("UNSAVED coder edit");
   });
@@ -414,5 +511,198 @@ describe("SkillsView", () => {
     expect(container.innerHTML).toContain(
       "skills-state.json exists but is unreadable or corrupt",
     );
+  });
+
+  // --- Phase 3b/3c: language personas + Discover + search --------------------
+
+  it("renders language persona rows per role with bundled/project source badges", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-rust"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-node"]'),
+    ).not.toBeNull();
+    const html = container.innerHTML;
+    expect(html).toContain("project"); // coder/rust is a project override
+    expect(html).toContain("bundled"); // coder/node is the bundled default
+  });
+
+  it("forks a bundled language persona via skills_save_lang (Customize → Save)", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    calls.length = 0;
+    const row = container.querySelector(
+      '[data-testid="lang-row-coder-node"]',
+    ) as HTMLElement;
+    const customize = Array.from(row.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Customize"),
+    ) as HTMLButtonElement;
+    await act(async () => {
+      customize.click();
+      await Promise.resolve();
+    });
+    await flush();
+    const saveBtn = Array.from(row.querySelectorAll("button")).find(
+      (b) => b.textContent === "Save",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      saveBtn.click();
+      await Promise.resolve();
+    });
+    await flush();
+    const call = calls.find((c) => c.name === "skills_save_lang");
+    expect(call?.args).toMatchObject({
+      workingFolderPath: FOLDER,
+      role: "coder",
+      lang: "node",
+    });
+  });
+
+  it("resets a project language override via skills_reset_lang", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    calls.length = 0;
+    const row = container.querySelector(
+      '[data-testid="lang-row-coder-rust"]',
+    ) as HTMLElement;
+    const reset = Array.from(row.querySelectorAll("button")).find(
+      (b) => b.textContent === "Reset",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      reset.click();
+      await Promise.resolve();
+    });
+    await flush();
+    const call = calls.find((c) => c.name === "skills_reset_lang");
+    expect(call?.args).toMatchObject({
+      workingFolderPath: FOLDER,
+      role: "coder",
+      lang: "rust",
+    });
+  });
+
+  it("switches to Discover and shows installable bundled language cards", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    const discoverTab = Array.from(
+      container.querySelectorAll('[role="tab"]'),
+    ).find((b) => b.textContent?.includes("Discover")) as HTMLButtonElement;
+    await act(async () => {
+      discoverTab.click();
+      await Promise.resolve();
+    });
+    await flush();
+    const html = container.innerHTML;
+    expect(html).toContain("Veteran rust conventions"); // a bundled language catalog card
+    expect(html).toContain("Install");
+  });
+
+  it("filters language rows by the global search query", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    const search = container.querySelector(
+      'input[type="search"]',
+    ) as HTMLInputElement;
+    await editInput(search, "rust");
+    await flush();
+    // The rust rows stay; the node rows are filtered out.
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-rust"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-node"]'),
+    ).toBeNull();
+  });
+
+  it("closes a language editor when the search hides its row (no stale draft)", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    const rustRow = container.querySelector(
+      '[data-testid="lang-row-coder-rust"]',
+    ) as HTMLElement;
+    const editBtn = Array.from(rustRow.querySelectorAll("button")).find(
+      (b) => b.textContent === "Edit" || b.textContent === "Customize",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      editBtn.click();
+      await Promise.resolve();
+    });
+    await flush();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-rust"] textarea'),
+    ).not.toBeNull();
+    // Search hides the rust row → its open editor must reset.
+    const search = container.querySelector(
+      'input[type="search"]',
+    ) as HTMLInputElement;
+    await editInput(search, "node");
+    await flush();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-rust"]'),
+    ).toBeNull();
+    // Clearing the search brings the row back WITHOUT its editor (no stale draft).
+    await editInput(search, "");
+    await flush();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-rust"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="lang-row-coder-rust"] textarea'),
+    ).toBeNull();
+  });
+
+  it("marks an already-forked language as Installed in Discover (no overwrite button)", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    const discoverTab = Array.from(
+      container.querySelectorAll('[role="tab"]'),
+    ).find((b) => b.textContent?.includes("Discover")) as HTMLButtonElement;
+    await act(async () => {
+      discoverTab.click();
+      await Promise.resolve();
+    });
+    await flush();
+    // coder/rust is a project override → its Discover card shows "Installed".
+    expect(container.innerHTML).toContain("Installed");
+  });
+
+  it("gates a truncated language override's Save behind the truncation ack", async () => {
+    await mount();
+    await chooseFolder();
+    await flush();
+    // coder/rust is flagged truncated by the mock → opening its editor shows the ack guard.
+    const row = container.querySelector(
+      '[data-testid="lang-row-coder-rust"]',
+    ) as HTMLElement;
+    const editBtn = Array.from(row.querySelectorAll("button")).find(
+      (b) => b.textContent === "Edit",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      editBtn.click();
+      await Promise.resolve();
+    });
+    await flush();
+    const saveBtn = Array.from(row.querySelectorAll("button")).find(
+      (b) => b.textContent === "Save",
+    ) as HTMLButtonElement;
+    // Save is BLOCKED until the user acknowledges the tail-loss.
+    expect(saveBtn.disabled).toBe(true);
+    const ack = row.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(ack).not.toBeNull();
+    await act(async () => {
+      ack.click();
+      await Promise.resolve();
+    });
+    await flush();
+    expect(saveBtn.disabled).toBe(false);
   });
 });

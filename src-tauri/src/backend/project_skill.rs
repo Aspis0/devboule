@@ -1085,13 +1085,14 @@ fn write_lang_file(canonical_root: &Path, role: &str, lang: &str, content: &str)
 fn bundled_lang_catalog() -> Vec<LangCatalogEntry> {
     LANG_PERSONA_BUNDLE
         .iter()
-        .map(|&(lang, _)| LangCatalogEntry {
+        .map(|&(lang, body)| LangCatalogEntry {
             lang: lang.to_string(),
             name: format!("{lang} idioms"),
             description: format!("Veteran {lang} conventions."),
             source: "bundled".to_string(),
-            // Reuse the single body accessor (verbatim) — no second trim site to drift.
-            body: bundled_lang_body(lang).unwrap_or_default().to_string(),
+            // `body` is already the verbatim bundled persona (no trim anywhere) — use it directly
+            // rather than re-searching the bundle via bundled_lang_body.
+            body: body.to_string(),
         })
         .collect()
 }
