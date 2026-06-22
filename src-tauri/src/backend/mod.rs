@@ -38,6 +38,7 @@ pub mod providers;
 pub mod roles;
 pub mod saved_workflows;
 pub mod skill_format;
+pub mod skill_vet;
 pub mod state;
 pub mod structure;
 pub mod token_usage;

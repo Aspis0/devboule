@@ -18,6 +18,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 # keyring 3.x ships NO default features: with none enabled it silently falls back
 # to the in-memory `mock` store, where `set_password` returns Ok but the secret is
