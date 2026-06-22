@@ -1,5 +1,7 @@
 # Local Censor Model Benchmark — 2026-06-13
 
+> ⚠️ **UPDATE (2026-06-20).** Canonical OOD baseline is now the untrained **Seed-Coder-8B-Instruct = recall 0.381 / FPR 0.333** on `rust_realbench` (same-harness, vLLM batched). Every trained arm (SFT/WiSE/ORPO) lost to it OOD; current direction = **RLVR/GRPO** — see `local-review-experts-longcot-sft-2026-06.md` (⭐⭐) + memory UPDATE-26.
+
 **Goal.** Pick the local LLM for the **Censor** role: small, fast, reviews files
 **one at a time**, and finds the semantic/logic bugs that deterministic tools
 (compiler, tsc, eslint, the existing linters) **cannot** catch. The censor is
@@ -91,3 +93,18 @@ Ollama** for the censor. Install Ollama as a persistent service.
   Gemma; expose the `oracle_context` tool for DEEP mode.
 - Set it as the **recommended** censor model in provider-detect for the public
   Devboule release.
+
+---
+
+## UPDATE 2026-06-17 — recent-model re-scan (Qwen3.5-9B, gemma-4-12B) + M1 Max speed ceiling
+
+Re-scanned newer ≤12B models as the censor engine. **The 2026-06-13 conclusion HOLDS and is reinforced** (small + right behavior > big; reasoning models over-ramble; runtime matters). Honest note: this day-long detour partly re-explored settled ground — should have re-read THIS doc first (lesson logged in `eval-runs-probe-first-no-fiddle` memory).
+
+**New data:**
+- **M1 Max decode ceiling: dense ≤12B-4bit ≈ 20 tok/s** — confirmed by two engines (oMLX 20, Ollama/llama.cpp 21) → it's the **hardware bandwidth ceiling, not a runtime bug**. Spec-decode (MTP/DFlash) = **<1× on M1 Max** (oMLX 0.4.4 bundles mlx-vlm 0.6.3, missing the "embedder clustering" MTP optimization; tested gemma-4 VLM-MTP with Google's official `gemma-4-12B-it-qat-assistant` drafter → ~16 t/s, 45-63% acceptance). The viral "gemma-12B @ 70 t/s" was an **H100**. → reinforces "small model": Nemotron-4B @ 2.8 GB is fast *because* it's small; no software lever makes a 12B fast here.
+- **Qwen3.5-9B-MLX-4bit** (official, served via oMLX): **34 t/s** (smaller/faster than gemma-12B), reasons natively (reasoning in `reasoning_content`), emits valid localized findings (line/severity/category/title/rationale). BUT ~20% of items **reason past the token cap → findings truncated** — re-confirms the doc's "reasoning models over-reason/ramble" failure mode (same family as MiMo/R1/Phi). Quality (recall/FPR vs base) bench was started, not completed; clean rerun needs a reasoning cap (`eval_api.py --thinking-budget 1024 --max-tokens 2048 --concurrency 2`).
+- **gemma-4-12B** (retired incumbent): re-confirmed bad fit — model_type `gemma4_unified` forces oMLX's slow VLM engine (~20 t/s) AND its reasoning rambles/truncates. **Stays RETIRED.**
+- **Decision reaffirmed:** censor = **≤12B, OFFICIAL weights only** (no community DFlash/MTP builds — they need `trust_remote_code` = run uploader's Python). Agentic tool-use (Nemotron's strength) still beats raw reasoning for cross-file (DEEP) mode.
+- **New tool:** `review-experts/src/eval_api.py` — API-backed eval that reuses `eval.py`'s scoring (numbers comparable), hits any OpenAI-compatible endpoint (oMLX :8000 / Ollama :11434), with per-request timeout + 180s deadline + retry→drop and `--enable-thinking`/`--thinking-budget`. Use for served-model recall/FPR.
+
+**Cross-link (review-experts SFT A/B, 2026-06-17):** fine-tuning a strong base for this task **collapses OOD** (base zero-shot recall 0.345/FPR 0.50 BEATS the LoRA arms; self-silencing). → the censor is **base + a calibration layer**, NOT a fine-tune. See `review-experts-project` memory UPDATE-5/6.
