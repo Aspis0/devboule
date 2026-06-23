@@ -97,9 +97,11 @@ impl Steer {
         };
 
         let consume_len = last_nl + 1;
+        // Lossy decode (never fails) so stray non-UTF8 bytes degrade to U+FFFD rather
+        // than dropping the whole window; advance the offset only AFTER decoding, so a
+        // decode issue can never silently consume messages.
+        let text = String::from_utf8_lossy(&buf[..consume_len]).into_owned();
         *off += consume_len as u64;
-
-        let text = std::str::from_utf8(&buf[..consume_len]).unwrap_or("");
         text.split('\n')
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string())

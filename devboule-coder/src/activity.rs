@@ -14,9 +14,17 @@
 //! append mode, writes one line, and closes it (append is atomic for the small,
 //! single-line writes we do on a local fs — the host tail reads only whole lines).
 //!
-//! PRIVACY: an event carries only a short, redacted LABEL (`text`) and a node style —
-//! NEVER a raw transcript, file body, token, or secret. The planner / burst pick the
-//! label; the host surfaces it verbatim. Keep every label a path basename + a verb.
+//! PRIVACY: a `milestone` event carries only a short, redacted LABEL (`text`) + a node
+//! style — NEVER a raw transcript, file body, token, or secret. The planner / burst pick
+//! the label; the host surfaces it verbatim. Keep every label a path basename + a verb.
+//!
+//! The `websearch` event is the ONE intentional exception: it carries the search query +
+//! the PUBLIC web pages the orchestrator read (url + title + a capped ≤400-char summary),
+//! because the whole point is to show the user the real sources feeding their plan. This
+//! is public web content surfaced to the same user, in their own local app — not a secret.
+//! (Edge: if the orchestrator ever fetched an AUTHENTICATED page, its summary would land
+//! here too; the egress backend only does public Exa search/crawl today, so that path is
+//! not reachable — revisit if authenticated fetch is ever added.)
 
 use std::io::Write;
 use std::path::PathBuf;

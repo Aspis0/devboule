@@ -568,10 +568,11 @@ pub fn parse_exa_pages(body: &str) -> Vec<ExaPage> {
         let summary = if !summary_raw.is_empty() {
             summary_raw.to_string()
         } else if let Some(highlights) = res.get("highlights").and_then(|v| v.as_array()) {
-            let parts: Vec<&str> = highlights
+            let parts: Vec<String> = highlights
                 .iter()
                 .filter_map(|h| h.as_str())
                 .take(5)
+                .map(|s| s.chars().take(100).collect::<String>())
                 .collect();
             if !parts.is_empty() {
                 parts.join(" … ")

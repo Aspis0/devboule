@@ -158,10 +158,6 @@ function taskMoveTargets(task: ProjectTask) {
   );
 }
 
-// Stable no-op for the planner panel's not-yet-wired callbacks (manual search → P2,
-// open-in-design → P3). Module-level so it keeps identity across renders.
-const PLANNER_NOOP = () => {};
-
 export function ProjectsView() {
   const { pendingTab, config, requestView } = useAppContext();
   const { consumePendingTab } = useAppActions();
@@ -505,6 +501,12 @@ export function ProjectsView() {
     setTaskBugDescription("");
     setNoteDraft("");
     setLaunchMessage(null);
+    // Reset the planner chat/goal/web-mode so a new project never shows the previous
+    // project's conversation (and a steer can't fire with stale context). The design +
+    // websearch feeds are already per-project (their own effect / the agent console).
+    setPlannerMessages([]);
+    setPlannerGoal(null);
+    setPlannerWebMode("auto");
     // Prefill the root editor with the project's current root (#6) so "Set root"
     // edits the existing value instead of starting blank.
     setRootDraft(currentProject?.metadata.rootPath ?? "");
@@ -2317,7 +2319,26 @@ export function ProjectsView() {
             findings={plannerWeb.findings}
             webMode={plannerWebMode}
             onWebModeChange={setPlannerWebMode}
-            onManualSearch={PLANNER_NOOP}
+            onManualSearch={(q) => {
+              const query = q.trim();
+              if (!query) return;
+              if (!orchestratorAgentId) {
+                setError(
+                  "Start the Orchestrator (describe a goal) before running a manual web search.",
+                );
+                return;
+              }
+              // Manual web search = steer the running orchestrator to search for it
+              // (reuses the P2 steer channel). The Websearch view then shows the results.
+              invokeBackendCommand("orchestrator_steer", {
+                agentId: orchestratorAgentId,
+                message: `Web-search for "${query}" and use the findings in the plan.`,
+              }).catch((e) =>
+                setError(
+                  e instanceof Error ? e.message : "Manual search failed.",
+                ),
+              );
+            }}
             design={plannerDesign}
             linkedTask={null}
             onOpenInDesign={() => requestView("design")}
@@ -2331,11 +2352,17 @@ export function ProjectsView() {
               if (orchestratorAgentId) {
                 // LIVE: steer the running orchestrator (mid-plan course-correction).
                 // It drains DEVBOULE_STEER_FILE between rounds and injects this as a
-                // human turn (P2).
-                void invokeBackendCommand("orchestrator_steer", {
+                // human turn (P2). Surface a failed send instead of swallowing it.
+                invokeBackendCommand("orchestrator_steer", {
                   agentId: orchestratorAgentId,
                   message: msg,
-                });
+                }).catch((e) =>
+                  setError(
+                    e instanceof Error
+                      ? e.message
+                      : "Steer failed — message not delivered.",
+                  ),
+                );
                 return;
               }
               // IDLE: start a new plan via the existing plan-first flow.
