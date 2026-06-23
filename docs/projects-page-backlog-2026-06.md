@@ -66,6 +66,21 @@ goal/steer/bridge infra):
   switch while running). F8: autoCreate env encoding nitpick.
 This is Phase-D-adjacent: a cloud orchestrator is a real integration, not just a launch.
 
+**💡 KEY SIMPLIFICATION (the owner, 2026-06-23):** the TUI to talk to Claude/Codex ALREADY exists
+and is ALREADY reused. The single-project (Work mode) page uses **`AgentTerminalViewer`**
+(`ProjectWorkspace.tsx:78` — a real xterm whose input flows to the agent PTY via
+`agent_pty_write` + a reply bar; "the same one the Agents room uses, one at a time"). That IS
+how we talk to Claude/Codex today. **B2 part 2 already mounts that same `AgentTerminalViewer`**
+in the planner for a cloud orchestrator — so the INTERACTION is solved by reuse (no new
+chat/steer path needed for cloud; the review's "no steer for cloud" F4 is a non-issue — you
+type into the terminal). The ONLY remaining cloud work is therefore small + launch-side, NOT a
+new TUI:
+- **F1** — pass the typed goal to the cloud CLI's prompt at launch (it currently starts blind).
+- **F2** — bind the planner's `AgentTerminalViewer` to the RIGHT session (capture the launched
+  agentId at launch instead of `find`-by-client, which collides with a hand-off coder).
+So "cloud orchestrator" reduces to: launch the existing CLI with the goal + show it in the
+existing terminal component. Much smaller than it first looked.
+
 ### B3 — Universal websearch UX (Phase D)
 **What:** the top **websearch view** must show the SAME cool UX whether it's **Exa via local
 devboule** OR **Claude/Codex's integrated web search**. Today only the local Exa path feeds
