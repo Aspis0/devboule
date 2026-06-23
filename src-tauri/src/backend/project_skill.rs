@@ -893,6 +893,161 @@ fn bundled_catalog() -> Vec<CatalogEntry> {
     ]
 }
 
+/// One featured open-source marketplace the UI surfaces as a discovery pointer (the owner browses
+/// it to find skills to install via the marketplace URL flow). All entries are real, open-licensed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturedMarketplace {
+    pub name: String,
+    pub url: String,
+    pub license: String,
+    pub description: String,
+}
+
+/// The featured open-source marketplaces (static, in-binary). Discovery pointers only — installing
+/// still goes through the SSRF-guarded preview/scan flow per individual SKILL.md.
+pub fn featured_marketplaces() -> Vec<FeaturedMarketplace> {
+    vec![
+        FeaturedMarketplace {
+            name: "Anthropic Skills".to_string(),
+            url: "https://github.com/anthropics/skills".to_string(),
+            license: "Apache-2.0 (examples) / source-available (docs)".to_string(),
+            description: "Official skills: Apache-licensed examples (frontend-design, webapp-testing, skill-creator, mcp-builder) plus source-available document skills.".to_string(),
+        },
+        FeaturedMarketplace {
+            name: "alirezarezvani/claude-skills".to_string(),
+            url: "https://github.com/alirezarezvani/claude-skills".to_string(),
+            license: "MIT".to_string(),
+            description: "Large community library: 330+ skills, 30+ agents, 70+ commands.".to_string(),
+        },
+        FeaturedMarketplace {
+            name: "VoltAgent/awesome-agent-skills".to_string(),
+            url: "https://github.com/VoltAgent/awesome-agent-skills".to_string(),
+            license: "Community (per-skill)".to_string(),
+            description: "1000+ community-maintained agent skills, portable across many agents.".to_string(),
+        },
+        FeaturedMarketplace {
+            name: "Agent Skills standard".to_string(),
+            url: "https://agentskills.io".to_string(),
+            license: "Open standard".to_string(),
+            description: "The agentskills.io open standard and registry that the SKILL.md format follows.".to_string(),
+        },
+    ]
+}
+
+#[tauri::command]
+pub fn skills_featured_marketplaces() -> Vec<FeaturedMarketplace> {
+    featured_marketplaces()
+}
+
+/// One in-binary library skill the app ships (distinct from the role starter templates): a full
+/// agentskills.io SKILL.md the owner can install (one click) into `.claude/skills/<name>/`. The
+/// SKILL.md frontmatter is the single source of truth for `name`/`description`.
+pub struct LibrarySkillTemplate {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// The 6 bundled library skills (devboule originals, agentskills.io-conformant — they pass our own
+/// `validate_skill`). Bodies are `include_str!`'d from `assets/skills/library/<id>/SKILL.md`, the
+/// same in-binary pattern as the language personas; name+description are parsed from each body.
+fn bundled_library_skills() -> Vec<LibrarySkillTemplate> {
+    let raw_bodies: &[&str] = &[
+        include_str!("../../assets/skills/library/code-review/SKILL.md"),
+        include_str!("../../assets/skills/library/debugging/SKILL.md"),
+        include_str!("../../assets/skills/library/commit-messages/SKILL.md"),
+        include_str!("../../assets/skills/library/pr-description/SKILL.md"),
+        include_str!("../../assets/skills/library/webapp-testing/SKILL.md"),
+        include_str!("../../assets/skills/library/frontend-design/SKILL.md"),
+        include_str!("../../assets/skills/library/tdd-strict/SKILL.md"),
+    ];
+    raw_bodies
+        .iter()
+        .map(|body| {
+            let (fm, _) = super::skill_format::parse_skill_frontmatter(body);
+            LibrarySkillTemplate {
+                name: fm.as_ref().and_then(|f| f.name.clone()).unwrap_or_default(),
+                description: fm.as_ref().and_then(|f| f.description.clone()).unwrap_or_default(),
+                body: body.to_string(),
+            }
+        })
+        .collect()
+}
+
+// ---- TDD CONTRACT for the BUNDLED LIBRARY skills (the 6 shipped, installable starter skills that
+// land in .claude/skills/<name>/ — distinct from the role starter templates above). The local model
+// implements `LibrarySkillTemplate { name, description, body }` + `bundled_library_skills()` (each
+// body include_str!'d from assets/skills/library/<id>/SKILL.md) to turn these green. ----
+#[cfg(test)]
+mod bundled_library_tests {
+    use super::*;
+
+    const EXPECTED: &[&str] = &[
+        "code-review",
+        "debugging",
+        "commit-messages",
+        "pr-description",
+        "webapp-testing",
+        "frontend-design",
+        "tdd-strict",
+    ];
+
+    #[test]
+    fn ships_all_bundled_library_skills() {
+        let skills = bundled_library_skills();
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        for want in EXPECTED {
+            assert!(names.contains(want), "missing bundled library skill {want}");
+        }
+        // Catch drift: a skill added to the include_str! list without updating EXPECTED (or vice versa).
+        assert_eq!(skills.len(), EXPECTED.len(), "bundled_library_skills count != EXPECTED");
+    }
+
+    #[test]
+    fn every_bundled_library_skill_has_a_description() {
+        for s in bundled_library_skills() {
+            assert!(!s.description.trim().is_empty(), "{} has empty description", s.name);
+            assert!(!s.body.trim().is_empty(), "{} has empty body", s.name);
+        }
+    }
+
+    // DOGFOODING: every skill WE ship must pass OUR OWN agentskills.io validator with zero warnings.
+    #[test]
+    fn every_bundled_library_skill_is_spec_conformant() {
+        for s in bundled_library_skills() {
+            let (fm, _) = super::super::skill_format::parse_skill_frontmatter(&s.body);
+            let fm = fm.unwrap_or_else(|| panic!("{} SKILL.md has no frontmatter", s.name));
+            let v = super::super::skill_format::validate_skill(&fm, &s.name);
+            assert!(v.conformant, "bundled '{}' is not spec-conformant: {:?}", s.name, v.warnings);
+            // The frontmatter name must equal the catalog name (so install dir == declared name).
+            assert_eq!(fm.name.as_deref(), Some(s.name.as_str()), "name mismatch for {}", s.name);
+        }
+    }
+}
+
+// ---- TDD CONTRACT for the FEATURED open-source marketplaces (discovery pointers shown in the UI;
+// each is a real, open-licensed source the owner can browse). The local model implements
+// `FeaturedMarketplace { name, url, license, description }` + `featured_marketplaces()`. ----
+#[cfg(test)]
+mod featured_marketplaces_tests {
+    use super::*;
+
+    #[test]
+    fn lists_the_featured_open_source_marketplaces() {
+        let m = featured_marketplaces();
+        assert!(m.len() >= 4, "expected >=4 featured marketplaces, got {}", m.len());
+        for e in &m {
+            assert!(e.url.starts_with("https://"), "{} url is not https", e.name);
+            assert!(!e.name.trim().is_empty(), "empty name");
+            assert!(!e.license.trim().is_empty(), "{} has no license label", e.name);
+        }
+        // The canonical Anthropic repo + the agentskills.io open standard must be present.
+        assert!(m.iter().any(|e| e.url.contains("github.com/anthropics/skills")), "anthropics/skills missing");
+        assert!(m.iter().any(|e| e.url.contains("agentskills.io")), "agentskills.io missing");
+    }
+}
+
 // The `#[tauri::command]` wrappers below do ONLY the Tauri-coupled concerns —
 // `ensure_unlocked`, role validation, the working-folder canonicalization, and (for
 // writers) the design write guard — then delegate to an `*_impl` taking the RAW working
@@ -1060,6 +1215,73 @@ pub fn skills_install_from_catalog(
     state.ensure_unlocked()?;
     let _guard = design_write_guard()?;
     skills_install_from_catalog_impl(&working_folder_path, &role, &catalog_id)
+}
+
+/// One installable bundled LIBRARY skill row for the panel (name + description; the body is fetched
+/// on install). `pub` because it is a `#[tauri::command]` return type.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCatalogEntry {
+    name: String,
+    description: String,
+}
+
+/// List the bundled library skills the app can install (name + description only). Static in-binary
+/// data — no `ensure_unlocked` (matches `skills_catalog`); the writer below IS gated.
+#[tauri::command]
+pub fn skills_library_catalog() -> Vec<LibraryCatalogEntry> {
+    bundled_library_skills()
+        .into_iter()
+        .map(|tpl| LibraryCatalogEntry {
+            name: tpl.name,
+            description: tpl.description,
+        })
+        .collect()
+}
+
+/// Install a bundled library skill into `.claude/skills/<name>/` for this project. BUNDLED body only
+/// (no network); installs through the SAME vetted path as a marketplace skill (`install_skill_package`:
+/// reserved-name + traversal guards + provenance), so the in-binary skills get identical safety.
+#[tauri::command]
+pub fn skills_install_bundled_library(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    skill_name: String,
+) -> Result<String, String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_install_bundled_library_impl(&working_folder_path, &skill_name)
+}
+
+fn skills_install_bundled_library_impl(
+    working_folder_path: &str,
+    skill_name: &str,
+) -> Result<String, String> {
+    let tpl = bundled_library_skills()
+        .into_iter()
+        .find(|t| t.name == skill_name)
+        .ok_or_else(|| format!("unknown bundled library skill '{skill_name}'"))?;
+
+    let root = canonical_working_folder(working_folder_path)?;
+    let lib_root = root.join(".claude").join("skills");
+    std::fs::create_dir_all(&lib_root).map_err(|e| format!("create library failed: {e}"))?;
+
+    // Use the VETTED compile-time template name (not the caller's raw string) for the dir + provenance.
+    let prov = super::skill_marketplace::SkillProvenance {
+        source_url: format!("bundled:devboule/{}", tpl.name),
+        fetched_at: String::new(),
+        sha256: super::skill_marketplace::sha256_hex(&tpl.body),
+    };
+
+    let dest = super::skill_marketplace::install_skill_package(
+        &lib_root,
+        &tpl.name,
+        &tpl.body,
+        &[],
+        &prov,
+    )?;
+
+    Ok(dest.to_string_lossy().into_owned())
 }
 
 fn skills_install_from_catalog_impl(
@@ -1392,6 +1614,8 @@ pub struct MarketplacePreview {
     pub worst: Option<super::skill_vet::RiskSeverity>,
     pub source_url: String,
     pub sha256: String,
+    pub conformant: bool,
+    pub conformance_warnings: Vec<String>,
 }
 
 /// Fetch a marketplace SKILL.md (SSRF-guarded), scan it, and return the preview. NEVER installs.
@@ -1406,6 +1630,41 @@ pub async fn skills_marketplace_preview(
         .map_err(|e| format!("preview task failed: {e}"))?
 }
 
+pub fn preview_from_content(content: &str, source_url: &str) -> MarketplacePreview {
+    let (fm, body) = super::skill_format::parse_skill_frontmatter(content);
+    let findings = super::skill_vet::scan_skill_risks(content, &[]);
+    let worst = super::skill_vet::worst_severity(&findings);
+
+    let (conformant, conformance_warnings) = if let Some(ref frontmatter) = fm {
+        // The install dir is not chosen yet at preview, so we validate against the skill's OWN
+        // declared name (so name==dir is trivially satisfied) — this still checks name FORMAT/length
+        // + description/compatibility. The name-vs-install-dir match is the one spec rule deferred:
+        // it is surfaced in the UI once the owner picks the "Install as" name (the only point where
+        // the destination dir name is actually known).
+        let dir_name = frontmatter.name.as_deref().unwrap_or("");
+        let validation = super::skill_format::validate_skill(frontmatter, dir_name);
+        (validation.conformant, validation.warnings)
+    } else {
+        (
+            false,
+            vec!["missing YAML frontmatter (not an agentskills.io SKILL.md)".to_string()],
+        )
+    };
+
+    MarketplacePreview {
+        name: fm.as_ref().and_then(|f| f.name.clone()),
+        description: fm.as_ref().and_then(|f| f.description.clone()),
+        allowed_tools: fm.as_ref().and_then(|f| f.allowed_tools.clone()),
+        body_excerpt: body.chars().take(2000).collect(),
+        findings,
+        worst,
+        source_url: source_url.to_string(),
+        sha256: super::skill_marketplace::sha256_hex(content),
+        conformant,
+        conformance_warnings,
+    }
+}
+
 fn marketplace_preview_impl(url: &str) -> Result<MarketplacePreview, String> {
     let (validated, addrs) = super::skill_marketplace::validate_public_url(url)?;
     let content = super::skill_marketplace::fetch_text_capped(
@@ -1414,19 +1673,36 @@ fn marketplace_preview_impl(url: &str) -> Result<MarketplacePreview, String> {
         MARKETPLACE_FETCH_MAX_BYTES,
         MARKETPLACE_FETCH_TIMEOUT_SECS,
     )?;
-    let (fm, body) = super::skill_format::parse_skill_frontmatter(&content);
-    let findings = super::skill_vet::scan_skill_risks(&content, &[]);
-    let worst = super::skill_vet::worst_severity(&findings);
-    Ok(MarketplacePreview {
-        name: fm.as_ref().and_then(|f| f.name.clone()),
-        description: fm.as_ref().and_then(|f| f.description.clone()),
-        allowed_tools: fm.as_ref().and_then(|f| f.allowed_tools.clone()),
-        body_excerpt: body.chars().take(2000).collect(),
-        findings,
-        worst,
-        source_url: validated.to_string(),
-        sha256: super::skill_marketplace::sha256_hex(&content),
-    })
+    Ok(preview_from_content(&content, &validated.to_string()))
+}
+
+// ---- TDD CONTRACT for F-spec.3: the marketplace preview must surface agentskills.io conformance
+// (conformant flag + warnings) to the vetting UI, alongside the SkillGate risk findings. The pure
+// (no-network) core `preview_from_content(content, source_url) -> MarketplacePreview` is extracted
+// from `marketplace_preview_impl` so it is unit-testable. veteran/local impl turns these green. ----
+#[cfg(test)]
+mod fspec3_preview_conformance_tests {
+    use super::*;
+
+    #[test]
+    fn preview_flags_nonconformant_name() {
+        let md = "---\nname: bad_name\ndescription: A valid description.\n---\nBody.";
+        let p = preview_from_content(md, "https://example.com/SKILL.md");
+        assert!(!p.conformant, "an underscore in `name` must be non-conformant");
+        assert!(p.conformance_warnings.iter().any(|w| w.contains("name")));
+    }
+
+    #[test]
+    fn preview_marks_conformant_skill_and_keeps_existing_fields() {
+        let md = "---\nname: code-review\ndescription: Reviews diffs. Use when reviewing code.\n---\nBody text.";
+        let p = preview_from_content(md, "https://example.com/SKILL.md");
+        assert!(p.conformant, "clean skill should be conformant; warnings: {:?}", p.conformance_warnings);
+        assert!(p.conformance_warnings.is_empty());
+        // existing preview behavior must be preserved by the refactor:
+        assert_eq!(p.name.as_deref(), Some("code-review"));
+        assert_eq!(p.sha256.len(), 64);
+        assert_eq!(p.source_url, "https://example.com/SKILL.md");
+    }
 }
 
 /// Install a marketplace skill into the project library after the owner confirmed the preview.

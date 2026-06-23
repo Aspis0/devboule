@@ -166,6 +166,33 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
             )}
           </div>
 
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-cream-400">
+              agentskills.io conformance
+            </div>
+            {preview.conformant ? (
+              <p className="mt-1 text-[12px] text-teal">Spec-conformant.</p>
+            ) : preview.conformance_warnings.length === 0 ? (
+              <p className="mt-1 text-[12px] text-amber-700">Not spec-conformant.</p>
+            ) : (
+              <ul className="mt-1 space-y-1">
+                {preview.conformance_warnings.map((w, i) => (
+                  <li
+                    key={i}
+                    className="flex items-start gap-2 rounded-2xl border border-amber-300 bg-amber-50 px-2.5 py-1.5"
+                  >
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
+                    <div className="min-w-0">
+                      <div className="text-[12px] text-amber-700">
+                        <code className="font-mono text-[11px]">{w}</code>
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
           <details className="rounded-2xl border border-cream-200 bg-cream-50">
             <summary className="cursor-pointer px-3 py-2 text-[12px] text-cream-500">Preview the skill body</summary>
             <pre className="max-h-48 overflow-auto whitespace-pre-wrap px-3 pb-3 font-mono text-[11px] text-cream-700">
@@ -183,6 +210,13 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
               className="w-44 rounded-2xl border border-cream-200 bg-white px-2.5 py-1 font-mono text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
             />
           </div>
+          {preview.name && skillName.trim().length > 0 && skillName.trim() !== preview.name && (
+            <p className="mt-1 rounded-2xl border border-amber-300 bg-amber-50 px-3 py-2 text-[12px] text-amber-700">
+              The install name does not match the skill&apos;s declared name ({'"'}
+              {preview.name}
+              {'"'}); agentskills.io expects them to match.
+            </p>
+          )}
 
           {isDanger && (
             <label className="flex items-start gap-2 rounded-2xl border border-red-300 bg-red-50 px-3 py-2 text-[12px] text-red-700">

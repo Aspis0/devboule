@@ -103,4 +103,21 @@ export interface MarketplacePreview {
   worst: RiskSeverity | null;
   source_url: string;
   sha256: string;
+  /** agentskills.io spec conformance (mirrors backend): false ⇒ show the warnings to the owner. */
+  conformant: boolean;
+  conformance_warnings: string[];
+}
+
+/** One bundled (in-binary) library skill the app can install in one click (`skills_library_catalog`). */
+export interface LibraryCatalogEntry {
+  name: string;
+  description: string;
+}
+
+/** One featured open-source marketplace shown as a discovery pointer (`skills_featured_marketplaces`). */
+export interface FeaturedMarketplace {
+  name: string;
+  url: string;
+  license: string;
+  description: string;
 }

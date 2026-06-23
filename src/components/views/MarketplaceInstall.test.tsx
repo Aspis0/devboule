@@ -36,6 +36,8 @@ function dangerPreview(): MarketplacePreview {
     worst: "Danger",
     source_url: "https://m/SKILL.md",
     sha256: "abc123",
+    conformant: true,
+    conformance_warnings: [],
   };
 }
 
@@ -49,11 +51,39 @@ function cleanPreview(): MarketplacePreview {
     worst: null,
     source_url: "https://m/ok/SKILL.md",
     sha256: "deadbeef",
+    conformant: true,
+    conformance_warnings: [],
+  };
+}
+
+// A skill that is SAFE (no risk findings) but NOT agentskills.io-spec-conformant: the owner must
+// still see the conformance warnings, distinct from the SkillGate risk surface.
+function nonConformantPreview(): MarketplacePreview {
+  return {
+    name: "Bad_Name",
+    description: "safe but non-conformant",
+    allowed_tools: null,
+    body_excerpt: "body",
+    findings: [],
+    worst: null,
+    source_url: "https://m/nc/SKILL.md",
+    sha256: "feedface",
+    conformant: false,
+    conformance_warnings: ["`name` may only contain lowercase letters, digits, and hyphens"],
   };
 }
 
 function setUrl(value: string) {
   const input = container.querySelector('input[type="url"]') as HTMLInputElement;
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+  act(() => {
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+function setSkillName(value: string) {
+  const input = container.querySelector('input[aria-label="Install skill name"]') as HTMLInputElement;
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
   act(() => {
     setter.call(input, value);
@@ -138,5 +168,40 @@ describe("MarketplaceInstall", () => {
     setUrl("https://10.0.0.1/SKILL.md");
     await clickButton("Preview");
     expect(container.textContent).toContain("private/loopback");
+  });
+
+  it("shows agentskills.io conformance warnings when the skill is not spec-conformant", async () => {
+    const invoke = vi.fn(async () => nonConformantPreview());
+    act(() => root.render(createElement(MarketplaceInstall, { folderPath: "/p", invoke })));
+    setUrl("https://m/nc/SKILL.md");
+    await clickButton("Preview");
+    // The conformance surface is labelled with the open standard, distinct from the risk findings…
+    expect(container.textContent).toContain("agentskills.io");
+    // …and lists the actual warning so the owner knows what to fix.
+    expect(container.textContent).toContain(
+      "`name` may only contain lowercase letters, digits, and hyphens",
+    );
+  });
+
+  it("does not show conformance warnings for a spec-conformant skill", async () => {
+    const invoke = vi.fn(async () => cleanPreview());
+    act(() => root.render(createElement(MarketplaceInstall, { folderPath: "/p", invoke })));
+    setUrl("https://m/ok/SKILL.md");
+    await clickButton("Preview");
+    expect(container.textContent).not.toContain("may only contain lowercase letters");
+    // Falsifiable positive: the conformant indicator must actually be shown.
+    expect(container.textContent).toContain("Spec-conformant.");
+  });
+
+  it("warns when the chosen install name differs from the skill's declared name (name==dir rule)", async () => {
+    const invoke = vi.fn(async () => cleanPreview()); // declared name: "nice-skill"
+    act(() => root.render(createElement(MarketplaceInstall, { folderPath: "/p", invoke })));
+    setUrl("https://m/ok/SKILL.md");
+    await clickButton("Preview");
+    // Defaults the install name to the declared name ⇒ no mismatch initially.
+    expect(container.textContent).not.toContain("does not match");
+    // Owner edits the install name ⇒ the spec's name-must-match-directory rule is now violated.
+    setSkillName("other-name");
+    expect(container.textContent).toContain("does not match");
   });
 });

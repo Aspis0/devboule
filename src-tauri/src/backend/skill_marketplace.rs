@@ -334,6 +334,23 @@ mod tests {
     }
 
     #[test]
+    fn install_name_gate_stays_tolerant_but_blocks_reserved() {
+        // D2 policy: spec-conformance is surfaced as a WARNING by `skill_format::validate_skill`
+        // (e.g. `_` in a name is non-conformant), NOT enforced at install. The install gate must
+        // stay TOLERANT so a slightly-off-spec community skill still installs — we "warn, don't
+        // break". So `my_skill` (underscore) is still accepted here on purpose…
+        assert!(
+            valid_skill_name("my_skill"),
+            "install gate must stay tolerant of underscores (spec-conformance is a warning, not a block)"
+        );
+        // …while a RESERVED role name like `coder` is still hard-rejected (supply-chain clobber).
+        assert!(
+            !valid_skill_name("coder"),
+            "reserved role names must remain blocked at install"
+        );
+    }
+
+    #[test]
     fn install_rejects_bad_and_reserved_skill_names() {
         let lib = fresh_dir("install_name");
         let prov = SkillProvenance {

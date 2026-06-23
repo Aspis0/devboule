@@ -42,6 +42,7 @@ pub mod skill_marketplace;
 pub mod skill_vet;
 pub mod state;
 pub mod structure;
+pub mod tdd_strict;
 pub mod token_usage;
 pub mod training_export;
 pub mod user_mcp_config;

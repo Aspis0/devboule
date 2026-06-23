@@ -15,6 +15,7 @@ import {
 } from "react";
 import { invokeBackendCommand } from "../../context/AppContext";
 import { MarketplaceInstall } from "./MarketplaceInstall";
+import { SkillsDiscovery } from "./SkillsDiscovery";
 import { UserMcpServersCard } from "../settings/UserMcpServersCard";
 import {
   MAX_SKILL_BYTES,
@@ -668,6 +669,15 @@ export function SkillsView() {
             <div className="space-y-4">
               {folder && (
                 <MarketplaceInstall
+                  folderPath={folder}
+                  invoke={invokeBackendCommand}
+                  onInstalled={() => {
+                    if (folder) void refreshLangs(folder);
+                  }}
+                />
+              )}
+              {folder && (
+                <SkillsDiscovery
                   folderPath={folder}
                   invoke={invokeBackendCommand}
                   onInstalled={() => {
