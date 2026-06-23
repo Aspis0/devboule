@@ -389,10 +389,32 @@ export function SkillsView() {
     setView("installed");
     setQuery("");
     setFolder(picked);
+    try {
+      localStorage.setItem("devboule.skills.lastFolder", picked);
+    } catch {
+      /* localStorage unavailable — non-fatal */
+    }
     setError(null);
     await refresh(picked);
     void refreshLangs(picked);
   }, [refresh, refreshLangs]);
+
+  // BUGFIX (P0): restore the last-used folder on mount so Skills doesn't reset to empty each launch.
+  useEffect(() => {
+    if (folder) return;
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem("devboule.skills.lastFolder");
+    } catch {
+      saved = null;
+    }
+    if (!saved) return;
+    setFolder(saved);
+    void refresh(saved);
+    void refreshLangs(saved);
+    // Run once on mount; refresh/refreshLangs are stable useCallbacks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Re-list the currently-selected folder (manual Refresh / post-mutation reload).
   const reloadCurrent = useCallback(async () => {

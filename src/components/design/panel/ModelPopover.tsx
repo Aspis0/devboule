@@ -72,6 +72,9 @@ export function ModelPopover({
   // popover remounts on each open (Popover renders null when closed), so seeding from
   // currentTimeout on mount is correct and always reflects the saved value.
   const [liveTimeout, setLiveTimeout] = useState(currentTimeout);
+  // The provider the user clicked but that couldn't be switched to (no saved config). Drives the
+  // dedicated config hint below so the click is never a silent no-op (bug #3).
+  const [pendingKind, setPendingKind] = useState<DesignLlmBackendKind | null>(null);
 
   // Switching provider: only persist a VALID backend. If the saved config lacks the
   // field the new kind needs, we surface a Settings note instead of saving garbage.
@@ -79,9 +82,14 @@ export function ModelPopover({
     (kind: DesignLlmBackendKind) => {
       if (kind === currentKind) return;
       const { value, valid } = nextBackendForKind(kind, backend);
-      if (valid && value) onSave(value);
-      // When invalid we intentionally do NOT save; the inline note (rendered below)
-      // tells the user to configure the field in Settings.
+      if (valid && value) {
+        onSave(value);
+        setPendingKind(null);
+      } else {
+        // Invalid (the kind needs a field the saved config lacks): DON'T save garbage, but DON'T
+        // silently no-op either — record the click so the hint below names this provider (bug #3).
+        setPendingKind(kind);
+      }
     },
     [currentKind, backend, onSave],
   );
@@ -181,7 +189,36 @@ export function ModelPopover({
         })}
       </div>
 
-      {needsConfig ? (
+      {pendingKind ? (
+        <p
+          className="mp-note"
+          data-testid="provider-config-hint"
+          style={{
+            margin: "-6px 2px 12px",
+            fontSize: "11.5px",
+            lineHeight: 1.4,
+            color: "var(--muted)",
+          }}
+        >
+          {(() => {
+            const meta = DESIGN_PROVIDERS.find((p) => p.id === pendingKind);
+            const needs = meta?.needs ?? [];
+            return `${meta?.name ?? pendingKind} needs ${
+              needs.length ? needs.join(" + ") : "configuration"
+            }. `;
+          })()}
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              onOpenSettings();
+            }}
+            style={{ color: "inherit", textDecoration: "underline" }}
+          >
+            Configure in Settings
+          </button>
+        </p>
+      ) : needsConfig ? (
         <p
           className="mp-note"
           style={{

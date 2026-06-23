@@ -125,3 +125,54 @@ describe("ModelPopover — timeout slider persistence", () => {
     );
   });
 });
+
+// BUG 3: switching to a local provider (ollama/oMLX/CLI) that has no saved config used to be a
+// SILENT no-op — the row looked unclickable. Clicking it must give visible feedback, not nothing.
+describe("ModelPopover — provider switch feedback (bug #3)", () => {
+  const claudeBackend: DesignLlmBackend = { kind: "claude", timeoutSecs: 180 };
+
+  function mountWith(b: DesignLlmBackend | null) {
+    act(() => {
+      root = createRoot(container);
+      root.render(
+        createElement(ModelPopover, {
+          open: true,
+          onClose: () => {},
+          backend: b,
+          onSave,
+          onOpenSettings: () => {},
+        }),
+      );
+    });
+  }
+
+  function clickProvider(name: string) {
+    const btn = [...container.querySelectorAll("button.mp-row")].find((b) =>
+      b.textContent?.includes(name),
+    ) as HTMLButtonElement;
+    if (!btn) throw new Error(`provider row "${name}" not found`);
+    act(() => {
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+  }
+
+  it("clicking an unconfigured local provider shows a dedicated config hint (not a silent no-op)", () => {
+    mountWith(claudeBackend);
+    // No dedicated hint before any failed click (the provider list + Settings button are always
+    // present, so we assert on a DEDICATED element, not on raw text — that would be tautological).
+    expect(container.querySelector('[data-testid="provider-config-hint"]')).toBeNull();
+    clickProvider("Ollama");
+    // It must NOT silently switch to a backend with no model…
+    expect(onSave).not.toHaveBeenCalled();
+    // …and a dedicated hint must appear, naming the clicked provider.
+    const hint = container.querySelector('[data-testid="provider-config-hint"]');
+    expect(hint, "expected a provider-config-hint after clicking an unconfigured provider").not.toBeNull();
+    expect(hint?.textContent ?? "").toMatch(/Ollama/);
+  });
+
+  it("clicking a valid provider (no required fields) switches immediately", () => {
+    mountWith(claudeBackend);
+    clickProvider("Codex");
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ kind: "codex" }));
+  });
+});

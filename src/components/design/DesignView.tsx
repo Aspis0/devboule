@@ -1011,6 +1011,12 @@ export function DesignView() {
         );
         await seedContract();
         await rememberProject(folderPath, loaded.meta.name);
+        // Persist the last-opened folder so the next cold start restores it (see the mount effect).
+        try {
+          localStorage.setItem("devboule.design.lastFolder", folderPath);
+        } catch {
+          /* localStorage unavailable — non-fatal */
+        }
         await refreshOracleStatus();
       } catch (e) {
         setError(
@@ -1088,6 +1094,23 @@ export function DesignView() {
     },
     [loadFolder],
   );
+
+  // BUGFIX (P0): restore the LAST-OPENED project on cold start so Design isn't empty every launch.
+  // Keyed on a persisted last-folder (written by loadFolder on a successful open), NOT on "the
+  // registry has entries" — so merely having known projects never force-opens one. Guarded by
+  // folderRef so it can't clobber a project the user already opened (or a deep-link).
+  useEffect(() => {
+    if (!tauri || folderRef.current) return;
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem("devboule.design.lastFolder");
+    } catch {
+      saved = null;
+    }
+    if (saved) void loadFolder(saved);
+    // Run once on mount; loadFolder is a stable useCallback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tauri]);
 
   // Consolidate the whole design project to disk. Returns TRUE on a successful save,
   // FALSE on any failure (no folder or backend error). The hand-off packaging flow
