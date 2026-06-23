@@ -593,6 +593,10 @@ pub struct RealExecutor {
     /// FILE BRIDGE to the host Console). Disabled (no-op) unless the host set
     /// `DEVBOULE_ACTIVITY_FILE` at launch — observability never gates the run.
     activity: crate::activity::Activity,
+    /// Orchestrator composer auto-create toggle (from `DEVBOULE_AUTO_CREATE`). `true` (default) ⇒
+    /// an approved plan auto-creates its tasks on the board; `false` ⇒ the plan is drafted +
+    /// submitted but its tasks are NOT created (the operator creates them). See `run_planner`.
+    auto_create: bool,
 }
 
 impl RealExecutor {
@@ -609,7 +613,16 @@ impl RealExecutor {
             project_id: String::new(),
             // Disabled by default; `with_planner` resolves the real emitter from env.
             activity: crate::activity::Activity::disabled(),
+            // Default ON (the pre-feature behavior); `with_auto_create` overrides from env.
+            auto_create: true,
         }
+    }
+
+    /// Set the orchestrator-composer auto-create toggle (from `DEVBOULE_AUTO_CREATE`). Builder-style
+    /// so existing `new()` callers/tests keep the default-ON behavior unchanged.
+    pub fn with_auto_create(mut self, auto_create: bool) -> Self {
+        self.auto_create = auto_create;
+        self
     }
 
     /// Attach the planner inputs (the model that drives the local planner + the
@@ -841,6 +854,7 @@ impl RealExecutor {
             &self.fs,
             &self.project_id,
             &self.activity,
+            self.auto_create,
         )
         .await
         {

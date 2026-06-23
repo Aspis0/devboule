@@ -74,6 +74,14 @@ const ENV_PROJECT_ID: &str = "DEVBOULE_PROJECT_ID";
 /// directive (`prompt::build_system_prompt(true)`) so the model's first action for a
 /// non-trivial goal is `plan`. NOT a secret.
 const ENV_PLAN_FIRST: &str = "DEVBOULE_PLAN_FIRST";
+/// Orchestrator composer "Plan it": the typed GOAL (the app launch sets it). When present, the
+/// binary runs that goal HEADLESS (one plan-first burst via `run_once`) instead of waiting for
+/// interactive TUI input — see `seeded_goal()` + `main.rs`. NOT a secret.
+const ENV_GOAL: &str = "DEVBOULE_GOAL";
+/// Orchestrator composer auto-create toggle. "0" ⇒ the planner drafts + submits the plan but does
+/// NOT create its tasks on approval (the operator creates them); absent / any other value ⇒ the
+/// existing behavior (tasks created on approval). NOT a secret.
+const ENV_AUTO_CREATE: &str = "DEVBOULE_AUTO_CREATE";
 /// The host-rendered LANGUAGE persona block (role × language), set by the app launch. Appended
 /// to the binary's system prompt for ANY backend (loopback oMLX / Ollama / Cloud — it threads
 /// through the SHARED `build_chat_body`). Absent ⇒ the prompt is byte-identical.
@@ -109,6 +117,13 @@ pub async fn build_runtime() -> Runtime {
         executor,
         allow_egress,
     }
+}
+
+/// The orchestrator-composer GOAL the app seeded via `DEVBOULE_GOAL`, if any. When `Some`, the
+/// binary runs it headless (one plan-first burst) instead of opening the interactive TUI — so the
+/// typed goal actually reaches the planner. Whitespace-only ⇒ `None` (no seeded run).
+pub fn seeded_goal() -> Option<String> {
+    env_nonempty(ENV_GOAL)
 }
 
 /// The model. PRECEDENCE (a discriminated-backend extension):
@@ -314,7 +329,13 @@ async fn build_executor(
     // a plan against the wrong project.
     let project_id = env_nonempty(ENV_PROJECT_ID).unwrap_or_default();
 
-    let executor = RealExecutor::new(mcp, fs, web).with_planner(model, project_id);
+    // Orchestrator composer auto-create toggle: DEVBOULE_AUTO_CREATE="0" ⇒ the planner submits the
+    // plan but does NOT create its tasks on approval; absent / any other value ⇒ the default
+    // (tasks created on approval), byte-identical to a pre-feature run.
+    let auto_create = !matches!(env_nonempty(ENV_AUTO_CREATE).as_deref(), Some("0"));
+    let executor = RealExecutor::new(mcp, fs, web)
+        .with_planner(model, project_id)
+        .with_auto_create(auto_create);
     let allow_egress = executor.egress_enabled();
     (Arc::new(executor), allow_egress)
 }

@@ -62,6 +62,16 @@ async fn main() -> std::io::Result<()> {
         return run_once(prompt).await;
     }
 
+    // Orchestrator composer "Plan it": when the app launched us with a seeded GOAL
+    // (`DEVBOULE_GOAL`), run that goal HEADLESS — one burst, biased plan-first by
+    // `DEVBOULE_PLAN_FIRST` — instead of opening the interactive TUI. This is how the typed goal
+    // actually reaches the planner (the TUI would otherwise wait for the operator to type it). The
+    // app streams this stdout + the activity file into the live Projects view. Absent ⇒ the
+    // interactive TUI, byte-identical to before.
+    if let Some(goal) = config::seeded_goal() {
+        return run_once(goal).await;
+    }
+
     // Resolve the model + executor from env BEFORE entering raw mode, so any
     // fallback note (oMLX/MCP disabled) prints to a normal terminal rather than
     // the alternate screen. With no config this yields the Mock + Stub so

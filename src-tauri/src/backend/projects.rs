@@ -1714,6 +1714,21 @@ fn prepare_or_launch_project_agent(
                     )
                 })
                 .unwrap_or_default(),
+            // Orchestrator composer: the typed goal (DEVBOULE_GOAL) + the auto-create toggle
+            // (DEVBOULE_AUTO_CREATE). Both meaningful only for the orchestrator client; empty ⇒
+            // omitted ⇒ byte-identical interactive launch.
+            initial_goal: input
+                .initial_goal
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_default(),
+            auto_create: if input.auto_create == Some(false) {
+                "0".to_string()
+            } else {
+                String::new()
+            },
         })
     } else {
         None
@@ -4746,6 +4761,14 @@ struct OrchestratorLaunchConfig {
     /// `DEVBOULE_PROJECT_CONTEXT`: the host-rendered (fenced + sentinel-neutralized) AGENTS.md/CLAUDE.md
     /// project-context block for the binary's OWN system prompt. EMPTY ⇒ the var is omitted.
     project_context: String,
+    /// `DEVBOULE_GOAL`: the typed orchestrator-composer goal. NON-empty ⇒ the orchestrator runs
+    /// HEADLESS on this goal (plan-first) instead of waiting for interactive TUI input; empty ⇒ the
+    /// var is omitted and the launch is byte-identical (interactive). NOT a secret.
+    initial_goal: String,
+    /// `DEVBOULE_AUTO_CREATE`: "0" when the composer's auto-create toggle is OFF (the planner drafts
+    /// + submits the plan but skips creating its tasks on approval); empty ⇒ the var is omitted and
+    /// the existing behavior (tasks created on approval) is byte-identical. NOT a secret.
+    auto_create: String,
 }
 
 /// The ordered `(NAME, value)` NON-SECRET env pairs both OS launch builders set for the
@@ -4821,6 +4844,15 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     // appended ONLY when present (absent ⇒ the pair is omitted, byte-identical launch).
     if !config.project_context.trim().is_empty() {
         pairs.push(("DEVBOULE_PROJECT_CONTEXT", config.project_context.clone()));
+    }
+    // Orchestrator composer: the typed goal (the binary runs headless on it, plan-first) and the
+    // auto-create toggle ("0" ⇒ don't create tasks on approval). Each appended ONLY when set, so an
+    // interactive launch with neither is byte-identical to a pre-feature launch.
+    if !config.initial_goal.trim().is_empty() {
+        pairs.push(("DEVBOULE_GOAL", config.initial_goal.clone()));
+    }
+    if !config.auto_create.trim().is_empty() {
+        pairs.push(("DEVBOULE_AUTO_CREATE", config.auto_create.clone()));
     }
     pairs
 }
@@ -10813,6 +10845,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             user_mcp_servers_json: String::new(),
             lang_skill: String::new(),
             project_context: String::new(),
+            initial_goal: String::new(),
+            auto_create: String::new(),
         }
     }
 
@@ -11015,6 +11049,36 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(
             !names.contains(&"DEVBOULE_PLAN_FIRST"),
             "plan-first OFF ⇒ no DEVBOULE_PLAN_FIRST pair (byte-identical default launch)"
+        );
+    }
+
+    #[test]
+    fn orchestrator_env_pairs_goal_and_auto_create_present_only_when_set() {
+        // The composer's typed goal (DEVBOULE_GOAL) + auto-create toggle (DEVBOULE_AUTO_CREATE)
+        // ride ONLY when set; an interactive launch (fixture defaults: both empty) omits both,
+        // byte-identical to a pre-feature launch.
+        let base = orchestrator_fixture(); // initial_goal = "", auto_create = ""
+        let base_names: Vec<&str> =
+            orchestrator_env_pairs(&base).into_iter().map(|(n, _)| n).collect();
+        assert!(!base_names.contains(&"DEVBOULE_GOAL"), "no goal ⇒ no DEVBOULE_GOAL");
+        assert!(
+            !base_names.contains(&"DEVBOULE_AUTO_CREATE"),
+            "auto-create default ⇒ no DEVBOULE_AUTO_CREATE"
+        );
+
+        let mut set = orchestrator_fixture();
+        set.initial_goal = "Add Stripe billing".to_string();
+        set.auto_create = "0".to_string();
+        let pairs = orchestrator_env_pairs(&set);
+        assert_eq!(
+            pairs.iter().find(|(n, _)| *n == "DEVBOULE_GOAL").map(|(_, v)| v.as_str()),
+            Some("Add Stripe billing"),
+            "a typed goal ⇒ DEVBOULE_GOAL carries it verbatim"
+        );
+        assert_eq!(
+            pairs.iter().find(|(n, _)| *n == "DEVBOULE_AUTO_CREATE").map(|(_, v)| v.as_str()),
+            Some("0"),
+            "auto-create OFF ⇒ DEVBOULE_AUTO_CREATE=0"
         );
     }
 

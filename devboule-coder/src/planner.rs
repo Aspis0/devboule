@@ -256,6 +256,13 @@ impl PlanOutcome {
                 "Plan: {} task(s), submitted -> approved (planId {plan_id}, created on the board)",
                 self.tasks_plan.tasks.len(),
             ),
+            // Approved but auto-create is OFF: the plan succeeded; its tasks were intentionally NOT
+            // created (the operator will). Say so explicitly so the model does not read this like a
+            // rejection nor try to run_plan tasks that don't exist.
+            (None, PlanApproval::Approved) => format!(
+                "Plan: {} task(s), submitted -> approved (auto-create OFF — tasks NOT created; the operator creates them)",
+                self.tasks_plan.tasks.len(),
+            ),
             _ => format!(
                 "Plan: {} task(s), submitted -> {} (not created on the board)",
                 self.tasks_plan.tasks.len(),
@@ -859,6 +866,9 @@ pub async fn run_planner(
     fs: &FsBackend,
     project_id: &str,
     activity: &Activity,
+    // Orchestrator-composer auto-create toggle: when false, an APPROVED plan is NOT turned into
+    // board tasks (the operator creates them); when true (default), tasks are created on approval.
+    auto_create: bool,
 ) -> Result<PlanOutcome, String> {
     let goal = goal.trim();
     if goal.is_empty() {
@@ -1052,7 +1062,7 @@ pub async fn run_planner(
     // T<n> ids + remaps the deps) tagged with the approved `planId`. A missing planId
     // here is a server-contract violation (an approval must carry one): surface it as a
     // hard error rather than create un-tagged tasks the runner could never find.
-    let created_plan_id = if approval == PlanApproval::Approved {
+    let created_plan_id = if approval == PlanApproval::Approved && auto_create {
         let plan_id = plan_id.ok_or_else(|| {
             "plan_submit approved the plan but returned no planId; cannot create tasks on the board"
                 .to_string()
@@ -1075,6 +1085,17 @@ pub async fn run_planner(
         );
         Some(created_plan_id)
     } else {
+        if approval == PlanApproval::Approved {
+            // auto-create OFF: the plan IS approved, but its tasks are left for the operator to
+            // create (the composer's "auto-create: off"). Note it so the run is not silent.
+            activity.milestone(
+                &format!(
+                    "plan approved; {} task(s) NOT auto-created (auto-create off)",
+                    plan.tasks.len()
+                ),
+                Node::Sage,
+            );
+        }
         None
     };
 
@@ -1355,7 +1376,7 @@ mod tests {
             plan_block(one_valid_task()),
         ]);
 
-        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", &noop_activity())
+        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .expect("planner succeeds");
 
@@ -1467,7 +1488,7 @@ mod tests {
         let mcp = MockMcp::new(vec!["src/a.rs"], "rejected");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
 
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .expect("planner succeeds even when the human rejects");
         assert_eq!(outcome.approval, PlanApproval::Rejected);
@@ -1514,7 +1535,7 @@ mod tests {
         let act_file = dir.path().join("activity.jsonl");
         let activity = Activity::with_path(&act_file);
 
-        run_planner("do the thing", &model, &mcp, &fs, "proj", &activity)
+        run_planner("do the thing", &model, &mcp, &fs, "proj", &activity, true)
             .await
             .expect("planner succeeds");
 
@@ -1541,6 +1562,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_create_off_approves_the_plan_but_creates_no_tasks() {
+        // The composer's "auto-create: off" (auto_create=false): an APPROVED plan is NOT turned into
+        // board tasks — the terminal milestone says so explicitly and the outcome carries no created
+        // plan id (no `project_create_plan_tasks` call).
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        let act_file = dir.path().join("activity.jsonl");
+        let activity = Activity::with_path(&act_file);
+
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &activity, false)
+            .await
+            .expect("planner succeeds");
+
+        assert!(
+            outcome.plan_id.is_none(),
+            "auto-create off ⇒ no tasks created ⇒ no created plan id"
+        );
+        let milestones = read_milestones(&act_file);
+        let last = milestones.last().expect("at least one milestone");
+        assert!(
+            last.0.contains("NOT auto-created"),
+            "auto-create off ⇒ terminal milestone notes tasks were not created, got {last:?}"
+        );
+        assert!(
+            !milestones.iter().any(|(t, _)| t.contains("created on the board")),
+            "auto-create off ⇒ no 'created on the board' milestone"
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_plan_emits_a_rejected_milestone() {
         let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "rejected");
@@ -1548,7 +1600,7 @@ mod tests {
         let act_file = dir.path().join("activity.jsonl");
         let activity = Activity::with_path(&act_file);
 
-        run_planner("g", &model, &mcp, &fs, "proj", &activity)
+        run_planner("g", &model, &mcp, &fs, "proj", &activity, true)
             .await
             .unwrap();
 
@@ -1574,7 +1626,7 @@ mod tests {
         let act_file = dir.path().join("activity.jsonl");
         let activity = Activity::with_path(&act_file);
 
-        run_planner("g", &model, &mcp, &fs, "proj", &activity)
+        run_planner("g", &model, &mcp, &fs, "proj", &activity, true)
             .await
             .unwrap();
 
@@ -1609,7 +1661,7 @@ mod tests {
         let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "vanished");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .unwrap();
         assert_eq!(outcome.approval, PlanApproval::Timeout);
@@ -1625,7 +1677,7 @@ mod tests {
         let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs", "src/ghost.rs"], "approved");
         let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .unwrap();
         // Only ONE explore call (ghost skipped) + ONE plan call.
@@ -1646,7 +1698,7 @@ mod tests {
             "not a note block at all".to_string(),
             plan_block(one_valid_task()),
         ]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .unwrap();
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
@@ -1676,7 +1728,7 @@ mod tests {
         outputs.push(plan_block(one_valid_task()));
         let model = CapturingModel::new(outputs);
 
-        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .expect("planner succeeds");
 
@@ -1723,7 +1775,7 @@ mod tests {
             plan_block(four_scope),       // attempt 1: rejected (scope > 3)
             plan_block(one_valid_task()), // attempt 2: valid
         ]);
-        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .expect("retry produces a valid plan");
         assert_eq!(outcome.tasks_plan.tasks.len(), 1);
@@ -1993,7 +2045,7 @@ mod tests {
             outputs.push(plan_block(bad.clone()));
         }
         let model = CapturingModel::new(outputs);
-        let err = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity())
+        let err = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .expect_err("exhausted retries is an error");
         assert!(
@@ -2159,7 +2211,7 @@ mod tests {
         let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![]);
-        let err = run_planner("   ", &model, &mcp, &fs, "proj", &noop_activity())
+        let err = run_planner("   ", &model, &mcp, &fs, "proj", &noop_activity(), true)
             .await
             .expect_err("an empty goal is rejected before any work");
         assert!(err.contains("non-empty goal"));
@@ -2172,7 +2224,7 @@ mod tests {
         let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let model = CapturingModel::new(vec![]);
-        let err = run_planner("g", &model, &mcp, &fs, "", &noop_activity())
+        let err = run_planner("g", &model, &mcp, &fs, "", &noop_activity(), true)
             .await
             .expect_err("an empty project_id is rejected before any work");
         assert!(err.contains("project_id"));

@@ -131,10 +131,7 @@ export interface RowActions {
   showExitedHint: boolean;
 }
 
-export function rowActions(
-  session: AgentSession,
-  hasPty: boolean,
-): RowActions {
+export function rowActions(session: AgentSession, hasPty: boolean): RowActions {
   const isApp = session.host === "app";
   return {
     showTerminalToggle: hasPty,
@@ -238,10 +235,7 @@ export function drawerData(
   const agentId = session.agentId;
   const mine = claims
     .filter((claim) => claim.agentId === agentId)
-    .sort(
-      (a, b) =>
-        (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
-    );
+    .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
   return {
     activeClaims: mine.filter((claim) => isWorkingClaim(claim, now)),
     waitingClaims: mine.filter(
@@ -316,6 +310,13 @@ export interface SpawnLaunchInput {
   // .languageOverride over IPC. Absent ⇒ the backend auto-detects; a non-empty value forces that
   // language's persona. Backend-agnostic (applies on whatever backend the role runs on).
   languageOverride?: string;
+  // Orchestrator composer "Plan it": the typed GOAL. Threaded to ProjectAgentLaunchInput.initialGoal
+  // → DEVBOULE_GOAL, so the orchestrator runs headless on it (plan-first) instead of waiting for TUI
+  // input. Absent ⇒ the interactive launch, unchanged.
+  initialGoal?: string;
+  // Orchestrator composer auto-create toggle. `false` ⇒ DEVBOULE_AUTO_CREATE=0 (the planner submits
+  // the plan but doesn't create its tasks on approval). Absent/`true` ⇒ the default (create on approval).
+  autoCreate?: boolean;
 }
 
 // Max length of an advisory model hint that rides into the prompt. A model name
@@ -423,9 +424,7 @@ export function canRoleLaunchTask(
     return task.status === "review" || task.status === "blocked";
   // coder (the only other spawn role): todo / wip / blocked.
   return (
-    task.status === "todo" ||
-    task.status === "wip" ||
-    task.status === "blocked"
+    task.status === "todo" || task.status === "wip" || task.status === "blocked"
   );
 }
 

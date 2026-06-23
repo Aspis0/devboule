@@ -90,6 +90,7 @@ export function OrchestratorHeroCard(props: Props) {
       <div className="mt-4 rounded-xl border border-cream-200 bg-cream-50 p-3">
         <textarea
           rows={3}
+          maxLength={2000}
           value={goal}
           onChange={(e) => setGoal(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -115,8 +116,8 @@ export function OrchestratorHeroCard(props: Props) {
             onClick={() => setAutoCreate((v) => !v)}
             title={
               autoCreate
-                ? "On: when you approve the orchestrator's plan, its tasks are added to the board automatically (you still approve the plan first) — the current behaviour."
-                : "Off: don't auto-create tasks on approval. (Preference recorded; backend enforcement is being wired — see DEVBOULE_AUTO_CREATE.)"
+                ? "On: when you approve the orchestrator's plan, its tasks are added to the board automatically (you still approve the plan first)."
+                : "Off: the orchestrator drafts + submits the plan but does NOT create its tasks on approval — you create them. Enforced via DEVBOULE_AUTO_CREATE."
             }
             className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors ${
               autoCreate
@@ -141,8 +142,8 @@ export function OrchestratorHeroCard(props: Props) {
       {/* GUARD */}
       {!hasRoot && (
         <div className="mt-3 text-[11px] text-cream-400">
-          Select a project with a working folder, then describe the goal to
-          plan it.
+          Select a project with a working folder, then describe the goal to plan
+          it.
         </div>
       )}
 

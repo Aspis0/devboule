@@ -600,6 +600,17 @@ pub struct ProjectAgentLaunchInput {
     /// clients (they have no planner / read no such env). camelCase over IPC.
     #[serde(default)]
     pub plan_first: Option<bool>,
+    /// Orchestrator composer "Plan it": the typed GOAL. When `Some(non-empty)` AND
+    /// `client == "orchestrator"`, the launch sets `DEVBOULE_GOAL` so the orchestrator runs
+    /// headless on that goal (plan-first) instead of waiting for interactive TUI input. Optional +
+    /// lenient: `None`/empty omits the env (byte-identical default launch). camelCase over IPC.
+    #[serde(default)]
+    pub initial_goal: Option<String>,
+    /// Orchestrator composer auto-create toggle. `Some(false)` sets `DEVBOULE_AUTO_CREATE=0` so the
+    /// planner drafts + submits the plan but does NOT create its tasks on approval (you create them).
+    /// `None`/`Some(true)` omits the env ⇒ the existing behavior (tasks created on approval). camelCase.
+    #[serde(default)]
+    pub auto_create: Option<bool>,
     /// Phase D: when `Some`, this is a design "Save & hand off" dispatch — the coder's
     /// launch prompt gains a FIXED-WORDING addendum that points it at the validated
     /// design bundle and instructs it to implement that design (respecting design.md as

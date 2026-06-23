@@ -61,10 +61,7 @@ import type {
   ProjectTaskCategory,
   SavedWorkflow,
 } from "../../types/backend";
-import {
-  isOpenClaim,
-  isRecentProjectSession,
-} from "../../utils/agentClaims";
+import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
 import { CollapsibleSection } from "../projects/CollapsibleSection";
 import { formatDateTime } from "../projects/projectFormat";
 import type { SpawnRole } from "../agents/roleDisplay";
@@ -86,10 +83,7 @@ import { ProjectStatusHeader } from "../projects/ProjectStatusHeader";
 import { ProjectNotes } from "../projects/ProjectNotes";
 import { TaskCard } from "../projects/TaskCard";
 import { TaskDependencyArrows } from "../projects/TaskDependencyArrows";
-import {
-  TASK_CATEGORIES,
-  categoryLabel,
-} from "../projects/taskCategory";
+import { TASK_CATEGORIES, categoryLabel } from "../projects/taskCategory";
 import type { ColumnId } from "../projects/taskBoard";
 import { deriveWorkers, agentColorHex } from "../projects/agentBadge";
 import { freshestSession } from "../projects/agentLiveStatus";
@@ -220,6 +214,10 @@ export function ProjectsView() {
   const [error, setError] = useState<string | null>(null);
   const [agentSyncError, setAgentSyncError] = useState<string | null>(null);
   const busyRef = useRef(false);
+  // Guards the whole orchestrator "Plan it" sequence (note write → launch). `busyRef` alone has a
+  // gap between the note mutation finishing and the launch acquiring it, where a fast second click
+  // could double-fire (two notes + two orchestrators); this ref spans the entire sequence.
+  const orchestratorPlanRef = useRef(false);
   // Reentrancy guard for the Work-mode git actions (commit/push). A fast
   // double-click or Commit-then-Push must not fire two concurrent git ops on the
   // same repo (double commit / non-fast-forward push). Mirrors busyRef: set in a
@@ -757,10 +755,7 @@ export function ProjectsView() {
         e instanceof Error ? e.message : "Agent refresh failed.",
       ),
     );
-  }, [
-    agentState,
-    refreshProjectsFromAgentState,
-  ]);
+  }, [agentState, refreshProjectsFromAgentState]);
 
   const drainPendingAgentRefresh = useCallback(() => {
     const pending = pendingAgentRefreshRef.current;
@@ -893,7 +888,11 @@ export function ProjectsView() {
     const detail = await runMutation(() =>
       invokeBackendCommand<ProjectDetail>("create_project", {
         // R1: pass the chosen working folder so tools/agents key off it (not the app dir).
-        input: { title, status: "active", rootPath: newProjectRootDraft.trim() || null },
+        input: {
+          title,
+          status: "active",
+          rootPath: newProjectRootDraft.trim() || null,
+        },
       }),
     );
     if (detail) {
@@ -961,11 +960,15 @@ export function ProjectsView() {
     if (isArchived) return; // archived project is read-only.
     // Category is mandatory on create (the button is disabled until picked, but
     // guard here too). A bug card carries its description as the P2 Oracle query.
-    if (!currentProject || !taskDraft.trim() || !taskCategory || busyRef.current)
+    if (
+      !currentProject ||
+      !taskDraft.trim() ||
+      !taskCategory ||
+      busyRef.current
+    )
       return;
     const title = taskDraft.trim();
-    const description =
-      taskCategory === "bug" ? taskBugDescription.trim() : "";
+    const description = taskCategory === "bug" ? taskBugDescription.trim() : "";
     const projectId = currentProject.metadata.id;
     // Task ids present BEFORE the create, so we can identify the new card in the
     // returned detail without relying on duplicate-prone title matching.
@@ -1110,10 +1113,7 @@ export function ProjectsView() {
     );
   };
 
-  const copyAgentPrompt = async (
-    role: SpawnRole,
-    taskId?: string,
-  ) => {
+  const copyAgentPrompt = async (role: SpawnRole, taskId?: string) => {
     if (isArchived) return; // archived project is read-only.
     if (!currentProject || busyRef.current) return;
     if (!canLaunchProjectAgents(currentProject)) {
@@ -1235,7 +1235,9 @@ export function ProjectsView() {
         savedWorkflows,
       );
     } catch (e) {
-      setWorkflowError(e instanceof Error ? e.message : "Workflow launch failed.");
+      setWorkflowError(
+        e instanceof Error ? e.message : "Workflow launch failed.",
+      );
       return;
     }
     busyRef.current = true;
@@ -1255,7 +1257,9 @@ export function ProjectsView() {
       await loadProjects();
     } catch (e) {
       const message =
-        e instanceof Error ? e.message : "Saved workflow could not be launched.";
+        e instanceof Error
+          ? e.message
+          : "Saved workflow could not be launched.";
       setWorkflowError(await recoverFromConflict(message));
     } finally {
       setWorkflowBusyName(null);
@@ -1500,6 +1504,10 @@ export function ProjectsView() {
             // Phase 6: the per-launch language-persona override (absent ⇒ backend auto-detects).
             // buildLaunchInput already emits undefined when the user picked no override.
             languageOverride: input.languageOverride,
+            // Orchestrator composer: the typed goal + auto-create toggle (absent for every other
+            // launch, so the backend omits DEVBOULE_GOAL/DEVBOULE_AUTO_CREATE — byte-identical).
+            initialGoal: input.initialGoal,
+            autoCreate: input.autoCreate,
           },
         },
       );
@@ -1511,9 +1519,13 @@ export function ProjectsView() {
       await loadAgentState();
       await loadProjects();
     } catch (e) {
-      setError(await recoverFromConflict(
-        e instanceof Error ? e.message : "Agent terminal could not be launched.",
-      ));
+      setError(
+        await recoverFromConflict(
+          e instanceof Error
+            ? e.message
+            : "Agent terminal could not be launched.",
+        ),
+      );
     } finally {
       busyRef.current = false;
       setIsBusy(false);
@@ -1532,28 +1544,42 @@ export function ProjectsView() {
     autoCreate: boolean,
   ) => {
     if (isArchived) return;
-    if (!currentProject?.metadata.rootPath || busyRef.current) return;
-    const note = `Orchestrator goal: ${goal}\n(hand off to: ${coderId} · auto-create tasks: ${autoCreate ? "on" : "off"})`;
-    const detail = await runMutation(() =>
-      invokeBackendCommand<ProjectDetail>("append_project_note", {
+    if (
+      !currentProject?.metadata.rootPath ||
+      busyRef.current ||
+      orchestratorPlanRef.current
+    )
+      return;
+    orchestratorPlanRef.current = true;
+    try {
+      const note = `Orchestrator goal: ${goal}\n(hand off to: ${coderId} · auto-create tasks: ${autoCreate ? "on" : "off"})`;
+      const detail = await runMutation(() =>
+        invokeBackendCommand<ProjectDetail>("append_project_note", {
+          projectId: currentProject.metadata.id,
+          note: {
+            text: note,
+            source: "user",
+            expectedRevision: currentProject.revision,
+          },
+        }),
+      );
+      if (!detail) return;
+      await launchFromSpawnPanel({
         projectId: currentProject.metadata.id,
-        note: {
-          text: note,
-          source: "user",
-          expectedRevision: currentProject.revision,
-        },
-      }),
-    );
-    if (!detail) return;
-    await launchFromSpawnPanel({
-      projectId: currentProject.metadata.id,
-      role: "coder",
-      client: "orchestrator",
-      taskId: null,
-      host: "app",
-      model: null,
-      planFirst: true,
-    });
+        role: "coder",
+        client: "orchestrator",
+        taskId: null,
+        host: "app",
+        model: null,
+        planFirst: true,
+        // The typed goal now reaches the planner directly (DEVBOULE_GOAL — the orchestrator runs it
+        // headless, plan-first); the note above is kept only as an audit trail. auto-create rides too.
+        initialGoal: goal,
+        autoCreate,
+      });
+    } finally {
+      orchestratorPlanRef.current = false;
+    }
   };
 
   // Rail copy-prompt: SpawnPanel selection → prepare_project_agent_prompt
@@ -1588,11 +1614,13 @@ export function ProjectsView() {
       await loadAgentState();
       await loadProjects();
     } catch (e) {
-      setError(await recoverFromConflict(
-        e instanceof Error
-          ? e.message
-          : "Clipboard is unavailable. Use the MCP command and project id manually.",
-      ));
+      setError(
+        await recoverFromConflict(
+          e instanceof Error
+            ? e.message
+            : "Clipboard is unavailable. Use the MCP command and project id manually.",
+        ),
+      );
     } finally {
       busyRef.current = false;
       setIsBusy(false);
@@ -1680,7 +1708,9 @@ export function ProjectsView() {
         setGitActionError(false);
         succeeded = true;
       } catch (e) {
-        setGitActionMessage(e instanceof Error ? e.message : "git push failed.");
+        setGitActionMessage(
+          e instanceof Error ? e.message : "git push failed.",
+        );
         setGitActionError(true);
       } finally {
         busyRef.current = false;
@@ -1722,7 +1752,9 @@ export function ProjectsView() {
         setGitActionError(false);
         succeeded = true;
       } catch (e) {
-        setGitActionMessage(e instanceof Error ? e.message : "git pull failed.");
+        setGitActionMessage(
+          e instanceof Error ? e.message : "git pull failed.",
+        );
         setGitActionError(true);
       } finally {
         busyRef.current = false;
@@ -1741,273 +1773,271 @@ export function ProjectsView() {
   // handlers/state (moveTask, createTask, appendNote, noteDraft, …). The `?`-guard
   // narrows currentProject to non-null inside each branch, so the moved JSX's
   // existing currentProject uses still type-check; absent → null renders nothing.
-  const notesNode = workMode && currentProject ? (
-    <ProjectNotes
-      notes={currentProject.state.notes}
-      noteDraft={noteDraft}
-      onNoteDraftChange={setNoteDraft}
-      onAppend={appendNote}
-      isBusy={isBusy}
-      readOnly={isArchived}
-      revision={currentProject.revision}
-      // ProjectDetail.modifiedAt is `string | null`; ProjectNotes expects a
-      // string and renders it via formatDate, whose falsy-guard maps "" → "no
-      // date" — identical to the prior inline block that passed null straight in.
-      modifiedAt={currentProject.modifiedAt ?? ""}
-      updatedAt={currentProject.metadata.updatedAt}
-    />
-  ) : null;
+  const notesNode =
+    workMode && currentProject ? (
+      <ProjectNotes
+        notes={currentProject.state.notes}
+        noteDraft={noteDraft}
+        onNoteDraftChange={setNoteDraft}
+        onAppend={appendNote}
+        isBusy={isBusy}
+        readOnly={isArchived}
+        revision={currentProject.revision}
+        // ProjectDetail.modifiedAt is `string | null`; ProjectNotes expects a
+        // string and renders it via formatDate, whose falsy-guard maps "" → "no
+        // date" — identical to the prior inline block that passed null straight in.
+        modifiedAt={currentProject.modifiedAt ?? ""}
+        updatedAt={currentProject.metadata.updatedAt}
+      />
+    ) : null;
 
-  const taskBoardNode = workMode && currentProject ? (
-    <CollapsibleSection
-      icon={FolderKanban}
-      title="Tasks"
-      purpose="Tasks for this project"
-      summary={`${tasksByColumn.done.length} done · ${tasksByColumn.wip.length} in progress · ${tasksByColumn.review.length} in review`}
-      defaultOpen
-      helpTitle="Board is for tasks and quick coder/verifier launches."
-      helpLines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
-    >
-      {/* Create-task form: hidden when the project is archived (read-only). The
+  const taskBoardNode =
+    workMode && currentProject ? (
+      <CollapsibleSection
+        icon={FolderKanban}
+        title="Tasks"
+        purpose="Tasks for this project"
+        summary={`${tasksByColumn.done.length} done · ${tasksByColumn.wip.length} in progress · ${tasksByColumn.review.length} in review`}
+        defaultOpen
+        helpTitle="Board is for tasks and quick coder/verifier launches."
+        helpLines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+      >
+        {/* Create-task form: hidden when the project is archived (read-only). The
           task COLUMNS below stay visible so archived tasks remain inspectable. */}
-      {!isArchived && (
-      <div className="mb-4 space-y-2">
-        <div className="flex gap-2">
-          <input
-            value={taskDraft}
-            onChange={(event) => setTaskDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void createTask();
-            }}
-            placeholder="Add task"
-            data-help-title="A task is one concrete piece of project work."
-            data-help-lines="Tasks appear in Todo, WIP, Review, Blocked, or Done.|Coders should move work toward Review; verifiers decide whether it can close.|Keep tasks small enough for one agent session.|Agents can update task state through MCP instead of editing the UI."
-            className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
-          />
-          <button
-            onClick={() => void createTask()}
-            disabled={isBusy || !taskDraft.trim() || !taskCategory}
-            data-help-title="This adds a Todo task to the project."
-            data-help-lines="The task is written to the project Markdown file.|A category is required so the orchestrator and Oracle know how to treat it.|It starts in Todo and can later be claimed by a coder or orchestrator.|If an agent is already working, reload before adding overlapping tasks."
-            className="inline-flex items-center gap-2 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            Task
-          </button>
-        </div>
-        <div
-          className="flex flex-wrap items-center gap-1.5"
-          data-help-title="A category is required for every new Todo card."
-          data-help-lines="feature, hardening, bug, or other.|It tells the orchestrator how to treat the card and seeds Oracle's suspect files.|A bug card asks for a short description used to localize the suspect files.|Pick one before the Task button enables."
-        >
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
-            Category
-          </span>
-          {TASK_CATEGORIES.map((category) => {
-            const active = taskCategory === category;
-            return (
-              <button
-                key={category}
-                type="button"
-                onClick={() => setTaskCategory(category)}
-                aria-pressed={active}
-                className={`rounded-md px-2 py-1 text-[10px] font-semibold transition-colors ${
-                  active
-                    ? "bg-teal text-white"
-                    : "bg-cream-100 text-cream-600 hover:bg-cream-200"
-                }`}
-              >
-                {categoryLabel(category)}
-              </button>
-            );
-          })}
-        </div>
-        {taskCategory === "bug" && (
-          <textarea
-            value={taskBugDescription}
-            onChange={(event) =>
-              setTaskBugDescription(event.target.value)
-            }
-            rows={3}
-            placeholder="Describe the bug — what is wrong, where you see it. This seeds Oracle's suspect files."
-            data-help-title="The bug description is used to localize suspect files."
-            data-help-lines="Oracle (P2) retrieves the most relevant files from the codebase index using this text.|Be specific: symptoms, error messages, the area of the app.|It is stored on the card and visible to the agent that claims it.|Optional, but a good description makes the suspect list far more useful."
-            className="w-full resize-y rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
-          />
-        )}
-      </div>
-      )}
-      {!isArchived && (
-        <div className="mb-2 flex items-center justify-end">
-          <button
-            type="button"
-            onClick={() => setShowArrows((v) => !v)}
-            aria-pressed={showArrows}
-            title="Toggle the dependency arrows on the board"
-            className={`rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
-              showArrows
-                ? "border-terracotta bg-terracotta text-white"
-                : "border-cream-200 text-cream-600 hover:bg-cream-50"
-            }`}
-          >
-            {showArrows ? "Arrows: on" : "Arrows: off"}
-          </button>
-        </div>
-      )}
-      <div className="overflow-x-auto pb-2">
-        <div className="relative grid min-w-[1080px] grid-cols-5 gap-3">
-          <TaskDependencyArrows
-            tasks={currentProject?.state.tasks ?? []}
-            visible={showArrows && !isArchived}
-            colorByTask={arrowColorByTask}
-          />
-          {columns.map((column) => {
-            const Icon = column.icon;
-            const items = tasksByColumn[column.id];
-            return (
-              <div
-                key={column.id}
-                className="rounded-lg border border-cream-200 bg-cream-50 p-3"
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  handleColumnDrop(column.id);
+        {!isArchived && (
+          <div className="mb-4 space-y-2">
+            <div className="flex gap-2">
+              <input
+                value={taskDraft}
+                onChange={(event) => setTaskDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void createTask();
                 }}
-                data-help-title={`${column.label} is a task status column.`}
-                data-help-lines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+                placeholder="Add task"
+                data-help-title="A task is one concrete piece of project work."
+                data-help-lines="Tasks appear in Todo, WIP, Review, Blocked, or Done.|Coders should move work toward Review; verifiers decide whether it can close.|Keep tasks small enough for one agent session.|Agents can update task state through MCP instead of editing the UI."
+                className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+              />
+              <button
+                onClick={() => void createTask()}
+                disabled={isBusy || !taskDraft.trim() || !taskCategory}
+                data-help-title="This adds a Todo task to the project."
+                data-help-lines="The task is written to the project Markdown file.|A category is required so the orchestrator and Oracle know how to treat it.|It starts in Todo and can later be claimed by a coder or orchestrator.|If an agent is already working, reload before adding overlapping tasks."
+                className="inline-flex items-center gap-2 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
               >
-                <div className="mb-3 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Icon className="h-4 w-4 text-cream-500" />
-                    <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
-                      {column.label}
-                    </h3>
-                  </div>
-                  <span className="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-cream-500">
-                    {items.length}
-                  </span>
-                </div>
-                {column.id === "done" && (
-                  <p className="mb-2 rounded-md bg-white/70 px-2 py-1 text-[10px] font-semibold text-cream-400">
-                    Verifier gated
-                  </p>
-                )}
-
-                <div className="space-y-2">
-                  {items.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-cream-200 bg-white/70 p-3 text-[11px] text-cream-400">
-                      Empty
+                <Plus className="h-3.5 w-3.5" />
+                Task
+              </button>
+            </div>
+            <div
+              className="flex flex-wrap items-center gap-1.5"
+              data-help-title="A category is required for every new Todo card."
+              data-help-lines="feature, hardening, bug, or other.|It tells the orchestrator how to treat the card and seeds Oracle's suspect files.|A bug card asks for a short description used to localize the suspect files.|Pick one before the Task button enables."
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+                Category
+              </span>
+              {TASK_CATEGORIES.map((category) => {
+                const active = taskCategory === category;
+                return (
+                  <button
+                    key={category}
+                    type="button"
+                    onClick={() => setTaskCategory(category)}
+                    aria-pressed={active}
+                    className={`rounded-md px-2 py-1 text-[10px] font-semibold transition-colors ${
+                      active
+                        ? "bg-teal text-white"
+                        : "bg-cream-100 text-cream-600 hover:bg-cream-200"
+                    }`}
+                  >
+                    {categoryLabel(category)}
+                  </button>
+                );
+              })}
+            </div>
+            {taskCategory === "bug" && (
+              <textarea
+                value={taskBugDescription}
+                onChange={(event) => setTaskBugDescription(event.target.value)}
+                rows={3}
+                placeholder="Describe the bug — what is wrong, where you see it. This seeds Oracle's suspect files."
+                data-help-title="The bug description is used to localize suspect files."
+                data-help-lines="Oracle (P2) retrieves the most relevant files from the codebase index using this text.|Be specific: symptoms, error messages, the area of the app.|It is stored on the card and visible to the agent that claims it.|Optional, but a good description makes the suspect list far more useful."
+                className="w-full resize-y rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+              />
+            )}
+          </div>
+        )}
+        {!isArchived && (
+          <div className="mb-2 flex items-center justify-end">
+            <button
+              type="button"
+              onClick={() => setShowArrows((v) => !v)}
+              aria-pressed={showArrows}
+              title="Toggle the dependency arrows on the board"
+              className={`rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                showArrows
+                  ? "border-terracotta bg-terracotta text-white"
+                  : "border-cream-200 text-cream-600 hover:bg-cream-50"
+              }`}
+            >
+              {showArrows ? "Arrows: on" : "Arrows: off"}
+            </button>
+          </div>
+        )}
+        <div className="overflow-x-auto pb-2">
+          <div className="relative grid min-w-[1080px] grid-cols-5 gap-3">
+            <TaskDependencyArrows
+              tasks={currentProject?.state.tasks ?? []}
+              visible={showArrows && !isArchived}
+              colorByTask={arrowColorByTask}
+            />
+            {columns.map((column) => {
+              const Icon = column.icon;
+              const items = tasksByColumn[column.id];
+              return (
+                <div
+                  key={column.id}
+                  className="rounded-lg border border-cream-200 bg-cream-50 p-3"
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    handleColumnDrop(column.id);
+                  }}
+                  data-help-title={`${column.label} is a task status column.`}
+                  data-help-lines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+                >
+                  <div className="mb-3 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Icon className="h-4 w-4 text-cream-500" />
+                      <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+                        {column.label}
+                      </h3>
                     </div>
-                  ) : (
-                    items.map((task) => {
-                      // All gating is computed here (unchanged) and
-                      // passed to TaskCard as plain booleans/titles. The
-                      // card invokes the SAME moveTask / launchAgent /
-                      // copyAgentPrompt handlers with identical args; it
-                      // only changes presentation (button rows -> menus).
-                      const taskClaims = claimsByTask[task.id] ?? [];
-                      const taskSessions =
-                        sessionsByTask[task.id] ?? [];
-                      const taskAgentControlled =
-                        taskClaims.length > 0 ||
-                        taskSessions.length > 0;
-                      // R7: the agent(s) working this card — internal mini OR external
-                      // Claude/codex — each a color-coded badge (the parallel-track viz).
-                      const workers = deriveWorkers(taskClaims, taskSessions);
-                      const manualMoveTitle = isArchived
-                        ? "Archived project is read-only."
-                        : taskAgentControlled
-                          ? "An open agent claim or session controls this task; let MCP update status or wait for expiry."
-                          : "Move task";
-                      const launchable =
-                        canLaunchProjectAgents(currentProject);
-                      const moveDisabled =
-                        isBusy ||
-                        taskAgentControlled ||
-                        isArchived ||
-                        // B-F2: a "done" task is verifier-terminal — not draggable (the Move
-                        // menu already offers it no targets).
-                        task.status === "done";
-                      return (
-                        // B17: the card is draggable only when movable; the column's
-                        // onDrop routes the dropped card through moveTask.
-                        <div
-                          key={task.id}
-                          draggable={!moveDisabled}
-                          onDragStart={() => handleCardDragStart(task)}
-                          onDragEnd={() => {
-                            dragTaskRef.current = null;
-                          }}
-                        >
-                          <TaskCard
-                            task={task}
-                            agentControlled={taskAgentControlled}
-                            workers={workers}
-                            moveTargets={taskMoveTargets(task)}
-                            moveDisabled={moveDisabled}
-                          manualMoveTitle={manualMoveTitle}
-                          showLaunch={task.status !== "done"}
-                          launchTitle={projectLaunchTitle(
-                            currentProject,
-                          )}
-                          coderDisabled={
-                            isBusy ||
-                            !launchable ||
-                            !canCoderClaimTask(task)
-                          }
-                          coderTitle={
-                            !launchable
-                              ? projectLaunchTitle(currentProject)
-                              : canCoderClaimTask(task)
-                                ? "Launch coder"
-                                : "Coder cannot claim a review task"
-                          }
-                          verifierDisabled={
-                            isBusy ||
-                            !launchable ||
-                            !canVerifierClaimTask(task)
-                          }
-                          verifierTitle={
-                            !launchable
-                              ? projectLaunchTitle(currentProject)
-                              : canVerifierClaimTask(task)
-                                ? "Launch verifier"
-                                : "Verifier can claim Review or Blocked tasks"
-                          }
-                          manualDisabled={!launchable}
-                          launchDisabled={isBusy || !launchable}
-                          onMove={(status) =>
-                            void moveTask(task, status)
-                          }
-                          onLaunchCoder={() =>
-                            void launchAgent("coder", mainCoderClient, task.id)
-                          }
-                          onLaunchVerifier={() =>
-                            void launchAgent(
-                              "verifier",
-                              mainCoderClient,
-                              task.id,
-                            )
-                          }
-                          onCopyManualPrompt={() =>
-                            void copyAgentPrompt(
-                              recommendedTaskRole(task),
-                              task.id,
-                            )
-                          }
-                          />
-                        </div>
-                      );
-                    })
+                    <span className="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-cream-500">
+                      {items.length}
+                    </span>
+                  </div>
+                  {column.id === "done" && (
+                    <p className="mb-2 rounded-md bg-white/70 px-2 py-1 text-[10px] font-semibold text-cream-400">
+                      Verifier gated
+                    </p>
                   )}
+
+                  <div className="space-y-2">
+                    {items.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-cream-200 bg-white/70 p-3 text-[11px] text-cream-400">
+                        Empty
+                      </div>
+                    ) : (
+                      items.map((task) => {
+                        // All gating is computed here (unchanged) and
+                        // passed to TaskCard as plain booleans/titles. The
+                        // card invokes the SAME moveTask / launchAgent /
+                        // copyAgentPrompt handlers with identical args; it
+                        // only changes presentation (button rows -> menus).
+                        const taskClaims = claimsByTask[task.id] ?? [];
+                        const taskSessions = sessionsByTask[task.id] ?? [];
+                        const taskAgentControlled =
+                          taskClaims.length > 0 || taskSessions.length > 0;
+                        // R7: the agent(s) working this card — internal mini OR external
+                        // Claude/codex — each a color-coded badge (the parallel-track viz).
+                        const workers = deriveWorkers(taskClaims, taskSessions);
+                        const manualMoveTitle = isArchived
+                          ? "Archived project is read-only."
+                          : taskAgentControlled
+                            ? "An open agent claim or session controls this task; let MCP update status or wait for expiry."
+                            : "Move task";
+                        const launchable =
+                          canLaunchProjectAgents(currentProject);
+                        const moveDisabled =
+                          isBusy ||
+                          taskAgentControlled ||
+                          isArchived ||
+                          // B-F2: a "done" task is verifier-terminal — not draggable (the Move
+                          // menu already offers it no targets).
+                          task.status === "done";
+                        return (
+                          // B17: the card is draggable only when movable; the column's
+                          // onDrop routes the dropped card through moveTask.
+                          <div
+                            key={task.id}
+                            draggable={!moveDisabled}
+                            onDragStart={() => handleCardDragStart(task)}
+                            onDragEnd={() => {
+                              dragTaskRef.current = null;
+                            }}
+                          >
+                            <TaskCard
+                              task={task}
+                              agentControlled={taskAgentControlled}
+                              workers={workers}
+                              moveTargets={taskMoveTargets(task)}
+                              moveDisabled={moveDisabled}
+                              manualMoveTitle={manualMoveTitle}
+                              showLaunch={task.status !== "done"}
+                              launchTitle={projectLaunchTitle(currentProject)}
+                              coderDisabled={
+                                isBusy ||
+                                !launchable ||
+                                !canCoderClaimTask(task)
+                              }
+                              coderTitle={
+                                !launchable
+                                  ? projectLaunchTitle(currentProject)
+                                  : canCoderClaimTask(task)
+                                    ? "Launch coder"
+                                    : "Coder cannot claim a review task"
+                              }
+                              verifierDisabled={
+                                isBusy ||
+                                !launchable ||
+                                !canVerifierClaimTask(task)
+                              }
+                              verifierTitle={
+                                !launchable
+                                  ? projectLaunchTitle(currentProject)
+                                  : canVerifierClaimTask(task)
+                                    ? "Launch verifier"
+                                    : "Verifier can claim Review or Blocked tasks"
+                              }
+                              manualDisabled={!launchable}
+                              launchDisabled={isBusy || !launchable}
+                              onMove={(status) => void moveTask(task, status)}
+                              onLaunchCoder={() =>
+                                void launchAgent(
+                                  "coder",
+                                  mainCoderClient,
+                                  task.id,
+                                )
+                              }
+                              onLaunchVerifier={() =>
+                                void launchAgent(
+                                  "verifier",
+                                  mainCoderClient,
+                                  task.id,
+                                )
+                              }
+                              onCopyManualPrompt={() =>
+                                void copyAgentPrompt(
+                                  recommendedTaskRole(task),
+                                  task.id,
+                                )
+                              }
+                            />
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
-      </div>
-    </CollapsibleSection>
-  ) : null;
+      </CollapsibleSection>
+    ) : null;
 
   return (
     <div className="w-full space-y-6">
@@ -2066,243 +2096,256 @@ export function ProjectsView() {
         // dissolved): the kanban board + calendar + selected-project detail. Work
         // mode is the only alternate render, gated solely by `workMode` above.
         <div className="space-y-6">
-      {error && (
-        <div className="rounded-lg border border-coral/20 bg-coral/[0.04] px-4 py-3 text-[12px] font-medium text-coral-dark">
-          {error}
-        </div>
-      )}
-      {agentSyncError && (
-        <div className="rounded-lg border border-amber/20 bg-amber/[0.06] px-4 py-3 text-[12px] font-medium text-amber-dark">
-          Agent sync degraded: {agentSyncError}
-        </div>
-      )}
+          {error && (
+            <div className="rounded-lg border border-coral/20 bg-coral/[0.04] px-4 py-3 text-[12px] font-medium text-coral-dark">
+              {error}
+            </div>
+          )}
+          {agentSyncError && (
+            <div className="rounded-lg border border-amber/20 bg-amber/[0.06] px-4 py-3 text-[12px] font-medium text-amber-dark">
+              Agent sync degraded: {agentSyncError}
+            </div>
+          )}
 
-      <section className="flex flex-wrap items-center gap-2 rounded-2xl border border-cream-200 bg-white px-3 py-2">
-        <FolderKanban className="h-5 w-5 shrink-0 text-terracotta" />
-        <input
-          value={titleDraft}
-          onChange={(event) => setTitleDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") void createProject();
-          }}
-          placeholder="New project title — or describe it to the Orchestrator below…"
-          data-help-title="A project is the local notebook for one work stream."
-          data-help-lines="Projects are Markdown files that the UI, agents, and Oracle can read.|Use one project for one goal, for example scrna-seq backend and frontend.|Agents update tasks and notes through MCP so the board stays current.|The project file is indexed by Oracle after it changes."
-          className="min-w-[12rem] flex-1 rounded-xl border border-transparent bg-transparent px-2 py-2 text-[13px] text-cream-800 outline-none focus:border-cream-200 focus:bg-cream-50"
-        />
-        <button
-          onClick={() => void pickProjectFolder()}
-          // B-F7: the native folder dialog only exists in the Tauri runtime — disable in the
-          // browser harness (where the dynamic import would silently no-op).
-          disabled={isBusy || !isTauriRuntime()}
-          title={newProjectRootDraft || "Choose the working folder the agent reads/writes in"}
-          data-help-title="Choose the project's working folder."
-          data-help-lines="The agent reads + writes code in THIS folder.|Without a working folder the project can't run tools — project_structure, visual_check, and Censor all need a root.|Pick the repo/folder the coder should work in.|This is the one thing to set here; the rest is configured in Settings."
-          className="inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:bg-cream-100 disabled:opacity-60"
-        >
-          <FolderOpen className="h-3.5 w-3.5 shrink-0" />
-          <span className="max-w-[10rem] truncate">
-            {newProjectRootDraft
-              ? (newProjectRootDraft.split(/[\\/]/).filter(Boolean).pop() ?? newProjectRootDraft)
-              : "Folder"}
-          </span>
-        </button>
-        <button
-          onClick={() => {
-            setCloneError(null);
-            setCloneOpen((open) => !open);
-          }}
-          disabled={cloneBusy}
-          data-help-title="This clones a GitHub repository and adds it as a project."
-          data-help-lines="Paste an https://github.com/owner/repo URL to clone it locally.|The clone uses your GitHub token from Settings; the token never appears in the URL or logs.|It refuses to overwrite a non-empty folder.|The cloned repo becomes a project rooted at the new folder."
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:bg-cream-100 disabled:opacity-60"
-        >
-          <GitBranch className="h-3.5 w-3.5" />
-          GitHub
-        </button>
-        <button
-          onClick={() => void createProject()}
-          disabled={isBusy || !titleDraft.trim()}
-          data-help-title="This creates a new project Markdown file."
-          data-help-lines="The new project starts active and appears on the stage board.|It does not launch agents by itself.|Choose the working folder (button at left) before creating — agents cannot run without one; there is no app-folder fallback.|Oracle can index the project file after the watcher sees it."
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-terracotta px-4 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          Create
-        </button>
-      </section>
-
-      {/* Clone-from-GitHub dialog (inline, board-mode only). Mirrors the small
-          inline-input idiom used elsewhere; reuses the same input/button tokens. */}
-      {cloneOpen && (
-        <section className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-4">
-          <label className="text-[12px] font-semibold text-cream-700">
-            Clone a GitHub repository
-          </label>
-          <div className="flex min-w-0 flex-wrap gap-2 sm:flex-nowrap sm:items-center">
+          <section className="flex flex-wrap items-center gap-2 rounded-2xl border border-cream-200 bg-white px-3 py-2">
+            <FolderKanban className="h-5 w-5 shrink-0 text-terracotta" />
             <input
-              value={cloneUrlDraft}
-              onChange={(event) => {
-                setCloneUrlDraft(event.target.value);
-                if (cloneError) setCloneError(null);
-              }}
+              value={titleDraft}
+              onChange={(event) => setTitleDraft(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") void cloneProject();
+                if (event.key === "Enter") void createProject();
               }}
-              placeholder="https://github.com/owner/repo"
-              autoFocus
-              spellCheck={false}
-              className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+              placeholder="New project title — or describe it to the Orchestrator below…"
+              data-help-title="A project is the local notebook for one work stream."
+              data-help-lines="Projects are Markdown files that the UI, agents, and Oracle can read.|Use one project for one goal, for example scrna-seq backend and frontend.|Agents update tasks and notes through MCP so the board stays current.|The project file is indexed by Oracle after it changes."
+              className="min-w-[12rem] flex-1 rounded-xl border border-transparent bg-transparent px-2 py-2 text-[13px] text-cream-800 outline-none focus:border-cream-200 focus:bg-cream-50"
             />
             <button
-              onClick={() => void cloneProject()}
-              disabled={cloneBusy || !cloneUrlDraft.trim()}
-              className="shrink-0 inline-flex items-center gap-2 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+              onClick={() => void pickProjectFolder()}
+              // B-F7: the native folder dialog only exists in the Tauri runtime — disable in the
+              // browser harness (where the dynamic import would silently no-op).
+              disabled={isBusy || !isTauriRuntime()}
+              title={
+                newProjectRootDraft ||
+                "Choose the working folder the agent reads/writes in"
+              }
+              data-help-title="Choose the project's working folder."
+              data-help-lines="The agent reads + writes code in THIS folder.|Without a working folder the project can't run tools — project_structure, visual_check, and Censor all need a root.|Pick the repo/folder the coder should work in.|This is the one thing to set here; the rest is configured in Settings."
+              className="inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:bg-cream-100 disabled:opacity-60"
+            >
+              <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+              <span className="max-w-[10rem] truncate">
+                {newProjectRootDraft
+                  ? (newProjectRootDraft.split(/[\\/]/).filter(Boolean).pop() ??
+                    newProjectRootDraft)
+                  : "Folder"}
+              </span>
+            </button>
+            <button
+              onClick={() => {
+                setCloneError(null);
+                setCloneOpen((open) => !open);
+              }}
+              disabled={cloneBusy}
+              data-help-title="This clones a GitHub repository and adds it as a project."
+              data-help-lines="Paste an https://github.com/owner/repo URL to clone it locally.|The clone uses your GitHub token from Settings; the token never appears in the URL or logs.|It refuses to overwrite a non-empty folder.|The cloned repo becomes a project rooted at the new folder."
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:bg-cream-100 disabled:opacity-60"
             >
               <GitBranch className="h-3.5 w-3.5" />
-              {cloneBusy ? "Cloning…" : "Clone"}
+              GitHub
             </button>
-          </div>
-          {cloneError && (
-            <p className="text-[11px] font-medium text-red-600">{cloneError}</p>
-          )}
-        </section>
-      )}
+            <button
+              onClick={() => void createProject()}
+              disabled={isBusy || !titleDraft.trim()}
+              data-help-title="This creates a new project Markdown file."
+              data-help-lines="The new project starts active and appears on the stage board.|It does not launch agents by itself.|Choose the working folder (button at left) before creating — agents cannot run without one; there is no app-folder fallback.|Oracle can index the project file after the watcher sees it."
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-terracotta px-4 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Create
+            </button>
+          </section>
 
-      {/* The Orchestrator composer — the centerpiece "describe a goal → plan → board" surface.
+          {/* Clone-from-GitHub dialog (inline, board-mode only). Mirrors the small
+          inline-input idiom used elsewhere; reuses the same input/button tokens. */}
+          {cloneOpen && (
+            <section className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-4">
+              <label className="text-[12px] font-semibold text-cream-700">
+                Clone a GitHub repository
+              </label>
+              <div className="flex min-w-0 flex-wrap gap-2 sm:flex-nowrap sm:items-center">
+                <input
+                  value={cloneUrlDraft}
+                  onChange={(event) => {
+                    setCloneUrlDraft(event.target.value);
+                    if (cloneError) setCloneError(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void cloneProject();
+                  }}
+                  placeholder="https://github.com/owner/repo"
+                  autoFocus
+                  spellCheck={false}
+                  className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200"
+                />
+                <button
+                  onClick={() => void cloneProject()}
+                  disabled={cloneBusy || !cloneUrlDraft.trim()}
+                  className="shrink-0 inline-flex items-center gap-2 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+                >
+                  <GitBranch className="h-3.5 w-3.5" />
+                  {cloneBusy ? "Cloning…" : "Clone"}
+                </button>
+              </div>
+              {cloneError && (
+                <p className="text-[11px] font-medium text-red-600">
+                  {cloneError}
+                </p>
+              )}
+            </section>
+          )}
+
+          {/* The Orchestrator composer — the centerpiece "describe a goal → plan → board" surface.
           Always visible; "Plan it" stays guarded until a project with a working folder is selected
           (the wiring to the existing plan-first flow lands in a follow-up). */}
-      <OrchestratorHeroCard
-        projectName={currentProject?.metadata.title ?? null}
-        hasRoot={!!currentProject?.metadata.rootPath}
-        language={null}
-        plannerModel={config.localCoderBackend?.model ?? mainCoderClient}
-        coders={[
-          { id: "claude", label: "Claude" },
-          { id: "codex", label: "Codex" },
-          ...(config.customAgentClients ?? []).map((c) => ({ id: c.id, label: c.label })),
-        ]}
-        busy={isBusy}
-        onPlan={(goal, coderId, autoCreate) =>
-          void planWithOrchestrator(goal, coderId, autoCreate)
-        }
-      />
+          <OrchestratorHeroCard
+            projectName={currentProject?.metadata.title ?? null}
+            hasRoot={!!currentProject?.metadata.rootPath}
+            language={null}
+            plannerModel={config.localCoderBackend?.model ?? mainCoderClient}
+            coders={[
+              { id: "claude", label: "Claude" },
+              { id: "codex", label: "Codex" },
+              ...(config.customAgentClients ?? []).map((c) => ({
+                id: c.id,
+                label: c.label,
+              })),
+            ]}
+            busy={isBusy}
+            onPlan={(goal, coderId, autoCreate) =>
+              void planWithOrchestrator(goal, coderId, autoCreate)
+            }
+          />
 
-      {/* Overview segmented toggle: the active stage board (default) vs. a simple
+          {/* Overview segmented toggle: the active stage board (default) vs. a simple
           read-only list of archived projects. The "Archived (N)" segment is shown
           disabled when there is nothing archived, so the control stays predictable
           without cluttering the header when N === 0. */}
-      <div className="flex items-center gap-1 rounded-lg border border-cream-200 bg-white p-1 w-fit">
-        <button
-          type="button"
-          onClick={() => setOverviewTab("board")}
-          aria-pressed={overviewTab === "board"}
-          data-help-title="Show the active stage board and calendar."
-          data-help-lines="The board is the active project workflow.|Archived projects leave the board and the calendar.|Use the Archived tab to find and reopen them.|This toggle only changes the overview, not the selection."
-          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors ${
-            overviewTab === "board"
-              ? "bg-terracotta text-white"
-              : "text-cream-600 hover:bg-cream-50"
-          }`}
-        >
-          Board
-        </button>
-        <button
-          type="button"
-          onClick={() => setOverviewTab("archived")}
-          aria-pressed={overviewTab === "archived"}
-          disabled={archivedProjects.length === 0}
-          data-help-title="Show archived projects."
-          data-help-lines="Archived projects are read-only and out of the active workflow.|They do not appear on the board or the calendar.|Open one to view it, then Unarchive from its page to make it active again.|Archiving is reversible."
-          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors disabled:opacity-40 ${
-            overviewTab === "archived"
-              ? "bg-terracotta text-white"
-              : "text-cream-600 hover:bg-cream-50"
-          }`}
-        >
-          Archived ({archivedProjects.length})
-        </button>
-      </div>
-
-      {overviewTab === "archived" ? (
-        // Archived list: a calm read-only list of archived projects, each with an
-        // [Open] button that enters the same single-project Work mode a board card
-        // does (enterWorkMode). Unarchive lives in the page banner (Part 2).
-        <section className="rounded-lg border border-cream-200 bg-white p-4">
-          <div className="mb-3 flex items-center gap-2">
-            <Archive className="h-4 w-4 text-cream-500" aria-hidden />
-            <h3 className="text-sm font-semibold text-cream-800">
-              Archived projects
-            </h3>
+          <div className="flex items-center gap-1 rounded-lg border border-cream-200 bg-white p-1 w-fit">
+            <button
+              type="button"
+              onClick={() => setOverviewTab("board")}
+              aria-pressed={overviewTab === "board"}
+              data-help-title="Show the active stage board and calendar."
+              data-help-lines="The board is the active project workflow.|Archived projects leave the board and the calendar.|Use the Archived tab to find and reopen them.|This toggle only changes the overview, not the selection."
+              className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+                overviewTab === "board"
+                  ? "bg-terracotta text-white"
+                  : "text-cream-600 hover:bg-cream-50"
+              }`}
+            >
+              Board
+            </button>
+            <button
+              type="button"
+              onClick={() => setOverviewTab("archived")}
+              aria-pressed={overviewTab === "archived"}
+              disabled={archivedProjects.length === 0}
+              data-help-title="Show archived projects."
+              data-help-lines="Archived projects are read-only and out of the active workflow.|They do not appear on the board or the calendar.|Open one to view it, then Unarchive from its page to make it active again.|Archiving is reversible."
+              className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors disabled:opacity-40 ${
+                overviewTab === "archived"
+                  ? "bg-terracotta text-white"
+                  : "text-cream-600 hover:bg-cream-50"
+              }`}
+            >
+              Archived ({archivedProjects.length})
+            </button>
           </div>
-          {archivedProjects.length === 0 ? (
-            <p className="text-[12px] text-cream-400">No archived projects.</p>
-          ) : (
-            <ul className="space-y-2">
-              {archivedProjects.map((item) => (
-                <li
-                  key={item.id}
-                  className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-cream-50 p-3 sm:flex-row sm:items-center sm:justify-between"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate text-[12px] font-semibold text-cream-800">
-                      {item.title}
-                    </p>
-                    <p className="mt-0.5 text-[11px] text-cream-400">
-                      Updated {formatDateTime(item.updatedAt)}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => enterWorkMode(item.id)}
-                    className="shrink-0 self-start rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 sm:self-auto"
-                  >
-                    Open
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      ) : (
-        <>
-          <ProjectsBoard
-            projectsByStage={projectsByStage}
-            claimsByProject={claimsByProject}
-            sessionsByProject={sessionsByProject}
-            censorCountByProject={censorCountByProject}
-            selectedId={selectedId}
-            isLoading={isLoadingProjects}
-            onSelect={enterWorkMode}
-          />
 
-          {/* Calendar / organizer BELOW the board (Board mode only: this whole
+          {overviewTab === "archived" ? (
+            // Archived list: a calm read-only list of archived projects, each with an
+            // [Open] button that enters the same single-project Work mode a board card
+            // does (enterWorkMode). Unarchive lives in the page banner (Part 2).
+            <section className="rounded-lg border border-cream-200 bg-white p-4">
+              <div className="mb-3 flex items-center gap-2">
+                <Archive className="h-4 w-4 text-cream-500" aria-hidden />
+                <h3 className="text-sm font-semibold text-cream-800">
+                  Archived projects
+                </h3>
+              </div>
+              {archivedProjects.length === 0 ? (
+                <p className="text-[12px] text-cream-400">
+                  No archived projects.
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {archivedProjects.map((item) => (
+                    <li
+                      key={item.id}
+                      className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-cream-50 p-3 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-[12px] font-semibold text-cream-800">
+                          {item.title}
+                        </p>
+                        <p className="mt-0.5 text-[11px] text-cream-400">
+                          Updated {formatDateTime(item.updatedAt)}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => enterWorkMode(item.id)}
+                        className="shrink-0 self-start rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 sm:self-auto"
+                      >
+                        Open
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          ) : (
+            <>
+              <ProjectsBoard
+                projectsByStage={projectsByStage}
+                claimsByProject={claimsByProject}
+                sessionsByProject={sessionsByProject}
+                censorCountByProject={censorCountByProject}
+                selectedId={selectedId}
+                isLoading={isLoadingProjects}
+                onSelect={enterWorkMode}
+              />
+
+              {/* Calendar / organizer BELOW the board (Board mode only: this whole
               block is skipped in Work mode). Fed from activeProjects so archived
               projects leave the calendar exactly as they leave the stage board. */}
-          <ProjectCalendar
-            projects={activeProjects}
-            onSelectProject={selectProjectOnly}
-            onChanged={() => void loadProjects()}
-          />
-        </>
-      )}
+              <ProjectCalendar
+                projects={activeProjects}
+                onSelectProject={selectProjectOnly}
+                onChanged={() => void loadProjects()}
+              />
+            </>
+          )}
 
-      <div className="grid grid-cols-1 gap-5">
-        {selectedId && loadingProjectId === selectedId && !currentProject ? (
-          <main className="rounded-lg border border-cream-200 bg-white p-8">
-            <div className="mb-4 h-6 w-52 animate-pulse rounded-md bg-cream-100" />
-            <div className="grid grid-cols-1 gap-3 xl:grid-cols-5">
-              {columns.map((column) => (
-                <div
-                  key={column.id}
-                  className="h-44 animate-pulse rounded-lg bg-cream-50"
-                />
-              ))}
-            </div>
-          </main>
-        ) : currentProject ? (
-          <main className="space-y-4">
-            {/* Fase 1 UI reorg: compact header — only title + status dot +
+          <div className="grid grid-cols-1 gap-5">
+            {selectedId &&
+            loadingProjectId === selectedId &&
+            !currentProject ? (
+              <main className="rounded-lg border border-cream-200 bg-white p-8">
+                <div className="mb-4 h-6 w-52 animate-pulse rounded-md bg-cream-100" />
+                <div className="grid grid-cols-1 gap-3 xl:grid-cols-5">
+                  {columns.map((column) => (
+                    <div
+                      key={column.id}
+                      className="h-44 animate-pulse rounded-lg bg-cream-50"
+                    />
+                  ))}
+                </div>
+              </main>
+            ) : currentProject ? (
+              <main className="space-y-4">
+                {/* Fase 1 UI reorg: compact header — only title + status dot +
                 lifecycle actions (Reload / Live status / Pause|Resume /
                 Archive). The stage badge, progress bar, task summary,
                 who's-working line, git-policy badge, and root/file lines are
@@ -2310,171 +2353,174 @@ export function ProjectsView() {
                 dropped here. The stage/taskCounts/workingAgent props are no
                 longer rendered in compact mode but stay wired so a future
                 non-compact use needs no re-plumbing. */}
-            <ProjectStatusHeader
-              project={currentProject}
-              compact
-              stageLabel={currentStage ? stageLabel(currentStage) : null}
-              stageToneClass={currentStage ? stageTone[currentStage] : null}
-              taskCounts={currentSummary?.taskCounts ?? null}
-              isBusy={isBusy}
-              workingAgent={
-                currentProject.metadata.status === "archived"
-                  ? undefined
-                  : workingAgent
-              }
-              onReload={() => void reloadSelectedProjectSafe()}
-              onRefreshLiveStatus={() => void refreshLiveStatus()}
-              onPause={() => void updateProjectStatus("paused")}
-              onResume={() => void updateProjectStatus("active")}
-              onArchive={() => void updateProjectStatus("archived")}
-            />
+                <ProjectStatusHeader
+                  project={currentProject}
+                  compact
+                  stageLabel={currentStage ? stageLabel(currentStage) : null}
+                  stageToneClass={currentStage ? stageTone[currentStage] : null}
+                  taskCounts={currentSummary?.taskCounts ?? null}
+                  isBusy={isBusy}
+                  workingAgent={
+                    currentProject.metadata.status === "archived"
+                      ? undefined
+                      : workingAgent
+                  }
+                  onReload={() => void reloadSelectedProjectSafe()}
+                  onRefreshLiveStatus={() => void refreshLiveStatus()}
+                  onPause={() => void updateProjectStatus("paused")}
+                  onResume={() => void updateProjectStatus("active")}
+                  onArchive={() => void updateProjectStatus("archived")}
+                />
 
-            {/* Project root editor (#6): the only remaining UI to set the agent
+                {/* Project root editor (#6): the only remaining UI to set the agent
                 root after the GitHub panel was removed. Unobtrusive single
                 input + button, prefilled with the current root. Hidden for an
                 archived (read-only) project — setting the root is a mutation. */}
-            {currentProject.metadata.status !== "archived" && (
-            <div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
-              <label
-                htmlFor="project-root-input"
-                className="text-[11px] font-semibold uppercase tracking-widest text-cream-500"
-              >
-                Agent root
-              </label>
-              <input
-                id="project-root-input"
-                value={rootDraft}
-                onChange={(event) => setRootDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void setProjectRoot();
-                }}
-                placeholder="Absolute path agents launch in (blank = default)"
-                data-help-title="The agent root is the folder CLI agents launch in."
-                data-help-lines="Set this to the exact repository or working folder for this project.|Coders and verifiers open their terminal here, so a wrong root makes them edit the wrong files.|Leave it blank to fall back to the app's default root.|It only updates project metadata; it does not move any files."
-                className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
-              />
-              <button
-                type="button"
-                onClick={() => void setProjectRoot()}
-                disabled={
-                  isBusy ||
-                  rootDraft.trim() ===
-                    (currentProject.metadata.rootPath ?? "").trim()
-                }
-                className="shrink-0 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-              >
-                Set root
-              </button>
-            </div>
-            )}
+                {currentProject.metadata.status !== "archived" && (
+                  <div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
+                    <label
+                      htmlFor="project-root-input"
+                      className="text-[11px] font-semibold uppercase tracking-widest text-cream-500"
+                    >
+                      Agent root
+                    </label>
+                    <input
+                      id="project-root-input"
+                      value={rootDraft}
+                      onChange={(event) => setRootDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void setProjectRoot();
+                      }}
+                      placeholder="Absolute path agents launch in (blank = default)"
+                      data-help-title="The agent root is the folder CLI agents launch in."
+                      data-help-lines="Set this to the exact repository or working folder for this project.|Coders and verifiers open their terminal here, so a wrong root makes them edit the wrong files.|Leave it blank to fall back to the app's default root.|It only updates project metadata; it does not move any files."
+                      className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void setProjectRoot()}
+                      disabled={
+                        isBusy ||
+                        rootDraft.trim() ===
+                          (currentProject.metadata.rootPath ?? "").trim()
+                      }
+                      className="shrink-0 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+                    >
+                      Set root
+                    </button>
+                  </div>
+                )}
 
-            {/* Fase 1 UI reorg: the live "who's working / Launch another"
+                {/* Fase 1 UI reorg: the live "who's working / Launch another"
                 ProjectAgentPanel was removed from the board-mode overview — it
                 100% duplicated Work mode's agent rail + SpawnPanel + terminal +
                 AgentDetailDrawer. Launch/monitor agents from Work mode instead. */}
 
-            {currentProject.metadata.status !== "archived" && (
-              <section className="rounded-lg border border-cream-200 bg-white p-3">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div>
-                    <h4 className="text-[12px] font-semibold text-cream-800">
-                      Saved workflows
-                    </h4>
-                    <p className="text-[11px] text-cream-500">
-                      Claude Code workflows discovered from this project and your user profile.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => void loadSavedWorkflows(currentProject.metadata.id)}
-                    disabled={isBusy}
-                    className="rounded-md border border-cream-200 px-2 py-1 text-[11px] font-semibold text-cream-600 hover:bg-cream-50 disabled:opacity-60"
-                  >
-                    Refresh
-                  </button>
-                </div>
-                {workflowError && (
-                  <p className="mb-2 text-[11px] font-medium text-red-600">
-                    {workflowError}
-                  </p>
-                )}
-                {savedWorkflows.length === 0 ? (
-                  <p className="text-[11px] text-cream-500">
-                    No saved workflows found.
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {savedWorkflows.map((workflow) => {
-                      const args = workflowArgs[workflow.name] ?? "";
-                      const running = workflowBusyName === workflow.name;
-                      return (
-                        <div
-                          key={`${workflow.scope}-${workflow.name}`}
-                          className="grid gap-2 rounded-md border border-cream-100 bg-cream-50/50 p-2 md:grid-cols-[minmax(0,1fr)_minmax(12rem,18rem)_auto]"
-                        >
-                          <div className="min-w-0">
-                            <div className="flex min-w-0 items-center gap-2">
-                              <span className="truncate font-mono text-[12px] font-semibold text-cream-800">
-                                /{workflow.name}
-                              </span>
-                              <span className="rounded bg-white px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cream-500">
-                                {workflow.scope}
-                              </span>
+                {currentProject.metadata.status !== "archived" && (
+                  <section className="rounded-lg border border-cream-200 bg-white p-3">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <div>
+                        <h4 className="text-[12px] font-semibold text-cream-800">
+                          Saved workflows
+                        </h4>
+                        <p className="text-[11px] text-cream-500">
+                          Claude Code workflows discovered from this project and
+                          your user profile.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void loadSavedWorkflows(currentProject.metadata.id)
+                        }
+                        disabled={isBusy}
+                        className="rounded-md border border-cream-200 px-2 py-1 text-[11px] font-semibold text-cream-600 hover:bg-cream-50 disabled:opacity-60"
+                      >
+                        Refresh
+                      </button>
+                    </div>
+                    {workflowError && (
+                      <p className="mb-2 text-[11px] font-medium text-red-600">
+                        {workflowError}
+                      </p>
+                    )}
+                    {savedWorkflows.length === 0 ? (
+                      <p className="text-[11px] text-cream-500">
+                        No saved workflows found.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {savedWorkflows.map((workflow) => {
+                          const args = workflowArgs[workflow.name] ?? "";
+                          const running = workflowBusyName === workflow.name;
+                          return (
+                            <div
+                              key={`${workflow.scope}-${workflow.name}`}
+                              className="grid gap-2 rounded-md border border-cream-100 bg-cream-50/50 p-2 md:grid-cols-[minmax(0,1fr)_minmax(12rem,18rem)_auto]"
+                            >
+                              <div className="min-w-0">
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <span className="truncate font-mono text-[12px] font-semibold text-cream-800">
+                                    /{workflow.name}
+                                  </span>
+                                  <span className="rounded bg-white px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cream-500">
+                                    {workflow.scope}
+                                  </span>
+                                </div>
+                                {workflow.description && (
+                                  <p className="mt-1 line-clamp-2 text-[11px] text-cream-500">
+                                    {workflow.description}
+                                  </p>
+                                )}
+                              </div>
+                              <input
+                                value={args}
+                                onChange={(event) =>
+                                  setWorkflowArgs((prev) => ({
+                                    ...prev,
+                                    [workflow.name]: event.target.value,
+                                  }))
+                                }
+                                placeholder="Args"
+                                spellCheck={false}
+                                className="min-w-0 rounded-md border border-cream-200 bg-white px-2 py-1.5 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => void runSavedWorkflow(workflow)}
+                                disabled={isBusy || running}
+                                className="inline-flex items-center justify-center gap-1.5 rounded-md bg-terracotta px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-60"
+                              >
+                                <Play className="h-3.5 w-3.5" />
+                                {running ? "Running..." : "Run"}
+                              </button>
                             </div>
-                            {workflow.description && (
-                              <p className="mt-1 line-clamp-2 text-[11px] text-cream-500">
-                                {workflow.description}
-                              </p>
-                            )}
-                          </div>
-                          <input
-                            value={args}
-                            onChange={(event) =>
-                              setWorkflowArgs((prev) => ({
-                                ...prev,
-                                [workflow.name]: event.target.value,
-                              }))
-                            }
-                            placeholder="Args"
-                            spellCheck={false}
-                            className="min-w-0 rounded-md border border-cream-200 bg-white px-2 py-1.5 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => void runSavedWorkflow(workflow)}
-                            disabled={isBusy || running}
-                            className="inline-flex items-center justify-center gap-1.5 rounded-md bg-terracotta px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-60"
-                          >
-                            <Play className="h-3.5 w-3.5" />
-                            {running ? "Running..." : "Run"}
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </section>
                 )}
-              </section>
-            )}
 
-            {/* Tasks + Notes relocated (Fase 1 UI reorg) into ProjectWorkspace's
+                {/* Tasks + Notes relocated (Fase 1 UI reorg) into ProjectWorkspace's
                 taskBoardSlot / notesSlot — see taskBoardNode / notesNode above. */}
-          </main>
-        ) : (
-          <main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
-            <FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />
-            <p className="text-sm font-semibold text-cream-700">
-              {error && projects.length === 0
-                ? "Project list unavailable."
-                : "Create a project to start."}
-            </p>
-            <p className="mt-1 text-[12px] text-cream-400">
-              {error && projects.length === 0
-                ? "Fix the load error above or reload the project folder."
-                : "Files are stored as local Markdown with a structured Aspis project block."}
-            </p>
-          </main>
-        )}
-      </div>
+              </main>
+            ) : (
+              <main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
+                <FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />
+                <p className="text-sm font-semibold text-cream-700">
+                  {error && projects.length === 0
+                    ? "Project list unavailable."
+                    : "Create a project to start."}
+                </p>
+                <p className="mt-1 text-[12px] text-cream-400">
+                  {error && projects.length === 0
+                    ? "Fix the load error above or reload the project folder."
+                    : "Files are stored as local Markdown with a structured Aspis project block."}
+                </p>
+              </main>
+            )}
+          </div>
         </div>
       )}
     </div>
