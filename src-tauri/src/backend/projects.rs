@@ -1654,6 +1654,10 @@ fn prepare_or_launch_project_agent(
         let activity_file = crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // The reverse bridge: the per-agent steer inbox the app appends live messages to.
+        let steer_file = crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Some(OrchestratorLaunchConfig {
             binary,
             omlx_base_url,
@@ -1671,6 +1675,7 @@ fn prepare_or_launch_project_agent(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             activity_file,
+            steer_file,
             // 3c — the Oracle-side project key the planner needs so its `plan_submit`
             // surfaces under THIS project in the per-project Plans tab. This is the SAME
             // id the PlansPanel queries (`project.metadata.id`), already normalized at
@@ -4730,6 +4735,10 @@ struct OrchestratorLaunchConfig {
     /// when the bridge could not be set up (the orchestrator then no-ops its milestones).
     /// NOT a secret — it carries only redacted, label-only milestone events.
     activity_file: String,
+    /// `DEVBOULE_STEER_FILE`: the per-agent inbox the app APPENDS live steer messages to
+    /// (the reverse bridge). The orchestrator drains it between rounds and injects each
+    /// message as a human turn. Empty when it could not be set up (steer then no-ops).
+    steer_file: String,
     /// `DEVBOULE_PROJECT_ID` (3c): the Oracle-side project key the orchestrator was
     /// launched on. The local planner reads it from the binary's config and passes it to
     /// the `project_structure` / `plan_submit` MCP tools; an EMPTY value makes the planner
@@ -4776,6 +4785,41 @@ struct OrchestratorLaunchConfig {
 /// drift. `DEVBOULE_APP_BIN` is appended LAST and ONLY when present (so the empty-app-bin
 /// case stays byte-identical to the prior 7-pair output). The SECRETS (launch token, Exa
 /// key) are NEVER here — they ride via `provider_env` (env only, B1 invariant).
+/// Append a LIVE steer message to a running orchestrator's inbox (the reverse bridge).
+/// The orchestrator drains `DEVBOULE_STEER_FILE` between rounds and injects the message
+/// as a human turn — this is how the app "talks to" a planning orchestrator mid-run.
+/// The path is deterministic from (projects dir, agent_id), so no ledger is needed.
+/// Newlines are stripped + the message capped so it stays ONE line the orchestrator
+/// splits cleanly. Best-effort create+append.
+#[tauri::command]
+pub fn orchestrator_steer(
+    app: tauri::AppHandle,
+    agent_id: String,
+    message: String,
+) -> Result<(), String> {
+    let msg: String = message
+        .trim()
+        .replace(['\n', '\r'], " ")
+        .chars()
+        .take(2000)
+        .collect();
+    if msg.is_empty() {
+        return Err("steer message is empty".to_string());
+    }
+    let dir = ensure_projects_dir(&app)?;
+    let path = crate::backend::mini_activity::steer_file_path(&dir, &agent_id)
+        .ok_or_else(|| "could not resolve the steer inbox path".to_string())?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("open steer inbox: {e}"))?;
+    file.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|e| format!("write steer inbox: {e}"))?;
+    Ok(())
+}
+
 fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static str, String)> {
     let mut pairs: Vec<(&'static str, String)> = vec![
         ("DEVBOULE_OMLX_BASE_URL", config.omlx_base_url.to_string()),
@@ -4810,6 +4854,11 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     // bridge-disabled case stays byte-identical to the prior output). Non-secret.
     if !config.activity_file.trim().is_empty() {
         pairs.push(("DEVBOULE_ACTIVITY_FILE", config.activity_file.clone()));
+    }
+    // The reverse-bridge steer inbox path, appended ONLY when present (steer-disabled
+    // case stays byte-identical). Non-secret — it's just a per-agent file path.
+    if !config.steer_file.trim().is_empty() {
+        pairs.push(("DEVBOULE_STEER_FILE", config.steer_file.clone()));
     }
     // 3c — the Oracle-side project key for the planner's `plan_submit` (so the plan
     // surfaces under THIS project in the per-project Plans tab). Set ONLY when present;
@@ -10836,6 +10885,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             project_root: PathBuf::from("/work/the-project"),
             app_bin: "/opt/aspis/aspis-management".to_string(),
             activity_file: "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl".to_string(),
+            steer_file: "/srv/aspis-mcp-root/projects/.devboule-activity/orchestrator-sentinel-42.jsonl.steer".to_string(),
             // 3c — the project key the planner submits under. 3b — plan-first ON.
             project_id: "the-project-sentinel".to_string(),
             plan_first: "1".to_string(),

@@ -2262,11 +2262,21 @@ export function ProjectsView() {
             messages={plannerMessages}
             awaitingReply={false}
             onSend={(text) => {
-              // P0: the composer drives the existing "Plan it" flow. Echo the goal +
-              // message optimistically; live-steer + real pages/findings/design wire in
-              // later (P1/P2/P3).
-              const goal = text.trim();
-              if (!goal) return;
+              const msg = text.trim();
+              if (!msg) return;
+              // Always echo the user's message in the chat.
+              setPlannerMessages((prev) => [...prev, { role: "user", text: msg }]);
+              if (orchestratorAgentId) {
+                // LIVE: steer the running orchestrator (mid-plan course-correction).
+                // It drains DEVBOULE_STEER_FILE between rounds and injects this as a
+                // human turn (P2).
+                void invokeBackendCommand("orchestrator_steer", {
+                  agentId: orchestratorAgentId,
+                  message: msg,
+                });
+                return;
+              }
+              // IDLE: start a new plan via the existing plan-first flow.
               if (!currentProject?.metadata.rootPath) {
                 setError(
                   "Select a project with a working folder before planning.",
@@ -2274,16 +2284,8 @@ export function ProjectsView() {
                 return;
               }
               if (busyRef.current || orchestratorPlanRef.current) return;
-              setPlannerGoal(goal);
-              setPlannerMessages((prev) => [
-                ...prev,
-                { role: "user", text: goal },
-              ]);
-              void planWithOrchestrator(
-                goal,
-                plannerCoderId,
-                plannerAutoCreate,
-              );
+              setPlannerGoal(msg);
+              void planWithOrchestrator(msg, plannerCoderId, plannerAutoCreate);
             }}
             coders={[
               { id: "claude", label: "Claude" },

@@ -134,6 +134,14 @@ pub trait ToolExecutor: Send + Sync {
     fn known_mcp_servers(&self) -> &[String] {
         &[]
     }
+
+    /// Drain any LIVE steer messages the app sent to this running orchestrator since
+    /// the last round (the burst injects them as human turns). Default EMPTY: only
+    /// [`crate::executor::RealExecutor`] with a `DEVBOULE_STEER_FILE` returns messages;
+    /// every other executor (stub, mocks) never has a steer inbox.
+    fn drain_steer(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The result every [`StubExecutor`] tool dispatch returns: an UNMISTAKABLE
@@ -227,6 +235,9 @@ pub enum TranscriptEntry {
     Result(ToolResult),
     /// Format-error feedback pushed after an unparseable model turn.
     FormatFeedback(String),
+    /// A LIVE human message injected mid-burst (a steer from the app). Rendered to the
+    /// model as a `user` turn so it can course-correct on its next call.
+    Human(String),
 }
 
 /// The running record of one burst: the human message plus, in order, each
@@ -261,6 +272,12 @@ impl Transcript {
 
     fn push(&mut self, entry: TranscriptEntry) {
         self.entries.push(entry);
+    }
+
+    /// Inject a LIVE human message (an app steer) mid-burst. Surfaces to the model as a
+    /// `user` turn on its next call.
+    pub fn push_human(&mut self, body: impl Into<String>) {
+        self.entries.push(TranscriptEntry::Human(body.into()));
     }
 
     /// Test-only entry push, so sibling modules (e.g. the model-client transcript
@@ -326,6 +343,14 @@ pub async fn run_burst(
         // `run_plan` execution time is excluded (see `excluded_elapsed`).
         if clock.elapsed().saturating_sub(excluded_elapsed) >= budget {
             return BurstOutcome::Escalated("time cap reached".to_string());
+        }
+
+        // Live steer: drain any messages the app sent to this RUNNING orchestrator and
+        // inject them as human turns so the model sees them on THIS round (mid-plan
+        // course-correction). Empty for every non-steered burst (no DEVBOULE_STEER_FILE).
+        for msg in executor.drain_steer() {
+            emit(progress_tx, format!("💬 steer: {}", elide(&msg))).await;
+            transcript.push_human(msg);
         }
 
         let raw = model.next_output(&transcript).await;

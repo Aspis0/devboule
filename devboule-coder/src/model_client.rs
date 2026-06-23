@@ -628,6 +628,9 @@ fn build_messages(
                 ("user", format!("{tag}:\n{}", result.output))
             }
             TranscriptEntry::FormatFeedback(feedback) => ("user", feedback.clone()),
+            // A live app steer, rendered as a plain user turn so the model treats it
+            // like any other human instruction on its next call.
+            TranscriptEntry::Human(body) => ("user", body.clone()),
         })
         .collect();
 

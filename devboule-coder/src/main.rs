@@ -26,6 +26,7 @@ mod prompt;
 mod rmcp_backend;
 mod runner;
 mod skills;
+mod steer;
 mod terminal;
 
 use std::sync::Arc;

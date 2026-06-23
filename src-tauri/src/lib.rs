@@ -455,6 +455,7 @@ pub fn run() {
             backend::projects::get_agentic_coverage_languages,
             backend::projects::get_project,
             backend::projects::launch_project_agent_terminal,
+            backend::projects::orchestrator_steer,
             backend::projects::list_projects,
             backend::saved_workflows::list_saved_workflows,
             backend::projects::move_project_task,

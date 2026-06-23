@@ -696,6 +696,10 @@ pub struct RealExecutor {
     /// an approved plan auto-creates its tasks on the board; `false` ⇒ the plan is drafted +
     /// submitted but its tasks are NOT created (the operator creates them). See `run_planner`.
     auto_create: bool,
+    /// Live steer INBOX (from `DEVBOULE_STEER_FILE`). The burst calls `drain_steer`
+    /// between rounds to inject app-sent messages as human turns. Disabled (no-op)
+    /// when the env is unset (every non-orchestrator / test executor).
+    steer: crate::steer::Steer,
 }
 
 impl RealExecutor {
@@ -714,6 +718,8 @@ impl RealExecutor {
             activity: crate::activity::Activity::disabled(),
             // Default ON (the pre-feature behavior); `with_auto_create` overrides from env.
             auto_create: true,
+            // Resolve the steer inbox from the launch env; disabled when unset.
+            steer: crate::steer::Steer::from_env(),
         }
     }
 
@@ -759,6 +765,12 @@ impl ToolExecutor for RealExecutor {
     /// time, so an unknown server is an immediate format error.
     fn known_mcp_servers(&self) -> &[String] {
         self.mcp.user_server_names()
+    }
+
+    /// Drain the live steer inbox (app → running orchestrator). Empty when no
+    /// `DEVBOULE_STEER_FILE` was set at launch.
+    fn drain_steer(&self) -> Vec<String> {
+        self.steer.drain()
     }
 
     async fn execute(&self, action: &AgentAction) -> ToolResult {

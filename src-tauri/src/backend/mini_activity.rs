@@ -1090,6 +1090,21 @@ pub fn activity_file_path(projects_dir: &Path, agent_id: &str) -> Option<PathBuf
     Some(dir.join(name))
 }
 
+/// Resolve the per-agent STEER inbox path (app → running orchestrator), mirroring
+/// [`activity_file_path`] but with a distinct extension so the two bridge files never
+/// collide. The app APPENDS one message per line here; the orchestrator drains it via
+/// `DEVBOULE_STEER_FILE`. Deterministic from (projects_dir, agent_id) so the launch and
+/// the `orchestrator_steer` command resolve the SAME path without a ledger. `None` when
+/// the id can't be made a safe filename or the dir can't be created.
+pub fn steer_file_path(projects_dir: &Path, agent_id: &str) -> Option<PathBuf> {
+    let name = activity_file_name(agent_id)?;
+    let dir = projects_dir.join(ACTIVITY_SUBDIR);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir.join(format!("{name}.steer")))
+}
+
 /// Start the poll-tail task for `agent_id` reading `file_path`. Registers a stop flag in
 /// the managed [`ActivityTailRegistry`] and spawns a tokio task that, until stopped:
 ///   1. reads any NEW whole lines appended since the last offset (bounded per tick),
