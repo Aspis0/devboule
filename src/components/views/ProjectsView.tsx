@@ -187,6 +187,12 @@ export function ProjectsView() {
   // optimistically on send; P2 replaces them with the orchestrator's live transcript.
   const [plannerMessages, setPlannerMessages] = useState<PlannerMessage[]>([]);
   const [plannerGoal, setPlannerGoal] = useState<string | null>(null);
+  // True from the moment a Planner launch starts until its session registers (the agent
+  // poll lags the launch by up to ~5s). Guards the composer so a second send in that window
+  // can't create a duplicate project or launch a second Planner. A timeout safety clears it
+  // if the session never registers (e.g. the orchestrator crashes on start).
+  const [plannerLaunching, setPlannerLaunching] = useState(false);
+  const plannerLaunchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The project's most-recent design (read-only preview in the planner's Design tab).
   const [plannerDesign, setPlannerDesign] = useState<{
     name: string;
@@ -352,10 +358,11 @@ export function ProjectsView() {
     if (requestSeq !== loadProjectsSeqRef.current) return null;
     setProjects(list);
     setSelectedId((current) => {
+      // Open the landing EMPTY: a project is a plan you CREATE here, so we never
+      // auto-select the most-recent one. Keep a still-valid current selection (e.g. after a
+      // mutation / entering work mode), otherwise clear it.
       const next =
-        current && list.some((item) => item.id === current)
-          ? current
-          : (list[0]?.id ?? null);
+        current && list.some((item) => item.id === current) ? current : null;
       selectedIdRef.current = next;
       if (!next) setProject(null);
       return next;
@@ -500,20 +507,36 @@ export function ProjectsView() {
     });
   }, [loadProject, selectedId]);
 
+  // Per-project reset (keyed on project id). Tracks the PREVIOUS id so we only wipe the
+  // planner chat/drafts when LEAVING a project (→ empty landing) or SWITCHING to a different
+  // one — NEVER on the null→new transition (creating a project from the empty landing), where
+  // onSend/startNewProject just populated the chat (that was the "my message vanished right
+  // after the project was created" bug). Also must NOT depend on rootPath (separate effect):
+  // setting a project's working folder must not wipe the conversation either.
+  const prevProjectIdRef = useRef<string | null>(null);
   useEffect(() => {
+    const prev = prevProjectIdRef.current;
+    const next = currentProject?.metadata.id ?? null;
+    prevProjectIdRef.current = next;
+    // null→new (creation) or no real change: keep the freshly-populated chat.
+    if (prev === null || prev === next) return;
     setTaskDraft("");
     setTaskCategory(null);
     setTaskBugDescription("");
     setNoteDraft("");
     setLaunchMessage(null);
-    // Reset the planner chat/goal/web-mode so a new project never shows the previous
+    // Reset the planner chat/goal/web-mode so a different project never shows the previous
     // project's conversation (and a steer can't fire with stale context). The design +
     // websearch feeds are already per-project (their own effect / the agent console).
     setPlannerMessages([]);
     setPlannerGoal(null);
     setPlannerWebMode("auto");
-    // Prefill the root editor with the project's current root (#6) so "Set root"
-    // edits the existing value instead of starting blank.
+  }, [currentProject?.metadata.id]);
+
+  // Prefill the root editor with the project's current root (#6) so "Set root" edits the
+  // existing value instead of starting blank. Tracks rootPath too, so after you set a
+  // folder the editor shows the saved value — WITHOUT touching the chat (separate effect).
+  useEffect(() => {
     setRootDraft(currentProject?.metadata.rootPath ?? "");
   }, [currentProject?.metadata.id, currentProject?.metadata.rootPath]);
 
@@ -777,6 +800,31 @@ export function ProjectsView() {
         (s) => s.client === "orchestrator" && s.host === "app",
       )?.agentId ?? null,
     [currentProjectSessions],
+  );
+  // Mark a Planner launch in flight (plannerLaunching) until its session registers — guards
+  // the composer against a duplicate launch during the agent-poll lag. A safety timeout
+  // clears it if the session never appears (e.g. the orchestrator crashes on start).
+  const beginPlannerLaunch = useCallback(() => {
+    setPlannerLaunching(true);
+    if (plannerLaunchTimerRef.current) clearTimeout(plannerLaunchTimerRef.current);
+    plannerLaunchTimerRef.current = setTimeout(() => {
+      setPlannerLaunching(false);
+      plannerLaunchTimerRef.current = null;
+    }, 30000);
+  }, []);
+  useEffect(() => {
+    if (!orchestratorAgentId) return;
+    setPlannerLaunching(false);
+    if (plannerLaunchTimerRef.current) {
+      clearTimeout(plannerLaunchTimerRef.current);
+      plannerLaunchTimerRef.current = null;
+    }
+  }, [orchestratorAgentId]);
+  useEffect(
+    () => () => {
+      if (plannerLaunchTimerRef.current) clearTimeout(plannerLaunchTimerRef.current);
+    },
+    [],
   );
   const orchestratorConsole = useAgentConsole(orchestratorAgentId);
   const plannerWeb = useMemo(
@@ -1663,6 +1711,73 @@ export function ProjectsView() {
     }
   };
 
+  // NEW-PROJECT flow: the landing opens EMPTY; the user's first message CREATES the project
+  // (with the chosen Folder) and launches the Planner on it (plan-first). A project IS a plan:
+  // creating one === starting the planning conversation. Chains the EXISTING create_project +
+  // orchestrator launch — no new backend. The typed goal reaches the Planner via initialGoal
+  // (DEVBOULE_GOAL); the drafted plan flows through the existing plan-approval surface.
+  const startNewProject = async (
+    goal: string,
+    coderId: string,
+    autoCreate: boolean,
+  ) => {
+    if (busyRef.current || orchestratorPlanRef.current) return;
+    const folder = newProjectRootDraft.trim();
+    if (!folder) {
+      // The Folder is required (the project depends on a working tree). Say so IN the
+      // conversation — the folder picker is right here in the create bar.
+      setPlannerMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          text: "Pick a folder for this project first (use an existing one, or create a new one), then send your goal again.",
+        },
+      ]);
+      return;
+    }
+    orchestratorPlanRef.current = true;
+    try {
+      const title = goal.length > 60 ? `${goal.slice(0, 57)}…` : goal;
+      const detail = await runMutation(() =>
+        invokeBackendCommand<ProjectDetail>("create_project", {
+          input: { title, status: "active", rootPath: folder },
+        }),
+      );
+      if (!detail) return;
+      // runMutation already selected the new project; clear the folder draft and launch the
+      // Planner ON the freshly-created project (use the returned detail — currentProject
+      // updates asynchronously, so we must not read it here).
+      setNewProjectRootDraft("");
+      setPlannerGoal(goal);
+      // Audit note: record the goal + the chosen build coder (mirrors planWithOrchestrator).
+      // The goal itself reaches the Planner via initialGoal (DEVBOULE_GOAL).
+      await runMutation(() =>
+        invokeBackendCommand<ProjectDetail>("append_project_note", {
+          projectId: detail.metadata.id,
+          note: {
+            text: `Planner goal: ${goal}\n(build with: ${coderId} · auto-create tasks: ${autoCreate ? "on" : "off"})`,
+            source: "user",
+            expectedRevision: detail.revision,
+          },
+        }),
+      );
+      beginPlannerLaunch();
+      await launchFromSpawnPanel({
+        projectId: detail.metadata.id,
+        role: "coder",
+        client: "orchestrator",
+        taskId: null,
+        host: "app",
+        model: null,
+        planFirst: true,
+        initialGoal: goal,
+        autoCreate,
+      });
+    } finally {
+      orchestratorPlanRef.current = false;
+    }
+  };
+
   // Orchestrator composer "Plan it": record the typed goal as a project note (the orchestrator
   // reads project state), then launch the LOCAL orchestrator in plan-first mode — the SAME path as
   // the SpawnPanel "Plan first" toggle (role "coder" + client "orchestrator" + planFirst). The
@@ -1694,6 +1809,7 @@ export function ProjectsView() {
         }),
       );
       if (!detail) return;
+      beginPlannerLaunch();
       await launchFromSpawnPanel({
         projectId: currentProject.metadata.id,
         role: "coder",
@@ -2399,11 +2515,34 @@ export function ProjectsView() {
                 );
                 return;
               }
-              // IDLE: start a new plan via the existing plan-first flow.
-              if (!currentProject?.metadata.rootPath) {
-                setError(
-                  "Select a project with a working folder before planning.",
-                );
+              // A Planner launch is in flight but its session hasn't registered yet — don't
+              // create a duplicate project or launch a second Planner; it'll pick up from here.
+              if (plannerLaunching) {
+                setPlannerMessages((prev) => [
+                  ...prev,
+                  {
+                    role: "assistant",
+                    text: "The Planner is starting — one moment, then it'll pick up your messages.",
+                  },
+                ]);
+                return;
+              }
+              // FRESH landing (no project yet): the first message CREATES the project
+              // (with the chosen Folder) and launches the Planner on it.
+              if (!currentProject) {
+                void startNewProject(msg, plannerCoderId, plannerAutoCreate);
+                return;
+              }
+              // A project is selected but no Planner is running: (re)plan it. Needs a folder.
+              if (!currentProject.metadata.rootPath) {
+                setPlannerMessages((prev) => [
+                  ...prev,
+                  {
+                    role: "assistant",
+                    text: "This project has no folder yet, so I can't plan or write code in it. Pick a folder, then send your goal again.",
+                  },
+                ]);
+                setError("Select a folder for this project before planning.");
                 return;
               }
               if (busyRef.current || orchestratorPlanRef.current) return;
