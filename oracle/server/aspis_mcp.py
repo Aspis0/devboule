@@ -5816,20 +5816,28 @@ def dispatch_design_request(projects_dir, state_lock, args):
                     continue
                 if str(directive.get("id") or "") == directive_id:
                     existing = directive.get("result")
+                    live_status = str(directive.get("status") or "")
                     if isinstance(existing, dict) and existing:
+                        # The frontend already finished — return its REAL result.
                         synthesized = existing
+                    elif live_status == "running":
+                        # The frontend is STILL generating: do NOT overwrite the directive —
+                        # leave it Running so its `design_request_complete` can stamp the real
+                        # result (the design will surface in the Design view). We only return a
+                        # timeout to the orchestrator; we do NOT race the directive to terminal.
+                        synthesized = {
+                            "status": "timeout",
+                            "error": "design_request is still generating — the design will appear in the Design view shortly.",
+                        }
                     else:
-                        live_status = str(directive.get("status") or "")
-                        if live_status == "running":
-                            synthesized = {
-                                "status": "timeout",
-                                "error": "design_request timed out waiting for the designer.",
-                            }
+                        # Never claimed (still pending): mark it terminal so the executor /
+                        # watcher won't later run a request the orchestrator gave up on.
                         directive["status"] = synthesized["status"]
                         directive["result"] = synthesized
                     break
             write_agents_state(projects_dir, state)
-    except McpError:
+    except Exception:
+        # Best-effort: a failed write-back must never turn the tool return into an exception.
         pass
     return _design_tool_result(directive_id, synthesized)
 

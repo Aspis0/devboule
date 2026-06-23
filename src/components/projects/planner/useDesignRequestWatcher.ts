@@ -26,8 +26,10 @@ async function generateAndRegisterDesign(
     startDesignGeneration(fullPrompt, {
       onText: t => { acc = t; },
       onStatus: (s, m) => {
-        if (s === 'done') resolve(acc);
-        else if (s === 'error') reject(new Error(m ?? 'generation failed'));
+        if (s === 'done') {
+          if (acc.trim()) resolve(acc);
+          else reject(new Error('the designer returned no content'));
+        } else if (s === 'error') reject(new Error(m ?? 'generation failed'));
         else if (s === 'cancelled') reject(new Error('cancelled'));
       }
     }, undefined, workingFolderPath).catch(reject);
@@ -56,31 +58,41 @@ export function useDesignRequestWatcher(
 
   useEffect(() => {
     if (!orchestratorAgentId || !projectRoot) return;
+    // Set on unmount: the in-flight generation cannot be cancelled (it should still finish
+    // + record the design in the backend), but we must NOT call onCompleted (setState) after
+    // unmount. The design surfaces on the next mount via the registry.
+    let aborted = false;
 
     const tick = async () => {
       try {
         const pending = await invokeBackendCommand<DesignRequestDirective[]>('list_pending_design_requests');
         for (const d of pending) {
-          if (d.parentAgentId === orchestratorAgentId && !processingRef.current.has(d.id)) {
-            processingRef.current.add(d.id);
-            const claimed = await invokeBackendCommand<DesignRequestDirective | null>('design_request_claim', { directiveId: d.id });
-            if (!claimed) continue;
+          if (d.parentAgentId !== orchestratorAgentId || processingRef.current.has(d.id)) {
+            continue;
+          }
+          processingRef.current.add(d.id);
+          const claimed = await invokeBackendCommand<DesignRequestDirective | null>('design_request_claim', { directiveId: d.id });
+          if (!claimed) {
+            processingRef.current.delete(d.id);
+            continue;
+          }
 
-            const workingFolderPath = `${projectRoot}/.aspis-design/${d.id}`;
-            const name = (d.prompt || 'Design').slice(0, 60);
-
-            try {
-              const registryId = await generateAndRegisterDesign(d.prompt, d.planContext, workingFolderPath, name);
-              await invokeBackendCommand('design_request_complete', { directiveId: d.id, designProjectPath: workingFolderPath, registryId, error: null });
-              onCompletedRef.current();
-            } catch (e) {
-              await invokeBackendCommand('design_request_complete', {
-                directiveId: d.id,
-                designProjectPath: null,
-                registryId: null,
-                error: e instanceof Error ? e.message : String(e)
-              }).catch(() => {});
-            }
+          const workingFolderPath = `${projectRoot}/.aspis-design/${d.id}`;
+          const name = (d.prompt || 'Design').slice(0, 60);
+          try {
+            const registryId = await generateAndRegisterDesign(d.prompt, d.planContext, workingFolderPath, name);
+            // The design is SAVED + REGISTERED now. Stamp the directive done (best-effort:
+            // may race with the Python timeout write-back — harmless) and ALWAYS refresh the
+            // Stage, because the design exists in the registry regardless of the directive.
+            await invokeBackendCommand('design_request_complete', { directiveId: d.id, designProjectPath: workingFolderPath, registryId, error: null }).catch(() => {});
+            if (!aborted) onCompletedRef.current();
+          } catch (e) {
+            await invokeBackendCommand('design_request_complete', {
+              directiveId: d.id,
+              designProjectPath: null,
+              registryId: null,
+              error: e instanceof Error ? e.message : String(e),
+            }).catch(() => {});
           }
         }
       } catch (err) {
@@ -91,6 +103,7 @@ export function useDesignRequestWatcher(
     const intervalId = setInterval(tick, 3000);
 
     return () => {
+      aborted = true;
       clearInterval(intervalId);
     };
   }, [orchestratorAgentId, projectRoot]);
