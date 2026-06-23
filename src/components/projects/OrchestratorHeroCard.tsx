@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from "react";
-import { Sparkles, Send } from "lucide-react";
+import { Sparkles, Send, FolderGit2 } from "lucide-react";
 
 interface Coder {
   id: string;
@@ -96,14 +96,24 @@ export function OrchestratorHeroCard(props: Props) {
           className="w-full resize-none border-none bg-transparent text-[15px] text-cream-800 outline-none leading-relaxed placeholder:text-cream-400"
         />
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          <span className="rounded-lg border border-cream-200 bg-white px-2.5 py-1 text-[11px] text-cream-600">
-            {projectName ?? "no project"}
+          <span
+            title="The selected project — the goal is planned against this project."
+            className="inline-flex items-center gap-1.5 rounded-lg border border-cream-200 bg-white px-2.5 py-1 text-[11px] text-cream-600"
+          >
+            <FolderGit2 className="h-3 w-3 text-cream-400" />
+            {projectName ?? "no project selected"}
           </span>
-          <span className="rounded-lg border border-cream-200 bg-white px-2.5 py-1 text-[11px] text-cream-600">
+          <span
+            title="The local model that drafts the plan (configured in Settings)."
+            className="rounded-lg border border-cream-200 bg-white px-2.5 py-1 text-[11px] text-cream-600"
+          >
             Planner: {plannerModel}
           </span>
-          <span className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700">
-            auto-create on
+          <span
+            title="When you approve the orchestrator's plan, its tasks are added to the board automatically. You still review and approve the plan first."
+            className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700"
+          >
+            auto-creates tasks on approval
           </span>
           <button
             type="button"
