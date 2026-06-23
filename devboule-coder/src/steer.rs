@@ -18,6 +18,12 @@ use std::sync::Mutex;
 /// Unset (headless / standalone) ⇒ [`Steer::drain`] always returns empty.
 const ENV_STEER_FILE: &str = "DEVBOULE_STEER_FILE";
 
+/// Hard cap on bytes read in ONE `drain` (the rest is read on the next drain). Bounds
+/// memory + the per-iteration message count so a flooded/huge inbox can't stall the
+/// burst. Messages are command-capped to 2000 chars, so this window always holds many
+/// WHOLE lines.
+const MAX_STEER_READ: u64 = 64 * 1024;
+
 /// Reads newly-appended lines from the steer inbox file. Interior-mutable (the
 /// executor holds it behind a shared ref): `drain` advances a byte offset under a
 /// `Mutex` so each whole line is delivered exactly once.
@@ -77,7 +83,11 @@ impl Steer {
         if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).is_err() {
             return Vec::new();
         }
-        if std::io::Read::read_to_end(&mut file, &mut buf).is_err() {
+        // Bound the per-drain read (see MAX_STEER_READ): read at most a fixed window from
+        // the offset; any tail beyond it is consumed on the next drain. Keeps the held
+        // lock + the allocation small even if the inbox file is huge.
+        let mut limited = std::io::Read::take(file, MAX_STEER_READ);
+        if std::io::Read::read_to_end(&mut limited, &mut buf).is_err() {
             return Vec::new();
         }
 
@@ -152,6 +162,35 @@ mod tests {
                 "and more".to_string()
             ],
         );
+    }
+
+    #[test]
+    fn drain_caps_the_read_window_but_loses_no_messages() {
+        // Write more than one read window of whole lines; one drain returns only what fits
+        // in the window, subsequent drains return the rest — total preserved, none lost.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steer.inbox");
+        let steer = Steer::with_path(&path);
+
+        let line = "x".repeat(1000); // ~1001 bytes per line incl '\n'
+        let n = 200; // ~200 KB total, > a couple of 64 KiB windows
+        for i in 0..n {
+            append(&path, &format!("{line}{i}\n"));
+        }
+
+        let first = steer.drain();
+        assert!(!first.is_empty(), "first drain returns something");
+        assert!(first.len() < n, "first drain is bounded by the read window, not the whole file");
+
+        let mut total = first.len();
+        loop {
+            let more = steer.drain();
+            if more.is_empty() {
+                break;
+            }
+            total += more.len();
+        }
+        assert_eq!(total, n, "every message is delivered exactly once across drains");
     }
 
     #[test]

@@ -1658,6 +1658,16 @@ fn prepare_or_launch_project_agent(
         let steer_file = crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Truncate it at launch: the path is deterministic per agent_id, so without this a
+        // PRIOR run's leftover messages would replay into this fresh burst (drain starts at
+        // offset 0). Best-effort — a failure just leaves the (rare) stale tail.
+        if !steer_file.is_empty() {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(&steer_file);
+        }
         Some(OrchestratorLaunchConfig {
             binary,
             omlx_base_url,
