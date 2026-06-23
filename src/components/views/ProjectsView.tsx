@@ -26,6 +26,7 @@ import {
   chatMessages,
 } from "../projects/planner/plannerModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
+import { useDesignRequestWatcher } from "../projects/planner/useDesignRequestWatcher";
 import type { PlannerMessage } from "../projects/planner/plannerModel";
 import type { DesignProjectEntry } from "../../types/design";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
@@ -193,6 +194,9 @@ export function ProjectsView() {
     ago: string | null;
     thumbnailUri: string | null;
   } | null>(null);
+  // Bumped when a design-request the watcher fulfilled completes, to re-run the design
+  // load effect so the freshly-generated design surfaces in the Stage Design view (P-B L5).
+  const [plannerDesignNonce, setPlannerDesignNonce] = useState(0);
   // Frecce (Phase 17): show/hide the dependency-arrow overlay on the task board.
   const [showArrows, setShowArrows] = useState(true);
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -801,6 +805,14 @@ export function ProjectsView() {
     plannerConvo.length > 0 &&
     plannerConvo[plannerConvo.length - 1].role === "assistant";
 
+  // Phase B L4/L5: fulfill the orchestrator's design_request directives (run the reused
+  // design pipeline) and refresh the Stage Design view when one completes.
+  useDesignRequestWatcher(
+    orchestratorAgentId,
+    currentProject?.metadata.rootPath ?? null,
+    () => setPlannerDesignNonce((n) => n + 1),
+  );
+
   // Load the project's most-recent design for the planner's read-only Design tab:
   // registry -> pick the entry at/under the project root -> its thumbnail (a data: URI).
   // Re-runs when the selected project's root changes; the cancel flag drops a stale
@@ -849,7 +861,7 @@ export function ProjectsView() {
     return () => {
       cancelled = true;
     };
-  }, [currentProject?.metadata.rootPath]);
+  }, [currentProject?.metadata.rootPath, plannerDesignNonce]);
 
   useEffect(() => {
     if (!agentState) return;
