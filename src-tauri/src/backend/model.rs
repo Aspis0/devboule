@@ -859,6 +859,29 @@ where
         .collect())
 }
 
+// Per-entry-lenient design-request deserializer (Phase B). The `designRequestDirectives`
+// array is written by the orchestrator's MCP `design_request` tool; a malformed/half-written
+// entry is dropped rather than failing the whole state load (mirrors the visual_check one).
+fn lenient_design_request_directives<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::backend::design_request::DesignRequestDirective>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let entries = match raw {
+        serde_json::Value::Array(items) => items,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            serde_json::from_value::<crate::backend::design_request::DesignRequestDirective>(entry)
+                .ok()
+        })
+        .collect())
+}
+
 // Per-entry-lenient git push-request deserializer (GH-P4). The `gitPushRequests`
 // array in `.aspis-agents.json` is written by the agent's MCP `request_git_push`
 // tool and round-tripped by the Rust approve/deny commands; a hand-edited or
@@ -1147,6 +1170,16 @@ pub struct AgentLiveState {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub visual_check_directives: Vec<crate::backend::visual_check::VisualCheckDirective>,
+    // Design-request directives (orchestrator -> app, Phase B): the Python MCP appends
+    // pending design generations; the executor claims one + emits a Tauri event the
+    // frontend runs (reusing the design pipeline), then stamps the result back.
+    #[serde(
+        default,
+        deserialize_with = "lenient_design_request_directives",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub design_request_directives:
+        Vec<crate::backend::design_request::DesignRequestDirective>,
     // GH-P4: agent→human git push-approval requests. The agent's MCP
     // `request_git_push` tool appends a `pending_approval` entry; the human's
     // approve/deny Tauri command drives the rest. Additive + skip-if-empty so an

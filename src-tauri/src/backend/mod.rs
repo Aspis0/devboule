@@ -46,6 +46,7 @@ pub mod tdd_strict;
 pub mod token_usage;
 pub mod training_export;
 pub mod user_mcp_config;
+pub mod design_request;
 pub mod util;
 pub mod vault;
 pub mod visual_check;
