@@ -59,6 +59,7 @@ const ORACLE_TOOL_NAMES: &[&str] = &[
     "steer_mini_coder",
     "mini_coder_result",
     "visual_check",
+    "design_request",
     "request_git_push",
     "plan_submit",
     "plan_status",

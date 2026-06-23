@@ -350,6 +350,81 @@ pub fn mutate_agent_live_state_retrying<T>(
     Err(last_err)
 }
 
+// === Phase B: design_request lifecycle commands (frontend drives the generation) ===
+//
+// The orchestrator's MCP `design_request` appends a PENDING directive. The frontend
+// watcher lists pending ones, CLAIMS one (-> running so a later poll skips it), runs the
+// reused design pipeline, then COMPLETES it (-> done/failed + result the MCP poll returns).
+// No Rust scan loop / Tauri emit: the design generate+parse+save pipeline is frontend TS.
+
+/// Pending design-request directives the frontend watcher should run.
+#[tauri::command]
+pub fn list_pending_design_requests(
+    app: tauri::AppHandle,
+) -> Result<Vec<crate::backend::design_request::DesignRequestDirective>, String> {
+    let state = read_agent_live_state_snapshot(&app)?;
+    Ok(state
+        .design_request_directives
+        .into_iter()
+        .filter(|d| {
+            d.status == crate::backend::design_request::DesignRequestStatus::Pending
+        })
+        .collect())
+}
+
+/// Claim a pending directive (pending -> running). Returns the claimed directive, or None
+/// if it vanished or is no longer pending (another claim won the race).
+#[tauri::command]
+pub fn design_request_claim(
+    app: tauri::AppHandle,
+    directive_id: String,
+) -> Result<Option<crate::backend::design_request::DesignRequestDirective>, String> {
+    let now = Utc::now().to_rfc3339();
+    mutate_agent_live_state(&app, |state| {
+        let d = state
+            .design_request_directives
+            .iter_mut()
+            .find(|d| d.id == directive_id)?;
+        match crate::backend::design_request::apply_claim(d, now.clone()) {
+            Ok(next) => {
+                *d = next;
+                Some(d.clone())
+            }
+            Err(_) => None,
+        }
+    })
+}
+
+/// Complete a running directive: on success pass the saved design's path + registry id;
+/// otherwise pass `error`. Stamps the terminal status + result (the MCP poll returns it).
+#[tauri::command]
+pub fn design_request_complete(
+    app: tauri::AppHandle,
+    directive_id: String,
+    design_project_path: Option<String>,
+    registry_id: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    use crate::backend::design_request::DesignRequestOutcome;
+    let outcome = match (design_project_path, registry_id) {
+        (Some(path), Some(id)) => DesignRequestOutcome::done(path, id),
+        _ => DesignRequestOutcome::failed(
+            error.unwrap_or_else(|| "design generation failed".to_string()),
+        ),
+    };
+    mutate_agent_live_state(&app, |state| {
+        if let Some(d) = state
+            .design_request_directives
+            .iter_mut()
+            .find(|d| d.id == directive_id)
+        {
+            if let Ok(next) = crate::backend::design_request::apply_result(d, outcome.clone()) {
+                *d = next;
+            }
+        }
+    })
+}
+
 /// Mini-coder executor support (MC-P2): record a ledger entry for a freshly-launched
 /// mini, mirroring `record_agent_launch` but stamping host="app", the backend kind
 /// as `client`, and the parent coder's id. The mini is an app-hosted PTY (no OS

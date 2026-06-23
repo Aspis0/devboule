@@ -47,15 +47,8 @@ impl DesignRequestOutcome {
             error: Some(error.into()),
         }
     }
-
-    pub fn timeout(error: impl Into<String>) -> Self {
-        Self {
-            status: DesignRequestStatus::Timeout,
-            design_project_path: None,
-            registry_id: None,
-            error: Some(error.into()),
-        }
-    }
+    // (No Rust `timeout()` constructor: the Python MCP dispatch writes the "timeout"
+    // status into the directive JSON directly; Rust only deserializes that variant.)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -106,6 +99,10 @@ pub fn apply_result(
     new_d.result = Some(outcome);
     Ok(new_d)
 }
+
+// NOTE: abandoned-directive timeout/eviction is handled by the Python MCP dispatch's
+// synthesized write-back (the orchestrator's blocking poll times out and stamps the
+// directive failed), so no Rust scan-pass / pass-plan is needed here.
 
 #[cfg(test)]
 mod tests {
