@@ -834,6 +834,9 @@ function RoleCard({
   const exists = entry?.exists ?? false;
   const enabled = entry?.enabled ?? false;
   const truncated = entry?.truncated ?? false;
+  // How many language personas have a PROJECT override — drives the lang disclosure's default-open
+  // (collapsed when none, so the Installed card stays compact) + the "N configured" badge.
+  const langProjectCount = (langs ?? []).filter((e) => e.source === "project").length;
 
   // Status line: active when present + enabled, disabled when present + off,
   // "no skill yet" when absent.
@@ -990,15 +993,24 @@ function RoleCard({
         </div>
       ) : null}
 
-      {/* Phase 3b — the (role × language) persona rows, data-driven from skills_list_langs. */}
-      <LangPersonaSection
-        role={role}
-        langs={langs}
-        disabled={disabled}
-        query={query}
-        onSaveLang={onSaveLang}
-        onResetLang={onResetLang}
-      />
+      {/* Phase 3b — the (role × language) persona rows, behind a disclosure so the Installed card
+          stays compact: collapsed when there are no project overrides, open when there are (or while
+          a search is active). */}
+      <CollapsibleSection
+        title="Language personas"
+        badge={langProjectCount > 0 ? `${langProjectCount} configured` : undefined}
+        defaultOpen={langProjectCount > 0}
+        forceOpen={(query ?? "").trim().length > 0}
+      >
+        <LangPersonaSection
+          role={role}
+          langs={langs}
+          disabled={disabled}
+          query={query}
+          onSaveLang={onSaveLang}
+          onResetLang={onResetLang}
+        />
+      </CollapsibleSection>
     </section>
   );
 }
