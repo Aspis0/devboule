@@ -50,6 +50,21 @@ as events within the conversation, not a terminal "Done" that ends the process. 
 local, terminal for cloud). `launch...` already accepts `client:"claude"|"codex"` (gate
 `planFirst` on local).
 **Severity:** medium-high (core to the multi-provider vision).
+**Status (2026-06):** selector + cloud-terminal embed shipped (b3a4222 + 20595e0). Hostile
+review found the cloud path needs REAL integration (cloud CLIs don't share the local
+goal/steer/bridge infra):
+- ✅ F3/F6 fixed: `plannerLaunching` now clears on a cloud bind (was a 30s composer lockout);
+  `live` counts a cloud orchestrator (chip pulses).
+- 🔴 **F1 (cloud goal):** Claude/Codex launch BLIND — `initialGoal`/`DEVBOULE_GOAL` only flow
+  for `client==="orchestrator"` (`projects.rs` OrchestratorLaunchConfig is None for cloud). Fix:
+  embed the goal in the cloud CLI's prompt (`build_*_agent_script`).
+- 🔴 **F2 (terminal binding):** `cloudOrchestratorAgentId` matches by `client` only → after a
+  hand-off it can bind to a CODER of the same CLI. Fix: capture the launched agentId at launch
+  (a ref/state), don't `.find` by client.
+- F4/F5 (deferred): no steer path for a live cloud orchestrator (you drive its own terminal —
+  acceptable); switching the selector while one runs can leave two orchestrators (disable the
+  switch while running). F8: autoCreate env encoding nitpick.
+This is Phase-D-adjacent: a cloud orchestrator is a real integration, not just a launch.
 
 ### B3 — Universal websearch UX (Phase D)
 **What:** the top **websearch view** must show the SAME cool UX whether it's **Exa via local

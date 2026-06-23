@@ -831,13 +831,16 @@ export function ProjectsView() {
     }, 30000);
   }, []);
   useEffect(() => {
-    if (!orchestratorAgentId) return;
+    // Clear the launching flag when EITHER a local or a cloud orchestrator session binds
+    // (cloud sessions never set orchestratorAgentId, so watching only it left the composer
+    // locked for the full 30s timeout on a cloud launch — review F3).
+    if (!orchestratorAgentId && !cloudOrchestratorAgentId) return;
     setPlannerLaunching(false);
     if (plannerLaunchTimerRef.current) {
       clearTimeout(plannerLaunchTimerRef.current);
       plannerLaunchTimerRef.current = null;
     }
-  }, [orchestratorAgentId]);
+  }, [orchestratorAgentId, cloudOrchestratorAgentId]);
   useEffect(
     () => () => {
       if (plannerLaunchTimerRef.current) clearTimeout(plannerLaunchTimerRef.current);
@@ -2496,7 +2499,7 @@ export function ProjectsView() {
                 .pop() ?? ""
             }
             plannerModelLabel={config.localCoderBackend?.model ?? mainCoderClient}
-            live={!!orchestratorAgentId}
+            live={!!orchestratorAgentId || !!cloudOrchestratorAgentId}
             planCards={derivePlanCards(currentProject?.state.tasks ?? [])}
             pages={plannerWeb.pages}
             findings={plannerWeb.findings}
