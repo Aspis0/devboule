@@ -18,6 +18,7 @@ import {
   stageTone,
 } from "../projects/projectStage";
 import { ProjectsBoard } from "../projects/ProjectsBoard";
+import { OrchestratorHeroCard } from "../projects/OrchestratorHeroCard";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
   CensorCountsTracker,
@@ -2041,74 +2042,59 @@ export function ProjectsView() {
         </div>
       )}
 
-      <section className="flex flex-col gap-3 rounded-lg border border-cream-200 bg-white p-4 md:flex-row md:items-center md:justify-between">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-terracotta/10">
-            <FolderKanban className="h-5 w-5 text-terracotta" />
-          </div>
-          <div>
-            <h3 className="text-sm font-semibold text-cream-800">
-              Project workspace
-            </h3>
-            <p className="text-[12px] text-cream-500">
-              Local Markdown projects, safe backend writes, Oracle-readable
-              notes.
-            </p>
-          </div>
-        </div>
-        <div className="flex min-w-0 flex-wrap gap-2">
-          <input
-            value={titleDraft}
-            onChange={(event) => setTitleDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void createProject();
-            }}
-            placeholder="New project title"
-            data-help-title="A project is the local notebook for one work stream."
-            data-help-lines="Projects are Markdown files that the UI, agents, and Oracle can read.|Use one project for one goal, for example scrna-seq backend and frontend.|Agents update tasks and notes through MCP so the board stays current.|The project file is indexed by Oracle after it changes."
-            className="min-w-0 w-full rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] text-cream-700 outline-none focus:border-terracotta-200 sm:w-60"
-          />
-          <button
-            onClick={() => void pickProjectFolder()}
-            // B-F7: the native folder dialog only exists in the Tauri runtime — disable in the
-            // browser harness (where the dynamic import would silently no-op).
-            disabled={isBusy || !isTauriRuntime()}
-            title={newProjectRootDraft || "Choose the working folder the agent reads/writes in"}
-            data-help-title="Choose the project's working folder."
-            data-help-lines="The agent reads + writes code in THIS folder.|Without a working folder the project can't run tools — project_structure, visual_check, and Censor all need a root.|Pick the repo/folder the coder should work in.|This is the one thing to set here; the rest is configured in Settings."
-            className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 disabled:opacity-60"
-          >
-            <FolderOpen className="h-3.5 w-3.5 shrink-0" />
-            <span className="max-w-[12rem] truncate">
-              {newProjectRootDraft
-                ? (newProjectRootDraft.split(/[\\/]/).filter(Boolean).pop() ?? newProjectRootDraft)
-                : "Choose folder"}
-            </span>
-          </button>
-          <button
-            onClick={() => void createProject()}
-            disabled={isBusy || !titleDraft.trim()}
-            data-help-title="This creates a new project Markdown file."
-            data-help-lines="The new project starts active and appears on the stage board.|It does not launch agents by itself.|Choose the working folder (button at left) before creating — agents cannot run without one; there is no app-folder fallback.|Oracle can index the project file after the watcher sees it."
-            className="inline-flex items-center gap-2 rounded-lg bg-terracotta px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            Create
-          </button>
-          <button
-            onClick={() => {
-              setCloneError(null);
-              setCloneOpen((open) => !open);
-            }}
-            disabled={cloneBusy}
-            data-help-title="This clones a GitHub repository and adds it as a project."
-            data-help-lines="Paste an https://github.com/owner/repo URL to clone it locally.|The clone uses your GitHub token from Settings; the token never appears in the URL or logs.|It refuses to overwrite a non-empty folder.|The cloned repo becomes a project rooted at the new folder."
-            className="inline-flex items-center gap-2 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 disabled:opacity-60"
-          >
-            <GitBranch className="h-3.5 w-3.5" />
-            Clone from GitHub
-          </button>
-        </div>
+      <section className="flex flex-wrap items-center gap-2 rounded-2xl border border-cream-200 bg-white px-3 py-2">
+        <FolderKanban className="h-5 w-5 shrink-0 text-terracotta" />
+        <input
+          value={titleDraft}
+          onChange={(event) => setTitleDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void createProject();
+          }}
+          placeholder="New project title — or describe it to the Orchestrator below…"
+          data-help-title="A project is the local notebook for one work stream."
+          data-help-lines="Projects are Markdown files that the UI, agents, and Oracle can read.|Use one project for one goal, for example scrna-seq backend and frontend.|Agents update tasks and notes through MCP so the board stays current.|The project file is indexed by Oracle after it changes."
+          className="min-w-[12rem] flex-1 rounded-xl border border-transparent bg-transparent px-2 py-2 text-[13px] text-cream-800 outline-none focus:border-cream-200 focus:bg-cream-50"
+        />
+        <button
+          onClick={() => void pickProjectFolder()}
+          // B-F7: the native folder dialog only exists in the Tauri runtime — disable in the
+          // browser harness (where the dynamic import would silently no-op).
+          disabled={isBusy || !isTauriRuntime()}
+          title={newProjectRootDraft || "Choose the working folder the agent reads/writes in"}
+          data-help-title="Choose the project's working folder."
+          data-help-lines="The agent reads + writes code in THIS folder.|Without a working folder the project can't run tools — project_structure, visual_check, and Censor all need a root.|Pick the repo/folder the coder should work in.|This is the one thing to set here; the rest is configured in Settings."
+          className="inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:bg-cream-100 disabled:opacity-60"
+        >
+          <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+          <span className="max-w-[10rem] truncate">
+            {newProjectRootDraft
+              ? (newProjectRootDraft.split(/[\\/]/).filter(Boolean).pop() ?? newProjectRootDraft)
+              : "Folder"}
+          </span>
+        </button>
+        <button
+          onClick={() => {
+            setCloneError(null);
+            setCloneOpen((open) => !open);
+          }}
+          disabled={cloneBusy}
+          data-help-title="This clones a GitHub repository and adds it as a project."
+          data-help-lines="Paste an https://github.com/owner/repo URL to clone it locally.|The clone uses your GitHub token from Settings; the token never appears in the URL or logs.|It refuses to overwrite a non-empty folder.|The cloned repo becomes a project rooted at the new folder."
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:bg-cream-100 disabled:opacity-60"
+        >
+          <GitBranch className="h-3.5 w-3.5" />
+          GitHub
+        </button>
+        <button
+          onClick={() => void createProject()}
+          disabled={isBusy || !titleDraft.trim()}
+          data-help-title="This creates a new project Markdown file."
+          data-help-lines="The new project starts active and appears on the stage board.|It does not launch agents by itself.|Choose the working folder (button at left) before creating — agents cannot run without one; there is no app-folder fallback.|Oracle can index the project file after the watcher sees it."
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-terracotta px-4 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          Create
+        </button>
       </section>
 
       {/* Clone-from-GitHub dialog (inline, board-mode only). Mirrors the small
@@ -2147,6 +2133,21 @@ export function ProjectsView() {
           )}
         </section>
       )}
+
+      {/* The Orchestrator composer — the centerpiece "describe a goal → plan → board" surface.
+          Always visible; "Plan it" stays guarded until a project with a working folder is selected
+          (the wiring to the existing plan-first flow lands in a follow-up). */}
+      <OrchestratorHeroCard
+        projectName={currentProject?.metadata.title ?? null}
+        hasRoot={!!currentProject?.metadata.rootPath}
+        language={null}
+        plannerModel={config.localCoderBackend?.model ?? mainCoderClient}
+        coders={[
+          { id: "claude", label: "Claude" },
+          { id: "codex", label: "Codex" },
+          ...(config.customAgentClients ?? []).map((c) => ({ id: c.id, label: c.label })),
+        ]}
+      />
 
       {/* Overview segmented toggle: the active stage board (default) vs. a simple
           read-only list of archived projects. The "Archived (N)" segment is shown
