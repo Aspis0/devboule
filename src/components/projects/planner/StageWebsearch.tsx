@@ -8,6 +8,9 @@ type StageWebsearchProps = {
   pages: StagePage[];
   findings: StageFinding[];
   mode: 'auto' | 'manual';
+  // Whether the orchestrator is actually working. When false AND no pages have
+  // arrived, the view shows a calm idle state — no fake scanline/skeleton activity.
+  live: boolean;
   onModeChange: (m: 'auto' | 'manual') => void;
   onManualSearch: (query: string) => void;
 };
@@ -16,10 +19,12 @@ export function StageWebsearch({
   pages,
   findings,
   mode,
+  live,
   onModeChange,
   onManualSearch,
 }: StageWebsearchProps) {
   const [query, setQuery] = useState("");
+  const idle = !live && pages.length === 0;
   const total = Math.max(pages.length, 3);
   const shown = Math.min(pages.length, 3);
   const isAuto = mode === 'auto';
@@ -88,7 +93,26 @@ export function StageWebsearch({
         </div>
       </div>
 
-      {/* Columns Row */}
+      {/* Columns row — or a calm idle state when nothing is running (no fake activity). */}
+      {idle ? (
+        <div
+          style={{
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            textAlign: 'center',
+            color: '#9c8d77',
+            fontSize: 12,
+            lineHeight: 1.5,
+            padding: 20,
+          }}
+        >
+          The Orchestrator isn&apos;t searching the web right now — switch to
+          Manual to run a one-off search, or describe a goal below to start
+          planning.
+        </div>
+      ) : (
       <div style={columnsRowStyle}>
         {/* LEFT COLUMN */}
         <div style={leftColStyle}>
@@ -195,6 +219,7 @@ export function StageWebsearch({
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }

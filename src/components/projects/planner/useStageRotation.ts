@@ -20,7 +20,12 @@ export interface StageRotation {
   toggleAuto: () => void;
 }
 
-export function useStageRotation(intervalMs: number = 3800): StageRotation {
+export function useStageRotation(
+  intervalMs: number = 3800,
+  // Only auto-rotate while the orchestrator is actually working. When idle the
+  // stage holds still (no fake cycling through views with nothing happening).
+  enabled: boolean = true,
+): StageRotation {
   const [view, setView] = useState<StageView>("exa");
   const [auto, setAuto] = useState<boolean>(true);
 
@@ -34,7 +39,7 @@ export function useStageRotation(intervalMs: number = 3800): StageRotation {
   }, []);
 
   useEffect(() => {
-    if (!auto) return;
+    if (!auto || !enabled) return;
     const timer = setInterval(() => {
       setView((current) => {
         const next = (STAGES.indexOf(current) + 1) % STAGES.length;
@@ -42,7 +47,7 @@ export function useStageRotation(intervalMs: number = 3800): StageRotation {
       });
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [auto, intervalMs]);
+  }, [auto, enabled, intervalMs]);
 
   return { view, auto, pick, toggleAuto };
 }

@@ -2230,8 +2230,6 @@ export function ProjectsView() {
           Always visible; "Plan it" stays guarded until a project with a working folder is selected
           (the wiring to the existing plan-first flow lands in a follow-up). */}
           <PlannerPlanMode
-            projectName={currentProject?.metadata.title ?? null}
-            hasRoot={!!currentProject?.metadata.rootPath}
             goal={plannerGoal}
             contextLabel={
               currentProject?.metadata.rootPath

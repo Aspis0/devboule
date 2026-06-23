@@ -12,8 +12,6 @@ import { PlannerChat } from "./PlannerChat";
 import { PlannerControls } from "./PlannerControls";
 
 interface PlannerPlanModeProps {
-  projectName: string | null;
-  hasRoot: boolean;
   goal: string | null;
   contextLabel: string;
   plannerModelLabel: string;
@@ -40,8 +38,6 @@ interface PlannerPlanModeProps {
 
 export function PlannerPlanMode(props: PlannerPlanModeProps) {
   const {
-    projectName,
-    hasRoot,
     goal,
     contextLabel,
     plannerModelLabel,
@@ -65,20 +61,31 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     onAutoCreateToggle,
   } = props;
 
-  const { view, auto, pick, toggleAuto } = useStageRotation();
+  const { view, auto, pick, toggleAuto } = useStageRotation(3800, live);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!ref.current) return;
-    const tween = gsap.from(ref.current, {
-      scaleY: 0.6,
-      opacity: 0,
-      transformOrigin: 'top',
-      duration: 0.35,
-      ease: 'power2.out',
-    });
+    const el = ref.current;
+    if (!el) return;
+    // fromTo with EXPLICIT end values (not gsap.from, which reads the current value
+    // as the destination): under React StrictMode the effect runs twice and the
+    // cleanup kills the first tween mid-flight at opacity:0 — gsap.from would then
+    // animate 0 -> 0 and leave the panel invisible. fromTo always ends visible.
+    const tween = gsap.fromTo(
+      el,
+      { scaleY: 0.6, opacity: 0 },
+      {
+        scaleY: 1,
+        opacity: 1,
+        transformOrigin: 'top',
+        duration: 0.35,
+        ease: 'power2.out',
+      },
+    );
     return () => {
       tween.kill();
+      // Guarantee the panel is left visible even if killed mid-flight.
+      gsap.set(el, { clearProps: 'opacity,transform' });
     };
   }, []);
 
@@ -88,112 +95,73 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
   return (
     <div
       ref={ref}
-      className="pp-root"
-      style={{
-        background: '#0E0D0B',
-        borderRadius: 14,
-        padding: '30px 6px 6px',
-        boxShadow: '0 28px 64px -24px rgba(0,0,0,.45)',
-        position: 'relative',
-      }}
+      className="pp-root rounded-2xl border border-cream-200 bg-white shadow-sm"
+      style={{ padding: 16 }}
     >
-      {/* Traffic Lights */}
       <div
         style={{
-          position: 'absolute',
-          top: 9,
-          left: 12,
-          display: 'flex',
-          gap: 7,
-        }}
-      >
-        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#E0664E' }} />
-        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#E3A93C' }} />
-        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#54A867' }} />
-      </div>
-
-      {/* Title */}
-      <div
-        className="pp-mono"
-        style={{
-          position: 'absolute',
-          top: 8,
-          left: 0,
-          right: 0,
-          textAlign: 'center',
-          fontSize: 10.5,
-          color: '#6b655d',
-        }}
-      >
-        devboule · planner
-      </div>
-
-      {/* Inner Cream Panel */}
-      <div
-        style={{
-          background: '#F4F0E9',
-          borderRadius: 10,
-          padding: 16,
           display: 'flex',
           flexDirection: 'column',
           gap: 13,
         }}
       >
-        {/* 1) Goal Echo Row */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            padding: '10px 12px',
-            background: '#FCFAF6',
-            border: '1px solid #E4DDD0',
-            borderRadius: 12,
-          }}
-        >
+        {/* 1) Goal echo — shown only while a REAL goal is being planned. No fake
+        placeholder when idle (the chat composer carries the "describe a goal" affordance). */}
+        {goal && (
           <div
-            className="pp-mono"
             style={{
-              fontSize: 12,
-              fontWeight: 600,
-              color: '#9A6A2E',
-              background: '#F1E4D2',
-              border: '1px solid #E6D3BB',
-              padding: '4px 11px',
-              borderRadius: 8,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '10px 12px',
+              background: '#FCFAF6',
+              border: '1px solid #E4DDD0',
+              borderRadius: 12,
             }}
           >
-            plan
+            <div
+              className="pp-mono"
+              style={{
+                fontSize: 12,
+                fontWeight: 600,
+                color: '#9A6A2E',
+                background: '#F1E4D2',
+                border: '1px solid #E6D3BB',
+                padding: '4px 11px',
+                borderRadius: 8,
+              }}
+            >
+              plan
+            </div>
+            <span
+              style={{
+                flex: 1,
+                fontSize: 13.5,
+                color: '#2A2621',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {goal}
+            </span>
+            {contextLabel && (
+              <div
+                className="pp-mono"
+                style={{
+                  fontSize: 11,
+                  color: '#7c766b',
+                  background: '#fff',
+                  border: '1px solid #E9E3D8',
+                  padding: '4px 8px',
+                  borderRadius: 7,
+                }}
+              >
+                {contextLabel}
+              </div>
+            )}
           </div>
-          <span
-            style={{
-              flex: 1,
-              fontSize: 13.5,
-              color: '#2A2621',
-              whiteSpace: 'nowrap',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-            }}
-          >
-            {goal ??
-              (hasRoot
-                ? `Describe a goal below to plan ${projectName ?? 'this project'}…`
-                : 'Select a project with a working folder to start planning.')}
-          </span>
-          <div
-            className="pp-mono"
-            style={{
-              fontSize: 11,
-              color: '#7c766b',
-              background: '#fff',
-              border: '1px solid #E9E3D8',
-              padding: '4px 8px',
-              borderRadius: 7,
-            }}
-          >
-            {contextLabel}
-          </div>
-        </div>
+        )}
 
         {/* 2) State Strip */}
         <div
@@ -334,6 +302,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                 pages={pages}
                 findings={findings}
                 mode={webMode}
+                live={live}
                 onModeChange={onWebModeChange}
                 onManualSearch={onManualSearch}
               />
