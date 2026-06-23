@@ -16,6 +16,7 @@ import {
 import { invokeBackendCommand } from "../../context/AppContext";
 import { MarketplaceInstall } from "./MarketplaceInstall";
 import { SkillsDiscovery } from "./SkillsDiscovery";
+import { CollapsibleSection } from "./CollapsibleSection";
 import { UserMcpServersCard } from "../settings/UserMcpServersCard";
 import {
   MAX_SKILL_BYTES,
@@ -678,7 +679,7 @@ export function SkillsView() {
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Filter languages…"
+                placeholder="Search skills and languages…"
                 aria-label="Search skills"
                 className="w-full max-w-xs rounded-2xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 focus:border-teal/40 focus:outline-none"
               />
@@ -688,25 +689,20 @@ export function SkillsView() {
           {view === "tools" ? (
             <UserMcpServersCard />
           ) : view === "discover" ? (
-            <div className="space-y-4">
-              {folder && (
-                <MarketplaceInstall
-                  folderPath={folder}
-                  invoke={invokeBackendCommand}
-                  onInstalled={() => {
-                    if (folder) void refreshLangs(folder);
-                  }}
-                />
-              )}
-              {folder && (
-                <SkillsDiscovery
-                  folderPath={folder}
-                  invoke={invokeBackendCommand}
-                  onInstalled={() => {
-                    if (folder) void refreshLangs(folder);
-                  }}
-                />
-              )}
+            <div className="space-y-3">
+              <CollapsibleSection title="Bundled skills" defaultOpen forceOpen={query.trim().length > 0}>
+                {folder && (
+                  <SkillsDiscovery
+                    folderPath={folder}
+                    invoke={invokeBackendCommand}
+                    query={query}
+                    onInstalled={() => {
+                      if (folder) void refreshLangs(folder);
+                    }}
+                  />
+                )}
+              </CollapsibleSection>
+              <CollapsibleSection title="Role & language templates" forceOpen={query.trim().length > 0}>
               <DiscoverView
               catalog={catalog ?? []}
               langCatalog={langCatalog}
@@ -746,9 +742,21 @@ export function SkillsView() {
                 false
               }
               />
+              </CollapsibleSection>
+              <CollapsibleSection title="Install a skill from a URL" forceOpen={query.trim().length > 0}>
+                {folder && (
+                  <MarketplaceInstall
+                    folderPath={folder}
+                    invoke={invokeBackendCommand}
+                    onInstalled={() => {
+                      if (folder) void refreshLangs(folder);
+                    }}
+                  />
+                )}
+              </CollapsibleSection>
             </div>
           ) : (
-            <div className="grid gap-4">
+            <div className="grid gap-4 lg:grid-cols-2">
               {ROLE_ORDER.map((role) => (
                 <RoleCard
                   key={role}

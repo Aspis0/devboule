@@ -598,6 +598,16 @@ describe("SkillsView", () => {
       await Promise.resolve();
     });
     await flush();
+    // The role/language catalog now lives in a collapsed "Role & language templates" section
+    // (IA redesign) — expand it before asserting on its cards.
+    const templatesSection = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Role & language templates"),
+    ) as HTMLButtonElement;
+    await act(async () => {
+      templatesSection.click();
+      await Promise.resolve();
+    });
+    await flush();
     const html = container.innerHTML;
     expect(html).toContain("Veteran rust conventions"); // a bundled language catalog card
     expect(html).toContain("Install");

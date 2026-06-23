@@ -5,6 +5,8 @@ interface Props {
   folderPath: string;
   invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
   onInstalled?: (dest: string) => void;
+  /** Optional filter applied to the bundled-skill + featured lists (matches name/description). */
+  query?: string;
 }
 
 /**
@@ -12,7 +14,7 @@ interface Props {
  * plus the featured open-source marketplaces to browse. `invoke` is a prop so the component is
  * unit-testable without Tauri (mirrors MarketplaceInstall).
  */
-export function SkillsDiscovery({ folderPath, invoke, onInstalled }: Props) {
+export function SkillsDiscovery({ folderPath, invoke, onInstalled, query = "" }: Props) {
   const [library, setLibrary] = useState<LibraryCatalogEntry[]>([]);
   const [featured, setFeatured] = useState<FeaturedMarketplace[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
@@ -65,6 +67,18 @@ export function SkillsDiscovery({ folderPath, invoke, onInstalled }: Props) {
     }
   }
 
+  const q = query.trim().toLowerCase();
+  const shownLibrary = q
+    ? library.filter(
+        (s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q),
+      )
+    : library;
+  const shownFeatured = q
+    ? featured.filter(
+        (m) => m.name.toLowerCase().includes(q) || m.description.toLowerCase().includes(q),
+      )
+    : featured;
+
   return (
     <section className="rounded-2xl border border-cream-200 bg-white p-4 space-y-4">
       <div>
@@ -88,7 +102,7 @@ export function SkillsDiscovery({ folderPath, invoke, onInstalled }: Props) {
       )}
 
       <ul className="space-y-2">
-        {library.map((s) => (
+        {shownLibrary.map((s) => (
           <li
             key={s.name}
             className="flex items-center justify-between rounded-2xl border border-cream-200 bg-cream-50 px-3 py-2"
@@ -114,7 +128,7 @@ export function SkillsDiscovery({ folderPath, invoke, onInstalled }: Props) {
       <div>
         <h4 className="text-[13px] font-semibold text-cream-800">Featured open-source marketplaces</h4>
         <ul className="mt-2 space-y-2">
-          {featured.map((m) => (
+          {shownFeatured.map((m) => (
             <li
               key={m.name}
               className="flex items-start justify-between gap-3 rounded-2xl border border-cream-200 bg-cream-50 px-3 py-2"
