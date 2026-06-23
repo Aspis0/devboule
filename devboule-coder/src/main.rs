@@ -119,40 +119,48 @@ async fn run_once(prompt: String) -> std::io::Result<()> {
     // user side from the bridge, in order, like every later steer).
     runtime.executor.emit_chat("user", &prompt);
 
-    // CONVERSATION LOOP: run a burst; if the orchestrator ASKS the user, stay alive and
-    // wait for the answer (delivered via the steer inbox), then continue with the answer
-    // folded into the running conversation. Done/Escalated ends the session. This is what
-    // makes the chat a real back-and-forth instead of a one-shot that exits on a question.
+    // CONVERSATION LOOP (vibe-coding chat): run a burst, then STAY ALIVE and wait for the
+    // user's next message (delivered via the steer inbox), folding it into the running
+    // conversation. A reply (Done) is NOT the end — it's just the orchestrator's turn; the
+    // session lives until the user stops replying (the wait window elapses) or the app stops
+    // it. Only a real failure (Escalated) ends it early. This is what makes deciding the
+    // project/plan/tasks a real back-and-forth instead of a one-shot that exits on the first
+    // reply. The assistant reply / question was already emitted as a chat bubble by the burst.
     let mut conversation = prompt;
     loop {
         let outcome = run_one_burst(&runtime, conversation.clone()).await?;
         println!("--- outcome ---");
-        match outcome {
-            BurstOutcome::Done(reply) => {
-                println!("DONE: {reply}");
-                break;
-            }
+        let pending_question = match outcome {
             BurstOutcome::Escalated(reason) => {
                 println!("ESCALATED: {reason}");
-                break;
+                break; // a real failure ends the session
+            }
+            BurstOutcome::Done(reply) => {
+                println!("DONE: {reply}");
+                None // a reply, not a question — just wait for the user's next turn
             }
             BurstOutcome::AskUser(question) => {
-                // The question was already emitted as an assistant chat bubble by the
-                // burst. Wait (alive) for the user's reply via the steer inbox.
                 println!("ASK_USER: {question}");
-                match wait_for_steer_reply(&runtime).await {
-                    Some(answer) => {
-                        runtime.executor.emit_chat("user", &answer);
-                        conversation = format!(
-                            "{conversation}\n\n[You asked the user: {question}]\n[User answered: {answer}]\n\nContinue from here.",
-                        );
-                        println!("--- continuing with the user's reply ---");
-                    }
-                    None => {
-                        println!("(no reply received before the wait window elapsed — ending)");
-                        break;
-                    }
-                }
+                Some(question)
+            }
+        };
+        // Stay alive and wait for the user's next message; continue when it arrives.
+        match wait_for_steer_reply(&runtime).await {
+            Some(answer) => {
+                runtime.executor.emit_chat("user", &answer);
+                conversation = match pending_question {
+                    Some(question) => format!(
+                        "{conversation}\n\n[You asked the user: {question}]\n[User answered: {answer}]\n\nContinue from here.",
+                    ),
+                    None => format!(
+                        "{conversation}\n\n[User says: {answer}]\n\nContinue the conversation.",
+                    ),
+                };
+                println!("--- continuing with the user's reply ---");
+            }
+            None => {
+                println!("(no reply received before the wait window elapsed — ending)");
+                break;
             }
         }
     }

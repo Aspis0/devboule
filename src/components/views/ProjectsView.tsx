@@ -794,11 +794,15 @@ export function ProjectsView() {
   // The live orchestrator session for THIS project (its in-app PTY agent), if any.
   // Drives the planner panel's "live" state + feeds its REAL websearch pages/findings
   // from the agent's activity console (the file-bridge `websearch` events).
+  // Bind to the current project's LOCAL orchestrator session. Match on client only — the
+  // orchestrator registers itself via MCP with host=null (NOT "app"), so requiring host==="app"
+  // here meant the landing never bound to it and the live conversation only showed up in the
+  // single-project work view (recognized as a coder). currentProjectSessions is already scoped
+  // to this project + recent (active) sessions, so client==="orchestrator" is the right one.
   const orchestratorAgentId = useMemo(
     () =>
-      currentProjectSessions.find(
-        (s) => s.client === "orchestrator" && s.host === "app",
-      )?.agentId ?? null,
+      currentProjectSessions.find((s) => s.client === "orchestrator")?.agentId ??
+      null,
     [currentProjectSessions],
   );
   // Mark a Planner launch in flight (plannerLaunching) until its session registers — guards
@@ -837,13 +841,20 @@ export function ProjectsView() {
   // echoed back (optimistic, deduped by text once the bridge catches up).
   const plannerConvo = useMemo(() => {
     const real = chatMessages(orchestratorConsole.entries);
-    // The orchestrator echoes EACH user turn (the launch goal + every steer) back as a
-    // user chat entry. Show the optimistic user messages BEYOND the count already echoed
-    // — a position watermark, NOT a text match, so repeated messages ("yes"/"continue")
-    // are never wrongly dropped. plannerMessages holds only user turns, in send order.
+    // Before the orchestrator's session binds, the bridge has nothing — show the optimistic
+    // echo + any frontend notices (pick-a-folder / starting…) in send order.
+    if (real.length === 0) return plannerMessages;
+    // Once the bridge has the conversation it is AUTHORITATIVE and chronological (user turns
+    // + assistant replies in order). Append ONLY the user messages sent but not yet echoed
+    // back — a position watermark on USER turns, so repeated "yes"/"continue" are never
+    // dropped, and frontend-only notices can't slip in and push a reply ABOVE the message it
+    // answers (that was the "the bubble is above my message" bug). Stale notices are dropped
+    // here on purpose: the real conversation supersedes them.
     const echoedUserCount = real.filter((m) => m.role === "user").length;
-    const pending = plannerMessages.slice(echoedUserCount);
-    return [...real, ...pending];
+    const pendingUsers = plannerMessages
+      .filter((m) => m.role === "user")
+      .slice(echoedUserCount);
+    return [...real, ...pendingUsers];
   }, [orchestratorConsole.entries, plannerMessages]);
 
   // "Awaiting your reply": the orchestrator spoke last and is live → your turn. Drives the
@@ -1735,12 +1746,17 @@ export function ProjectsView() {
       ]);
       return;
     }
+    // Clean slate: the conversation starts with exactly this goal (drops any stale notices
+    // like "pick a folder first" from earlier attempts, so the bridge echo lines up cleanly).
+    setPlannerMessages([{ role: "user", text: goal }]);
     orchestratorPlanRef.current = true;
     try {
-      const title = goal.length > 60 ? `${goal.slice(0, 57)}…` : goal;
+      // The NAME is decided DURING the conversation (this is a vibe-coding app: you talk to
+      // the Planner to shape the project/plan/tasks). Start with a neutral placeholder — the
+      // first message is a goal, NOT a title — and let the conversation rename it later.
       const detail = await runMutation(() =>
         invokeBackendCommand<ProjectDetail>("create_project", {
-          input: { title, status: "active", rootPath: folder },
+          input: { title: "Untitled plan", status: "active", rootPath: folder },
         }),
       );
       if (!detail) return;

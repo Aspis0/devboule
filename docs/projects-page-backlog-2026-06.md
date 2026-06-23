@@ -1,0 +1,167 @@
+# Projects page — bugs & features backlog (2026-06)
+
+The first Projects page is becoming the heart of the app: **create a project = talk to the
+orchestrator to shape a plan (a project IS a plan), which is then built by a coder**. It's a
+**vibe-coding chat**. This doc tracks what's left to fix/build, from a live testing session
+with the owner. Companion: `agent-roles-architecture-2026-06.md`.
+
+## Mental model (settled)
+- **Project = a plan.** You CREATE it on this page by talking to the orchestrator; the plan
+  is split into tasks at the end; you then follow/run it on the single-project page.
+- **A project depends on a working folder** (existing codebase, e.g. an Android app where the
+  project is "a new page"; or a brand-new folder).
+- **Names**: keep the internal agent names (orchestrator / main coder / mini-coder / censor)
+  — DON'T rename in the UX; just EXPLAIN well what each does. "Planner" = orchestrator + main
+  coder (same role, different phases; can be two different agents) — kept as our dev shorthand.
+
+## DONE this session (context)
+- Landing opens EMPTY; first message CREATES the project (with the chosen folder) + launches
+  the Planner (`startNewProject`, commit `ef1e298`). Chat-persistence fixes: the chat no
+  longer wipes on project creation / folder set; double-launch guard (`plannerLaunching`).
+- Chat ordering fix: the bridge conversation is the chronological authority; optimistic
+  notices no longer push a reply above the message it answers.
+- Title placeholder "Untitled plan" (the name is decided in conversation — see B7).
+
+---
+
+## BUGS / FEATURES TO FIX
+
+### B1 — It's a vibe-coding CHAT, not run-once by nature  ⚠️ ARCHITECTURE
+**What:** the local orchestrator runs through `devboule-coder` `run_once` — designed as a
+headless ONE-SHOT that exits on the first "Done". We had to bolt on a "stay alive and wait
+for the next message" loop so the conversation doesn't die after one reply. That's a smell:
+a vibe-coding agent should be a **persistent conversation by nature**, not a one-shot with a
+keep-alive hack.
+**Where:** `devboule-coder/src/main.rs` `run_once` (the conversation loop).
+**Fix (proper):** make the orchestrator a first-class **interactive conversation session** —
+its natural mode is "converse until the user/plan is done", with plan-submit / task-creation
+as events within the conversation, not a terminal "Done" that ends the process. Re-think
+`run_once` vs an interactive `run_session`.
+**Severity:** high (architectural; the current keep-alive works but is fragile).
+
+### B2 — Orchestrator backend selectable: local / Claude / Codex
+**What:** the orchestrator (the one you talk to) must be choosable among **local devboule**,
+**Claude**, **Codex** — same three as the main coder (per `agent-roles-architecture`).
+- **Local** keeps OUR TUI (the Stage: chat + plan + websearch/design views).
+- **Claude / Codex** keep their OWN terminal — we simply **embed/show their terminal here**
+  (reuse `AgentTerminalViewer`), not the full Stage.
+**Where:** `ProjectsView.tsx` (`planWithOrchestrator`/`startNewProject` hardcode
+`client:"orchestrator"`); needs an orchestrator selector + conditional render (Stage for
+local, terminal for cloud). `launch...` already accepts `client:"claude"|"codex"` (gate
+`planFirst` on local).
+**Severity:** medium-high (core to the multi-provider vision).
+
+### B3 — Universal websearch UX (Phase D)
+**What:** the top **websearch view** must show the SAME cool UX whether it's **Exa via local
+devboule** OR **Claude/Codex's integrated web search**. Today only the local Exa path feeds
+the Stage.
+**Fix:** per-provider **activity adapters** that parse each provider's own web/tool activity
+and normalize it into the SAME bridge events (`websearch`/`chat`) → identical Stage rendering
++ animations. (This is the big "Phase D universal activity engine".)
+**Where:** `devboule-coder` ExaBackend → `Activity::websearch` bridge today; need cloud
+adapters. `mini_activity.rs` parse + `StageWebsearch` consume already exist.
+**Severity:** medium (big epic; after B1/B2).
+
+### B4 — The TUI grows unbounded as messages pile up  ⚠️ UX BUG
+**What:** the chat (our TUI) **keeps getting taller** as messages increase, blowing out the
+app layout. It needs a **fixed/bounded height with internal scroll** (scroll inside the TUI,
+newest at bottom, auto-stick-to-bottom).
+**Where:** `PlannerChat.tsx` (the messages container) + the planner panel height in
+`PlannerPlanMode.tsx` / `planner.css`.
+**Fix:** give the chat a bounded height (e.g. max-height / flex with `min-height:0`) and
+`overflow-y:auto` on the messages list; keep the near-bottom auto-scroll already present.
+**Severity:** high (makes the app unusable after a few turns).
+
+### B5 — Working folder not persisted when the app self-locks  ⚠️ DATA BUG
+**What:** the chosen working folder is **lost when the app locks itself** (auto-lock /
+re-lock). The project ends up with `rootPath: null` again.
+**Where:** project create/update path (`create_project` / `update_project_metadata`) +
+the lock/unlock lifecycle (`state.ensure_unlocked` / what happens to project state on lock).
+Investigate whether the folder is written to the project `.md` durably vs held only in
+memory, and whether a re-lock reloads stale project state.
+**Severity:** high (data loss; directly blocks planning since a folder is required).
+
+### B6 — Landing didn't show the live conversation  ✅ FIXED
+**What looked like:** "the orchestrator doesn't respond." **Actually it DOES respond** — the
+activity file proved it ("come stai" → "Tutto bene, grazie!…") — but the reply only showed in
+the SINGLE-PROJECT work view (recognized as a coder), never on the create landing.
+**Root cause:** the orchestrator registers its session via MCP with **`host=null`**, but the
+landing bound the chat with `client==="orchestrator" && host==="app"` → never matched → the
+landing never bound to the live session.
+**Fix (done):** bind by `client==="orchestrator"` only (currentProjectSessions is already
+scoped to this project + active sessions). tsc 0, 107 view tests.
+
+### B10 — Orchestrator is TOO EAGER: auto-plans + auto-creates + auto-hands-off on message 1
+**What:** the very first message makes the orchestrator immediately draft the plan, create
+the tasks (they appear in the Kanban), and hand off to the main coder — instead of having a
+CONVERSATION to shape the project/plan first (vibe coding). Too eager.
+**Cause:** launched with `planFirst:true` + `autoCreate` → it plans + creates on turn 1
+rather than conversing. Ties to **B1** (conversation-native): the orchestrator should discuss
+first and only plan/create/hand-off when the conversation converges (the user signals ready),
+not on the opening message.
+**Severity:** high (it's the core vibe-coding UX — discuss, THEN plan).
+
+### B7 — The Planner should NAME the project during the conversation
+**What:** the project is created as "Untitled plan"; the **name should be decided during the
+conversation** (the orchestrator renames it once the plan takes shape).
+**Where:** needs an orchestrator capability/tool to set the project title (e.g. via an MCP
+tool or the plan-submit carrying a title) → `update_project_metadata`.
+**Severity:** low-medium (placeholder works meanwhile).
+
+### B8 — Move the per-project detail panel OFF the landing; Kanban = history
+**What:** the landing should be CREATE + the **Kanban as the project history** (click a card
+→ that project's page). The per-project detail panel (status header + root editor + saved
+workflows) belongs on the single-project page, not the create landing.
+**Where:** `ProjectsView.tsx` board-mode render (the `<main>` detail block); keep
+`<ProjectsBoard>` + `<ProjectCalendar>`.
+**Severity:** medium (layout cleanup; agreed with the owner — "tieni la kanban, la history è la
+kanban stessa").
+
+### B9 — Explain what each agent does (no rename)
+**What:** keep the agent names, but add clear **explanations/tooltips** of what the
+orchestrator / main coder / mini-coder / censor do, so non-developers understand.
+**Where:** the planner controls + wherever a role/agent is surfaced.
+**Severity:** low-medium.
+
+### B11 — Can't delete a project  ⚠️
+**What:** there's no way to delete a project. The list fills with junk ("hola", "Untitled
+plan", …) from testing, with no cleanup.
+**Where:** `ProjectsView.tsx` (list / Kanban card / detail) + a `delete_project` (or archive +
+purge) backend command — check whether one exists; if archive exists, expose a real delete.
+**Severity:** medium-high (clutter + no recovery from test runs).
+
+### B12 — Orchestrator shouldn't be on the single-project page by default
+**What:** on the single-project page the orchestrator session is present from the start. But
+the orchestrator is the **create-time** conversation — it couldn't have existed "at the
+beginning". On the single-project page it should NOT appear automatically; instead you should
+be able to **re-invoke** the orchestrator on demand (to change the plan / modify tasks) if you
+want it. So: orchestrator = create flow + opt-in re-invocation, not a permanent project agent.
+**Where:** Work-mode session display + how the create-time orchestrator session is associated
+with / shown on the project (it lingers as a project session). Relates to B10 (after it plans
++ hands off, it shouldn't stick around as the project's agent).
+**Severity:** medium (model/UX clarity).
+
+### B13 — "Changes" view shows the whole working-tree diff, not the project's changes
+**What:** the Changes section on the single-project page is genuinely nice, BUT it shows ALL
+git changes in the working tree — e.g. unrelated edits to the SAME repo (the owner saw OUR edits
+to `ProjectsView.tsx` while the project's working tree was the Aspis-management repo). It
+should show only the changes THAT PROJECT's agents made, not the whole tree's diff.
+**Where:** the changes/diff backend (`changes.rs`?) + the Changes view — scope to the
+project's agent activity (e.g. a baseline ref captured when the agent starts, or the agent's
+own commits), not a raw working-tree `git diff`.
+**Severity:** medium (correctness of a good feature).
+
+---
+
+## Suggested order
+✅ **B6** done (binding). Then:
+1. **B11** (delete projects — quick win, clears the test junk) →
+2. **B5** (folder persistence — blocks planning) →
+3. **B4** (scrollable TUI — usability) →
+4. **B10 + B12** (stop the eager auto-plan/handoff; orchestrator off the single-project page
+   by default — both are the "discuss first, orchestrator is the create flow" behavior) →
+5. **B1** (make the conversation conversation-native, not run-once) →
+6. **B13** (scope Changes to the project) →
+7. **B2** (orchestrator selector + cloud terminal) →
+8. **B8 / B9 / B7** (layout, explanations, naming) →
+9. **B3** (universal websearch — the big Phase D epic).
