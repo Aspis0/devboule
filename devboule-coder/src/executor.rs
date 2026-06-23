@@ -410,6 +410,10 @@ impl ExaBackend {
             body: json!({
                 "urls": [url],
                 "text": true,
+                // Exa Contents API: a per-page LLM summary + key highlights. These are
+                // the "distilled findings" the planner panel renders (not just raw text).
+                "summary": true,
+                "highlights": true,
                 "livecrawl": "always",
             }),
         }
@@ -426,7 +430,12 @@ impl ExaBackend {
                 "query": query,
                 "type": "neural",
                 "numResults": EXA_NUM_RESULTS,
-                "contents": { "text": true },
+                // Query-guided per-page summary + highlights (the "findings"), plus text.
+                "contents": {
+                    "text": true,
+                    "summary": { "query": query },
+                    "highlights": true,
+                },
             }),
         }
     }
@@ -434,7 +443,7 @@ impl ExaBackend {
     /// Perform a built request and parse the JSON to a compact text result. The
     /// live HTTP is integration-deferred; the parsing is unit-tested against a
     /// fixture string via [`parse_exa_response`].
-    async fn run(&self, req: ExaRequest) -> Result<String, String> {
+    async fn run(&self, req: ExaRequest) -> Result<ExaOutcome, String> {
         let resp = self
             .client
             .post(req.url)
@@ -456,7 +465,10 @@ impl ExaBackend {
                 elide_line(&text)
             ));
         }
-        Ok(parse_exa_response(&text))
+        Ok(ExaOutcome {
+            text: parse_exa_response(&text),
+            pages: parse_exa_pages(&text),
+        })
     }
 }
 
@@ -494,6 +506,93 @@ pub fn parse_exa_response(body: &str) -> String {
         }
     }
     elide_to(&out, MAX_RESULT_LEN)
+}
+
+/// A single web page surfaced to the planner panel's Websearch view: the source
+/// URL + title + a distilled summary (Exa's per-page `summary`, falling back to
+/// `highlights` then a `text` snippet). Serialized into the activity bridge so the
+/// host shows REAL pages/findings, not demo content.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct ExaPage {
+    pub url: String,
+    pub title: String,
+    pub summary: String,
+}
+
+/// The result of an Exa call: the compact `text` fed back to the burst model
+/// (unchanged behavior) PLUS the structured `pages` for the live Websearch view.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct ExaOutcome {
+    pub text: String,
+    pub pages: Vec<ExaPage>,
+}
+
+/// Parse an Exa `/search` or `/contents` JSON body into structured pages for the
+/// Websearch view. Summary precedence: `summary` -> joined `highlights` -> a `text`
+/// snippet. PURE + total: invalid JSON / no `results` -> empty Vec (never panics).
+/// Caps to 6 pages and each summary to 400 chars (char-boundary safe).
+pub fn parse_exa_pages(body: &str) -> Vec<ExaPage> {
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let results = match value.get("results").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut pages = Vec::with_capacity(results.len().min(6));
+    for res in results.iter().take(6) {
+        // Cap url + title (chars, boundary-safe): the whole event is one bridge line
+        // bounded by MAX_LINE_BYTES on the host — a long url/title would push the line
+        // over the cap and the reader would silently drop the entire event.
+        let url: String = res
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(500)
+            .collect();
+        // A result with no source URL is not a real page for the Websearch view.
+        if url.is_empty() {
+            continue;
+        }
+        let title_raw = res.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let title: String = if title_raw.is_empty() {
+            url.clone()
+        } else {
+            title_raw.chars().take(160).collect()
+        };
+
+        let summary_raw = res.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = if !summary_raw.is_empty() {
+            summary_raw.to_string()
+        } else if let Some(highlights) = res.get("highlights").and_then(|v| v.as_array()) {
+            let parts: Vec<&str> = highlights
+                .iter()
+                .filter_map(|h| h.as_str())
+                .take(5)
+                .collect();
+            if !parts.is_empty() {
+                parts.join(" … ")
+            } else {
+                let text = res.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                text.trim().chars().take(240).collect()
+            }
+        } else {
+            let text = res.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            text.trim().chars().take(240).collect()
+        };
+
+        let summary = summary.trim().chars().take(400).collect::<String>();
+
+        pages.push(ExaPage {
+            url,
+            title,
+            summary,
+        });
+    }
+    pages
 }
 
 /// Read an HTTP response body, buffering AT MOST `cap` bytes then stopping. The
@@ -788,14 +887,20 @@ impl ToolExecutor for RealExecutor {
             // rather than silently succeed.
             AgentAction::Fetch { url } => match &self.web {
                 Some(web) => match web.run(web.build_fetch_request(url)).await {
-                    Ok(text) => ToolResult::ok(text),
+                    Ok(outcome) => {
+                        self.activity.websearch(url, &outcome.pages);
+                        ToolResult::ok(outcome.text)
+                    }
                     Err(e) => ToolResult::err(format!("fetch {url}: {e}")),
                 },
                 None => ToolResult::err("fetch reached the executor with egress disabled"),
             },
             AgentAction::Websearch { query } => match &self.web {
                 Some(web) => match web.run(web.build_search_request(query)).await {
-                    Ok(text) => ToolResult::ok(text),
+                    Ok(outcome) => {
+                        self.activity.websearch(query, &outcome.pages);
+                        ToolResult::ok(outcome.text)
+                    }
                     Err(e) => ToolResult::err(format!("websearch: {e}")),
                 },
                 None => ToolResult::err("websearch reached the executor with egress disabled"),
@@ -1498,6 +1603,38 @@ mod tests {
     fn parse_exa_empty_results_is_marked() {
         let out = parse_exa_response(r#"{"results": []}"#);
         assert_eq!(out, "[exa: 0 results]");
+    }
+
+    #[test]
+    fn parse_exa_pages_summary_precedence_and_totality() {
+        // summary wins; else highlights joined; else a text snippet; bad JSON -> empty.
+        let fixture = r#"{
+            "results": [
+                {"title": "Sum", "url": "https://s.test", "summary": "the summary", "text": "ignored", "highlights": ["h"]},
+                {"title": "Hi", "url": "https://h.test", "highlights": ["one", "two"], "text": "ignored"},
+                {"title": "Txt", "url": "https://t.test", "text": "fallback body"},
+                {"title": "", "url": "https://u.test"}
+            ]
+        }"#;
+        let pages = parse_exa_pages(fixture);
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[0].summary, "the summary");
+        assert_eq!(pages[1].summary, "one … two");
+        assert_eq!(pages[2].summary, "fallback body");
+        // empty title falls back to the url
+        assert_eq!(pages[3].title, "https://u.test");
+        // total: invalid / no-results -> empty, never panics
+        assert!(parse_exa_pages("not json").is_empty());
+        assert!(parse_exa_pages(r#"{"foo": 1}"#).is_empty());
+        // cap: at most 6 pages
+        let many = format!(
+            r#"{{"results": [{}]}}"#,
+            (0..10)
+                .map(|i| format!(r#"{{"url": "https://x{i}.test", "summary": "s{i}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(parse_exa_pages(&many).len(), 6);
     }
 
     #[test]

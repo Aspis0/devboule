@@ -19,12 +19,9 @@ import {
 } from "../projects/projectStage";
 import { ProjectsBoard } from "../projects/ProjectsBoard";
 import { PlannerPlanMode } from "../projects/planner/PlannerPlanMode";
-import { derivePlanCards } from "../projects/planner/plannerModel";
-import type {
-  PlannerMessage,
-  StagePage,
-  StageFinding,
-} from "../projects/planner/plannerModel";
+import { derivePlanCards, latestWeb } from "../projects/planner/plannerModel";
+import { useAgentConsole } from "../agents/useAgentConsole";
+import type { PlannerMessage } from "../projects/planner/plannerModel";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
   CensorCountsTracker,
@@ -156,10 +153,8 @@ function taskMoveTargets(task: ProjectTask) {
   );
 }
 
-// Stable references for the planner panel's not-yet-wired props (P1/P3 fill these).
-// Module-level so they keep identity across renders and don't defeat PlannerPlanMode's memo.
-const PLANNER_NO_PAGES: StagePage[] = [];
-const PLANNER_NO_FINDINGS: StageFinding[] = [];
+// Stable no-op for the planner panel's not-yet-wired callbacks (manual search → P2,
+// open-in-design → P3). Module-level so it keeps identity across renders.
 const PLANNER_NOOP = () => {};
 
 export function ProjectsView() {
@@ -752,6 +747,22 @@ export function ProjectsView() {
   const workingAgent = useMemo<AgentSession | null>(
     () => freshestSession(currentProjectSessions),
     [currentProjectSessions],
+  );
+
+  // The live orchestrator session for THIS project (its in-app PTY agent), if any.
+  // Drives the planner panel's "live" state + feeds its REAL websearch pages/findings
+  // from the agent's activity console (the file-bridge `websearch` events).
+  const orchestratorAgentId = useMemo(
+    () =>
+      currentProjectSessions.find(
+        (s) => s.client === "orchestrator" && s.host === "app",
+      )?.agentId ?? null,
+    [currentProjectSessions],
+  );
+  const orchestratorConsole = useAgentConsole(orchestratorAgentId);
+  const plannerWeb = useMemo(
+    () => latestWeb(orchestratorConsole.entries),
+    [orchestratorConsole.entries],
   );
 
   useEffect(() => {
@@ -2238,12 +2249,10 @@ export function ProjectsView() {
                 .pop() ?? ""
             }
             plannerModelLabel={config.localCoderBackend?.model ?? mainCoderClient}
-            live={currentProjectSessions.some(
-              (s) => s.client === "orchestrator" && s.host === "app",
-            )}
+            live={!!orchestratorAgentId}
             planCards={derivePlanCards(currentProject?.state.tasks ?? [])}
-            pages={PLANNER_NO_PAGES}
-            findings={PLANNER_NO_FINDINGS}
+            pages={plannerWeb.pages}
+            findings={plannerWeb.findings}
             webMode={plannerWebMode}
             onWebModeChange={setPlannerWebMode}
             onManualSearch={PLANNER_NOOP}

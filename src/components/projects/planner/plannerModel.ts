@@ -1,4 +1,5 @@
 import type { ProjectTask } from "../../../types/backend";
+import type { ConsoleEntry } from "../../agents/agentConsoleModel";
 
 export type StageView = 'exa' | 'plan' | 'design';
 
@@ -55,6 +56,33 @@ export function pageHostname(url: string): string {
   } catch {
     return url.trim();
   }
+}
+
+export interface PlannerWeb {
+  pages: StagePage[];
+  findings: StageFinding[];
+}
+
+/** Extract the LATEST websearch row's real pages + derived findings from a console
+ *  timeline (the orchestrator's `useAgentConsole` entries). Findings are the per-page
+ *  summaries. Empty when the orchestrator hasn't searched yet. Pure + total. */
+export function latestWeb(entries: ConsoleEntry[] | undefined): PlannerWeb {
+  if (!entries) return { pages: [], findings: [] };
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.type === 'webSearch') {
+      const pages: StagePage[] = e.pages.map((p) => ({
+        url: p.url,
+        title: p.title,
+        summary: p.summary,
+      }));
+      const findings: StageFinding[] = pages
+        .filter((p) => p.summary.trim().length > 0)
+        .map((p) => ({ text: p.summary }));
+      return { pages, findings };
+    }
+  }
+  return { pages: [], findings: [] };
 }
 
 /** Returns the human-readable label for a given stage view. */

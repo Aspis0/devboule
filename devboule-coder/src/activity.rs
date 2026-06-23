@@ -21,6 +21,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::executor::ExaPage;
+
 /// The env var the Tauri host sets at orchestrator launch to the per-agent activity
 /// file path. Unset (the headless / standalone case) ⇒ every milestone no-ops.
 const ENV_ACTIVITY_FILE: &str = "DEVBOULE_ACTIVITY_FILE";
@@ -121,6 +123,25 @@ impl Activity {
             let _ = file.write_all(line.as_bytes());
         }
     }
+
+    /// Append ONE `websearch` event: the query + the REAL pages (url/title/summary)
+    /// the orchestrator just read, so the host's Websearch view shows live sources +
+    /// distilled findings instead of demo content. Same best-effort contract as
+    /// [`milestone`] (None path / any I/O error silently no-ops). Pages are already
+    /// capped (≤6, summaries ≤400 chars) by `parse_exa_pages`.
+    pub fn websearch(&self, query: &str, pages: &[ExaPage]) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let line = encode_websearch(query, pages);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// Serialize ONE milestone event to its single-line JSON form, `text` char-capped to
@@ -145,6 +166,26 @@ fn encode_milestone(text: &str, node: Node) -> String {
     line
 }
 
+/// Serialize ONE `websearch` event to single-line JSON:
+/// `{"kind":"websearch","query":"…","pages":[{"url","title","summary"}]}` + `\n`.
+/// The query is char-capped to [`MAX_TEXT_CHARS`]; pages are serialized as-is
+/// (already capped upstream). serde_json guarantees the value stays on one line.
+fn encode_websearch(query: &str, pages: &[ExaPage]) -> String {
+    let capped: String = if query.chars().count() > MAX_TEXT_CHARS {
+        query.chars().take(MAX_TEXT_CHARS).collect()
+    } else {
+        query.to_string()
+    };
+    let value = serde_json::json!({
+        "kind": "websearch",
+        "query": capped,
+        "pages": pages,
+    });
+    let mut line = value.to_string();
+    line.push('\n');
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +202,48 @@ mod tests {
         assert_eq!(v["kind"], "milestone");
         assert_eq!(v["text"], "Planning: 3 spine files");
         assert_eq!(v["node"], "dot");
+    }
+
+    #[test]
+    fn encode_websearch_is_one_line_with_pages_and_capped_query() {
+        let pages = vec![
+            ExaPage {
+                url: "https://stripe.com/docs".to_string(),
+                title: "Usage billing".to_string(),
+                summary: "meter via UsageRecord".to_string(),
+            },
+            ExaPage {
+                url: "https://x.test".to_string(),
+                title: "X".to_string(),
+                summary: "".to_string(),
+            },
+        ];
+        // A query with an embedded newline must NOT break the single-line contract.
+        let line = encode_websearch("stripe\nbilling", &pages);
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "exactly one physical line");
+
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["kind"], "websearch");
+        assert_eq!(v["query"], "stripe\nbilling");
+        let arr = v["pages"].as_array().expect("pages array");
+        assert_eq!(arr.len(), 2);
+        // Pages serialize with the exact wire keys (not camelCase — they have no _).
+        assert_eq!(arr[0]["url"], "https://stripe.com/docs");
+        assert_eq!(arr[0]["title"], "Usage billing");
+        assert_eq!(arr[0]["summary"], "meter via UsageRecord");
+    }
+
+    #[test]
+    fn encode_websearch_caps_an_overlong_query() {
+        let long = "é".repeat(MAX_TEXT_CHARS + 40);
+        let line = encode_websearch(&long, &[]);
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(
+            v["query"].as_str().unwrap().chars().count(),
+            MAX_TEXT_CHARS,
+            "query char-capped, codepoint-safe"
+        );
     }
 
     #[test]

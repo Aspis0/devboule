@@ -259,7 +259,10 @@ describe("useAgentConsole — effect wiring", () => {
     // base (the spawn) is preserved …
     expect(latest.entries?.[0]?.type).toBe("spawn");
     // … and the buffered event is replayed on top (not clobbered).
-    expect(latest.entries?.[1]?.text).toBe("buffered milestone");
+    const buffered = latest.entries?.[1];
+    expect(buffered && "text" in buffered ? buffered.text : undefined).toBe(
+      "buffered milestone",
+    );
 
     await act(async () => {
       root.unmount();
@@ -312,7 +315,10 @@ describe("useAgentConsole — effect wiring", () => {
     });
 
     expect(latest.entries).toHaveLength(1);
-    expect(latest.entries?.[0]?.text).toBe("early live event");
+    const early = latest.entries?.[0];
+    expect(early && "text" in early ? early.text : undefined).toBe(
+      "early live event",
+    );
 
     await act(async () => {
       root.unmount();

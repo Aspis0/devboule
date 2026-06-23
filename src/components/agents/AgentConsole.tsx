@@ -497,7 +497,9 @@ function MiniCard({ mini }: { mini: MiniRun }) {
 
 // ---- timeline row -----------------------------------------------------------
 
-function nodeRingClass(node: ConsoleEntry["node"]): string {
+function nodeRingClass(
+  node: "" | "dot" | "sage" | "terra" | undefined,
+): string {
   switch (node) {
     case "dot":
       return "border-teal bg-teal";
@@ -533,7 +535,7 @@ function TimelineRow({
         ) : null}
         <span
           className={`relative z-[1] mt-1 h-[9px] w-[9px] rounded-full border-2 ${nodeRingClass(
-            entry.node,
+            entry.type === "webSearch" ? undefined : entry.node,
           )}`}
           aria-hidden
         />
@@ -542,11 +544,27 @@ function TimelineRow({
       {/* content */}
       <div className="min-w-0 flex-1 pt-px">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-teal/40 bg-teal/15 px-2.5 text-[10.5px] font-semibold text-teal-dark">
-            <span className="h-[5px] w-[5px] rounded-full bg-current" />
-            Coder
-          </span>
-          <CoderText text={entry.text} />
+          {entry.type === "webSearch" ? (
+            <span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-terracotta/40 bg-terracotta/10 px-2.5 text-[10.5px] font-semibold text-terracotta">
+              <span className="h-[5px] w-[5px] rounded-full bg-current" />
+              Web
+            </span>
+          ) : (
+            <span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-teal/40 bg-teal/15 px-2.5 text-[10.5px] font-semibold text-teal-dark">
+              <span className="h-[5px] w-[5px] rounded-full bg-current" />
+              Coder
+            </span>
+          )}
+          {entry.type === "webSearch" ? (
+            <span className="min-w-0 truncate text-[12px] text-cream-700">
+              {entry.query}
+              <span className="ml-1.5 text-cream-400">
+                · {entry.pages.length} page{entry.pages.length === 1 ? "" : "s"}
+              </span>
+            </span>
+          ) : (
+            <CoderText text={entry.text} />
+          )}
           <span className="ml-auto whitespace-nowrap font-mono text-[10.5px] text-cream-400">
             {entry.time}
           </span>

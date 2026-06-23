@@ -252,6 +252,23 @@ pub enum ConsoleEntry {
         time: String,
         mini: MiniRun,
     },
+    /// A websearch row: the query + the REAL pages the orchestrator read (the planner
+    /// panel's Websearch view renders these as live sources + distilled findings).
+    WebSearch {
+        query: String,
+        pages: Vec<PageEntry>,
+        time: String,
+    },
+}
+
+/// One web page surfaced by a `websearch` bridge event: source url + title + a
+/// distilled summary (the "finding"). Mirrors the orchestrator's `ExaPage` wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageEntry {
+    pub url: String,
+    pub title: String,
+    pub summary: String,
 }
 
 /// The whole console state for ONE agent — the exact shape `mini_activity_snapshot` returns
@@ -471,6 +488,29 @@ pub fn push_coder_milestone(
     }
     // A milestone means the orchestrator is live; reflect that in the tab (spinner + pill)
     // and leave the resting/empty state. `run_count` mirrors the mini path's "one active".
+    activity.running = Some(true);
+    activity.run_count = Some(1);
+    activity.empty = None;
+}
+
+/// Append ONE `WebSearch` timeline entry (the query + the real pages just read). Same
+/// FIFO cap + live-state bookkeeping as [`push_coder_milestone`].
+pub fn push_websearch(
+    activity: &mut ConsoleActivity,
+    query: &str,
+    pages: Vec<PageEntry>,
+    time: &str,
+) {
+    let entries = activity.entries.get_or_insert_with(Vec::new);
+    entries.push(ConsoleEntry::WebSearch {
+        query: query.to_string(),
+        pages,
+        time: time.to_string(),
+    });
+    if entries.len() > MAX_ENTRIES_PER_AGENT {
+        let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+        entries.drain(0..overflow);
+    }
     activity.running = Some(true);
     activity.run_count = Some(1);
     activity.empty = None;
@@ -867,6 +907,43 @@ fn parse_milestone_line(line: &str) -> Option<(String, Option<NodeStyle>)> {
     Some((text, node_from_wire(&event.node)))
 }
 
+/// The `websearch` bridge event wire shape (separate from [`BridgeEvent`]).
+#[derive(Deserialize)]
+struct WsEvent {
+    kind: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    pages: Vec<PageEntry>,
+}
+
+/// Parse ONE file line into a `(query, pages)` websearch event, or `None` to SKIP
+/// (blank, oversized, non-JSON, or not `kind == "websearch"`). Pure + total. Re-caps
+/// the untrusted query/title/summary lengths and the page count on the read side.
+fn parse_websearch_line(line: &str) -> Option<(String, Vec<PageEntry>)> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: WsEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "websearch" {
+        return None;
+    }
+    let query: String = event.query.chars().take(MILESTONE_TEXT_CAP).collect();
+    let pages: Vec<PageEntry> = event
+        .pages
+        .into_iter()
+        .take(6)
+        .map(|mut p| {
+            p.url = p.url.chars().take(500).collect();
+            p.title = p.title.chars().take(160).collect();
+            p.summary = p.summary.chars().take(400).collect();
+            p
+        })
+        .collect();
+    Some((query, pages))
+}
+
 /// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
 /// because the file is untrusted input the host reads back.
 const MILESTONE_TEXT_CAP: usize = 200;
@@ -1081,6 +1158,13 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
                             let time = now_clock();
                             store.update(&app, &agent_id, |a| {
                                 push_coder_milestone(a, &text, node, &time)
+                            });
+                        }
+                    } else if let Some((query, pages)) = parse_websearch_line(&line) {
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            let time = now_clock();
+                            store.update(&app, &agent_id, |a| {
+                                push_websearch(a, &query, pages, &time)
                             });
                         }
                     }
@@ -1432,6 +1516,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_push_websearch_round_trips() {
+        let line = r#"{"kind":"websearch","query":"stripe usage billing","pages":[{"url":"https://stripe.com/docs","title":"Usage","summary":"meter via UsageRecord"}]}"#;
+        let (query, pages) = parse_websearch_line(line).expect("parses a websearch line");
+        assert_eq!(query, "stripe usage billing");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].url, "https://stripe.com/docs");
+        assert_eq!(pages[0].summary, "meter via UsageRecord");
+        // wrong kind / bad json -> None (never panics)
+        assert!(parse_websearch_line(r#"{"kind":"milestone","text":"x"}"#).is_none());
+        assert!(parse_websearch_line("not json").is_none());
+        // push appends a WebSearch entry + marks the stream live
+        let mut a = ConsoleActivity::empty();
+        push_websearch(&mut a, &query, pages, "14:00:00");
+        assert_eq!(a.running, Some(true));
+        assert!(a.empty.is_none());
+        match &a.entries.as_ref().unwrap()[0] {
+            ConsoleEntry::WebSearch { query: q, pages: p, .. } => {
+                assert_eq!(q, "stripe usage billing");
+                assert_eq!(p.len(), 1);
+            }
+            _ => panic!("expected a websearch entry"),
+        }
+    }
+
+    #[test]
     fn resume_retry_round_rebuilds_when_history_lost() {
         // FIX 3 defensive arm: if the predecessor console was evicted/lost (no entries), the
         // resume must reseed a fresh console rather than leave an empty resting state.
@@ -1758,6 +1867,7 @@ mod tests {
             .map(|e| match e {
                 ConsoleEntry::Coder { text, .. } => text.as_str(),
                 ConsoleEntry::Spawn { text, .. } => text.as_str(),
+                ConsoleEntry::WebSearch { query, .. } => query.as_str(),
             })
             .collect();
         assert_eq!(

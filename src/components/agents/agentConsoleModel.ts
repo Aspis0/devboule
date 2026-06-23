@@ -146,8 +146,25 @@ export interface SpawnEntry {
   mini: MiniRun;
 }
 
+/** One real web page the orchestrator read (Exa): source url + title + a distilled
+ *  summary (the "finding"). Mirrors the backend `PageEntry`/`ExaPage`. */
+export interface ConsolePage {
+  url: string;
+  title: string;
+  summary: string;
+}
+
+/** A websearch row: the query + the REAL pages just read. The planner panel's
+ *  Websearch view renders these as live sources + distilled findings. */
+export interface WebSearchEntry {
+  type: "webSearch";
+  query: string;
+  pages: ConsolePage[];
+  time: string;
+}
+
 /** A single top-level row of the timeline. */
-export type ConsoleEntry = CoderEntry | SpawnEntry;
+export type ConsoleEntry = CoderEntry | SpawnEntry | WebSearchEntry;
 
 // ---- the activity snapshot --------------------------------------------------
 
