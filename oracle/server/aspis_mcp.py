@@ -316,6 +316,7 @@ ROLE_RULES = [
             "censor_findings",
             "censor_dispose",
             "visual_check",
+            "design_request",
             "spawn_mini_coder",
             "steer_mini_coder",
             "mini_coder_result",
@@ -390,6 +391,7 @@ ROLE_RULES = [
             "plan_submit",
             "plan_status",
             "ask_user",
+            "design_request",
         ],
         "forbidden": [
             "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per spawn_mini_coder (tu pianifichi e riveli il contesto; il mini scrive).",
@@ -632,6 +634,17 @@ TOOLS = [
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "html_path": {"type": "string"},
             "focus": {"type": "string", "default": ""},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "design_request",
+        "description": "Orchestrator only: ask the DESIGNER AI to generate a UI screen for the plan (e.g. a dashboard / home page). Pass `prompt` (what to design) + optional `context` (the conversation/plan context). The designer generates it and it appears in the planner's Design view. Returns the generated design's id + path.",
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "prompt": {"type": "string"},
+            "context": {"type": "string", "default": ""},
             "session_token": {"type": "string"},
         },
     },
@@ -2037,6 +2050,11 @@ def normalize_agents_state(state: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(visual_directives, list):
         visual_directives = []
     state["visualCheckDirectives"] = cap_visual_check_directives(visual_directives)
+    # Phase B: design-request queue (orchestrator -> designer), same cap discipline.
+    design_directives = state.get("designRequestDirectives")
+    if not isinstance(design_directives, list):
+        design_directives = []
+    state["designRequestDirectives"] = cap_design_request_directives(design_directives)
     # GH-P4: git push-approval queue, co-owned with the Rust approve/deny commands.
     # Same backfill + non-list-reset + single-choke-point cap discipline as the
     # mini-coder queue. PASSTHROUGH: each request dict is preserved VERBATIM (only
@@ -5710,6 +5728,112 @@ def dispatch_visual_check(
     return _visual_tool_result(directive_id, synthesized)
 
 
+# === Phase B: design_request (orchestrator -> designer AI) — mirrors visual_check ===
+DESIGN_REQUEST_POLL_TIMEOUT_SECS = 300.0
+DESIGN_REQUEST_POLL_INTERVAL_SECS = 2.0
+
+def cap_design_request_directives(directives):
+    return [d for d in directives if isinstance(d, dict)][-20:]
+
+def _design_directive_result(projects_dir, state_lock, directive_id):
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+        for directive in state.get('designRequestDirectives', []):
+            if not isinstance(directive, dict): continue
+            if str(directive.get('id') or '') == directive_id:
+                status = str(directive.get('status') or '')
+                result = directive.get('result')
+                if isinstance(result, dict) and result: return True, status, result
+                return True, status, None
+    return False, '', None
+
+def _design_tool_result(directive_id, result):
+    status = str(result.get('status') or '').strip().lower()
+    if status == 'done':
+        return {
+            'directiveId': directive_id,
+            'designProjectPath': clean_text(result.get('designProjectPath'), 'Design path', 1000),
+            'registryId': clean_text(result.get('registryId'), 'Registry id', 200)
+        }
+    error = clean_text(result.get('error') or 'design_request failed.', 'Design error', 1000)
+    return {'directiveId': directive_id, 'error': error}
+
+def dispatch_design_request(projects_dir, state_lock, args):
+    agent_id, role = require_agent_tool(projects_dir, args, 'design_request')
+    if 'design_request' not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f'{role} agents cannot use design_request.')
+    prompt = clean_text(args.get('prompt'), 'Design prompt', 4000)
+    if not prompt:
+        raise McpError('Design prompt is required.')
+    context = args.get('context')
+    plan_context = clean_text(context, 'Design context', 4000) if context else None
+    directive_id = uuid.uuid4().hex
+    directive = {
+        'id': directive_id,
+        'parentAgentId': agent_id,
+        'status': 'pending',
+        'prompt': prompt,
+        'resultPath': f'{directive_id}.json',
+        'createdAt': now()
+    }
+    if plan_context:
+        directive['planContext'] = plan_context
+    with file_lock(state_lock):
+        state = read_agents_state(projects_dir)
+        session = next((it for it in state['sessions'] if it.get('agentId')==agent_id), None)
+        status = str((session or {}).get('status') or '').strip().lower()
+        if session is None or status in ('','closed','launch_pending'):
+            raise McpError('design_request requires a live registered session.')
+        directives = state.setdefault('designRequestDirectives', [])
+        directives.append(directive)
+        state['designRequestDirectives'] = cap_design_request_directives(directives)
+        add_event(state, agent_id, role, 'design_request', 'Requested a design from the designer AI.')
+        write_agents_state(projects_dir, state)
+    deadline = time.monotonic() + DESIGN_REQUEST_POLL_TIMEOUT_SECS
+    seen = False; ever_ran = False
+    while True:
+        present, status, result = _design_directive_result(projects_dir, state_lock, directive_id)
+        if result is not None: return _design_tool_result(directive_id, result)
+        if present:
+            seen = True
+            if status == 'running': ever_ran = True
+        elif seen:
+            return {'directiveId': directive_id, 'error': 'directive vanished'}
+        if time.monotonic() >= deadline: break
+        time.sleep(DESIGN_REQUEST_POLL_INTERVAL_SECS)
+    synthesized = (
+        {"status": "timeout", "error": "design_request timed out waiting for the designer."}
+        if ever_ran
+        else {"status": "failed", "error": "design-request executor did not start this request within the poll window."}
+    )
+    # Write the synthesized terminal result BACK to the directive so the executor never
+    # processes a request the orchestrator already gave up on (mirrors visual_check).
+    try:
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            for directive in state.get("designRequestDirectives", []):
+                if not isinstance(directive, dict):
+                    continue
+                if str(directive.get("id") or "") == directive_id:
+                    existing = directive.get("result")
+                    if isinstance(existing, dict) and existing:
+                        synthesized = existing
+                    else:
+                        live_status = str(directive.get("status") or "")
+                        if live_status == "running":
+                            synthesized = {
+                                "status": "timeout",
+                                "error": "design_request timed out waiting for the designer.",
+                            }
+                        directive["status"] = synthesized["status"]
+                        directive["result"] = synthesized
+                    break
+            write_agents_state(projects_dir, state)
+    except McpError:
+        pass
+    return _design_tool_result(directive_id, synthesized)
+
+
 # FIX 4: cheap mirror of the Rust `sanitize_error` GitHub-token families
 # (src-tauri/src/backend/github.rs): classic PATs `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`
 # and fine-grained `github_pat_`, each followed by a run of token-body chars
@@ -6611,6 +6735,9 @@ def handle_tool_call(
 
     if name == "visual_check":
         return dispatch_visual_check(projects_dir, state_lock, args)
+
+    if name == "design_request":
+        return dispatch_design_request(projects_dir, state_lock, args)
 
     if name == "request_git_push":
         return dispatch_request_git_push(projects_dir, state_lock, args)

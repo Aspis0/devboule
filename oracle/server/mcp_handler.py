@@ -45,6 +45,17 @@ TOOLS = [
             "session_token": {"type": "string"},
         },
     },
+    {
+        "name": "design_request",
+        "description": "Ask the designer AI to generate a UI screen for the plan; it appears in the planner Design view. Pass prompt + optional context.",
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string"},
+            "prompt": {"type": "string"},
+            "context": {"type": "string", "default": ""},
+            "session_token": {"type": "string"},
+        },
+    },
 ]
 
 
@@ -64,6 +75,10 @@ def handle_tool_call(name: str, arguments: dict) -> dict | list:
         from oracle.server.aspis_mcp import handle_tool_call as handle_aspis_tool
 
         return handle_aspis_tool("visual_check", arguments)
+    if name == "design_request":
+        from oracle.server.aspis_mcp import handle_tool_call as handle_aspis_tool
+
+        return handle_aspis_tool("design_request", arguments)
     raise ValueError(f"Unknown Oracle MCP tool: {name}")
 
 
@@ -110,6 +125,20 @@ def create_mcp_server():
                 "role": role,
                 "html_path": html_path,
                 "focus": focus,
+                "session_token": session_token,
+            },
+        )
+
+    @server.tool()
+    def design_request(agent_id: str, role: str, prompt: str, context: str = "", session_token: str = "") -> dict:
+        """Ask the designer AI to generate a UI screen for the plan; it appears in the planner Design view."""
+        return handle_tool_call(
+            "design_request",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "prompt": prompt,
+                "context": context,
                 "session_token": session_token,
             },
         )

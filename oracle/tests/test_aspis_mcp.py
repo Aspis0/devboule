@@ -3563,6 +3563,7 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "plan_submit",
                 "plan_status",
                 "ask_user",
+                "design_request",
             },
         )
 
@@ -6979,6 +6980,46 @@ class VisualCheckTests(unittest.TestCase):
             self.assertEqual(d["resultPath"], f"{out['directiveId']}.json")
             self.assertNotIn("html_path", d)
             self.assertNotIn("parent_agent_id", d)
+
+    def test_design_request_in_tool_schema_and_allowed_for_orchestrator_and_coder(self):
+        from oracle.server import aspis_mcp
+        from oracle.server import mcp_handler
+
+        self.assertIn("design_request", {tool["name"] for tool in aspis_mcp.TOOLS})
+        self.assertIn("design_request", {tool["name"] for tool in mcp_handler.TOOLS})
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        orchestrator = next(r for r in ROLE_RULES if r["role"] == "orchestrator")
+        self.assertIn("design_request", coder["allowedTools"])
+        self.assertIn("design_request", orchestrator["allowedTools"])
+
+    def test_design_request_writes_pending_directive_camel_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.DESIGN_REQUEST_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "design_request",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "prompt": "a billing dashboard with usage metering",
+                        "context": "task 5 of the Stripe plan",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertIn("directiveId", out)
+            self.assertIn("did not start", out["error"])
+            directives = self._read_state(root)["designRequestDirectives"]
+            self.assertEqual(len(directives), 1)
+            d = directives[0]
+            self.assertEqual(d["id"], out["directiveId"])
+            self.assertEqual(d["parentAgentId"], "codex")
+            self.assertEqual(d["prompt"], "a billing dashboard with usage metering")
+            self.assertEqual(d["planContext"], "task 5 of the Stripe plan")
+            self.assertEqual(d["status"], "failed")
+            self.assertNotIn("parent_agent_id", d)
+            self.assertNotIn("plan_context", d)
 
     def test_visual_check_poll_returns_critique_without_holding_lock(self):
         import threading
