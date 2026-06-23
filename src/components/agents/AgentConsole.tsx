@@ -535,7 +535,9 @@ function TimelineRow({
         ) : null}
         <span
           className={`relative z-[1] mt-1 h-[9px] w-[9px] rounded-full border-2 ${nodeRingClass(
-            entry.type === "webSearch" ? undefined : entry.node,
+            entry.type === "webSearch" || entry.type === "chat"
+              ? undefined
+              : entry.node,
           )}`}
           aria-hidden
         />
@@ -548,6 +550,11 @@ function TimelineRow({
             <span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-terracotta/40 bg-terracotta/10 px-2.5 text-[10.5px] font-semibold text-terracotta">
               <span className="h-[5px] w-[5px] rounded-full bg-current" />
               Web
+            </span>
+          ) : entry.type === "chat" ? (
+            <span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-cream-300 bg-cream-100 px-2.5 text-[10.5px] font-semibold text-cream-700">
+              <span className="h-[5px] w-[5px] rounded-full bg-current" />
+              {entry.role === "user" ? "You" : "Orchestrator"}
             </span>
           ) : (
             <span className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-teal/40 bg-teal/15 px-2.5 text-[10.5px] font-semibold text-teal-dark">

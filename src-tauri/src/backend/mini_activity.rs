@@ -259,6 +259,13 @@ pub enum ConsoleEntry {
         pages: Vec<PageEntry>,
         time: String,
     },
+    /// A conversational chat turn (the planner chat): `role` is "assistant" (the
+    /// orchestrator talking) or "user" (a steer echoed back) + the message text.
+    Chat {
+        role: String,
+        text: String,
+        time: String,
+    },
 }
 
 /// One web page surfaced by a `websearch` bridge event: source url + title + a
@@ -505,6 +512,24 @@ pub fn push_websearch(
     entries.push(ConsoleEntry::WebSearch {
         query: query.to_string(),
         pages,
+        time: time.to_string(),
+    });
+    if entries.len() > MAX_ENTRIES_PER_AGENT {
+        let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+        entries.drain(0..overflow);
+    }
+    activity.running = Some(true);
+    activity.run_count = Some(1);
+    activity.empty = None;
+}
+
+/// Append ONE `Chat` timeline entry (a conversational turn). Same FIFO cap + live-state
+/// bookkeeping as [`push_coder_milestone`].
+pub fn push_chat(activity: &mut ConsoleActivity, role: &str, text: &str, time: &str) {
+    let entries = activity.entries.get_or_insert_with(Vec::new);
+    entries.push(ConsoleEntry::Chat {
+        role: role.to_string(),
+        text: text.to_string(),
         time: time.to_string(),
     });
     if entries.len() > MAX_ENTRIES_PER_AGENT {
@@ -944,9 +969,47 @@ fn parse_websearch_line(line: &str) -> Option<(String, Vec<PageEntry>)> {
     Some((query, pages))
 }
 
+/// The `chat` bridge event wire shape.
+#[derive(Deserialize)]
+struct ChatEvent {
+    kind: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    text: String,
+}
+
+/// Parse ONE file line into a `(role, text)` chat turn, or `None` to SKIP (blank,
+/// oversized, non-JSON, not `kind == "chat"`, or an unknown role). Pure + total. Role
+/// is normalized to "assistant"/"user" (anything else is dropped); text re-capped.
+fn parse_chat_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: ChatEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "chat" {
+        return None;
+    }
+    let role = match event.role.as_str() {
+        "assistant" => "assistant",
+        "user" => "user",
+        _ => return None,
+    };
+    let text: String = event.text.chars().take(CHAT_TEXT_CAP).collect();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some((role.to_string(), text))
+}
+
 /// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
 /// because the file is untrusted input the host reads back.
 const MILESTONE_TEXT_CAP: usize = 200;
+
+/// Host-side cap for a `chat` turn's text (chars) — matches the writer's larger chat cap.
+/// A chat reply is prose, not a basename+verb label, so 200 would truncate it mid-sentence.
+const CHAT_TEXT_CAP: usize = 2000;
 
 /// A short local clock stamp (`HH:MM:SS`) for the milestone's `time` field, so the live
 /// timeline shows WHEN each phase arrived. Local time matches the user's wall clock.
@@ -1180,6 +1243,13 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
                             let time = now_clock();
                             store.update(&app, &agent_id, |a| {
                                 push_websearch(a, &query, pages, &time)
+                            });
+                        }
+                    } else if let Some((role, text)) = parse_chat_line(&line) {
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            let time = now_clock();
+                            store.update(&app, &agent_id, |a| {
+                                push_chat(a, &role, &text, &time)
                             });
                         }
                     }
@@ -1556,6 +1626,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_push_chat_round_trips() {
+        let line = r#"{"kind":"chat","role":"assistant","text":"I drafted a 6-task plan."}"#;
+        let (role, text) = parse_chat_line(line).expect("parses a chat line");
+        assert_eq!(role, "assistant");
+        assert_eq!(text, "I drafted a 6-task plan.");
+        // wrong kind / unknown role / blank text / bad json -> None
+        assert!(parse_chat_line(r#"{"kind":"milestone","text":"x"}"#).is_none());
+        assert!(parse_chat_line(r#"{"kind":"chat","role":"system","text":"x"}"#).is_none());
+        assert!(parse_chat_line(r#"{"kind":"chat","role":"user","text":"   "}"#).is_none());
+        assert!(parse_chat_line("not json").is_none());
+        // push appends a Chat entry + marks live
+        let mut a = ConsoleActivity::empty();
+        push_chat(&mut a, &role, &text, "14:00:00");
+        assert_eq!(a.running, Some(true));
+        match &a.entries.as_ref().unwrap()[0] {
+            ConsoleEntry::Chat { role: r, text: t, .. } => {
+                assert_eq!(r, "assistant");
+                assert_eq!(t, "I drafted a 6-task plan.");
+            }
+            _ => panic!("expected a chat entry"),
+        }
+    }
+
+    #[test]
     fn resume_retry_round_rebuilds_when_history_lost() {
         // FIX 3 defensive arm: if the predecessor console was evicted/lost (no entries), the
         // resume must reseed a fresh console rather than leave an empty resting state.
@@ -1883,6 +1977,7 @@ mod tests {
                 ConsoleEntry::Coder { text, .. } => text.as_str(),
                 ConsoleEntry::Spawn { text, .. } => text.as_str(),
                 ConsoleEntry::WebSearch { query, .. } => query.as_str(),
+                ConsoleEntry::Chat { text, .. } => text.as_str(),
             })
             .collect();
         assert_eq!(

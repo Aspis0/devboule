@@ -28,7 +28,6 @@ export const StagePlan = ({ cards }: { cards: PlanCard[] }) => {
               borderRadius: 9,
               padding: '8px 10px',
             };
-            cardStyle.animation = `pp-crystal .6s ease-out both ${delay}`;
           } else if (isForming) {
             cardStyle = {
               ...cardStyle,
@@ -45,9 +44,13 @@ export const StagePlan = ({ cards }: { cards: PlanCard[] }) => {
               border: '1px dashed #E0D6C5',
               borderRadius: 9,
               padding: '8px 10px',
-              opacity: 0.55,
             };
           }
+          // EVERY card crystallizes in (staggered) when the Plan view mounts — not just
+          // 'done' ones, so a fresh plan's todo/wip cards also appear gradually. The
+          // pending look comes from its dim border/badge/text colors (not opacity, which
+          // pp-crystal's 0→1 would override).
+          cardStyle.animation = `pp-crystal .6s ease-out both ${delay}`;
 
           const badgeBg = isDone ? '#C0894F' : isForming ? '#F1E4D2' : '#F1ECE2';
           const badgeColor = isDone ? '#FBF6EF' : isForming ? '#C0894F' : '#B3AB9C';

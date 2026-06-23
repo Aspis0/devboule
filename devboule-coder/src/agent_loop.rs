@@ -142,6 +142,11 @@ pub trait ToolExecutor: Send + Sync {
     fn drain_steer(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Emit ONE conversational chat turn to the planner chat (role = "assistant" for the
+    /// orchestrator's own words, "user" for an echoed steer). Default NO-OP: only
+    /// [`crate::executor::RealExecutor`] with a live activity bridge surfaces it.
+    fn emit_chat(&self, _role: &str, _text: &str) {}
 }
 
 /// The result every [`StubExecutor`] tool dispatch returns: an UNMISTAKABLE
@@ -350,6 +355,7 @@ pub async fn run_burst(
         // course-correction). Empty for every non-steered burst (no DEVBOULE_STEER_FILE).
         for msg in executor.drain_steer() {
             emit(progress_tx, format!("💬 steer: {}", elide(&msg))).await;
+            executor.emit_chat("user", &msg);
             transcript.push_human(msg);
         }
 
@@ -399,10 +405,15 @@ pub async fn run_burst(
                 match &action {
                     AgentAction::Done { reply } => {
                         emit(progress_tx, format!("✓ done: {}", elide(reply))).await;
+                        // The orchestrator's closing words → an assistant chat bubble.
+                        executor.emit_chat("assistant", reply);
                         return BurstOutcome::Done(reply.clone());
                     }
                     AgentAction::AskUser { question } => {
                         emit(progress_tx, format!("❓ {}", elide(question))).await;
+                        // The orchestrator's question → an assistant chat bubble (the user
+                        // answers it via the chat composer → steer → continues).
+                        executor.emit_chat("assistant", question);
                         return BurstOutcome::AskUser(question.clone());
                     }
                     AgentAction::Escalate { reason } => {

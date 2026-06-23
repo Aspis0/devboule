@@ -1,6 +1,6 @@
 import type { ProjectTask } from "../../../types/backend";
 import type { DesignProjectEntry } from "../../../types/design";
-import type { ConsoleEntry } from "../../agents/agentConsoleModel";
+import type { ConsoleEntry, ChatEntry } from "../../agents/agentConsoleModel";
 
 export type StageView = 'exa' | 'plan' | 'design';
 
@@ -87,6 +87,14 @@ export function pickProjectDesign(
   }
 
   return best;
+}
+
+/** Map the orchestrator's chat console entries to planner chat bubbles, in order
+ *  (skips non-chat entries). The real two-way conversation surfaced from the bridge. */
+export function chatMessages(entries: ConsoleEntry[] | undefined): PlannerMessage[] {
+  return (entries ?? [])
+    .filter((e): e is ChatEntry => e.type === "chat")
+    .map((e) => ({ role: e.role, text: e.text }));
 }
 
 export interface PlannerWeb {

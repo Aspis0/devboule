@@ -115,12 +115,62 @@ async fn run_once(prompt: String) -> std::io::Result<()> {
     println!("prompt: {prompt}");
     println!("--- transcript ---");
 
+    // Surface the launch goal as the FIRST user chat turn (so the panel chat shows the
+    // user side from the bridge, in order, like every later steer).
+    runtime.executor.emit_chat("user", &prompt);
+
+    // CONVERSATION LOOP: run a burst; if the orchestrator ASKS the user, stay alive and
+    // wait for the answer (delivered via the steer inbox), then continue with the answer
+    // folded into the running conversation. Done/Escalated ends the session. This is what
+    // makes the chat a real back-and-forth instead of a one-shot that exits on a question.
+    let mut conversation = prompt;
+    loop {
+        let outcome = run_one_burst(&runtime, conversation.clone()).await?;
+        println!("--- outcome ---");
+        match outcome {
+            BurstOutcome::Done(reply) => {
+                println!("DONE: {reply}");
+                break;
+            }
+            BurstOutcome::Escalated(reason) => {
+                println!("ESCALATED: {reason}");
+                break;
+            }
+            BurstOutcome::AskUser(question) => {
+                // The question was already emitted as an assistant chat bubble by the
+                // burst. Wait (alive) for the user's reply via the steer inbox.
+                println!("ASK_USER: {question}");
+                match wait_for_steer_reply(&runtime).await {
+                    Some(answer) => {
+                        runtime.executor.emit_chat("user", &answer);
+                        conversation = format!(
+                            "{conversation}\n\n[You asked the user: {question}]\n[User answered: {answer}]\n\nContinue from here.",
+                        );
+                        println!("--- continuing with the user's reply ---");
+                    }
+                    None => {
+                        println!("(no reply received before the wait window elapsed — ending)");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run ONE burst for `human`, draining its progress to stdout live, returning the
+/// terminal outcome. Factored out so the conversation loop can run several in sequence.
+async fn run_one_burst(
+    runtime: &Arc<config::Runtime>,
+    human: String,
+) -> std::io::Result<BurstOutcome> {
     let (tx, mut rx) = mpsc::channel::<String>(CHUNK_BUFFER);
-    let burst_runtime = Arc::clone(&runtime);
+    let burst_runtime = Arc::clone(runtime);
     let burst = tokio::spawn(async move {
         let clock = SystemClock::start_now();
         run_burst(
-            prompt,
+            human,
             burst_runtime.model.as_ref(),
             burst_runtime.executor.as_ref(),
             &clock,
@@ -129,29 +179,35 @@ async fn run_once(prompt: String) -> std::io::Result<()> {
             &tx,
         )
         .await
-        // `tx` drops here -> the drain loop below sees the channel close and ends.
     });
-
-    // Drain progress lines live. Each already carries a trailing newline (the
-    // burst's `emit` appends one), so print WITHOUT an extra newline.
     while let Some(line) = rx.recv().await {
         print!("{line}");
     }
-
-    // The burst task cannot panic (run_burst has no panic path) but join is
-    // fallible in principle; surface a join failure as an IO error rather than
-    // unwrapping.
-    let outcome = burst
+    burst
         .await
-        .map_err(|e| std::io::Error::other(format!("burst task failed: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("burst task failed: {e}")))
+}
 
-    println!("--- outcome ---");
-    match &outcome {
-        BurstOutcome::Done(reply) => println!("DONE: {reply}"),
-        BurstOutcome::AskUser(question) => println!("ASK_USER: {question}"),
-        BurstOutcome::Escalated(reason) => println!("ESCALATED: {reason}"),
+/// How long the orchestrator stays alive waiting for a steer reply after asking the user
+/// a question, before it gives up and ends the session.
+const STEER_REPLY_WAIT_SECS: u64 = 1800;
+
+/// Poll the steer inbox until the user sends a reply (or the wait window elapses). The
+/// process stays alive the whole time, so the chat composer can deliver the answer. If
+/// several lines arrive together they are joined (the user's multi-line answer).
+async fn wait_for_steer_reply(runtime: &Arc<config::Runtime>) -> Option<String> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(STEER_REPLY_WAIT_SECS);
+    loop {
+        let msgs = runtime.executor.drain_steer();
+        if !msgs.is_empty() {
+            return Some(msgs.join("\n"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
-    Ok(())
 }
 
 async fn run(guard: &mut TerminalGuard, runtime: Arc<Runtime>) -> std::io::Result<()> {

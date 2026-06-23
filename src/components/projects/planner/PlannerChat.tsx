@@ -23,11 +23,15 @@ export function PlannerChat({
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) {
+    if (!el) return;
+    // Only auto-scroll if the user is ALREADY near the bottom — otherwise a 300ms
+    // activity poll (which re-renders this list) would yank them back down while they
+    // scroll up to read history. Depend on the array identity + last-message length so
+    // streaming (text appended in place) also keeps a pinned view pinned.
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (nearBottom) {
       el.scrollTop = el.scrollHeight;
     }
-    // Depend on the message array identity + last-message length so streaming
-    // (text appended in place to the last entry) also keeps the view pinned.
   }, [messages, messages[messages.length - 1]?.text.length, awaitingReply]);
 
   const send = () => {

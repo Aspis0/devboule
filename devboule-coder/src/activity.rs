@@ -40,6 +40,11 @@ const ENV_ACTIVITY_FILE: &str = "DEVBOULE_ACTIVITY_FILE";
 /// payload tiny. A label longer than this is char-truncated (never split mid-codepoint).
 const MAX_TEXT_CHARS: usize = 200;
 
+/// Hard cap on a `chat` turn's `text` (chars). Much larger than [`MAX_TEXT_CHARS`]: a
+/// milestone is a basename+verb LABEL, but a chat message is the orchestrator's prose
+/// reply (a plan summary, an answer) — 200 would truncate it mid-sentence.
+const MAX_CHAT_TEXT_CHARS: usize = 2000;
+
 /// The timeline node style for a milestone — mirrors the host's `NodeStyle` /
 /// the frontend `ConsoleEntry["node"]` union (`"" | "dot" | "sage" | "terra"`).
 /// `Hollow` serializes to the empty string. There is NO "coral" node in the wire
@@ -150,6 +155,24 @@ impl Activity {
             let _ = file.write_all(line.as_bytes());
         }
     }
+
+    /// Append ONE `chat` turn (a conversational message in the planner chat): `role` is
+    /// "assistant" (the orchestrator talking) or "user" (a steer echoed back). Same
+    /// best-effort contract as [`milestone`]. This is what makes the panel chat a real
+    /// two-way conversation instead of a one-way steer.
+    pub fn chat(&self, role: &str, text: &str) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let line = encode_chat(role, text);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// Serialize ONE milestone event to its single-line JSON form, `text` char-capped to
@@ -188,6 +211,25 @@ fn encode_websearch(query: &str, pages: &[ExaPage]) -> String {
         "kind": "websearch",
         "query": capped,
         "pages": pages,
+    });
+    let mut line = value.to_string();
+    line.push('\n');
+    line
+}
+
+/// Serialize ONE `chat` turn to single-line JSON:
+/// `{"kind":"chat","role":"assistant"|"user","text":"…"}` + `\n`. `text` is char-capped
+/// to [`MAX_TEXT_CHARS`] (codepoint-safe); `role` is not capped.
+fn encode_chat(role: &str, text: &str) -> String {
+    let capped: String = if text.chars().count() > MAX_CHAT_TEXT_CHARS {
+        text.chars().take(MAX_CHAT_TEXT_CHARS).collect()
+    } else {
+        text.to_string()
+    };
+    let value = serde_json::json!({
+        "kind": "chat",
+        "role": role,
+        "text": capped,
     });
     let mut line = value.to_string();
     line.push('\n');
@@ -252,6 +294,28 @@ mod tests {
             MAX_TEXT_CHARS,
             "query char-capped, codepoint-safe"
         );
+    }
+
+    #[test]
+    fn encode_chat_is_one_line_with_role_and_capped_text() {
+        // A reply with an embedded newline must stay on ONE physical line.
+        let line = encode_chat("assistant", "I drafted a plan.\nReading the docs now.");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "exactly one physical line");
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["kind"], "chat");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["text"], "I drafted a plan.\nReading the docs now.");
+
+        // Text is char-capped at the larger CHAT cap (codepoint-safe).
+        let long = "é".repeat(MAX_CHAT_TEXT_CHARS + 40);
+        let capped: Value =
+            serde_json::from_str(encode_chat("user", &long).trim_end()).unwrap();
+        assert_eq!(
+            capped["text"].as_str().unwrap().chars().count(),
+            MAX_CHAT_TEXT_CHARS,
+        );
+        assert_eq!(capped["role"], "user");
     }
 
     #[test]

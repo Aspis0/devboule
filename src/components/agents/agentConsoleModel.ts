@@ -163,8 +163,17 @@ export interface WebSearchEntry {
   time: string;
 }
 
+/** A conversational chat turn surfaced into the planner chat: the orchestrator's own
+ *  words (`assistant`) or a steer echoed back (`user`). Mirrors the backend `Chat` entry. */
+export interface ChatEntry {
+  type: "chat";
+  role: "assistant" | "user";
+  text: string;
+  time: string;
+}
+
 /** A single top-level row of the timeline. */
-export type ConsoleEntry = CoderEntry | SpawnEntry | WebSearchEntry;
+export type ConsoleEntry = CoderEntry | SpawnEntry | WebSearchEntry | ChatEntry;
 
 // ---- the activity snapshot --------------------------------------------------
 

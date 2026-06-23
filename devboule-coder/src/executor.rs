@@ -774,6 +774,12 @@ impl ToolExecutor for RealExecutor {
         self.steer.drain()
     }
 
+    /// Surface a conversational chat turn through the activity bridge (no-op when no
+    /// `DEVBOULE_ACTIVITY_FILE`). Makes the planner chat a real two-way conversation.
+    fn emit_chat(&self, role: &str, text: &str) {
+        self.activity.chat(role, text);
+    }
+
     async fn execute(&self, action: &AgentAction) -> ToolResult {
         match action {
             // --- MCP backend: private/grounded Oracle + write delegation ------

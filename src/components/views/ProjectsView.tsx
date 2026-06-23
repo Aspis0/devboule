@@ -23,6 +23,7 @@ import {
   derivePlanCards,
   latestWeb,
   pickProjectDesign,
+  chatMessages,
 } from "../projects/planner/plannerModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import type { PlannerMessage } from "../projects/planner/plannerModel";
@@ -778,6 +779,27 @@ export function ProjectsView() {
     () => latestWeb(orchestratorConsole.entries),
     [orchestratorConsole.entries],
   );
+
+  // The planner chat = the REAL conversation from the bridge (the orchestrator's
+  // assistant turns + its echoed user steers) PLUS any just-sent user message not yet
+  // echoed back (optimistic, deduped by text once the bridge catches up).
+  const plannerConvo = useMemo(() => {
+    const real = chatMessages(orchestratorConsole.entries);
+    // The orchestrator echoes EACH user turn (the launch goal + every steer) back as a
+    // user chat entry. Show the optimistic user messages BEYOND the count already echoed
+    // — a position watermark, NOT a text match, so repeated messages ("yes"/"continue")
+    // are never wrongly dropped. plannerMessages holds only user turns, in send order.
+    const echoedUserCount = real.filter((m) => m.role === "user").length;
+    const pending = plannerMessages.slice(echoedUserCount);
+    return [...real, ...pending];
+  }, [orchestratorConsole.entries, plannerMessages]);
+
+  // "Awaiting your reply": the orchestrator spoke last and is live → your turn. Drives the
+  // PlannerChat pill so the user knows to respond (esp. after an AskUser question).
+  const plannerAwaitingReply =
+    !!orchestratorAgentId &&
+    plannerConvo.length > 0 &&
+    plannerConvo[plannerConvo.length - 1].role === "assistant";
 
   // Load the project's most-recent design for the planner's read-only Design tab:
   // registry -> pick the entry at/under the project root -> its thumbnail (a data: URI).
@@ -2342,8 +2364,8 @@ export function ProjectsView() {
             design={plannerDesign}
             linkedTask={null}
             onOpenInDesign={() => requestView("design")}
-            messages={plannerMessages}
-            awaitingReply={false}
+            messages={plannerConvo}
+            awaitingReply={plannerAwaitingReply}
             onSend={(text) => {
               const msg = text.trim();
               if (!msg) return;

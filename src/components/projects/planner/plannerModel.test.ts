@@ -4,8 +4,10 @@ import {
   pageHostname,
   stripLabel,
   pickProjectDesign,
+  chatMessages,
   type PlanCard,
 } from "./plannerModel";
+import type { ConsoleEntry } from "../../agents/agentConsoleModel";
 import type { ProjectTask } from "../../../types/backend";
 import type { DesignProjectEntry } from "../../../types/design";
 
@@ -20,6 +22,28 @@ function designEntry(over: Partial<DesignProjectEntry>): DesignProjectEntry {
     ...over,
   };
 }
+
+describe("chatMessages", () => {
+  it("keeps only chat entries, in order, mapping role+text", () => {
+    const entries: ConsoleEntry[] = [
+      { type: "coder", text: "Planning: 3 files", time: "1" },
+      { type: "chat", role: "user", text: "build OAuth", time: "2" },
+      { type: "webSearch", query: "oauth", pages: [], time: "3" },
+      { type: "chat", role: "assistant", text: "On it — drafting a plan.", time: "4" },
+    ];
+    expect(chatMessages(entries)).toEqual([
+      { role: "user", text: "build OAuth" },
+      { role: "assistant", text: "On it — drafting a plan." },
+    ]);
+  });
+
+  it("returns [] for undefined / no chat entries", () => {
+    expect(chatMessages(undefined)).toEqual([]);
+    expect(
+      chatMessages([{ type: "coder", text: "x", time: "1" }]),
+    ).toEqual([]);
+  });
+});
 
 describe("pickProjectDesign", () => {
   it("returns null for no root or no entries", () => {
