@@ -181,6 +181,10 @@ export function ProjectsView() {
   // Planner panel (Plan Mode) controls — lifted from the old OrchestratorHeroCard so
   // the choices survive (coder hand-off, auto-create, websearch auto/manual).
   const [plannerCoderId, setPlannerCoderId] = useState<string>("claude");
+  // Which backend runs as the ORCHESTRATOR (who you talk to). "orchestrator" = local Devboule
+  // (our Stage/TUI); "claude"/"codex" run their own CLI (we show their terminal). Default local.
+  const [plannerOrchestratorClient, setPlannerOrchestratorClient] =
+    useState<string>("orchestrator");
   const [plannerAutoCreate, setPlannerAutoCreate] = useState<boolean>(true);
   const [plannerWebMode, setPlannerWebMode] = useState<"auto" | "manual">("auto");
   // The chat transcript + active goal echo shown in the planner panel. P0 seeds them
@@ -1781,11 +1785,14 @@ export function ProjectsView() {
       await launchFromSpawnPanel({
         projectId: detail.metadata.id,
         role: "coder",
-        client: "orchestrator",
+        // The chosen orchestrator backend: local Devboule ("orchestrator") or a cloud CLI
+        // ("claude"/"codex"). plan-first is a local-orchestrator concept; cloud CLIs drive
+        // their own loop, so only gate it on local.
+        client: plannerOrchestratorClient,
         taskId: null,
         host: "app",
         model: null,
-        planFirst: true,
+        planFirst: plannerOrchestratorClient === "orchestrator",
         initialGoal: goal,
         autoCreate,
       });
@@ -1829,11 +1836,11 @@ export function ProjectsView() {
       await launchFromSpawnPanel({
         projectId: currentProject.metadata.id,
         role: "coder",
-        client: "orchestrator",
+        client: plannerOrchestratorClient,
         taskId: null,
         host: "app",
         model: null,
-        planFirst: true,
+        planFirst: plannerOrchestratorClient === "orchestrator",
         // The typed goal now reaches the planner directly (DEVBOULE_GOAL — the orchestrator runs it
         // headless, plan-first); the note above is kept only as an audit trail. auto-create rides too.
         initialGoal: goal,
@@ -2565,6 +2572,13 @@ export function ProjectsView() {
               setPlannerGoal(msg);
               void planWithOrchestrator(msg, plannerCoderId, plannerAutoCreate);
             }}
+            orchestrators={[
+              { id: "orchestrator", label: "Local" },
+              { id: "claude", label: "Claude" },
+              { id: "codex", label: "Codex" },
+            ]}
+            orchestratorId={plannerOrchestratorClient}
+            onOrchestratorChange={setPlannerOrchestratorClient}
             coders={[
               { id: "claude", label: "Claude" },
               { id: "codex", label: "Codex" },

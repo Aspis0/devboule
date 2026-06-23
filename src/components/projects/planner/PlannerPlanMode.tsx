@@ -3,7 +3,6 @@ import gsap from "gsap";
 import { Search, ListOrdered, LayoutDashboard } from "lucide-react";
 import "./planner.css";
 import { useStageRotation } from "./useStageRotation";
-import { stripLabel } from "./plannerModel";
 import type { PlanCard, StagePage, StageFinding, PlannerMessage } from "./plannerModel";
 import { StageWebsearch } from "./StageWebsearch";
 import { StagePlan } from "./StagePlan";
@@ -28,6 +27,12 @@ interface PlannerPlanModeProps {
   messages: PlannerMessage[];
   awaitingReply: boolean;
   onSend: (text: string) => void;
+  // Orchestrator backend selector — who you TALK TO (the planner). Replaces the redundant
+  // status strip (searching/planning/designing duplicated the view tabs). The active one
+  // pulses. Local = our Stage/TUI; Claude/Codex run their own CLI (their terminal is shown).
+  orchestrators: { id: string; label: string }[];
+  orchestratorId: string;
+  onOrchestratorChange: (id: string) => void;
   // Hand-off + auto-create controls (preserved from the old composer — never strip choices).
   coders: { id: string; label: string }[];
   coderId: string;
@@ -54,6 +59,9 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     messages,
     awaitingReply,
     onSend,
+    orchestrators,
+    orchestratorId,
+    onOrchestratorChange,
     coders,
     coderId,
     onCoderChange,
@@ -88,9 +96,6 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
       gsap.set(el, { clearProps: 'opacity,transform' });
     };
   }, []);
-
-  const labels: Array<'searching' | 'planning' | 'designing'> = ['searching', 'planning', 'designing'];
-  const currentLabel = stripLabel(view);
 
   return (
     <div
@@ -163,7 +168,9 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           </div>
         )}
 
-        {/* 2) State Strip */}
+        {/* 2) Orchestrator selector — WHO YOU TALK TO. Replaces the old status strip
+            (searching/planning/designing duplicated the view tabs below). The active backend
+            pulses while it's live. Local = our Stage; Claude/Codex run their own CLI. */}
         <div
           style={{
             display: 'flex',
@@ -171,12 +178,20 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
             gap: 7,
           }}
         >
-          {labels.map((label) => {
-            const isActive = currentLabel === label;
+          <span
+            className="pp-mono"
+            style={{ fontSize: 10, color: '#A89F90', marginRight: 1 }}
+          >
+            orchestrator
+          </span>
+          {orchestrators.map((o) => {
+            const isActive = o.id === orchestratorId;
             return (
-              <div
+              <button
+                type="button"
                 className="pp-mono"
-                key={label}
+                key={o.id}
+                onClick={() => onOrchestratorChange(o.id)}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -184,11 +199,12 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                   fontSize: 10.5,
                   borderRadius: 8,
                   padding: '5px 9px',
+                  cursor: 'pointer',
                   fontWeight: isActive ? 600 : 400,
                   color: isActive ? '#9A6A2E' : '#A89F90',
                   background: isActive ? '#F1E4D2' : '#fff',
                   border: isActive ? '1px solid #E6D3BB' : '1px solid #ECE6DB',
-                  animation: isActive ? 'pp-pulse 1.9s infinite' : 'none',
+                  animation: isActive && live ? 'pp-pulse 1.9s infinite' : 'none',
                 }}
               >
                 <div
@@ -199,8 +215,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                     background: isActive ? '#C0894F' : '#CFC6B6',
                   }}
                 />
-                <span>{label}</span>
-              </div>
+                <span>{o.label}</span>
+              </button>
             );
           })}
         </div>

@@ -151,6 +151,54 @@ project's agent activity (e.g. a baseline ref captured when the agent starts, or
 own commits), not a raw working-tree `git diff`.
 **Severity:** medium (correctness of a good feature).
 
+### B14 — Liveness in the chat TUI: streaming + "thinking/working" indicators
+**What:** there's a noticeable wait between sending and the first reply (normal — model
+warmup + first token). The chat feels dead during it. Add liveness:
+- **B14a (quick win):** an immediate "thinking…/working" indicator the instant you send
+  (animated dots / "Planner is thinking…"), shown until the first token arrives. Frontend-only.
+  ⚠️ MUST be gated on the planner being ACTUALLY active (live OR launching) — a first naive
+  attempt keyed it on "last message is the user's", which wrongly showed it with no planner
+  running (e.g. after the session dies in B15). Thread a live/launching signal, don't infer
+  from the message list alone.
+- **B14b (bigger):** **token streaming** — render the reply token-by-token as it generates,
+  instead of one complete bubble at the end. Needs the orchestrator to emit incremental chat
+  DELTAS to the bridge (a `chat-delta` activity event), `mini_activity` to coalesce them into
+  the live chat entry, and `PlannerChat` to render the growing text. The design pipeline
+  already streams (`startDesignGeneration` onText accumulates) — reuse that shape for chat.
+- Optional: small status lines for what the AI is doing (reading files, searching, planning)
+  — these already exist as milestones/websearch on the Stage; surface a compact form in/near
+  the chat too.
+**Where:** `PlannerChat.tsx` (indicator + incremental render); `devboule-coder` burst
+(emit chat deltas) + `mini_activity.rs` (coalesce) for streaming.
+**Severity:** medium (perceived performance / it feels alive).
+
+### B15 — Steering the live orchestrator kills it + the chat resets (history lost)  🔴 BLOCKER
+**What:** asked the live orchestrator a follow-up ("can you call the designer for design
+help?") → the orchestrator **turned off** (session ended), the **chat reset** (the prior
+replies vanished), and **no response**.
+**Two distinct failures:**
+- **(a) The steer ends the orchestrator** instead of continuing the conversation. The 2nd
+  turn kills it. Suspect: `run_once` `wait_for_steer_reply` (does it actually drain the steer
+  and continue, or time out / exit?), or the design-related turn crashing the burst. Needs
+  the activity file + whether the steer reached `DEVBOULE_STEER_FILE` and was drained.
+- **(b) The chat is bound to the LIVE session, so when it closes the conversation VANISHES.**
+  `plannerConvo` reads the bridge of the live `orchestratorAgentId`; when the session ends,
+  `orchestratorAgentId` → null → the bridge (assistant replies) disappears and the chat
+  collapses to just the optimistic user messages. The conversation must **persist from a
+  durable source** (the activity file / a stored transcript per project) regardless of whether
+  the orchestrator process is currently alive — like any chat app keeps history.
+**Severity:** BLOCKER (the conversation collapses on the second turn). Tightly coupled to B1
+(conversation-native) and B6 (binding). Likely fix B15b (durable transcript) + B1 together.
+
+### B16 — Designer-help request inside the conversation (the design_request loop)
+**What:** the user wants to ask the orchestrator, mid-conversation, to call the **designer**
+for help ("can you call design?"). This is exactly the Phase-B `design_request` flow — but it
+must work as a natural conversational request (the orchestrator decides to call the designer,
+the result lands in the Design view) without killing the session (see B15a).
+**Where:** Phase-B `design_request` (already built) + the orchestrator deciding to invoke it
+from the conversation; verify the design_request turn doesn't crash/exit the burst.
+**Severity:** medium (depends on B15a being fixed first).
+
 ---
 
 ## Suggested order
