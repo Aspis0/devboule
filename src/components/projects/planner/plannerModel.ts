@@ -1,4 +1,5 @@
 import type { ProjectTask } from "../../../types/backend";
+import type { DesignProjectEntry } from "../../../types/design";
 import type { ConsoleEntry } from "../../agents/agentConsoleModel";
 
 export type StageView = 'exa' | 'plan' | 'design';
@@ -56,6 +57,36 @@ export function pageHostname(url: string): string {
   } catch {
     return url.trim();
   }
+}
+
+/**
+ * Selects the most-recently opened design entry matching the given project root path.
+ * Matches a design at the root or in a folder UNDER it (exact path or `root + '/'`
+ * prefix — never a bare sibling like '/proj2' for root '/proj'). Pure + total.
+ */
+export function pickProjectDesign(
+  entries: DesignProjectEntry[],
+  rootPath: string | null,
+): DesignProjectEntry | null {
+  if (rootPath == null || rootPath === "" || entries.length === 0) {
+    return null;
+  }
+
+  let best: DesignProjectEntry | null = null;
+  const prefix = rootPath + "/";
+
+  for (const entry of entries) {
+    if (
+      entry.workingFolderPath === rootPath ||
+      entry.workingFolderPath.startsWith(prefix)
+    ) {
+      if (best === null || entry.lastOpenedAt > best.lastOpenedAt) {
+        best = entry;
+      }
+    }
+  }
+
+  return best;
 }
 
 export interface PlannerWeb {

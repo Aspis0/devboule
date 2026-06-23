@@ -3,9 +3,70 @@ import {
   derivePlanCards,
   pageHostname,
   stripLabel,
+  pickProjectDesign,
   type PlanCard,
 } from "./plannerModel";
 import type { ProjectTask } from "../../../types/backend";
+import type { DesignProjectEntry } from "../../../types/design";
+
+function designEntry(over: Partial<DesignProjectEntry>): DesignProjectEntry {
+  return {
+    id: "d",
+    name: "D",
+    workingFolderPath: "/proj",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    lastOpenedAt: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+describe("pickProjectDesign", () => {
+  it("returns null for no root or no entries", () => {
+    expect(pickProjectDesign([], "/proj")).toBeNull();
+    expect(pickProjectDesign([designEntry({})], null)).toBeNull();
+    expect(pickProjectDesign([designEntry({})], "")).toBeNull();
+  });
+
+  it("matches a design at the project root OR under it", () => {
+    const atRoot = designEntry({ id: "root", workingFolderPath: "/proj" });
+    const under = designEntry({ id: "under", workingFolderPath: "/proj/design" });
+    const other = designEntry({ id: "other", workingFolderPath: "/elsewhere" });
+    expect(pickProjectDesign([other, atRoot], "/proj")?.id).toBe("root");
+    expect(pickProjectDesign([other, under], "/proj")?.id).toBe("under");
+    expect(pickProjectDesign([other], "/proj")).toBeNull();
+  });
+
+  it("picks the most-recent match by lastOpenedAt", () => {
+    const older = designEntry({
+      id: "older",
+      workingFolderPath: "/proj",
+      lastOpenedAt: "2026-01-01T00:00:00Z",
+    });
+    const newer = designEntry({
+      id: "newer",
+      workingFolderPath: "/proj",
+      lastOpenedAt: "2026-06-01T00:00:00Z",
+    });
+    expect(pickProjectDesign([older, newer], "/proj")?.id).toBe("newer");
+    expect(pickProjectDesign([newer, older], "/proj")?.id).toBe("newer");
+  });
+
+  it("does not match a sibling whose path merely shares a prefix string", () => {
+    // '/proj2' must NOT match root '/proj' (prefix-string trap).
+    const sibling = designEntry({ id: "s", workingFolderPath: "/proj2" });
+    expect(pickProjectDesign([sibling], "/proj")).toBeNull();
+  });
+
+  it("still returns a sole match with an empty lastOpenedAt (legacy entry)", () => {
+    const legacy = designEntry({
+      id: "legacy",
+      workingFolderPath: "/proj",
+      lastOpenedAt: "",
+    });
+    expect(pickProjectDesign([legacy], "/proj")?.id).toBe("legacy");
+  });
+});
 
 // Minimal ProjectTask factory — only the fields derivePlanCards reads matter.
 function task(over: Partial<ProjectTask>): ProjectTask {

@@ -19,9 +19,14 @@ import {
 } from "../projects/projectStage";
 import { ProjectsBoard } from "../projects/ProjectsBoard";
 import { PlannerPlanMode } from "../projects/planner/PlannerPlanMode";
-import { derivePlanCards, latestWeb } from "../projects/planner/plannerModel";
+import {
+  derivePlanCards,
+  latestWeb,
+  pickProjectDesign,
+} from "../projects/planner/plannerModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import type { PlannerMessage } from "../projects/planner/plannerModel";
+import type { DesignProjectEntry } from "../../types/design";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
   CensorCountsTracker,
@@ -158,7 +163,7 @@ function taskMoveTargets(task: ProjectTask) {
 const PLANNER_NOOP = () => {};
 
 export function ProjectsView() {
-  const { pendingTab, config } = useAppContext();
+  const { pendingTab, config, requestView } = useAppContext();
   const { consumePendingTab } = useAppActions();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   // Open Censor finding count per project id, fed by an event-driven tracker (NO
@@ -184,6 +189,13 @@ export function ProjectsView() {
   // optimistically on send; P2 replaces them with the orchestrator's live transcript.
   const [plannerMessages, setPlannerMessages] = useState<PlannerMessage[]>([]);
   const [plannerGoal, setPlannerGoal] = useState<string | null>(null);
+  // The project's most-recent design (read-only preview in the planner's Design tab).
+  const [plannerDesign, setPlannerDesign] = useState<{
+    name: string;
+    version: string | null;
+    ago: string | null;
+    thumbnailUri: string | null;
+  } | null>(null);
   // Frecce (Phase 17): show/hide the dependency-arrow overlay on the task board.
   const [showArrows, setShowArrows] = useState(true);
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -764,6 +776,56 @@ export function ProjectsView() {
     () => latestWeb(orchestratorConsole.entries),
     [orchestratorConsole.entries],
   );
+
+  // Load the project's most-recent design for the planner's read-only Design tab:
+  // registry -> pick the entry at/under the project root -> its thumbnail (a data: URI).
+  // Re-runs when the selected project's root changes; the cancel flag drops a stale
+  // in-flight load when the selection changes again.
+  useEffect(() => {
+    const rootPath = currentProject?.metadata.rootPath ?? null;
+    if (!rootPath) {
+      setPlannerDesign(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const entries = await invokeBackendCommand<DesignProjectEntry[]>(
+          "design_registry_list",
+        );
+        const entry = pickProjectDesign(entries ?? [], rootPath);
+        if (!entry) {
+          if (!cancelled) setPlannerDesign(null);
+          return;
+        }
+        // The selection changed while the registry was loading — drop this stale load
+        // before firing a second (thumbnail) IPC for a project we no longer show.
+        if (cancelled) return;
+        let thumbnailUri: string | null = null;
+        try {
+          thumbnailUri = await invokeBackendCommand<string | null>(
+            "design_read_thumbnail",
+            { workingFolderPath: entry.workingFolderPath },
+          );
+        } catch {
+          thumbnailUri = null;
+        }
+        if (!cancelled) {
+          setPlannerDesign({
+            name: entry.name,
+            version: null,
+            ago: entry.updatedAt ? entry.updatedAt.slice(0, 10) : null,
+            thumbnailUri,
+          });
+        }
+      } catch {
+        if (!cancelled) setPlannerDesign(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProject?.metadata.rootPath]);
 
   useEffect(() => {
     if (!agentState) return;
@@ -2256,9 +2318,9 @@ export function ProjectsView() {
             webMode={plannerWebMode}
             onWebModeChange={setPlannerWebMode}
             onManualSearch={PLANNER_NOOP}
-            design={null}
+            design={plannerDesign}
             linkedTask={null}
-            onOpenInDesign={PLANNER_NOOP}
+            onOpenInDesign={() => requestView("design")}
             messages={plannerMessages}
             awaitingReply={false}
             onSend={(text) => {
