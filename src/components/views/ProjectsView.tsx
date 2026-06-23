@@ -18,7 +18,13 @@ import {
   stageTone,
 } from "../projects/projectStage";
 import { ProjectsBoard } from "../projects/ProjectsBoard";
-import { OrchestratorHeroCard } from "../projects/OrchestratorHeroCard";
+import { PlannerPlanMode } from "../projects/planner/PlannerPlanMode";
+import { derivePlanCards } from "../projects/planner/plannerModel";
+import type {
+  PlannerMessage,
+  StagePage,
+  StageFinding,
+} from "../projects/planner/plannerModel";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
   CensorCountsTracker,
@@ -150,6 +156,12 @@ function taskMoveTargets(task: ProjectTask) {
   );
 }
 
+// Stable references for the planner panel's not-yet-wired props (P1/P3 fill these).
+// Module-level so they keep identity across renders and don't defeat PlannerPlanMode's memo.
+const PLANNER_NO_PAGES: StagePage[] = [];
+const PLANNER_NO_FINDINGS: StageFinding[] = [];
+const PLANNER_NOOP = () => {};
+
 export function ProjectsView() {
   const { pendingTab, config } = useAppContext();
   const { consumePendingTab } = useAppActions();
@@ -168,6 +180,15 @@ export function ProjectsView() {
   // (default) vs. a simple read-only list of archived projects. Purely a view
   // sub-state of board mode; it never affects Work mode or the selection.
   const [overviewTab, setOverviewTab] = useState<"board" | "archived">("board");
+  // Planner panel (Plan Mode) controls — lifted from the old OrchestratorHeroCard so
+  // the choices survive (coder hand-off, auto-create, websearch auto/manual).
+  const [plannerCoderId, setPlannerCoderId] = useState<string>("claude");
+  const [plannerAutoCreate, setPlannerAutoCreate] = useState<boolean>(true);
+  const [plannerWebMode, setPlannerWebMode] = useState<"auto" | "manual">("auto");
+  // The chat transcript + active goal echo shown in the planner panel. P0 seeds them
+  // optimistically on send; P2 replaces them with the orchestrator's live transcript.
+  const [plannerMessages, setPlannerMessages] = useState<PlannerMessage[]>([]);
+  const [plannerGoal, setPlannerGoal] = useState<string | null>(null);
   // Frecce (Phase 17): show/hide the dependency-arrow overlay on the task board.
   const [showArrows, setShowArrows] = useState(true);
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -2208,11 +2229,55 @@ export function ProjectsView() {
           {/* The Orchestrator composer — the centerpiece "describe a goal → plan → board" surface.
           Always visible; "Plan it" stays guarded until a project with a working folder is selected
           (the wiring to the existing plan-first flow lands in a follow-up). */}
-          <OrchestratorHeroCard
+          <PlannerPlanMode
             projectName={currentProject?.metadata.title ?? null}
             hasRoot={!!currentProject?.metadata.rootPath}
-            language={null}
-            plannerModel={config.localCoderBackend?.model ?? mainCoderClient}
+            goal={plannerGoal}
+            contextLabel={
+              currentProject?.metadata.rootPath
+                ?.split("/")
+                .filter(Boolean)
+                .pop() ?? ""
+            }
+            plannerModelLabel={config.localCoderBackend?.model ?? mainCoderClient}
+            live={currentProjectSessions.some(
+              (s) => s.client === "orchestrator" && s.host === "app",
+            )}
+            planCards={derivePlanCards(currentProject?.state.tasks ?? [])}
+            pages={PLANNER_NO_PAGES}
+            findings={PLANNER_NO_FINDINGS}
+            webMode={plannerWebMode}
+            onWebModeChange={setPlannerWebMode}
+            onManualSearch={PLANNER_NOOP}
+            design={null}
+            linkedTask={null}
+            onOpenInDesign={PLANNER_NOOP}
+            messages={plannerMessages}
+            awaitingReply={false}
+            onSend={(text) => {
+              // P0: the composer drives the existing "Plan it" flow. Echo the goal +
+              // message optimistically; live-steer + real pages/findings/design wire in
+              // later (P1/P2/P3).
+              const goal = text.trim();
+              if (!goal) return;
+              if (!currentProject?.metadata.rootPath) {
+                setError(
+                  "Select a project with a working folder before planning.",
+                );
+                return;
+              }
+              if (busyRef.current || orchestratorPlanRef.current) return;
+              setPlannerGoal(goal);
+              setPlannerMessages((prev) => [
+                ...prev,
+                { role: "user", text: goal },
+              ]);
+              void planWithOrchestrator(
+                goal,
+                plannerCoderId,
+                plannerAutoCreate,
+              );
+            }}
             coders={[
               { id: "claude", label: "Claude" },
               { id: "codex", label: "Codex" },
@@ -2221,10 +2286,10 @@ export function ProjectsView() {
                 label: c.label,
               })),
             ]}
-            busy={isBusy}
-            onPlan={(goal, coderId, autoCreate) =>
-              void planWithOrchestrator(goal, coderId, autoCreate)
-            }
+            coderId={plannerCoderId}
+            onCoderChange={setPlannerCoderId}
+            autoCreate={plannerAutoCreate}
+            onAutoCreateToggle={() => setPlannerAutoCreate((v) => !v)}
           />
 
           {/* Overview segmented toggle: the active stage board (default) vs. a simple
