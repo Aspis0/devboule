@@ -14,7 +14,7 @@ interface Props {
   plannerModel: string;
   coders: Coder[];
   busy?: boolean;
-  onPlan?: (goal: string, coderId: string) => void;
+  onPlan?: (goal: string, coderId: string, autoCreate: boolean) => void;
 }
 
 /**
@@ -35,11 +35,12 @@ export function OrchestratorHeroCard(props: Props) {
 
   const [goal, setGoal] = useState("");
   const [coderId, setCoderId] = useState(coders.length > 0 ? coders[0].id : "");
+  const [autoCreate, setAutoCreate] = useState(true);
 
   const submit = () => {
     const g = goal.trim();
     if (!g || !onPlan || !hasRoot || busy) return;
-    onPlan(g, coderId);
+    onPlan(g, coderId, autoCreate);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -109,12 +110,22 @@ export function OrchestratorHeroCard(props: Props) {
           >
             Planner: {plannerModel}
           </span>
-          <span
-            title="When you approve the orchestrator's plan, its tasks are added to the board automatically. You still review and approve the plan first."
-            className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] text-emerald-700"
+          <button
+            type="button"
+            onClick={() => setAutoCreate((v) => !v)}
+            title={
+              autoCreate
+                ? "On: when you approve the orchestrator's plan, its tasks are added to the board automatically (you still approve the plan first) — the current behaviour."
+                : "Off: don't auto-create tasks on approval. (Preference recorded; backend enforcement is being wired — see DEVBOULE_AUTO_CREATE.)"
+            }
+            className={`rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+              autoCreate
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-cream-200 bg-white text-cream-500 hover:bg-cream-50"
+            }`}
           >
-            auto-creates tasks on approval
-          </span>
+            auto-create tasks: {autoCreate ? "on" : "off"}
+          </button>
           <button
             type="button"
             onClick={submit}

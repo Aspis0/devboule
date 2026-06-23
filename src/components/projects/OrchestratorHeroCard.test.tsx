@@ -100,6 +100,6 @@ describe("OrchestratorHeroCard", () => {
     ) as HTMLButtonElement;
     act(() => codexChip.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     act(() => planButton().dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    expect(onPlan).toHaveBeenCalledWith("Add Stripe billing", "codex");
+    expect(onPlan).toHaveBeenCalledWith("Add Stripe billing", "codex", true);
   });
 });

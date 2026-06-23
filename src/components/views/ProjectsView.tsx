@@ -1521,6 +1521,41 @@ export function ProjectsView() {
     }
   };
 
+  // Orchestrator composer "Plan it": record the typed goal as a project note (the orchestrator
+  // reads project state), then launch the LOCAL orchestrator in plan-first mode — the SAME path as
+  // the SpawnPanel "Plan first" toggle (role "coder" + client "orchestrator" + planFirst). The
+  // drafted plan flows through the EXISTING plan-approval surface (bell / PlanApprovalCard); on
+  // approval its tasks land on the board. No new backend, no new approval UI.
+  const planWithOrchestrator = async (
+    goal: string,
+    coderId: string,
+    autoCreate: boolean,
+  ) => {
+    if (isArchived) return;
+    if (!currentProject?.metadata.rootPath || busyRef.current) return;
+    const note = `Orchestrator goal: ${goal}\n(hand off to: ${coderId} · auto-create tasks: ${autoCreate ? "on" : "off"})`;
+    const detail = await runMutation(() =>
+      invokeBackendCommand<ProjectDetail>("append_project_note", {
+        projectId: currentProject.metadata.id,
+        note: {
+          text: note,
+          source: "user",
+          expectedRevision: currentProject.revision,
+        },
+      }),
+    );
+    if (!detail) return;
+    await launchFromSpawnPanel({
+      projectId: currentProject.metadata.id,
+      role: "coder",
+      client: "orchestrator",
+      taskId: null,
+      host: "app",
+      model: null,
+      planFirst: true,
+    });
+  };
+
   // Rail copy-prompt: SpawnPanel selection → prepare_project_agent_prompt
   // (normalizes the advisory model hint identically to the launch path).
   const copyFromSpawnPanel = async (selection: SpawnSelection) => {
@@ -2147,6 +2182,10 @@ export function ProjectsView() {
           { id: "codex", label: "Codex" },
           ...(config.customAgentClients ?? []).map((c) => ({ id: c.id, label: c.label })),
         ]}
+        busy={isBusy}
+        onPlan={(goal, coderId, autoCreate) =>
+          void planWithOrchestrator(goal, coderId, autoCreate)
+        }
       />
 
       {/* Overview segmented toggle: the active stage board (default) vs. a simple
