@@ -9,6 +9,7 @@ import { StagePlan } from "./StagePlan";
 import { StageDesign } from "./StageDesign";
 import { PlannerChat } from "./PlannerChat";
 import { PlannerControls } from "./PlannerControls";
+import { AgentTerminalViewer } from "../../agents/AgentTerminalViewer";
 
 interface PlannerPlanModeProps {
   goal: string | null;
@@ -33,6 +34,9 @@ interface PlannerPlanModeProps {
   orchestrators: { id: string; label: string }[];
   orchestratorId: string;
   onOrchestratorChange: (id: string) => void;
+  // When a CLOUD orchestrator (Claude/Codex) is running, its agent id — we show ITS terminal
+  // instead of the local Stage (the Stage bridges are local-devboule only). null = local/none.
+  cloudTerminalAgentId: string | null;
   // Hand-off + auto-create controls (preserved from the old composer — never strip choices).
   coders: { id: string; label: string }[];
   coderId: string;
@@ -62,6 +66,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     orchestrators,
     orchestratorId,
     onOrchestratorChange,
+    cloudTerminalAgentId,
     coders,
     coderId,
     onCoderChange,
@@ -221,6 +226,22 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           })}
         </div>
 
+        {cloudTerminalAgentId ? (
+          /* Cloud orchestrator (Claude/Codex) runs its OWN CLI — show ITS terminal here. The
+             Stage bridges (chat/websearch/design events) are local-devboule only (Phase D), so
+             for a cloud orchestrator the terminal IS the interaction. Bounded; scrolls internally. */
+          <div
+            style={{
+              height: 316,
+              borderRadius: 12,
+              overflow: 'hidden',
+              border: '1px solid #ECE6DB',
+            }}
+          >
+            <AgentTerminalViewer agentId={cloudTerminalAgentId} />
+          </div>
+        ) : (
+          <>
         {/* 3) Stage Container */}
         <div
           style={{
@@ -334,7 +355,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           </div>
         </div>
 
-        {/* 4) Chat */}
+        {/* 4) Chat (local Stage / pre-launch composer; the cloud terminal replaces it above) */}
         <PlannerChat
           messages={messages}
           modelLabel={`Orchestrator · ${plannerModelLabel}`}
@@ -342,6 +363,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           awaitingReply={awaitingReply}
           onSend={onSend}
         />
+          </>
+        )}
 
         {/* 5) Hand-off + auto-create controls (preserved choices) */}
         <PlannerControls

@@ -809,6 +809,16 @@ export function ProjectsView() {
       null,
     [currentProjectSessions],
   );
+  // When the chosen orchestrator is a CLOUD CLI (claude/codex), the running session for this
+  // project — its terminal is shown in the planner instead of the local Stage. null when the
+  // orchestrator is local, or when no cloud session is running yet (pre-launch).
+  const cloudOrchestratorAgentId = useMemo(() => {
+    if (plannerOrchestratorClient === "orchestrator") return null;
+    return (
+      currentProjectSessions.find((s) => s.client === plannerOrchestratorClient)
+        ?.agentId ?? null
+    );
+  }, [plannerOrchestratorClient, currentProjectSessions]);
   // Mark a Planner launch in flight (plannerLaunching) until its session registers — guards
   // the composer against a duplicate launch during the agent-poll lag. A safety timeout
   // clears it if the session never appears (e.g. the orchestrator crashes on start).
@@ -2579,6 +2589,7 @@ export function ProjectsView() {
             ]}
             orchestratorId={plannerOrchestratorClient}
             onOrchestratorChange={setPlannerOrchestratorClient}
+            cloudTerminalAgentId={cloudOrchestratorAgentId}
             coders={[
               { id: "claude", label: "Claude" },
               { id: "codex", label: "Codex" },
