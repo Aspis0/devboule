@@ -42,6 +42,10 @@ export interface CensorPanelProps {
   projectId: string;
   /** The project's working root (ProjectDetail.metadata.rootPath). */
   root: string | null;
+  /** When provided, the parent owns the findings feed (a single shared
+   *  CensorFindingsTracker); this panel renders them and skips its own tracker
+   *  to avoid a duplicate subscription + doubled IPC. */
+  findings?: CensorFinding[];
   /** Launches an agent via the same path ProjectsView uses ("Run final review"). */
   onLaunch: (input: SpawnLaunchInput) => void;
   /** True while a launch/git op is in flight (disables Run final review). */
@@ -55,12 +59,15 @@ export interface CensorPanelProps {
 export function CensorPanel({
   projectId,
   root,
+  findings: findingsProp,
   onLaunch,
   isBusy = false,
   canLaunch = true,
   editor = "vscode",
 }: CensorPanelProps) {
-  const [findings, setFindings] = useState<CensorFinding[]>([]);
+  const ownsFeed = findingsProp === undefined;
+  const [localFindings, setFindings] = useState<CensorFinding[]>([]);
+  const findings = findingsProp ?? localFindings;
   const [status, setStatus] = useState<CensorStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
@@ -73,6 +80,8 @@ export function CensorPanel({
   // Event-driven findings: initial fetch + refetch on censor://findings-updated.
   // ONE tracker per (project, root); cleaned up on unmount / project change.
   useEffect(() => {
+    // When the parent owns the findings feed, this panel does not run its own tracker.
+    if (!ownsFeed) return;
     if (!isTauriRuntime()) return;
     if (!trimmedRoot) {
       setFindings([]);
@@ -94,7 +103,7 @@ export function CensorPanel({
     });
     void tracker.start();
     return () => tracker.stop();
-  }, [projectId, trimmedRoot]);
+  }, [projectId, trimmedRoot, ownsFeed]);
 
   // One-shot status read (Gemma availability + detected linters). Re-read when the
   // project root changes; refreshed alongside a manual Review now.

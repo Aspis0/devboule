@@ -459,7 +459,7 @@ export function miniKillCall(session: AgentSession): IpcCall | null {
 
 // ---- bottom dock ------------------------------------------------------------
 
-export type DockTab = "censor" | "git" | "plans" | "console" | "mcp" | "changes";
+export type DockTab = "censor" | "git" | "plans" | "mcp" | "changes";
 
 /** The dock's default-selected tab. Censor is the star of the Work-mode dock
  *  (the placeholder this phase, real UI in Phase E). */

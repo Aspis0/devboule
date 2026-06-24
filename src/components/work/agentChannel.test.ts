@@ -57,4 +57,9 @@ describe("agentChannel — not handled here", () => {
     expect(agentChannel(mk({ type: "orchestrator", agentId: "o1" }), { miniManaged: true }, "message")).toBeNull();
     expect(agentChannel(mk({ type: "orchestrator", agentId: "o1" }), { miniManaged: false }, "answer")).toBeNull();
   });
+
+  it("returns null for the censor (an automated reviewer, never messaged)", () => {
+    expect(agentChannel(mk({ type: "censor", agentId: "z1" }), { miniManaged: true }, "message")).toBeNull();
+    expect(agentChannel(mk({ type: "censor", agentId: "z1" }), { miniManaged: false }, "answer")).toBeNull();
+  });
 });

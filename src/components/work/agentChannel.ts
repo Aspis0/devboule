@@ -10,7 +10,9 @@ export interface AgentChannel {
   buildArgs: (text: string) => Record<string, unknown>;
 }
 export function agentChannel(node: WorkNode, ctx: ChannelCtx, dir: CommsDirection): AgentChannel | null {
-  if (node.type === "orchestrator") return null;
+  // The orchestrator is steered through the reused planner console; the censor is an
+  // automated reviewer — neither is messaged from the worker composer. No channel.
+  if (node.type === "orchestrator" || node.type === "censor") return null;
 
   const isMiniManaged = node.type === "mini" || ctx.miniManaged;
 

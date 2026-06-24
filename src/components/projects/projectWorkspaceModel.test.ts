@@ -749,7 +749,8 @@ describe("dock", () => {
       "mcp",
       "changes",
     ]);
-    expect(DOCK_TABS.find((t) => t.id === "console")).toBeUndefined();
+    // "console" is no longer even a valid DockTab (removed from the union).
+    expect((DOCK_TABS as { id: string }[]).find((t) => t.id === "console")).toBeUndefined();
     expect(DOCK_TABS.find((t) => t.id === "mcp")!.label).toBe("MCP");
     expect(DOCK_TABS.find((t) => t.id === "changes")!.label).toBe("Changes");
   });

@@ -289,15 +289,21 @@ export function ProjectWorkspace({
   useEffect(() => {
     setFocusView("activity");
   }, [selectedAgentId]);
-  const focusNode = useMemo(() => {
-    if (!selectedAgentId) return null;
-    const model = buildWorkConsoleModel({
-      sessions,
-      tasks: project.state.tasks,
-      projectId: project.metadata.id,
-    });
-    return findWorkNode(model, selectedAgentId);
-  }, [selectedAgentId, sessions, project.state.tasks, project.metadata.id]);
+  // Split: the model rebuilds only when sessions/tasks change (the 5s poll), and the node
+  // lookup re-runs when the SELECTION changes — so switching agents doesn't rebuild the model.
+  const workConsoleModel = useMemo(
+    () =>
+      buildWorkConsoleModel({
+        sessions,
+        tasks: project.state.tasks,
+        projectId: project.metadata.id,
+      }),
+    [sessions, project.state.tasks, project.metadata.id],
+  );
+  const focusNode = useMemo(
+    () => (selectedAgentId ? findWorkNode(workConsoleModel, selectedAgentId) : null),
+    [workConsoleModel, selectedAgentId],
+  );
 
   // Direction A/B dispatch: route the composer to the right backend command. The signal is
   // whether the agent is mini_coder-managed (local mini/coder -> mini_coder_steer) vs a cloud
@@ -308,9 +314,11 @@ export function ProjectWorkspace({
     node: null,
     miniManaged: true,
   });
+  // Null the node when there is no resolved session, so a transient (selected-but-session-
+  // not-yet-loaded) state can't route a message to the wrong channel and silently drop it.
   focusDispatchRef.current = {
-    node: focusNode,
-    miniManaged: selectedSession ? isMiniManagedSession(selectedSession) : true,
+    node: selectedSession ? focusNode : null,
+    miniManaged: selectedSession ? isMiniManagedSession(selectedSession) : false,
   };
   const dispatchToFocus = useCallback((text: string, dir: CommsDirection) => {
     const { node, miniManaged } = focusDispatchRef.current;
@@ -320,6 +328,19 @@ export function ProjectWorkspace({
     if (!ch) return;
     void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch(() => {});
   }, []);
+  // Stable handlers so the FocusStage (and its AgentConsole timeline) don't re-render on
+  // every 5s poll just because new inline closures were created.
+  const onFocusSend = useCallback((t: string) => dispatchToFocus(t, "message"), [dispatchToFocus]);
+  const onFocusAnswer = useCallback((t: string) => dispatchToFocus(t, "answer"), [dispatchToFocus]);
+  const onFocusQuickAction = useCallback(
+    (a: "redo" | "narrow" | "pause") => dispatchToFocus(FOCUS_QUICK_ACTIONS[a], "message"),
+    [dispatchToFocus],
+  );
+  // The worker composer can only message a coder/mini. The orchestrator (planner console) and
+  // the censor (automated) have no channel here — disable the composer rather than drop sends.
+  const focusComposerDisabled =
+    !!readOnly ||
+    (focusNode != null && focusNode.type !== "coder" && focusNode.type !== "mini");
 
   // Censor strip: the project-wide inspection summary (clean/dirty per file). Reuses the
   // SAME event-driven findings feed as the Censor dock tab — NO new poller.
@@ -693,15 +714,15 @@ export function ProjectWorkspace({
                     activity={consoleActivity}
                     view={focusView}
                     onViewChange={setFocusView}
-                    onSendMessage={(t) => dispatchToFocus(t, "message")}
+                    onSendMessage={onFocusSend}
                     pendingQuestion={
                       readOnly || !focusNode.pendingQuestion
                         ? null
                         : stripSpoofChars(focusNode.pendingQuestion)
                     }
-                    onAnswer={(t) => dispatchToFocus(t, "answer")}
-                    disabled={readOnly}
-                    onQuickAction={(a) => dispatchToFocus(FOCUS_QUICK_ACTIONS[a], "message")}
+                    onAnswer={onFocusAnswer}
+                    disabled={focusComposerDisabled}
+                    onQuickAction={onFocusQuickAction}
                     rawSlot={
                       ptyAgents.has(selectedSession.agentId) ? (
                         <Suspense
@@ -790,6 +811,7 @@ export function ProjectWorkspace({
             <CensorPanel
               projectId={project.metadata.id}
               root={project.metadata.rootPath}
+              findings={censorFindings}
               onLaunch={onLaunch}
               isBusy={isBusy}
               canLaunch={canLaunch}

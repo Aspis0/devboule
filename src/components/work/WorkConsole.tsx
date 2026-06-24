@@ -1,5 +1,5 @@
 import "./work.css";
-import { Suspense, lazy, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { buildWorkConsoleModel, findWorkNode } from "./workConsoleModel";
 import { LivingPlan } from "./LivingPlan";
 import { FocusStage } from "./FocusStage";
@@ -33,6 +33,10 @@ export function WorkConsole(props: WorkConsoleProps) {
   const selectedNode = selectedAgentId ? findWorkNode(model, selectedAgentId) : null;
   
   const [view, setView] = useState<"activity" | "raw">("activity");
+  // Reset to Activity when the selection changes, so a Raw view never leaks across agents.
+  useEffect(() => {
+    setView("activity");
+  }, [selectedAgentId]);
   
   const activity = useAgentConsole(selectedAgentId);
   
@@ -52,14 +56,14 @@ export function WorkConsole(props: WorkConsoleProps) {
     if (!t || !selectedNode) return;
     const ch = agentChannel(selectedNode, { miniManaged }, dir);
     if (!ch) return;
-    void invokeBackendCommand(ch.command, ch.buildArgs(t));
+    void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch(() => {});
   };
 
   const onSendMessage = (t: string) => dispatch(t, "message");
   const onAnswer = (t: string) => dispatch(t, "answer");
 
   const QUICK = { redo: "Redo this round.", narrow: "Narrow the scope to the current file only.", pause: "Pause after the current step." };
-  const onQuickAction = (a: string) => dispatch(QUICK[a as keyof typeof QUICK], "message");
+  const onQuickAction = (a: "redo" | "narrow" | "pause") => dispatch(QUICK[a], "message");
 
   const rawSlot = isPty && selectedNode
     ? <Suspense fallback={<div style={{padding:24,textAlign:'center',color:'#9c9488',fontSize:12}}>Loading terminal…</div>}>

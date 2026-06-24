@@ -171,6 +171,7 @@ export function FocusStage(props: FocusStageProps) {
             }}
           />
           <button
+            type="button"
             onClick={handleSend}
             disabled={disabled || !value.trim()}
             data-action="send"
