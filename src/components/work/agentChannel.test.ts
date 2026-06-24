@@ -5,7 +5,7 @@ import type { WorkNode } from "./workConsoleModel";
 const mk = (over: Partial<WorkNode> = {}): WorkNode => ({
   agentId: "c1", type: "coder", file: "src/auth/login.ts", district: "auth",
   status: "running", label: "coder · codex", parentAgentId: null, taskId: "t1",
-  pendingQuestion: null, live: true, children: [], ...over,
+  pendingQuestion: null, live: true, children: [], orphaned: false, subagents: [], ...over,
 });
 
 // miniManaged = local mini OR local agentic coder (driven by mini_coder directives).

@@ -136,6 +136,11 @@ export function LivingPlan(props: LivingPlanProps) {
           <span className="pp-mono" style={{ fontSize: node.type === "orchestrator" ? "12px" : "12.5px", color: "#2A2621", fontWeight: "500" }}>
             {getLabel(node)}
           </span>
+          {node.orphaned && (
+            <span style={{ fontSize: "9px", fontWeight: 700, color: "#C2542F", background: "#F8E7E0", border: "1px solid #EFD2C7", padding: "2px 6px", borderRadius: "5px", marginLeft: "6px" }}>
+              orphan
+            </span>
+          )}
           {node.type === "orchestrator" && (
             <span className="pp-mono" style={{ fontSize: "10.5px", color: "#9c9488" }}>
               orchestrator
@@ -144,6 +149,15 @@ export function LivingPlan(props: LivingPlanProps) {
           {statusBadge()}
           {asksBadge}
         </div>
+        {node.subagents.length > 0 && (
+          <div style={{ marginLeft: "26px", marginTop: "2px" }}>
+            {node.subagents.map((sub, idx) => (
+              <div key={idx} className="pp-mono" style={{ fontSize: "10px", color: "#A89F90", marginTop: "2px" }}>
+                · {sub.label} ×{sub.count}
+              </div>
+            ))}
+          </div>
+        )}
         {children}
       </div>
     );

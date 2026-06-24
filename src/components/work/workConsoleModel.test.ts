@@ -20,6 +20,7 @@ function session(p: Partial<AgentSession> & { agentId: string }): AgentSession {
     parentAgentId: p.parentAgentId ?? null,
     pendingQuestion: p.pendingQuestion ?? null,
     host: p.host ?? "app",
+    subagents: p.subagents,
   };
 }
 
@@ -261,6 +262,46 @@ describe("buildWorkConsoleModel — hardening (reviewer findings)", () => {
     const m1 = coder.children.find((c) => c.agentId === "m1")!;
     expect(m1).toBeTruthy();
     expect(m1.children.map((c) => c.agentId)).toEqual(["m2"]);
+  });
+
+  it("carries heartbeat-reported subagents onto the node (parity with the old rail)", () => {
+    const tasks = [task({ id: "t1", scope: ["src/auth/login.ts"] })];
+    const sessions = [
+      session({
+        agentId: "c1",
+        currentTaskId: "t1",
+        subagents: [
+          { label: "writer", model: "sonnet", count: 2 },
+          { label: "tester", model: "haiku", count: 1 },
+        ],
+      }),
+    ];
+    const m = buildWorkConsoleModel({ sessions, tasks, projectId: PROJECT });
+    const node = m.districts[0].nodes[0];
+    expect(node.subagents).toEqual([
+      { label: "writer", count: 2 },
+      { label: "tester", count: 1 },
+    ]);
+  });
+
+  it("flags an orphaned mini (parent absent) and not a healthy one", () => {
+    const tasks = [
+      task({ id: "t-c", scope: ["src/views/projects/board.tsx"] }),
+      task({ id: "t-m", scope: ["src/views/projects/card.tsx"] }),
+      task({ id: "t-o", scope: ["src/auth/login.ts"] }),
+    ];
+    const sessions = [
+      session({ agentId: "c1", currentTaskId: "t-c" }),
+      session({ agentId: "m-ok", parentAgentId: "c1", currentTaskId: "t-m" }),
+      session({ agentId: "m-orphan", parentAgentId: "ghost", currentTaskId: "t-o" }),
+    ];
+    const m = buildWorkConsoleModel({ sessions, tasks, projectId: PROJECT });
+    const all = [
+      ...m.districts.flatMap((d) => d.nodes.flatMap((n) => [n, ...n.children])),
+      ...m.unplaced,
+    ];
+    expect(all.find((n) => n.agentId === "m-ok")?.orphaned).toBe(false);
+    expect(all.find((n) => n.agentId === "m-orphan")?.orphaned).toBe(true);
   });
 
   it("does not throw on duplicate agentIds", () => {

@@ -19,7 +19,7 @@ import { STATE_RUNNING } from "../agents/__fixtures__/agentConsoleStates";
 const node: WorkNode = {
   agentId: "c1", type: "coder", file: "src/auth/login.ts", district: "auth",
   status: "round 3", label: "coder · codex", parentAgentId: null, taskId: "t1",
-  pendingQuestion: null, live: true, children: [],
+  pendingQuestion: null, live: true, children: [], orphaned: false, subagents: [],
 };
 
 type Props = Parameters<typeof FocusStage>[0];

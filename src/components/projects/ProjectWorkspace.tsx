@@ -3,10 +3,11 @@
 // (the per-project task board + Notes now live HERE, via slots). Layout:
 //   - Top bar: ← Board, project name, git status (from project.gitStatus) +
 //     [Commit]/[Push] wired to the new backend commands.
-//   - Left rail: ProjectWorkspaceAgentRail (the project's agents, selectable).
-//   - Center: the SELECTED agent's live terminal (AgentTerminalViewer, lazy
-//     chunk, KEYED by agentId so switching agents remounts cleanly) + a
-//     [drawer ▸] control opening AgentDetailDrawer for that agent.
+//   - Left: the Living Plan navigator (work/LivingPlan) — agents inhabit the file
+//     they edit; selecting a node drives the Focus stage. (The old rail + its spawn
+//     launcher are replaced: launch is now a top-bar "+ Launch" → SpawnPanel.)
+//   - Center: the FocusStage — Activity (structured) / Raw (the lazy AgentTerminalViewer,
+//     KEYED by agentId) + a two-way composer + inline question card.
 //   - Task board (taskBoardSlot) above the dock; bottom dock: Censor (default)
 //     / Git / Plans / Console / MCP; Notes (notesSlot) below the dock.
 //
@@ -21,6 +22,7 @@ import {
   Minimize2,
   OctagonX,
   PanelRightOpen,
+  Plus,
   Sparkles,
   Square,
   Terminal,
@@ -51,6 +53,8 @@ import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { CensorPanel } from "./CensorPanel";
 import { FocusStage } from "../work/FocusStage";
+import { LivingPlan } from "../work/LivingPlan";
+import { SpawnPanel } from "../agents/SpawnPanel";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, findWorkNode, type WorkNode } from "../work/workConsoleModel";
@@ -59,7 +63,6 @@ import { CensorFindingsTracker } from "./censorPanelModel";
 import { stripSpoofChars } from "../agents/attentionNotifier";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
-import { ProjectWorkspaceAgentRail } from "./ProjectWorkspaceAgentRail";
 import { PushApprovalCard } from "./PushApprovalCard";
 import { ProjectMcpServersCard } from "./ProjectMcpServersCard";
 import { ChangesDockTab } from "./ChangesDockTab";
@@ -92,6 +95,10 @@ const FOCUS_QUICK_ACTIONS: Record<"redo" | "narrow" | "pause", string> = {
   narrow: "Narrow the scope to the current file only.",
   pause: "Pause after the current step.",
 };
+
+// Stable empty set so the Living Plan's dirty highlight doesn't churn identity (and force
+// a re-render) on every poll when the Censor is clean.
+const EMPTY_AGENT_IDS: Set<string> = new Set<string>();
 
 export interface ProjectWorkspaceProps {
   project: ProjectDetail;
@@ -294,6 +301,10 @@ export function ProjectWorkspace({
   useEffect(() => {
     setFocusView("activity");
   }, [selectedAgentId]);
+  // Archiving (readOnly) closes the launcher so a stale-open SpawnPanel can't re-mount on unarchive.
+  useEffect(() => {
+    if (readOnly) setLauncherOpen(false);
+  }, [readOnly]);
   // Split: the model rebuilds only when sessions/tasks change (the 5s poll), and the node
   // lookup re-runs when the SELECTION changes — so switching agents doesn't rebuild the model.
   const workConsoleModel = useMemo(
@@ -371,6 +382,24 @@ export function ProjectWorkspace({
     return () => tracker.stop();
   }, [project.metadata.id, censorRoot]);
   const censorStrip = useMemo(() => buildCensorStrip(censorFindings), [censorFindings]);
+
+  // Map the Censor's DIRTY files onto the agents inhabiting them, so the Living Plan can
+  // highlight a node coral when the file it edits has open findings.
+  const dirtyAgentIds = useMemo(() => {
+    const dirtyFiles = new Set(
+      censorStrip.items.filter((i) => i.status === "dirty").map((i) => i.file),
+    );
+    if (dirtyFiles.size === 0) return EMPTY_AGENT_IDS;
+    const ids = new Set<string>();
+    const walk = (n: WorkNode) => {
+      if (n.file && dirtyFiles.has(n.file)) ids.add(n.agentId);
+      n.children.forEach(walk);
+    };
+    if (workConsoleModel.orchestrator) walk(workConsoleModel.orchestrator);
+    workConsoleModel.districts.forEach((d) => d.nodes.forEach(walk));
+    workConsoleModel.unplaced.forEach(walk);
+    return ids;
+  }, [censorStrip, workConsoleModel]);
 
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
@@ -489,6 +518,23 @@ export function ProjectWorkspace({
               Change plan
             </button>
           )}
+          {!readOnly && (
+            <button
+              type="button"
+              onClick={() => setLauncherOpen((open) => !open)}
+              disabled={!canLaunch}
+              data-help-title="Launch a coder or verifier for this project."
+              data-help-lines="Opens the spawn panel to start a new agent on this project.|Pick a coder (writes code) or a verifier (reviews) and a task.|Only active projects can launch agents.|The new agent appears in the Living Plan on the file it claims."
+              className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-semibold disabled:opacity-60 ${
+                launcherOpen
+                  ? "border-terracotta bg-terracotta/10 text-terracotta"
+                  : "border-cream-200 bg-white text-cream-600 hover:text-terracotta"
+              }`}
+            >
+              <Plus className="h-3.5 w-3.5" aria-hidden />
+              Launch
+            </button>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -588,26 +634,34 @@ export function ProjectWorkspace({
           reason as the push card (approve/reject are mutations). */}
       {!readOnly && <PlanApprovalCard projectId={project.metadata.id} />}
 
-      {/* ---- Main: rail + center terminal ---- */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
-        <ProjectWorkspaceAgentRail
-          sessions={sessions}
-          selectedAgentId={selectedAgentId}
-          onSelectAgent={setSelectedAgentId}
-          projectId={project.metadata.id}
-          projectTitle={project.metadata.title}
+      {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
+      {launcherOpen && !readOnly && (
+        <SpawnPanel
+          projects={[{ id: project.metadata.id, title: project.metadata.title }]}
+          lockedProjectId={project.metadata.id}
+          selectedProjectId={project.metadata.id}
           tasks={project.state.tasks}
           projectActive={canLaunch}
           isBusy={isBusy}
-          launchMessage={launchMessage}
+          message={launchMessage}
           rules={rules}
           customClients={customClients}
           localCoderModel={localCoderModel}
           onLaunch={onLaunch}
           onCopyPrompt={onCopyPrompt}
-          launcherOpen={launcherOpen}
-          onToggleLauncher={() => setLauncherOpen((open) => !open)}
         />
+      )}
+
+      {/* ---- Main: Living Plan (left nav, replaces the rail) + Focus stage (center) ---- */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
+        <div className="overflow-hidden rounded-2xl border border-cream-200 bg-white">
+          <LivingPlan
+            model={workConsoleModel}
+            selectedAgentId={selectedAgentId}
+            onSelect={setSelectedAgentId}
+            dirtyAgentIds={dirtyAgentIds}
+          />
+        </div>
 
         <section className="min-w-0">
           {selectedSession ? (

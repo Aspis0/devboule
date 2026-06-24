@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 // this tsconfig has no types for). We assert against the raw component source.
 import projectWorkspaceSrc from "./ProjectWorkspace.tsx?raw";
 import projectWorkspaceAgentRailSrc from "./ProjectWorkspaceAgentRail.tsx?raw";
+import livingPlanSrc from "../work/LivingPlan.tsx?raw";
 
 // Invariant (Phase D): the Work-mode shell reuses the SINGLE agent-state poller
 // owned by ProjectsView. ProjectWorkspace / ProjectWorkspaceAgentRail must NOT
@@ -31,6 +32,7 @@ describe("Work-mode shell holds no second poller", () => {
   const cases: [string, string][] = [
     ["ProjectWorkspace.tsx", projectWorkspaceSrc],
     ["ProjectWorkspaceAgentRail.tsx", projectWorkspaceAgentRailSrc],
+    ["work/LivingPlan.tsx", livingPlanSrc],
   ];
   for (const [file, src] of cases) {
     it(`${file} contains no own poller / live-state IPC`, () => {

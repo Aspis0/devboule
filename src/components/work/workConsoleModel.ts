@@ -14,6 +14,8 @@ export interface WorkNode {
   pendingQuestion: string | null;
   live: boolean;
   children: WorkNode[];
+  orphaned: boolean;
+  subagents: { label: string; count: number }[];
 }
 
 export interface WorkDistrict {
@@ -49,6 +51,8 @@ function buildNode(session: AgentSession, taskMap: Record<string, ProjectTask>, 
   const statusLower = (session.status ?? "").toLowerCase();
   const live = statusLower.length > 0 && !TERMINAL_STATUSES.has(statusLower);
 
+  const subagents = (session.subagents ?? []).map((s) => ({ label: s.label, count: s.count }));
+
   return {
     agentId: session.agentId,
     type,
@@ -61,6 +65,8 @@ function buildNode(session: AgentSession, taskMap: Record<string, ProjectTask>, 
     pendingQuestion: session.pendingQuestion?.question ?? null,
     live,
     children: [],
+    orphaned: false,
+    subagents,
   };
 }
 
@@ -130,7 +136,11 @@ export function buildWorkConsoleModel({
       if (parent && parent.agentId !== mini.agentId) {
         parent.children.push(mini);
         attachedMiniAgentIds.add(mini.agentId);
+      } else {
+        mini.orphaned = true;
       }
+    } else {
+      mini.orphaned = true;
     }
   }
 

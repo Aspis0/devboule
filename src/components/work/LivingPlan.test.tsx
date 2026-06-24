@@ -22,7 +22,7 @@ const sess = (p: Partial<AgentSession> & { agentId: string }): AgentSession =>
     status: p.status ?? "running", message: null, client: p.client ?? null,
     currentProjectId: PROJECT, currentTaskId: p.currentTaskId ?? null,
     firstSeenAt: null, lastSeenAt: null, parentAgentId: p.parentAgentId ?? null,
-    pendingQuestion: p.pendingQuestion ?? null, host: "app",
+    pendingQuestion: p.pendingQuestion ?? null, host: "app", subagents: p.subagents,
   }) as AgentSession;
 const tsk = (id: string, scope: string[]): ProjectTask =>
   ({ id, title: id, status: "wip", priority: null, assignee: null, due: null,
@@ -115,6 +115,33 @@ describe("LivingPlan", () => {
       dirtyAgentIds: new Set(["c1"]),
     });
     expect(out).toMatch(/data-agent-id="c1"[^>]*data-dirty="true"|data-dirty="true"[^>]*data-agent-id="c1"/);
+  });
+
+  it("renders an orphan chip for a mini whose parent is absent", () => {
+    const model = buildWorkConsoleModel({
+      projectId: PROJECT,
+      tasks: [tsk("t1", ["src/views/projects/card.tsx"])],
+      sessions: [sess({ agentId: "m1", currentTaskId: "t1", parentAgentId: "ghost" })],
+    });
+    const out = html({ model, selectedAgentId: null, onSelect: () => {} });
+    expect(out).toContain('data-agent-id="m1"');
+    expect(out.toLowerCase()).toContain("orphan");
+  });
+
+  it("renders heartbeat-reported subagents as info lines", () => {
+    const model = buildWorkConsoleModel({
+      projectId: PROJECT,
+      tasks: [tsk("t1", ["src/auth/login.ts"])],
+      sessions: [
+        sess({
+          agentId: "c1", currentTaskId: "t1",
+          subagents: [{ label: "writer", model: "sonnet", count: 3 }],
+        }),
+      ],
+    });
+    const out = html({ model, selectedAgentId: null, onSelect: () => {} });
+    expect(out).toContain("writer");
+    expect(out).toContain("3");
   });
 
   it("calls onSelect with the agentId when a node is clicked", () => {

@@ -98,6 +98,28 @@ describe("ProjectWorkspace mounts the unified Work Console (FocusStage) for the 
   });
 });
 
+describe("ProjectWorkspace Living Plan navigator + Launch (replaces the rail)", () => {
+  it("renders the Living Plan with the agent as a selectable node", () => {
+    const html = render([session({ agentId: "coder-1" })], new Set(["coder-1"]));
+    // The Living Plan replaces the old rail: agents are nodes with data-agent-id.
+    expect(html).toContain('data-agent-id="coder-1"');
+    expect(html).toContain("LIVING PLAN");
+  });
+
+  it("shows the + Launch button in the top bar (not readOnly)", () => {
+    const html = render([session({ agentId: "coder-1" })], new Set(["coder-1"]));
+    expect(html).toContain("Launch");
+  });
+
+  it("hides the + Launch button when readOnly (archived)", () => {
+    const html = render([session({ agentId: "coder-1" })], new Set(["coder-1"]), {
+      readOnly: true,
+      onUnarchive: noop,
+    });
+    expect(html).not.toContain(">Launch<");
+  });
+});
+
 describe("ProjectWorkspace recall-orchestrator (Change plan)", () => {
   it("shows the Change plan button when onRecallOrchestrator is provided and not readOnly", () => {
     const html = renderToStaticMarkup(
