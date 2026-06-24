@@ -1,7 +1,7 @@
 // Pure, DOM-free model for the Work-mode shell (Phase D of the Projects/Agents
 // IA redesign). All routing/selection/format logic lives here so ProjectWorkspace
-// .tsx / ProjectWorkspaceAgentRail.tsx stay thin JSX shells and the logic is
-// unit-testable in node (this repo's vitest runs in the node env, no jsdom).
+// .tsx stays a thin JSX shell and the logic is unit-testable in node (this repo's
+// vitest runs in the node env, no jsdom).
 //
 // NONE of these render a secret or raw value: the git top-bar line shows the
 // branch name + integer counts already on ProjectGitStatus; the rail model echoes

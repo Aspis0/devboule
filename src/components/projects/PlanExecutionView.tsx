@@ -8,7 +8,7 @@
 // `done` so it cannot skip, and rejects a blocked task that still holds its failed
 // attempt's claim). retry: blocked → todo (runner re-picks); skip: → done (terminal,
 // runner skips it, dependents unblock). Stopping a RUNNING mini is NOT here — that is
-// mini-scoped and lives in the Console Stop control (MiniSteerBar).
+// mini-scoped and lives in the Work Console's Focus stage composer (pause/stop).
 //
 // CSP-strict: no dangerouslySetInnerHTML, no inline HTML on*= handlers, no eval.
 
@@ -33,7 +33,7 @@ export function canRetry(status: ProjectTaskStatus): boolean {
 }
 
 /** Skip applies to non-terminal, non-running steps. A `wip` task is a RUNNING mini —
- *  stopping it is the Console Stop (MiniSteerBar), not a task skip. The backend
+ *  stopping it is the Work Console Focus-stage composer, not a task skip. The backend
  *  plan_task_control(skip) rejects wip, so we gate it here too. */
 export function canSkip(status: ProjectTaskStatus): boolean {
   return status !== "done" && status !== "wip";

@@ -30,10 +30,11 @@ describe("architect-ghost removal", () => {
 
   it("keeps the REAL Work-mode agent surface", async () => {
     // The board-mode ProjectAgentPanel was retired; its real per-agent controls
-    // (stop / focus CLI / recovery) now live in the Work-mode agent surface. Guard
-    // that the rail component is still shipped and importable.
-    const mod = await import("./ProjectWorkspaceAgentRail");
-    expect(typeof mod.ProjectWorkspaceAgentRail).toBe("function");
+    // (stop / focus CLI / recovery) now live in the Work-mode shell (ProjectWorkspace).
+    // The old left rail was replaced by the Living Plan navigator. Guard that the
+    // Work-mode surface is still shipped and importable.
+    const mod = await import("./ProjectWorkspace");
+    expect(typeof mod.ProjectWorkspace).toBe("function");
   });
 
   it("keeps the REAL kanban stage derivation untouched", async () => {

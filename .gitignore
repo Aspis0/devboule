@@ -57,3 +57,6 @@ polis-dev-city.json
 # Local training rail (ORPO pairs, scribe data) — never commit
 .aspis-training/
 .aspis-mini/
+.aspis-censor/
+aspis.html
+tsconfig.tsbuildinfo
