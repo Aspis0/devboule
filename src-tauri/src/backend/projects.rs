@@ -1783,7 +1783,54 @@ fn prepare_or_launch_project_agent(
         } else {
             Vec::new()
         };
-    if launch_terminal && host == HOST_APP {
+    // Phase D: a CLOUD orchestrator (claude/codex) requested in DUPLEX mode launches as a piped
+    // (non-PTY) child whose structured event stream is normalized into the activity bridge, so it
+    // drives the SAME planner Stage as the local orchestrator. Gated tightly so every existing
+    // launch (PTY/external/prepare) is byte-identical.
+    let cloud_duplex = input.cloud_duplex == Some(true)
+        && launch_terminal
+        && host == HOST_APP
+        && (client == "claude" || client == "codex");
+    if cloud_duplex {
+        let provider = crate::backend::cloud_duplex::Provider::from_client(&client)
+            .ok_or_else(|| "unsupported cloud duplex client".to_string())?;
+        let (program, args, envs) = build_cloud_duplex_launch(
+            &client,
+            input.model.as_deref(),
+            &management_root,
+            &projects_path,
+            &user_servers,
+            &provider_env,
+        )
+        .ok_or_else(|| "could not build the cloud duplex launch".to_string())?;
+        let activity_file =
+            crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
+                .ok_or_else(|| {
+                    "could not resolve the activity bridge file for the cloud orchestrator (the \
+                     Stage would be blank); aborting the launch".to_string()
+                })?;
+        let sessions = app.state::<crate::backend::cloud_duplex::CloudDuplexSessions>();
+        crate::backend::cloud_duplex::spawn_cloud_duplex(
+            &app,
+            &sessions,
+            &agent_id,
+            provider,
+            &program,
+            &args,
+            &envs,
+            &root_path,
+            activity_file,
+            input.initial_goal.as_deref(),
+        )?;
+        if let Err(record_err) =
+            record_agent_launch(&app, &agent_id, &client, None, None, None, None, Some(HOST_APP))
+        {
+            crate::backend::cloud_duplex::kill_cloud_duplex(&app, &sessions, &agent_id);
+            return Err(format!(
+                "Cloud orchestrator launched but its control record could not be saved ({record_err}). It was stopped to avoid an uncontrollable agent."
+            ));
+        }
+    } else if launch_terminal && host == HOST_APP {
         // APP-HOSTED: spawn under our in-app PTY. There is no OS console pid/title
         // to record — stop_agent routes by the ledger host to agent_pty_kill — so
         // the ledger entry stamps host "app" and leaves pid/title/creationTime
@@ -1896,6 +1943,16 @@ fn prepare_or_launch_project_agent(
                     &agent_id,
                     PathBuf::from(&orch.activity_file),
                 );
+            }
+        }
+        // Phase D: a cloud DUPLEX orchestrator has no `OrchestratorLaunchConfig`, but its reader
+        // thread writes the SAME activity bridge file — tail it so its normalized events surface
+        // in the planner Stage exactly like the local orchestrator's.
+        if cloud_duplex {
+            if let Some(activity_file) =
+                crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
+            {
+                crate::backend::mini_activity::start_activity_tail(&app, &agent_id, activity_file);
             }
         }
         // B13: capture the diff baseline the first time an agent actually launches for
@@ -5233,6 +5290,80 @@ fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Pat
     // STDIN and the clipboard ONLY; it is NEVER written to the PTY stream (no
     // `Write-Host $prompt`), so it cannot leak into the ConPTY snapshot/xterm.
     format!("$mcpConfig = @'\n{config}\n'@\n$prompt | & claude {model_flag}--mcp-config $mcpConfig")
+}
+
+/// Phase D: build the program + args + env for a DUPLEX cloud orchestrator launch (piped child in
+/// structured-streaming mode), reusing the same Oracle MCP config + provider secrets as the PTY
+/// path. Claude runs `--input/--output-format stream-json` in `--permission-mode plan` (read-only
+/// planning; writes prompt for native approval — the owner's policy); Codex runs `app-server`.
+/// ⚠️ The exact Codex app-server argv/handshake + Claude flag set need e2e validation.
+fn build_cloud_duplex_launch(
+    client: &str,
+    model: Option<&str>,
+    management_root: &Path,
+    projects_dir: &Path,
+    user_servers: &[user_mcp_config::UserMcpServer],
+    provider_env: &[AgentLaunchEnv],
+) -> Option<(String, Vec<String>, Vec<(String, String)>)> {
+    let provider = crate::backend::cloud_duplex::Provider::from_client(client)?;
+    let python = crate::oracle::oracle_setup::resolve_oracle_python();
+    let app_bin = resolve_app_binary().map(|p| p.to_string_lossy().into_owned());
+    let mcp = mcp_client_config_json(&python, management_root, projects_dir, app_bin.as_deref(), user_servers);
+
+    let mut args: Vec<String> = Vec::new();
+    let program = match provider {
+        crate::backend::cloud_duplex::Provider::Claude => {
+            for a in [
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "--verbose",
+                "--permission-mode",
+                "plan",
+                "--mcp-config",
+            ] {
+                args.push(a.to_string());
+            }
+            args.push(mcp);
+            if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+                args.push("--model".to_string());
+                args.push(m.to_string());
+            }
+            "claude"
+        }
+        crate::backend::cloud_duplex::Provider::Codex => {
+            // codex app-server: model + MCP are configured via the JSON-RPC handshake, not argv
+            // (left for e2e). The opening goal still rides in as the first stdin user turn.
+            args.push("app-server".to_string());
+            "codex"
+        }
+    };
+
+    let mut envs: Vec<(String, String)> =
+        provider_env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
+    // Mirror the env the PTY launch script sets for the CLI process itself.
+    envs.push(("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".to_string(), "1".to_string()));
+    envs.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+    envs.push((
+        "PYTHONPATH".to_string(),
+        management_root.to_string_lossy().into_owned(),
+    ));
+    // SECURITY: the SAME git-config neutralizers the PTY launch scripts set, so the cloud CLI (and
+    // any git subprocess it spawns via MCP) cannot read the user's real ~/.gitconfig / system
+    // config — no credential helper, so a raw `git push` can't bypass the request_git_push gate.
+    // Best-effort: if the session gitconfig can't be written we still launch (GIT_TERMINAL_PROMPT
+    // already blocks interactive auth), but log nothing secret.
+    if let Ok(session_gitconfig) = write_session_gitconfig() {
+        envs.push(("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()));
+        envs.push((
+            "GIT_CONFIG_GLOBAL".to_string(),
+            session_gitconfig.to_string_lossy().into_owned(),
+        ));
+    }
+    Some((program.to_string(), args, envs))
 }
 
 fn mcp_client_config_json(

@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::action::{parse_action_with_servers, AgentAction, FormatError};
 use crate::model::CoderModel;
+use crate::reply_stream::ReplyStreamExtractor;
 
 /// Max number of EXECUTED tool actions in one burst before the loop gives up.
 /// Owner-tunable in 12–16; format errors do NOT count toward it (a format error
@@ -147,6 +148,14 @@ pub trait ToolExecutor: Send + Sync {
     /// orchestrator's own words, "user" for an echoed steer). Default NO-OP: only
     /// [`crate::executor::RealExecutor`] with a live activity bridge surfaces it.
     fn emit_chat(&self, _role: &str, _text: &str) {}
+
+    /// B14b: an OWNED handle to the activity bridge for STREAMING chat deltas during a model
+    /// call. The burst captures this (it is cheap to clone + `'static`) into the streaming
+    /// closure, so the closure does not borrow `self` across the async model call. Default is a
+    /// disabled (no-op) emitter; only [`crate::executor::RealExecutor`] returns a live one.
+    fn activity_handle(&self) -> crate::activity::Activity {
+        crate::activity::Activity::disabled()
+    }
 }
 
 /// The result every [`StubExecutor`] tool dispatch returns: an UNMISTAKABLE
@@ -341,6 +350,9 @@ pub async fn run_burst(
     // MODEL's exploration only; we subtract run_plan's duration so a long, successful run
     // does not get a spurious "time cap reached" the instant it returns.
     let mut excluded_elapsed = Duration::ZERO;
+    // B14b: a monotonic id for each assistant turn, so the host can tie a turn's streaming
+    // chat deltas together (and a new turn replaces the previous live tail).
+    let mut turn_seq: u64 = 0;
 
     loop {
         // Wall-clock cap: check BEFORE asking the model so an already-overrun
@@ -359,13 +371,36 @@ pub async fn run_burst(
             transcript.push_human(msg);
         }
 
-        let raw = model.next_output(&transcript).await;
+        // B14b: stream the model's output. The extractor pulls the partial `done.reply` /
+        // `ask_user.question` out of the growing action JSON and forwards it as a chat delta,
+        // so the planner chat types the reply token-by-token. A non-streaming model (default
+        // trait impl) never calls the closure → unchanged one-shot behaviour. The authoritative
+        // parse + the final emit_chat still happen below on the complete `raw`.
+        turn_seq += 1;
+        let seq = turn_seq;
+        // The closure OWNS its captures (an Activity clone + the extractor) so it is `'static`
+        // and does not borrow `executor` across the async model call. A non-streaming model
+        // (default trait impl) never invokes it; a disabled activity handle makes it a no-op.
+        let sink = executor.activity_handle();
+        let mut reply_stream = ReplyStreamExtractor::new();
+        let raw = model
+            .next_output_streaming(&transcript, &mut move |cumulative: &str| {
+                if let Some(partial) = reply_stream.feed(cumulative) {
+                    sink.chat_delta(seq, &partial);
+                }
+            })
+            .await;
 
         // Validate against the executor's configured user-MCP server names so an
         // `mcp_tool` naming an unknown server is an immediate format error (the
         // default empty set rejects every `mcp_tool` when no user servers exist).
         match parse_action_with_servers(&raw, executor.known_mcp_servers()) {
             Err(fe) => {
+                // B14b: a malformed output that LOOKED like a `done` reply mid-stream may have
+                // emitted chat-delta(s) for `seq`; since it didn't parse, no final emit_chat will
+                // finalize that streaming tail. Blank it (empty text → the host clears/hides the
+                // live bubble) so a parse failure can't leave a ghost half-typed reply.
+                executor.activity_handle().chat_delta(seq, "");
                 // 11.4 output-hash loop-detector: a model re-emitting the SAME invalid
                 // output — even interleaved with valid actions that reset the
                 // consecutive-error counter below — is stuck in a way neither the

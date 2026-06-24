@@ -300,6 +300,22 @@ pub struct ConsoleActivity {
     /// `None` when the model is unpriced/free or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_cost_estimate_usd: Option<f64>,
+    /// B14b: the assistant reply CURRENTLY streaming, if any. A SEPARATE live tail — NOT a
+    /// timeline entry — so it is immune to FIFO eviction, interleaved milestone/websearch
+    /// events (cloud turns interleave text↔tool), and orphaning. Each `chat-delta` replaces it
+    /// with the cumulative reply-so-far; the final `chat` turn lands the real entry and clears
+    /// it. The frontend renders it as the last (in-progress) assistant bubble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_chat: Option<StreamingChat>,
+}
+
+/// The live, in-progress assistant reply tail (B14b). `seq` ties it to one turn (for the
+/// producer's bookkeeping); `text` is the cumulative reply-so-far.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamingChat {
+    pub seq: u64,
+    pub text: String,
 }
 
 impl ConsoleActivity {
@@ -561,6 +577,12 @@ pub fn push_websearch(
 /// Append ONE `Chat` timeline entry (a conversational turn). Same FIFO cap + live-state
 /// bookkeeping as [`push_coder_milestone`].
 pub fn push_chat(activity: &mut ConsoleActivity, role: &str, text: &str, time: &str) {
+    // B14b: the final assistant turn lands as a real timeline entry — clear the live
+    // streaming tail so the in-progress bubble is replaced by the finalized one (no
+    // duplicate, no leftover preview). A user turn never clears an in-flight reply.
+    if role == "assistant" {
+        activity.streaming_chat = None;
+    }
     let entries = activity.entries.get_or_insert_with(Vec::new);
     entries.push(ConsoleEntry::Chat {
         role: role.to_string(),
@@ -571,6 +593,21 @@ pub fn push_chat(activity: &mut ConsoleActivity, role: &str, text: &str, time: &
         let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
         entries.drain(0..overflow);
     }
+    activity.running = Some(true);
+    activity.run_count = Some(1);
+    activity.empty = None;
+}
+
+/// Replace the live STREAMING assistant reply tail with the cumulative reply-so-far for turn
+/// `seq` (B14b). This is a SEPARATE slot, NOT a timeline entry: it is immune to FIFO eviction,
+/// to interleaved milestone/websearch events (a cloud turn interleaves text↔tool within one
+/// reply), and to orphaning. Each delta carries the full reply-so-far, so a replace can never
+/// lose or reorder tokens. The final [`push_chat`] lands the real entry and clears this tail.
+pub fn push_chat_delta(activity: &mut ConsoleActivity, seq: u64, text: &str) {
+    activity.streaming_chat = Some(StreamingChat {
+        seq,
+        text: text.to_string(),
+    });
     activity.running = Some(true);
     activity.run_count = Some(1);
     activity.empty = None;
@@ -616,6 +653,7 @@ pub fn build_initial(model: &str, label: &str, scope: &[String], round_n: u32) -
             mini,
         }]),
         task_cost_estimate_usd: None,
+        streaming_chat: None,
     }
 }
 
@@ -805,6 +843,9 @@ pub fn resume_retry_round(
     a.running = Some(true);
     a.run_count = Some(1);
     a.empty = None;
+    // B14b: drop any stale streaming tail inherited from the predecessor run so a resumed
+    // run never shows a half-finished reply that will never be finalized.
+    a.streaming_chat = None;
 
     if let Some(mini) = live_mini_mut(a) {
         // Re-light the shimmer, clear any predecessor banner (a resumed run is not terminal).
@@ -1036,6 +1077,34 @@ fn parse_chat_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((role.to_string(), text))
+}
+
+/// The `chat-delta` bridge event wire shape (B14b): a cumulative snapshot of an assistant
+/// turn's reply as it streams. `seq` ties the deltas of one turn together.
+#[derive(Deserialize)]
+struct ChatDeltaEvent {
+    kind: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    text: String,
+}
+
+/// Parse ONE file line into a `(seq, text)` streaming chat delta, or `None` to SKIP (blank,
+/// oversized, non-JSON, or not `kind == "chat-delta"`). Pure + total. Unlike `parse_chat_line`
+/// this does NOT reject empty/whitespace text — a delta may legitimately be short or empty as
+/// the reply grows; the host coalesces same-`seq` deltas into one live row. Text is re-capped.
+fn parse_chat_delta_line(line: &str) -> Option<(u64, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: ChatDeltaEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "chat-delta" {
+        return None;
+    }
+    let text: String = event.text.chars().take(CHAT_TEXT_CAP).collect();
+    Some((event.seq, text))
 }
 
 /// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
@@ -1285,6 +1354,12 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
                             let time = now_clock();
                             store.update(&app, &agent_id, |a| {
                                 push_chat(a, &role, &text, &time)
+                            });
+                        }
+                    } else if let Some((seq, text)) = parse_chat_delta_line(&line) {
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            store.update(&app, &agent_id, |a| {
+                                push_chat_delta(a, seq, &text)
                             });
                         }
                     }
@@ -1712,6 +1787,74 @@ not json\n";
             }
             _ => panic!("expected a chat entry"),
         }
+    }
+
+    #[test]
+    fn parse_chat_delta_line_accepts_and_rejects() {
+        let (seq, text) =
+            parse_chat_delta_line(r#"{"kind":"chat-delta","seq":3,"text":"Hel"}"#).expect("parses");
+        assert_eq!(seq, 3);
+        assert_eq!(text, "Hel");
+        // a delta may be empty as it grows — NOT rejected on blank text
+        let (s, t) = parse_chat_delta_line(r#"{"kind":"chat-delta","seq":0,"text":""}"#)
+            .expect("empty delta still parses");
+        assert_eq!(s, 0);
+        assert_eq!(t, "");
+        // wrong kind / non-json rejected
+        assert!(parse_chat_delta_line(r#"{"kind":"chat","role":"assistant","text":"x"}"#).is_none());
+        assert!(parse_chat_delta_line(r#"{"kind":"milestone","text":"x"}"#).is_none());
+        assert!(parse_chat_delta_line("not json").is_none());
+    }
+
+    #[test]
+    fn chat_delta_is_a_separate_live_tail_finalized_by_push_chat() {
+        let mut a = ConsoleActivity::empty();
+        push_chat_delta(&mut a, 1, "He");
+        push_chat_delta(&mut a, 1, "Hello");
+        // The streaming tail holds the cumulative reply; NO timeline entry yet.
+        assert!(a.entries.as_ref().map(|e| e.is_empty()).unwrap_or(true));
+        assert_eq!(
+            a.streaming_chat,
+            Some(StreamingChat { seq: 1, text: "Hello".to_string() })
+        );
+        assert_eq!(a.running, Some(true));
+        // the final turn lands ONE real entry and clears the tail (no duplicate, no leftover)
+        push_chat(&mut a, "assistant", "Hello there", "10:00:01");
+        assert_eq!(a.streaming_chat, None, "tail cleared on finalize");
+        let entries = a.entries.as_ref().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            ConsoleEntry::Chat { role, text, .. } => {
+                assert_eq!(role, "assistant");
+                assert_eq!(text, "Hello there");
+            }
+            _ => panic!("expected a Chat entry"),
+        }
+    }
+
+    #[test]
+    fn chat_delta_new_seq_replaces_the_tail_no_orphan() {
+        let mut a = ConsoleActivity::empty();
+        push_chat_delta(&mut a, 1, "first");
+        // a new turn's delta replaces the tail outright — the old partial can't orphan,
+        // even if the previous turn was never finalized (e.g. interrupted).
+        push_chat_delta(&mut a, 2, "second");
+        assert_eq!(
+            a.streaming_chat,
+            Some(StreamingChat { seq: 2, text: "second".to_string() })
+        );
+        assert!(a.entries.as_ref().map(|e| e.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn streaming_chat_serializes_camelcase_and_omits_when_none() {
+        let mut a = ConsoleActivity::empty();
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(v.get("streamingChat").is_none(), "absent tail is omitted");
+        push_chat_delta(&mut a, 4, "partial");
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["streamingChat"]["seq"], 4);
+        assert_eq!(v["streamingChat"]["text"], "partial");
     }
 
     #[test]

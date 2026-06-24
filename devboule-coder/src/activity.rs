@@ -173,6 +173,26 @@ impl Activity {
             let _ = file.write_all(line.as_bytes());
         }
     }
+
+    /// Append ONE `chat-delta` event: a CUMULATIVE snapshot of the assistant turn `seq`'s
+    /// reply as it streams (B14b). The text is the full reply-so-far, not just the new
+    /// chunk, so the host tail can take the latest state and never has to re-order or
+    /// re-assemble fragments. Same best-effort contract as [`chat`] (None path / any I/O
+    /// error silently no-ops). The host coalesces same-`seq` deltas into one live chat
+    /// row and the final [`chat`] turn finalizes it.
+    pub fn chat_delta(&self, seq: u64, text: &str) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let line = encode_chat_delta(seq, text);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// Serialize ONE milestone event to its single-line JSON form, `text` char-capped to
@@ -236,10 +256,49 @@ fn encode_chat(role: &str, text: &str) -> String {
     line
 }
 
+/// Serialize ONE `chat-delta` event to single-line JSON:
+/// `{"kind":"chat-delta","seq":N,"text":"…"}` + `\n`. `text` is the cumulative reply-so-far,
+/// char-capped to [`MAX_CHAT_TEXT_CHARS`] (codepoint-safe). serde_json escapes control chars
+/// so the value stays on one physical line even mid-token.
+fn encode_chat_delta(seq: u64, text: &str) -> String {
+    let capped: String = if text.chars().count() > MAX_CHAT_TEXT_CHARS {
+        text.chars().take(MAX_CHAT_TEXT_CHARS).collect()
+    } else {
+        text.to_string()
+    };
+    let value = serde_json::json!({
+        "kind": "chat-delta",
+        "seq": seq,
+        "text": capped,
+    });
+    let mut line = value.to_string();
+    line.push('\n');
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn encode_chat_delta_is_one_line_with_seq_and_capped_text() {
+        let line = encode_chat_delta(7, "Hel\nlo");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "exactly one physical line");
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["kind"], "chat-delta");
+        assert_eq!(v["seq"], 7);
+        assert_eq!(v["text"], "Hel\nlo");
+    }
+
+    #[test]
+    fn encode_chat_delta_caps_overlong_text_codepoint_safe() {
+        let long = "é".repeat(MAX_CHAT_TEXT_CHARS + 50);
+        let line = encode_chat_delta(1, &long);
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["text"].as_str().unwrap().chars().count(), MAX_CHAT_TEXT_CHARS);
+    }
 
     #[test]
     fn encode_milestone_is_one_well_formed_json_line() {

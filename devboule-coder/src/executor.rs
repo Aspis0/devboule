@@ -780,6 +780,13 @@ impl ToolExecutor for RealExecutor {
         self.activity.chat(role, text);
     }
 
+    /// B14b: hand the burst an owned clone of the live activity bridge, so its streaming closure
+    /// can emit `chat_delta`s (cumulative reply-so-far) without borrowing the executor across the
+    /// async model call. The final `emit_chat` still lands the durable entry; deltas are ephemeral.
+    fn activity_handle(&self) -> crate::activity::Activity {
+        self.activity.clone()
+    }
+
     async fn execute(&self, action: &AgentAction) -> ToolResult {
         match action {
             // --- MCP backend: private/grounded Oracle + write delegation ------

@@ -31,6 +31,11 @@ import type { PlannerMessage } from "../projects/planner/plannerModel";
 import type { DesignProjectEntry } from "../../types/design";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
+  clearPersistedProjectRootDraft,
+  persistProjectRootDraft,
+  readPersistedProjectRootDraft,
+} from "./projectRootDraft";
+import {
   CensorCountsTracker,
   censorTrackedSignature,
   type CensorCountByProject,
@@ -609,8 +614,14 @@ export function ProjectsView() {
   // Prefill the root editor with the project's current root (#6) so "Set root" edits the
   // existing value instead of starting blank. Tracks rootPath too, so after you set a
   // folder the editor shows the saved value — WITHOUT touching the chat (separate effect).
+  // Finding 5: a draft persisted before the idle auto-lock unmount wins over the
+  // saved rootPath, so an unsaved edit survives the lock. With no persisted draft
+  // this restores the saved value exactly as before. Persistence is driven by the
+  // input's onChange (user edits only), NOT a mirror effect — so this restore-only
+  // effect cannot clobber the stored draft via effect-ordering.
   useEffect(() => {
-    setRootDraft(currentProject?.metadata.rootPath ?? "");
+    const persisted = readPersistedProjectRootDraft(currentProject?.metadata.id);
+    setRootDraft(persisted ?? (currentProject?.metadata.rootPath ?? ""));
   }, [currentProject?.metadata.id, currentProject?.metadata.rootPath]);
 
   useEffect(() => {
@@ -915,6 +926,13 @@ export function ProjectsView() {
     currentProjectSessions,
     cloudOrchestratorLaunchedId,
   ]);
+  // Phase D: the agent whose activity bridge feeds the planner Stage — the LOCAL orchestrator, or
+  // (when the orchestrator is a CLOUD CLI in duplex mode) the cloud agent, whose reader thread
+  // writes the SAME bridge file. So cloud + local drive the identical Stage (chat/websearch).
+  const plannerActivityAgentId = useMemo(
+    () => orchestratorAgentId ?? cloudOrchestratorAgentId,
+    [orchestratorAgentId, cloudOrchestratorAgentId],
+  );
   // Mark a Planner launch in flight (plannerLaunching) until its session registers — guards
   // the composer against a duplicate launch during the agent-poll lag. A safety timeout
   // clears it if the session never appears (e.g. the orchestrator crashes on start).
@@ -943,16 +961,18 @@ export function ProjectsView() {
     },
     [],
   );
-  // B15b: persist the live orchestrator id per project whenever one is bound.
+  // B15b: persist the live orchestrator id per project whenever one is bound — local OR cloud
+  // duplex (both write the same durable activity .jsonl), so the chat survives an app restart for
+  // either backend.
   useEffect(() => {
     const pid = currentProject?.metadata.id;
-    if (!pid || !orchestratorAgentId) return;
+    if (!pid || !plannerActivityAgentId) return;
     try {
-      localStorage.setItem(orchAgentKey(pid), orchestratorAgentId);
+      localStorage.setItem(orchAgentKey(pid), plannerActivityAgentId);
     } catch {
       /* storage unavailable — non-fatal */
     }
-  }, [orchestratorAgentId, currentProject?.metadata.id]);
+  }, [plannerActivityAgentId, currentProject?.metadata.id]);
 
   // The id the chat reads from: the LIVE session when present, else the last known
   // orchestrator for this project. The in-memory activity store keeps that agent's
@@ -964,11 +984,11 @@ export function ProjectsView() {
   // and surface another project's activity (reviewer max-recall finding). The live
   // console stays on orchestratorAgentId; the disk transcript covers a dead session.
   const effectiveOrchestratorId = useMemo(() => {
-    if (orchestratorAgentId) return orchestratorAgentId;
+    if (plannerActivityAgentId) return plannerActivityAgentId;
     return readPersistedOrchestratorId(currentProject?.metadata.id);
-  }, [orchestratorAgentId, currentProject?.metadata.id]);
+  }, [plannerActivityAgentId, currentProject?.metadata.id]);
 
-  const orchestratorConsole = useAgentConsole(orchestratorAgentId);
+  const orchestratorConsole = useAgentConsole(plannerActivityAgentId);
   const plannerWeb = useMemo(
     () => latestWeb(orchestratorConsole.entries),
     [orchestratorConsole.entries],
@@ -1032,6 +1052,21 @@ export function ProjectsView() {
       .slice(echoedUserCount);
     return [...real, ...pendingUsers];
   }, [orchestratorConsole.entries, plannerMessages, durableChat]);
+
+  // B14b: append the live, in-progress assistant reply (token streaming) as the LAST bubble —
+  // a SEPARATE slot from the finalized timeline, so it grows token-by-token and is replaced by
+  // the real entry when the turn finalizes. Empty tail (no reply streaming) leaves chat as-is.
+  const plannerConvoLive = useMemo(() => {
+    const tail = orchestratorConsole.streamingChat;
+    // Suppress the live tail if the finalized assistant entry already landed (the `chat` entry can
+    // arrive one event before `streamingChat` is cleared) — otherwise the bubble shows twice for a
+    // frame. Also skip an empty tail.
+    const lastIsAssistant =
+      plannerConvo.length > 0 &&
+      plannerConvo[plannerConvo.length - 1].role === "assistant";
+    if (!tail || tail.text.length === 0 || lastIsAssistant) return plannerConvo;
+    return [...plannerConvo, { role: "assistant" as const, text: tail.text, streaming: true }];
+  }, [plannerConvo, orchestratorConsole.streamingChat]);
 
   // "Awaiting your reply": the orchestrator spoke last and is live → your turn. Drives the
   // PlannerChat pill so the user knows to respond (esp. after an AskUser question).
@@ -1522,15 +1557,22 @@ export function ProjectsView() {
     const trimmed = rootDraft.trim();
     const nextRoot = trimmed === "" ? null : trimmed;
     if (nextRoot === (currentProject.metadata.rootPath ?? null)) return;
-    await runMutation(() =>
+    const savedProjectId = currentProject.metadata.id;
+    const saved = await runMutation(() =>
       invokeBackendCommand<ProjectDetail>("update_project_metadata", {
-        projectId: currentProject.metadata.id,
+        projectId: savedProjectId,
         patch: {
           rootPath: nextRoot,
           expectedRevision: currentProject.revision,
         },
       }),
     );
+    // Finding 5: drop the persisted draft ONLY on a successful save (runMutation
+    // returns null on failure) — otherwise a failed save would silently discard
+    // the user's unsaved edit, which is the very thing we're trying to protect.
+    if (saved !== null) {
+      clearPersistedProjectRootDraft(savedProjectId);
+    }
   };
 
   const copyAgentPrompt = async (role: SpawnRole, taskId?: string) => {
@@ -1935,6 +1977,8 @@ export function ProjectsView() {
             // launch, so the backend omits DEVBOULE_GOAL/DEVBOULE_AUTO_CREATE — byte-identical).
             initialGoal: input.initialGoal,
             autoCreate: input.autoCreate,
+            // Phase D: run a cloud orchestrator as a piped duplex child (Stage, not terminal).
+            cloudDuplex: input.cloudDuplex,
           },
         },
       );
@@ -2034,8 +2078,10 @@ export function ProjectsView() {
         planFirst: plannerOrchestratorClient === "orchestrator" && autoCreate,
         initialGoal: goal,
         autoCreate,
+        // Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
+        cloudDuplex: plannerOrchestratorClient !== "orchestrator",
       });
-      // B2 F2: capture the cloud orchestrator's exact agentId for terminal binding.
+      // B2 F2: capture the cloud orchestrator's exact agentId for binding (Stage in duplex mode).
       if (plannerOrchestratorClient !== "orchestrator") {
         setCloudOrchestratorLaunchedId(launchedId);
       }
@@ -2091,8 +2137,10 @@ export function ProjectsView() {
         // headless, plan-first); the note above is kept only as an audit trail. auto-create rides too.
         initialGoal: goal,
         autoCreate,
+        // Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
+        cloudDuplex: plannerOrchestratorClient !== "orchestrator",
       });
-      // B2 F2: capture the cloud orchestrator's exact agentId for terminal binding.
+      // B2 F2: capture the cloud orchestrator's exact agentId for binding (Stage in duplex mode).
       if (plannerOrchestratorClient !== "orchestrator") {
         setCloudOrchestratorLaunchedId(launchedId);
       }
@@ -2350,7 +2398,18 @@ export function ProjectsView() {
             <input
               id="project-root-input"
               value={rootDraft}
-              onChange={(event) => setRootDraft(event.target.value)}
+              onChange={(event) => {
+                const next = event.target.value;
+                setRootDraft(next);
+                // Finding 5: persist the unsaved edit on each keystroke so it
+                // outlives an idle auto-lock unmount (removed when it equals the
+                // saved rootPath or is empty).
+                persistProjectRootDraft(
+                  currentProject?.metadata.id,
+                  next,
+                  currentProject?.metadata.rootPath,
+                );
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter") void setProjectRoot();
               }}
@@ -2916,17 +2975,18 @@ export function ProjectsView() {
             design={plannerDesign}
             linkedTask={null}
             onOpenInDesign={() => requestView("design")}
-            messages={plannerConvo}
+            messages={plannerConvoLive}
             awaitingReply={plannerAwaitingReply}
             onSend={(text) => {
               const msg = text.trim();
               if (!msg) return;
               // Always echo the user's message in the chat.
               setPlannerMessages((prev) => [...prev, { role: "user", text: msg }]);
-              if (orchestratorAgentId) {
-                // LIVE: steer the running orchestrator (mid-plan course-correction).
+              if (plannerOrchestratorClient === "orchestrator" && orchestratorAgentId) {
+                // LIVE: steer the running LOCAL orchestrator (mid-plan course-correction).
                 // It drains DEVBOULE_STEER_FILE between rounds and injects this as a
-                // human turn (P2). Surface a failed send instead of swallowing it.
+                // human turn (P2). Routed by the selected client (not just "any non-null id")
+                // so a stale-but-recent local session can't steal a cloud-mode message.
                 invokeBackendCommand("orchestrator_steer", {
                   agentId: orchestratorAgentId,
                   message: msg,
@@ -2935,6 +2995,22 @@ export function ProjectsView() {
                     e instanceof Error
                       ? e.message
                       : "Steer failed — message not delivered.",
+                  ),
+                );
+                return;
+              }
+              if (cloudOrchestratorAgentId) {
+                // Phase D: a CLOUD duplex orchestrator — write the turn straight to its piped
+                // stdin (the cloud counterpart of orchestrator_steer). Its event stream surfaces
+                // the reply in the Stage just like the local path.
+                invokeBackendCommand("project_cloud_orchestrator_send", {
+                  agentId: cloudOrchestratorAgentId,
+                  message: msg,
+                }).catch((e) =>
+                  setError(
+                    e instanceof Error
+                      ? e.message
+                      : "Send failed — message not delivered.",
                   ),
                 );
                 return;
@@ -2980,7 +3056,7 @@ export function ProjectsView() {
             ]}
             orchestratorId={plannerOrchestratorClient}
             onOrchestratorChange={setPlannerOrchestratorClient}
-            cloudTerminalAgentId={cloudOrchestratorAgentId}
+            cloudTerminalAgentId={null}
             coders={[
               { id: "claude", label: "Claude" },
               { id: "codex", label: "Codex" },
@@ -2993,24 +3069,34 @@ export function ProjectsView() {
             onCoderChange={setPlannerCoderId}
             autoCreate={plannerAutoCreate}
             onAutoCreateToggle={() => setPlannerAutoCreate((v) => !v)}
-            canCreatePlan={!!orchestratorAgentId}
+            canCreatePlan={!!orchestratorAgentId || !!cloudOrchestratorAgentId}
             onCreatePlan={() => {
-              if (!orchestratorAgentId) {
+              // B10: discuss-first — the plan is created on demand. Steer the live orchestrator
+              // (local OR cloud duplex) to draft + submit the plan and create the Kanban tasks.
+              const planMessage =
+                "We've discussed enough — now draft the plan: submit it with plan_submit, and once it's approved create the Kanban tasks with project_create_plan_tasks (one per phase).";
+              const target =
+                plannerOrchestratorClient === "orchestrator" && orchestratorAgentId
+                  ? { command: "orchestrator_steer", agentId: orchestratorAgentId }
+                  : cloudOrchestratorAgentId
+                    ? {
+                        command: "project_cloud_orchestrator_send",
+                        agentId: cloudOrchestratorAgentId,
+                      }
+                    : null;
+              if (!target) {
                 setError(
                   "Start the Orchestrator (describe a goal) before creating the plan.",
                 );
                 return;
               }
-              // B10: discuss-first — the plan is created on demand. Steer the live
-              // orchestrator to draft + submit the plan and create the Kanban tasks.
               setPlannerMessages((prev) => [
                 ...prev,
                 { role: "user", text: "Create the plan and the tasks now." },
               ]);
-              invokeBackendCommand("orchestrator_steer", {
-                agentId: orchestratorAgentId,
-                message:
-                  "We've discussed enough — now draft the plan: submit it with plan_submit, and once it's approved create the Kanban tasks with project_create_plan_tasks (one per phase).",
+              invokeBackendCommand(target.command, {
+                agentId: target.agentId,
+                message: planMessage,
               }).catch((e) =>
                 setError(
                   e instanceof Error ? e.message : "Could not start planning.",

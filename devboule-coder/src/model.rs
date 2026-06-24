@@ -59,6 +59,19 @@ pub trait CoderModel: Send + Sync {
     ///
     /// [`run_burst`]: crate::agent_loop::run_burst
     async fn next_output(&self, transcript: &Transcript) -> String;
+
+    /// B14b: like [`next_output`], but stream the CUMULATIVE raw output to `on_progress` as it
+    /// generates, so the burst can render the reply token-by-token. The DEFAULT does not stream
+    /// (it just runs `next_output`) — only a real backend that supports SSE overrides this, so
+    /// scripted/mock models and the non-streaming path stay byte-identical. `on_progress` is
+    /// called with the full text-so-far (monotonically growing), never just the new chunk.
+    async fn next_output_streaming(
+        &self,
+        transcript: &Transcript,
+        _on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> String {
+        self.next_output(transcript).await
+    }
 }
 
 /// Canned model: acknowledges the user input and emits a short markdown blob in

@@ -1736,6 +1736,14 @@ pub fn stop_agent(
     // external kill-by-title path below.
     if ledger_host_is_app(entry.as_ref()) {
         super::agent_pty::kill_agent_pty(&app, &agent_id);
+        // Phase D: an app-hosted agent may instead be a cloud DUPLEX child (piped, not a PTY).
+        // kill_cloud_duplex is idempotent + no-ops when there is no such session, so calling it
+        // alongside the PTY kill cleans up whichever kind this agent actually is.
+        {
+            use tauri::Manager;
+            let sessions = app.state::<super::cloud_duplex::CloudDuplexSessions>();
+            super::cloud_duplex::kill_cloud_duplex(&app, &sessions, &agent_id);
+        }
         // Best-effort prompt-file cleanup (same discipline as the external path).
         // FIX 2: remove the per-launch restricted DIRECTORY too, not just the file.
         if let Some(prompt_file) = entry.as_ref().and_then(|entry| entry.prompt_file.clone()) {

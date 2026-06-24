@@ -28,6 +28,9 @@ export type ChatRole = 'user' | 'assistant';
 export interface PlannerMessage {
   role: ChatRole;
   text: string;
+  /** B14b: this bubble is the live, in-progress reply being streamed token-by-token (render a
+   *  caret / "typing" affordance). Absent/false for finalized turns. */
+  streaming?: boolean;
 }
 
 export interface StatusPill {

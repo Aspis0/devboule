@@ -175,6 +175,14 @@ export interface ChatEntry {
 /** A single top-level row of the timeline. */
 export type ConsoleEntry = CoderEntry | SpawnEntry | WebSearchEntry | ChatEntry;
 
+/** B14b: the live, in-progress assistant reply tail — a SEPARATE slot from `entries` (so it
+ *  is immune to FIFO eviction / interleaved events), rendered as the last in-progress assistant
+ *  bubble until the final `chat` turn lands the real entry. `seq` ties it to one turn. */
+export interface StreamingChat {
+  seq: number;
+  text: string;
+}
+
 // ---- the activity snapshot --------------------------------------------------
 
 /** The whole console state for ONE agent. This is the exact shape the backend
@@ -195,6 +203,9 @@ export interface ConsoleActivity {
   entries?: ConsoleEntry[];
   /** Estimated USD cost for the current task (P2). Null/absent when model is unpriced. */
   taskCostEstimateUsd?: number | null;
+  /** B14b: the live in-progress assistant reply (token streaming). Absent when no reply is
+   *  currently streaming; cleared when the final `chat` turn lands. */
+  streamingChat?: StreamingChat | null;
 }
 
 // ---- pure helpers (unit-tested in node) -------------------------------------

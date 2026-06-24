@@ -304,6 +304,7 @@ pub fn run() {
         .manage(mini_coder_state)
         .manage(backend::mini_activity::MiniActivityStore::default())
         .manage(backend::mini_activity::ActivityTailRegistry::default())
+        .manage(backend::cloud_duplex::CloudDuplexSessions::new())
         .manage(design_gen_state)
         .setup(|app| {
             // Record the bundled, read-only `oracle/` location so release builds
@@ -426,6 +427,7 @@ pub fn run() {
             backend::agent_pty::agent_pty_write,
             backend::agent_pty::agent_pty_resize,
             backend::agent_pty::agent_pty_kill,
+            backend::cloud_duplex::project_cloud_orchestrator_send,
             backend::agent_pty::agent_pty_list,
             backend::mini_coder_executor::mini_coder_kill,
             backend::mini_coder_executor::mini_coder_steer,

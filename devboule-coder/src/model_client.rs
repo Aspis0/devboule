@@ -717,6 +717,21 @@ pub fn parse_chat_response(body: &str) -> Result<String, String> {
         .ok_or_else(|| "response missing choices[0].message.content".to_string())
 }
 
+/// B14b: extract the incremental assistant text from ONE SSE `data:` payload's JSON
+/// (`choices[0].delta.content`). PURE + total — role-only/finish chunks and malformed JSON
+/// all return None, so the streaming loop simply skips them. Unit-tested against fixtures.
+fn parse_sse_delta_content(data: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(data).ok()?;
+    value
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("delta")?
+        .get("content")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 #[async_trait]
 impl CoderModel for OmlxModel {
     /// L2.1 streaming path: unused by the burst loop (the loop drives
@@ -738,6 +753,22 @@ impl CoderModel for OmlxModel {
             // loop's parser turns it into a FORMAT ERROR fed back to the model,
             // and three in a row escalate cleanly. We never panic on I/O.
             Err(e) => format!("[model request failed: {e}]"),
+        }
+    }
+
+    async fn next_output_streaming(
+        &self,
+        transcript: &Transcript,
+        on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> String {
+        match self.run_completion_streaming(transcript, on_progress).await {
+            Ok(text) => text,
+            // Streaming failed mid-flight — fall back to a clean non-streaming completion so the
+            // burst always gets a well-formed result (the final emit_chat finalizes the chat).
+            Err(_) => match self.run_completion(transcript).await {
+                Ok(t) => t,
+                Err(e) => format!("[model request failed: {e}]"),
+            },
         }
     }
 }
@@ -762,6 +793,64 @@ impl OmlxModel {
             return Err(format!("HTTP {}", status.as_u16()));
         }
         parse_chat_response(&text)
+    }
+
+    /// B14b: POST a STREAMING (`"stream": true`) chat-completions request and forward the
+    /// assistant text to `on_progress` (the FULL text-so-far) as SSE deltas arrive; return the
+    /// complete text. Only COMPLETE lines (terminated by '\n') are parsed each chunk — the
+    /// trailing partial stays buffered, so a `data:` line split across two chunks is never
+    /// processed twice. Memory is bounded by `HTTP_BODY_CAP`.
+    async fn run_completion_streaming(
+        &self,
+        transcript: &Transcript,
+        on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<String, String> {
+        let mut body = self.build_request_body(transcript);
+        body["stream"] = serde_json::json!(true);
+        let mut resp = self
+            .client
+            .post(self.endpoint())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+
+        // Buffer raw BYTES (not a per-chunk lossy String): a multibyte codepoint split across two
+        // `resp.chunk()` boundaries would otherwise be corrupted into U+FFFD. We decode only
+        // COMPLETE lines — a '\n' is single-byte ASCII, so a whole line never splits a codepoint.
+        let mut byte_buf: Vec<u8> = Vec::new();
+        let mut full = String::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("stream error: {e}"))?
+        {
+            byte_buf.extend_from_slice(&chunk);
+            while let Some(nl) = byte_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = byte_buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim();
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue; // SSE comments / blank separators
+                };
+                let payload = payload.trim();
+                if payload == "[DONE]" {
+                    return Ok(full);
+                }
+                if let Some(piece) = parse_sse_delta_content(payload) {
+                    full.push_str(&piece);
+                    on_progress(&full); // deliver this piece to the UI first...
+                    if full.len() > crate::executor::HTTP_BODY_CAP {
+                        return Ok(full); // ...then bound memory (parity with run_completion's cap)
+                    }
+                }
+            }
+        }
+        Ok(full)
     }
 }
 
@@ -925,6 +1014,21 @@ impl CoderModel for CloudModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_sse_delta_content_extracts_or_skips() {
+        assert_eq!(
+            parse_sse_delta_content(r#"{"choices":[{"delta":{"content":"Hel"}}]}"#),
+            Some("Hel".to_string())
+        );
+        // role-only / finish / empty-choices / malformed → None (skipped by the stream loop)
+        assert_eq!(
+            parse_sse_delta_content(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
+            None
+        );
+        assert_eq!(parse_sse_delta_content(r#"{"choices":[]}"#), None);
+        assert_eq!(parse_sse_delta_content("not json"), None);
+    }
 
     // --- loopback validator ---------------------------------------------------
 

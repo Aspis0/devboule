@@ -23,6 +23,7 @@ mod model_client;
 mod multi_mcp;
 mod planner;
 mod prompt;
+mod reply_stream;
 mod rmcp_backend;
 mod runner;
 mod skills;

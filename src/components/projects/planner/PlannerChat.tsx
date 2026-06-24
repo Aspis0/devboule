@@ -159,6 +159,19 @@ export function PlannerChat({
                   }}
                 >
                   {msg.text}
+                  {msg.streaming && (
+                    <span
+                      aria-hidden
+                      style={{
+                        display: "inline-block",
+                        width: 7,
+                        marginLeft: 1,
+                        animation: "pp-blink 1s step-start infinite",
+                      }}
+                    >
+                      ▌
+                    </span>
+                  )}
                 </div>
               </div>
             ))}

@@ -317,6 +317,10 @@ export interface SpawnLaunchInput {
   // Orchestrator composer auto-create toggle. `false` ⇒ DEVBOULE_AUTO_CREATE=0 (the planner submits
   // the plan but doesn't create its tasks on approval). Absent/`true` ⇒ the default (create on approval).
   autoCreate?: boolean;
+  // Phase D — true only when launching a CLOUD orchestrator (claude/codex) AS the planner, so the
+  // backend runs it as a piped duplex child whose events feed the Stage (instead of a terminal).
+  // Threaded to ProjectAgentLaunchInput.cloudDuplex over IPC; absent ⇒ the existing launch.
+  cloudDuplex?: boolean;
 }
 
 // Max length of an advisory model hint that rides into the prompt. A model name

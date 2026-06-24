@@ -625,6 +625,13 @@ pub struct ProjectAgentLaunchInput {
     /// provide arbitrary prompt text.
     #[serde(default)]
     pub workflow_run: Option<ProjectWorkflowRunInput>,
+    /// Phase D: when `Some(true)` AND `client` is `"claude"`/`"codex"`, launch the cloud CLI as a
+    /// DUPLEX orchestrator — a piped (non-PTY) child in its structured-streaming mode whose events
+    /// are normalized into the activity bridge so it drives the SAME planner Stage as the local
+    /// orchestrator (instead of an opaque terminal). Optional + lenient: `None`/`Some(false)` keeps
+    /// the existing PTY/terminal launch byte-identical. Ignored for non-cloud clients. camelCase.
+    #[serde(default)]
+    pub cloud_duplex: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
