@@ -137,6 +137,11 @@ export interface ProjectWorkspaceProps {
   taskBoardSlot?: ReactNode;
   /** The per-project Notes section, built by ProjectsView, rendered BELOW the dock. */
   notesSlot?: ReactNode;
+  /** B8: the per-project detail (status header + lifecycle actions + agent-root
+   *  editor + saved workflows), built by ProjectsView and relocated here from the
+   *  create landing — a project's detail belongs on its OWN page, not the create
+   *  page (the landing = create + Kanban-as-history). Optional → absent renders nothing. */
+  detailSlot?: ReactNode;
 }
 
 export function ProjectWorkspace({
@@ -167,6 +172,7 @@ export function ProjectWorkspace({
   gitActionBusy,
   taskBoardSlot,
   notesSlot,
+  detailSlot,
 }: ProjectWorkspaceProps) {
   const now = useNow();
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(() =>
@@ -467,6 +473,10 @@ export function ProjectWorkspace({
           {gitActionMessage}
         </p>
       )}
+
+      {/* B8: the per-project detail (status header + root editor + saved workflows),
+          relocated here from the create landing. */}
+      {detailSlot}
 
       {/* GH-P4: agent push-approval gate — agents commit freely, the human approves
           every push. Surfaces this project's pending request(s) with Approve/Deny.

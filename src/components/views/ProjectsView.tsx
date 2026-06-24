@@ -160,6 +160,36 @@ function taskMoveTargets(task: ProjectTask) {
   );
 }
 
+// B5: key under which the create-flow working-folder draft is persisted, so it
+// survives the app's idle auto-lock (which unmounts ProjectsView and wipes all
+// volatile useState). Read defensively — localStorage can throw (private mode,
+// disabled storage) and must never break the view.
+const NEW_PROJECT_ROOT_DRAFT_KEY = "devboule.newProjectRootDraft";
+
+function readPersistedRootDraft(): string {
+  try {
+    return localStorage.getItem(NEW_PROJECT_ROOT_DRAFT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+// B15b: remember the orchestrator agentId per project, so the planner chat can keep
+// reading the durable transcript after the orchestrator session ends (the in-memory
+// activity store still has it) — and, via read_activity_chat, across an app restart.
+// Without this the chat was bound to the LIVE session id; when it went null the whole
+// conversation vanished (the reported "steer kills the orchestrator + chat resets" bug).
+const orchAgentKey = (projectId: string) => `devboule.orch.${projectId}`;
+
+function readPersistedOrchestratorId(projectId: string | null | undefined): string | null {
+  if (!projectId) return null;
+  try {
+    return localStorage.getItem(orchAgentKey(projectId));
+  } catch {
+    return null;
+  }
+}
+
 export function ProjectsView() {
   const { pendingTab, config, requestView } = useAppContext();
   const { consumePendingTab } = useAppActions();
@@ -185,7 +215,11 @@ export function ProjectsView() {
   // (our Stage/TUI); "claude"/"codex" run their own CLI (we show their terminal). Default local.
   const [plannerOrchestratorClient, setPlannerOrchestratorClient] =
     useState<string>("orchestrator");
-  const [plannerAutoCreate, setPlannerAutoCreate] = useState<boolean>(true);
+  // B10: discuss-first by default. OFF = the orchestrator converses on turn 1 and
+  // only plans/creates when the user clicks "Create plan"; ON = the old eager mode
+  // (plan-first + auto-create on launch). The choice is preserved (a toggle), just
+  // defaulted to the non-eager behavior the owner wants.
+  const [plannerAutoCreate, setPlannerAutoCreate] = useState<boolean>(false);
   const [plannerWebMode, setPlannerWebMode] = useState<"auto" | "manual">("auto");
   // The chat transcript + active goal echo shown in the planner panel. P0 seeds them
   // optimistically on send; P2 replaces them with the orchestrator's live transcript.
@@ -196,6 +230,12 @@ export function ProjectsView() {
   // can't create a duplicate project or launch a second Planner. A timeout safety clears it
   // if the session never registers (e.g. the orchestrator crashes on start).
   const [plannerLaunching, setPlannerLaunching] = useState(false);
+  // B2 F2: the EXACT agentId of the cloud orchestrator (claude/codex) captured at
+  // launch, so its terminal binds to the right session instead of `.find(by client)`
+  // — which after a hand-off can match a CODER of the same CLI.
+  const [cloudOrchestratorLaunchedId, setCloudOrchestratorLaunchedId] = useState<
+    string | null
+  >(null);
   const plannerLaunchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The project's most-recent design (read-only preview in the planner's Design tab).
   const [plannerDesign, setPlannerDesign] = useState<{
@@ -216,7 +256,14 @@ export function ProjectsView() {
   const [gitActionBusy, setGitActionBusy] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   // R1: the project's working folder, chosen at creation (the agent reads/writes here).
-  const [newProjectRootDraft, setNewProjectRootDraft] = useState("");
+  // B5: persisted to localStorage so a folder picked for a NEW project survives the
+  // app's idle auto-lock — which unmounts this whole view (App renders <LockedScreen>
+  // when isLocked), wiping all volatile useState. Without this the user picks a
+  // folder, the app self-locks mid-planning, and on unlock the draft is gone, so the
+  // project gets created with rootPath=null. Restored on mount, cleared after create.
+  const [newProjectRootDraft, setNewProjectRootDraft] = useState(
+    () => readPersistedRootDraft(),
+  );
   // S5: the configured default external main-coder CLI for task-card launches (claude|codex).
   const [mainCoderClient, setMainCoderClient] = useState<"claude" | "codex">(
     "codex",
@@ -305,6 +352,22 @@ export function ProjectsView() {
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
+
+  // B5: mirror the create-flow folder draft to localStorage on every change, so a
+  // folder picked for a new project outlives the idle auto-lock unmount. Clearing
+  // the draft after create (setNewProjectRootDraft("")) writes "" here too, which
+  // we treat as "no draft" and remove from storage.
+  useEffect(() => {
+    try {
+      if (newProjectRootDraft.trim()) {
+        localStorage.setItem(NEW_PROJECT_ROOT_DRAFT_KEY, newProjectRootDraft);
+      } else {
+        localStorage.removeItem(NEW_PROJECT_ROOT_DRAFT_KEY);
+      }
+    } catch {
+      /* storage unavailable — non-fatal, the draft just won't persist */
+    }
+  }, [newProjectRootDraft]);
 
   // Memoized so the six downstream useMemos keyed on currentProject don't all
   // recompute on every unrelated state update (e.g. the 5s agent poll).
@@ -535,6 +598,12 @@ export function ProjectsView() {
     setPlannerMessages([]);
     setPlannerGoal(null);
     setPlannerWebMode("auto");
+    // B15b (reviewer F1): clear the durable transcript SYNCHRONOUSLY on switch, so
+    // the new project never briefly renders the previous project's conversation
+    // while its own read_activity_chat round-trips.
+    setDurableChat([]);
+    // B2 F2: a captured cloud-orchestrator id belongs to the project we're leaving.
+    setCloudOrchestratorLaunchedId(null);
   }, [currentProject?.metadata.id]);
 
   // Prefill the root editor with the project's current root (#6) so "Set root" edits the
@@ -786,6 +855,17 @@ export function ProjectsView() {
     return sessionsByProject[currentProject.metadata.id] ?? [];
   }, [currentProject, sessionsByProject]);
 
+  // B12: the orchestrator is the CREATE-TIME conversation (the planner), not a
+  // permanent project agent. Keep it OFF the single-project Work page by default —
+  // it shouldn't auto-appear in the agent rail or get auto-selected there (it
+  // couldn't have existed "at the beginning"). Re-invoking it is opt-in (the
+  // planner). The landing's planner binding still uses currentProjectSessions, so
+  // only the Work-mode rail is scoped here.
+  const workModeSessions = useMemo(
+    () => currentProjectSessions.filter((s) => s.client !== "orchestrator"),
+    [currentProjectSessions],
+  );
+
   // The single agent to surface in the header's working-agent line: the
   // freshest session by last-seen heartbeat, if any. Uses the shared
   // freshestSession helper so the header, board card, and panel all agree on
@@ -814,11 +894,27 @@ export function ProjectsView() {
   // orchestrator is local, or when no cloud session is running yet (pre-launch).
   const cloudOrchestratorAgentId = useMemo(() => {
     if (plannerOrchestratorClient === "orchestrator") return null;
+    // B2 F2: prefer the EXACT id captured at launch, validated against this
+    // project's live sessions (so it can't point at a stale/other-project agent).
+    // Only if that's unavailable fall back to the first session of this CLI — which
+    // can collide with a hand-off coder, hence the captured id takes precedence.
+    if (
+      cloudOrchestratorLaunchedId &&
+      currentProjectSessions.some(
+        (s) => s.agentId === cloudOrchestratorLaunchedId,
+      )
+    ) {
+      return cloudOrchestratorLaunchedId;
+    }
     return (
       currentProjectSessions.find((s) => s.client === plannerOrchestratorClient)
         ?.agentId ?? null
     );
-  }, [plannerOrchestratorClient, currentProjectSessions]);
+  }, [
+    plannerOrchestratorClient,
+    currentProjectSessions,
+    cloudOrchestratorLaunchedId,
+  ]);
   // Mark a Planner launch in flight (plannerLaunching) until its session registers — guards
   // the composer against a duplicate launch during the agent-poll lag. A safety timeout
   // clears it if the session never appears (e.g. the orchestrator crashes on start).
@@ -847,20 +943,83 @@ export function ProjectsView() {
     },
     [],
   );
+  // B15b: persist the live orchestrator id per project whenever one is bound.
+  useEffect(() => {
+    const pid = currentProject?.metadata.id;
+    if (!pid || !orchestratorAgentId) return;
+    try {
+      localStorage.setItem(orchAgentKey(pid), orchestratorAgentId);
+    } catch {
+      /* storage unavailable — non-fatal */
+    }
+  }, [orchestratorAgentId, currentProject?.metadata.id]);
+
+  // The id the chat reads from: the LIVE session when present, else the last known
+  // orchestrator for this project. The in-memory activity store keeps that agent's
+  // transcript after its process ends, so the conversation survives a session death
+  // within the app; read_activity_chat (below) covers an app restart.
+  // Used ONLY for the durable chat READ (read_activity_chat below) — NOT for the live
+  // console. Binding the live console to a persisted (possibly dead / previous-session)
+  // id would feed plannerWeb (websearch) + the "real" plannerConvo from a stale agent
+  // and surface another project's activity (reviewer max-recall finding). The live
+  // console stays on orchestratorAgentId; the disk transcript covers a dead session.
+  const effectiveOrchestratorId = useMemo(() => {
+    if (orchestratorAgentId) return orchestratorAgentId;
+    return readPersistedOrchestratorId(currentProject?.metadata.id);
+  }, [orchestratorAgentId, currentProject?.metadata.id]);
+
   const orchestratorConsole = useAgentConsole(orchestratorAgentId);
   const plannerWeb = useMemo(
     () => latestWeb(orchestratorConsole.entries),
     [orchestratorConsole.entries],
   );
 
+  // B15b durable fallback: when the in-memory console has NO chat (e.g. after an app
+  // restart, the store is empty) but we know this project's orchestrator, read the
+  // transcript straight from the on-disk .jsonl so the conversation is reconstructed.
+  const [durableChat, setDurableChat] = useState<PlannerMessage[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const live = chatMessages(orchestratorConsole.entries);
+    if (!effectiveOrchestratorId || live.length > 0) {
+      setDurableChat([]);
+      return;
+    }
+    void invokeBackendCommand<{ role: string; text: string }[]>(
+      "read_activity_chat",
+      { agentId: effectiveOrchestratorId },
+    )
+      .then((turns) => {
+        if (cancelled) return;
+        setDurableChat(
+          (turns ?? []).map((t) => ({
+            role: t.role === "assistant" ? "assistant" : "user",
+            text: t.text,
+          })),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setDurableChat([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveOrchestratorId, orchestratorConsole.entries]);
+
   // The planner chat = the REAL conversation from the bridge (the orchestrator's
   // assistant turns + its echoed user steers) PLUS any just-sent user message not yet
   // echoed back (optimistic, deduped by text once the bridge catches up).
   const plannerConvo = useMemo(() => {
     const real = chatMessages(orchestratorConsole.entries);
-    // Before the orchestrator's session binds, the bridge has nothing — show the optimistic
-    // echo + any frontend notices (pick-a-folder / starting…) in send order.
-    if (real.length === 0) return plannerMessages;
+    // Before the orchestrator's session binds, the bridge has nothing. B15b: if a
+    // DURABLE transcript was reconstructed from disk (session ended / app restarted),
+    // show it (+ any just-typed optimistic user messages after it); otherwise show the
+    // optimistic echo + frontend notices (pick-a-folder / starting…) in send order.
+    if (real.length === 0) {
+      return durableChat.length > 0
+        ? [...durableChat, ...plannerMessages]
+        : plannerMessages;
+    }
     // Once the bridge has the conversation it is AUTHORITATIVE and chronological (user turns
     // + assistant replies in order). Append ONLY the user messages sent but not yet echoed
     // back — a position watermark on USER turns, so repeated "yes"/"continue" are never
@@ -872,7 +1031,7 @@ export function ProjectsView() {
       .filter((m) => m.role === "user")
       .slice(echoedUserCount);
     return [...real, ...pendingUsers];
-  }, [orchestratorConsole.entries, plannerMessages]);
+  }, [orchestratorConsole.entries, plannerMessages, durableChat]);
 
   // "Awaiting your reply": the orchestrator spoke last and is live → your turn. Drives the
   // PlannerChat pill so the user knows to respond (esp. after an AskUser question).
@@ -1298,6 +1457,61 @@ export function ProjectsView() {
     );
   };
 
+  // B11: permanently delete the current project. Unlike runMutation (which
+  // expects a ProjectDetail back and re-selects it), delete returns nothing and
+  // the project no longer exists — so we clear the selection and reload the list.
+  // Idempotent backend: a missing project is a success.
+  const deleteProject = async () => {
+    if (!currentProject || busyRef.current) return;
+    const title = currentProject.metadata.title || currentProject.metadata.id;
+    // Warn (do not hard-block — the user's explicit choice wins) if agents are
+    // still live on this project: deleting the record orphans them and their MCP
+    // writes will start failing with "Project not found." Surface that so the user
+    // can stop them first if they meant to.
+    const liveCount = currentProjectSessions.length;
+    const liveWarning =
+      liveCount > 0
+        ? `\n\n⚠️ ${liveCount} agent session${liveCount > 1 ? "s are" : " is"} still live on this project. Deleting it will orphan ${liveCount > 1 ? "them" : "it"} — stop ${liveCount > 1 ? "them" : "it"} first if you didn't mean to.`
+        : "";
+    if (
+      !window.confirm(
+        `Delete project “${title}” permanently?\n\nThis removes the project record from disk and cannot be undone. The working folder, git history, and any cloud resources are left untouched.${liveWarning}`,
+      )
+    )
+      return;
+    busyRef.current = true;
+    setIsBusy(true);
+    setError(null);
+    try {
+      await invokeBackendCommand<void>("delete_project", {
+        projectId: currentProject.metadata.id,
+      });
+      // B15b hygiene: drop the remembered orchestrator id for the gone project.
+      try {
+        localStorage.removeItem(orchAgentKey(currentProject.metadata.id));
+      } catch {
+        /* non-fatal */
+      }
+      selectedIdRef.current = null;
+      setSelectedId(null);
+      setProject(null);
+      // Reviewer max-recall: if we deleted the project we were working on, leave Work
+      // mode in the same tick — don't rely on the coherence effect re-firing a render
+      // later (closes the workMode=true / currentProject=null window).
+      setWorkMode(false);
+      await loadProjects();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not delete project.");
+    } finally {
+      busyRef.current = false;
+      setIsBusy(false);
+      // Flush any agent-state updates parked while busyRef was held (matches every
+      // other mutation path — without this the parked update is stuck until the
+      // next poll, bleeding stale liveness into sessionsByProject).
+      drainPendingAgentRefresh();
+    }
+  };
+
   // Set (or clear) the project root from the UI (#6). This is the only remaining
   // editor for the agent root after the GitHub panel was removed: without it,
   // agents fall back to a default root with no recovery path. Routes through
@@ -1679,13 +1893,20 @@ export function ProjectsView() {
 
   // Rail launch (app/external): thread the SpawnPanel-built input into the same
   // launch_project_agent_terminal command used everywhere (host + advisory model).
-  const launchFromSpawnPanel = async (input: SpawnLaunchInput) => {
-    if (isArchived) return; // archived project is read-only.
-    if (busyRef.current) return;
+  const launchFromSpawnPanel = async (
+    input: SpawnLaunchInput,
+  ): Promise<string | null> => {
+    if (isArchived) return null; // archived project is read-only.
+    if (busyRef.current) return null;
     busyRef.current = true;
     setIsBusy(true);
     setError(null);
     setLaunchMessage(null);
+    // B2 F2: generate the launched agentId HERE (once) so the caller can capture
+    // the EXACT id — binding the cloud orchestrator's terminal by a captured id is
+    // robust, vs `.find(by client)` which collides with a hand-off coder of the
+    // same CLI.
+    const launchedAgentId = `${input.role}-${Date.now()}`;
     try {
       const result = await invokeBackendCommand<ProjectAgentLaunchResult>(
         "launch_project_agent_terminal",
@@ -1694,7 +1915,7 @@ export function ProjectsView() {
             projectId: input.projectId,
             role: input.role,
             client: input.client,
-            agentId: `${input.role}-${Date.now()}`,
+            agentId: launchedAgentId,
             taskId: input.taskId,
             host: input.host,
             model: input.model,
@@ -1724,6 +1945,7 @@ export function ProjectsView() {
       );
       await loadAgentState();
       await loadProjects();
+      return launchedAgentId;
     } catch (e) {
       setError(
         await recoverFromConflict(
@@ -1732,6 +1954,7 @@ export function ProjectsView() {
             : "Agent terminal could not be launched.",
         ),
       );
+      return null;
     } finally {
       busyRef.current = false;
       setIsBusy(false);
@@ -1795,7 +2018,7 @@ export function ProjectsView() {
         }),
       );
       beginPlannerLaunch();
-      await launchFromSpawnPanel({
+      const launchedId = await launchFromSpawnPanel({
         projectId: detail.metadata.id,
         role: "coder",
         // The chosen orchestrator backend: local Devboule ("orchestrator") or a cloud CLI
@@ -1805,10 +2028,17 @@ export function ProjectsView() {
         taskId: null,
         host: "app",
         model: null,
-        planFirst: plannerOrchestratorClient === "orchestrator",
+        // B10: discuss-first. Only bias the local orchestrator plan-first when the
+        // user opted into eager mode (autoCreate ON); otherwise it converses until
+        // the user clicks "Create plan".
+        planFirst: plannerOrchestratorClient === "orchestrator" && autoCreate,
         initialGoal: goal,
         autoCreate,
       });
+      // B2 F2: capture the cloud orchestrator's exact agentId for terminal binding.
+      if (plannerOrchestratorClient !== "orchestrator") {
+        setCloudOrchestratorLaunchedId(launchedId);
+      }
     } finally {
       orchestratorPlanRef.current = false;
     }
@@ -1846,19 +2076,26 @@ export function ProjectsView() {
       );
       if (!detail) return;
       beginPlannerLaunch();
-      await launchFromSpawnPanel({
+      const launchedId = await launchFromSpawnPanel({
         projectId: currentProject.metadata.id,
         role: "coder",
         client: plannerOrchestratorClient,
         taskId: null,
         host: "app",
         model: null,
-        planFirst: plannerOrchestratorClient === "orchestrator",
+        // B10: discuss-first. Only bias the local orchestrator plan-first when the
+        // user opted into eager mode (autoCreate ON); otherwise it converses until
+        // the user clicks "Create plan".
+        planFirst: plannerOrchestratorClient === "orchestrator" && autoCreate,
         // The typed goal now reaches the planner directly (DEVBOULE_GOAL — the orchestrator runs it
         // headless, plan-first); the note above is kept only as an audit trail. auto-create rides too.
         initialGoal: goal,
         autoCreate,
       });
+      // B2 F2: capture the cloud orchestrator's exact agentId for terminal binding.
+      if (plannerOrchestratorClient !== "orchestrator") {
+        setCloudOrchestratorLaunchedId(launchedId);
+      }
     } finally {
       orchestratorPlanRef.current = false;
     }
@@ -2071,6 +2308,156 @@ export function ProjectsView() {
         modifiedAt={currentProject.modifiedAt ?? ""}
         updatedAt={currentProject.metadata.updatedAt}
       />
+    ) : null;
+
+  // B8: the per-project detail (status header + lifecycle actions + agent-root
+  // editor + saved workflows), relocated OFF the create landing and INTO the
+  // single-project Work page via ProjectWorkspace's detailSlot. The landing is now
+  // create + Kanban(history) only; a project's detail lives on its own page.
+  const projectDetailNode =
+    workMode && currentProject ? (
+      <div className="space-y-4">
+        <ProjectStatusHeader
+          project={currentProject}
+          compact
+          stageLabel={currentStage ? stageLabel(currentStage) : null}
+          stageToneClass={currentStage ? stageTone[currentStage] : null}
+          taskCounts={currentSummary?.taskCounts ?? null}
+          isBusy={isBusy}
+          workingAgent={
+            currentProject.metadata.status === "archived"
+              ? undefined
+              : workingAgent
+          }
+          onReload={() => void reloadSelectedProjectSafe()}
+          onRefreshLiveStatus={() => void refreshLiveStatus()}
+          onPause={() => void updateProjectStatus("paused")}
+          onResume={() => void updateProjectStatus("active")}
+          onArchive={() => void updateProjectStatus("archived")}
+          onDelete={() => void deleteProject()}
+        />
+
+        {/* Agent-root editor — unobtrusive single input + button, prefilled with the
+        current root. Hidden for an archived (read-only) project. */}
+        {currentProject.metadata.status !== "archived" && (
+          <div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
+            <label
+              htmlFor="project-root-input"
+              className="text-[11px] font-semibold uppercase tracking-widest text-cream-500"
+            >
+              Agent root
+            </label>
+            <input
+              id="project-root-input"
+              value={rootDraft}
+              onChange={(event) => setRootDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void setProjectRoot();
+              }}
+              placeholder="Absolute path agents launch in (blank = default)"
+              data-help-title="The agent root is the folder CLI agents launch in."
+              data-help-lines="Set this to the exact repository or working folder for this project.|Coders and verifiers open their terminal here, so a wrong root makes them edit the wrong files.|Leave it blank to fall back to the app's default root.|It only updates project metadata; it does not move any files."
+              className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
+            />
+            <button
+              type="button"
+              onClick={() => void setProjectRoot()}
+              disabled={
+                isBusy ||
+                rootDraft.trim() ===
+                  (currentProject.metadata.rootPath ?? "").trim()
+              }
+              className="shrink-0 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
+            >
+              Set root
+            </button>
+          </div>
+        )}
+
+        {currentProject.metadata.status !== "archived" && (
+          <section className="rounded-lg border border-cream-200 bg-white p-3">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <h4 className="text-[12px] font-semibold text-cream-800">
+                  Saved workflows
+                </h4>
+                <p className="text-[11px] text-cream-500">
+                  Claude Code workflows discovered from this project and your user
+                  profile.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadSavedWorkflows(currentProject.metadata.id)}
+                disabled={isBusy}
+                className="rounded-md border border-cream-200 px-2 py-1 text-[11px] font-semibold text-cream-600 hover:bg-cream-50 disabled:opacity-60"
+              >
+                Refresh
+              </button>
+            </div>
+            {workflowError && (
+              <p className="mb-2 text-[11px] font-medium text-red-600">
+                {workflowError}
+              </p>
+            )}
+            {savedWorkflows.length === 0 ? (
+              <p className="text-[11px] text-cream-500">
+                No saved workflows found.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {savedWorkflows.map((workflow) => {
+                  const args = workflowArgs[workflow.name] ?? "";
+                  const running = workflowBusyName === workflow.name;
+                  return (
+                    <div
+                      key={`${workflow.scope}-${workflow.name}`}
+                      className="grid gap-2 rounded-md border border-cream-100 bg-cream-50/50 p-2 md:grid-cols-[minmax(0,1fr)_minmax(12rem,18rem)_auto]"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="truncate font-mono text-[12px] font-semibold text-cream-800">
+                            /{workflow.name}
+                          </span>
+                          <span className="rounded bg-white px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cream-500">
+                            {workflow.scope}
+                          </span>
+                        </div>
+                        {workflow.description && (
+                          <p className="mt-1 line-clamp-2 text-[11px] text-cream-500">
+                            {workflow.description}
+                          </p>
+                        )}
+                      </div>
+                      <input
+                        value={args}
+                        onChange={(event) =>
+                          setWorkflowArgs((prev) => ({
+                            ...prev,
+                            [workflow.name]: event.target.value,
+                          }))
+                        }
+                        placeholder="Args"
+                        spellCheck={false}
+                        className="min-w-0 rounded-md border border-cream-200 bg-white px-2 py-1.5 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void runSavedWorkflow(workflow)}
+                        disabled={isBusy || running}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-md bg-terracotta px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-60"
+                      >
+                        <Play className="h-3.5 w-3.5" />
+                        {running ? "Running..." : "Run"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+      </div>
     ) : null;
 
   const taskBoardNode =
@@ -2337,7 +2724,7 @@ export function ProjectsView() {
         >
           <ProjectWorkspace
             project={currentProject}
-            sessions={currentProjectSessions}
+            sessions={workModeSessions}
             claims={projectClaims}
             events={projectAgentEvents}
             ptyAgents={ptyAgents}
@@ -2371,6 +2758,7 @@ export function ProjectsView() {
             gitActionBusy={gitActionBusy}
             taskBoardSlot={taskBoardNode}
             notesSlot={notesNode}
+            detailSlot={projectDetailNode}
           />
         </Suspense>
       ) : (
@@ -2605,6 +2993,30 @@ export function ProjectsView() {
             onCoderChange={setPlannerCoderId}
             autoCreate={plannerAutoCreate}
             onAutoCreateToggle={() => setPlannerAutoCreate((v) => !v)}
+            canCreatePlan={!!orchestratorAgentId}
+            onCreatePlan={() => {
+              if (!orchestratorAgentId) {
+                setError(
+                  "Start the Orchestrator (describe a goal) before creating the plan.",
+                );
+                return;
+              }
+              // B10: discuss-first — the plan is created on demand. Steer the live
+              // orchestrator to draft + submit the plan and create the Kanban tasks.
+              setPlannerMessages((prev) => [
+                ...prev,
+                { role: "user", text: "Create the plan and the tasks now." },
+              ]);
+              invokeBackendCommand("orchestrator_steer", {
+                agentId: orchestratorAgentId,
+                message:
+                  "We've discussed enough — now draft the plan: submit it with plan_submit, and once it's approved create the Kanban tasks with project_create_plan_tasks (one per phase).",
+              }).catch((e) =>
+                setError(
+                  e instanceof Error ? e.message : "Could not start planning.",
+                ),
+              );
+            }}
           />
 
           {/* Overview segmented toggle: the active stage board (default) vs. a simple
@@ -2724,167 +3136,10 @@ export function ProjectsView() {
                 </div>
               </main>
             ) : currentProject ? (
-              <main className="space-y-4">
-                {/* Fase 1 UI reorg: compact header — only title + status dot +
-                lifecycle actions (Reload / Live status / Pause|Resume /
-                Archive). The stage badge, progress bar, task summary,
-                who's-working line, git-policy badge, and root/file lines are
-                duplicated by ProjectCard + the Work-mode top bar, so they are
-                dropped here. The stage/taskCounts/workingAgent props are no
-                longer rendered in compact mode but stay wired so a future
-                non-compact use needs no re-plumbing. */}
-                <ProjectStatusHeader
-                  project={currentProject}
-                  compact
-                  stageLabel={currentStage ? stageLabel(currentStage) : null}
-                  stageToneClass={currentStage ? stageTone[currentStage] : null}
-                  taskCounts={currentSummary?.taskCounts ?? null}
-                  isBusy={isBusy}
-                  workingAgent={
-                    currentProject.metadata.status === "archived"
-                      ? undefined
-                      : workingAgent
-                  }
-                  onReload={() => void reloadSelectedProjectSafe()}
-                  onRefreshLiveStatus={() => void refreshLiveStatus()}
-                  onPause={() => void updateProjectStatus("paused")}
-                  onResume={() => void updateProjectStatus("active")}
-                  onArchive={() => void updateProjectStatus("archived")}
-                />
-
-                {/* Project root editor (#6): the only remaining UI to set the agent
-                root after the GitHub panel was removed. Unobtrusive single
-                input + button, prefilled with the current root. Hidden for an
-                archived (read-only) project — setting the root is a mutation. */}
-                {currentProject.metadata.status !== "archived" && (
-                  <div className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-white p-3 sm:flex-row sm:items-center">
-                    <label
-                      htmlFor="project-root-input"
-                      className="text-[11px] font-semibold uppercase tracking-widest text-cream-500"
-                    >
-                      Agent root
-                    </label>
-                    <input
-                      id="project-root-input"
-                      value={rootDraft}
-                      onChange={(event) => setRootDraft(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") void setProjectRoot();
-                      }}
-                      placeholder="Absolute path agents launch in (blank = default)"
-                      data-help-title="The agent root is the folder CLI agents launch in."
-                      data-help-lines="Set this to the exact repository or working folder for this project.|Coders and verifiers open their terminal here, so a wrong root makes them edit the wrong files.|Leave it blank to fall back to the app's default root.|It only updates project metadata; it does not move any files."
-                      className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void setProjectRoot()}
-                      disabled={
-                        isBusy ||
-                        rootDraft.trim() ===
-                          (currentProject.metadata.rootPath ?? "").trim()
-                      }
-                      className="shrink-0 rounded-lg bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
-                    >
-                      Set root
-                    </button>
-                  </div>
-                )}
-
-                {/* Fase 1 UI reorg: the live "who's working / Launch another"
-                ProjectAgentPanel was removed from the board-mode overview — it
-                100% duplicated Work mode's agent rail + SpawnPanel + terminal +
-                AgentDetailDrawer. Launch/monitor agents from Work mode instead. */}
-
-                {currentProject.metadata.status !== "archived" && (
-                  <section className="rounded-lg border border-cream-200 bg-white p-3">
-                    <div className="mb-3 flex items-center justify-between gap-3">
-                      <div>
-                        <h4 className="text-[12px] font-semibold text-cream-800">
-                          Saved workflows
-                        </h4>
-                        <p className="text-[11px] text-cream-500">
-                          Claude Code workflows discovered from this project and
-                          your user profile.
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void loadSavedWorkflows(currentProject.metadata.id)
-                        }
-                        disabled={isBusy}
-                        className="rounded-md border border-cream-200 px-2 py-1 text-[11px] font-semibold text-cream-600 hover:bg-cream-50 disabled:opacity-60"
-                      >
-                        Refresh
-                      </button>
-                    </div>
-                    {workflowError && (
-                      <p className="mb-2 text-[11px] font-medium text-red-600">
-                        {workflowError}
-                      </p>
-                    )}
-                    {savedWorkflows.length === 0 ? (
-                      <p className="text-[11px] text-cream-500">
-                        No saved workflows found.
-                      </p>
-                    ) : (
-                      <div className="space-y-2">
-                        {savedWorkflows.map((workflow) => {
-                          const args = workflowArgs[workflow.name] ?? "";
-                          const running = workflowBusyName === workflow.name;
-                          return (
-                            <div
-                              key={`${workflow.scope}-${workflow.name}`}
-                              className="grid gap-2 rounded-md border border-cream-100 bg-cream-50/50 p-2 md:grid-cols-[minmax(0,1fr)_minmax(12rem,18rem)_auto]"
-                            >
-                              <div className="min-w-0">
-                                <div className="flex min-w-0 items-center gap-2">
-                                  <span className="truncate font-mono text-[12px] font-semibold text-cream-800">
-                                    /{workflow.name}
-                                  </span>
-                                  <span className="rounded bg-white px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cream-500">
-                                    {workflow.scope}
-                                  </span>
-                                </div>
-                                {workflow.description && (
-                                  <p className="mt-1 line-clamp-2 text-[11px] text-cream-500">
-                                    {workflow.description}
-                                  </p>
-                                )}
-                              </div>
-                              <input
-                                value={args}
-                                onChange={(event) =>
-                                  setWorkflowArgs((prev) => ({
-                                    ...prev,
-                                    [workflow.name]: event.target.value,
-                                  }))
-                                }
-                                placeholder="Args"
-                                spellCheck={false}
-                                className="min-w-0 rounded-md border border-cream-200 bg-white px-2 py-1.5 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => void runSavedWorkflow(workflow)}
-                                disabled={isBusy || running}
-                                className="inline-flex items-center justify-center gap-1.5 rounded-md bg-terracotta px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-60"
-                              >
-                                <Play className="h-3.5 w-3.5" />
-                                {running ? "Running..." : "Run"}
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </section>
-                )}
-
-                {/* Tasks + Notes relocated (Fase 1 UI reorg) into ProjectWorkspace's
-                taskBoardSlot / notesSlot — see taskBoardNode / notesNode above. */}
-              </main>
+              // B8: the per-project detail moved to the single-project Work page
+              // (ProjectWorkspace detailSlot ← projectDetailNode). The landing is now
+              // create + Kanban(history); a selected project opens its own page.
+              null
             ) : (
               <main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
                 <FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />

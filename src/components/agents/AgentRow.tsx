@@ -160,6 +160,16 @@ export function AgentRow({
           className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold capitalize ${
             roleTone[session.role.toLowerCase()] ?? "bg-white text-cream-500"
           }`}
+          title={
+            {
+              orchestrator:
+                "Orchestrator: the create-time agent you talk to to shape the plan; it drafts the tasks and hands them to a coder.",
+              coder:
+                "Coder: builds the plan into code, delegates one-shot edits to mini-coders, and moves tasks toward Review.",
+              verifier:
+                "Verifier: audits work read-only (the Censor) and decides when Done is justified.",
+            }[session.role.toLowerCase()] ?? `Role: ${session.role}`
+          }
         >
           {session.role}
         </span>

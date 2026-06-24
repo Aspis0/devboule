@@ -378,6 +378,81 @@ root_path: "{escaped_work_root}"
 
             self.assertIn("Duplicate project task id", str(ctx.exception))
 
+    def test_project_set_title_renames_durably(self):
+        # B7: the orchestrator renames the project via MCP during planning; the new
+        # title must be returned AND durable on disk (re-read shows it).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            sample_project(projects)
+            handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "namer",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "naming",
+                },
+                root=root,
+            )
+            result = handle_tool_call(
+                "project_set_title",
+                {
+                    "project_id": "scrna-seq",
+                    "title": "Renamed Plan",
+                    "agent_id": "namer",
+                    "role": "orchestrator",
+                },
+                root=root,
+            )
+            self.assertEqual(result["metadata"]["title"], "Renamed Plan")
+            reloaded = handle_tool_call(
+                "project_get",
+                {"project_id": "scrna-seq", "agent_id": "namer", "role": "orchestrator"},
+                root=root,
+            )
+            self.assertEqual(reloaded["metadata"]["title"], "Renamed Plan")
+
+    def test_python_write_preserves_censor_trusted(self):
+        # B7 fix (reviewer BLOCKER): a Python frontmatter rewrite (here via
+        # project_set_title) must NOT silently drop the user's `censor_trusted: true`
+        # opt-in. Without the round-trip the flag vanishes and Censor is revoked.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "projects"
+            projects.mkdir()
+            path = sample_project(projects)
+            # Mark the project censor-trusted exactly as the Rust serializer does
+            # (a `censor_trusted: true` line just before the frontmatter close).
+            text = path.read_text(encoding="utf-8")
+            text = text.replace("---\n\n", "censor_trusted: true\n---\n\n", 1)
+            path.write_text(text, encoding="utf-8")
+            self.assertIn("censor_trusted: true", path.read_text(encoding="utf-8"))
+
+            handle_tool_call(
+                "agent_register",
+                {"agent_id": "namer", "role": "orchestrator", "model": "test", "message": "x"},
+                root=root,
+            )
+            handle_tool_call(
+                "project_set_title",
+                {
+                    "project_id": "scrna-seq",
+                    "title": "Trusted Rename",
+                    "agent_id": "namer",
+                    "role": "orchestrator",
+                },
+                root=root,
+            )
+            after = path.read_text(encoding="utf-8")
+            self.assertIn(
+                "censor_trusted: true",
+                after,
+                "a Python write must preserve the Censor trust opt-in",
+            )
+            self.assertIn("title: Trusted Rename", after)
+
     def test_legacy_orchestrator_can_claim_but_only_verifier_closes(self):
         # BACK-COMPAT FIXTURE: this agent registers and operates with the legacy
         # role="orchestrator", which now normalizes to itself (first-class role).
@@ -3551,6 +3626,7 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_claim_task",
                 "project_update_status",
                 "project_append_note",
+                "project_set_title",
                 "project_create_followup",
                 "project_create_plan_tasks",
                 "oracle_ask",
@@ -3603,6 +3679,7 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_claim_task",
                 "project_update_status",
                 "project_append_note",
+                "project_set_title",
                 "project_create_followup",
                 "plan_submit",
                 "plan_status",

@@ -5,6 +5,7 @@ import {
   PauseCircle,
   RefreshCw,
   ShieldCheck,
+  Trash2,
 } from "lucide-react";
 import type {
   AgentSession,
@@ -119,6 +120,7 @@ export function ProjectStatusHeader({
   onPause,
   onResume,
   onArchive,
+  onDelete,
 }: {
   project: ProjectDetail;
   stageLabel: string | null;
@@ -135,6 +137,9 @@ export function ProjectStatusHeader({
   onPause: () => void;
   onResume: () => void;
   onArchive: () => void;
+  // B11: permanently delete the project (removes its Markdown file). Optional —
+  // headers rendered in read-only contexts may omit it.
+  onDelete?: () => void;
 }) {
   const status = project.metadata.status;
   // Live clock so the working-agent line's age + health recompute between data
@@ -225,6 +230,18 @@ export function ProjectStatusHeader({
         >
           <Archive className="h-3.5 w-3.5" />
           Archive
+        </button>
+      )}
+      {onDelete && (
+        <button
+          onClick={onDelete}
+          disabled={isBusy}
+          data-help-title="This permanently deletes the project."
+          data-help-lines="Delete removes the project's Markdown file from disk for good.|Unlike Archive, it cannot be undone from the app.|It does not touch the working folder, git history, or any provider resources — only the project record.|Use it to clear test/junk projects."
+          className="inline-flex items-center gap-2 rounded-lg border border-coral-light bg-white px-3 py-2 text-[12px] font-semibold text-coral-dark hover:bg-coral hover:text-white disabled:opacity-60"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+          Delete
         </button>
       )}
     </div>

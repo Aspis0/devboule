@@ -190,22 +190,110 @@ fn untracked_section(git: &Path, root: &Path) -> Option<String> {
     Some(section)
 }
 
-/// Compose the full diff body for a canonical `root`: tracked changes vs HEAD (or
-/// the unstaged diff when there is no HEAD yet) followed by a labeled untracked-files
-/// section, then truncated to the byte cap. Factored out of the `#[tauri::command]`
-/// so the git logic is unit-testable against a real temp repo without a Tauri
-/// `AppHandle`/`State`.
-fn working_diff_for_root(git: &Path, root: &Path) -> Result<String, String> {
-    let tracked = match run_git(git, root, &["diff", "HEAD"]) {
-        Ok(stdout) => stdout,
+/// B13: filename of the per-repo diff baseline marker. Stored INSIDE the git dir so
+/// it travels with the repo and never shows up as an untracked work-tree file.
+const ASPIS_DIFF_BASELINE: &str = "aspis-diff-baseline";
+
+/// B13: resolve the baseline marker path via `--absolute-git-dir` (handles worktrees /
+/// submodules where `.git` is a file, not a directory). `None` when not a git repo.
+fn baseline_path(git: &Path, root: &Path) -> Option<PathBuf> {
+    let git_dir = run_git(git, root, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    let git_dir = git_dir.trim();
+    if git_dir.is_empty() {
+        return None;
+    }
+    Some(Path::new(git_dir).join(ASPIS_DIFF_BASELINE))
+}
+
+/// B13: capture a diff baseline the FIRST time an agent launches for this repo, so the
+/// project's "Changes" view shows what the AGENTS changed — not pre-existing dirty edits
+/// already in the work tree (e.g. a developer's own unrelated edits to the SAME repo,
+/// the reported bug). Idempotent: once a baseline exists it is NOT reset, so it keeps
+/// representing the state before the project's agents first touched the tree. Best-effort:
+/// any git failure is a silent no-op (the diff then falls back to `git diff HEAD`).
+pub fn ensure_diff_baseline(root: &Path) {
+    ensure_diff_baseline_with_git(&resolve_git(), root);
+}
+
+fn ensure_diff_baseline_with_git(git: &Path, root: &Path) {
+    let Some(path) = baseline_path(git, root) else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    // Snapshot the current dirty work tree as a commit object WITHOUT touching the tree
+    // (`stash create` prints a commit sha and leaves the tree untouched). Empty output ⇒
+    // a clean tree ⇒ baseline is HEAD. No HEAD (fresh repo) ⇒ skip (nothing to baseline).
+    let snapshot = match run_git(git, root, &["stash", "create"]) {
+        Ok(out) if !out.trim().is_empty() => out.trim().to_string(),
+        _ => match run_git(git, root, &["rev-parse", "HEAD"]) {
+            Ok(head) if !head.trim().is_empty() => head.trim().to_string(),
+            _ => return,
+        },
+    };
+    // Reviewer max-recall: atomic create_new so two concurrent agent launches can't both
+    // pass the exists() check and clobber each other's baseline — the FIRST writer wins
+    // (it captured the earliest "before agents" state), the loser is a silent no-op.
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        let _ = file.write_all(snapshot.as_bytes());
+    }
+}
+
+/// B13: read a STILL-VALID baseline commit for `root`, or `None`. Validated with
+/// `cat-file -e` so a stale/garbage-collected snapshot can never break the diff (we
+/// fall back to HEAD).
+fn read_diff_baseline(git: &Path, root: &Path) -> Option<String> {
+    let path = baseline_path(git, root)?;
+    let sha = std::fs::read_to_string(&path).ok()?.trim().to_string();
+    if sha.is_empty() {
+        // Reviewer max-recall: an empty marker (e.g. a write that was interrupted after
+        // create_new) would otherwise stick forever (ensure_diff_baseline early-returns on
+        // exists()). Remove it so the NEXT launch re-captures a real baseline.
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    run_git(git, root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).ok()?;
+    Some(sha)
+}
+
+/// Tracked-changes diff against HEAD, falling back to the unstaged diff when the repo
+/// has no HEAD yet (fresh repo). The original `working_diff_for_root` behavior, factored
+/// out so the B13 baseline path can reuse it as a fallback.
+fn diff_against_head(git: &Path, root: &Path) -> Result<String, String> {
+    match run_git(git, root, &["diff", "HEAD"]) {
+        Ok(stdout) => Ok(stdout),
         Err(stderr) => {
             if is_missing_head_error(&stderr) {
-                // No HEAD yet (fresh repo): fall back to the unstaged diff.
-                run_git(git, root, &["diff"])?
+                run_git(git, root, &["diff"])
             } else {
-                return Err(stderr);
+                Err(stderr)
             }
         }
+    }
+}
+
+/// Compose the full diff body for a canonical `root`: tracked changes vs the captured
+/// baseline (B13 — falls back to HEAD, or the unstaged diff when there is no HEAD yet)
+/// followed by a labeled untracked-files section, then truncated to the byte cap.
+/// Factored out of the `#[tauri::command]` so the git logic is unit-testable against a
+/// real temp repo without a Tauri `AppHandle`/`State`.
+fn working_diff_for_root(git: &Path, root: &Path) -> Result<String, String> {
+    // B13: prefer a diff against the captured baseline (changes since the agents started),
+    // so unrelated pre-existing dirty edits in the same repo don't pollute the view.
+    let tracked = if let Some(base) = read_diff_baseline(git, root) {
+        match run_git(git, root, &["diff", &base]) {
+            Ok(stdout) => stdout,
+            // A baseline that no longer diffs cleanly (e.g. object gone) ⇒ fall back.
+            Err(_) => diff_against_head(git, root)?,
+        }
+    } else {
+        diff_against_head(git, root)?
     };
 
     let mut body = tracked;
@@ -442,6 +530,46 @@ mod tests {
             out.contains("?? brand_new.txt"),
             "missing untracked file line: {out}"
         );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// B13: with a captured baseline, the diff shows ONLY changes made AFTER the
+    /// baseline (the agents' work) — a pre-existing dirty edit (a developer's own
+    /// edit to the same repo) is in the baseline snapshot and must NOT appear.
+    #[test]
+    fn baseline_scopes_diff_to_post_baseline_changes() {
+        let Some(git) = git_or_skip() else { return };
+        let repo = temp_repo_dir("baseline");
+        git_in(&git, &repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_in(&git, &repo, &["add", "a.txt"]);
+        git_in(&git, &repo, &["commit", "-q", "-m", "init"]);
+
+        // PRE-LAUNCH developer dirty edit (unrelated to the project's agents).
+        std::fs::write(repo.join("a.txt"), "one\nDEV_EDIT\n").unwrap();
+        // Baseline captured at launch — snapshots the dirty tree (incl. DEV_EDIT).
+        ensure_diff_baseline_with_git(&git, &repo);
+        assert!(
+            baseline_path(&git, &repo).unwrap().exists(),
+            "baseline marker must be written"
+        );
+
+        // POST-LAUNCH agent edit.
+        std::fs::write(repo.join("a.txt"), "one\nDEV_EDIT\nAGENT_EDIT\n").unwrap();
+
+        let out = working_diff_for_root(&git, &repo).unwrap();
+        assert!(out.contains("AGENT_EDIT"), "agent change must show: {out}");
+        assert!(
+            !out.contains("+DEV_EDIT"),
+            "the pre-existing dirty edit is in the baseline and must NOT show: {out}"
+        );
+
+        // Idempotent: a second ensure does not reset the baseline.
+        let first = std::fs::read_to_string(baseline_path(&git, &repo).unwrap()).unwrap();
+        ensure_diff_baseline_with_git(&git, &repo);
+        let second = std::fs::read_to_string(baseline_path(&git, &repo).unwrap()).unwrap();
+        assert_eq!(first, second, "baseline must not be reset once captured");
 
         let _ = std::fs::remove_dir_all(&repo);
     }

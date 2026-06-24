@@ -210,6 +210,22 @@ pub fn update_project_metadata(
     )
 }
 
+/// B11: permanently delete a project. Idempotent — deleting an already-gone
+/// project is a success (the goal state is "no such project"). Resolves the
+/// `<id>.md` path and removes it under the same lock discipline as every other
+/// project write (see [`delete_project_file`]).
+#[tauri::command]
+pub fn delete_project(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    project_id: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let path = project_path_by_id(&app, &project_id)?;
+    delete_project_file(&path)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn create_project_task(
     app: tauri::AppHandle,
@@ -1540,6 +1556,13 @@ fn prepare_or_launch_project_agent(
             None
         },
     );
+    // B2 F1: a CLOUD orchestrator (claude/codex chosen as the orchestrator) reads ONLY
+    // this stdin prompt — unlike the local Devboule orchestrator, which gets the goal via
+    // the DEVBOULE_GOAL env. Without this the cloud CLI launched BLIND (no goal). Inject
+    // the typed goal into its prompt (see `cloud_goal_addendum` for the gating rationale).
+    if let Some(block) = cloud_goal_addendum(&client, input.initial_goal.as_deref()) {
+        prompt.push_str(&block);
+    }
     // LANGUAGE LAYER: append the (role × language) persona-skill right after the role-skill block
     // that project_agent_prompt ends with — for the EXTERNAL CLIs (claude/codex) that actually
     // CONSUME this prompt. The local ORCHESTRATOR binary IGNORES this prompt (it unsets $PROMPT and
@@ -1875,6 +1898,10 @@ fn prepare_or_launch_project_agent(
                 );
             }
         }
+        // B13: capture the diff baseline the first time an agent actually launches for
+        // this repo, so the project's "Changes" view shows what the agents changed (not
+        // pre-existing dirty edits to the same repo). Idempotent + best-effort.
+        crate::backend::changes::ensure_diff_baseline(&root_path);
     }
     Ok(ProjectAgentLaunchResult {
         project_id: project.metadata.id,
@@ -1956,6 +1983,40 @@ where
 /// This helper is app-free (path-based) so the no-window guarantee is unit-testable
 /// without a Tauri runtime; the public `app`-taking wrappers resolve the path and
 /// build the `ProjectDetail`.
+/// B11: permanently delete a project's `<id>.md` file (and its sibling
+/// `.md.lock`). Returns `Ok(true)` if a file was removed, `Ok(false)` if it did
+/// not exist (idempotent — do NOT error on a missing project; the goal state is
+/// "no such project"). Delete is intentionally allowed on ANY status (including
+/// archived) — that is the whole point of clearing junk/archived projects.
+///
+/// The existence check + `.md` removal happen under BOTH the global write lock
+/// and the per-file lock, so they form one atomic critical section matching
+/// `mutate_project_file_latest`. The `.md.lock` sidecar is removed AFTER the
+/// per-file guard is dropped (but still under the global write lock): on Windows
+/// `DeleteFileW` fails with a sharing violation while our own handle holds the
+/// lock file open (no `FILE_SHARE_DELETE`), so dropping the guard first lets the
+/// sidecar actually be removed instead of orphaning it. On POSIX the order is
+/// immaterial (flock is on the inode). Atomicity is preserved because the global
+/// write lock still serializes the whole operation against any other writer.
+fn delete_project_file(path: &Path) -> Result<bool, String> {
+    let _write_guard = project_write_lock()
+        .lock()
+        .map_err(|_| "Project write lock is poisoned.".to_string())?;
+    let existed = {
+        let _file_guard = project_file_lock(&project_lock_path(path))?;
+        if !path.exists() {
+            false
+        } else {
+            fs::remove_file(path)
+                .map_err(|e| format!("Could not delete project file: {e}"))?;
+            true
+        }
+    }; // per-file guard dropped here — releases & closes the .md.lock handle.
+    // Best-effort sidecar cleanup, now that no handle holds it open.
+    let _ = fs::remove_file(project_lock_path(path));
+    Ok(existed)
+}
+
 fn mutate_project_file_latest<F>(
     path: &Path,
     mut update: F,
@@ -3135,6 +3196,21 @@ mod language_persona_tests {
     fn empty_override_falls_through_to_detection_returns_none() {
         assert!(language_persona_block(Path::new("/nonexistent_xyz"), "coder", Some("")).is_none());
     }
+}
+
+/// B2 F1: build the goal section appended to a CLOUD orchestrator's stdin prompt.
+/// Returns `None` (no change) for the local orchestrator client (it reads the goal
+/// from DEVBOULE_GOAL env, ignoring this prompt) or when no goal was typed. Gating on
+/// a non-empty `initial_goal` is what distinguishes an orchestrator-style launch (carries
+/// a goal) from a task-board coder launch (carries a task_id, no goal). Pure → testable.
+fn cloud_goal_addendum(client: &str, initial_goal: Option<&str>) -> Option<String> {
+    if client == "orchestrator" {
+        return None;
+    }
+    let goal = initial_goal.map(str::trim).filter(|g| !g.is_empty())?;
+    Some(format!(
+        "\n\n# Your goal for this project\n\n{goal}\n\nDiscuss this goal with the user to shape a plan. When the conversation has converged, draft the plan (plan_submit) and create the Kanban tasks (project_create_plan_tasks). Do not start coding until the plan is agreed.\n"
+    ))
 }
 
 fn project_agent_prompt(
@@ -11298,6 +11374,25 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(!claude.trim_end().ends_with("$prompt"));
     }
 
+    /// B2 F1: a cloud orchestrator (claude/codex) with a typed goal gets the goal
+    /// in its prompt; the local orchestrator (env-fed) and a goalless launch do not.
+    #[test]
+    fn cloud_goal_addendum_only_for_cloud_with_goal() {
+        // Cloud client + a goal ⇒ the goal section is injected.
+        let block = cloud_goal_addendum("claude", Some("Add Stripe billing"))
+            .expect("cloud + goal ⇒ Some");
+        assert!(block.contains("Add Stripe billing"));
+        assert!(block.contains("# Your goal for this project"));
+        assert!(block.contains("plan_submit"));
+        // codex too.
+        assert!(cloud_goal_addendum("codex", Some("x")).is_some());
+        // The LOCAL orchestrator reads DEVBOULE_GOAL env, not the prompt ⇒ None.
+        assert!(cloud_goal_addendum("orchestrator", Some("Add Stripe billing")).is_none());
+        // No goal / blank goal ⇒ None (a task-board coder launch carries no goal).
+        assert!(cloud_goal_addendum("claude", None).is_none());
+        assert!(cloud_goal_addendum("claude", Some("   ")).is_none());
+    }
+
     #[test]
     fn launch_scripts_keep_special_char_prompt_off_the_cli_argv() {
         // A realistic agent prompt: contains `<`, `>`, spaces and newlines, which
@@ -12789,6 +12884,67 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             result.is_none(),
             "a missing project file must be a no-op None"
         );
+    }
+
+    /// B11: deleting a project removes its `.md` AND its `.md.lock` sidecar, and
+    /// is idempotent — a second delete of the already-gone file returns Ok(false),
+    /// never an error.
+    #[test]
+    fn delete_project_file_removes_md_and_is_idempotent() {
+        let (root, path) = write_temp_project("delete-me");
+        // Materialize the lock sidecar the real lock path would create, so the
+        // sidecar-cleanup branch is actually exercised (write_temp_project writes
+        // only the .md directly).
+        let lock = project_lock_path(&path);
+        fs::write(&lock, b"").unwrap();
+        assert!(path.exists());
+        assert!(lock.exists());
+        assert!(delete_project_file(&path).unwrap());
+        assert!(!path.exists(), "the .md must be gone");
+        assert!(!lock.exists(), "the .md.lock sidecar must be gone");
+        assert!(!delete_project_file(&path).unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// B5: the working folder must SURVIVE on disk through the serialize → write →
+    /// parse round-trip (the project `.md` is the durable source of truth; the app
+    /// auto-lock is in-memory auth and never rewrites the file). This pins that the
+    /// frontmatter serializer emits `root_path` and the parser reads it back intact,
+    /// so a re-lock/reload cannot silently drop a chosen folder to null.
+    #[test]
+    fn root_path_survives_markdown_round_trip() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-b5-rootpath-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let chosen = root.to_string_lossy().into_owned();
+        let metadata = ProjectMetadata {
+            id: "b5-roundtrip".into(),
+            title: "B5 round trip".into(),
+            status: "active".into(),
+            updated_at: "2026-06-24T00:00:00Z".into(),
+            root_path: Some(chosen.clone()),
+            censor_trusted: false,
+        };
+        let state = ProjectStateBlock {
+            version: 1,
+            tasks: Vec::new(),
+            notes: Vec::new(),
+            milestones: Vec::new(),
+        };
+        let path = root.join("b5-roundtrip.md");
+        fs::write(&path, initial_project_markdown(&metadata, &state).unwrap()).unwrap();
+
+        let parsed = read_project_file(&path).unwrap();
+        assert_eq!(
+            parsed.metadata.root_path,
+            Some(chosen),
+            "the chosen working folder must round-trip through the .md intact"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// FIX 2 (privacy + TOCTOU): the failure note must (a) apply after a revision

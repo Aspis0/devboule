@@ -63,14 +63,14 @@ async fn main() -> std::io::Result<()> {
         return run_once(prompt).await;
     }
 
-    // Orchestrator composer "Plan it": when the app launched us with a seeded GOAL
-    // (`DEVBOULE_GOAL`), run that goal HEADLESS — one burst, biased plan-first by
-    // `DEVBOULE_PLAN_FIRST` — instead of opening the interactive TUI. This is how the typed goal
-    // actually reaches the planner (the TUI would otherwise wait for the operator to type it). The
-    // app streams this stdout + the activity file into the live Projects view. Absent ⇒ the
-    // interactive TUI, byte-identical to before.
+    // Orchestrator composer: when the app launched us with a seeded GOAL (`DEVBOULE_GOAL`),
+    // run it HEADLESS as a CONVERSATION-NATIVE session (`run_session`) — a persistent
+    // back-and-forth that survives recoverable burst limits and waits for the user's steers,
+    // optionally biased plan-first by `DEVBOULE_PLAN_FIRST`. This is how the typed goal reaches
+    // the planner (the TUI would otherwise wait for the operator to type it). The app streams
+    // this stdout + the activity file into the live Projects view. Absent ⇒ the interactive TUI.
     if let Some(goal) = config::seeded_goal() {
-        return run_once(goal).await;
+        return run_session(goal).await;
     }
 
     // Resolve the model + executor from env BEFORE entering raw mode, so any
@@ -99,67 +99,152 @@ fn parse_once_prompt(mut args: impl Iterator<Item = String>) -> Option<String> {
     None
 }
 
-/// Headless burst: build the runtime from env, run ONE `run_burst` for `prompt`,
-/// streaming each progress line to stdout AS IT ARRIVES, then print the terminal
-/// `BurstOutcome`. NO raw mode, NO alternate screen, NO TUI — pure stdout. The
-/// progress receiver is drained on THIS task while the burst runs on a spawned
-/// task, so the bounded channel never backpressures the burst to a halt and the
-/// transcript is printed live (not buffered to the end).
-async fn run_once(prompt: String) -> std::io::Result<()> {
-    // Same env-resolved runtime the TUI uses. Any oMLX/MCP fallback note already
-    // prints to stderr inside `build_runtime`, so a Stub fallback is LOUD here.
-    let runtime = Arc::new(config::build_runtime().await);
+/// What the orchestrator just did, carried across the steer wait so the next
+/// burst is framed correctly when the user replies.
+enum PriorTurn {
+    /// Replied (Done) or just started — a plain continuation.
+    Reply,
+    /// Asked the user a question (AskUser) — the answer continues from there.
+    Question(String),
+    /// Paused on a RECOVERABLE burst limit (Escalated). NOT a failure that ends
+    /// the session — the user's reply resumes it. This is the B1/B15a fix: the
+    /// orchestrator is conversation-native, so hitting a per-burst time/round cap
+    /// (or any escalation) pauses and waits for the human instead of dying.
+    Paused(String),
+}
 
+/// Fold the user's steer reply into the running conversation string, given what
+/// the orchestrator did on the prior turn. Pure (no I/O) so it is unit-testable.
+fn fold_user_reply(conversation: &str, prior: &PriorTurn, answer: &str) -> String {
+    match prior {
+        PriorTurn::Reply => format!(
+            "{conversation}\n\n[User says: {answer}]\n\nContinue the conversation."
+        ),
+        PriorTurn::Question(q) => format!(
+            "{conversation}\n\n[You asked the user: {q}]\n[User answered: {answer}]\n\nContinue from here."
+        ),
+        PriorTurn::Paused(reason) => format!(
+            "{conversation}\n\n[You paused: {reason}]\n[User says: {answer}]\n\nResume from here."
+        ),
+    }
+}
+
+/// The chat turn emitted when a burst escalates on a recoverable limit, so the
+/// user SEES the pause and can steer. Must read as a pause, not a fatal error.
+fn paused_note(reason: &str) -> String {
+    format!(
+        "I paused this turn ({reason}). I can keep going — tell me how you'd like to continue, or say \"go on\"."
+    )
+}
+
+/// Char budget for the cumulative session conversation (reviewer F3). The
+/// conversation is the non-evictable `human` message of every burst, so it must
+/// stay well under the model's context window across a long planning session.
+const MAX_CONVERSATION_CHARS: usize = 48_000;
+
+/// Bound the running conversation to `max` CHARS (marker included), keeping the head
+/// (original goal + early framing) and the recent tail with a trim marker between.
+/// Splits on char boundaries so it never cuts a UTF-8 codepoint. Pure → unit-testable.
+fn trim_conversation(conversation: String, max: usize) -> String {
+    const TRIM_MARKER: &str = "\n\n…[earlier conversation trimmed to fit context]…\n\n";
+    let total = conversation.chars().count();
+    if total <= max {
+        return conversation;
+    }
+    // Reviewer max-recall: if the budget can't even fit the marker, just hard-truncate to
+    // `max` (degenerate; never hit in practice since MAX_CONVERSATION_CHARS ≫ marker).
+    if max <= TRIM_MARKER.chars().count() {
+        return conversation.chars().take(max).collect();
+    }
+    // The marker counts toward `max` so the result never exceeds it.
+    let content_budget = max.saturating_sub(TRIM_MARKER.chars().count());
+    let head_budget = (content_budget / 8).min(2_000);
+    let tail_budget = content_budget.saturating_sub(head_budget);
+    let chars: Vec<char> = conversation.chars().collect();
+    let head: String = chars.iter().take(head_budget).collect();
+    let tail: String = chars.iter().skip(total - tail_budget).collect();
+    format!("{head}{TRIM_MARKER}{tail}")
+}
+
+/// Headless ONE-SHOT (`--once` / `--print`): build the runtime, run EXACTLY ONE
+/// `run_burst` for `prompt`, print the streamed transcript + the terminal
+/// `BurstOutcome`, and exit. NO raw mode, NO TUI, NO keep-alive — pure stdout for
+/// CI smoke / scripted runs. (The app-launched orchestrator uses `run_session`.)
+async fn run_once(prompt: String) -> std::io::Result<()> {
+    let runtime = Arc::new(config::build_runtime().await);
     eprintln!("devboule --once: egress_enabled={}", runtime.allow_egress);
     println!("=== devboule headless burst ===");
     println!("prompt: {prompt}");
     println!("--- transcript ---");
-
-    // Surface the launch goal as the FIRST user chat turn (so the panel chat shows the
-    // user side from the bridge, in order, like every later steer).
     runtime.executor.emit_chat("user", &prompt);
 
-    // CONVERSATION LOOP (vibe-coding chat): run a burst, then STAY ALIVE and wait for the
-    // user's next message (delivered via the steer inbox), folding it into the running
-    // conversation. A reply (Done) is NOT the end — it's just the orchestrator's turn; the
-    // session lives until the user stops replying (the wait window elapses) or the app stops
-    // it. Only a real failure (Escalated) ends it early. This is what makes deciding the
-    // project/plan/tasks a real back-and-forth instead of a one-shot that exits on the first
-    // reply. The assistant reply / question was already emitted as a chat bubble by the burst.
-    let mut conversation = prompt;
+    let outcome = run_one_burst(&runtime, prompt).await?;
+    println!("--- outcome ---");
+    match outcome {
+        BurstOutcome::Done(reply) => println!("DONE: {reply}"),
+        BurstOutcome::AskUser(question) => println!("ASK_USER: {question}"),
+        BurstOutcome::Escalated(reason) => println!("ESCALATED: {reason}"),
+    }
+    Ok(())
+}
+
+/// CONVERSATION-NATIVE session (B1): the app-launched orchestrator. Runs a burst,
+/// then STAYS ALIVE and waits for the user's next message (the steer inbox),
+/// folding it into the running conversation. A reply (Done) is just the
+/// orchestrator's turn, NOT the end; an Escalated burst is a RECOVERABLE pause —
+/// it emits a chat turn and keeps waiting (it no longer kills the session, the
+/// B15a bug). The session ends ONLY when the user stops replying (the wait window
+/// elapses) or the app stops the process; the transcript persists on disk either
+/// way (B15b). There is NO runaway: the loop BLOCKS on `wait_for_steer_reply`
+/// between bursts, so another burst runs only after the human sends a message.
+async fn run_session(goal: String) -> std::io::Result<()> {
+    let runtime = Arc::new(config::build_runtime().await);
+    eprintln!("devboule session: egress_enabled={}", runtime.allow_egress);
+    println!("=== devboule orchestrator session ===");
+    println!("goal: {goal}");
+    println!("--- transcript ---");
+
+    // Surface the launch goal as the FIRST user chat turn (so the panel chat shows
+    // the user side from the bridge, in order, like every later steer).
+    runtime.executor.emit_chat("user", &goal);
+
+    let mut conversation = goal;
     loop {
+        // Reviewer F3: the cumulative conversation is the NON-evictable `human`
+        // message of every burst, so it must be bounded or a long planning session
+        // overflows the model context. Keep the head (the original goal + early
+        // framing) and the recent tail.
+        conversation = trim_conversation(conversation, MAX_CONVERSATION_CHARS);
         let outcome = run_one_burst(&runtime, conversation.clone()).await?;
-        println!("--- outcome ---");
-        let pending_question = match outcome {
-            BurstOutcome::Escalated(reason) => {
-                println!("ESCALATED: {reason}");
-                break; // a real failure ends the session
-            }
+        let prior = match outcome {
+            // The reply was already emitted as a chat bubble by the burst — do NOT
+            // re-emit it. But DO fold it into the conversation (reviewer F5) so the
+            // model keeps its own prior replies in context across turns.
             BurstOutcome::Done(reply) => {
-                println!("DONE: {reply}");
-                None // a reply, not a question — just wait for the user's next turn
+                println!("--- replied; waiting for the user ---");
+                conversation = format!("{conversation}\n\n[You replied: {reply}]");
+                PriorTurn::Reply
             }
             BurstOutcome::AskUser(question) => {
-                println!("ASK_USER: {question}");
-                Some(question)
+                println!("--- asked the user; waiting ---");
+                PriorTurn::Question(question)
+            }
+            BurstOutcome::Escalated(reason) => {
+                // RECOVERABLE pause — NOT the end. Emit a chat turn so the user sees
+                // it and can steer; the session stays alive.
+                println!("--- paused ({reason}); waiting for the user ---");
+                runtime.executor.emit_chat("assistant", &paused_note(&reason));
+                PriorTurn::Paused(reason)
             }
         };
-        // Stay alive and wait for the user's next message; continue when it arrives.
         match wait_for_steer_reply(&runtime).await {
             Some(answer) => {
                 runtime.executor.emit_chat("user", &answer);
-                conversation = match pending_question {
-                    Some(question) => format!(
-                        "{conversation}\n\n[You asked the user: {question}]\n[User answered: {answer}]\n\nContinue from here.",
-                    ),
-                    None => format!(
-                        "{conversation}\n\n[User says: {answer}]\n\nContinue the conversation.",
-                    ),
-                };
+                conversation = fold_user_reply(&conversation, &prior, &answer);
                 println!("--- continuing with the user's reply ---");
             }
             None => {
-                println!("(no reply received before the wait window elapsed — ending)");
+                println!("(no reply before the wait window elapsed — ending session)");
                 break;
             }
         }
@@ -464,5 +549,58 @@ mod tests {
         assert_eq!(parse_once_prompt(args(&["--once"])), None);
         // A blank/whitespace prompt is treated as absent for the same reason.
         assert_eq!(parse_once_prompt(args(&["--once", "   "])), None);
+    }
+
+    #[test]
+    fn fold_user_reply_reply_case() {
+        let result = fold_user_reply("prev", &PriorTurn::Reply, "hi");
+        assert!(result.contains("[User says: hi]"));
+        assert!(result.contains("Continue the conversation."));
+    }
+
+    #[test]
+    fn fold_user_reply_question_case() {
+        let result = fold_user_reply("prev", &PriorTurn::Question("why?".into()), "hi");
+        assert!(result.contains("[You asked the user: why?]"));
+        assert!(result.contains("[User answered: hi]"));
+    }
+
+    /// B15a: an escalation folds into a RESUME (not a session end). This is the
+    /// regression guard for "the 2nd-turn steer kills the orchestrator".
+    #[test]
+    fn fold_user_reply_paused_case() {
+        let result =
+            fold_user_reply("prev", &PriorTurn::Paused("round cap reached".into()), "hi");
+        assert!(result.contains("[You paused: round cap reached]"));
+        assert!(result.contains("[User says: hi]"));
+        assert!(result.contains("Resume"));
+    }
+
+    #[test]
+    fn paused_note_reads_as_pause_not_failure() {
+        let note = paused_note("time cap reached");
+        assert!(note.contains("time cap reached"));
+        assert!(note.contains("paused"));
+        assert!(!note.contains("ESCALATED"));
+        assert!(!note.contains("failed"));
+    }
+
+    /// Reviewer F3: a short conversation is returned verbatim; a long one is
+    /// bounded to ~max chars, keeping the head (goal) and the recent tail.
+    #[test]
+    fn trim_conversation_bounds_long_and_keeps_short() {
+        let short = "the original goal".to_string();
+        assert_eq!(trim_conversation(short.clone(), 48_000), short);
+
+        let head = "GOAL: build the thing";
+        let long = format!("{head}{}", "x".repeat(60_000));
+        let trimmed = trim_conversation(long, 48_000);
+        assert!(
+            trimmed.chars().count() <= 48_000,
+            "must be bounded to max (marker included): {}",
+            trimmed.chars().count()
+        );
+        assert!(trimmed.contains("GOAL: build the thing"), "head preserved");
+        assert!(trimmed.contains("trimmed to fit context"), "marker present");
     }
 }

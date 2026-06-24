@@ -449,6 +449,41 @@ pub fn mini_activity_snapshot(
     store.snapshot(&agent_id)
 }
 
+/// One durable chat turn read back from an agent's on-disk activity bridge.
+/// Field names match the frontend planner message shape (`role` / `text`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatTurn {
+    pub role: String,
+    pub text: String,
+}
+
+/// B15b: read an agent's DURABLE chat transcript directly from its on-disk
+/// `.jsonl` bridge, independent of the in-memory store. Lets the planner chat
+/// survive the orchestrator process ending, a store eviction, or an app restart.
+/// Best-effort: returns an empty Vec on any resolution/read error (a missing
+/// transcript is "no history", never a hard failure).
+#[tauri::command]
+pub fn read_activity_chat(app: tauri::AppHandle, agent_id: String) -> Vec<ChatTurn> {
+    let Ok(projects_dir) = crate::backend::projects::ensure_projects_dir(&app) else {
+        return Vec::new();
+    };
+    // Reviewer max-recall: resolve the path WITHOUT creating the .devboule-activity dir
+    // (a read must not mutate the filesystem). `activity_file_name` is the same
+    // traversal-safe basename `activity_file_path` uses; we just skip the create_dir_all.
+    let Some(name) = activity_file_name(&agent_id) else {
+        return Vec::new();
+    };
+    let path = projects_dir.join(ACTIVITY_SUBDIR).join(name);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(parse_chat_line)
+        .map(|(role, text)| ChatTurn { role, text })
+        .collect()
+}
+
 // ---- builder / mutator helpers (keep the executor diff tiny) ----------------
 
 /// The live "working" shimmer line shown after the last round while a mini run is mid-flight.
@@ -1461,6 +1496,36 @@ mod tests {
         let inner = StoreInner::default();
         let v = to_value(inner.snapshot("nope")).unwrap();
         assert_eq!(v, json!({ "empty": true }));
+    }
+
+    /// B15b: the durable chat reader keeps only valid chat lines from the on-disk
+    /// `.jsonl`, dropping milestones and malformed lines. (Tests the parse path the
+    /// `read_activity_chat` command relies on — a tauri::AppHandle can't be built in
+    /// a unit test, so we exercise the same `lines().filter_map(parse_chat_line)`.)
+    #[test]
+    fn read_activity_chat_parses_chat_lines_from_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "devboule-b15-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let content = "{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"ciao\"}\n\
+{\"kind\":\"milestone\",\"text\":\"x\"}\n\
+{\"kind\":\"chat\",\"role\":\"assistant\",\"text\":\"hello\"}\n\
+not json\n";
+        std::fs::write(&path, content).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let turns: Vec<ChatTurn> = on_disk
+            .lines()
+            .filter_map(parse_chat_line)
+            .map(|(role, text)| ChatTurn { role, text })
+            .collect();
+        assert_eq!(turns.len(), 2, "only the two chat lines survive");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].text, "ciao");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].text, "hello");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

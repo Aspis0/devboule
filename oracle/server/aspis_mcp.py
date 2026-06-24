@@ -303,6 +303,7 @@ ROLE_RULES = [
             "project_claim_task",
             "project_update_status",
             "project_append_note",
+            "project_set_title",
             "project_create_followup",
             "project_create_plan_tasks",
             "provider_credentials_status",
@@ -379,6 +380,7 @@ ROLE_RULES = [
             "project_claim_task",
             "project_update_status",
             "project_append_note",
+            "project_set_title",
             "project_create_followup",
             "project_create_plan_tasks",
             "oracle_ask",
@@ -753,6 +755,17 @@ TOOLS = [
         "parameters": {
             "project_id": {"type": "string"},
             "text": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "project_set_title",
+        "description": "Rinomina il progetto: imposta il titolo deciso durante la conversazione di planning.",
+        "parameters": {
+            "project_id": {"type": "string"},
+            "title": {"type": "string"},
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
@@ -1703,6 +1716,14 @@ def parse_frontmatter(content: str, path: Path) -> tuple[dict[str, Any], int]:
             "status": normalize_project_status(fields.get("status", "active")),
             "updatedAt": fields.get("updated_at") or fields.get("updatedAt") or now(),
             "rootPath": fields.get("root_path") or fields.get("rootPath") or fields.get("root"),
+            # B7 fix: round-trip the Censor trust flag. The Rust serializer emits
+            # `censor_trusted: true` only when the user opted in; if Python parses
+            # and rewrites the frontmatter without carrying it, EVERY agent write
+            # (append_note, set_title, …) silently revokes that trust (Rust then
+            # re-parses it as absent → fail-closed false). Read it here and re-emit
+            # it in replace_frontmatter so a Python mutation preserves the opt-in.
+            "censorTrusted": str(fields.get("censor_trusted", "")).strip().lower()
+            == "true",
         },
         close_end,
     )
@@ -1739,6 +1760,9 @@ def find_state_block(content: str) -> tuple[dict[str, Any], tuple[int, int]]:
 def replace_frontmatter(content: str, metadata: dict[str, Any]) -> str:
     _, frontmatter_end = parse_frontmatter(content, Path("project.md"))
     root_line = f"root_path: {yaml_quote(metadata['rootPath'])}\n" if metadata.get("rootPath") else ""
+    # B7 fix: re-emit the Censor trust flag (same line/format/position as the Rust
+    # serializer: after root_path, only when true) so a Python write preserves it.
+    censor_line = "censor_trusted: true\n" if metadata.get("censorTrusted") else ""
     frontmatter = (
         "---\n"
         f"id: {metadata['id']}\n"
@@ -1746,6 +1770,7 @@ def replace_frontmatter(content: str, metadata: dict[str, Any]) -> str:
         f"status: {metadata['status']}\n"
         f"updated_at: {metadata['updatedAt']}\n"
         f"{root_line}"
+        f"{censor_line}"
         "---\n"
     )
     return f"{frontmatter}{content[frontmatter_end:]}"
@@ -6993,6 +7018,26 @@ def handle_tool_call(
                 saved = write_project_file(project)
             upsert_session(state, agent_id, role, status="noted", message=text, project_id=project_id)
             add_event(state, agent_id, role, "note", text, project_id)
+            write_agents_state(projects_dir, state)
+        return public_project(saved)
+
+    if name == "project_set_title":
+        # B7: the orchestrator names the project during the planning conversation.
+        # Same locked read-modify-write as project_append_note; touches only the
+        # metadata title (+ updatedAt) so it is durable on disk immediately.
+        agent_id = normalize_agent_id(args.get("agent_id"))
+        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        project_id = normalize_project_id(args.get("project_id", ""))
+        title = clean_text(args.get("title"), "Project title", 200)
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            with file_lock(project_lock_path(projects_dir, project_id)):
+                project = read_project_file(project_path(projects_dir, project_id))
+                project["metadata"]["title"] = title
+                project["metadata"]["updatedAt"] = now()
+                saved = write_project_file(project)
+            upsert_session(state, agent_id, role, status="renamed", message=title, project_id=project_id)
+            add_event(state, agent_id, role, "rename", title, project_id)
             write_agents_state(projects_dir, state)
         return public_project(saved)
 

@@ -58,6 +58,11 @@ export function PlannerChat({
         display: "flex",
         flexDirection: "column",
         minHeight: 340,
+        // B4: cap the chat height so the message list scrolls INTERNALLY instead
+        // of growing the whole panel unbounded (which blew out the app layout
+        // after a few turns). The inner scroll area (minHeight:0 + overflowY:auto)
+        // does the scrolling; the near-bottom auto-stick logic keeps newest in view.
+        maxHeight: 460,
         flex: 1,
       }}
     >
@@ -105,6 +110,9 @@ export function PlannerChat({
         className="pp-scroll"
         style={{
           flex: 1,
+          // B4: min-height:0 lets this flex child shrink below its content size so
+          // overflowY:auto actually scrolls (the classic flexbox overflow gotcha).
+          minHeight: 0,
           overflowY: "auto",
           padding: "13px 13px 4px",
           display: "flex",
@@ -154,6 +162,38 @@ export function PlannerChat({
                 </div>
               </div>
             ))}
+            {/* B14a: liveness — the instant you send, show a "thinking" indicator
+            until the orchestrator's reply arrives. Gated on the planner being
+            ACTUALLY live (not inferred from the message list alone, per the prior
+            bug where it showed with no planner running) AND the last turn being the
+            user's AND not already awaiting YOUR reply. */}
+            {live &&
+              !awaitingReply &&
+              messages[messages.length - 1]?.role === "user" && (
+                <div
+                  style={{
+                    alignSelf: "flex-start",
+                    marginTop: 9,
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: "#7c766b",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 7,
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: "50%",
+                      background: "#C0894F",
+                      animation: "pp-pulse 1.2s ease-in-out infinite",
+                    }}
+                  />
+                  Planner is thinking…
+                </div>
+              )}
             {awaitingReply && (
               <div
                 style={{

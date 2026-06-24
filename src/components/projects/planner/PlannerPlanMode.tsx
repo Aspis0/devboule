@@ -43,6 +43,9 @@ interface PlannerPlanModeProps {
   onCoderChange: (id: string) => void;
   autoCreate: boolean;
   onAutoCreateToggle: () => void;
+  // B10: explicit "Create plan" trigger (discuss-first; plan on demand).
+  onCreatePlan?: () => void;
+  canCreatePlan?: boolean;
 }
 
 export function PlannerPlanMode(props: PlannerPlanModeProps) {
@@ -72,6 +75,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     onCoderChange,
     autoCreate,
     onAutoCreateToggle,
+    onCreatePlan,
+    canCreatePlan,
   } = props;
 
   const { view, auto, pick, toggleAuto } = useStageRotation(3800, live);
@@ -185,7 +190,9 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
         >
           <span
             className="pp-mono"
-            style={{ fontSize: 10, color: '#A89F90', marginRight: 1 }}
+            style={{ fontSize: 10, color: '#A89F90', marginRight: 1, cursor: 'help' }}
+            data-help-title="The orchestrator is the agent you talk to here to shape the plan."
+            data-help-lines="A project is a plan: you discuss the goal with the orchestrator, and it drafts the tasks.|Local (Devboule) keeps this rich Stage (chat + websearch + plan + design); Claude/Codex run in their own embedded terminal.|Once the plan is ready you hand it off to a main coder, which writes the code.|It is the create-time conversation — not a permanent agent of the project."
           >
             orchestrator
           </span>
@@ -373,6 +380,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           onCoderChange={onCoderChange}
           autoCreate={autoCreate}
           onAutoCreateToggle={onAutoCreateToggle}
+          onCreatePlan={onCreatePlan}
+          canCreatePlan={canCreatePlan}
         />
       </div>
     </div>
