@@ -2796,6 +2796,17 @@ export function ProjectsView() {
             customClients={config.customAgentClients ?? []}
             localCoderModel={config.localCoderBackend?.model ?? null}
             onBack={exitWorkMode}
+            onRecallOrchestrator={() => {
+              // Recall the orchestrator to REVISE the current plan, reusing the SAME
+              // planner console 1:1 (the main-page orchestrator). It relaunches on the
+              // existing project — so it sees the current tasks — and on re-approval it
+              // sleeps. Surface the planner by returning to the board view.
+              const replanGoal =
+                "Revise the current plan for this project — the user wants to change it. Read the existing tasks and propose the changes.";
+              setPlannerGoal(replanGoal);
+              void planWithOrchestrator(replanGoal, plannerCoderId, plannerAutoCreate);
+              exitWorkMode();
+            }}
             onLaunch={(input) => void launchFromSpawnPanel(input)}
             onCopyPrompt={(selection) => void copyFromSpawnPanel(selection)}
             onCommit={(message) => void commitProject(message)}

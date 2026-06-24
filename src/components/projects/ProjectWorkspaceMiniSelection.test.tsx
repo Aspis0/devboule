@@ -98,6 +98,36 @@ describe("ProjectWorkspace mounts the unified Work Console (FocusStage) for the 
   });
 });
 
+describe("ProjectWorkspace recall-orchestrator (Change plan)", () => {
+  it("shows the Change plan button when onRecallOrchestrator is provided and not readOnly", () => {
+    const html = renderToStaticMarkup(
+      <ProjectWorkspace
+        project={project()} sessions={[session({})]} claims={[]} events={[]}
+        ptyAgents={new Set(["coder-1"])} isBusy={false} canLaunch
+        launchMessage={null} onBack={noop} onRecallOrchestrator={noop}
+        onLaunch={noop} onCopyPrompt={noop} onCommit={noop} onPush={noop} onPull={noop}
+        onStopAgent={noop} onFocusCli={noop} onCopyRecovery={noop}
+        gitActionMessage={null} gitActionError={false} gitActionBusy={false}
+      />,
+    );
+    expect(html).toContain("Change plan");
+  });
+
+  it("hides the Change plan button when readOnly (archived)", () => {
+    const html = renderToStaticMarkup(
+      <ProjectWorkspace
+        project={project()} sessions={[session({})]} claims={[]} events={[]}
+        ptyAgents={new Set(["coder-1"])} isBusy={false} canLaunch readOnly
+        launchMessage={null} onBack={noop} onRecallOrchestrator={noop} onUnarchive={noop}
+        onLaunch={noop} onCopyPrompt={noop} onCommit={noop} onPush={noop} onPull={noop}
+        onStopAgent={noop} onFocusCli={noop} onCopyRecovery={noop}
+        gitActionMessage={null} gitActionError={false} gitActionBusy={false}
+      />,
+    );
+    expect(html).not.toContain("Change plan");
+  });
+});
+
 describe("ProjectWorkspace Stop (kill) safety brake (MC-P5)", () => {
   it("renders the Stop button + help copy ONLY for a selected mini", () => {
     const sessions = [

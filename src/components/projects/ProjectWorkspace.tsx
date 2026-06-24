@@ -21,6 +21,7 @@ import {
   Minimize2,
   OctagonX,
   PanelRightOpen,
+  Sparkles,
   Square,
   Terminal,
 } from "lucide-react";
@@ -123,6 +124,9 @@ export interface ProjectWorkspaceProps {
    *  threaded to SpawnPanel via the agent rail. Optional. */
   localCoderModel?: string | null;
   onBack: () => void;
+  /** Recall the orchestrator to revise the current plan (reuses the main-page planner
+   *  console 1:1). Optional: omitted in contexts without an orchestrator. */
+  onRecallOrchestrator?: () => void;
   onLaunch: (input: SpawnLaunchInput) => void;
   onCopyPrompt: (selection: SpawnSelection) => void;
   onCommit: (message: string) => void;
@@ -170,6 +174,7 @@ export function ProjectWorkspace({
   customClients = [],
   localCoderModel = null,
   onBack,
+  onRecallOrchestrator,
   onLaunch,
   onCopyPrompt,
   onCommit,
@@ -472,6 +477,18 @@ export function ProjectWorkspace({
           <h2 className="truncate text-sm font-semibold text-cream-800">
             {project.metadata.title}
           </h2>
+          {onRecallOrchestrator && !readOnly && (
+            <button
+              type="button"
+              onClick={onRecallOrchestrator}
+              data-help-title="This recalls the Orchestrator to revise the current plan."
+              data-help-lines="Brings the Orchestrator back to change the plan for this project.|It is the SAME planner console you used to create the project, seeded with the current work.|Once you re-approve the plan, the Orchestrator sleeps and you return to the Work Console.|The running coders keep their work; only the plan is revised."
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-teal/30 bg-teal/[0.06] px-3 py-1.5 text-[12px] font-semibold text-teal-dark hover:bg-teal/[0.12]"
+            >
+              <Sparkles className="h-3.5 w-3.5" aria-hidden />
+              Change plan
+            </button>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
