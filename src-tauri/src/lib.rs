@@ -425,6 +425,7 @@ pub fn run() {
             backend::agents::stop_agent,
             backend::agent_pty::agent_pty_snapshot,
             backend::agent_pty::agent_pty_write,
+            backend::agent_pty::agent_pty_send_message,
             backend::agent_pty::agent_pty_resize,
             backend::agent_pty::agent_pty_kill,
             backend::cloud_duplex::project_cloud_orchestrator_send,

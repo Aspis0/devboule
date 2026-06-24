@@ -433,6 +433,65 @@ pub fn agent_pty_write(
     Ok(())
 }
 
+/// Frame a single conversational message for an agent PTY: a PTY treats EVERY '\r'/'\n' as
+/// "submit line", so a multi-line message would fire multiple premature submits. We therefore
+/// (1) strip trailing newlines, (2) replace every INTERNAL '\r'/'\n' with a single space so the
+/// whole message is one line, then (3) append exactly one '\r' (the single Enter that submits it).
+pub(crate) fn frame_agent_message(message: &str) -> String {
+    let trimmed = message.trim_end_matches(|c| c == '\r' || c == '\n');
+    let replaced: String = trimmed
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect();
+    format!("{}\r", replaced)
+}
+
+/// Send a conversational message (one human turn) to a cloud agent running in an
+/// app-hosted PTY (Claude/Codex). The structured counterpart to `project_cloud_orchestrator_send`
+/// for the PTY path: frames the text as `message + "\r"` and writes it via the same
+/// writer path as `agent_pty_write` (no new transport — reuse).
+#[tauri::command]
+pub fn agent_pty_send_message(
+    state: State<'_, BackendState>,
+    sessions: State<'_, AgentPtySessions>,
+    agent_id: String,
+    message: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    validate_agent_id(&agent_id)?;
+    if message.trim().is_empty() {
+        return Err("empty message".to_string());
+    }
+    // `>=`: the framed string appends one '\r', so an exactly-MAX message would write
+    // MAX+1 bytes. Bound the framed write to MAX_WRITE_BYTES.
+    if message.len() >= MAX_WRITE_BYTES {
+        return Err("write too large".to_string());
+    }
+    let data = frame_agent_message(&message);
+    let writer = {
+        let map = sessions
+            .inner
+            .lock()
+            .map_err(|_| "Agent terminal state is unavailable.".to_string())?;
+        let session = map
+            .get(&agent_id)
+            .ok_or_else(|| "No app terminal for this agent.".to_string())?;
+        Arc::clone(&session.writer)
+    };
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "Agent terminal state is unavailable.".to_string())?;
+    writer.write_all(data.as_bytes()).map_err(|e| {
+        log_pty_detail("pty write failed", &e.to_string());
+        "Could not send input to the agent terminal.".to_string()
+    })?;
+    writer.flush().map_err(|e| {
+        log_pty_detail("pty flush failed", &e.to_string());
+        "Could not send input to the agent terminal.".to_string()
+    })?;
+    Ok(())
+}
+
 /// Resize the agent's pty to the viewer's current geometry.
 #[tauri::command]
 pub fn agent_pty_resize(
@@ -710,6 +769,31 @@ fn sanitize_detail(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_agent_message_appends_a_single_carriage_return() {
+        // A structured "send message" frames the text as one conversational turn:
+        // the message followed by a single Enter (carriage return) for the PTY.
+        assert_eq!(frame_agent_message("narrow to the parser"), "narrow to the parser\r");
+    }
+
+    #[test]
+    fn frame_agent_message_strips_existing_trailing_newlines_to_avoid_double_submit() {
+        // The frontend may include a trailing newline; we must not submit twice.
+        assert_eq!(frame_agent_message("use Auth0\n"), "use Auth0\r");
+        assert_eq!(frame_agent_message("use Auth0\r\n"), "use Auth0\r");
+        assert_eq!(frame_agent_message("use Auth0\r"), "use Auth0\r");
+    }
+
+    #[test]
+    fn frame_agent_message_collapses_internal_newlines_into_one_pty_line() {
+        // A PTY treats every \r/\n as Enter, so internal newlines must become spaces —
+        // otherwise a multi-line message fires several premature, truncated submits.
+        assert_eq!(frame_agent_message("multi\nline body\n"), "multi line body\r");
+        // Each internal \r and \n maps to its own space (a \r\n pair -> two spaces);
+        // harmless for a PTY line, and never a premature submit.
+        assert_eq!(frame_agent_message("a\r\nb\r\n"), "a  b\r");
+    }
 
     #[test]
     fn push_capped_keeps_within_capacity_dropping_oldest() {

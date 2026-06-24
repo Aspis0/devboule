@@ -2344,6 +2344,9 @@ fn console_finalize(
             let status = applied_outcome
                 .map(|o| o.status)
                 .unwrap_or(MiniCoderStatus::Done);
+            // The mini's clarification question (if any), surfaced in the terminal banner.
+            // `applied_outcome` is `Option<&MiniCoderOutcome>` (Copy), so reading it twice is fine.
+            let clarification_question = applied_outcome.and_then(|o| o.question.clone());
             store.update(app, agent_id, |a| {
                 for path in files_touched {
                     console::push_write_action(a, path, diff_for(path));
@@ -2391,8 +2394,23 @@ fn console_finalize(
                             },
                         );
                     }
-                    // failed / timeout / needs_clarification / (pending/launching/running are
-                    // unreachable here): the neutral `stop` terminal. No verdict.
+                    // needs_clarification: a `stop` terminal that SURFACES the mini's
+                    // question to the human (Direction B for local coders, via the
+                    // activity stream) instead of a bare stop.
+                    MiniCoderStatus::NeedsClarification => {
+                        console::set_terminal(
+                            a,
+                            console::Banner {
+                                kind: console::BannerKind::Stop,
+                                title: None,
+                                sub: Some(clarification_banner_sub(
+                                    clarification_question.as_deref(),
+                                )),
+                            },
+                        );
+                    }
+                    // failed / timeout / (pending/launching/running are unreachable here):
+                    // the neutral `stop` terminal. No verdict.
                     _ => {
                         console::set_terminal(
                             a,
@@ -2406,6 +2424,15 @@ fn console_finalize(
                 }
             });
         }
+    }
+}
+
+/// The muted sub-line for a `needs_clarification` terminal banner: surfaces the mini coder's
+/// QUESTION to the human in the activity stream instead of a bare stop.
+fn clarification_banner_sub(question: Option<&str>) -> String {
+    match question {
+        Some(q) if !q.trim().is_empty() => format!("needs clarification: {}", q.trim()),
+        _ => "needs clarification".to_string(),
     }
 }
 
@@ -10610,5 +10637,18 @@ mod tests {
         );
         // Singular/plural still respected on both axes.
         assert_eq!(done_sub(1, 2, true), "1 file · 2 rounds · edits applied");
+    }
+
+    #[test]
+    fn clarification_banner_sub_surfaces_the_question_to_the_human() {
+        // A local coder reporting needs_clarification must show its QUESTION in the
+        // terminal banner (not a bare stop), so the human sees what it's blocked on.
+        assert_eq!(
+            clarification_banner_sub(Some("which auth provider should I wire?")),
+            "needs clarification: which auth provider should I wire?",
+        );
+        // No / empty / whitespace question -> a plain, still-informative banner.
+        assert_eq!(clarification_banner_sub(None), "needs clarification");
+        assert_eq!(clarification_banner_sub(Some("   ")), "needs clarification");
     }
 }
