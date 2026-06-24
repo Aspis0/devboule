@@ -34,13 +34,14 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { invokeBackendCommand } from "../../context/AppContext";
+import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
 import { useNow } from "../../hooks/useNow";
 import type {
   AgentClaim,
   AgentEvent,
   AgentRoleRule,
   AgentSession,
+  CensorFinding,
   ProjectDetail,
 } from "../../types/backend";
 import type { CustomAgentClient } from "../../types/config";
@@ -49,8 +50,11 @@ import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { CensorPanel } from "./CensorPanel";
 import { FocusStage } from "../work/FocusStage";
+import { CensorStrip } from "../work/CensorStrip";
+import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, findWorkNode, type WorkNode } from "../work/workConsoleModel";
 import { agentChannel, type CommsDirection } from "../work/agentChannel";
+import { CensorFindingsTracker } from "./censorPanelModel";
 import { stripSpoofChars } from "../agents/attentionNotifier";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
@@ -316,6 +320,31 @@ export function ProjectWorkspace({
     if (!ch) return;
     void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch(() => {});
   }, []);
+
+  // Censor strip: the project-wide inspection summary (clean/dirty per file). Reuses the
+  // SAME event-driven findings feed as the Censor dock tab — NO new poller.
+  const [censorFindings, setCensorFindings] = useState<CensorFinding[]>([]);
+  const censorRoot = (project.metadata.rootPath ?? "").trim();
+  useEffect(() => {
+    if (!isTauriRuntime() || !censorRoot) {
+      setCensorFindings([]);
+      return;
+    }
+    const tracker = new CensorFindingsTracker({
+      projectId: project.metadata.id,
+      root: censorRoot,
+      invoke: invokeBackendCommand,
+      listen: async (channel, handler) => {
+        const { listen } = await import("@tauri-apps/api/event");
+        return listen(channel, (event) => handler({ payload: event.payload }));
+      },
+      onChange: (next) => setCensorFindings(next),
+      onError: () => {},
+    });
+    void tracker.start();
+    return () => tracker.stop();
+  }, [project.metadata.id, censorRoot]);
+  const censorStrip = useMemo(() => buildCensorStrip(censorFindings), [censorFindings]);
 
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
@@ -724,6 +753,11 @@ export function ProjectWorkspace({
             </div>
           )}
         </section>
+      </div>
+
+      {/* ---- Censor strip: project-wide inspection summary (sober, always-visible) ---- */}
+      <div className="overflow-hidden rounded-2xl border border-cream-200 bg-white">
+        <CensorStrip model={censorStrip} />
       </div>
 
       {/* ---- Task board (relocated from the board-mode panel), above the dock ---- */}
