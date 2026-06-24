@@ -15,6 +15,7 @@ import {
   enterWorkMode,
   exitWorkMode,
   isMiniSession,
+  isMiniManagedSession,
   miniKillCall,
   projectsViewMode,
   pushProjectCall,
@@ -219,6 +220,25 @@ describe("isMiniSession", () => {
     expect(isMiniSession(session({ parentAgentId: null }))).toBe(false);
     expect(isMiniSession(session({ parentAgentId: "" }))).toBe(false);
     expect(isMiniSession(session({ parentAgentId: "   " }))).toBe(false);
+  });
+});
+
+describe("isMiniManagedSession", () => {
+  it("a mini is always mini-managed (even with a cloud client)", () => {
+    expect(isMiniManagedSession(session({ parentAgentId: "c1", client: "claude" }))).toBe(true);
+  });
+  it("a cloud (claude/codex) top-level coder is NOT mini-managed (raw PTY worker)", () => {
+    expect(isMiniManagedSession(session({ client: "claude" }))).toBe(false);
+    expect(isMiniManagedSession(session({ client: "codex" }))).toBe(false);
+    expect(isMiniManagedSession(session({ client: "CLAUDE" }))).toBe(false);
+  });
+  it("a local-model coder is mini-managed", () => {
+    expect(isMiniManagedSession(session({ client: "ollama" }))).toBe(true);
+    expect(isMiniManagedSession(session({ client: "qwen-32b" }))).toBe(true);
+  });
+  it("an unknown/absent client defaults to mini-managed (safer route)", () => {
+    expect(isMiniManagedSession(session({ client: null }))).toBe(true);
+    expect(isMiniManagedSession(session({}))).toBe(true);
   });
 });
 
@@ -719,16 +739,17 @@ describe("dock", () => {
     expect(DOCK_TABS[0].id).toBe("censor");
   });
 
-  it("exposes the six tabs in order (Changes tab added in Fase 2)", () => {
+  it("exposes the five tabs in order (Console merged into the unified Work Console)", () => {
+    // The standalone "Console" dock tab was merged into the FocusStage Activity view
+    // and removed — no duplicate structured-console surface.
     expect(DOCK_TABS.map((t) => t.id)).toEqual([
       "censor",
       "git",
       "plans",
-      "console",
       "mcp",
       "changes",
     ]);
-    expect(DOCK_TABS.find((t) => t.id === "console")!.label).toBe("Console");
+    expect(DOCK_TABS.find((t) => t.id === "console")).toBeUndefined();
     expect(DOCK_TABS.find((t) => t.id === "mcp")!.label).toBe("MCP");
     expect(DOCK_TABS.find((t) => t.id === "changes")!.label).toBe("Changes");
   });

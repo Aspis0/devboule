@@ -45,14 +45,13 @@ import type {
 } from "../../types/backend";
 import type { CustomAgentClient } from "../../types/config";
 import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
-import { AgentConsole } from "../agents/AgentConsole";
-import { AgentTimelineStrip } from "../agents/AgentTimelineStrip";
-import { consoleRunCount } from "../agents/agentConsoleModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
-import { AgentQuestionCard } from "./AgentQuestionCard";
 import { CensorPanel } from "./CensorPanel";
-import { MiniSteerBar } from "./MiniSteerBar";
+import { FocusStage } from "../work/FocusStage";
+import { buildWorkConsoleModel, findWorkNode, type WorkNode } from "../work/workConsoleModel";
+import { agentChannel, type CommsDirection } from "../work/agentChannel";
+import { stripSpoofChars } from "../agents/attentionNotifier";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
 import { ProjectWorkspaceAgentRail } from "./ProjectWorkspaceAgentRail";
@@ -65,6 +64,7 @@ import {
   type DockTab,
   compactWriteCall,
   isMiniSession,
+  isMiniManagedSession,
   miniKillCall,
   reconcileSelectedAgentId,
   shouldShowCompact,
@@ -80,6 +80,13 @@ const AgentTerminalViewer = lazy(() =>
     default: m.AgentTerminalViewer,
   })),
 );
+
+// Canned steer messages for the FocusStage quick-action chips (Direction A).
+const FOCUS_QUICK_ACTIONS: Record<"redo" | "narrow" | "pause", string> = {
+  redo: "Redo this round.",
+  narrow: "Narrow the scope to the current file only.",
+  pause: "Pause after the current step.",
+};
 
 export interface ProjectWorkspaceProps {
   project: ProjectDetail;
@@ -183,7 +190,6 @@ export function ProjectWorkspace({
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
-  const [costTotalUsd, setCostTotalUsd] = useState<number | null>(null);
 
   // The previous sessions snapshot, so reconcile can tell whether a now-gone
   // selection WAS a mini (and thus fall back to its parent, not the freshest).
@@ -269,23 +275,48 @@ export function ProjectWorkspace({
   // mini-activity://<agentId>) lands — no second poller, no GPU. Its `running`
   // flag drives the spinner + run-count pill on the Console tab.
   const consoleActivity = useAgentConsole(selectedAgentId);
-  const consoleRunning = Boolean(consoleActivity.running);
-  const consoleCount = consoleRunCount(consoleActivity);
 
-  // P2 cost: fetch running cost total on mount and whenever a new task estimate arrives.
+  // Unified Work Console: derive the selected node from the live model so the FocusStage
+  // (the merged terminal + structured console) can drive its header, activity, raw flip,
+  // and the two-way composer/question card for whichever agent is selected.
+  const [focusView, setFocusView] = useState<"activity" | "raw">("activity");
+  // Reset to the Activity view whenever the selected agent changes, so a Raw view (or its
+  // "external console" note for a non-PTY agent) never leaks across selections.
   useEffect(() => {
-    let cancelled = false;
-    invokeBackendCommand<{ totalUsd: number; byModel: Record<string, number> }>(
-      "get_cost_summary"
-    )
-      .then((summary) => {
-        if (!cancelled) setCostTotalUsd(summary.totalUsd);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [consoleActivity?.taskCostEstimateUsd]);
+    setFocusView("activity");
+  }, [selectedAgentId]);
+  const focusNode = useMemo(() => {
+    if (!selectedAgentId) return null;
+    const model = buildWorkConsoleModel({
+      sessions,
+      tasks: project.state.tasks,
+      projectId: project.metadata.id,
+    });
+    return findWorkNode(model, selectedAgentId);
+  }, [selectedAgentId, sessions, project.state.tasks, project.metadata.id]);
+
+  // Direction A/B dispatch: route the composer to the right backend command. The signal is
+  // whether the agent is mini_coder-managed (local mini/coder -> mini_coder_steer) vs a cloud
+  // PTY worker (claude/codex -> agent_pty_send_message / reply_to_agent) — NOT raw PTY presence
+  // (a local mini also runs in a PTY). Read through a ref so the callback stays stable across
+  // the 5s sessions poll (avoids re-rendering the FocusStage timeline every tick).
+  const focusDispatchRef = useRef<{ node: WorkNode | null; miniManaged: boolean }>({
+    node: null,
+    miniManaged: true,
+  });
+  focusDispatchRef.current = {
+    node: focusNode,
+    miniManaged: selectedSession ? isMiniManagedSession(selectedSession) : true,
+  };
+  const dispatchToFocus = useCallback((text: string, dir: CommsDirection) => {
+    const { node, miniManaged } = focusDispatchRef.current;
+    const t = text.trim();
+    if (!t || !node) return;
+    const ch = agentChannel(node, { miniManaged }, dir);
+    if (!ch) return;
+    void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch(() => {});
+  }, []);
+
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
   // two-step confirm): `mini_coder_kill` records killRequested THEN kills the PTY so
@@ -621,28 +652,55 @@ export function ProjectWorkspace({
                 </div>
               </div>
 
-              {/* Mount the live terminal ONLY for an app-hosted agent (one with a
-                  live in-app PTY). Key by agentId so switching agents remounts the
-                  viewer cleanly; the lazy xterm chunk loads once and is reused. An
-                  external/legacy agent has no app PTY — show a tidy note instead of
-                  the viewer's snapshot-error banner. */}
-              {ptyAgents.has(selectedSession.agentId) ? (
-                <Suspense
-                  fallback={
-                    <div className="rounded-2xl border border-cream-200 bg-cream-50 px-3 py-10 text-center text-[11px] text-cream-400">
-                      Loading terminal…
-                    </div>
-                  }
-                >
-                  <AgentTerminalViewer
-                    key={selectedSession.agentId}
-                    agentId={selectedSession.agentId}
+              {/* Unified Work Console: the FocusStage merges the raw PTY terminal (Raw)
+                  and the structured activity console (Activity) into ONE surface, with a
+                  two-way composer + inline question card for the selected agent. The raw
+                  terminal is mounted only for an app-hosted PTY agent; an external/legacy
+                  agent shows a tidy note in the Raw slot instead. */}
+              {focusNode ? (
+                <div className="h-[560px] overflow-hidden rounded-2xl border border-cream-200 bg-white">
+                  <FocusStage
+                    node={focusNode}
+                    activity={consoleActivity}
+                    view={focusView}
+                    onViewChange={setFocusView}
+                    onSendMessage={(t) => dispatchToFocus(t, "message")}
+                    pendingQuestion={
+                      readOnly || !focusNode.pendingQuestion
+                        ? null
+                        : stripSpoofChars(focusNode.pendingQuestion)
+                    }
+                    onAnswer={(t) => dispatchToFocus(t, "answer")}
+                    disabled={readOnly}
+                    onQuickAction={(a) => dispatchToFocus(FOCUS_QUICK_ACTIONS[a], "message")}
+                    rawSlot={
+                      ptyAgents.has(selectedSession.agentId) ? (
+                        <Suspense
+                          fallback={
+                            <div className="rounded-2xl border border-cream-200 bg-cream-50 px-3 py-10 text-center text-[11px] text-cream-400">
+                              Loading terminal…
+                            </div>
+                          }
+                        >
+                          <AgentTerminalViewer
+                            key={selectedSession.agentId}
+                            agentId={selectedSession.agentId}
+                          />
+                        </Suspense>
+                      ) : (
+                        <div className="flex h-full items-center justify-center px-4 text-center text-[12px] text-cream-400">
+                          This agent runs in an external console — no in-app terminal to
+                          show. Use the drawer for its claims and events.
+                        </div>
+                      )
+                    }
                   />
-                </Suspense>
+                </div>
               ) : (
                 <div className="flex h-72 items-center justify-center rounded-2xl border border-dashed border-cream-200 bg-cream-50 px-4 text-center text-[12px] text-cream-400">
-                  This agent runs in an external console — no in-app terminal to
-                  show. Use the drawer for its claims and events.
+                  This agent isn&apos;t placed in the work model (it may belong to a
+                  different project or have no current task). Use the drawer for its
+                  claims and events.
                 </div>
               )}
 
@@ -655,9 +713,8 @@ export function ProjectWorkspace({
                 />
               )}
 
-              {/* Question card: shown when the selected agent is waiting for a
-                  human reply to a question it raised via ask_user / pendingQuestion. */}
-              {!readOnly && <AgentQuestionCard session={selectedSession} />}
+              {/* The agent's question card is now inline in the FocusStage (Direction B:
+                  the agent asks, the composer becomes an answer box). */}
             </div>
           ) : (
             <div className="flex h-72 items-center justify-center rounded-2xl border border-dashed border-cream-200 bg-cream-50 text-center text-[12px] text-cream-400">
@@ -677,9 +734,6 @@ export function ProjectWorkspace({
         <div className="flex w-fit gap-1 border-b border-cream-200 p-1">
           {DOCK_TABS.map((tab) => {
             const active = dockTab === tab.id;
-            // The Console tab carries a run pill (spinner + count) while a mini run
-            // is active for the selected agent — mirroring the mock's tab badge.
-            const showConsoleRun = tab.id === "console" && consoleRunning;
             return (
               <button
                 key={tab.id}
@@ -692,25 +746,6 @@ export function ProjectWorkspace({
                 }`}
               >
                 {tab.label}
-                {showConsoleRun ? (
-                  <span
-                    className={`inline-flex items-center gap-1 rounded-full px-1.5 text-[10px] font-bold ${
-                      active
-                        ? "bg-white/20 text-white"
-                        : "bg-indigo/15 text-indigo-dark"
-                    }`}
-                  >
-                    <span
-                      className={`h-2 w-2 animate-spin rounded-full border-[1.6px] border-transparent motion-reduce:animate-none ${
-                        active
-                          ? "border-t-white"
-                          : "border-indigo-light border-t-indigo"
-                      }`}
-                      aria-hidden
-                    />
-                    {consoleCount}
-                  </span>
-                ) : null}
               </button>
             );
           })}
@@ -733,32 +768,6 @@ export function ProjectWorkspace({
             <PlansDockTab projectId={project.metadata.id} />
           )}
 
-          {dockTab === "console" && (
-            // CONCRETE height (the mock's dock-body height) so BOTH the empty
-            // state's `flex-1 h-full justify-center` can actually center AND a long
-            // timeline scrolls inside the panel. A max-h/min-h pair leaves the
-            // flex child without a definite height, so the empty state pins to the
-            // top instead of centering.
-            <div className="flex h-[348px] flex-col">
-              <AgentTimelineStrip activity={consoleActivity} />
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                <AgentConsole activity={consoleActivity} />
-              </div>
-              {(consoleActivity?.taskCostEstimateUsd != null || costTotalUsd != null) && (
-                <div className="flex items-center justify-end gap-3 border-t border-cream-100 px-3 py-1 text-[11px] text-cream-500">
-                  {consoleActivity?.taskCostEstimateUsd != null && (
-                    <span>
-                      est. task ~${consoleActivity.taskCostEstimateUsd.toFixed(4)}
-                    </span>
-                  )}
-                  {costTotalUsd != null && (
-                    <span>total ~${costTotalUsd.toFixed(2)} (est)</span>
-                  )}
-                </div>
-              )}
-              <MiniSteerBar agentId={selectedAgentId} disabled={readOnly} />
-            </div>
-          )}
 
           {dockTab === "mcp" &&
             (project.metadata.rootPath ? (

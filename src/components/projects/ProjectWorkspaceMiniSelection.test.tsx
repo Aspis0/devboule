@@ -71,8 +71,8 @@ function render(
   );
 }
 
-describe("ProjectWorkspace mini selection mounts the PTY-gated terminal", () => {
-  it("auto-selects the freshest (a mini here) and mounts the terminal when it has a live PTY", () => {
+describe("ProjectWorkspace mounts the unified Work Console (FocusStage) for the selected agent", () => {
+  it("auto-selects the freshest (a mini here) and focuses it in the Work Console (Activity default)", () => {
     // The mini is freshest, so reconcileSelectedAgentId(null, …) selects it.
     const sessions = [
       session({ agentId: "coder-1", lastSeenAt: "2026-06-05T00:00:00Z" }),
@@ -83,21 +83,18 @@ describe("ProjectWorkspace mini selection mounts the PTY-gated terminal", () => 
         lastSeenAt: "2026-06-05T05:00:00Z",
       }),
     ];
-    // The mini has a live app PTY (agent_pty_list returns host="app" sessions).
     const html = render(sessions, new Set(["coder-1", "mini-1"]));
-    // The selected agent header shows the mini id.
+    // The selected agent (mini-1) is focused — the FocusStage renders with the
+    // Activity view as the default (the raw PTY terminal is behind the Raw flip).
     expect(html).toContain("mini-1");
-    // Because the mini IS in ptyAgents, the PTY-gated branch (Suspense terminal)
-    // renders its loading state, NOT the "external console" no-terminal note.
-    expect(html).toContain("Loading terminal");
-    expect(html).not.toContain("external console");
+    expect(html).toContain('data-view="activity"');
   });
 
-  it("shows the no-terminal note when the selected agent lacks a live PTY", () => {
+  it("focuses a non-PTY agent in the Work Console too (Activity default)", () => {
     const sessions = [session({ agentId: "coder-1" })];
     const html = render(sessions, new Set()); // empty PTY set
-    expect(html).toContain("external console");
-    expect(html).not.toContain("Loading terminal");
+    expect(html).toContain("coder-1");
+    expect(html).toContain('data-view="activity"');
   });
 });
 
@@ -118,8 +115,8 @@ describe("ProjectWorkspace Stop (kill) safety brake (MC-P5)", () => {
     expect(html).toContain(
       "Immediately kills this mini-coder; the parent coder will be told it was aborted and must escalate to you.",
     );
-    // The reused AgentTerminalViewer (with its reply bar) is mounted, not bypassed.
-    expect(html).toContain("Loading terminal");
+    // The mini is focused in the Work Console (Activity default; terminal behind Raw).
+    expect(html).toContain('data-view="activity"');
   });
 
   it("renders the NORMAL-agent Stop (stop_agent) but NOT the mini brake for a non-mini agent", () => {
@@ -214,13 +211,16 @@ describe("ProjectWorkspace read-only (archived) mode", () => {
     expect(html).not.toContain(">Unarchive<");
   });
 
-  it('hides the agent question card when readOnly', () => {
+  it('shows the inline question card normally but hides it when readOnly', () => {
     const sessions = [session({ pendingQuestion: { id: "q1", question: "Which file?", createdAt: "2026-06-05T00:00:00Z" } })];
     const set = new Set<string>();
+    // Direction B is now inline in the FocusStage: the agent's question + an answer box.
     const htmlNormal = render(sessions, set);
-    expect(htmlNormal).toContain('is asking you a question');
+    expect(htmlNormal).toContain('Which file?');
+    expect(htmlNormal).toContain('data-asking="true"');
+    // Archived (readOnly): the question card is suppressed (you cannot answer anyway).
     const htmlReadOnly = render(sessions, set, { readOnly: true, onUnarchive: noop });
-    expect(htmlReadOnly).not.toContain('is asking you a question');
+    expect(htmlReadOnly).not.toContain('data-asking="true"');
   });
 
   it('keeps the mini Stop brake available when readOnly', () => {

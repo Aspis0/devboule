@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildWorkConsoleModel } from "./workConsoleModel";
+import { buildWorkConsoleModel, findWorkNode } from "./workConsoleModel";
 import type { AgentSession, ProjectTask } from "../../types/backend";
 
 const PROJECT = "proj-1";
@@ -270,5 +270,31 @@ describe("buildWorkConsoleModel — hardening (reviewer findings)", () => {
       session({ agentId: "dup", currentTaskId: "t1" }),
     ];
     expect(() => buildWorkConsoleModel({ sessions, tasks, projectId: PROJECT })).not.toThrow();
+  });
+});
+
+describe("findWorkNode", () => {
+  const model = () =>
+    buildWorkConsoleModel({
+      projectId: PROJECT,
+      tasks: [
+        task({ id: "t-board", scope: ["src/views/projects/board.tsx"] }),
+        task({ id: "t-card", scope: ["src/views/projects/card.tsx"] }),
+      ],
+      sessions: [
+        session({ agentId: "o1", client: "orchestrator", currentTaskId: null }),
+        session({ agentId: "c1", currentTaskId: "t-board" }),
+        session({ agentId: "m1", currentTaskId: "t-card", parentAgentId: "c1" }),
+      ],
+    });
+
+  it("finds the orchestrator, a district coder, and a nested mini", () => {
+    expect(findWorkNode(model(), "o1")?.type).toBe("orchestrator");
+    expect(findWorkNode(model(), "c1")?.agentId).toBe("c1");
+    expect(findWorkNode(model(), "m1")?.type).toBe("mini");
+  });
+
+  it("returns null for an unknown agentId", () => {
+    expect(findWorkNode(model(), "nope")).toBeNull();
   });
 });

@@ -161,3 +161,21 @@ export function buildWorkConsoleModel({
     unplaced,
   };
 }
+
+/** Find a node anywhere in the model (orchestrator + its children, district nodes +
+ *  children recursively, unplaced) by agentId. Returns null if absent. */
+export function findWorkNode(model: WorkConsoleModel, agentId: string): WorkNode | null {
+  const search = (nodes: readonly WorkNode[]): WorkNode | null => {
+    for (const node of nodes) {
+      if (node.agentId === agentId) return node;
+      const found = search(node.children);
+      if (found) return found;
+    }
+    return null;
+  };
+  return (
+    search(model.orchestrator ? [model.orchestrator] : []) ||
+    search(model.districts.flatMap((d) => d.nodes)) ||
+    search(model.unplaced)
+  );
+}

@@ -164,6 +164,19 @@ export function isMiniSession(session: AgentSession): boolean {
   );
 }
 
+/** True when the agent is driven by the mini_coder directive layer (a local mini OR a
+ *  local agentic coder) and must therefore be steered/answered via `mini_coder_steer`
+ *  (the directive queue), NOT by raw-writing its PTY. A mini is always mini-managed; a
+ *  top-level coder is mini-managed unless its client is a cloud CLI (claude/codex), which
+ *  runs as a raw PTY worker. An unknown/absent client defaults to mini-managed (the safer
+ *  route: mini_coder_steer no-ops if there is no directive, whereas a raw PTY write could
+ *  corrupt a process that isn't a cloud worker). */
+export function isMiniManagedSession(session: AgentSession): boolean {
+  if (isMiniSession(session)) return true;
+  const client = (session.client ?? "").trim().toLowerCase();
+  return client !== "claude" && client !== "codex";
+}
+
 /** Build a single row. `miniChildren` are assigned AT CONSTRUCTION (default empty),
  *  so a returned row object is never mutated after it is built — important for any
  *  future memo-by-identity and to avoid an aliased-mutation hazard. */
@@ -456,9 +469,8 @@ export const DOCK_TABS: { id: DockTab; label: string }[] = [
   { id: "censor", label: "Censor" },
   { id: "git", label: "Git" },
   { id: "plans", label: "Plans" },
-  // The structured agent-activity timeline (the complement to the raw xterm). Its
-  // tab shows a spinner + run-count when a mini run is active for the selected agent.
-  { id: "console", label: "Console" },
+  // NOTE: the standalone "Console" dock tab was merged into the unified Work Console
+  // (FocusStage Activity view) and removed — no duplicate structured-console surface.
   // Project-scoped user MCP servers (Phase A.3).
   { id: "mcp", label: "MCP" },
   // Read-only working-tree diff + "Open in <editor>" / Open-PR launchers (open the
