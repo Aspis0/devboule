@@ -66,6 +66,7 @@ const ORACLE_TOOL_NAMES: &[&str] = &[
     "ask_user",
     "project_list",
     "project_get",
+    "project_set_title",
     "project_next_task",
     "project_claim_task",
     "project_update_status",
