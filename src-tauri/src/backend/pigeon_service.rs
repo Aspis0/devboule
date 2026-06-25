@@ -1,0 +1,279 @@
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use std::thread;
+
+use tauri::AppHandle;
+use tauri::Manager;
+use serde_json;
+
+// Statics
+static PIGEON_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+static PIGEON_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static PIGEON_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+static PIGEON_PORT: OnceLock<u16> = OnceLock::new();
+static PIGEON_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
+
+// Windows no-window
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn apply_no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+pub fn set_pigeon_data_root(dir: &Path) {
+    let _ = PIGEON_DATA_ROOT.set(dir.to_path_buf());
+}
+
+fn pigeon_data_root() -> Option<PathBuf> {
+    PIGEON_DATA_ROOT.get().cloned().or_else(|| {
+        #[cfg(debug_assertions)]
+        return std::env::current_dir().ok().map(|c| c.join("pigeon-data"));
+        #[cfg(not(debug_assertions))]
+        None
+    })
+}
+
+/// Pure: read the `pigeon.enabled` flag out of a parsed config.json value. Default false.
+pub fn pigeon_enabled_from_value(v: &serde_json::Value) -> bool {
+    v.get("pigeon")
+        .and_then(|p| p.get("enabled"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false)
+}
+
+/// Read config.json and return whether Pigeon is enabled (default false on any error).
+pub fn read_pigeon_enabled(app: &AppHandle) -> bool {
+    let Some(path) = crate::backend::projects::locate_config_path(app) else { return false; };
+    let Ok(content) = std::fs::read_to_string(&path) else { return false; };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else { return false; };
+    pigeon_enabled_from_value(&value)
+}
+
+fn pigeon_port() -> u16 {
+    *PIGEON_PORT.get_or_init(random_pigeon_port)
+}
+
+fn random_pigeon_port() -> u16 {
+    let mut bytes = [0u8; 2];
+    if let Ok(()) = getrandom::fill(&mut bytes) {
+        20_000 + (u16::from_le_bytes(bytes) % 30_000)
+    } else {
+        20_000 + (std::process::id() as u16 % 30_000)
+    }
+}
+
+fn pigeon_auth_token() -> &'static str {
+    PIGEON_AUTH_TOKEN.get_or_init(|| {
+        let mut b = [0u8; 24];
+        let _ = getrandom::fill(&mut b);
+        b.iter().map(|x| format!("{:02x}", x)).collect()
+    })
+}
+
+fn pigeon_http_client() -> &'static reqwest::blocking::Client {
+    PIGEON_HTTP_CLIENT.get_or_init(|| reqwest::blocking::Client::builder().build().unwrap())
+}
+
+fn pigeon_package_root(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let pigeon_dir = resource_dir.join("pigeon");
+        if pigeon_dir.is_dir() {
+            return Some(resource_dir);
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        return std::env::current_dir().ok();
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+fn build_pigeon_command(app: &AppHandle) -> Result<Command, String> {
+    let python = crate::oracle::oracle_setup::resolve_oracle_runtime_python()
+        .ok_or_else(|| "Pigeon: Python runtime (oracle venv) not installed; skipping".to_string())?;
+    let package_root = pigeon_package_root(app).ok_or_else(|| "Pigeon: package root not found".to_string())?;
+    let data_root = pigeon_data_root().ok_or_else(|| "Pigeon: data root not set".to_string())?;
+    let sqlite_path = data_root.join("mailbox.sqlite");
+    let mut cmd = Command::new(python);
+    cmd.args(["-m", "pigeon.dispatcher"])
+        .current_dir(&package_root)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONPATH", &package_root)
+        .env("PIGEON_PORT", pigeon_port().to_string())
+        .env("PIGEON_AUTH_TOKEN", pigeon_auth_token())
+        .env("PIGEON_DIR", &data_root)
+        .env("PIGEON_SQLITE_PATH", &sqlite_path);
+    apply_no_window(&mut cmd);
+    Ok(cmd)
+}
+
+fn probe_ready() -> bool {
+    let port = pigeon_port();
+    let token = pigeon_auth_token();
+    let client = pigeon_http_client();
+    let url = format!("http://127.0.0.1:{port}/health");
+    match client.get(&url)
+        .timeout(Duration::from_secs(2))
+        .header("x-pigeon-auth-token", token)
+        .send() {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>() {
+                    return body.get("service").and_then(|s| s.as_str()) == Some("pigeon");
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn start_if_enabled(app: &AppHandle) {
+    if !read_pigeon_enabled(app) {
+        eprintln!("Pigeon disabled (config pigeon.enabled=false); not starting.");
+        return;
+    }
+
+    let slot = PIGEON_CHILD.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_some() {
+        eprintln!("Pigeon already running; not starting again.");
+        return;
+    }
+
+    let mut cmd = match build_pigeon_command(app) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Pigeon: failed to build command: {e}");
+            return;
+        }
+    };
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Pigeon: failed to spawn child: {e}");
+            return;
+        }
+    };
+
+    *guard = Some(child);
+
+    thread::spawn(move || {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(20);
+        loop {
+            if probe_ready() {
+                eprintln!("Pigeon service is ready.");
+                return;
+            }
+            if start.elapsed() > timeout {
+                eprintln!("Pigeon: did not become ready within 20s.");
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+pub fn on_app_exit() {
+    if let Some(mutex) = PIGEON_CHILD.get() {
+        let mut guard = mutex.lock().unwrap();
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if Instant::now() > deadline {
+                            eprintln!("Pigeon: child did not exit within 5s, detaching.");
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_pigeon_enabled(app: tauri::AppHandle) -> bool {
+    read_pigeon_enabled(&app)
+}
+
+#[tauri::command]
+pub fn set_pigeon_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::backend::state::BackendState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    state.ensure_unlocked()?;
+    let _lock = crate::backend::projects::config_write_lock()
+        .lock()
+        .map_err(|e| format!("config write lock poisoned: {e}"))?;
+
+    let path = crate::backend::projects::locate_config_path(&app)
+        .ok_or_else(|| "config.json not found".to_string())?;
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) if !path.exists() => "{}".to_string(),
+        Err(e) => return Err(format!("Could not read config.json: {e}")),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    if !value.is_object() { value = serde_json::json!({}); }
+    let obj = value.as_object_mut().unwrap();
+    let pigeon = obj.entry("pigeon").or_insert_with(|| serde_json::json!({}));
+    if !pigeon.is_object() { *pigeon = serde_json::json!({}); }
+    pigeon.as_object_mut().unwrap().insert("enabled".to_string(), serde_json::json!(enabled));
+    let serialized = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let suffix = format!("{}-{}", std::process::id(), timestamp);
+    let temp = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup = path.with_extension(format!("json.{suffix}.bak"));
+
+    std::fs::write(&temp, serialized).map_err(|e| e.to_string())?;
+    crate::backend::fs_replace::replace_file_with_backup(&temp, &path, &backup, "config.json")?;
+
+    Ok(enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pigeon_enabled_from_value;
+    use serde_json::json;
+    #[test]
+    fn default_false_when_absent() {
+        assert!(!pigeon_enabled_from_value(&json!({})));
+        assert!(!pigeon_enabled_from_value(&json!({"pigeon": {}})));
+        assert!(!pigeon_enabled_from_value(&json!({"other": true})));
+    }
+    #[test]
+    fn reads_explicit_bool() {
+        assert!(pigeon_enabled_from_value(&json!({"pigeon": {"enabled": true}})));
+        assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": false}})));
+    }
+    #[test]
+    fn non_bool_is_false() {
+        assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": "yes"}})));
+        assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": 1}})));
+    }
+}

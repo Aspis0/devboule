@@ -11,6 +11,7 @@ import { WorkspaceView } from "./components/views/WorkspaceView";
 import { DevicesView } from "./components/views/DevicesView";
 import { OracleView } from "./components/views/OracleView";
 import { SettingsView } from "./components/views/SettingsView";
+import { LabsView } from "./components/views/LabsView";
 import { LockedScreen } from "./components/auth/LockedScreen";
 import { OnboardingWizard } from "./components/onboarding/OnboardingWizard";
 import { HelpModeOverlay } from "./components/help/HelpModeOverlay";
@@ -186,6 +187,8 @@ function AppShell() {
         return <BudgetView />;
       case "oracle":
         return <OracleView />;
+      case "labs":
+        return <LabsView />;
       case "settings":
         return <SettingsView />;
       case "polis":

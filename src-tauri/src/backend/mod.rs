@@ -33,6 +33,7 @@ pub mod mini_coder_executor;
 pub mod model;
 pub mod model_registry;
 pub mod oracle_service;
+pub mod pigeon_service;
 pub mod plan_approval;
 pub mod project_skill;
 pub mod projects;

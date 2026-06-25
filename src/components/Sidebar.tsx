@@ -15,6 +15,7 @@ import {
   Castle,
   Palette,
   GraduationCap,
+  FlaskConical,
   Settings,
   type LucideIcon,
 } from "lucide-react";
@@ -38,6 +39,7 @@ const iconMap: Record<string, LucideIcon> = {
   Castle,
   Palette,
   GraduationCap,
+  FlaskConical,
 };
 
 // The Polis isometric map nav entry. Injected by the Sidebar so it appears
@@ -57,6 +59,10 @@ const SKILLS_NAV: NavItem = {
   icon: "GraduationCap",
 };
 
+// The Labs view nav entry (experimental feature toggles: Pigeon, Oracle).
+// Injected the same way as Skills; not in the ADMIN_ONLY_VIEWS denylist.
+const LABS_NAV: NavItem = { id: "labs", label: "Labs", icon: "FlaskConical" };
+
 export function Sidebar() {
   const { config, activeView, roleStatus } = useAppContext();
   const { setActiveView } = useAppActions();
@@ -69,9 +75,12 @@ export function Sidebar() {
   const withDesign = withPolis.some((n) => n.id === DESIGN_NAV.id)
     ? withPolis
     : [...withPolis, DESIGN_NAV];
-  const baseNavigation = withDesign.some((n) => n.id === SKILLS_NAV.id)
+  const withSkills = withDesign.some((n) => n.id === SKILLS_NAV.id)
     ? withDesign
     : [...withDesign, SKILLS_NAV];
+  const baseNavigation = withSkills.some((n) => n.id === LABS_NAV.id)
+    ? withSkills
+    : [...withSkills, LABS_NAV];
   // Filter by role (cosmetic — the backend enforces privileged commands). A
   // null/loading role defaults to the restricted collaborator set.
   const allowedIds = new Set(

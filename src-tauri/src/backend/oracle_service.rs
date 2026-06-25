@@ -321,6 +321,9 @@ fn try_claim_watcher_start(flag: &AtomicBool) -> bool {
 /// poll loop. The operator `/ask` path lazily starts the server on demand anyway,
 /// so a slow first tick never blocks a query either.
 pub fn on_unlock() {
+    if !oracle_is_enabled() {
+        return;
+    }
     // Opportunistically (re)resolve the projects dir now that the app is unlocked:
     // if setup's first resolution was None, a config-bearing cwd may exist by now,
     // re-enabling discovery publishing. Cheap and best-effort; the supervisor's
@@ -838,6 +841,9 @@ fn normalize_lexical(p: &Path) -> PathBuf {
 /// POST — runs INSIDE the spawned thread, so the Tauri command thread is never
 /// blocked (an in-app commit/pull must not hang up to 5s when Oracle is down).
 pub fn notify_local_commit(project_root: &Path) {
+    if !oracle_is_enabled() {
+        return;
+    }
     let project_root = project_root.to_path_buf();
     // Coalesce concurrent kicks: if a kick thread is already running, don't
     // spawn another. compare_exchange so exactly one caller wins the slot.
@@ -2343,5 +2349,79 @@ mod tests {
         // Give the spawned thread a moment to clear the in-flight flag so it does
         // not leak into a subsequent test that inspects the static.
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+static ORACLE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub fn set_oracle_enabled_flag(enabled: bool) {
+    let _ = ORACLE_ENABLED.set(enabled);
+}
+
+fn oracle_is_enabled() -> bool {
+    *ORACLE_ENABLED.get().unwrap_or(&true)
+}
+
+pub fn oracle_enabled_from_value(v: &serde_json::Value) -> bool {
+    v.get("oracle").and_then(|o| o.get("enabled")).and_then(|e| e.as_bool()).unwrap_or(true)
+}
+
+pub fn read_oracle_enabled(app: &tauri::AppHandle) -> bool {
+    let Some(path) = crate::backend::projects::locate_config_path(app) else { return true; };
+    let Ok(content) = std::fs::read_to_string(&path) else { return true; };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else { return true; };
+    oracle_enabled_from_value(&value)
+}
+
+#[tauri::command]
+pub fn get_oracle_enabled(app: tauri::AppHandle) -> bool {
+    read_oracle_enabled(&app)
+}
+
+#[tauri::command]
+pub fn set_oracle_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::backend::state::BackendState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    state.ensure_unlocked()?;
+    let _lock = crate::backend::projects::config_write_lock().lock().map_err(|e| format!("config write lock poisoned: {e}"))?;
+    let path = crate::backend::projects::locate_config_path(&app).ok_or_else(|| "config.json not found".to_string())?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) if !path.exists() => "{}".to_string(),
+        Err(e) => return Err(format!("Could not read config.json: {e}")),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+    if !value.is_object() { value = serde_json::json!({}); }
+    let obj = value.as_object_mut().unwrap();
+    let oracle = obj.entry("oracle").or_insert_with(|| serde_json::json!({}));
+    if !oracle.is_object() { *oracle = serde_json::json!({}); }
+    oracle.as_object_mut().unwrap().insert("enabled".to_string(), serde_json::json!(enabled));
+    let serialized = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let suffix = format!("{}-{}", std::process::id(), timestamp);
+    let temp = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup = path.with_extension(format!("json.{suffix}.bak"));
+    std::fs::write(&temp, serialized).map_err(|e| e.to_string())?;
+    crate::backend::fs_replace::replace_file_with_backup(&temp, &path, &backup, "config.json")?;
+    Ok(enabled)
+}
+
+#[cfg(test)]
+mod oracle_toggle_tests {
+    use super::oracle_enabled_from_value;
+    use serde_json::json;
+
+    #[test]
+    fn default_true_when_absent() {
+        assert!(oracle_enabled_from_value(&json!({})));
+        assert!(oracle_enabled_from_value(&json!({"oracle": {}})));
+    }
+
+    #[test]
+    fn reads_explicit_bool() {
+        assert!(!oracle_enabled_from_value(&json!({"oracle": {"enabled": false}})));
+        assert!(oracle_enabled_from_value(&json!({"oracle": {"enabled": true}})));
     }
 }

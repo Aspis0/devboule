@@ -340,6 +340,7 @@ pub fn run() {
                     .app_data_dir()
                     .expect("release: app_data_dir required for Oracle data root");
                 oracle::python_oracle::set_oracle_data_root(&dir);
+                backend::pigeon_service::set_pigeon_data_root(&dir.join("pigeon-data"));
             }
             // Bootstrap the per-machine `config.json` EAGERLY, before any projects-dir
             // resolution below. On a fresh checkout config.json is untracked and absent;
@@ -367,6 +368,16 @@ pub fn run() {
             if let Some(projects_dir) = resolve_projects_dir(app.handle()) {
                 backend::oracle_service::init(projects_dir);
             }
+            // Record whether Oracle is enabled (config oracle.enabled, default true) so
+            // the lock/unlock hooks (which have no AppHandle) can gate the supervisor
+            // start in on_unlock. Default true preserves the always-on behaviour.
+            backend::oracle_service::set_oracle_enabled_flag(
+                backend::oracle_service::read_oracle_enabled(app.handle()),
+            );
+            // Pigeon mailbox service — OPTIONAL, OFF by default. This is a clean no-op
+            // unless config.json has pigeon.enabled=true; when off, the legacy mini
+            // dispatch path is untouched.
+            backend::pigeon_service::start_if_enabled(app.handle());
             // Install the mini-coder executor: the singleton backend thread that
             // drains `miniCoderDirectives` from `.aspis-agents.json` and spawns the
             // one-shot mini PTY for each. It is the ONLY agent->app action bridge
@@ -459,6 +470,10 @@ pub fn run() {
             backend::projects::set_mini_write_behavior,
             backend::projects::get_main_coder_client,
             backend::projects::set_main_coder_client,
+            backend::pigeon_service::get_pigeon_enabled,
+            backend::pigeon_service::set_pigeon_enabled,
+            backend::oracle_service::get_oracle_enabled,
+            backend::oracle_service::set_oracle_enabled,
             backend::projects::get_agentic_coverage_languages,
             backend::projects::get_project,
             backend::projects::launch_project_agent_terminal,
@@ -663,6 +678,7 @@ pub fn run() {
         .run(|app_handle, event| match event {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 backend::oracle_service::on_app_exit();
+                backend::pigeon_service::on_app_exit();
                 // PAST-LESSON: kill+reap every app-hosted agent PTY child here. On
                 // Windows the ConPTY child does NOT die with the parent, and a dev
                 // Ctrl-C must not orphan agent shells. Idempotent and bounded (kill,
