@@ -69,11 +69,12 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
         p.push('\n');
     }
 
-    p.push_str("; exec: sh + standard interpreter dirs (exec of read-only system bins is not the boundary)\n");
-    p.push_str("(allow process-exec\n");
-    p.push_str("    (literal \"/bin/sh\")\n");
-    p.push_str("    (subpath \"/usr/bin\") (subpath \"/bin\")\n");
-    p.push_str("    (subpath \"/opt/homebrew\") (subpath \"/usr/local/bin\") (subpath \"/usr/libexec\"))\n");
+    // exec is NOT the security boundary (writes + network are). Allow process-exec BROADLY so the
+    // agent runs toolchains living in $HOME (~/.cargo/bin, ~/.rustup, nvm/pyenv/…) AND the test
+    // binaries it compiles into target/ (e.g. `cargo test` exec's target/debug/<test>). Spawned
+    // children inherit THIS profile, so they remain write+network confined regardless. (review F1)
+    p.push_str("; exec: broad — exec is not the boundary; children inherit the write+net confinement\n");
+    p.push_str("(allow process-exec)\n");
     p.push_str("(allow process-fork)\n\n");
 
     match policy.net {

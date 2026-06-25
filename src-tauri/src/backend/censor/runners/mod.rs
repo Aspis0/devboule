@@ -413,10 +413,30 @@ pub fn build_command(program: &str) -> Command {
 /// read can be exfiltrated) and confine writes to `target/` (clippy/cargo-check compile there; all
 /// other runners are check-mode and write nothing). Reads stay broad — the boundary is writes+net.
 /// Multi-language note: `target/` is harmless on non-Rust projects (the subpath just won't exist).
-pub(crate) fn censor_run_policy(root: &Path) -> crate::backend::sandbox::SandboxPolicy {
+/// Vulnerability-audit runners fetch an advisory DB from the network; with net DENIED they would
+/// return ZERO findings = a false SECURITY all-clear. They (and ONLY they) run with net Enabled —
+/// they are trusted first-party tools. Pure linters stay net=None. (review F2)
+pub(crate) fn censor_needs_network(program: &str, args: &[&str]) -> bool {
+    let p = program.to_ascii_lowercase();
+    p.contains("audit")
+        || (matches!(p.as_str(), "npm" | "pnpm" | "yarn" | "cargo")
+            && args.iter().any(|a| a.eq_ignore_ascii_case("audit")))
+}
+
+pub(crate) fn censor_run_policy(
+    root: &Path,
+    program: &str,
+    args: &[&str],
+) -> crate::backend::sandbox::SandboxPolicy {
+    use crate::backend::sandbox::NetPolicy;
+    let net = if censor_needs_network(program, args) {
+        NetPolicy::Enabled
+    } else {
+        NetPolicy::None
+    };
     crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
         .writable(root.join("target"))
-    // net stays None (deny) — linters never need network.
+        .net(net)
 }
 
 #[cfg(test)]
@@ -425,14 +445,29 @@ mod sandbox_tests {
     use std::path::PathBuf;
 
     #[test]
-    fn censor_policy_is_net_none_and_target_writable() {
+    fn censor_linter_policy_is_net_none_and_target_writable() {
         use crate::backend::sandbox::NetPolicy;
         let root = PathBuf::from("/proj");
-        let p = censor_run_policy(&root);
+        let p = censor_run_policy(&root, "eslint", &[]);
         assert_eq!(p.net, NetPolicy::None);
         assert!(p.writable_paths.iter().any(|w| w.ends_with("target")), "target/ must be writable");
         // the source root itself must NOT be writable (linters must not rewrite source)
         assert!(!p.writable_paths.contains(&root), "the project root must NOT be writable");
+    }
+
+    #[test]
+    fn censor_audit_runners_get_network() {
+        use crate::backend::sandbox::NetPolicy;
+        let root = PathBuf::from("/proj");
+        // audit runners need the advisory DB → net Enabled (else false security all-clear)
+        assert_eq!(censor_run_policy(&root, "cargo-audit", &[]).net, NetPolicy::Enabled);
+        assert_eq!(censor_run_policy(&root, "pip-audit", &[]).net, NetPolicy::Enabled);
+        assert_eq!(censor_run_policy(&root, "npm", &["audit", "--json"]).net, NetPolicy::Enabled);
+        // a plain linter / npm-run stays denied
+        assert_eq!(censor_run_policy(&root, "npm", &["run", "lint"]).net, NetPolicy::None);
+        assert_eq!(censor_run_policy(&root, "clippy-driver", &[]).net, NetPolicy::None);
+        assert!(censor_needs_network("cargo-audit", &[]));
+        assert!(!censor_needs_network("eslint", &[]));
     }
 
     /// macOS: a real runner spawn under the sandbox still executes (the wrap doesn't break it).
@@ -725,7 +760,7 @@ fn run_capture_stream_with_timeout(
     // NO network. build_command keeps apply_no_window (Windows console-flash guard). On non-macOS
     // wrap is a passthrough+warn (Windows lands in phase 3). One edit confines ALL runners.
     let args_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let policy = censor_run_policy(root);
+    let policy = censor_run_policy(root, program, args);
     let wrapped = crate::backend::sandbox::wrap(&policy, program, &args_owned, root);
     let mut cmd = build_command(&wrapped.program);
     cmd.args(&wrapped.args)

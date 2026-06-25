@@ -1448,6 +1448,21 @@ fn claim_and_launch(
     // Capable (>20B) models with write_mode=AgenticIterative run the multi-turn tool loop
     // (they write files themselves via sandboxed tools); everything else uses the one-shot
     // emit-edits PTY. Both produce the SAME result-file contract for finalize→Censor→retry.
+    // AUDIT CRITICAL (review F3): refuse BEFORE the branch. A local-kind backend with a
+    // NON-loopback base_url would ship the prompt + project source to a remote host on BOTH the
+    // agentic AND the one-shot path — declining only the agentic loop just falls through to the
+    // one-shot, which makes the same HTTP request. So gate both here.
+    if let Some(url) = backend.base_url.as_deref() {
+        if agentic_local_base_url_rejected(backend.kind, url) {
+            fail_launching(
+                app,
+                &directive_id,
+                "refusing mini spawn: local backend base_url is not loopback (would exfiltrate prompt+source)",
+            );
+            return;
+        }
+    }
+
     let spawn_result = if should_run_agentic(app, &backend, directive) {
         spawn_agentic_worker(
             app,
