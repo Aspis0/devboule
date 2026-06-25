@@ -4921,26 +4921,10 @@ fn base_url_host_is_loopback(base_url: &str) -> bool {
     trimmed.is_empty() || crate::backend::censor::gemma::is_loopback_base(trimmed)
 }
 
-/// P5: escape a path/string for embedding inside an SBPL (Seatbelt) double-quoted string
-/// literal. SBPL string literals are C-like: backslash and double-quote must be escaped,
-/// or a path containing either (`/Users/the owner/My "Project"/…`) would terminate the
-/// literal early and corrupt the profile (or, worse, silently widen the rule). Backslash
-/// is escaped FIRST so the inserted escape backslashes are not themselves re-escaped.
-#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
-fn sbpl_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// P5: canonicalize an absolute path for an SBPL `(subpath …)` rule. Mirrors the P4
-/// canonicalize logic (`std::fs::canonicalize`, used by `apply_emitted_edits`): a
-/// canonical path resolves `.`/`..`/symlinks so the Seatbelt rule matches the REAL inode
-/// the kernel checks. Falls back to the input path when canonicalization fails (the path
-/// does not exist yet — e.g. a not-yet-created scratch subdir), since a not-yet-existing
-/// writable target still needs its (lexical) subpath allowed for the child to create it.
-#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
-fn canonical_sandbox_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
+// sbpl_escape + canonical_sandbox_path now live in `sandbox::seatbelt` as the single source of
+// truth (unified per review finding F3 — the duplicate copies here have been removed). They are
+// used by `build_seatbelt_profile` below.
+use crate::backend::sandbox::seatbelt::{canonical_sandbox_path, sbpl_escape};
 
 // TODO(P5-followup): (a) the mini does NOT yet execute the project test suite (P4 noted
 // "tests run in the sandbox" but nothing runs them today), and (b) the Censor static-

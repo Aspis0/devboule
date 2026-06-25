@@ -6,14 +6,14 @@ use super::{NetPolicy, SandboxPolicy};
 ///
 /// NOTE: a byte-identical copy lives in `mini_coder_executor.rs`; the two are unified when the
 /// one-shot mini is rewired onto this module (phase 1). Keep them in sync until then.
-fn sbpl_escape(value: &str) -> String {
+pub(crate) fn sbpl_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Canonicalize an absolute path for an SBPL `(subpath ...)` rule so the rule matches the REAL
 /// inode the kernel checks (resolves `.`/`..`/symlinks). Falls back to the input when the path
 /// does not exist yet (a not-yet-created scratch dir still needs its lexical subpath allowed).
-fn canonical_sandbox_path(path: &Path) -> PathBuf {
+pub(crate) fn canonical_sandbox_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
