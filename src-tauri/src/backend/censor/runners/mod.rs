@@ -409,6 +409,51 @@ pub fn build_command(program: &str) -> Command {
     cmd
 }
 
+/// Sandbox policy for a Censor runner: linters do STATIC analysis, so deny network (nothing they
+/// read can be exfiltrated) and confine writes to `target/` (clippy/cargo-check compile there; all
+/// other runners are check-mode and write nothing). Reads stay broad — the boundary is writes+net.
+/// Multi-language note: `target/` is harmless on non-Rust projects (the subpath just won't exist).
+pub(crate) fn censor_run_policy(root: &Path) -> crate::backend::sandbox::SandboxPolicy {
+    crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
+        .writable(root.join("target"))
+    // net stays None (deny) — linters never need network.
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn censor_policy_is_net_none_and_target_writable() {
+        use crate::backend::sandbox::NetPolicy;
+        let root = PathBuf::from("/proj");
+        let p = censor_run_policy(&root);
+        assert_eq!(p.net, NetPolicy::None);
+        assert!(p.writable_paths.iter().any(|w| w.ends_with("target")), "target/ must be writable");
+        // the source root itself must NOT be writable (linters must not rewrite source)
+        assert!(!p.writable_paths.contains(&root), "the project root must NOT be writable");
+    }
+
+    /// macOS: a real runner spawn under the sandbox still executes (the wrap doesn't break it).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_runner_executes_simple_command() {
+        let root = std::env::temp_dir();
+        let out = run_capture_stream_with_timeout(
+            "/bin/echo",
+            &["censor-sandbox-ok"],
+            &root,
+            std::time::Duration::from_secs(10),
+            false,
+        );
+        assert!(
+            out.unwrap_or_default().contains("censor-sandbox-ok"),
+            "sandboxed runner must still run"
+        );
+    }
+}
+
 /// Default hard timeout for a single runner invocation. Compile/dependency-scan
 /// tools (clippy/cargo-check/cargo-audit/semgrep) are slow; A3 passes a longer
 /// budget for those via [`run_capture_with_timeout`]. The plain [`run_capture`]
@@ -676,8 +721,14 @@ fn run_capture_stream_with_timeout(
     timeout: Duration,
     capture_stderr: bool,
 ) -> Option<String> {
-    let mut cmd = build_command(program);
-    cmd.args(args)
+    // OS sandbox (macOS Seatbelt): confine the runner to read-only project + writable target/ +
+    // NO network. build_command keeps apply_no_window (Windows console-flash guard). On non-macOS
+    // wrap is a passthrough+warn (Windows lands in phase 3). One edit confines ALL runners.
+    let args_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let policy = censor_run_policy(root);
+    let wrapped = crate::backend::sandbox::wrap(&policy, program, &args_owned, root);
+    let mut cmd = build_command(&wrapped.program);
+    cmd.args(&wrapped.args)
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
