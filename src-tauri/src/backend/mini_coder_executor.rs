@@ -1175,6 +1175,7 @@ fn spawn_agentic_worker(
     result_rel: &str,
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
+    net: crate::backend::sandbox::NetPolicy,
 ) -> Result<(), String> {
     let state = app
         .try_state::<MiniCoderState>()
@@ -1231,6 +1232,7 @@ fn spawn_agentic_worker(
                 &task,
                 root,
                 allowlist,
+                net,
                 max_rounds,
                 &cancel,
             ) {
@@ -1458,6 +1460,16 @@ fn claim_and_launch(
         }
     }
 
+    // SANDBOX phase 2: the per-project network-unblock flag (set by the user after a network-blocked
+    // failure surfaced the HINT) selects the agentic sandbox net policy — Enabled if unblocked, else
+    // None (deny). Default false → None.
+    let agentic_net = if crate::backend::projects::project_net_enabled(app, &project_id).unwrap_or(false)
+    {
+        crate::backend::sandbox::NetPolicy::Enabled
+    } else {
+        crate::backend::sandbox::NetPolicy::None
+    };
+
     let spawn_result = if should_run_agentic(app, &backend, directive) {
         spawn_agentic_worker(
             app,
@@ -1466,6 +1478,7 @@ fn claim_and_launch(
             &result_rel,
             &backend,
             directive,
+            agentic_net,
         )
     } else {
         spawn_one_shot_mini(

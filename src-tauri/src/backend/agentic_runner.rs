@@ -141,6 +141,7 @@ pub fn run_agentic_coder(
     task: &str,
     root: PathBuf,
     write_allowlist: Vec<String>,
+    net: crate::backend::sandbox::NetPolicy,
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(LoopOutcome, Vec<String>), String> {
@@ -158,7 +159,9 @@ pub fn run_agentic_coder(
     let mut llm = HttpAgentLlm::new(base_url, model, tools, params, enable_thinking)?;
     // Reads are project-wide (for context); WRITES are confined to the directive's file
     // allowlist (empty = no extra restriction beyond the root).
-    let mut fs_tools = ScopedAgentTools::new(root).with_write_allowlist(write_allowlist);
+    let mut fs_tools = ScopedAgentTools::new(root)
+        .with_write_allowlist(write_allowlist)
+        .with_net(net);
     let outcome = run_agent_loop(
         &mut llm,
         &mut fs_tools,

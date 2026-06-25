@@ -146,6 +146,12 @@ pub struct ProjectMetadata {
     /// project never injects `censor_trusted: false`.
     #[serde(default)]
     pub censor_trusted: bool,
+    /// SANDBOX phase 2: whether the user has UNBLOCKED network for this project's sandboxed
+    /// agentic commands, after a network-blocked failure surfaced the HINT (see
+    /// `agentic_tools::looks_network_blocked`). Default `false` (net denied). NO-CHURN: omitted
+    /// from the on-disk frontmatter when false, like `censor_trusted`.
+    #[serde(default)]
+    pub net_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

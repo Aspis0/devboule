@@ -168,6 +168,7 @@ pub fn create_project(
         // BLOCKER B: a freshly created project is UNTRUSTED for Censor by default;
         // the user must explicitly opt in via `set_censor_trusted`.
         censor_trusted: false,
+        net_enabled: false,
     };
     let state_block = ProjectStateBlock {
         version: 1,
@@ -2227,6 +2228,30 @@ pub fn set_project_censor_trusted(
     .map(|_| ())
 }
 
+/// SANDBOX phase 2: read whether NETWORK is unblocked for this project's sandboxed agentic
+/// commands. Mirrors [`project_censor_trusted`].
+pub fn project_net_enabled(app: &tauri::AppHandle, project_id: &str) -> Result<bool, String> {
+    Ok(read_project_by_id(app, project_id)?.metadata.net_enabled)
+}
+
+/// SANDBOX phase 2: persist the project's network-unblock flag via the same locked
+/// read-modify-write path as [`set_project_censor_trusted`] (NO-CHURN omits it when false).
+// TODO(phase 2 frontend): wire as a #[tauri::command] (like the censor-trust command) once the
+// "unblock network for this project" toggle/UI lands. The READ side is already wired into the mini.
+#[allow(dead_code)]
+pub fn set_project_net_enabled(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let path = project_path_by_id(app, project_id)?;
+    mutate_project_file_latest(&path, |project| {
+        project.metadata.net_enabled = enabled;
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 fn read_project_file(path: &Path) -> Result<ParsedProject, String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("Could not read project file {}: {e}", path.display()))?;
@@ -2362,6 +2387,7 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     updated_at,
                     root_path,
                     censor_trusted,
+                    net_enabled: false,
                 },
                 offset,
             ));
@@ -8829,6 +8855,7 @@ mod tests {
             updated_at: "t".into(),
             root_path: None,
             censor_trusted: true,
+            net_enabled: false,
         };
         let serialized = replace_frontmatter(old, &trusted).unwrap();
         assert!(serialized.contains("censor_trusted: true"));
@@ -8853,6 +8880,7 @@ mod tests {
             updated_at: "2026-05-28T00:00:00Z".into(),
             root_path: Some("C:\\Users\\gualt\\Desktop\\aspis bio".into()),
             censor_trusted: false,
+            net_enabled: false,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -8946,6 +8974,7 @@ updated_at: 2026-05-28T00:00:00Z
             updated_at: "2026-06-01T00:00:00Z".into(),
             root_path: None,
             censor_trusted: false,
+            net_enabled: false,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -9576,6 +9605,7 @@ updated_at: 2026-05-28T00:00:00Z
                 updated_at: "2026-05-29T00:00:00Z".into(),
                 root_path: Some(root.to_string_lossy().into_owned()),
                 censor_trusted: false,
+                net_enabled: false,
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -10052,6 +10082,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 updated_at: "2026-05-29T00:00:00Z".into(),
                 root_path: Some(root.to_string_lossy().into_owned()),
                 censor_trusted: false,
+                net_enabled: false,
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -12521,6 +12552,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 updated_at: "2026-05-29T00:00:00Z".into(),
                 root_path: None,
                 censor_trusted: false,
+                net_enabled: false,
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -12873,6 +12905,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             updated_at: "2026-05-28T00:00:00Z".into(),
             root_path: None,
             censor_trusted: false,
+            net_enabled: false,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -13059,6 +13092,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             updated_at: "2026-06-24T00:00:00Z".into(),
             root_path: Some(chosen.clone()),
             censor_trusted: false,
+            net_enabled: false,
         };
         let state = ProjectStateBlock {
             version: 1,
