@@ -2379,6 +2379,13 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                 .or_else(|| fields.get("censorTrusted"))
                 .map(|value| value.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+            // SANDBOX phase 2 (review F1): READ net_enabled from the frontmatter — fail-closed,
+            // NO-CHURN, same shape as censor_trusted.
+            let net_enabled = fields
+                .get("net_enabled")
+                .or_else(|| fields.get("netEnabled"))
+                .map(|value| value.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             return Ok((
                 ProjectMetadata {
                     id,
@@ -2387,7 +2394,7 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     updated_at,
                     root_path,
                     censor_trusted,
-                    net_enabled: false,
+                    net_enabled,
                 },
                 offset,
             ));
@@ -2521,7 +2528,7 @@ fn write_project_file(project: &ParsedProject) -> Result<(), String> {
 fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<String, String> {
     let (_, end) = parse_frontmatter(content, Path::new("project.md"))?;
     let frontmatter = format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}---\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}---\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2532,6 +2539,7 @@ fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<Stri
             .map(|value| format!("root_path: \"{}\"\n", yaml_double_quote_inner(value)))
             .unwrap_or_default(),
         censor_trusted_frontmatter_line(metadata.censor_trusted),
+        net_enabled_frontmatter_line(metadata.net_enabled),
     );
     Ok(format!("{frontmatter}{}", &content[end..]))
 }
@@ -2548,12 +2556,22 @@ fn censor_trusted_frontmatter_line(trusted: bool) -> String {
     }
 }
 
+/// SANDBOX phase 2 NO-CHURN: emit `net_enabled: true` ONLY when enabled; nothing when false, so a
+/// pre-existing project's on-disk bytes stay identical (no content-hash / git churn).
+fn net_enabled_frontmatter_line(enabled: bool) -> String {
+    if enabled {
+        "net_enabled: true\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn initial_project_markdown(
     metadata: &ProjectMetadata,
     state: &ProjectStateBlock,
 ) -> Result<String, String> {
     Ok(format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2564,6 +2582,7 @@ fn initial_project_markdown(
             .map(|value| format!("root_path: \"{}\"\n", yaml_double_quote_inner(value)))
             .unwrap_or_default(),
         censor_trusted_frontmatter_line(metadata.censor_trusted),
+        net_enabled_frontmatter_line(metadata.net_enabled),
         serde_json::to_string_pretty(state)
             .map_err(|e| format!("Project state could not be serialized: {e}"))?
     ))
@@ -8869,6 +8888,37 @@ mod tests {
         };
         let serialized_off = replace_frontmatter(old, &untrusted).unwrap();
         assert!(!serialized_off.contains("censor_trusted"));
+    }
+
+    #[test]
+    fn net_enabled_roundtrips_and_old_files_default_false() {
+        // An old file with NO net_enabled line parses as net-DENIED (back-compat / fail-closed).
+        let old = "---\nid: proj-n\ntitle: P\nstatus: active\nupdated_at: t\n---\n";
+        let (meta, _) = parse_frontmatter(old, Path::new("proj-n.md")).unwrap();
+        assert!(!meta.net_enabled, "missing key must default to false");
+
+        // Serializing an UNBLOCKED project emits the line; re-parsing reads it back true.
+        let enabled = ProjectMetadata {
+            id: "proj-n".into(),
+            title: "P".into(),
+            status: "active".into(),
+            updated_at: "t".into(),
+            root_path: None,
+            censor_trusted: false,
+            net_enabled: true,
+        };
+        let serialized = replace_frontmatter(old, &enabled).unwrap();
+        assert!(serialized.contains("net_enabled: true"));
+        let (reparsed, _) = parse_frontmatter(&serialized, Path::new("proj-n.md")).unwrap();
+        assert!(reparsed.net_enabled, "net_enabled must round-trip true");
+
+        // Serializing a net-DISABLED project (default) must NOT inject the key (NO-CHURN).
+        let disabled = ProjectMetadata {
+            net_enabled: false,
+            ..enabled
+        };
+        let serialized_off = replace_frontmatter(old, &disabled).unwrap();
+        assert!(!serialized_off.contains("net_enabled"));
     }
 
     #[test]

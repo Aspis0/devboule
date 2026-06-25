@@ -163,10 +163,14 @@ pub fn apply_rlimits(cmd: &mut std::process::Command, limits: &ResourceLimits) {
     let addr = limits.addr_space_bytes;
     // SAFETY: pre_exec runs in the forked child before exec; we only call the async-signal-safe
     // setrlimit syscall (no allocation, no locks).
+    // NOTE (review F4): RLIMIT_NPROC is intentionally NOT set — on macOS it caps the whole UID
+    // (the Tauri app + every concurrent agent), not just this child, so a fork-bomb here would also
+    // starve the app. Per-process fork bounding belongs to the Windows Job Object (phase 3); here
+    // CPU + address-space + the timeout/process-group kill are the runaway guard.
+    let _ = nproc;
     unsafe {
         cmd.pre_exec(move || {
             set_rlimit(libc::RLIMIT_CPU, cpu);
-            set_rlimit(libc::RLIMIT_NPROC, nproc);
             if let Some(bytes) = addr {
                 set_rlimit(libc::RLIMIT_AS, bytes);
             }
