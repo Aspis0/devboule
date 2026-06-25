@@ -1276,7 +1276,7 @@ mod tests {
             }],
         };
         let outcome =
-            MiniCoderOutcome::escalated(vec!["src/x.rs".into()], escalation);
+            MiniCoderOutcome::escalated(vec!["src/x.rs".into()], escalation, false);
         assert_eq!(outcome.status, MiniCoderStatus::Escalated, "fixture is escalated");
 
         record_directive_result(&root, &d, &outcome);

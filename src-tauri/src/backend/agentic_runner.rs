@@ -144,7 +144,7 @@ pub fn run_agentic_coder(
     net: crate::backend::sandbox::NetPolicy,
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<(LoopOutcome, Vec<String>), String> {
+) -> Result<(LoopOutcome, Vec<String>, bool), String> {
     let tools = default_tool_definitions();
     // Q1: append the per-MODEL-FAMILY thinking directive to the house-rules system prompt.
     // Gemma/North have no thinking_budget param, so their reasoning is bounded in the prompt;
@@ -171,15 +171,18 @@ pub fn run_agentic_coder(
         cancel,
     );
     let touched = fs_tools.touched().to_vec();
-    Ok((outcome, touched))
+    let net_blocked = fs_tools.net_blocked();
+    Ok((outcome, touched, net_blocked))
 }
 
 /// Serialize an agentic run into the MiniCoderResult wire JSON the executor's finalize path
 /// reads. A finished loop → status "done" + the files the tools wrote (NO `edits` key — the
 /// tools already applied them on disk). An aborted loop (runaway / LLM error) →
 /// "needs_clarification" so it ESCALATES rather than falsely claiming success.
-pub fn agentic_result_json(outcome: &LoopOutcome, touched: &[String]) -> String {
-    let value = match outcome {
+/// `net_blocked` is set to true when `ScopedAgentTools::net_blocked()` fired during the run
+/// (net=None + network-blocked heuristic matched); omitted (NO-CHURN) when false.
+pub fn agentic_result_json(outcome: &LoopOutcome, touched: &[String], net_blocked: bool) -> String {
+    let mut value = match outcome {
         LoopOutcome::Done { output, .. } => json!({
             "status": "done",
             "output": if output.is_empty() { "agentic loop complete" } else { output.as_str() },
@@ -191,6 +194,11 @@ pub fn agentic_result_json(outcome: &LoopOutcome, touched: &[String]) -> String 
             "filesTouched": touched,
         }),
     };
+    // NO-CHURN: only inject the field when true so existing result files that pre-date
+    // this feature continue to deserialize cleanly (serde default = false).
+    if net_blocked {
+        value["netBlocked"] = json!(true);
+    }
     value.to_string()
 }
 
@@ -240,19 +248,46 @@ mod tests {
         let done = agentic_result_json(
             &LoopOutcome::Done { output: "ok".into(), rounds: 2 },
             &["src/a.rs".to_string()],
+            false,
         );
         let v: Value = serde_json::from_str(&done).unwrap();
         assert_eq!(v["status"], "done");
         assert_eq!(v["output"], "ok");
         assert_eq!(v["filesTouched"][0], "src/a.rs");
         assert!(v.get("edits").is_none()); // agentic path applied edits itself
+        assert!(v.get("netBlocked").is_none()); // not set when false (NO-CHURN)
 
         let aborted = agentic_result_json(
             &LoopOutcome::Aborted { reason: "max rounds (8) exceeded".into(), rounds: 8 },
             &[],
+            false,
         );
         let v2: Value = serde_json::from_str(&aborted).unwrap();
         assert_eq!(v2["status"], "needs_clarification");
         assert!(v2["question"].as_str().unwrap().contains("max rounds"));
     }
+
+    #[test]
+    fn agentic_result_json_net_blocked_is_present_when_true() {
+        let json = agentic_result_json(
+            &LoopOutcome::Done { output: "done".into(), rounds: 1 },
+            &[],
+            true,
+        );
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["netBlocked"], true);
+    }
+
+    #[test]
+    fn agentic_result_json_net_blocked_absent_when_false() {
+        let json = agentic_result_json(
+            &LoopOutcome::Done { output: "done".into(), rounds: 1 },
+            &[],
+            false,
+        );
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // NO-CHURN: field must be absent, not `false`.
+        assert!(v.get("netBlocked").is_none());
+    }
 }
+

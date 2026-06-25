@@ -65,6 +65,14 @@ import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
 import { CensorFindingsTracker } from "./censorPanelModel";
+import { NetConsentModal } from "./NetConsentModal";
+import {
+  enqueueConsent,
+  grantNetConsentArgs,
+  isNetRequestForProject,
+  sameConsentRequest,
+  type ConsentRequest,
+} from "./netConsentModel";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
 import { PushApprovalCard } from "./PushApprovalCard";
@@ -451,6 +459,99 @@ export function ProjectWorkspace({
     setCommitOpen(false);
   };
 
+  // ── Permission broker — net-consent listener ──────────────────────────────
+  // Subscribes to `sandbox://consent-request` on mount (subscribe-before-invoke
+  // discipline: the listener is registered before any invoke that could trigger
+  // a backend emit). Filters to kind=Net and the current projectId so requests
+  // from other projects are silently ignored. Cleared after the user acts.
+  //
+  // Seatbelt constraint: the grant activates at the NEXT spawn; the copy inside
+  // NetConsentModal tells the user to re-launch.
+  // FIX 1: FIFO queue — concurrent requests are appended, not overwritten.
+  const [pendingConsents, setPendingConsents] = useState<ConsentRequest[]>([]);
+  const [consentBusy, setConsentBusy] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
+  const consentMountedRef = useRef(true);
+  // Mark unmounted so the handleConsentDecision async callback doesn't write state
+  // after the component has been torn down. Runs only once on component unmount.
+  // FIX 4: The current safety depends on the parent's key={projectId} triggering
+  // a full remount on project switch; self-heal by resetting to true on each mount.
+  useEffect(() => {
+    consentMountedRef.current = true; // FIX 4: self-heal if re-used without full remount
+    return () => {
+      consentMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    // Use a local cancelled flag per effect run so re-mounting (project id change)
+    // doesn't poison the shared ref: the async unlisten registration must be
+    // guarded per-invocation, not per-component-lifetime.
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    if (!isTauriRuntime()) return;
+
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      if (cancelled) return; // effect tore down before the dynamic import resolved
+      unlisten = await listen<ConsentRequest>(
+        "sandbox://consent-request",
+        (event) => {
+          if (cancelled) return;
+          const req = event.payload;
+          if (!isNetRequestForProject(req, project.metadata.id)) return;
+          // FIX 1: append to FIFO queue, deduping by (projectId, agentId) so
+          // a duplicate event doesn't double-enqueue the same request.
+          setPendingConsents((prev) => enqueueConsent(prev, req));
+          setConsentError(null);
+        },
+      );
+      if (cancelled) {
+        unlisten?.();
+        unlisten = null;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [project.metadata.id]);
+
+  const handleConsentDecision = useCallback(
+    async (decision: "allowRemember" | "allowOnce" | "deny") => {
+      // FIX 1: operate on the HEAD of the FIFO queue
+      const head = pendingConsents[0];
+      if (!head || consentBusy) return;
+      setConsentBusy(true);
+      setConsentError(null);
+      try {
+        await invokeBackendCommand<void>(
+          "grant_net_consent",
+          grantNetConsentArgs({ projectId: head.projectId, decision }),
+        );
+        if (consentMountedRef.current) {
+          // FIX 1: remove head by identity so a concurrently enqueued request survives
+          setPendingConsents((prev) =>
+            prev.filter((r) => !sameConsentRequest(r, head)),
+          );
+        }
+      } catch (e) {
+        if (consentMountedRef.current) {
+          // FIX 2: Tauri rejects with a string, not an Error — use String(e)
+          setConsentError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        // FIX 3: reset busy in finally so it clears even when unmounted mid-invoke
+        if (consentMountedRef.current) {
+          setConsentBusy(false);
+        }
+      }
+    },
+    [pendingConsents, consentBusy],
+  );
+
   return (
     <div className="flex w-full flex-col gap-4">
       {/* ---- Read-only (archived) banner ---- */}
@@ -615,6 +716,20 @@ export function ProjectWorkspace({
           exist, regardless of the active dock tab. Hidden when archived for the same
           reason as the push card (approve/reject are mutations). */}
       {!readOnly && <PlanApprovalCard projectId={project.metadata.id} />}
+
+      {/* Net-consent gate — surfaces the network-permission prompt when a mini-coder
+          agent is blocked by a missing net grant. Hidden when archived (no live agents
+          to prompt). The grant applies on the NEXT spawn; NetConsentModal copy says so. */}
+      {/* FIX 1: render the HEAD of the queue; subsequent requests queue up and
+          become the new head once the user acts on the current one. */}
+      {!readOnly && pendingConsents.length > 0 && (
+        <NetConsentModal
+          request={pendingConsents[0]}
+          busy={consentBusy}
+          error={consentError}
+          onDecision={(d) => void handleConsentDecision(d)}
+        />
+      )}
 
       {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
       {launcherOpen && !readOnly && (

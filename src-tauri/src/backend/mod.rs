@@ -1,6 +1,7 @@
 pub mod agent_pty;
 pub mod api_fuzz;
 pub mod agents;
+pub mod broker;
 pub mod agent_notifications;
 pub mod agentic_loop;
 pub mod agentic_runner;

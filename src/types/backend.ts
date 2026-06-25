@@ -747,6 +747,10 @@ export interface ProjectMetadata {
   status: ProjectStatus;
   updatedAt: string;
   rootPath: string | null;
+  /** Whether network access is enabled for agentic minis in this project. */
+  netEnabled?: boolean;
+  /** Whether the Censor reviewer is trusted (opted in) for this project. */
+  censorTrusted?: boolean;
 }
 
 export interface ProjectTaskCounts {

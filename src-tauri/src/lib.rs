@@ -8,6 +8,7 @@ use tauri::command;
 use tauri::Manager;
 
 use backend::agent_pty::AgentPtySessions;
+use backend::broker::PermissionBrokerState;
 use backend::censor::commands::CensorState;
 use backend::design_generate::DesignGenState;
 use backend::mini_coder_executor::MiniCoderState;
@@ -302,6 +303,7 @@ pub fn run() {
         .manage(agent_pty_sessions)
         .manage(censor_state)
         .manage(mini_coder_state)
+        .manage(PermissionBrokerState::new())
         .manage(backend::mini_activity::MiniActivityStore::default())
         .manage(backend::mini_activity::ActivityTailRegistry::default())
         .manage(backend::cloud_duplex::CloudDuplexSessions::new())
@@ -603,6 +605,8 @@ pub fn run() {
             backend::censor::commands::censor_status,
             backend::censor::commands::censor_open_in_editor,
             backend::censor::commands::set_censor_trusted,
+            backend::projects::set_project_net_enabled_cmd,
+            backend::projects::grant_net_consent,
             backend::design::design_create_project,
             backend::design::design_load_project,
             backend::design::design_save_project,

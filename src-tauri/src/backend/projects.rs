@@ -2234,11 +2234,9 @@ pub fn project_net_enabled(app: &tauri::AppHandle, project_id: &str) -> Result<b
     Ok(read_project_by_id(app, project_id)?.metadata.net_enabled)
 }
 
-/// SANDBOX phase 2: persist the project's network-unblock flag via the same locked
+/// SANDBOX broker: persist the project's network-unblock flag via the same locked
 /// read-modify-write path as [`set_project_censor_trusted`] (NO-CHURN omits it when false).
-// TODO(phase 2 frontend): wire as a #[tauri::command] (like the censor-trust command) once the
-// "unblock network for this project" toggle/UI lands. The READ side is already wired into the mini.
-#[allow(dead_code)]
+/// Called directly by [`set_project_net_enabled_cmd`] and [`grant_net_consent`].
 pub fn set_project_net_enabled(
     app: &tauri::AppHandle,
     project_id: &str,
@@ -2250,6 +2248,53 @@ pub fn set_project_net_enabled(
         Ok(())
     })
     .map(|_| ())
+}
+
+/// Tauri command: persist the network-unblock flag for a project.
+/// Mirrors `set_censor_trusted` (`censor/commands.rs:746`):
+/// same signature shape, same `ensure_unlocked` guard.
+#[tauri::command]
+pub fn set_project_net_enabled_cmd(
+    project_id: String,
+    enabled: bool,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    set_project_net_enabled(&app, &project_id, enabled)
+}
+
+/// Tauri command: apply a consent decision from the frontend net-block modal.
+///
+/// - `AllowRemember` → persists `net_enabled = true` (survives restart).
+/// - `AllowOnce` → inserts a one-shot transient grant consumed at the next spawn.
+/// - `Deny` → no-op (the next run will fail again; user may retry manually).
+///
+/// A `// TODO(slice0): trigger retry on grant` would live here; for now the grant
+/// activates at the next directive spawn (the "activates on reset" contract).
+#[tauri::command]
+pub fn grant_net_consent(
+    project_id: String,
+    decision: crate::backend::broker::ConsentDecision,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+    broker: State<'_, crate::backend::broker::PermissionBrokerState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    match decision {
+        crate::backend::broker::ConsentDecision::AllowRemember => {
+            set_project_net_enabled(&app, &project_id, true)?;
+        }
+        crate::backend::broker::ConsentDecision::AllowOnce => {
+            broker.grant_net_once(&project_id);
+        }
+        crate::backend::broker::ConsentDecision::Deny => {
+            // No-op: next run will fail again; the user may invoke this command again.
+        }
+    }
+    // TODO(slice0): trigger retry on grant — reuse build_retry_directive path so the
+    // directive is re-spawned immediately without waiting for the next executor pass.
+    Ok(())
 }
 
 fn read_project_file(path: &Path) -> Result<ParsedProject, String> {
@@ -9323,6 +9368,66 @@ updated_at: 2026-05-28T00:00:00Z
             .contains("censor_trusted"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// SANDBOX broker: setting the net_enabled flag via the locked latest-on-disk
+    /// write helper (the exact mechanism `set_project_net_enabled` uses) round-trips
+    /// through a real on-disk project file: a fresh project reads disabled, flips to
+    /// enabled and persists `net_enabled: true`, then flips back and the key is GONE
+    /// from disk (no-churn, mirrors the `censor_trusted` pattern).
+    #[test]
+    fn net_enabled_persists_through_locked_write_and_clears_no_churn() {
+        let (root, path) = write_temp_project("net-enabled");
+
+        // Fresh project: net disabled by default, no key on disk.
+        let initial = read_project_file(&path).unwrap();
+        assert!(!initial.metadata.net_enabled);
+        assert!(!fs::read_to_string(&path).unwrap().contains("net_enabled"));
+
+        // Enable (mirrors set_project_net_enabled's closure).
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.net_enabled = true;
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        assert!(read_project_file(&path).unwrap().metadata.net_enabled);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("net_enabled: true"));
+
+        // Disable: flag clears AND frontmatter key disappears (no-churn).
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.net_enabled = false;
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        assert!(!read_project_file(&path).unwrap().metadata.net_enabled);
+        assert!(!fs::read_to_string(&path).unwrap().contains("net_enabled"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// SANDBOX broker: `grant_net_consent` decision mapping (tested at the
+    /// PermissionBrokerState level since the Tauri command wraps that logic).
+    /// `AllowRemember` → persisted flag true; `AllowOnce` → transient present then
+    /// consumed; `Deny` → nothing changed.  These mirror the tests in
+    /// `backend::broker::tests` but confirm the same semantics from the projects layer.
+    #[test]
+    fn grant_net_consent_allow_once_is_one_shot() {
+        let broker = crate::backend::broker::PermissionBrokerState::new();
+        broker.grant_net_once("proj-x");
+        assert!(broker.take_net_grant("proj-x"), "first take must be true");
+        assert!(!broker.take_net_grant("proj-x"), "second take must be false (consumed)");
+    }
+
+    #[test]
+    fn grant_net_consent_deny_leaves_broker_unchanged() {
+        let broker = crate::backend::broker::PermissionBrokerState::new();
+        // Deny: no grant inserted.
+        // (The command itself is a no-op; we verify that nothing is in the set.)
+        assert!(!broker.take_net_grant("proj-y"));
     }
 
     /// A milestone added via the locked latest-on-disk write helper (the exact

@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use portable_pty::CommandBuilder;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::agents;
 use super::project_skill::{
@@ -1236,13 +1236,15 @@ fn spawn_agentic_worker(
                 max_rounds,
                 &cancel,
             ) {
-                Ok((outcome, touched)) => {
-                    crate::backend::agentic_runner::agentic_result_json(&outcome, &touched)
+                Ok((outcome, touched, net_blocked)) => {
+                    crate::backend::agentic_runner::agentic_result_json(&outcome, &touched, net_blocked)
                 }
-                // Transport/init failure → escalate (NOT a false "done").
+                // Transport/init failure → escalate (NOT a false "done"); net_blocked=false
+                // (the LLM never got to run a tool, so no network heuristic could have fired).
                 Err(e) => crate::backend::agentic_runner::agentic_result_json(
                     &crate::backend::agentic_loop::LoopOutcome::Aborted { reason: e, rounds: 0 },
                     &[],
+                    false,
                 ),
             };
             // Write the result the finalize path reads, BEFORE the guard releases the in-flight
@@ -1460,18 +1462,36 @@ fn claim_and_launch(
         }
     }
 
-    // SANDBOX phase 2: the per-project network-unblock flag (set by the user after a network-blocked
-    // failure surfaced the HINT) selects the agentic sandbox net policy — Enabled if unblocked, else
-    // None (deny). Default false → None.
-    let agentic_net = if crate::backend::projects::project_net_enabled(app, &project_id).unwrap_or(false)
-    {
-        crate::backend::sandbox::NetPolicy::Enabled
-    } else {
-        crate::backend::sandbox::NetPolicy::None
-    };
+    // SANDBOX broker: resolve the net policy for this spawn.
+    // Two sources unlock the network (OR'd):
+    //   1. Persistent flag `net_enabled` (survives restart; set via AllowRemember).
+    //   2. One-shot transient grant (set via AllowOnce; consumed on first agentic use).
+    //
+    // FIX 1: the transient grant is consumed ONLY on the agentic path. The one-shot
+    // path (`spawn_one_shot_mini`) does not accept a NetPolicy and would silently waste
+    // the grant — leaving the user stuck in an infinite re-prompt loop. Additionally,
+    // if the agentic spawn fails, we re-insert the grant so the next attempt can use it
+    // (otherwise the failure outcome has net_blocked=false and no consent-request fires).
+    //
+    // Concurrency note: the grant is keyed per-project (not per-directive). With
+    // concurrent same-project agentic directives the first spawn consumes it — the
+    // second runs without network access and may emit its own net_blocked outcome,
+    // re-triggering the consent flow. Accepted for Slice 0.
+    let persistent_net =
+        crate::backend::projects::project_net_enabled(app, &project_id).unwrap_or(false);
 
     let spawn_result = if should_run_agentic(app, &backend, directive) {
-        spawn_agentic_worker(
+        // Consume the one-shot grant only here (agentic path uses NetPolicy).
+        let transient_net = app
+            .try_state::<crate::backend::broker::PermissionBrokerState>()
+            .map(|broker| broker.take_net_grant(&project_id))
+            .unwrap_or(false);
+        let agentic_net = if persistent_net || transient_net {
+            crate::backend::sandbox::NetPolicy::Enabled
+        } else {
+            crate::backend::sandbox::NetPolicy::None
+        };
+        let spawn_r = spawn_agentic_worker(
             app,
             &project_root,
             &scratch_root,
@@ -1479,8 +1499,23 @@ fn claim_and_launch(
             &backend,
             directive,
             agentic_net,
-        )
+        );
+        // Re-insert the transient grant if the spawn itself failed (not the run):
+        // the worker never launched, so the user never saw a net-blocked outcome and
+        // would not be re-prompted — put the grant back so the next claim_and_launch
+        // attempt can use it.
+        if spawn_r.is_err() && transient_net {
+            if let Some(broker) =
+                app.try_state::<crate::backend::broker::PermissionBrokerState>()
+            {
+                broker.grant_net_once(&project_id);
+            }
+        }
+        spawn_r
     } else {
+        // One-shot path: NetPolicy is not threaded here. The persistent flag applies
+        // via the sandbox wrapper the one-shot runner inherits; the transient grant is
+        // intentionally NOT consumed so it remains available for the agentic path.
         spawn_one_shot_mini(
             app,
             &agent_id,
@@ -1603,8 +1638,34 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         .as_deref()
         .filter(|p| !p.trim().is_empty())
         .and_then(|p| Path::new(p).parent().map(|r| r.to_path_buf()));
+    // FIX 3: capture net_blocked BEFORE apply_write_directive_edits, because the
+    // apply step can replace the outcome (e.g. failed-apply → MiniCoderOutcome::failed)
+    // which has net_blocked=false, silently zeroing the flag before the emit check below.
+    let was_net_blocked = outcome.net_blocked;
     let (outcome, write_diffs) =
         apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
+
+    // SANDBOX broker: if the agentic worker detected a net-blocked failure and this run
+    // had a project, emit the consent-request event so the frontend can prompt the user.
+    // The grant (AllowOnce or AllowRemember) takes effect on the NEXT spawn ("activates on
+    // reset" — Seatbelt cannot be widened mid-run). Fire-and-forget: a missing listener /
+    // torn-down runtime is non-fatal (same contract as MiniActivityStore::update).
+    // Use was_net_blocked (pre-apply capture) to guard against the apply step zeroing
+    // the flag when it replaces the outcome with a synthesized failed/timeout (FIX 3).
+    if was_net_blocked {
+        if let Some(pid) = project_id.as_deref() {
+            let agent_id = mini_agent_id(directive);
+            let req = crate::backend::broker::ConsentRequest {
+                kind: crate::backend::broker::ConsentKind::Net,
+                project_id: pid.to_string(),
+                agent_id,
+                detail: "A sandboxed command needed network access, which is disabled for this \
+                         project. Grant to retry."
+                    .to_string(),
+            };
+            let _ = app.emit("sandbox://consent-request", req);
+        }
+    }
 
     // The gate (linters) is needed ONLY for a clean, un-killed `done` on a TRUSTED tree.
     let needs_gate =
@@ -2194,7 +2255,9 @@ fn finalize_finished_mini_with(
                         // win): use the dedicated pure helper, reconstructing its args
                         // from the decision's outcome payload.
                         let escalation = fo.escalation.clone().unwrap_or_default();
-                        mini_coder::apply_escalated(d, fo.files_touched.clone(), escalation)
+                        // FIX 2: forward net_blocked so the consent-request event fires
+                        // on the escalation path (previously hardcoded to false).
+                        mini_coder::apply_escalated(d, fo.files_touched.clone(), escalation, fo.net_blocked)
                     } else {
                         // The kill won (aborted_by_human) — stamp the abort instead.
                         mini_coder::apply_result(d, fo.clone())
@@ -6513,6 +6576,7 @@ mod tests {
             edits,
             question: None,
             partial: None,
+            net_blocked: false,
         })
     }
 
@@ -6579,6 +6643,41 @@ mod tests {
                 .contains("without a resolvable project root"),
             "error missing: {:?}",
             out.error
+        );
+    }
+
+    // ── FIX 3: apply_write_directive_edits must not zero was_net_blocked ──────
+
+    /// When `apply_write_directive_edits` converts an outcome to `failed`
+    /// (e.g. no project root), the returned outcome has net_blocked=false.
+    /// The caller in `finalize_finished_mini` must capture `was_net_blocked`
+    /// BEFORE the call so the consent-request check reads the pre-apply value.
+    ///
+    /// This test documents the hazard: input net_blocked=true → output
+    /// net_blocked=false after the no-root failure path.
+    #[test]
+    fn apply_write_directive_edits_no_root_drops_net_blocked() {
+        let d = p4_write_directive(&["a.txt"]);
+        // Construct a done outcome that has net_blocked=true.
+        let mut outcome = p4_done_with_edits(vec![p4_edit("a.txt", "alpha", "ALPHA")]);
+        outcome.net_blocked = true;
+
+        // Pre-capture (what the fixed caller does).
+        let was_net_blocked = outcome.net_blocked;
+
+        // apply_write_directive_edits with no root → returns MiniCoderOutcome::failed
+        // which has net_blocked=false.
+        let (applied, _diffs) = apply_write_directive_edits(None, &d, outcome);
+        assert_eq!(applied.status, MiniCoderStatus::Failed);
+        // The applied outcome has LOST the net_blocked flag.
+        assert!(
+            !applied.net_blocked,
+            "apply_write_directive_edits::failed path zeros net_blocked (expected hazard)"
+        );
+        // The caller must use was_net_blocked, not applied.net_blocked.
+        assert!(
+            was_net_blocked,
+            "was_net_blocked pre-captured correctly before apply_write_directive_edits"
         );
     }
 
@@ -7771,6 +7870,7 @@ mod tests {
                 attempts: 3,
                 findings: vec![],
             },
+            false,
         );
         transition_directive(&mut state, "root-r2", |d| {
             mini_coder::apply_result(d, escalated.clone())

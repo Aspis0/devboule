@@ -280,6 +280,12 @@ pub struct MiniCoderResult {
     pub question: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<String>,
+    /// SANDBOX broker: set by the agentic worker when `looks_network_blocked` fired
+    /// during a `run` call while `net == NetPolicy::None`. Propagated into
+    /// `MiniCoderOutcome` so `finalize_finished_mini` can emit the consent-request
+    /// event.  NO-CHURN: omitted from the JSON when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub net_blocked: bool,
 }
 
 /// The app-owned terminal payload stored in `MiniCoderDirective.result`. A
@@ -349,6 +355,12 @@ pub struct MiniCoderOutcome {
     /// summary that the orchestrator reads to redo the file itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation: Option<EscalationInfo>,
+    /// SANDBOX broker: true when the agentic worker set `net_blocked` in its result
+    /// JSON (network-blocked failure detected while `net == NetPolicy::None`).
+    /// `finalize_finished_mini` uses this to emit the `sandbox://consent-request`
+    /// event.  NO-CHURN: omitted from serialized state when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub net_blocked: bool,
 }
 
 impl MiniCoderOutcome {
@@ -364,6 +376,7 @@ impl MiniCoderOutcome {
             partial: result.partial,
             error: None,
             escalation: None,
+            net_blocked: result.net_blocked,
         }
     }
 
@@ -381,13 +394,22 @@ impl MiniCoderOutcome {
             partial: result.partial,
             error: None,
             escalation: None,
+            net_blocked: result.net_blocked,
         }
     }
 
     /// P6: app-synthesized `escalated` (retry chain exhausted, Censor still dirty).
     /// Carries the give-up summary back to the orchestrator. `files_touched` is the
     /// last attempt's touched set so the orchestrator knows which files to redo.
-    pub fn escalated(files_touched: Vec<String>, escalation: EscalationInfo) -> Self {
+    ///
+    /// `net_blocked` is threaded from the LAST attempt's outcome so that
+    /// `finalize_finished_mini` still emits the `sandbox://consent-request` event
+    /// on the escalation path (FIX 2).
+    pub fn escalated(
+        files_touched: Vec<String>,
+        escalation: EscalationInfo,
+        net_blocked: bool,
+    ) -> Self {
         Self {
             status: MiniCoderStatus::Escalated,
             output: None,
@@ -400,6 +422,7 @@ impl MiniCoderOutcome {
                 escalation.attempts
             )),
             escalation: Some(escalation),
+            net_blocked,
         }
     }
 
@@ -799,14 +822,18 @@ pub fn apply_awaiting_retry(
 /// still dirty) on an ACTIVE (`Running`) directive — the LEAF of the chain. The
 /// escalation payload rides back to the orchestrator. Propagation then stamps the
 /// same outcome onto the chain's `AwaitingRetry` predecessors.
+///
+/// `net_blocked` is threaded from the last attempt's outcome (FIX 2: keeps the
+/// consent-request event firing on the escalation path).
 pub fn apply_escalated(
     directive: &MiniCoderDirective,
     files_touched: Vec<String>,
     escalation: EscalationInfo,
+    net_blocked: bool,
 ) -> Result<MiniCoderDirective, String> {
     apply_outcome(
         directive,
-        MiniCoderOutcome::escalated(files_touched, escalation),
+        MiniCoderOutcome::escalated(files_touched, escalation, net_blocked),
     )
 }
 
@@ -1174,9 +1201,12 @@ pub fn verdict_gate_decision(
             attempts: directive.attempt + 1,
             findings: high_findings,
         };
+        // FIX 2: carry net_blocked from the last attempt so finalize_finished_mini
+        // can still emit the consent-request event on the escalation path.
         GateDecision::Escalate(MiniCoderOutcome::escalated(
             outcome.files_touched.clone(),
             escalation,
+            outcome.net_blocked,
         ))
     }
 }
@@ -4670,14 +4700,85 @@ mod tests {
                 line: Some(42),
             }],
         };
-        let next = apply_escalated(&running, vec!["src/a.rs".into()], info.clone()).unwrap();
+        let next = apply_escalated(&running, vec!["src/a.rs".into()], info.clone(), false).unwrap();
         assert_eq!(next.status, MiniCoderStatus::Escalated);
         let out = next.result.unwrap();
         assert_eq!(out.escalation.as_ref().unwrap().attempts, 3);
         assert_eq!(out.files_touched, vec!["src/a.rs".to_string()]);
         // escalated only from an active directive.
         let pending = directive("d2", MiniCoderStatus::Pending, "t0");
-        assert!(apply_escalated(&pending, vec![], info).is_err());
+        assert!(apply_escalated(&pending, vec![], info, false).is_err());
+    }
+
+    // ── FIX 2: escalated outcome must propagate net_blocked ──────────────────
+
+    /// When the last attempt had net_blocked=true and retries are exhausted, the
+    /// Escalated outcome must carry net_blocked=true so finalize_finished_mini
+    /// emits the consent-request event on the escalation path.
+    #[test]
+    fn escalated_outcome_propagates_net_blocked_true() {
+        let info = EscalationInfo {
+            attempts: 2,
+            findings: vec![],
+        };
+        // net_blocked=true must survive into the escalated outcome.
+        let o = MiniCoderOutcome::escalated(vec!["src/a.rs".into()], info, true);
+        assert!(
+            o.net_blocked,
+            "escalated outcome must carry net_blocked=true from the last attempt"
+        );
+    }
+
+    #[test]
+    fn escalated_outcome_net_blocked_false_by_default() {
+        let info = EscalationInfo {
+            attempts: 1,
+            findings: vec![],
+        };
+        let o = MiniCoderOutcome::escalated(vec![], info, false);
+        assert!(!o.net_blocked, "escalated outcome with net_blocked=false");
+    }
+
+    /// verdict_gate_decision on the Escalate branch must carry net_blocked from
+    /// the incoming outcome (the last attempt's result).
+    #[test]
+    fn verdict_gate_decision_escalate_carries_net_blocked() {
+        let mut d = directive("d1", MiniCoderStatus::Running, "t0");
+        d.write = true;
+        d.attempt = 99; // force escalate path
+        let outcome = MiniCoderOutcome {
+            status: MiniCoderStatus::Done,
+            net_blocked: true,
+            files_touched: vec!["src/a.rs".into()],
+            ..MiniCoderOutcome::default()
+        };
+        let finding = EscalationFinding {
+            file: "src/a.rs".into(),
+            severity: "high".into(),
+            source: "clippy".into(),
+            title: "unwrap".into(),
+            line: None,
+        };
+        let decision = verdict_gate_decision(
+            &d,
+            &outcome,
+            true, // trusted
+            WriteMode::EmitEdits,
+            false, // covered
+            vec![finding],
+            "d1-r1",
+            "result.json",
+            "t1",
+        );
+        match decision {
+            GateDecision::Escalate(escalated_outcome) => {
+                assert!(
+                    escalated_outcome.net_blocked,
+                    "GateDecision::Escalate must carry net_blocked=true from the last attempt"
+                );
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4777,5 +4878,78 @@ mod tests {
         assert_eq!(old.attempt, 0);
         assert!(old.parent_directive_id.is_none());
         assert!(old.retry_directive_id.is_none());
+    }
+
+    // ── FIX 4: is_false helper — NO-CHURN round-trip for net_blocked ─────────
+
+    /// `net_blocked = false` must NOT appear in the serialized JSON (no-churn).
+    #[test]
+    fn net_blocked_false_omitted_from_result_json() {
+        let r = MiniCoderResult {
+            status: "done".into(),
+            output: None,
+            files_touched: vec![],
+            edits: vec![],
+            question: None,
+            partial: None,
+            net_blocked: false,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("netBlocked"),
+            "net_blocked=false must be omitted: {json}"
+        );
+        // Round-trip: absent key deserializes back to false.
+        let back: MiniCoderResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.net_blocked);
+    }
+
+    /// `net_blocked = true` must appear in the serialized JSON.
+    #[test]
+    fn net_blocked_true_present_in_result_json() {
+        let r = MiniCoderResult {
+            status: "done".into(),
+            output: None,
+            files_touched: vec![],
+            edits: vec![],
+            question: None,
+            partial: None,
+            net_blocked: true,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains("\"netBlocked\":true"),
+            "net_blocked=true must be present: {json}"
+        );
+        let back: MiniCoderResult = serde_json::from_str(&json).unwrap();
+        assert!(back.net_blocked);
+    }
+
+    /// Same no-churn guarantee on MiniCoderOutcome.
+    #[test]
+    fn net_blocked_false_omitted_from_outcome_json() {
+        let o = MiniCoderOutcome::failed("something went wrong");
+        assert!(!o.net_blocked);
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(
+            !json.contains("netBlocked"),
+            "net_blocked=false must be omitted from outcome: {json}"
+        );
+        let back: MiniCoderOutcome = serde_json::from_str(&json).unwrap();
+        assert!(!back.net_blocked);
+    }
+
+    /// net_blocked=true on an outcome serialises and round-trips.
+    #[test]
+    fn net_blocked_true_present_in_outcome_json() {
+        let mut o = MiniCoderOutcome::default();
+        o.net_blocked = true;
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(
+            json.contains("\"netBlocked\":true"),
+            "net_blocked=true must be present in outcome: {json}"
+        );
+        let back: MiniCoderOutcome = serde_json::from_str(&json).unwrap();
+        assert!(back.net_blocked);
     }
 }
