@@ -409,120 +409,6 @@ pub fn build_command(program: &str) -> Command {
     cmd
 }
 
-/// Kill the runner's WHOLE process group (the child was spawned with `process_group(0)`), so on a
-/// timeout/overrun no orphaned grandchild (rustc/linker) survives holding the output pipe open and
-/// hanging the drain thread. Falls back to a direct child kill on non-unix. (review F1 race)
-fn kill_runner_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        // negative pid = the whole group; ignore ESRCH (already gone).
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    child.kill().ok();
-}
-
-/// Sandbox policy for a Censor runner: linters do STATIC analysis, so deny network (nothing they
-/// read can be exfiltrated) and confine writes to `target/` (clippy/cargo-check compile there; all
-/// other runners are check-mode and write nothing). Reads stay broad — the boundary is writes+net.
-/// Multi-language note: `target/` is harmless on non-Rust projects (the subpath just won't exist).
-/// Vulnerability-audit runners fetch an advisory DB from the network; with net DENIED they would
-/// return ZERO findings = a false SECURITY all-clear. They (and ONLY they) run with net Enabled —
-/// they are trusted first-party tools. Pure linters stay net=None. (review F2)
-pub(crate) fn censor_needs_network(program: &str, args: &[&str]) -> bool {
-    // Match the BASENAME against an EXPLICIT allowlist — never a substring on the full path (a tool
-    // living in a dir named "audit" must not silently get egress). (review F1/F3)
-    const AUDIT_TOOLS: &[&str] = &[
-        "cargo-audit", "pip-audit", "npm-audit", "pnpm-audit", "yarn-audit",
-        "trivy", "snyk", "osv-scanner", "grype",
-    ];
-    let name = std::path::Path::new(program)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    AUDIT_TOOLS.contains(&name.as_str())
-        || (matches!(name.as_str(), "npm" | "pnpm" | "yarn" | "cargo")
-            && args.iter().any(|a| a.eq_ignore_ascii_case("audit")))
-}
-
-pub(crate) fn censor_run_policy(
-    root: &Path,
-    program: &str,
-    args: &[&str],
-) -> crate::backend::sandbox::SandboxPolicy {
-    use crate::backend::sandbox::NetPolicy;
-    let net = if censor_needs_network(program, args) {
-        NetPolicy::Enabled
-    } else {
-        NetPolicy::None
-    };
-    let mut policy = crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
-        .writable(root.join("target")) // Rust: clippy/cargo-check compile here
-        .net(net);
-    // review F5: linters write incremental caches into these dirs under the project root; with ONLY
-    // target/ writable, mypy/pytest/ruff/eslint/gradle would fail silently (None) = a FALSE clean.
-    // Allow the well-known cache dirs — NOT the source, NOT .git (the profile denies .git anyway).
-    for cache in [
-        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".gradle",
-        "node_modules/.cache", "__pycache__",
-    ] {
-        policy = policy.writable(root.join(cache));
-    }
-    policy
-}
-
-#[cfg(test)]
-mod sandbox_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn censor_linter_policy_is_net_none_and_target_writable() {
-        use crate::backend::sandbox::NetPolicy;
-        let root = PathBuf::from("/proj");
-        let p = censor_run_policy(&root, "eslint", &[]);
-        assert_eq!(p.net, NetPolicy::None);
-        assert!(p.writable_paths.iter().any(|w| w.ends_with("target")), "target/ must be writable");
-        // the source root itself must NOT be writable (linters must not rewrite source)
-        assert!(!p.writable_paths.contains(&root), "the project root must NOT be writable");
-    }
-
-    #[test]
-    fn censor_audit_runners_get_network() {
-        use crate::backend::sandbox::NetPolicy;
-        let root = PathBuf::from("/proj");
-        // audit runners need the advisory DB → net Enabled (else false security all-clear)
-        assert_eq!(censor_run_policy(&root, "cargo-audit", &[]).net, NetPolicy::Enabled);
-        assert_eq!(censor_run_policy(&root, "pip-audit", &[]).net, NetPolicy::Enabled);
-        assert_eq!(censor_run_policy(&root, "npm", &["audit", "--json"]).net, NetPolicy::Enabled);
-        // a plain linter / npm-run stays denied
-        assert_eq!(censor_run_policy(&root, "npm", &["run", "lint"]).net, NetPolicy::None);
-        assert_eq!(censor_run_policy(&root, "clippy-driver", &[]).net, NetPolicy::None);
-        assert!(censor_needs_network("cargo-audit", &[]));
-        assert!(!censor_needs_network("eslint", &[]));
-    }
-
-    /// macOS: a real runner spawn under the sandbox still executes (the wrap doesn't break it).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sandboxed_runner_executes_simple_command() {
-        let root = std::env::temp_dir();
-        let out = run_capture_stream_with_timeout(
-            "/bin/echo",
-            &["censor-sandbox-ok"],
-            &root,
-            std::time::Duration::from_secs(10),
-            false,
-        );
-        assert!(
-            out.unwrap_or_default().contains("censor-sandbox-ok"),
-            "sandboxed runner must still run"
-        );
-    }
-}
-
 /// Default hard timeout for a single runner invocation. Compile/dependency-scan
 /// tools (clippy/cargo-check/cargo-audit/semgrep) are slow; A3 passes a longer
 /// budget for those via [`run_capture_with_timeout`]. The plain [`run_capture`]
@@ -790,40 +676,12 @@ fn run_capture_stream_with_timeout(
     timeout: Duration,
     capture_stderr: bool,
 ) -> Option<String> {
-    // OS sandbox (macOS Seatbelt): confine the runner to read-only project + writable target/ +
-    // NO network. build_command keeps apply_no_window (Windows console-flash guard). On non-macOS
-    // wrap is a passthrough+warn (Windows lands in phase 3). One edit confines ALL runners.
-    let args_owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let policy = censor_run_policy(root, program, args);
-    let wrapped = crate::backend::sandbox::wrap(&policy, program, &args_owned, root);
-    let mut cmd = build_command(&wrapped.program);
-    cmd.args(&wrapped.args)
+    let mut cmd = build_command(program);
+    cmd.args(args)
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    // review F4: env hygiene — a dependency `build.rs` (run by cargo check/clippy) must NOT read the
-    // app's secrets from the env (OPENAI_API_KEY, etc.) and bake them into a target/ binary. Clear
-    // and pass only what build/lint tools need (mirrors agentic_tools::run). Doubly important now
-    // that audit runners get net=Enabled.
-    cmd.env_clear();
-    for key in [
-        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL", "CARGO_HOME", "RUSTUP_HOME",
-        "GOPATH", "GOCACHE", "GOMODCACHE", "NODE_PATH", "JAVA_HOME", "ANDROID_HOME", "PYENV_ROOT",
-        "VIRTUAL_ENV", "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR", "LIBRARY_PATH", "LD_LIBRARY_PATH",
-    ] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    // review F1(race): own process group so a timeout/overrun kill hits the WHOLE tree
-    // (sandbox-exec→linter→rustc→linker); killing only the direct child orphans grandchildren that
-    // keep the output pipe open → the drain thread would hang forever.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -880,7 +738,7 @@ fn run_capture_stream_with_timeout(
             Ok(None) => {}
             Err(_) => {
                 // try_wait itself failed: kill, drain, give up.
-                kill_runner_tree(&mut child);
+                let _ = child.kill();
                 let _ = child.wait();
                 eprintln!(
                     "censor: runner '{program}' wait failed at {}",
@@ -895,13 +753,13 @@ fn run_capture_stream_with_timeout(
             // The reader hit the cap; kill the child so it can't keep producing
             // (and so it unblocks if it's stalled on a now-unread, full pipe).
             overran = true;
-            kill_runner_tree(&mut child);
+            let _ = child.kill();
             let _ = child.wait();
             break;
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            kill_runner_tree(&mut child);
+            let _ = child.kill();
             let _ = child.wait();
             break;
         }
