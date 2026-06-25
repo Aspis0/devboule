@@ -132,10 +132,16 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
     {
         // TODO(windows: phase 3 — Restricted Token + WFP + Job Object) / (linux: landlock stub).
         let _ = policy;
-        eprintln!(
-            "[sandbox] wrap: NO OS confinement on this platform — child '{program}' runs UNRESTRICTED \
-             (Windows/Linux sandbox not yet implemented). Auto-mode must refuse unattended use here."
-        );
+        // review F3: log ONCE (Censor/agentic call wrap dozens of times → stderr spam) and WITHOUT
+        // the program name (a user path can be sensitive).
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+        WARN_ONCE.call_once(|| {
+            eprintln!(
+                "[sandbox] wrap: NO OS confinement on this platform — children run UNRESTRICTED \
+                 (Windows/Linux sandbox not yet implemented). Auto-mode must refuse unattended use here."
+            );
+        });
         SandboxedCommand {
             program: program.to_string(),
             args: args.to_vec(),

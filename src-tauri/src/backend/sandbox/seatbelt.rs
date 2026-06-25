@@ -4,8 +4,8 @@ use super::{NetPolicy, SandboxPolicy};
 /// Escape a string for an SBPL double-quoted literal: backslash FIRST, then double-quote,
 /// so a path containing either cannot terminate the literal early and corrupt the profile.
 ///
-/// NOTE: a byte-identical copy lives in `mini_coder_executor.rs`; the two are unified when the
-/// one-shot mini is rewired onto this module (phase 1). Keep them in sync until then.
+/// Single source of truth: `mini_coder_executor::build_seatbelt_profile` imports this (the former
+/// duplicate copy was removed, review F3). The one-shot profile FUNCTION is still separate.
 #[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
 pub(crate) fn sbpl_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -38,7 +38,16 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     let tmpdir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let tmpdir_canon = canonical_sandbox_path(&tmpdir);
+    // review F2(race): a SILENT canonicalize fallback would emit a lexical TMPDIR rule that the
+    // kernel (which resolves symlinks at open-time) won't match → the child's temp writes get
+    // denied and it fails silently. Warn loudly so an operator can diagnose the broken sandbox.
+    let tmpdir_canon = match std::fs::canonicalize(&tmpdir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[sandbox] WARNING: TMPDIR {tmpdir:?} canonicalize failed ({e}); sandboxed temp writes may be denied");
+            tmpdir.clone()
+        }
+    };
     p.push_str(&format!("    (subpath \"{}\")\n", sbpl_escape(&tmpdir_canon.to_string_lossy())));
 
     for wp in &policy.writable_paths {
@@ -59,15 +68,15 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     // .git/hooks/* script that the user's OWN git would later execute OUTSIDE the sandbox (RCE).
     // The deny comes AFTER the allow so it wins (SBPL is last-match-wins). Only meaningful when
     // readonly_root is a real absolute path.
-    if policy.readonly_root.is_absolute() {
-        let root_canon = canonical_sandbox_path(&policy.readonly_root);
-        p.push_str("; security: never writable, even if a writable_path covers the root\n");
-        for protected in [".git", ".devboule"] {
-            let prot = sbpl_escape(&root_canon.join(protected).to_string_lossy());
-            p.push_str(&format!("(deny file-write* (subpath \"{prot}\"))\n"));
-        }
-        p.push('\n');
-    }
+    // SECURITY (review F1/F2): NEVER allow writes to a `.git` or `.devboule` directory — even when
+    // a writable_path covers the project root. A build script could otherwise plant a `.git/hooks/*`
+    // the user's own git later runs OUTSIDE the sandbox (RCE). A REGEX (not a top-level subpath)
+    // covers .git ANYWHERE (nested repos / submodule module dirs), and is harmless globally since
+    // the only writable paths are the explicit allowlist anyway. (deny wins — SBPL last-match.)
+    p.push_str("; security: deny writes to any .git / .devboule (RCE via planted hooks), nested too\n");
+    p.push_str("(deny file-write* (regex #\"/\\.git($|/)\"))\n");
+    p.push_str("(deny file-write* (regex #\"/\\.devboule($|/)\"))\n");
+    p.push('\n');
 
     // exec is NOT the security boundary (writes + network are). Allow process-exec BROADLY so the
     // agent runs toolchains living in $HOME (~/.cargo/bin, ~/.rustup, nvm/pyenv/…) AND the test

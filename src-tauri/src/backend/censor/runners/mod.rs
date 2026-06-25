@@ -409,6 +409,21 @@ pub fn build_command(program: &str) -> Command {
     cmd
 }
 
+/// Kill the runner's WHOLE process group (the child was spawned with `process_group(0)`), so on a
+/// timeout/overrun no orphaned grandchild (rustc/linker) survives holding the output pipe open and
+/// hanging the drain thread. Falls back to a direct child kill on non-unix. (review F1 race)
+fn kill_runner_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // negative pid = the whole group; ignore ESRCH (already gone).
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    child.kill().ok();
+}
+
 /// Sandbox policy for a Censor runner: linters do STATIC analysis, so deny network (nothing they
 /// read can be exfiltrated) and confine writes to `target/` (clippy/cargo-check compile there; all
 /// other runners are check-mode and write nothing). Reads stay broad — the boundary is writes+net.
@@ -417,9 +432,18 @@ pub fn build_command(program: &str) -> Command {
 /// return ZERO findings = a false SECURITY all-clear. They (and ONLY they) run with net Enabled —
 /// they are trusted first-party tools. Pure linters stay net=None. (review F2)
 pub(crate) fn censor_needs_network(program: &str, args: &[&str]) -> bool {
-    let p = program.to_ascii_lowercase();
-    p.contains("audit")
-        || (matches!(p.as_str(), "npm" | "pnpm" | "yarn" | "cargo")
+    // Match the BASENAME against an EXPLICIT allowlist — never a substring on the full path (a tool
+    // living in a dir named "audit" must not silently get egress). (review F1/F3)
+    const AUDIT_TOOLS: &[&str] = &[
+        "cargo-audit", "pip-audit", "npm-audit", "pnpm-audit", "yarn-audit",
+        "trivy", "snyk", "osv-scanner", "grype",
+    ];
+    let name = std::path::Path::new(program)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    AUDIT_TOOLS.contains(&name.as_str())
+        || (matches!(name.as_str(), "npm" | "pnpm" | "yarn" | "cargo")
             && args.iter().any(|a| a.eq_ignore_ascii_case("audit")))
 }
 
@@ -434,9 +458,19 @@ pub(crate) fn censor_run_policy(
     } else {
         NetPolicy::None
     };
-    crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
-        .writable(root.join("target"))
-        .net(net)
+    let mut policy = crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
+        .writable(root.join("target")) // Rust: clippy/cargo-check compile here
+        .net(net);
+    // review F5: linters write incremental caches into these dirs under the project root; with ONLY
+    // target/ writable, mypy/pytest/ruff/eslint/gradle would fail silently (None) = a FALSE clean.
+    // Allow the well-known cache dirs — NOT the source, NOT .git (the profile denies .git anyway).
+    for cache in [
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".gradle",
+        "node_modules/.cache", "__pycache__",
+    ] {
+        policy = policy.writable(root.join(cache));
+    }
+    policy
 }
 
 #[cfg(test)]
@@ -768,6 +802,28 @@ fn run_capture_stream_with_timeout(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // review F4: env hygiene — a dependency `build.rs` (run by cargo check/clippy) must NOT read the
+    // app's secrets from the env (OPENAI_API_KEY, etc.) and bake them into a target/ binary. Clear
+    // and pass only what build/lint tools need (mirrors agentic_tools::run). Doubly important now
+    // that audit runners get net=Enabled.
+    cmd.env_clear();
+    for key in [
+        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL", "CARGO_HOME", "RUSTUP_HOME",
+        "GOPATH", "GOCACHE", "GOMODCACHE", "NODE_PATH", "JAVA_HOME", "ANDROID_HOME", "PYENV_ROOT",
+        "VIRTUAL_ENV", "CC", "CXX", "PKG_CONFIG_PATH", "OPENSSL_DIR", "LIBRARY_PATH", "LD_LIBRARY_PATH",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    // review F1(race): own process group so a timeout/overrun kill hits the WHOLE tree
+    // (sandbox-exec→linter→rustc→linker); killing only the direct child orphans grandchildren that
+    // keep the output pipe open → the drain thread would hang forever.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -824,7 +880,7 @@ fn run_capture_stream_with_timeout(
             Ok(None) => {}
             Err(_) => {
                 // try_wait itself failed: kill, drain, give up.
-                let _ = child.kill();
+                kill_runner_tree(&mut child);
                 let _ = child.wait();
                 eprintln!(
                     "censor: runner '{program}' wait failed at {}",
@@ -839,13 +895,13 @@ fn run_capture_stream_with_timeout(
             // The reader hit the cap; kill the child so it can't keep producing
             // (and so it unblocks if it's stalled on a now-unread, full pipe).
             overran = true;
-            let _ = child.kill();
+            kill_runner_tree(&mut child);
             let _ = child.wait();
             break;
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            let _ = child.kill();
+            kill_runner_tree(&mut child);
             let _ = child.wait();
             break;
         }

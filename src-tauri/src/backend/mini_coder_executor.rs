@@ -1141,14 +1141,9 @@ fn should_run_agentic(
         return false;
     }
 
-    // AUDIT CRITICAL: re-validate base_url at USE-time. Refuse agentic for a local-kind backend
-    // whose base_url is NOT loopback — it would exfiltrate the prompt + source to a remote host.
-    if let Some(url) = backend.base_url.as_deref() {
-        if agentic_local_base_url_rejected(backend.kind, url) {
-            eprintln!("mini agentic: refusing spawn — local backend base_url is not loopback");
-            return false;
-        }
-    }
+    // NOTE: the local-backend non-loopback base_url gate lives in the CALLER, BEFORE the
+    // agentic/one-shot branch, so it blocks BOTH paths (declining only agentic here would just
+    // fall through to the one-shot, which makes the same remote request). (review F3/F4)
 
     // S2 — the toggle STAYS (always give the user the choice); capability drives only the
     // AUTO default, it never removes a choice:
@@ -5006,11 +5001,17 @@ fn build_seatbelt_profile(project_root: &Path, writable_paths: &[PathBuf]) -> St
     // One `(subpath "<canonical abs>")` per writable path, canonicalized + SBPL-escaped.
     let writable_subpaths = writable_paths
         .iter()
-        .map(|p| {
-            format!(
+        .filter_map(|p| {
+            // review F2: skip non-absolute writable paths — a relative `(subpath "..")` has
+            // dangerous CWD-relative SBPL semantics. Mirrors the guard in `seatbelt::build_profile`.
+            if !p.is_absolute() {
+                eprintln!("[sandbox] mini one-shot: skipping non-absolute writable_path {p:?}");
+                return None;
+            }
+            Some(format!(
                 "    (subpath \"{}\")",
                 sbpl_escape(&canonical_sandbox_path(p).to_string_lossy())
-            )
+            ))
         })
         .collect::<Vec<_>>()
         .join("\n");
