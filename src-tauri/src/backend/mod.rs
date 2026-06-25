@@ -40,6 +40,7 @@ pub mod projects;
 pub mod provider_detect;
 pub mod providers;
 pub mod roles;
+pub mod sandbox;
 pub mod saved_workflows;
 pub mod skill_format;
 pub mod skill_marketplace;
