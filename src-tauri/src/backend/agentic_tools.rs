@@ -417,6 +417,9 @@ impl ScopedAgentTools {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        // C3 (rlimits): Seatbelt has no native rlimit — enforce CPU/addr-space/max-procs on the
+        // spawned process (inherited by the child). Bounds a runaway/fork-bomb in a sandboxed run.
+        crate::backend::sandbox::apply_rlimits(&mut cmd, &policy.rlimits);
 
         let mut child = cmd.spawn().map_err(|e| format!("failed to start '{}': {e}", argv[0]))?;
         let pid = child.id() as i32;

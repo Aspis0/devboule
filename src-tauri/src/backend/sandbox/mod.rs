@@ -125,7 +125,8 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
     #[cfg(target_os = "macos")]
     {
         let profile = seatbelt::build_profile(policy);
-        // TODO(rlimits): apply policy.rlimits via nix::setrlimit pre_exec (next slice).
+        // rlimits are applied separately by `apply_rlimits()` (the spawner calls it on the built
+        // Command) — Seatbelt has no native rlimit, and they must go in a pre_exec on the Command.
         macos_sandbox_exec_argv(&profile, program, args)
     }
     #[cfg(not(target_os = "macos"))]
@@ -149,9 +150,63 @@ pub fn wrap(policy: &SandboxPolicy, program: &str, args: &[String], _cwd: &Path)
     }
 }
 
+/// Enforce `limits` on a command via a `pre_exec` `setrlimit` (unix). Seatbelt has NO native rlimit,
+/// so CPU-seconds / address-space / max-procs are set here on the spawned process (sandbox-exec),
+/// inherited by its child. Best-effort: a denied limit never aborts the spawn. No-op on non-unix.
+/// (RLIMIT_AS is a soft no-op on macOS but harmless to set.) The spawner calls this after building
+/// the Command from `wrap`'s `SandboxedCommand`.
+#[cfg(unix)]
+pub fn apply_rlimits(cmd: &mut std::process::Command, limits: &ResourceLimits) {
+    use std::os::unix::process::CommandExt;
+    let cpu = limits.cpu_secs;
+    let nproc = limits.max_procs;
+    let addr = limits.addr_space_bytes;
+    // SAFETY: pre_exec runs in the forked child before exec; we only call the async-signal-safe
+    // setrlimit syscall (no allocation, no locks).
+    unsafe {
+        cmd.pre_exec(move || {
+            set_rlimit(libc::RLIMIT_CPU, cpu);
+            set_rlimit(libc::RLIMIT_NPROC, nproc);
+            if let Some(bytes) = addr {
+                set_rlimit(libc::RLIMIT_AS, bytes);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+fn set_rlimit(resource: libc::c_int, value: u64) {
+    let lim = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // best-effort; ignore failure so a rejected limit can't abort the spawn under set -e semantics
+    unsafe {
+        libc::setrlimit(resource, &lim);
+    }
+}
+
+/// No-op on non-unix (Windows rlimits land with the Job Object backend in phase 3).
+#[cfg(not(unix))]
+pub fn apply_rlimits(_cmd: &mut std::process::Command, _limits: &ResourceLimits) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS: rlimits actually take effect — a child sees the RLIMIT_CPU we set (via `ulimit -t`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_apply_rlimits_sets_cpu_limit() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("ulimit -t");
+        let limits = ResourceLimits { cpu_secs: 7, addr_space_bytes: None, max_procs: 64 };
+        apply_rlimits(&mut cmd, &limits);
+        let out = cmd.output().expect("spawn sh");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), "7", "child should see the RLIMIT_CPU we set");
+    }
 
     #[test]
     fn macos_argv_wraps_with_sandbox_exec() {
