@@ -365,8 +365,14 @@ impl ScopedAgentTools {
             argv.insert(1, "--prefer-offline".to_string());
         }
 
-        let mut cmd = std::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
+        // OS sandbox (macOS Seatbelt): confine writes to the scope root + deny network. The
+        // app-level RCE gate (parse_run_command allowlist), env_clear, and process_group below
+        // stay as defense-in-depth ON TOP of the OS sandbox. On non-macOS, wrap is a passthrough
+        // (Windows lands in phase 3) and logs a warning.
+        let policy = agentic_run_policy(&self.root);
+        let wrapped = crate::backend::sandbox::wrap(&policy, &argv[0], &argv[1..], &self.root);
+        let mut cmd = std::process::Command::new(&wrapped.program);
+        cmd.args(&wrapped.args)
             .current_dir(&self.root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -450,6 +456,17 @@ impl ScopedAgentTools {
         }
         Ok(body)
     }
+}
+
+/// Build the sandbox policy for a `run` command: the scope root is the SINGLE writable root
+/// (build/test tools write under it: target/, node_modules/.cache, …); reads are broad; network
+/// is DENY by default (a hostile test cannot exfiltrate). Per-project network unlock to Enabled
+/// is a later slice (1b: detect a network-blocked failure → let the user re-run with net). rlimits
+/// are NOT yet enforced by wrap (TODO in wrap).
+fn agentic_run_policy(root: &std::path::Path) -> crate::backend::sandbox::SandboxPolicy {
+    crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
+        .writable(root.to_path_buf())
+    // net stays None (deny) — the default of `deny`.
 }
 
 /// Read a child stream, keeping at most `MAX_RUN_OUTPUT` bytes but CONTINUING to read+discard
@@ -578,6 +595,16 @@ impl AgentTools for ScopedAgentTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agentic_run_policy_is_net_none_and_writable_root() {
+        use crate::backend::sandbox::NetPolicy;
+        let root = std::path::PathBuf::from("/some/project/root");
+        let policy = super::agentic_run_policy(&root);
+        assert_eq!(policy.net, NetPolicy::None);
+        assert_eq!(policy.readonly_root, root);
+        assert!(policy.writable_paths.contains(&root), "scope root must be writable");
+    }
 
     #[test]
     fn safe_rel_path_rejects_escapes() {
