@@ -1141,6 +1141,15 @@ fn should_run_agentic(
         return false;
     }
 
+    // AUDIT CRITICAL: re-validate base_url at USE-time. Refuse agentic for a local-kind backend
+    // whose base_url is NOT loopback — it would exfiltrate the prompt + source to a remote host.
+    if let Some(url) = backend.base_url.as_deref() {
+        if agentic_local_base_url_rejected(backend.kind, url) {
+            eprintln!("mini agentic: refusing spawn — local backend base_url is not loopback");
+            return false;
+        }
+    }
+
     // S2 — the toggle STAYS (always give the user the choice); capability drives only the
     // AUTO default, it never removes a choice:
     //   Safe           => never agentic (force emit-edits).
@@ -3884,6 +3893,17 @@ mod mini_language_tests {
     use std::path::Path;
 
     #[test]
+    fn agentic_local_base_url_rejected_only_for_local_nonloopback() {
+        // local backend on loopback → accepted
+        assert!(!agentic_local_base_url_rejected(MiniCoderBackendKind::Omlx, "http://127.0.0.1:8000"));
+        assert!(!agentic_local_base_url_rejected(MiniCoderBackendKind::Ollama, "http://localhost:11434"));
+        // local backend pointed off-box → REJECTED (would exfiltrate prompt+source)
+        assert!(agentic_local_base_url_rejected(MiniCoderBackendKind::Omlx, "http://evil.example.com:8000"));
+        // cloud backends are remote by design → not rejected by this local-only gate
+        assert!(!agentic_local_base_url_rejected(MiniCoderBackendKind::Codex, "http://evil.example.com"));
+    }
+
+    #[test]
     fn task_scope_rust() {
         let b = mini_language_block(Path::new("/nonexistent_xyz"), &["a.rs".to_string()]).unwrap();
         assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
@@ -4919,6 +4939,18 @@ fn build_apple_fm_run_macos(prompt_pipe: &str, fm_path: &str, model: Option<&str
 fn base_url_host_is_loopback(base_url: &str) -> bool {
     let trimmed = base_url.trim();
     trimmed.is_empty() || crate::backend::censor::gemma::is_loopback_base(trimmed)
+}
+
+/// AUDIT CRITICAL (use-time base_url revalidation): a LOCAL-kind backend (oMLX/Ollama/AppleFm)
+/// MUST point at a loopback endpoint. A hand-edited NON-loopback base_url would ship the prompt +
+/// project source to a REMOTE host — no sandbox confines an HTTP egress to a config-controlled URL.
+/// `true` = REJECT the agentic spawn (caller declines → escalates, never leaks). Codex/Api are
+/// cloud backends (remote by design) and are not rejected here. Pure → unit-testable.
+fn agentic_local_base_url_rejected(kind: MiniCoderBackendKind, base_url: &str) -> bool {
+    matches!(
+        kind,
+        MiniCoderBackendKind::Omlx | MiniCoderBackendKind::Ollama | MiniCoderBackendKind::AppleFm
+    ) && !base_url_host_is_loopback(base_url)
 }
 
 // sbpl_escape + canonical_sandbox_path now live in `sandbox::seatbelt` as the single source of
