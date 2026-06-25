@@ -57,6 +57,10 @@ import {
 } from "../../context/AppContext";
 import { useAgentAttentionStore } from "../../store/agentAttentionStore";
 import {
+  useWorkSelectionStore,
+  primaryAgentForTask,
+} from "../../store/workSelectionStore";
+import {
   parseWorkTab,
   shouldClearWorkEntryBridge,
   shouldExitWorkMode,
@@ -123,6 +127,10 @@ export function agentStateSignature(
   if (!state) return "∅";
   return `${state.updatedAt ?? ""}|${state.sessions?.length ?? 0}|${state.claims?.length ?? 0}|${state.events?.length ?? 0}`;
 }
+
+// A trailing click fired within this window after a card drag-end is treated as drag noise,
+// not a real selection (see dragEndAtRef).
+const DRAG_CLICK_SUPPRESS_MS = 300;
 
 const columns: { id: ColumnId; label: string; icon: typeof Circle }[] = [
   { id: "todo", label: "To do", icon: Circle },
@@ -205,6 +213,17 @@ export function ProjectsView() {
   const [censorCountByProject, setCensorCountByProject] =
     useState<CensorCountByProject>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Phase B twinning: the board card selection is the SAME shared selection the Work
+  // Console (LivingPlan/FocusStage) drives. Reading selectedTaskId here highlights the
+  // active card; clicking a card sets task + its primary agent so the console focuses it.
+  const selectedTaskId = useWorkSelectionStore((s) => s.selectedTaskId);
+  const selectBothSelection = useWorkSelectionStore((s) => s.selectBoth);
+  const clearSelection = useWorkSelectionStore((s) => s.clear);
+  // A card drag emits a trailing click on some platforms; suppress the spurious select that
+  // would otherwise hijack the Work Console focus right after a board move. Timestamp-based
+  // (not a boolean + rAF) so there is no leaked frame callback and no rAF-vs-click ordering race:
+  // a click within DRAG_CLICK_SUPPRESS_MS of a drag-end is ignored; a genuine later click passes.
+  const dragEndAtRef = useRef(0);
   // Work mode is a SUB-STATE of the board (not a new nav view): clicking a card
   // flips this on and renders ProjectWorkspace full-bleed; `← Board` flips it off
   // while KEEPING selectedId so the card stays selected on the board.
@@ -609,7 +628,11 @@ export function ProjectsView() {
     setDurableChat([]);
     // B2 F2: a captured cloud-orchestrator id belongs to the project we're leaving.
     setCloudOrchestratorLaunchedId(null);
-  }, [currentProject?.metadata.id]);
+    // Phase B twinning (reviewer F1): the work-selection store is a global singleton, so a
+    // stale agent/task selection from the project we're leaving would otherwise highlight a
+    // card / focus an agent in the new project. Wipe it on a real project switch.
+    clearSelection();
+  }, [currentProject?.metadata.id, clearSelection]);
 
   // Prefill the root editor with the project's current root (#6) so "Set root" edits the
   // existing value instead of starting blank. Tracks rootPath too, so after you set a
@@ -2695,10 +2718,29 @@ export function ProjectsView() {
                             onDragStart={() => handleCardDragStart(task)}
                             onDragEnd={() => {
                               dragTaskRef.current = null;
+                              dragEndAtRef.current = Date.now();
                             }}
                           >
                             <TaskCard
                               task={task}
+                              selected={selectedTaskId === task.id}
+                              onSelect={(taskId) => {
+                                // A drag emits a trailing click on some platforms — ignore a
+                                // click that lands right after a drag-end.
+                                if (
+                                  Date.now() - dragEndAtRef.current <
+                                  DRAG_CLICK_SUPPRESS_MS
+                                ) {
+                                  return;
+                                }
+                                // Twin the board with the console: select the task AND its
+                                // primary worker (the first badge on this card) in ONE write,
+                                // so the FocusStage focuses exactly the agent shown here.
+                                selectBothSelection(
+                                  primaryAgentForTask(taskId, taskClaims, taskSessions),
+                                  taskId,
+                                );
+                              }}
                               agentControlled={taskAgentControlled}
                               workers={workers}
                               moveTargets={taskMoveTargets(task)}
@@ -2782,6 +2824,9 @@ export function ProjectsView() {
           }
         >
           <ProjectWorkspace
+            // Remount on project switch so ALL per-project local state (splitAgentId, open
+            // drawer, dock tab, commit/launcher) resets — none of it is valid across projects.
+            key={currentProject.metadata.id}
             project={currentProject}
             sessions={workModeSessions}
             claims={projectClaims}

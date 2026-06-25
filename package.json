@@ -29,6 +29,7 @@
     "pixi.js": "^8.18.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-resizable-panels": "^2.1.9",
     "zustand": "^5.0.14"
   },
   "devDependencies": {

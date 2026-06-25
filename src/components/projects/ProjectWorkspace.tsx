@@ -12,11 +12,14 @@
 //     / Git / Plans / Console / MCP; Notes (notesSlot) below the dock.
 //
 // CRITICAL: this component adds NO agent-state poller. It consumes the sessions /
-// claims / events ProjectsView already polls (passed as props). The terminal is
-// the SAME lazy AgentTerminalViewer the Agents room uses, mounted ONE at a time.
+// claims / events ProjectsView already polls (passed as props). Each focus pane mounts the
+// SAME lazy AgentTerminalViewer the Agents room uses; in split view UP TO TWO are mounted at
+// once — safe, since each is a self-contained TerminalSession on its own per-agent channel
+// (agent-terminal://<agentId>), no shared module-level state.
 
 import {
   ArrowLeft,
+  Columns2,
   GitBranch,
   LifeBuoy,
   Minimize2,
@@ -28,8 +31,6 @@ import {
   Terminal,
 } from "lucide-react";
 import {
-  Suspense,
-  lazy,
   useCallback,
   useEffect,
   useMemo,
@@ -49,18 +50,21 @@ import type {
 } from "../../types/backend";
 import type { CustomAgentClient } from "../../types/config";
 import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
-import { useAgentConsole } from "../agents/useAgentConsole";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { CensorPanel } from "./CensorPanel";
-import { FocusStage } from "../work/FocusStage";
+import { FocusStagePane } from "../work/FocusStagePane";
+import {
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+  type ImperativePanelGroupHandle,
+} from "react-resizable-panels";
 import { LivingPlan } from "../work/LivingPlan";
 import { SpawnPanel } from "../agents/SpawnPanel";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
-import { buildWorkConsoleModel, findWorkNode, type WorkNode } from "../work/workConsoleModel";
-import { agentChannel, type CommsDirection } from "../work/agentChannel";
+import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
 import { CensorFindingsTracker } from "./censorPanelModel";
-import { stripSpoofChars } from "../agents/attentionNotifier";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
 import { PushApprovalCard } from "./PushApprovalCard";
@@ -72,29 +76,18 @@ import {
   type DockTab,
   compactWriteCall,
   isMiniSession,
-  isMiniManagedSession,
   miniKillCall,
   reconcileSelectedAgentId,
   shouldShowCompact,
   workspaceGitLine,
 } from "./projectWorkspaceModel";
+import {
+  useWorkSelectionStore,
+  taskIdForAgent,
+} from "../../store/workSelectionStore";
 import { TokenUsageBadge } from "../agents/TokenUsageBadge";
 import { useAgentTokenUsage } from "../agents/useAgentTokenUsage";
 import type { AgentTokenUsage } from "../../types/backend";
-
-// Same lazy xterm chunk the Agents room + ProjectsView board use; loaded once.
-const AgentTerminalViewer = lazy(() =>
-  import("../agents/AgentTerminalViewer").then((m) => ({
-    default: m.AgentTerminalViewer,
-  })),
-);
-
-// Canned steer messages for the FocusStage quick-action chips (Direction A).
-const FOCUS_QUICK_ACTIONS: Record<"redo" | "narrow" | "pause", string> = {
-  redo: "Redo this round.",
-  narrow: "Narrow the scope to the current file only.",
-  pause: "Pause after the current step.",
-};
 
 // Stable empty set so the Living Plan's dirty highlight doesn't churn identity (and force
 // a re-render) on every poll when the Censor is clean.
@@ -198,10 +191,30 @@ export function ProjectWorkspace({
   detailSlot,
 }: ProjectWorkspaceProps) {
   const now = useNow();
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(() =>
-    reconcileSelectedAgentId(null, sessions),
+  // Phase B twinning: the selection lives in the shared store so the bottom DAG board
+  // (TaskCard) and the Work Console drive ONE selection. All the reads below are unchanged;
+  // writes go through selectAgentWithTask, which sets the agent AND its task in tandem so the
+  // two surfaces never half-desync. The effective per-render selection is reconciled
+  // synchronously just below (so the default is right on the first render, effects-free).
+  const storeSelectedAgentId = useWorkSelectionStore((s) => s.selectedAgentId);
+  const selectBoth = useWorkSelectionStore((s) => s.selectBoth);
+  // Select an agent AND resolve its task together (agent -> task direction), in ONE atomic
+  // store write so the board twin never sees a half-updated snapshot.
+  const selectAgentWithTask = useCallback(
+    (agentId: string | null) =>
+      selectBoth(agentId, taskIdForAgent(agentId, sessions, claims)),
+    [selectBoth, sessions, claims],
   );
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Split view: when set, pins a SECOND agent's focus pane beside the primary selection.
+  // Local to the console (not shared with the board) — split is a pure view concern.
+  const [splitAgentId, setSplitAgentId] = useState<string | null>(null);
+  // defaultSize is initial-mount-only in react-resizable-panels, so drive the proportions
+  // imperatively: toggling split rebalances to 50/50, unsplit restores the primary to 100%.
+  const panelGroupRef = useRef<ImperativePanelGroupHandle>(null);
+  useEffect(() => {
+    panelGroupRef.current?.setLayout(splitAgentId ? [50, 50] : [100]);
+  }, [splitAgentId]);
   const [dockTab, setDockTab] = useState<DockTab>(DEFAULT_DOCK_TAB);
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [commitOpen, setCommitOpen] = useState(false);
@@ -210,6 +223,17 @@ export function ProjectWorkspace({
   // The previous sessions snapshot, so reconcile can tell whether a now-gone
   // selection WAS a mini (and thus fall back to its parent, not the freshest).
   const prevSessionsRef = useRef<AgentSession[]>(sessions);
+
+  // Effective selection for THIS render: reconcile the STORED selection against the live
+  // sessions synchronously, so the default is correct on the very first render (SSR /
+  // renderToStaticMarkup run no effects, so a store seeded only by an effect would render
+  // null). The effect below persists the reconciled value back to the store so the board
+  // twin + a reaped-mini→parent fallback stay in sync across the live (DOM) poll.
+  const selectedAgentId = useMemo(
+    () =>
+      reconcileSelectedAgentId(storeSelectedAgentId, sessions, prevSessionsRef.current),
+    [storeSelectedAgentId, sessions],
+  );
 
   // Reconcile the selection against the live session list every render-relevant
   // change: keep a still-live selection, otherwise fall back — to the gone mini's
@@ -225,10 +249,25 @@ export function ProjectWorkspace({
     // real prior list.
     const prev = prevSessionsRef.current;
     prevSessionsRef.current = sessions;
-    setSelectedAgentId((current) =>
-      reconcileSelectedAgentId(current, sessions, prev),
-    );
-  }, [sessions]);
+    // Read the live store value (not a stale closure) so reconcile sees the real current
+    // selection — which may have just been set by the board card the user clicked to enter
+    // Work mode. Only write when it actually changes; reconcile is idempotent for a still-
+    // live selection. When the agent changes (e.g. a reaped mini falls back to its parent),
+    // the task follows the agent so the board highlight stays twinned.
+    const current = useWorkSelectionStore.getState().selectedAgentId;
+    const next = reconcileSelectedAgentId(current, sessions, prev);
+    if (next !== current) {
+      selectBoth(next, taskIdForAgent(next, sessions, claims));
+    }
+  }, [sessions, claims, selectBoth]);
+
+  // Auto-unpin the split's second pane when its agent's session disappears (reaped/exited),
+  // so a dead agent can't leave a stale "unsplit" state or a wasted activity subscription.
+  useEffect(() => {
+    if (splitAgentId && !sessions.some((s) => s.agentId === splitAgentId)) {
+      setSplitAgentId(null);
+    }
+  }, [splitAgentId, sessions]);
 
   const gitLine = useMemo(
     () => workspaceGitLine(project.gitStatus),
@@ -286,21 +325,6 @@ export function ProjectWorkspace({
       }),
   });
 
-  // The structured Console timeline for the SELECTED agent. The hook degrades to
-  // the empty resting state until the Step B backend (mini_activity_snapshot +
-  // mini-activity://<agentId>) lands — no second poller, no GPU. Its `running`
-  // flag drives the spinner + run-count pill on the Console tab.
-  const consoleActivity = useAgentConsole(selectedAgentId);
-
-  // Unified Work Console: derive the selected node from the live model so the FocusStage
-  // (the merged terminal + structured console) can drive its header, activity, raw flip,
-  // and the two-way composer/question card for whichever agent is selected.
-  const [focusView, setFocusView] = useState<"activity" | "raw">("activity");
-  // Reset to the Activity view whenever the selected agent changes, so a Raw view (or its
-  // "external console" note for a non-PTY agent) never leaks across selections.
-  useEffect(() => {
-    setFocusView("activity");
-  }, [selectedAgentId]);
   // Archiving (readOnly) closes the launcher so a stale-open SpawnPanel can't re-mount on unarchive.
   useEffect(() => {
     if (readOnly) setLauncherOpen(false);
@@ -316,48 +340,6 @@ export function ProjectWorkspace({
       }),
     [sessions, project.state.tasks, project.metadata.id],
   );
-  const focusNode = useMemo(
-    () => (selectedAgentId ? findWorkNode(workConsoleModel, selectedAgentId) : null),
-    [workConsoleModel, selectedAgentId],
-  );
-
-  // Direction A/B dispatch: route the composer to the right backend command. The signal is
-  // whether the agent is mini_coder-managed (local mini/coder -> mini_coder_steer) vs a cloud
-  // PTY worker (claude/codex -> agent_pty_send_message / reply_to_agent) — NOT raw PTY presence
-  // (a local mini also runs in a PTY). Read through a ref so the callback stays stable across
-  // the 5s sessions poll (avoids re-rendering the FocusStage timeline every tick).
-  const focusDispatchRef = useRef<{ node: WorkNode | null; miniManaged: boolean }>({
-    node: null,
-    miniManaged: true,
-  });
-  // Null the node when there is no resolved session, so a transient (selected-but-session-
-  // not-yet-loaded) state can't route a message to the wrong channel and silently drop it.
-  focusDispatchRef.current = {
-    node: selectedSession ? focusNode : null,
-    miniManaged: selectedSession ? isMiniManagedSession(selectedSession) : false,
-  };
-  const dispatchToFocus = useCallback((text: string, dir: CommsDirection) => {
-    const { node, miniManaged } = focusDispatchRef.current;
-    const t = text.trim();
-    if (!t || !node) return;
-    const ch = agentChannel(node, { miniManaged }, dir);
-    if (!ch) return;
-    void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch(() => {});
-  }, []);
-  // Stable handlers so the FocusStage (and its AgentConsole timeline) don't re-render on
-  // every 5s poll just because new inline closures were created.
-  const onFocusSend = useCallback((t: string) => dispatchToFocus(t, "message"), [dispatchToFocus]);
-  const onFocusAnswer = useCallback((t: string) => dispatchToFocus(t, "answer"), [dispatchToFocus]);
-  const onFocusQuickAction = useCallback(
-    (a: "redo" | "narrow" | "pause") => dispatchToFocus(FOCUS_QUICK_ACTIONS[a], "message"),
-    [dispatchToFocus],
-  );
-  // The worker composer can only message a coder/mini. The orchestrator (planner console) and
-  // the censor (automated) have no channel here — disable the composer rather than drop sends.
-  const focusComposerDisabled =
-    !!readOnly ||
-    (focusNode != null && focusNode.type !== "coder" && focusNode.type !== "mini");
-
   // Censor strip: the project-wide inspection summary (clean/dirty per file). Reuses the
   // SAME event-driven findings feed as the Censor dock tab — NO new poller.
   const [censorFindings, setCensorFindings] = useState<CensorFinding[]>([]);
@@ -658,7 +640,7 @@ export function ProjectWorkspace({
           <LivingPlan
             model={workConsoleModel}
             selectedAgentId={selectedAgentId}
-            onSelect={setSelectedAgentId}
+            onSelect={selectAgentWithTask}
             dirtyAgentIds={dirtyAgentIds}
           />
         </div>
@@ -759,6 +741,33 @@ export function ProjectWorkspace({
                   )}
                   <button
                     type="button"
+                    onClick={() =>
+                      setSplitAgentId((cur) =>
+                        cur ? null : selectedSession.agentId,
+                      )
+                    }
+                    // Splitting needs a SECOND agent to compare against — disable when there's
+                    // only one session (unsplit is always allowed).
+                    disabled={!splitAgentId && sessions.length < 2}
+                    aria-pressed={splitAgentId != null}
+                    title={
+                      splitAgentId
+                        ? "Close the split view"
+                        : sessions.length < 2
+                          ? "Need a second agent to split the view"
+                          : "Pin this agent and open a second focus pane"
+                    }
+                    className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${
+                      splitAgentId
+                        ? "border-terracotta bg-terracotta/10 text-terracotta"
+                        : "border-cream-200 bg-white text-cream-600 hover:text-terracotta"
+                    }`}
+                  >
+                    <Columns2 className="h-3 w-3" aria-hidden />
+                    {splitAgentId ? "unsplit" : "split"}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setDrawerOpen((open) => !open)}
                     aria-expanded={drawerOpen}
                     className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold ${
@@ -778,52 +787,53 @@ export function ProjectWorkspace({
                   two-way composer + inline question card for the selected agent. The raw
                   terminal is mounted only for an app-hosted PTY agent; an external/legacy
                   agent shows a tidy note in the Raw slot instead. */}
-              {focusNode ? (
-                <div className="h-[560px] overflow-hidden rounded-2xl border border-cream-200 bg-white">
-                  <FocusStage
-                    node={focusNode}
-                    activity={consoleActivity}
-                    view={focusView}
-                    onViewChange={setFocusView}
-                    onSendMessage={onFocusSend}
-                    pendingQuestion={
-                      readOnly || !focusNode.pendingQuestion
-                        ? null
-                        : stripSpoofChars(focusNode.pendingQuestion)
-                    }
-                    onAnswer={onFocusAnswer}
-                    disabled={focusComposerDisabled}
-                    onQuickAction={onFocusQuickAction}
-                    rawSlot={
-                      ptyAgents.has(selectedSession.agentId) ? (
-                        <Suspense
-                          fallback={
-                            <div className="rounded-2xl border border-cream-200 bg-cream-50 px-3 py-10 text-center text-[11px] text-cream-400">
-                              Loading terminal…
-                            </div>
-                          }
-                        >
-                          <AgentTerminalViewer
-                            key={selectedSession.agentId}
-                            agentId={selectedSession.agentId}
-                          />
-                        </Suspense>
-                      ) : (
-                        <div className="flex h-full items-center justify-center px-4 text-center text-[12px] text-cream-400">
-                          This agent runs in an external console — no in-app terminal to
-                          show. Use the drawer for its claims and events.
-                        </div>
-                      )
-                    }
+              {/* The PanelGroup is ALWAYS the focus container — the primary pane lives in a
+                  stable Panel whether split or not, so toggling split never remounts the
+                  primary (no terminal flash / re-subscribe). The second Panel + handle are
+                  added only when an agent is pinned. id/order keep the lib's layout stable
+                  across the conditional second panel. */}
+              <PanelGroup
+                ref={panelGroupRef}
+                direction="horizontal"
+                className="h-[560px] overflow-hidden rounded-2xl"
+              >
+                <Panel
+                  id="focus-primary"
+                  order={1}
+                  defaultSize={splitAgentId ? 50 : 100}
+                  minSize={28}
+                  className="min-w-0"
+                >
+                  <FocusStagePane
+                    agentId={selectedSession.agentId}
+                    model={workConsoleModel}
+                    sessions={sessions}
+                    ptyAgents={ptyAgents}
+                    readOnly={readOnly}
                   />
-                </div>
-              ) : (
-                <div className="flex h-72 items-center justify-center rounded-2xl border border-dashed border-cream-200 bg-cream-50 px-4 text-center text-[12px] text-cream-400">
-                  This agent isn&apos;t placed in the work model (it may belong to a
-                  different project or have no current task). Use the drawer for its
-                  claims and events.
-                </div>
-              )}
+                </Panel>
+                {splitAgentId ? (
+                  <>
+                    <PanelResizeHandle className="mx-1 w-1.5 rounded-full bg-cream-200 transition-colors hover:bg-terracotta/60 data-[resize-handle-active]:bg-terracotta" />
+                    <Panel
+                      id="focus-secondary"
+                      order={2}
+                      defaultSize={50}
+                      minSize={28}
+                      className="min-w-0"
+                    >
+                      <FocusStagePane
+                        agentId={splitAgentId}
+                        model={workConsoleModel}
+                        sessions={sessions}
+                        ptyAgents={ptyAgents}
+                        readOnly={readOnly}
+                        onClose={() => setSplitAgentId(null)}
+                      />
+                    </Panel>
+                  </>
+                ) : null}
+              </PanelGroup>
 
               {drawerOpen && (
                 <AgentDetailDrawer

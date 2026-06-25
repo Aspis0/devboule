@@ -53,6 +53,8 @@ export function TaskCard({
   onLaunchCoder,
   onLaunchVerifier,
   onCopyManualPrompt,
+  selected = false,
+  onSelect,
 }: {
   task: ProjectTask;
   agentControlled: boolean;
@@ -72,6 +74,11 @@ export function TaskCard({
   onLaunchCoder: () => void;
   onLaunchVerifier: () => void;
   onCopyManualPrompt: () => void;
+  // Phase B twinning: selecting a card focuses its task (and its primary agent) in the
+  // Work Console; the selected card shows a highlight ring. Both optional so non-board
+  // callers keep working unchanged.
+  selected?: boolean;
+  onSelect?: (taskId: string) => void;
 }) {
   // Face meta is limited to the "who" (assignee) and the due date when present.
   // Linked resources are detail and intentionally excluded from the face.
@@ -153,7 +160,20 @@ export function TaskCard({
   return (
     <article
       data-task-id={task.id}
-      className={`rounded-lg border bg-white p-3 shadow-soft-sm ${taskTone(task)}`}
+      aria-current={selected ? "true" : undefined}
+      onClick={
+        onSelect
+          ? (e) => {
+              // Only a click on the card FACE selects it. Clicks on the inner action
+              // controls (Move/Launch menus) must not hijack the Work Console focus.
+              if ((e.target as HTMLElement).closest("button")) return;
+              onSelect(task.id);
+            }
+          : undefined
+      }
+      className={`rounded-lg border bg-white p-3 shadow-soft-sm ${taskTone(task)} ${
+        onSelect ? "cursor-pointer" : ""
+      } ${selected ? "ring-2 ring-terracotta" : ""}`}
     >
       <div className="flex items-start justify-between gap-2">
         <span className="flex min-w-0 items-start gap-2">
