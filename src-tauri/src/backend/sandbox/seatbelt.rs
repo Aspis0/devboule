@@ -6,6 +6,7 @@ use super::{NetPolicy, SandboxPolicy};
 ///
 /// NOTE: a byte-identical copy lives in `mini_coder_executor.rs`; the two are unified when the
 /// one-shot mini is rewired onto this module (phase 1). Keep them in sync until then.
+#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
 pub(crate) fn sbpl_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -13,6 +14,7 @@ pub(crate) fn sbpl_escape(value: &str) -> String {
 /// Canonicalize an absolute path for an SBPL `(subpath ...)` rule so the rule matches the REAL
 /// inode the kernel checks (resolves `.`/`..`/symlinks). Falls back to the input when the path
 /// does not exist yet (a not-yet-created scratch dir still needs its lexical subpath allowed).
+#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
 pub(crate) fn canonical_sandbox_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -51,6 +53,21 @@ pub fn build_profile(policy: &SandboxPolicy) -> String {
     }
 
     p.push_str(")\n\n");
+
+    // SECURITY (review F1): even when a writable path covers the project root, NEVER allow writes
+    // to .git or .devboule. A build script run under the sandbox could otherwise plant a
+    // .git/hooks/* script that the user's OWN git would later execute OUTSIDE the sandbox (RCE).
+    // The deny comes AFTER the allow so it wins (SBPL is last-match-wins). Only meaningful when
+    // readonly_root is a real absolute path.
+    if policy.readonly_root.is_absolute() {
+        let root_canon = canonical_sandbox_path(&policy.readonly_root);
+        p.push_str("; security: never writable, even if a writable_path covers the root\n");
+        for protected in [".git", ".devboule"] {
+            let prot = sbpl_escape(&root_canon.join(protected).to_string_lossy());
+            p.push_str(&format!("(deny file-write* (subpath \"{prot}\"))\n"));
+        }
+        p.push('\n');
+    }
 
     p.push_str("; exec: sh + standard interpreter dirs (exec of read-only system bins is not the boundary)\n");
     p.push_str("(allow process-exec\n");
@@ -299,5 +316,42 @@ mod tests {
             "Enabled profile must be accepted by the kernel: {}",
             String::from_utf8_lossy(&res.stderr)
         );
+    }
+
+    /// SECURITY (review F1): `.git` must be DENIED for writes even when the project root is writable
+    /// (otherwise a build script could plant a hook the user's git later runs unsandboxed = RCE).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_git_dir_denied_even_when_root_writable() {
+        let pid = std::process::id();
+        let root = PathBuf::from(format!("/private/tmp/sb_git_test_{pid}"));
+        let _ = std::fs::create_dir_all(root.join(".git/hooks"));
+        let policy = SandboxPolicy::deny(root.clone()).writable(root.clone());
+        let profile = build_profile(&policy);
+
+        // a normal write under the writable root SUCCEEDS
+        let ok = root.join("src.txt");
+        let _ = std::fs::remove_file(&ok);
+        let r_ok = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p").arg(&profile).arg("--")
+            .arg("/bin/sh").arg("-c").arg(format!("echo y > {}/src.txt", root.display()))
+            .output().expect("sandbox-exec");
+        assert!(
+            r_ok.status.success(),
+            "write under the writable root must be allowed: {}",
+            String::from_utf8_lossy(&r_ok.stderr)
+        );
+
+        // a write into .git/hooks is DENIED despite the root being writable
+        let hook = root.join(".git/hooks/post-checkout");
+        let _ = std::fs::remove_file(&hook);
+        let r_git = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p").arg(&profile).arg("--")
+            .arg("/bin/sh").arg("-c").arg(format!("echo evil > {}/.git/hooks/post-checkout", root.display()))
+            .output().expect("sandbox-exec");
+        assert!(!r_git.status.success(), "write into .git must be DENIED");
+        assert!(!hook.exists(), "the .git hook must not have been created");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

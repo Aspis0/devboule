@@ -183,6 +183,8 @@ impl ScopedAgentTools {
 
     /// Set the network policy for sandboxed `run` commands (default `None`). Used to unblock a
     /// project to `Enabled` after the user approves a network-blocked failure.
+    // TODO(phase 2): called once the per-project net flag is wired into the mini launch.
+    #[allow(dead_code)]
     pub fn with_net(mut self, net: crate::backend::sandbox::NetPolicy) -> Self {
         self.net = net;
         self
@@ -498,12 +500,15 @@ DISABLED for this project's sandbox. If you trust it, enable network for this pr
 /// Used only when net == None to append a HINT (no false-positive risk: it only adds advice).
 fn looks_network_blocked(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
+    // Only clearly network-specific strings. Deliberately EXCLUDES "operation not permitted"
+    // (Seatbelt also returns it for WRITE denials → would wrongly suggest enabling network when
+    // the real issue is a write restriction), "failed to get" (cargo lock contention), and
+    // "network error"/"failed to download" (too ambiguous). (review F2)
     const NEEDLES: &[&str] = &[
         "could not resolve host", "couldn't resolve host", "name resolution", "getaddrinfo",
         "temporary failure in name resolution", "network is unreachable", "no route to host",
-        "connection refused", "operation not permitted", "failed to download", "failed to get",
-        "spurious network error", "etimedout", "enotfound", "econnrefused",
-        "connection timed out", "could not connect", "network error", "tls handshake",
+        "connection refused", "spurious network error", "etimedout", "enotfound", "econnrefused",
+        "connection timed out", "could not connect", "tls handshake",
     ];
     NEEDLES.iter().any(|n| b.contains(n))
 }
