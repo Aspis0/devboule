@@ -152,6 +152,11 @@ pub struct ProjectMetadata {
     /// from the on-disk frontmatter when false, like `censor_trusted`.
     #[serde(default)]
     pub net_enabled: bool,
+    /// SANDBOX broker Slice 1: per-project autonomy mode governing whether the broker prompts
+    /// the user on blocked requests.  Default `Ask` (always prompt).  NO-CHURN: omitted from
+    /// the on-disk frontmatter when equal to `Ask` so pre-existing project files stay byte-stable.
+    #[serde(default, skip_serializing_if = "crate::backend::broker::is_default_sandbox_mode")]
+    pub sandbox_mode: crate::backend::broker::SandboxMode,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

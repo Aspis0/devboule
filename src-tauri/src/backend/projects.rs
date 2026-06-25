@@ -169,6 +169,7 @@ pub fn create_project(
         // the user must explicitly opt in via `set_censor_trusted`.
         censor_trusted: false,
         net_enabled: false,
+        sandbox_mode: crate::backend::broker::SandboxMode::default(),
     };
     let state_block = ProjectStateBlock {
         version: 1,
@@ -2264,6 +2265,47 @@ pub fn set_project_net_enabled_cmd(
     set_project_net_enabled(&app, &project_id, enabled)
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// sandbox_mode — per-project autonomy mode (broker Slice 1)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// SANDBOX broker Slice 1: read the autonomy mode for this project.
+/// Mirrors [`project_net_enabled`].
+pub fn project_sandbox_mode(
+    app: &tauri::AppHandle,
+    project_id: &str,
+) -> Result<crate::backend::broker::SandboxMode, String> {
+    Ok(read_project_by_id(app, project_id)?.metadata.sandbox_mode)
+}
+
+/// SANDBOX broker Slice 1: persist the autonomy mode via the same locked read-modify-write
+/// path as [`set_project_net_enabled`] (NO-CHURN omits it when equal to `Ask`).
+pub fn set_project_sandbox_mode(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    mode: crate::backend::broker::SandboxMode,
+) -> Result<(), String> {
+    let path = project_path_by_id(app, project_id)?;
+    mutate_project_file_latest(&path, |project| {
+        project.metadata.sandbox_mode = mode;
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Tauri command: persist the sandbox autonomy mode for a project.
+/// Mirrors [`set_project_net_enabled_cmd`]: same signature shape, same `ensure_unlocked` guard.
+#[tauri::command]
+pub fn set_project_sandbox_mode_cmd(
+    project_id: String,
+    mode: crate::backend::broker::SandboxMode,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    set_project_sandbox_mode(&app, &project_id, mode)
+}
+
 /// Tauri command: apply a consent decision from the frontend net-block modal.
 ///
 /// - `AllowRemember` → persists `net_enabled = true` (survives restart).
@@ -2431,6 +2473,29 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                 .or_else(|| fields.get("netEnabled"))
                 .map(|value| value.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+            // SANDBOX broker Slice 1: read sandbox_mode. Missing key → Ask (default, fail-open
+            // for prompting). Unknown/unrecognised value → Ask (defensive; never errors the
+            // whole parse). NO-CHURN: Ask is not written.
+            //
+            // Use a direct closed-enum match instead of JSON-string construction to avoid
+            // fragility from escaping (e.g. a value containing a backslash would silently
+            // produce a serde error and fall through to Ask, hiding the bad on-disk value;
+            // a direct match makes the intent explicit and works for any byte sequence).
+            let sandbox_mode = fields
+                .get("sandbox_mode")
+                .or_else(|| fields.get("sandboxMode"))
+                .map(|value| match value.trim() {
+                    "ask" => crate::backend::broker::SandboxMode::Ask,
+                    "autoAcceptInWorkspace" => {
+                        crate::backend::broker::SandboxMode::AutoAcceptInWorkspace
+                    }
+                    "unattended" => crate::backend::broker::SandboxMode::Unattended,
+                    // Any unrecognised string (typo, future variant, garbage) → Ask.
+                    // This is intentionally tolerant: a bad on-disk value must never prevent
+                    // opening the project.
+                    _ => crate::backend::broker::SandboxMode::Ask,
+                })
+                .unwrap_or_default();
             return Ok((
                 ProjectMetadata {
                     id,
@@ -2440,6 +2505,7 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     root_path,
                     censor_trusted,
                     net_enabled,
+                    sandbox_mode,
                 },
                 offset,
             ));
@@ -2573,7 +2639,7 @@ fn write_project_file(project: &ParsedProject) -> Result<(), String> {
 fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<String, String> {
     let (_, end) = parse_frontmatter(content, Path::new("project.md"))?;
     let frontmatter = format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}---\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}---\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2585,6 +2651,7 @@ fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<Stri
             .unwrap_or_default(),
         censor_trusted_frontmatter_line(metadata.censor_trusted),
         net_enabled_frontmatter_line(metadata.net_enabled),
+        sandbox_mode_frontmatter_line(metadata.sandbox_mode),
     );
     Ok(format!("{frontmatter}{}", &content[end..]))
 }
@@ -2611,12 +2678,26 @@ fn net_enabled_frontmatter_line(enabled: bool) -> String {
     }
 }
 
+/// SANDBOX broker Slice 1 NO-CHURN: emit `sandbox_mode: <variant>` ONLY when the mode differs
+/// from the default (`Ask`), so pre-existing project files stay byte-stable.
+/// The on-disk value is the serde camelCase string without quotes (e.g. `autoAcceptInWorkspace`).
+fn sandbox_mode_frontmatter_line(mode: crate::backend::broker::SandboxMode) -> String {
+    if crate::backend::broker::is_default_sandbox_mode(&mode) {
+        String::new()
+    } else {
+        // Serialize via serde to get the canonical camelCase string, then strip the JSON quotes.
+        let json = serde_json::to_string(&mode).unwrap_or_default();
+        let value = json.trim_matches('"');
+        format!("sandbox_mode: {value}\n")
+    }
+}
+
 fn initial_project_markdown(
     metadata: &ProjectMetadata,
     state: &ProjectStateBlock,
 ) -> Result<String, String> {
     Ok(format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2628,6 +2709,7 @@ fn initial_project_markdown(
             .unwrap_or_default(),
         censor_trusted_frontmatter_line(metadata.censor_trusted),
         net_enabled_frontmatter_line(metadata.net_enabled),
+        sandbox_mode_frontmatter_line(metadata.sandbox_mode),
         serde_json::to_string_pretty(state)
             .map_err(|e| format!("Project state could not be serialized: {e}"))?
     ))
@@ -8920,6 +9002,7 @@ mod tests {
             root_path: None,
             censor_trusted: true,
             net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
         };
         let serialized = replace_frontmatter(old, &trusted).unwrap();
         assert!(serialized.contains("censor_trusted: true"));
@@ -8951,6 +9034,7 @@ mod tests {
             root_path: None,
             censor_trusted: false,
             net_enabled: true,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
         };
         let serialized = replace_frontmatter(old, &enabled).unwrap();
         assert!(serialized.contains("net_enabled: true"));
@@ -8966,6 +9050,124 @@ mod tests {
         assert!(!serialized_off.contains("net_enabled"));
     }
 
+    // ── sandbox_mode NO-CHURN round-trip ──────────────────────────────────────────────
+
+    /// SANDBOX broker Slice 1: `Ask` (the default) is omitted from the frontmatter so
+    /// pre-existing project files stay byte-stable (NO-CHURN).  Non-default variants
+    /// round-trip through parse→serialize→parse.
+    #[test]
+    fn sandbox_mode_roundtrips_and_old_files_default_ask() {
+        use crate::backend::broker::SandboxMode;
+
+        // An old file with NO sandbox_mode line must parse as Ask (back-compat / fail-open).
+        let old = "---\nid: proj-s\ntitle: P\nstatus: active\nupdated_at: t\n---\n";
+        let (meta, _) = parse_frontmatter(old, Path::new("proj-s.md")).unwrap();
+        assert_eq!(
+            meta.sandbox_mode,
+            SandboxMode::Ask,
+            "missing key must default to Ask"
+        );
+
+        // Serializing a project with Ask (default) must NOT inject the key (NO-CHURN).
+        let ask_meta = ProjectMetadata {
+            id: "proj-s".into(),
+            title: "P".into(),
+            status: "active".into(),
+            updated_at: "t".into(),
+            root_path: None,
+            censor_trusted: false,
+            net_enabled: false,
+            sandbox_mode: SandboxMode::Ask,
+        };
+        let serialized_ask = replace_frontmatter(old, &ask_meta).unwrap();
+        assert!(
+            !serialized_ask.contains("sandbox_mode"),
+            "Ask must not write sandbox_mode key (NO-CHURN)"
+        );
+
+        // Serializing AutoAcceptInWorkspace emits the key; re-parsing reads it back.
+        let auto_meta = ProjectMetadata {
+            sandbox_mode: SandboxMode::AutoAcceptInWorkspace,
+            ..ask_meta
+        };
+        let serialized_auto = replace_frontmatter(old, &auto_meta).unwrap();
+        assert!(
+            serialized_auto.contains("sandbox_mode: autoAcceptInWorkspace"),
+            "AutoAcceptInWorkspace must write the key"
+        );
+        let (reparsed_auto, _) =
+            parse_frontmatter(&serialized_auto, Path::new("proj-s.md")).unwrap();
+        assert_eq!(
+            reparsed_auto.sandbox_mode,
+            SandboxMode::AutoAcceptInWorkspace,
+            "AutoAcceptInWorkspace must round-trip"
+        );
+
+        // Serializing Unattended emits the key; re-parsing reads it back.
+        let unattended_meta = ProjectMetadata {
+            sandbox_mode: SandboxMode::Unattended,
+            ..reparsed_auto
+        };
+        let serialized_unattended = replace_frontmatter(&serialized_auto, &unattended_meta).unwrap();
+        assert!(
+            serialized_unattended.contains("sandbox_mode: unattended"),
+            "Unattended must write the key"
+        );
+        let (reparsed_unattended, _) =
+            parse_frontmatter(&serialized_unattended, Path::new("proj-s.md")).unwrap();
+        assert_eq!(
+            reparsed_unattended.sandbox_mode,
+            SandboxMode::Unattended,
+            "Unattended must round-trip"
+        );
+    }
+
+    /// FIX A: a garbage `sandbox_mode` value on disk must never fail the parse.
+    /// The project must load successfully and the mode must fall back to `Ask`.
+    ///
+    /// This test also covers values that would have broken the old serde JSON-string
+    /// approach (e.g. a backslash in the value produces invalid JSON but is a valid
+    /// ASCII string that our direct match handles correctly by falling through to Ask).
+    #[test]
+    fn sandbox_mode_garbage_value_defaults_to_ask_and_does_not_error() {
+        use crate::backend::broker::SandboxMode;
+
+        // Plain unrecognised token.
+        let bogus = "---\nid: proj-g\ntitle: G\nstatus: active\nupdated_at: t\nsandbox_mode: bogus\n---\n";
+        let (meta, _) = parse_frontmatter(bogus, Path::new("proj-g.md"))
+            .expect("parse must succeed even with an unrecognised sandbox_mode value");
+        assert_eq!(
+            meta.sandbox_mode,
+            SandboxMode::Ask,
+            "unrecognised value must fall back to Ask"
+        );
+
+        // Value with a backslash — would produce invalid JSON in the old code.
+        let backslash =
+            "---\nid: proj-g\ntitle: G\nstatus: active\nupdated_at: t\nsandbox_mode: bogus\\value\n---\n";
+        let (meta_bs, _) = parse_frontmatter(backslash, Path::new("proj-g.md"))
+            .expect("parse must succeed even with a backslash in sandbox_mode");
+        assert_eq!(
+            meta_bs.sandbox_mode,
+            SandboxMode::Ask,
+            "backslash-containing value must fall back to Ask (not error)"
+        );
+
+        // Completely empty value (key present, value is blank after trim).
+        let empty =
+            "---\nid: proj-g\ntitle: G\nstatus: active\nupdated_at: t\nsandbox_mode:  \n---\n";
+        // Note: parse_simple_yaml splits on the FIRST ':', so "sandbox_mode:  " yields
+        // key="sandbox_mode", value="  " (whitespace only). After trim → "". Not a known
+        // variant → Ask.
+        let (meta_e, _) = parse_frontmatter(empty, Path::new("proj-g.md"))
+            .expect("parse must succeed even with a blank sandbox_mode value");
+        assert_eq!(
+            meta_e.sandbox_mode,
+            SandboxMode::Ask,
+            "blank value must fall back to Ask"
+        );
+    }
+
     #[test]
     fn project_markdown_roundtrip_preserves_state_block() {
         let metadata = ProjectMetadata {
@@ -8976,6 +9178,7 @@ mod tests {
             root_path: Some("C:\\Users\\gualt\\Desktop\\aspis bio".into()),
             censor_trusted: false,
             net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -9070,6 +9273,7 @@ updated_at: 2026-05-28T00:00:00Z
             root_path: None,
             censor_trusted: false,
             net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -9407,6 +9611,99 @@ updated_at: 2026-05-28T00:00:00Z
         assert!(!fs::read_to_string(&path).unwrap().contains("net_enabled"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── sandbox_mode persists through locked write + NO-CHURN ─────────────────────
+
+    /// SANDBOX broker Slice 1: `set_project_sandbox_mode` persists via the locked
+    /// read-modify-write helper, and the NO-CHURN invariant holds: Ask writes nothing,
+    /// non-Ask writes the key, and clearing back to Ask removes it.
+    #[test]
+    fn sandbox_mode_persists_through_locked_write_and_clears_no_churn() {
+        use crate::backend::broker::SandboxMode;
+
+        let (root, path) = write_temp_project("sandbox-mode");
+
+        // Fresh project: mode is Ask by default, no key on disk.
+        let initial = read_project_file(&path).unwrap();
+        assert_eq!(initial.metadata.sandbox_mode, SandboxMode::Ask);
+        assert!(
+            !fs::read_to_string(&path).unwrap().contains("sandbox_mode"),
+            "Ask must not write key"
+        );
+
+        // Set to Unattended: key must appear on disk.
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.sandbox_mode = SandboxMode::Unattended;
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        assert_eq!(
+            read_project_file(&path).unwrap().metadata.sandbox_mode,
+            SandboxMode::Unattended
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("sandbox_mode: unattended"),
+            "Unattended must write key"
+        );
+
+        // Set to AutoAcceptInWorkspace: key changes value.
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.sandbox_mode = SandboxMode::AutoAcceptInWorkspace;
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        assert_eq!(
+            read_project_file(&path).unwrap().metadata.sandbox_mode,
+            SandboxMode::AutoAcceptInWorkspace
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("sandbox_mode: autoAcceptInWorkspace"),
+            "AutoAcceptInWorkspace must write its key"
+        );
+
+        // Clear back to Ask: key disappears from disk (NO-CHURN).
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.sandbox_mode = SandboxMode::Ask;
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        assert_eq!(
+            read_project_file(&path).unwrap().metadata.sandbox_mode,
+            SandboxMode::Ask
+        );
+        assert!(
+            !fs::read_to_string(&path).unwrap().contains("sandbox_mode"),
+            "Clearing to Ask must remove key (NO-CHURN)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Gating unit test: Unattended does NOT prompt; Ask and AutoAcceptInWorkspace do.
+    /// Tests `prompts_for_net` at the projects layer to pin the contract end-to-end.
+    #[test]
+    fn unattended_does_not_prompt_others_do() {
+        use crate::backend::broker::SandboxMode;
+        assert!(
+            SandboxMode::Ask.prompts_for_net(),
+            "Ask must prompt for net"
+        );
+        assert!(
+            SandboxMode::AutoAcceptInWorkspace.prompts_for_net(),
+            "AutoAcceptInWorkspace must prompt for net"
+        );
+        assert!(
+            !SandboxMode::Unattended.prompts_for_net(),
+            "Unattended must NOT prompt (fail-closed)"
+        );
     }
 
     /// SANDBOX broker: `grant_net_consent` decision mapping (tested at the
@@ -9761,6 +10058,7 @@ updated_at: 2026-05-28T00:00:00Z
                 root_path: Some(root.to_string_lossy().into_owned()),
                 censor_trusted: false,
                 net_enabled: false,
+                sandbox_mode: crate::backend::broker::SandboxMode::default(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -10238,6 +10536,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 root_path: Some(root.to_string_lossy().into_owned()),
                 censor_trusted: false,
                 net_enabled: false,
+                sandbox_mode: crate::backend::broker::SandboxMode::default(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -12708,6 +13007,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 root_path: None,
                 censor_trusted: false,
                 net_enabled: false,
+                sandbox_mode: crate::backend::broker::SandboxMode::default(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -13061,6 +13361,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             root_path: None,
             censor_trusted: false,
             net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -13248,6 +13549,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             root_path: Some(chosen.clone()),
             censor_trusted: false,
             net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
         };
         let state = ProjectStateBlock {
             version: 1,

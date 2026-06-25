@@ -47,11 +47,13 @@ import type {
   AgentSession,
   CensorFinding,
   ProjectDetail,
+  SandboxMode,
 } from "../../types/backend";
 import type { CustomAgentClient } from "../../types/config";
 import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { CensorPanel } from "./CensorPanel";
+import { SandboxModeSelector } from "./SandboxModeSelector";
 import { FocusStagePane } from "../work/FocusStagePane";
 import {
   Panel,
@@ -165,6 +167,9 @@ export interface ProjectWorkspaceProps {
    *  create landing — a project's detail belongs on its OWN page, not the create
    *  page (the landing = create + Kanban-as-history). Optional → absent renders nothing. */
   detailSlot?: ReactNode;
+  /** Called after a successful sandbox-mode write so the parent can patch the
+   *  in-memory project metadata immediately (avoids a ~10s wait for the poll). */
+  onSandboxModeChange?: (mode: SandboxMode) => void;
 }
 
 export function ProjectWorkspace({
@@ -197,6 +202,7 @@ export function ProjectWorkspace({
   taskBoardSlot,
   notesSlot,
   detailSlot,
+  onSandboxModeChange,
 }: ProjectWorkspaceProps) {
   const now = useNow();
   // Phase B twinning: the selection lives in the shared store so the bottom DAG board
@@ -1004,14 +1010,23 @@ export function ProjectWorkspace({
 
         <div className="p-4">
           {dockTab === "censor" && (
-            <CensorPanel
-              projectId={project.metadata.id}
-              root={project.metadata.rootPath}
-              findings={censorFindings}
-              onLaunch={onLaunch}
-              isBusy={isBusy}
-              canLaunch={canLaunch}
-            />
+            <div className="space-y-5">
+              {!readOnly && (
+                <SandboxModeSelector
+                  projectId={project.metadata.id}
+                  sandboxMode={project.metadata.sandboxMode}
+                  onModeChange={onSandboxModeChange}
+                />
+              )}
+              <CensorPanel
+                projectId={project.metadata.id}
+                root={project.metadata.rootPath}
+                findings={censorFindings}
+                onLaunch={onLaunch}
+                isBusy={isBusy}
+                canLaunch={canLaunch}
+              />
+            </div>
           )}
 
           {dockTab === "git" && <DockGit project={project} />}

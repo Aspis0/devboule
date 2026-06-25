@@ -78,6 +78,7 @@ import type {
   ProjectSummary,
   ProjectTask,
   ProjectTaskCategory,
+  SandboxMode,
   SavedWorkflow,
 } from "../../types/backend";
 import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
@@ -2854,6 +2855,16 @@ export function ProjectsView() {
             }}
             onLaunch={(input) => void launchFromSpawnPanel(input)}
             onCopyPrompt={(selection) => void copyFromSpawnPanel(selection)}
+            onSandboxModeChange={(mode: SandboxMode) => {
+              setProject((current) =>
+                current?.metadata.id === currentProject.metadata.id
+                  ? {
+                      ...current,
+                      metadata: { ...current.metadata, sandboxMode: mode },
+                    }
+                  : current,
+              );
+            }}
             onCommit={(message) => void commitProject(message)}
             onPush={() => void pushProject()}
             onPull={() => void pullProject()}

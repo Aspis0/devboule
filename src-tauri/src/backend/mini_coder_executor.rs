@@ -1481,12 +1481,29 @@ fn claim_and_launch(
         crate::backend::projects::project_net_enabled(app, &project_id).unwrap_or(false);
 
     let spawn_result = if should_run_agentic(app, &backend, directive) {
-        // Consume the one-shot grant only here (agentic path uses NetPolicy).
-        let transient_net = app
-            .try_state::<crate::backend::broker::PermissionBrokerState>()
-            .map(|broker| broker.take_net_grant(&project_id))
-            .unwrap_or(false);
-        let agentic_net = if persistent_net || transient_net {
+        // FIX B: resolve the sandbox mode BEFORE consuming the transient grant.
+        // When the mode is Unattended, a stale AllowOnce grant (issued before the
+        // project was switched to Unattended) must NOT silently enable net — Unattended
+        // is fail-closed.  We therefore only consume the transient grant when the mode
+        // would actually honour it (Ask / AutoAcceptInWorkspace).
+        let sandbox_mode =
+            crate::backend::projects::project_sandbox_mode(app, &project_id)
+                .unwrap_or(crate::backend::broker::SandboxMode::Ask);
+
+        // Consume the one-shot grant only when the mode would honour it.
+        // For Unattended the grant is left untouched (not consumed, not used).
+        let transient_net = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
+            app.try_state::<crate::backend::broker::PermissionBrokerState>()
+                .map(|broker| broker.take_net_grant(&project_id))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        // Net is enabled iff the pure resolver says so (pins the invariant table).
+        let net_enabled =
+            crate::backend::broker::resolve_net_enabled(persistent_net, transient_net, sandbox_mode);
+        let agentic_net = if net_enabled {
             crate::backend::sandbox::NetPolicy::Enabled
         } else {
             crate::backend::sandbox::NetPolicy::None
@@ -1504,6 +1521,7 @@ fn claim_and_launch(
         // the worker never launched, so the user never saw a net-blocked outcome and
         // would not be re-prompted — put the grant back so the next claim_and_launch
         // attempt can use it.
+        // NOTE: only re-insert when we actually consumed (transient_net == true).
         if spawn_r.is_err() && transient_net {
             if let Some(broker) =
                 app.try_state::<crate::backend::broker::PermissionBrokerState>()
@@ -1652,18 +1670,29 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // torn-down runtime is non-fatal (same contract as MiniActivityStore::update).
     // Use was_net_blocked (pre-apply capture) to guard against the apply step zeroing
     // the flag when it replaces the outcome with a synthesized failed/timeout (FIX 3).
+    //
+    // SANDBOX broker Slice 1: gate by sandbox_mode.
+    // - Ask / AutoAcceptInWorkspace → always prompt for net (network is always sensitive).
+    // - Unattended → suppress the event (fail-closed, no prompt).
+    // Defensive: if reading the mode errors (project not found, corrupt metadata) we
+    // default to PROMPTING rather than silently failing closed — better an extra dialog
+    // than a permanently silenced agent with no feedback to the user.
     if was_net_blocked {
         if let Some(pid) = project_id.as_deref() {
-            let agent_id = mini_agent_id(directive);
-            let req = crate::backend::broker::ConsentRequest {
-                kind: crate::backend::broker::ConsentKind::Net,
-                project_id: pid.to_string(),
-                agent_id,
-                detail: "A sandboxed command needed network access, which is disabled for this \
-                         project. Grant to retry."
-                    .to_string(),
-            };
-            let _ = app.emit("sandbox://consent-request", req);
+            let mode = crate::backend::projects::project_sandbox_mode(app, pid)
+                .unwrap_or(crate::backend::broker::SandboxMode::Ask);
+            if mode.prompts_for_net() {
+                let agent_id = mini_agent_id(directive);
+                let req = crate::backend::broker::ConsentRequest {
+                    kind: crate::backend::broker::ConsentKind::Net,
+                    project_id: pid.to_string(),
+                    agent_id,
+                    detail: "A sandboxed command needed network access, which is disabled for \
+                             this project. Grant to retry."
+                        .to_string(),
+                };
+                let _ = app.emit("sandbox://consent-request", req);
+            }
         }
     }
 

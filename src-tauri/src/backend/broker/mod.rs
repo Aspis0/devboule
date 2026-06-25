@@ -14,6 +14,101 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 // ──────────────────────────────────────────────
+// SandboxMode — per-project autonomy knob
+// ──────────────────────────────────────────────
+
+/// Controls how the permission broker handles agent requests for this project.
+///
+/// Serialized as camelCase JSON strings (`"ask"`, `"autoAcceptInWorkspace"`, `"unattended"`)
+/// so the frontend can read/write it directly via the Tauri command.
+///
+/// # Design
+/// - `Ask`: always prompt the user.  The safest default.
+/// - `AutoAcceptInWorkspace`: intended to auto-grant writes **inside the project root**
+///   without a prompt; still prompts for network (always sensitive) and out-of-workspace
+///   folders.  **IMPORTANT — implementation status**: the folder auto-grant is not yet
+///   wired; it is being built in Slice 2 (folder consent).  Until Slice 2 lands,
+///   `AutoAcceptInWorkspace` behaves identically to `Ask` for all non-network actions.
+///   For network it also behaves like `Ask` (prompts).  No caller should assume that
+///   in-workspace writes are silently auto-granted today.
+/// - `Unattended`: fail-closed — NO prompts, every blocked request is silently denied.
+///   This is the mode that gates Pigeon go-live (the agent must operate unsupervised).
+///   The ONLY way to enable network in Unattended is a standing `net_enabled` flag
+///   (AllowRemember); transient one-shot grants are not honoured.
+///
+/// The default is `Ask`, which is equivalent to omitting the field from disk (NO-CHURN).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxMode {
+    Ask,
+    AutoAcceptInWorkspace,
+    Unattended,
+}
+
+impl Default for SandboxMode {
+    fn default() -> Self {
+        SandboxMode::Ask
+    }
+}
+
+impl SandboxMode {
+    /// Returns `true` when this mode should emit a net-consent prompt to the frontend.
+    ///
+    /// Only `Unattended` returns `false` (fail-closed, no prompt).  Both `Ask` and
+    /// `AutoAcceptInWorkspace` always prompt for network because network access is
+    /// considered sensitive regardless of workspace scope.
+    ///
+    /// Note: `AutoAcceptInWorkspace`'s in-workspace **write** auto-grant is NOT yet
+    /// active — it is implemented in Slice 2 (folder consent).  This method reflects
+    /// only the network-prompt behaviour, which is identical for Ask and
+    /// AutoAcceptInWorkspace.
+    pub fn prompts_for_net(self) -> bool {
+        !matches!(self, SandboxMode::Unattended)
+    }
+}
+
+/// `skip_serializing_if` predicate for `SandboxMode` fields.
+///
+/// Used by `ProjectMetadata.sandbox_mode` to implement NO-CHURN: when the mode equals
+/// the default (`Ask`) the field is **omitted** from the serialized frontmatter so
+/// pre-existing project files remain byte-stable.
+pub fn is_default_sandbox_mode(mode: &SandboxMode) -> bool {
+    *mode == SandboxMode::default()
+}
+
+// ──────────────────────────────────────────────
+// Net-policy resolution helper
+// ──────────────────────────────────────────────
+
+/// Pure, unit-testable net-policy resolver for the agentic spawn path.
+///
+/// Returns `true` (network enabled) according to the following fail-closed logic:
+///
+/// | `mode`                  | `persistent` | `transient` | result  |
+/// |-------------------------|:------------:|:-----------:|:-------:|
+/// | any                     | `true`       | any         | enabled |
+/// | `Ask` / `AutoAccept`    | `false`      | `true`      | enabled |
+/// | `Unattended`            | `false`      | `true`      | **disabled** |
+/// | any                     | `false`      | `false`     | disabled |
+///
+/// Key invariant: a stale one-shot (`transient`) grant granted before the project was
+/// switched to `Unattended` must NOT silently enable net.  `Unattended` is fail-closed:
+/// only a standing, deliberate `persistent` (AllowRemember) opt-in can open the network.
+///
+/// This function is deliberately free of I/O so it can be unit-tested directly.
+pub fn resolve_net_enabled(persistent: bool, transient: bool, mode: SandboxMode) -> bool {
+    if persistent {
+        // Explicit AllowRemember: always honoured regardless of mode.
+        return true;
+    }
+    if transient && mode != SandboxMode::Unattended {
+        // One-shot grant is only honoured when the mode allows interactive consent.
+        return true;
+    }
+    false
+}
+
+// ──────────────────────────────────────────────
 // Wire types (provider-agnostic)
 // ──────────────────────────────────────────────
 
@@ -222,6 +317,110 @@ mod tests {
 
         let deny: ConsentDecision = serde_json::from_str(r#""deny""#).unwrap();
         assert_eq!(deny, ConsentDecision::Deny);
+    }
+
+    // ── SandboxMode serde + default + prompts_for_net ────────────────────────
+
+    #[test]
+    fn sandbox_mode_default_is_ask() {
+        assert_eq!(SandboxMode::default(), SandboxMode::Ask);
+    }
+
+    #[test]
+    fn sandbox_mode_serde_camel_case_round_trip() {
+        // Serialize each variant and verify the camelCase JSON string.
+        assert_eq!(serde_json::to_string(&SandboxMode::Ask).unwrap(), r#""ask""#);
+        assert_eq!(
+            serde_json::to_string(&SandboxMode::AutoAcceptInWorkspace).unwrap(),
+            r#""autoAcceptInWorkspace""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxMode::Unattended).unwrap(),
+            r#""unattended""#
+        );
+
+        // Deserialize back.
+        let ask: SandboxMode = serde_json::from_str(r#""ask""#).unwrap();
+        assert_eq!(ask, SandboxMode::Ask);
+        let auto: SandboxMode = serde_json::from_str(r#""autoAcceptInWorkspace""#).unwrap();
+        assert_eq!(auto, SandboxMode::AutoAcceptInWorkspace);
+        let unattended: SandboxMode = serde_json::from_str(r#""unattended""#).unwrap();
+        assert_eq!(unattended, SandboxMode::Unattended);
+    }
+
+    #[test]
+    fn prompts_for_net_only_false_for_unattended() {
+        assert!(
+            SandboxMode::Ask.prompts_for_net(),
+            "Ask must prompt for net"
+        );
+        assert!(
+            SandboxMode::AutoAcceptInWorkspace.prompts_for_net(),
+            "AutoAcceptInWorkspace must prompt for net"
+        );
+        assert!(
+            !SandboxMode::Unattended.prompts_for_net(),
+            "Unattended must NOT prompt for net (fail-closed)"
+        );
+    }
+
+    // ── resolve_net_enabled (FIX B pure helper) ──────────────────────────────
+
+    /// Unattended + transient-only grant → net DISABLED (fail-closed).
+    /// A stale AllowOnce granted before the mode was changed to Unattended must not
+    /// silently enable network in an unattended run.
+    #[test]
+    fn unattended_with_transient_only_net_is_disabled() {
+        assert!(
+            !resolve_net_enabled(false, true, SandboxMode::Unattended),
+            "Unattended + transient-only must be net-disabled (fail-closed)"
+        );
+    }
+
+    /// Unattended + persistent (AllowRemember) → net ENABLED.
+    /// A deliberate standing opt-in must still work even in Unattended mode — that is
+    /// the whole point of AllowRemember (users that want unattended + net explicitly grant it).
+    #[test]
+    fn unattended_with_persistent_net_is_enabled() {
+        assert!(
+            resolve_net_enabled(true, false, SandboxMode::Unattended),
+            "Unattended + persistent must be net-enabled (explicit AllowRemember)"
+        );
+    }
+
+    /// Unattended + both flags → net ENABLED (persistent wins).
+    #[test]
+    fn unattended_with_both_flags_net_is_enabled() {
+        assert!(
+            resolve_net_enabled(true, true, SandboxMode::Unattended),
+            "Unattended + persistent + transient must be net-enabled (persistent wins)"
+        );
+    }
+
+    /// Ask + transient → net ENABLED (normal interactive grant path).
+    #[test]
+    fn ask_with_transient_net_is_enabled() {
+        assert!(
+            resolve_net_enabled(false, true, SandboxMode::Ask),
+            "Ask + transient must be net-enabled"
+        );
+    }
+
+    /// AutoAcceptInWorkspace + transient → net ENABLED (same as Ask for network).
+    #[test]
+    fn auto_accept_with_transient_net_is_enabled() {
+        assert!(
+            resolve_net_enabled(false, true, SandboxMode::AutoAcceptInWorkspace),
+            "AutoAcceptInWorkspace + transient must be net-enabled"
+        );
+    }
+
+    /// No flags, any mode → net DISABLED.
+    #[test]
+    fn no_flags_any_mode_net_is_disabled() {
+        assert!(!resolve_net_enabled(false, false, SandboxMode::Ask));
+        assert!(!resolve_net_enabled(false, false, SandboxMode::AutoAcceptInWorkspace));
+        assert!(!resolve_net_enabled(false, false, SandboxMode::Unattended));
     }
 
     // ── ConsentRequest serde round-trip ──────────────────────────────────────

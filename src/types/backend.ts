@@ -741,6 +741,19 @@ export type AgentClaimStatus =
   | "claimed"
   | "provider_action_pending";
 
+/**
+ * Per-project sandbox autonomy level.
+ *
+ * Maps to the Rust enum `SandboxMode` (serde rename_all = "camelCase"):
+ *   Ask                   → "ask"
+ *   AutoAcceptInWorkspace → "autoAcceptInWorkspace"
+ *   Unattended            → "unattended"
+ *
+ * The backend omits the field (skip_serializing_if) when the value is the
+ * default "ask", so the frontend MUST treat `undefined` as "ask".
+ */
+export type SandboxMode = "ask" | "autoAcceptInWorkspace" | "unattended";
+
 export interface ProjectMetadata {
   id: string;
   title: string;
@@ -751,6 +764,12 @@ export interface ProjectMetadata {
   netEnabled?: boolean;
   /** Whether the Censor reviewer is trusted (opted in) for this project. */
   censorTrusted?: boolean;
+  /**
+   * Per-project sandbox autonomy level. Absent means "ask" (the default).
+   * The backend skips serializing this field when it equals the default, so
+   * `undefined` and `"ask"` are semantically identical on the frontend.
+   */
+  sandboxMode?: SandboxMode;
 }
 
 export interface ProjectTaskCounts {
