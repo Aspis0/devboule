@@ -156,11 +156,20 @@ pub struct ScopedAgentTools {
     /// paths (the directive's file scope). Reads stay project-wide for context. Empty = no
     /// extra restriction beyond the scope root.
     write_allowlist: Vec<String>,
+    /// Network policy for the OS sandbox around `run` commands. Default `None` (deny). The caller
+    /// sets it to `Enabled` for a project the user unblocked after a network-blocked failure
+    /// (per-project flag). `Loopback` is unused here for now.
+    net: crate::backend::sandbox::NetPolicy,
 }
 
 impl ScopedAgentTools {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, touched: Vec::new(), write_allowlist: Vec::new() }
+        Self {
+            root,
+            touched: Vec::new(),
+            write_allowlist: Vec::new(),
+            net: crate::backend::sandbox::NetPolicy::None,
+        }
     }
 
     /// Restrict WRITES to `files` (the directive's allowlist). Empty leaves writes confined
@@ -169,6 +178,13 @@ impl ScopedAgentTools {
         // Normalize through safe_rel_path so the allowlist matches what write_file/edit_file
         // compare against (e.g. a directive's "./src/a.rs" → "src/a.rs"). Drops invalid entries.
         self.write_allowlist = files.into_iter().filter_map(|f| safe_rel_path(&f).ok()).collect();
+        self
+    }
+
+    /// Set the network policy for sandboxed `run` commands (default `None`). Used to unblock a
+    /// project to `Enabled` after the user approves a network-blocked failure.
+    pub fn with_net(mut self, net: crate::backend::sandbox::NetPolicy) -> Self {
+        self.net = net;
         self
     }
 
@@ -369,7 +385,7 @@ impl ScopedAgentTools {
         // app-level RCE gate (parse_run_command allowlist), env_clear, and process_group below
         // stay as defense-in-depth ON TOP of the OS sandbox. On non-macOS, wrap is a passthrough
         // (Windows lands in phase 3) and logs a warning.
-        let policy = agentic_run_policy(&self.root);
+        let policy = agentic_run_policy(&self.root, self.net.clone());
         let wrapped = crate::backend::sandbox::wrap(&policy, &argv[0], &argv[1..], &self.root);
         let mut cmd = std::process::Command::new(&wrapped.program);
         cmd.args(&wrapped.args)
@@ -454,6 +470,9 @@ impl ScopedAgentTools {
             body.truncate(end);
             body.push_str("\n…[truncated]");
         }
+        if matches!(self.net, crate::backend::sandbox::NetPolicy::None) && looks_network_blocked(&body) {
+            body.push_str(NETWORK_BLOCKED_HINT);
+        }
         Ok(body)
     }
 }
@@ -463,10 +482,30 @@ impl ScopedAgentTools {
 /// is DENY by default (a hostile test cannot exfiltrate). Per-project network unlock to Enabled
 /// is a later slice (1b: detect a network-blocked failure → let the user re-run with net). rlimits
 /// are NOT yet enforced by wrap (TODO in wrap).
-fn agentic_run_policy(root: &std::path::Path) -> crate::backend::sandbox::SandboxPolicy {
+fn agentic_run_policy(
+    root: &std::path::Path,
+    net: crate::backend::sandbox::NetPolicy,
+) -> crate::backend::sandbox::SandboxPolicy {
     crate::backend::sandbox::SandboxPolicy::deny(root.to_path_buf())
         .writable(root.to_path_buf())
-    // net stays None (deny) — the default of `deny`.
+        .net(net)
+}
+
+const NETWORK_BLOCKED_HINT: &str = "\n--- HINT: this command likely needs NETWORK access, which is \
+DISABLED for this project's sandbox. If you trust it, enable network for this project and re-run. ---";
+
+/// Heuristic: does `body` look like a command that failed because the sandbox denied network?
+/// Used only when net == None to append a HINT (no false-positive risk: it only adds advice).
+fn looks_network_blocked(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "could not resolve host", "couldn't resolve host", "name resolution", "getaddrinfo",
+        "temporary failure in name resolution", "network is unreachable", "no route to host",
+        "connection refused", "operation not permitted", "failed to download", "failed to get",
+        "spurious network error", "etimedout", "enotfound", "econnrefused",
+        "connection timed out", "could not connect", "network error", "tls handshake",
+    ];
+    NEEDLES.iter().any(|n| b.contains(n))
 }
 
 /// Read a child stream, keeping at most `MAX_RUN_OUTPUT` bytes but CONTINUING to read+discard
@@ -597,13 +636,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agentic_run_policy_is_net_none_and_writable_root() {
+    fn agentic_run_policy_respects_net() {
         use crate::backend::sandbox::NetPolicy;
         let root = std::path::PathBuf::from("/some/project/root");
-        let policy = super::agentic_run_policy(&root);
-        assert_eq!(policy.net, NetPolicy::None);
-        assert_eq!(policy.readonly_root, root);
-        assert!(policy.writable_paths.contains(&root), "scope root must be writable");
+        let p_none = super::agentic_run_policy(&root, NetPolicy::None);
+        assert_eq!(p_none.net, NetPolicy::None);
+        assert_eq!(p_none.readonly_root, root);
+        assert!(p_none.writable_paths.contains(&root), "scope root must be writable");
+        let p_en = super::agentic_run_policy(&root, NetPolicy::Enabled);
+        assert_eq!(p_en.net, NetPolicy::Enabled);
+    }
+
+    #[test]
+    fn looks_network_blocked_detects_common_failures() {
+        assert!(super::looks_network_blocked("error: could not resolve host: crates.io"));
+        assert!(super::looks_network_blocked("npm ERR! network ETIMEDOUT"));
+        assert!(super::looks_network_blocked("curl: (7) Connection refused"));
+        assert!(!super::looks_network_blocked("test result: ok. 5 passed"));
+        assert!(!super::looks_network_blocked("compile error: missing semicolon"));
     }
 
     #[test]
