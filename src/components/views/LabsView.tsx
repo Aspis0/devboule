@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FlaskConical, Bird, BrainCircuit } from "lucide-react";
+import { FlaskConical, Bird, BrainCircuit, Sparkles, Moon, Lock, AlertTriangle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { invokeBackendCommand } from "../../context/AppContext";
 
@@ -12,6 +12,8 @@ interface FeatureToggleCardProps {
   setCommand: string;
   defaultEnabled: boolean;
   Icon: LucideIcon;
+  /** When set, render a prominent caution block instead of the plain description. */
+  warning?: string;
 }
 
 function FeatureToggleCard({
@@ -23,6 +25,7 @@ function FeatureToggleCard({
   setCommand,
   defaultEnabled,
   Icon,
+  warning,
 }: FeatureToggleCardProps) {
   const [enabled, setEnabled] = useState(defaultEnabled);
   const [busy, setBusy] = useState(false);
@@ -95,8 +98,49 @@ function FeatureToggleCard({
           />
         </button>
       </div>
-      <p className="mt-4 text-[12px] leading-5 text-cream-600">{description}</p>
+      {warning ? (
+        <div className="mt-4 flex gap-2 rounded-xl border border-amber/40 bg-amber/10 p-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-dark" />
+          <p className="text-[12px] leading-5 text-amber-dark">{warning}</p>
+        </div>
+      ) : (
+        <p className="mt-4 text-[12px] leading-5 text-cream-600">{description}</p>
+      )}
       <p className="mt-2 text-[11px] text-cream-400">Applies on app restart.</p>
+    </div>
+  );
+}
+
+interface ComingSoonCardProps {
+  title: string;
+  subtitle: string;
+  description: string;
+  reference?: string;
+  Icon: LucideIcon;
+}
+
+function ComingSoonCard({ title, subtitle, description, reference, Icon }: ComingSoonCardProps) {
+  return (
+    <div className="rounded-2xl border border-dashed border-cream-200 bg-cream-50 p-5 opacity-70">
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-cream-200/60">
+            <Icon className="h-4 w-4 text-cream-400" />
+          </div>
+          <div className="mt-3 flex flex-col">
+            <span className="text-[11px] font-semibold uppercase tracking-widest text-cream-400">
+              {title}
+            </span>
+            <span className="text-[11px] text-cream-400">{subtitle}</span>
+          </div>
+        </div>
+        <span className="inline-flex items-center gap-1 rounded-full bg-cream-200/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-widest text-cream-500">
+          <Lock className="h-3 w-3" aria-hidden="true" />
+          In test
+        </span>
+      </div>
+      <p className="mt-4 text-[12px] leading-5 text-cream-500">{description}</p>
+      {reference ? <p className="mt-2 text-[11px] text-cream-400">Ref: {reference}</p> : null}
     </div>
   );
 }
@@ -115,6 +159,10 @@ export function LabsView() {
           </p>
         </div>
       </div>
+
+      <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-widest text-cream-400">
+        Active
+      </h2>
       <div className="grid gap-4">
         <FeatureToggleCard
           title="Pigeon"
@@ -135,6 +183,26 @@ export function LabsView() {
           setCommand="set_oracle_enabled"
           defaultEnabled={true}
           Icon={BrainCircuit}
+          warning="Core dependency. Switching Oracle off stops the RAG/embeddings server, so agents lose semantic project context and the auto-reindex on commit. The app keeps running and the Kanban/plan tools still work, but agents get much weaker. Switch off only to debug."
+        />
+      </div>
+
+      <h2 className="mb-3 mt-8 text-[11px] font-semibold uppercase tracking-widest text-cream-400">
+        Not available yet · in testing
+      </h2>
+      <div className="grid gap-4">
+        <ComingSoonCard
+          title="SkillOpt"
+          subtitle="Self-improving skills"
+          description="Automatically tunes the SKILL.md manuals from real outcomes, so the agents' playbooks get better over time."
+          reference="Microsoft / Darwin (Darwin Gödel Machine)"
+          Icon={Sparkles}
+        />
+        <ComingSoonCard
+          title="ORPO Night"
+          subtitle="Nightly local fine-tune"
+          description="Trains the local mini-coder overnight on accepted edit-pairs captured by the Censor. May never ship."
+          Icon={Moon}
         />
       </div>
     </div>
