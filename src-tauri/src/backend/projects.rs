@@ -6218,51 +6218,12 @@ fn toml_array(values: &[&str]) -> String {
     format!("[{values}]")
 }
 
-#[cfg(windows)]
+/// Resolve a command against the AUGMENTED PATH so a GUI-launched app (stripped PATH) still
+/// finds Homebrew/npm/cargo tools. Pure scan, no shell spawn (no argv injection surface) — see
+/// `provider_detect::resolve_program`, which is cross-platform (handles path-bearing names and
+/// Windows extensions), so the old windows/unix split is no longer needed.
 pub(crate) fn command_exists(executable: &str) -> bool {
-    use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW so the where.exe probe never flashes a console window.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    Command::new("where.exe")
-        .arg(executable)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-// UNVERIFIED on macOS — needs testing on a real Mac.
-/// Unix variant: resolve a command on PATH WITHOUT spawning a shell. The previous
-/// `sh -c "command -v {} ..."` interpolated the executable into a shell string;
-/// even with single-quote escaping a name carrying shell metacharacters could be
-/// executed as code (argv injection). Now that this fn is `pub(crate)` its callers
-/// (incl. the Censor runners, fed paths from the MCP boundary) widen that exposure,
-/// so we do a pure PATH scan instead: iterate the `PATH` entries and accept the
-/// first that contains an executable regular file named `executable`. No shell, no
-/// interpolation, no spawn.
-#[cfg(unix)]
-pub(crate) fn command_exists(executable: &str) -> bool {
-    /// A path is runnable if it is an existing regular file with any execute bit set.
-    fn is_executable_file(candidate: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(candidate) {
-            Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
-            Err(_) => false,
-        }
-    }
-
-    // An absolute / path-bearing name is checked directly (mirrors how a shell
-    // would resolve `./tool` or `/usr/bin/tool` without consulting PATH).
-    if executable.contains('/') {
-        return is_executable_file(Path::new(executable));
-    }
-    let path_var = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return false,
-    };
-    std::env::split_paths(&path_var)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .any(|dir| is_executable_file(&dir.join(executable)))
+    crate::backend::provider_detect::resolve_program(executable).is_some()
 }
 
 pub(crate) fn ps_single_quote(value: &str) -> String {
