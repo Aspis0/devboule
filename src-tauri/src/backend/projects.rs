@@ -10438,6 +10438,8 @@ updated_at: 2026-05-28T00:00:00Z
                 system_prompt: Some("be terse".to_string()),
                 max_turns: Some(7),
                 max_budget_usd: None,
+                verifier_per_task: false,
+                max_recall_per_project: false,
             };
             Ok(())
         })

@@ -86,6 +86,12 @@ pub fn process_censor_review(
         file: request.file.clone(),
         findings: Vec::new(),
     };
+    // BLOCKER B (anti-RCE): NEVER run the repo's own tool-configs (eslintrc, build.rs, …) for an
+    // UNTRUSTED project, even via this async path. The sync verdict gate enforces this for the mini;
+    // mirror it here because the Pigeon producer is best-effort and does not pre-check trust.
+    if !crate::backend::projects::project_censor_trusted(app, &request.project_id).unwrap_or(false) {
+        return receipt;
+    }
     // Resolve the canonical working root from the project id (single source of truth — the
     // producer need not know it). An unknown/unrooted project is a clean no-op.
     let root = match crate::backend::projects::resolve_project_root_by_id(app, &request.project_id) {
@@ -167,7 +173,10 @@ pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
                 Ok(req) => {
                     CENSOR_REVIEW_INFLIGHT.fetch_add(1, Ordering::SeqCst);
                     let app_for_thread = app.clone();
-                    std::thread::spawn(move || {
+                    // Builder::spawn returns Err (instead of panicking) if the OS refuses a thread,
+                    // so a spawn failure can't leak the reserved in-flight slot. ticket is Copy, so it
+                    // stays usable below for the failure path.
+                    let spawned = std::thread::Builder::new().spawn(move || {
                         // Decrements the in-flight slot on ANY exit (success, error, or panic).
                         let _guard = InflightGuard;
                         let reviewed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -206,6 +215,15 @@ pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
                             }
                         }
                     });
+                    if spawned.is_err() {
+                        // OS refused the thread: undo the reserved slot and let the sweep requeue.
+                        CENSOR_REVIEW_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        let _ = client.fail(
+                            ticket,
+                            PIGEON_CENSOR_POOL_RECEIVER,
+                            "censor review thread spawn failed",
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("censor-review ingest: undecodable request (ticket {ticket}): {e}");

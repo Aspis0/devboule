@@ -1687,7 +1687,7 @@ export function ProjectsView() {
         input: {
           projectId: pid,
           role: "verifier",
-          client: "claude",
+          client: mainCoderClient,
           agentId: `verifier-${taskId ?? "recall"}-${Date.now()}-${idx}`,
           taskId,
           host: "app",
@@ -1727,6 +1727,7 @@ export function ProjectsView() {
     currentProject?.metadata.agentControls,
     currentProject?.metadata.id,
     isArchived,
+    mainCoderClient,
   ]);
 
   const launchAgent = async (

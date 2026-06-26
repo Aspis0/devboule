@@ -409,7 +409,7 @@ export function CensorPanelView({
                   data-censor-missing-tool={t.name}
                   title={hint ? `Click to copy: ${hint}` : `${t.name} is not installed`}
                   onClick={() => {
-                    if (hint) void navigator.clipboard?.writeText(hint);
+                    if (hint) void navigator.clipboard?.writeText(hint).catch(() => {});
                   }}
                   className="inline-flex items-center gap-1 rounded-md border border-coral/30 bg-coral/8 px-2 py-0.5 text-[10px] text-coral-dark hover:bg-coral/15"
                 >

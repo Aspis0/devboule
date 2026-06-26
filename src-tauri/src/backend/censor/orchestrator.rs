@@ -518,7 +518,7 @@ pub fn run_fine_batch(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
 ) {
-    run_fine_batch_inner(app, project_id, root, files, gemma, running, true);
+    run_fine_batch_inner(app, project_id, root, files, gemma, running, true, true);
 }
 
 /// WARNING 4 (P6 verdict gate): like [`run_fine_batch`] but SKIPS the training-rail
@@ -536,7 +536,7 @@ pub fn run_fine_batch_no_rail(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
 ) {
-    run_fine_batch_inner(app, project_id, root, files, gemma, running, false);
+    run_fine_batch_inner(app, project_id, root, files, gemma, running, false, false);
 }
 
 /// Shared core of [`run_fine_batch`] / [`run_fine_batch_no_rail`]. `record_rail`
@@ -549,11 +549,17 @@ fn run_fine_batch_inner(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
     record_rail: bool,
+    emit_scan: bool,
 ) {
     if !running.load(Ordering::SeqCst) {
         return;
     }
-    emit_scan_started(app, project_id, "fine", files.len(), running);
+    // Only the LIVE watcher lights the "linters running…" indicator. The verdict gate and the async
+    // Censor review reuse this pass too, but they must NOT flicker the indicator (findings-updated
+    // still fires below so their findings surface).
+    if emit_scan {
+        emit_scan_started(app, project_id, "fine", files.len(), running);
+    }
     let changed = fine_batch_collect(root, files, gemma);
     // TRAINING RAIL: record findings for every changed file while the project is
     // still running. Agent-state snapshot is read under its lock, cloned to owned

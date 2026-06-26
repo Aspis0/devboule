@@ -450,7 +450,9 @@ export function ProjectWorkspace({
 
     void (async () => {
       const { listen } = await import("@tauri-apps/api/event");
+      if (cancelled) return; // torn down before the dynamic import resolved — register nothing.
       const un1 = await listen("censor://scan-started", (event) => {
+        if (cancelled) return;
         const payload = event.payload as { projectId: string; fileCount?: number };
         if (payload.projectId !== pid) return;
         setCensorScanning(true);
@@ -460,19 +462,24 @@ export function ProjectWorkspace({
           if (!cancelled) setCensorScanning(false);
         }, 45000);
       });
+      if (cancelled) {
+        un1();
+        return;
+      }
       unlistens.push(un1);
       const un2 = await listen("censor://findings-updated", (event) => {
+        if (cancelled) return;
         const payload = event.payload as { projectId: string };
         if (payload.projectId !== pid) return;
         clearScanTimer();
         setCensorScanning(false);
         void refreshMissingTools();
       });
-      unlistens.push(un2);
       if (cancelled) {
-        unlistens.forEach((u) => u());
+        un2();
         return;
       }
+      unlistens.push(un2);
       await refreshMissingTools();
     })();
 
