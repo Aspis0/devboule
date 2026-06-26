@@ -1496,9 +1496,15 @@ fn claim_and_launch(
         // project was switched to Unattended) must NOT silently enable net — Unattended
         // is fail-closed.  We therefore only consume the transient grant when the mode
         // would actually honour it (Ask / AutoAcceptInWorkspace).
-        let sandbox_mode =
+        // SLICE 1 capability gate: Unattended autonomy is honoured ONLY where the OS sandbox is
+        // actually enforced (`sandbox::is_enforced()`); on an un-sandboxed platform it silently
+        // degrades to Ask (Decision B + silent fallback). `is_enforced()` is constant per process,
+        // so applying the same gate at finalize stays consistent with this spawn-time decision.
+        let sandbox_mode = crate::backend::broker::effective_sandbox_mode(
             crate::backend::projects::project_sandbox_mode(app, &project_id)
-                .unwrap_or(crate::backend::broker::SandboxMode::Ask);
+                .unwrap_or(crate::backend::broker::SandboxMode::Ask),
+            crate::backend::sandbox::is_enforced(),
+        );
 
         // CHEAP FIX A + WARNING 2 fix: atomically drain BOTH net and folder grants in a
         // single combined lock acquisition, eliminating the split-grant race where two
@@ -1511,6 +1517,11 @@ fn claim_and_launch(
             .unwrap_or((false, std::collections::HashSet::new()));
 
         // Discard in Unattended (fail-closed); honour in Ask / AutoAcceptInWorkspace.
+        // NOTE (Slice 1): `sandbox_mode` here is the EFFECTIVE mode — on an un-sandboxed platform
+        // `effective_sandbox_mode` has already degraded a raw `Unattended` to `Ask`, so this branch
+        // honours the transient grant (full-Ask supervised behaviour, by design — see
+        // `broker::degraded_unattended_behaves_as_full_ask_not_stricter`). On macOS (enforced) the
+        // effective mode equals the raw mode, so a real Unattended project still fails closed.
         let transient_net = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
             transient_net_taken
         } else {
@@ -1724,8 +1735,14 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     let sandbox_mode = project_id
         .as_deref()
         .map(|pid| {
-            crate::backend::projects::project_sandbox_mode(app, pid)
-                .unwrap_or(crate::backend::broker::SandboxMode::Ask)
+            // SLICE 1 capability gate (same wrapper as the spawn site): degrade Unattended→Ask
+            // where the OS sandbox is not enforced, so finalize's prompt-gating matches the
+            // spawn-time decision. On macOS is_enforced()=true → identity (no behaviour change).
+            crate::backend::broker::effective_sandbox_mode(
+                crate::backend::projects::project_sandbox_mode(app, pid)
+                    .unwrap_or(crate::backend::broker::SandboxMode::Ask),
+                crate::backend::sandbox::is_enforced(),
+            )
         });
 
     if was_net_blocked {

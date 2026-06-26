@@ -195,6 +195,32 @@ fn set_rlimit(resource: libc::c_int, value: u64) {
 #[cfg(not(unix))]
 pub fn apply_rlimits(_cmd: &mut std::process::Command, _limits: &ResourceLimits) {}
 
+/// Returns `true` if this platform actually applies OS-level sandbox confinement in [`wrap`].
+///
+/// This is the SINGLE source of truth for "is the sandbox real here". Callers gate autonomous
+/// (Unattended) behaviour on it so that no agent runs unsupervised code without OS isolation
+/// (see `broker::effective_sandbox_mode`). Zero-I/O, compile-time only.
+///
+/// Forward-compatible: when the Windows Job Object backend lands (sandbox epic phase 3 — Restricted
+/// Token + WFP + Job Object, the `#[cfg(not(target_os = "macos"))]` passthrough branch in `wrap`),
+/// Windows go-live is JUST flipping the `windows` arm below to `true`. No other code changes.
+pub fn is_enforced() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Flips to `true` when the Windows Job Object backend lands (sandbox epic phase 3).
+        false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux/other: `wrap` is passthrough (landlock stub) — no OS confinement yet.
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +281,21 @@ mod tests {
         assert_eq!(limits.cpu_secs, 600);
         assert_eq!(limits.addr_space_bytes, None);
         assert_eq!(limits.max_procs, 256);
+    }
+
+    /// macOS DOES apply real OS confinement (Seatbelt) in `wrap`, so `is_enforced()` is true here.
+    /// This is the predicate that gates Unattended autonomy (`broker::effective_sandbox_mode`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn is_enforced_true_on_macos() {
+        assert!(is_enforced());
+    }
+
+    /// Off macOS, `wrap` is passthrough (no OS confinement), so `is_enforced()` is false until the
+    /// platform sandbox backend lands.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn is_enforced_false_off_macos() {
+        assert!(!is_enforced());
     }
 }

@@ -118,6 +118,28 @@ pub fn resolve_net_enabled(persistent: bool, transient: bool, mode: SandboxMode)
     false
 }
 
+/// Apply the platform **capability gate** to a per-project `SandboxMode`.
+///
+/// Decision B (with silent fallback): `Unattended` is the autonomy-bearing mode — it runs the
+/// agent unsupervised (fail-closed, no prompts). That is only safe where the OS sandbox actually
+/// confines the executed commands. So `Unattended` is honoured **only when `sandbox_enforced`**;
+/// otherwise it silently degrades to `Ask` (supervised) — no banner, no error (per the owner).
+///
+/// `sandbox_enforced` comes from [`crate::backend::sandbox::is_enforced`] — the single platform
+/// truth. On macOS it is `true`, so this function is the **identity** there (zero behaviour
+/// change). On a not-yet-sandboxed platform (Windows today) an `Unattended` project behaves like
+/// `Ask` until the Job Object backend lands and `is_enforced()` flips to `true` — at which point
+/// `Unattended` lights up with **no change to this code**.
+///
+/// `Ask` and `AutoAcceptInWorkspace` are never altered (they are already supervised). Pure, no I/O.
+pub fn effective_sandbox_mode(mode: SandboxMode, sandbox_enforced: bool) -> SandboxMode {
+    if mode == SandboxMode::Unattended && !sandbox_enforced {
+        SandboxMode::Ask
+    } else {
+        mode
+    }
+}
+
 // ──────────────────────────────────────────────
 // Wire types (provider-agnostic)
 // ──────────────────────────────────────────────
@@ -835,6 +857,69 @@ mod tests {
         assert!(!resolve_net_enabled(false, false, SandboxMode::Ask));
         assert!(!resolve_net_enabled(false, false, SandboxMode::AutoAcceptInWorkspace));
         assert!(!resolve_net_enabled(false, false, SandboxMode::Unattended));
+    }
+
+    // ── effective_sandbox_mode (Slice 1 capability gate) ─────────────────────
+
+    /// Unattended is honoured only where the OS sandbox is enforced.
+    #[test]
+    fn effective_mode_unattended_honoured_when_enforced() {
+        assert_eq!(
+            effective_sandbox_mode(SandboxMode::Unattended, true),
+            SandboxMode::Unattended,
+            "enforced platform (macOS) keeps Unattended"
+        );
+    }
+
+    /// Unattended silently degrades to Ask where the OS sandbox is NOT enforced (Decision B).
+    #[test]
+    fn effective_mode_unattended_degrades_to_ask_when_not_enforced() {
+        assert_eq!(
+            effective_sandbox_mode(SandboxMode::Unattended, false),
+            SandboxMode::Ask,
+            "un-sandboxed platform must not run unattended autonomy"
+        );
+    }
+
+    /// Ask and AutoAcceptInWorkspace are never altered, regardless of enforcement.
+    #[test]
+    fn effective_mode_supervised_modes_unchanged() {
+        assert_eq!(effective_sandbox_mode(SandboxMode::Ask, false), SandboxMode::Ask);
+        assert_eq!(effective_sandbox_mode(SandboxMode::Ask, true), SandboxMode::Ask);
+        assert_eq!(
+            effective_sandbox_mode(SandboxMode::AutoAcceptInWorkspace, false),
+            SandboxMode::AutoAcceptInWorkspace
+        );
+        assert_eq!(
+            effective_sandbox_mode(SandboxMode::AutoAcceptInWorkspace, true),
+            SandboxMode::AutoAcceptInWorkspace
+        );
+    }
+
+    /// COMPOSED contract (pins the deliberate Decision-B semantics; addresses the Slice-1 review):
+    /// on an un-enforced platform an `Unattended` project degrades to a FULLY supervised `Ask`
+    /// session — it is NOT made stricter than Ask. The degrade is intentional: the owner chose "silent
+    /// fallback to human-gated (supervised)", so prompts return AND user approvals (transient
+    /// grants) are honoured. Suppressing transient grants under the degraded mode would create an
+    /// infinite re-prompt loop (approve AllowOnce → suppressed → blocked → prompt again). An
+    /// un-sandboxed platform is unconfined for EVERY mode anyway; the capability gate's job is to
+    /// deny *autonomy* (Unattended's gate-bypass), not to make Unattended more restrictive than Ask.
+    #[test]
+    fn degraded_unattended_behaves_as_full_ask_not_stricter() {
+        let enforced = false; // e.g. Windows today
+        let effective = effective_sandbox_mode(SandboxMode::Unattended, enforced);
+        assert_eq!(effective, SandboxMode::Ask, "degrades to Ask on un-enforced platform");
+        // Under the degraded mode, a user-approved one-shot (transient) grant IS honoured — same
+        // as any Ask session — so the user is never stuck in a re-prompt loop.
+        assert!(
+            resolve_net_enabled(false, true, effective),
+            "degraded Ask honours a transient net grant (supervised, not fail-closed)"
+        );
+        // And the degraded mode prompts (supervised), unlike raw Unattended (fail-closed silent).
+        assert!(effective.prompts_for_net(), "degraded mode is supervised → prompts for net");
+        assert!(effective.prompts_for_folder_write(), "degraded mode prompts for folder write");
+        // Sanity: on an enforced platform (macOS) there is NO degrade — Unattended stays Unattended.
+        assert_eq!(effective_sandbox_mode(SandboxMode::Unattended, true), SandboxMode::Unattended);
     }
 
     // ── ConsentRequest serde round-trip ──────────────────────────────────────
