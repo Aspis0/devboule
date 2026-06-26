@@ -22,6 +22,12 @@ class PollResponse(BaseModel):
 class DoneRequest(BaseModel):
     ticket_no: int
     result: dict
+    agent_id: Optional[str] = None
+
+class FailRequest(BaseModel):
+    ticket_no: int
+    agent_id: str
+    error: str
 
 class Agent(BaseModel):
     agent_id: str
@@ -41,6 +47,8 @@ class Task(BaseModel):
     result: Optional[dict] = None
     error_msg: Optional[str] = None
     reply_to_ticket: Optional[int] = None
+    attempts: int = 0
+    visibility_deadline: Optional[int] = None
     created_at: int
     claimed_at: Optional[int] = None
     done_at: Optional[int] = None

@@ -194,6 +194,32 @@ pub fn on_app_exit() {
     if let Some(mutex) = PIGEON_CHILD.get() {
         let mut guard = mutex.lock().unwrap();
         if let Some(mut child) = guard.take() {
+            // GRACEFUL STOP (Slice 2): send SIGTERM first so uvicorn runs the FastAPI lifespan
+            // shutdown — which checkpoints the SQLite WAL (`wal_checkpoint(TRUNCATE)`) and closes
+            // the connection cleanly — BEFORE we force-kill. Windows has no SIGTERM, so that build
+            // falls straight through to kill() (TerminateProcess); the WAL is still crash-safe via
+            // recovery, this just bounds its growth on a clean exit.
+            #[cfg(unix)]
+            {
+                // SAFETY: kill() with a live pid and SIGTERM is async-signal-safe and well-defined.
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                }
+                let graceful_deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return, // exited cleanly after the WAL checkpoint
+                        Ok(None) => {
+                            if Instant::now() > graceful_deadline {
+                                break; // escalate to SIGKILL below
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+            // Escalate (or the Windows path): force-kill, then reap up to 5s.
             let _ = child.kill();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
