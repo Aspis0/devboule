@@ -675,6 +675,16 @@ pub struct MiniCoderDirective {
     /// appended) and fail it rather than leave it in limbo. NO-CHURN: omitted when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_directive_id: Option<String>,
+    /// Slice 3 (Pigeon transport): the Pigeon mailbox ticket this directive arrived on,
+    /// stamped by the executor's INGEST when it drains `mini-pool` (seam B). The EGRESS
+    /// (seam C) posts the terminal outcome back to THIS ticket (`/pigeon/done`) so the
+    /// Python `spawn_mini_coder` wait, which polls `/pigeon/status/{ticket}`, unblocks.
+    /// NO-CHURN: a directive that never went through Pigeon (the default file path, AND
+    /// every Python-written directive) omits this entirely (None), so the on-disk JSON is
+    /// byte-identical to before this slice. The Python co-owner preserves it verbatim
+    /// (passthrough, like `claimedAt`/`scratchPath`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pigeon_ticket: Option<i64>,
 }
 
 /// `skip_serializing_if` for a `u32` that is zero-by-default (NO-CHURN co-ownership,
@@ -1052,6 +1062,11 @@ pub fn build_retry_directive(
         attempt: predecessor.attempt + 1,
         parent_directive_id: Some(root),
         retry_directive_id: None,
+        // Slice 3: there is ONE Pigeon ticket for the whole retry chain (the ROOT's task,
+        // which the Python wait polls). CARRY it forward so the LEAF directive — the one
+        // `finalize_finished_mini` terminates — knows the ticket and its egress (seam C)
+        // posts the terminal outcome back to it, unblocking the root's `/status` poll.
+        pigeon_ticket: predecessor.pigeon_ticket,
     }
 }
 
@@ -2260,6 +2275,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             retry_directive_id: None,
+            pigeon_ticket: None,
         }
     }
 
@@ -2289,6 +2305,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             retry_directive_id: None,
+            pigeon_ticket: None,
         };
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"claimedAt\""), "json: {json}");
@@ -2302,8 +2319,24 @@ mod tests {
         assert!(!json.contains("parent_agent_id"), "snake leaked: {json}");
         // status snake_case over the wire.
         assert!(json.contains("\"status\":\"running\""), "json: {json}");
+        // Slice 3 NO-CHURN: a directive that never went through Pigeon (pigeon_ticket None)
+        // OMITS the field entirely — byte-identical to before this slice.
+        assert!(!json.contains("pigeonTicket"), "None ticket must be omitted: {json}");
 
         let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn pigeon_ticket_round_trips_as_camel_case_when_present() {
+        // Slice 3: when the directive arrived via Pigeon, the ticket is carried as the
+        // camelCase `pigeonTicket` and survives a round-trip (the Python co-owner reads it).
+        let mut d = directive("d-pigeon", MiniCoderStatus::Pending, "2026-06-26T00:00:00Z");
+        d.pigeon_ticket = Some(42);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"pigeonTicket\":42"), "json: {json}");
+        let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pigeon_ticket, Some(42));
         assert_eq!(d, back);
     }
 

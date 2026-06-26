@@ -73,8 +73,11 @@ impl PigeonClient {
     pub fn poll(&self, agent_id: &str) -> Result<Option<(i64, Value)>, String> {
         let resp = self
             .http
+            // MAX-RECALL: /poll returns IMMEDIATELY (claim-or-null, not a long-poll), and it runs on
+            // the single mini-executor thread — a long timeout here would stall every timeout/launch/
+            // finalize if the dispatcher wedges. 5s is generous for a loopback immediate-return.
             .get(self.url("/pigeon/poll"))
-            .timeout(Duration::from_secs(35))
+            .timeout(Duration::from_secs(5))
             .header(AUTH_HEADER, &self.token)
             .query(&[("agent_id", agent_id)])
             .send()
@@ -145,7 +148,10 @@ fn parse_ok(resp: reqwest::blocking::Response, op: &str) -> Result<Value, String
             .map_err(|e| format!("Pigeon {op}: invalid JSON in response: {e}"))
     } else {
         let code = status.as_u16();
+        // MAX-RECALL: truncate the body — callers log these errors, and a response body could echo
+        // task/result text. The status code (always present) is what callers branch on.
         let detail = resp.text().unwrap_or_default();
+        let detail: String = detail.chars().take(256).collect();
         Err(format!("Pigeon {op}: HTTP {code}: {detail}"))
     }
 }

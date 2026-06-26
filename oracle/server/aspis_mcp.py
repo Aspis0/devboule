@@ -155,6 +155,29 @@ MINI_CODER_POLL_TIMEOUT_SECS = 1800.0
 # Sleep between result re-reads. Bounded so the lock is taken briefly each pass and
 # never held across the sleep (the executor co-writes the same file).
 MINI_CODER_POLL_INTERVAL_SECS = 0.75
+
+# ── Slice 3 (Pigeon transport) ────────────────────────────────────────────────
+# The mini-dispatch round-trip can be routed through the durable Pigeon mailbox
+# INSTEAD of the blocking `.aspis-agents.json` file-poll — ONLY when the app started
+# the Pigeon child and published its loopback port + auth token to this MCP server
+# via env (gated on the `pigeon.enabled` config flag, decided Rust-side in
+# `pigeon_service::start_if_enabled` / the aspis_mcp spawn in `agents.rs`). When the
+# env is absent (the DEFAULT), `_pigeon_enabled()` is False and EVERY path here is
+# byte-identical to before this slice — no Pigeon import, no HTTP, no behaviour change.
+#
+# The receiver id MUST match the Rust executor's poll id (`mini_coder_executor.rs`):
+# the executor polls `client.poll("mini-pool")` to drain directives this server sends.
+PIGEON_PORT_ENV = "PIGEON_PORT"
+PIGEON_AUTH_TOKEN_ENV = "PIGEON_AUTH_TOKEN"
+PIGEON_MINI_POOL_RECEIVER = "mini-pool"
+# The `/send` priority for a mini directive. Matches the Rust default lane.
+PIGEON_MINI_SEND_PRIORITY = 50
+# Per-request HTTP timeout for the (loopback) Pigeon calls. Short — the dispatcher is a
+# local SQLite-backed FastAPI app; a slow/hung call must not wedge the MCP thread.
+PIGEON_HTTP_TIMEOUT_SECS = 10.0
+# Status-poll cadence for the blocking `wait` path (seam D). Same order as the file
+# poll's interval so the perceived latency is unchanged.
+PIGEON_STATUS_POLL_INTERVAL_SECS = 0.75
 # Visual checks run a native capture + local VLM critique. They should be fast,
 # but the MCP caller must always unblock.
 VISUAL_CHECK_POLL_TIMEOUT_SECS = 120.0
@@ -3506,6 +3529,164 @@ def import_httpx():
     return httpx
 
 
+# ── Slice 3 (Pigeon transport) helpers ────────────────────────────────────────
+def _pigeon_enabled() -> bool:
+    """True when (and only when) the app launched the Pigeon child and published its
+    loopback coordinates to this MCP server. This is the SINGLE gate for the whole
+    Slice-3 transport swap: when False (the default — env absent) every dispatch path
+    is byte-identical to before this slice (no Pigeon import, no HTTP).
+
+    The Rust side sets BOTH env vars together (`pigeon_port()` / `pigeon_auth_token()`)
+    at the aspis_mcp spawn, and ONLY when `pigeon.enabled` is true — so requiring both
+    present-and-non-empty mirrors that all-or-nothing contract exactly.
+    """
+    return bool(optional_env(PIGEON_PORT_ENV)) and bool(optional_env(PIGEON_AUTH_TOKEN_ENV))
+
+
+def _pigeon_base_url() -> str | None:
+    """The loopback base URL of the running Pigeon dispatcher, or None when disabled."""
+    port = optional_env(PIGEON_PORT_ENV)
+    if not port:
+        return None
+    return f"http://127.0.0.1:{port}"
+
+
+def _pigeon_auth_headers() -> dict[str, str]:
+    """The auth header Pigeon requires (`x-pigeon-auth-token`). Empty when disabled."""
+    token = optional_env(PIGEON_AUTH_TOKEN_ENV)
+    return {"x-pigeon-auth-token": token} if token else {}
+
+
+def _pigeon_send_directive(
+    *, sender_id: str, project_id: str, directive: dict[str, Any]
+) -> int:
+    """POST the WHOLE `directive` into the Pigeon mailbox for the Rust mini executor to
+    drain (receiver `mini-pool`). Returns the assigned `ticket_no` (the `pigeonTicket`
+    the wait path then polls). Raises `McpError` on any transport / non-2xx failure so
+    the caller fails LOUDLY (the directive never entered Pigeon and the executor would
+    otherwise never see it). Only reached when `_pigeon_enabled()`.
+    """
+    base = _pigeon_base_url()
+    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+        raise McpError("Pigeon transport requested but PIGEON_PORT is not set.")
+    httpx = import_httpx()
+    body = {
+        "sender_id": sender_id,
+        "receiver_id": PIGEON_MINI_POOL_RECEIVER,
+        "project_id": project_id,
+        "priority": PIGEON_MINI_SEND_PRIORITY,
+        "payload": directive,
+    }
+    try:
+        resp = httpx.post(
+            f"{base}/pigeon/send",
+            headers=_pigeon_auth_headers(),
+            json=body,
+            timeout=PIGEON_HTTP_TIMEOUT_SECS,
+        )
+    except Exception as exc:
+        raise McpError(f"Pigeon send failed (transport): {exc}") from exc
+    if resp.status_code // 100 != 2:
+        raise McpError(f"Pigeon send failed (HTTP {resp.status_code}).")
+    try:
+        ticket_no = resp.json().get("ticket_no")
+    except Exception as exc:
+        raise McpError(f"Pigeon send returned invalid JSON: {exc}") from exc
+    if not isinstance(ticket_no, int):
+        raise McpError("Pigeon send response missing an integer ticket_no.")
+    return ticket_no
+
+
+def _pigeon_status_once(ticket_no: int) -> tuple[str | None, dict[str, Any] | None]:
+    """Single `GET /pigeon/status/{ticket_no}` read. Returns `(status, result)`.
+
+    `status` is the Pigeon task status (`pending`|`claimed`|`done`|`failed`|...), or
+    None on a transport/404 hiccup (treated as "not yet, keep polling" by the caller).
+    `result` is the receiver's stored `result` dict on a `done` task (None otherwise).
+    Best-effort: a transient error here is non-fatal — the bounded wait loop retries.
+    """
+    base = _pigeon_base_url()
+    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+        return None, None
+    httpx = import_httpx()
+    try:
+        resp = httpx.get(
+            f"{base}/pigeon/status/{ticket_no}",
+            headers=_pigeon_auth_headers(),
+            timeout=PIGEON_HTTP_TIMEOUT_SECS,
+        )
+    except Exception:
+        return None, None
+    if resp.status_code // 100 != 2:
+        return None, None
+    try:
+        body = resp.json()
+    except Exception:
+        return None, None
+    status = body.get("status")
+    result = body.get("result")
+    return (str(status) if status is not None else None,
+            result if isinstance(result, dict) else None)
+
+
+def _await_mini_directive_pigeon(
+    directive_id: str, pigeon_ticket: int, deadline: float
+) -> dict[str, Any]:
+    """Seam D (Pigeon mode): poll `GET /pigeon/status/{pigeon_ticket}` until the task is
+    terminal (`done`/`failed`) or the shared `deadline` (a `time.monotonic()` value)
+    fires, then return the SAME `{directiveId, result}` shape `_await_mini_directive`
+    returns. The Rust executor posts the terminal `MiniCoderOutcome` to `/done` (seam C),
+    so a `done` task's `result` IS that outcome dict — returned verbatim as `result`.
+
+    A `failed` Pigeon task (the executor reported the mini failed) is synthesized into the
+    same failed outcome shape the file path returns. On the hard cap we synthesize the
+    SAME `timeout`/`failed` distinction the file path uses (we cannot re-derive the
+    directive's live launch status off Pigeon alone, so a still-unclaimed `pending`/`None`
+    at the deadline is the executor-never-started `failed`, and a `claimed` task that did
+    not finish is a `timeout`).
+    """
+    last_status: str | None = None
+    while True:
+        status, result = _pigeon_status_once(pigeon_ticket)
+        if status is not None:
+            last_status = status
+        if status == "done":
+            # The executor's `/done` payload IS the terminal MiniCoderOutcome (seam C).
+            # If for any reason the result is absent, fall back to a generic done outcome.
+            return {
+                "directiveId": directive_id,
+                "result": result if isinstance(result, dict) else {"status": "done"},
+            }
+        if status == "failed":
+            # Pigeon dead-lettered the task (the executor reported it failed). Synthesize
+            # the same failed terminal shape the file path returns.
+            return {
+                "directiveId": directive_id,
+                "result": {
+                    "status": "failed",
+                    "error": "mini-coder reported a failure (Pigeon task failed).",
+                },
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(PIGEON_STATUS_POLL_INTERVAL_SECS)
+
+    # Hard cap. A task that reached `claimed` (the executor picked it up) but did not
+    # finish in time is a `timeout`; one still `pending` / never observed (`None`) was
+    # never started — `failed`, exactly like the file path's never-claimed branch.
+    if last_status == "claimed":
+        synthesized = {
+            "status": "timeout",
+            "error": "spawn_mini_coder poll timed out waiting for the mini result.",
+        }
+    else:
+        synthesized = {
+            "status": "failed",
+            "error": "executor did not start this mini within the poll window.",
+        }
+    return {"directiveId": directive_id, "result": synthesized}
+
+
 class OracleHttpError(Exception):
     """Raised inside the thin-client when an HTTP Oracle call fails.
 
@@ -5372,31 +5553,80 @@ def dispatch_spawn_mini_coder(
             )
         directive["writeMode"] = raw_write_mode
 
-    with file_lock(state_lock):
-        state = read_agents_state(projects_dir)
-        session = next(
-            (item for item in state["sessions"] if item.get("agentId") == agent_id),
-            None,
-        )
-        status = str((session or {}).get("status") or "").strip().lower()
-        if session is None or status in ("", "closed", "launch_pending"):
-            raise McpError(
-                "spawn_mini_coder requires a live parent session; register (and keep it active) before delegating."
+    # Seam A (Slice 3): in Pigeon mode the directive enters the durable mailbox, and the
+    # Rust executor INGESTS it from there into `.aspis-agents.json` (stamping `pigeonTicket`)
+    # — so we must NOT also append it here (that would DOUBLE-run it). We still do the
+    # parent-liveness gate + the UI `mini_coder_spawn` event under the lock (the UI/session
+    # bookkeeping is unchanged). When DISABLED (the default), this whole branch is skipped
+    # and the original append-under-lock path below runs byte-identically.
+    pigeon = _pigeon_enabled()
+    if pigeon:
+        # Liveness gate FIRST (read-only, under the lock) so we never publish a directive
+        # for a parent session that is already closed — otherwise the executor would ingest
+        # and run an orphaned mini after the only human-contact point is gone.
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            session = next(
+                (item for item in state["sessions"] if item.get("agentId") == agent_id),
+                None,
             )
-        directives = state.setdefault("miniCoderDirectives", [])
-        directives.append(directive)
-        # Cap here too (write_agents_state normalizes again, but capping pre-write
-        # keeps the in-memory list bounded and never drops our just-appended pending
-        # directive — it is active, so eviction skips it).
-        state["miniCoderDirectives"] = cap_mini_coder_directives(directives)
-        add_event(
-            state,
-            agent_id,
-            role,
-            "mini_coder_spawn",
-            f"Delegated a mini-coder sub-task on {len(files)} file(s).",
+            status = str((session or {}).get("status") or "").strip().lower()
+            if session is None or status in ("", "closed", "launch_pending"):
+                raise McpError(
+                    "spawn_mini_coder requires a live parent session; register (and keep it active) before delegating."
+                )
+            # Pigeon stores the project id for bookkeeping only; use the parent session's
+            # project when known, else a stable `"default"`.
+            project_id = str((session or {}).get("currentProjectId") or "").strip() or "default"
+        # Publish to Pigeon OUTSIDE the lock (HTTP must never run under the state lock). On
+        # failure this raises McpError — the directive never entered Pigeon, so the coder
+        # gets a clear error rather than a silently-dropped sub-task.
+        pigeon_ticket = _pigeon_send_directive(
+            sender_id=agent_id, project_id=project_id, directive=directive
         )
-        write_agents_state(projects_dir, state)
+        # Stamp the ticket onto the directive so the Rust executor's egress (seam C) can post
+        # the terminal outcome back to THIS ticket, and the wait path (seam D) polls it.
+        directive["pigeonTicket"] = pigeon_ticket
+        # Re-stamp the (now ticket-bearing) directive into the mailbox is unnecessary — the
+        # WHOLE directive we just sent is already in Pigeon; the executor's ingest re-inserts
+        # it into `.aspis-agents.json` WITH `pigeonTicket` (it reads it from the Pigeon
+        # payload). Here we only record the UI event so the rail shows the delegation.
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            add_event(
+                state,
+                agent_id,
+                role,
+                "mini_coder_spawn",
+                f"Delegated a mini-coder sub-task on {len(files)} file(s).",
+            )
+            write_agents_state(projects_dir, state)
+    else:
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            session = next(
+                (item for item in state["sessions"] if item.get("agentId") == agent_id),
+                None,
+            )
+            status = str((session or {}).get("status") or "").strip().lower()
+            if session is None or status in ("", "closed", "launch_pending"):
+                raise McpError(
+                    "spawn_mini_coder requires a live parent session; register (and keep it active) before delegating."
+                )
+            directives = state.setdefault("miniCoderDirectives", [])
+            directives.append(directive)
+            # Cap here too (write_agents_state normalizes again, but capping pre-write
+            # keeps the in-memory list bounded and never drops our just-appended pending
+            # directive — it is active, so eviction skips it).
+            state["miniCoderDirectives"] = cap_mini_coder_directives(directives)
+            add_event(
+                state,
+                agent_id,
+                role,
+                "mini_coder_spawn",
+                f"Delegated a mini-coder sub-task on {len(files)} file(s).",
+            )
+            write_agents_state(projects_dir, state)
 
     # 4) ASYNC (b): a `wait: false` caller (an LLM coder self-steering a running mini)
     #    gets the directiveId IMMEDIATELY and watches / steers / collects via
@@ -5404,6 +5634,11 @@ def dispatch_spawn_mini_coder(
     #    BLOCKS on the bounded poll exactly as before, so every existing caller (the
     #    local runner, claude/codex) is byte-identical to today.
     if not wait:
+        # NOTE (Slice 3 limitation): the non-blocking `wait=false` path stays on the file
+        # bridge for result COLLECTION even in Pigeon mode — only the blocking `wait` path
+        # below is rewired to poll Pigeon `/status`. The later `mini_coder_result` collect
+        # therefore still reads `.aspis-agents.json` (which the executor's ingest keeps
+        # up to date). Rewiring the async collect to Pigeon is a follow-on.
         return {"directiveId": directive_id, "status": "running"}
 
     # BOUNDED poll for the executor's terminal verdict. Re-read under the lock each
@@ -5412,6 +5647,12 @@ def dispatch_spawn_mini_coder(
     # timed-out so the executor stops chasing it). Shared verbatim with the blocking
     # `mini_coder_result` so the timeout/failed/killRequested-WINS semantics match.
     deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
+    # Seam D (Slice 3): in Pigeon mode the terminal outcome lands on the Pigeon TASK (the
+    # executor posts it to `/done`, seam C), so we poll `/pigeon/status/{ticket}` instead
+    # of the file. Same bounded deadline + same `{directiveId, result}` return shape. When
+    # DISABLED, this is the original file-poll — byte-identical.
+    if pigeon:
+        return _await_mini_directive_pigeon(directive_id, pigeon_ticket, deadline)
     return _await_mini_directive(projects_dir, state_lock, directive_id, deadline)
 
 

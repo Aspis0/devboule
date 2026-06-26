@@ -60,6 +60,18 @@ pub fn read_pigeon_enabled(app: &AppHandle) -> bool {
     pigeon_enabled_from_value(&value)
 }
 
+static PIGEON_ENABLED_CACHED: OnceLock<bool> = OnceLock::new();
+
+/// Cached `pigeon.enabled` for the HOT executor path (read on every ~1500ms mini-executor tick and
+/// on every terminal reap). MAX-RECALL fix: `read_pigeon_enabled` does a `config.json` disk read +
+/// JSON parse each call — on the default (disabled) path that was a per-tick disk read the OFF path
+/// never had before (byte-identical regression). The flag is **restart-scoped** (toggling it applies
+/// on next launch — see LabsView "applies on restart"), so caching the first read is correct. The
+/// UI/command path keeps using the fresh `read_pigeon_enabled` so the toggle reflects disk state.
+pub fn pigeon_enabled_cached(app: &AppHandle) -> bool {
+    *PIGEON_ENABLED_CACHED.get_or_init(|| read_pigeon_enabled(app))
+}
+
 fn pigeon_port() -> u16 {
     *PIGEON_PORT.get_or_init(random_pigeon_port)
 }
@@ -79,6 +91,19 @@ fn pigeon_auth_token() -> &'static str {
         let _ = getrandom::fill(&mut b);
         b.iter().map(|x| format!("{:02x}", x)).collect()
     })
+}
+
+/// Slice 3: the `(PIGEON_PORT, PIGEON_AUTH_TOKEN)` pair the aspis_mcp spawn must inject so
+/// the Python MCP server can talk to THIS process's Pigeon dispatcher — but ONLY when
+/// Pigeon is enabled. Returns `None` when disabled, so the spawn site can keep the launch
+/// env byte-identical to before this slice. Both statics lazily initialise here on first
+/// call to the SAME values the child supervisor was (or will be) launched with, so the
+/// MCP-published port/token always match the running dispatcher.
+pub fn pigeon_spawn_env(app: &AppHandle) -> Option<(String, String)> {
+    if !read_pigeon_enabled(app) {
+        return None;
+    }
+    Some((pigeon_port().to_string(), pigeon_auth_token().to_string()))
 }
 
 fn pigeon_http_client() -> &'static reqwest::blocking::Client {
@@ -330,5 +355,15 @@ mod tests {
     fn non_bool_is_false() {
         assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": "yes"}})));
         assert!(!pigeon_enabled_from_value(&json!({"pigeon": {"enabled": 1}})));
+    }
+
+    #[test]
+    fn client_is_none_when_no_child_spawned() {
+        // Slice 3 INGEST GATE (flag-OFF half): with no Pigeon child supervised in this
+        // process, `pigeon_client_from_running()` returns None — so the executor's seam-B
+        // drain (which builds the client via this fn) constructs NO client and makes NO
+        // poll. Combined with the `read_pigeon_enabled` gate (default false, proven above),
+        // the disabled path performs zero Pigeon work.
+        assert!(super::pigeon_client_from_running().is_none());
     }
 }

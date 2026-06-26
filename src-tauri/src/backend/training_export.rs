@@ -947,6 +947,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             retry_directive_id: None,
+            pigeon_ticket: None,
         }
     }
 

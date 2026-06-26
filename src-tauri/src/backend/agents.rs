@@ -1086,14 +1086,31 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
 
 fn mcp_command_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
     let root = management_root_for_mcp(app, projects_dir);
-    mcp_command_hint_for_paths(&root, projects_dir)
+    // Slice 3: inject the Pigeon coordinates ONLY when Pigeon is enabled (else None ⇒
+    // byte-identical launch env). The Python MCP server reads PIGEON_PORT/PIGEON_AUTH_TOKEN
+    // to learn that the durable mailbox transport is available (`_pigeon_enabled()`).
+    let pigeon = crate::backend::pigeon_service::pigeon_spawn_env(app);
+    mcp_command_hint_for_paths(&root, projects_dir, pigeon.as_ref().map(|(p, t)| (p.as_str(), t.as_str())))
 }
 
-fn mcp_command_hint_for_paths(root: &Path, projects_dir: &Path) -> String {
+fn mcp_command_hint_for_paths(
+    root: &Path,
+    projects_dir: &Path,
+    pigeon_env: Option<(&str, &str)>,
+) -> String {
+    // NO-CHURN: with `pigeon_env` None (the default / Pigeon disabled) this is byte-identical
+    // to before this slice. When Some, append the two `$env:` exports next to the existing ones.
+    let pigeon_exports = match pigeon_env {
+        Some((port, token)) => format!(
+            " $env:PIGEON_PORT=\"{port}\"; $env:PIGEON_AUTH_TOKEN=\"{token}\";"
+        ),
+        None => String::new(),
+    };
     format!(
-        "cd \"{}\"; $env:PYTHONPATH=\"{}\"; $env:PYTHONIOENCODING=\"utf-8\"; $env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE=\"1\"; python -m oracle.server.aspis_mcp --root \"{}\" --projects-dir \"{}\"",
+        "cd \"{}\"; $env:PYTHONPATH=\"{}\"; $env:PYTHONIOENCODING=\"utf-8\"; $env:ASPIS_MCP_CLOUDFLARE_PROFILE_MODE=\"1\";{} python -m oracle.server.aspis_mcp --root \"{}\" --projects-dir \"{}\"",
         root.to_string_lossy(),
         root.to_string_lossy(),
+        pigeon_exports,
         root.to_string_lossy(),
         projects_dir.to_string_lossy()
     )
@@ -1101,10 +1118,30 @@ fn mcp_command_hint_for_paths(root: &Path, projects_dir: &Path) -> String {
 
 fn mcp_client_config_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
     let root = management_root_for_mcp(app, projects_dir);
-    mcp_client_config_hint_for_paths(&root, projects_dir)
+    let pigeon = crate::backend::pigeon_service::pigeon_spawn_env(app);
+    mcp_client_config_hint_for_paths(&root, projects_dir, pigeon.as_ref().map(|(p, t)| (p.as_str(), t.as_str())))
 }
 
-fn mcp_client_config_hint_for_paths(root: &Path, projects_dir: &Path) -> String {
+fn mcp_client_config_hint_for_paths(
+    root: &Path,
+    projects_dir: &Path,
+    pigeon_env: Option<(&str, &str)>,
+) -> String {
+    // Build the env map, then conditionally add the Pigeon coordinates. With `pigeon_env`
+    // None the map is byte-identical to before this slice (NO-CHURN).
+    let mut env = json!({
+        "PYTHONPATH": root.to_string_lossy(),
+        "PYTHONIOENCODING": "utf-8",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1"
+    });
+    if let Some((port, token)) = pigeon_env {
+        if let Some(map) = env.as_object_mut() {
+            map.insert("PIGEON_PORT".into(), json!(port));
+            map.insert("PIGEON_AUTH_TOKEN".into(), json!(token));
+        }
+    }
     serde_json::to_string_pretty(&json!({
         "mcpServers": {
             "aspis-management": {
@@ -1118,13 +1155,7 @@ fn mcp_client_config_hint_for_paths(root: &Path, projects_dir: &Path) -> String 
                     projects_dir.to_string_lossy()
                 ],
                 "cwd": root.to_string_lossy(),
-                "env": {
-                    "PYTHONPATH": root.to_string_lossy(),
-                    "PYTHONIOENCODING": "utf-8",
-                    "HF_HUB_OFFLINE": "1",
-                    "TRANSFORMERS_OFFLINE": "1",
-                    "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE": "1"
-                }
+                "env": env
             }
         }
     }))
@@ -2041,11 +2072,23 @@ mod tests {
         )
         .unwrap();
 
-        let command = mcp_command_hint_for_paths(&root, &projects);
-        let config = mcp_client_config_hint_for_paths(&root, &projects);
+        // None pigeon env ⇒ the byte-identical (pre-Slice-3) hints.
+        let command = mcp_command_hint_for_paths(&root, &projects, None);
+        let config = mcp_client_config_hint_for_paths(&root, &projects, None);
 
         assert!(command.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
         assert!(config.contains("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE"));
+        // NO-CHURN: Pigeon env is absent when None.
+        assert!(!command.contains("PIGEON_PORT"));
+        assert!(!config.contains("PIGEON_PORT"));
+
+        // When enabled, both hints carry the two Pigeon env vars.
+        let command_on = mcp_command_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
+        let config_on = mcp_client_config_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
+        assert!(command_on.contains("PIGEON_PORT=\"28771\""), "{command_on}");
+        assert!(command_on.contains("PIGEON_AUTH_TOKEN=\"abc123\""), "{command_on}");
+        assert!(config_on.contains("\"PIGEON_PORT\""), "{config_on}");
+        assert!(config_on.contains("abc123"), "{config_on}");
         let _ = fs::remove_dir_all(&root);
     }
 

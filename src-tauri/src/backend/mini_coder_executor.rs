@@ -63,6 +63,12 @@ use super::projects::ps_single_quote;
 /// keeping the idle cost (one locked read of a usually-empty queue) negligible.
 const SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Slice 3 (Pigeon transport): the mailbox receiver id of the mini worker pool. MUST match
+/// the Python `PIGEON_MINI_POOL_RECEIVER` in `aspis_mcp.py` (the `spawn_mini_coder` send
+/// target) — this is the queue the executor drains (seam B) and the receiver it posts the
+/// terminal outcome from (seam C).
+const PIGEON_MINI_POOL_RECEIVER: &str = "mini-pool";
+
 /// Scratch dir name (under the project root) where minis write their result files.
 /// A sibling of `.aspis-censor`; `read_result_file` confines reads to it.
 const MINI_SCRATCH_DIR: &str = ".aspis-mini";
@@ -469,6 +475,19 @@ fn run_loop(app: AppHandle, running: Arc<AtomicBool>) {
         eprintln!("mini-coder executor: startup awaiting-retry-sweep error: {e}");
     }
 
+    // Slice 3 (seam 3d): when Pigeon is enabled, register the `mini-pool` receiver as
+    // `loaded` once so the agents row exists (a `/send` to a known-loaded receiver gets
+    // `delivery_mode=immediate`). Best-effort + gated: a registration failure (dispatcher
+    // still booting) is non-fatal — polling does not depend on the row, and the next
+    // `start_if_enabled`/retry covers it. When DISABLED, no client is built (no-op).
+    if crate::backend::pigeon_service::pigeon_enabled_cached(&app) {
+        if let Some(client) = crate::backend::pigeon_service::pigeon_client_from_running() {
+            if let Err(e) = client.register_agent(PIGEON_MINI_POOL_RECEIVER, "loaded") {
+                eprintln!("mini-coder executor: pigeon mini-pool registration skipped: {e}");
+            }
+        }
+    }
+
     // WARNING 3: a panic inside a pass must NOT kill the only agent→app action
     // bridge permanently. Run each pass under `catch_unwind`; on a caught panic log
     // (no secret — just a marker) and continue after a short backoff. The thread
@@ -716,10 +735,120 @@ fn plan_result_file_sweep(
     plan
 }
 
+/// Slice 3 (seam B): max directives drained from the Pigeon `mini-pool` queue in ONE pass,
+/// so a flood of queued sub-tasks can't starve the rest of the pass (timeouts, launches,
+/// finalizes). Whatever is left stays queued and is drained on the next tick.
+const PIGEON_INGEST_MAX_PER_PASS: usize = 16;
+
+/// Slice 3 (seam B): when Pigeon is enabled, drain up to [`PIGEON_INGEST_MAX_PER_PASS`]
+/// directives the Python `spawn_mini_coder` sent to the `mini-pool` queue and insert them
+/// (status `pending`, with their `pigeon_ticket` stamped) into `.aspis-agents.json`. The
+/// EXISTING `run_pass` machinery then claims/launches/finalizes them unchanged. When
+/// disabled this function is never called (the caller gates it), so the pass is byte-identical.
+///
+/// Robustness: every error here is NON-FATAL — a missing client (dispatcher still booting),
+/// a poll network error, or a payload that does not deserialize into a `MiniCoderDirective`
+/// is logged (no payload bodies — they may carry task text) and SKIPPED. We never abort the
+/// pass on an ingest hiccup; the durable mailbox keeps the un-drained task for the next tick.
+fn ingest_pigeon_directives(app: &AppHandle) {
+    let Some(client) = crate::backend::pigeon_service::pigeon_client_from_running() else {
+        // Dispatcher not running yet (enabled but still booting) — nothing to drain.
+        return;
+    };
+    let mut drained: Vec<MiniCoderDirective> = Vec::new();
+    for _ in 0..PIGEON_INGEST_MAX_PER_PASS {
+        match client.poll(PIGEON_MINI_POOL_RECEIVER) {
+            Ok(Some((ticket_no, payload))) => {
+                match serde_json::from_value::<MiniCoderDirective>(payload) {
+                    Ok(mut directive) => {
+                        // Force the lifecycle to `pending` (the executor owns the claim) and
+                        // stamp the ticket so the egress (seam C) can post the outcome back.
+                        directive.status = MiniCoderStatus::Pending;
+                        directive.pigeon_ticket = Some(ticket_no);
+                        drained.push(directive);
+                    }
+                    Err(e) => {
+                        // The task was already CLAIMED off the queue by this poll; a malformed
+                        // payload can't be run. Best-effort fail it so it dead-letters instead
+                        // of being reclaimed forever. No payload echoed.
+                        eprintln!("mini-coder executor: pigeon ingest: undecodable directive (ticket {ticket_no}): {e}");
+                        let _ = client.fail(ticket_no, PIGEON_MINI_POOL_RECEIVER, "undecodable mini-coder directive");
+                    }
+                }
+            }
+            // Empty queue — stop draining this pass.
+            Ok(None) => break,
+            Err(e) => {
+                // Network/None error — non-fatal, skip the rest of the drain this pass.
+                eprintln!("mini-coder executor: pigeon ingest poll error: {e}");
+                break;
+            }
+        }
+    }
+    if drained.is_empty() {
+        return;
+    }
+    // DEDUP (MAX-RECALL BLOCKER): a ticket that was reclaimed+requeued by the Slice-2 sweep
+    // (because an earlier /done egress failed) is re-polled carrying the SAME directive `id`
+    // already tracked in `.aspis-agents.json`. Pushing it again would LAUNCH THE MINI A SECOND
+    // TIME (double file edits). So insert only ids NOT already present; for a re-polled dup whose
+    // original is already terminal, RE-ATTEMPT the egress (/done with the existing outcome) to
+    // close the requeued ticket; if the original is still in-flight, leave the ticket for the
+    // original's own egress (skip — never double-launch).
+    let existing: std::collections::HashMap<String, Option<MiniCoderOutcome>> =
+        match agents::read_agent_live_state_snapshot(app) {
+            Ok(s) => s
+                .mini_coder_directives
+                .iter()
+                .map(|d| (d.id.clone(), d.result.clone()))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+    let mut to_insert: Vec<MiniCoderDirective> = Vec::new();
+    let mut dups_to_close: Vec<(i64, MiniCoderOutcome)> = Vec::new();
+    for directive in drained.drain(..) {
+        match existing.get(&directive.id) {
+            None => to_insert.push(directive),
+            Some(result_opt) => {
+                if let (Some(ticket), Some(outcome)) = (directive.pigeon_ticket, result_opt.clone())
+                {
+                    dups_to_close.push((ticket, outcome));
+                }
+                // else: original still in-flight — its own egress will close the ticket.
+            }
+        }
+    }
+    if !to_insert.is_empty() {
+        // Protect the just-inserted ids from eviction this pass (MAX-RECALL: otherwise a full
+        // queue could evict a directive before it runs/egresses, orphaning its ticket).
+        let inserted_ids: Vec<String> = to_insert.iter().map(|d| d.id.clone()).collect();
+        let _ = agents::mutate_agent_live_state(app, |state| {
+            for directive in to_insert.drain(..) {
+                state.mini_coder_directives.push(directive);
+            }
+            cap_pass_protecting(state, &inserted_ids);
+        });
+    }
+    // Best-effort, OUTSIDE the lock: re-attempt the failed egress for requeued-but-terminal
+    // tickets so they close instead of looping. A 409 (already done) is harmless and ignored.
+    for (ticket, outcome) in dups_to_close {
+        if let Ok(json) = serde_json::to_value(&outcome) {
+            let _ = client.done(ticket, PIGEON_MINI_POOL_RECEIVER, json);
+        }
+    }
+}
+
 /// One executor pass (extracted so it is callable from a test with a real PTY).
 /// Returns Err only on a hard state-access failure; per-directive problems degrade
 /// to a synthesized `failed`/`timeout` outcome rather than aborting the pass.
 fn run_pass(app: &AppHandle) -> Result<(), String> {
+    // Slice 3 (seam B): in Pigeon mode, drain the durable `mini-pool` queue into
+    // `.aspis-agents.json` BEFORE the directive scan so the existing machinery claims them
+    // this same pass. Gated on the flag: when disabled, NO poll/client — byte-identical.
+    if crate::backend::pigeon_service::pigeon_enabled_cached(app) {
+        ingest_pigeon_directives(app);
+    }
+
     // 1) Locked READ snapshot, then work entirely off the clone (lock released).
     let snapshot = agents::read_agent_live_state_snapshot(app)?;
     let directives = snapshot.mini_coder_directives.clone();
@@ -803,12 +932,20 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 if let Some(aid) = agent_id.as_deref() {
                     close_mini_session(state, aid);
                 }
-                cap_pass(state);
+                // MAX-RECALL: protect the just-timed-out directive from eviction this pass so the
+                // Pigeon egress (below, by id) can still read it to close the ticket.
+                cap_pass_protecting(state, std::slice::from_ref(timed_out_id));
             });
             // FIX 2: terminate the live console too (timeout reap) — OUTSIDE the lock above,
             // after the directive transition is durably applied. Without this the console is
             // stuck running:true (shimmer on) and the store entry stays pinned forever.
             console_mark_stopped(app, directive);
+            // Slice 3 (seam C, bypass path): this terminal reap does NOT go through
+            // `finalize_finished_mini`, so close the Pigeon ticket here too — both to unblock
+            // the Python wait promptly AND to prevent the reclaim sweep from re-queuing +
+            // re-running a timed-out mini. Read the AUTHORITATIVE terminal outcome (timeout or
+            // killRequested-WINS aborted) back from state. No-op when not Pigeon-ticketed.
+            pigeon_egress_terminal_by_id(app, timed_out_id);
         }
     }
 
@@ -835,13 +972,16 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 if let Some(aid) = agent_id.as_deref() {
                     close_mini_session(state, aid);
                 }
-                cap_pass(state);
+                // MAX-RECALL: protect from eviction so the Pigeon egress can close the ticket.
+                cap_pass_protecting(state, std::slice::from_ref(stuck_id));
             });
             // FIX 2: terminate the live console (stuck-launching reap) — OUTSIDE the lock. A
             // never-seeded directive (no build_initial ran) has no live mini, so set_terminal
             // only flips running=Some(false): it stops "running", never paints a phantom
             // timeline. A directive that DID seed a console gets the neutral Stop banner.
             console_mark_stopped(app, directive);
+            // Slice 3 (seam C, bypass path): close the Pigeon ticket for this terminal reap too.
+            pigeon_egress_terminal_by_id(app, stuck_id);
         }
     }
 
@@ -897,11 +1037,14 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 if let Some(aid) = agent_id.as_deref() {
                     close_mini_session(state, aid);
                 }
-                cap_pass(state);
+                // MAX-RECALL: protect from eviction so the Pigeon egress can close the ticket.
+                cap_pass_protecting(state, std::slice::from_ref(&id));
             });
             // FIX 2: terminate the live console too (parent-gone reap) — OUTSIDE the lock,
             // before the `continue`. Without this the console is stuck running:true forever.
             console_mark_stopped(app, directive);
+            // Slice 3 (seam C, bypass path): close the Pigeon ticket for this terminal reap.
+            pigeon_egress_terminal_by_id(app, &id);
             continue;
         }
         // BLOCKER 2 (IN-FLIGHT GUARD): a finished mini whose deferred-verdict thread is
@@ -2510,6 +2653,20 @@ fn finalize_finished_mini_with(
                     );
                 }
             }
+
+            // Slice 3 (seam C): if this directive arrived via Pigeon AND Pigeon is enabled,
+            // ALSO post the terminal outcome to `/pigeon/done` so the Python wait, which polls
+            // `/pigeon/status/{ticket}`, unblocks with the SAME outcome dict the file path
+            // returns. The `.aspis-agents.json` stamp above is UNCHANGED (the UI/session path),
+            // so this is purely additive. BEST-EFFORT: a network error / already-terminal
+            // mailbox task (409) is logged and ignored — never blocks finalize. We post the
+            // outcome on EVERY terminal status (done/failed/timeout/aborted/escalated): the
+            // Python `/status` handler returns whatever `result` we stored, so a non-`done`
+            // outcome rides through `done`'s result field exactly like the file path stamps it.
+            // The non-finalize terminal reaps (timeout / stuck-launching / parent-gone /
+            // launch-fail) close the SAME ticket via `pigeon_egress_terminal_by_id`, so a
+            // terminal mini's mailbox task is ALWAYS closed (the reclaim sweep can't re-run it).
+            pigeon_egress_terminal(app, directive, terminal);
         }
 
         // CONSOLE (Step B): publish the finalize snapshot AFTER the state write succeeded so
@@ -2530,6 +2687,81 @@ fn finalize_finished_mini_with(
                 directive.write,
                 &write_diffs,
             );
+        }
+    }
+}
+
+/// Slice 3 (seam C): post a Pigeon-ticketed directive's TERMINAL outcome back to the mailbox
+/// (`/pigeon/done`), unblocking the Python `spawn_mini_coder` wait that polls
+/// `/pigeon/status/{ticket}`, AND — crucially — CLOSING the claimed mailbox task so the
+/// reclaim sweep never re-queues a terminal mini for a second run (at-least-once would
+/// otherwise re-ingest + re-run it after the visibility timeout). Best-effort + fully gated:
+///   * a directive with no `pigeon_ticket` (the file path / a never-Pigeon directive) is a
+///     no-op (so this is safe to call from EVERY terminal path);
+///   * when Pigeon is DISABLED no client is built (no-op);
+///   * a network error / already-`done` task (409) is LOGGED and ignored — never blocks the
+///     caller. No payload bodies are logged (they may carry task/result text).
+fn pigeon_egress_terminal(app: &AppHandle, directive: &MiniCoderDirective, outcome: &MiniCoderOutcome) {
+    let Some(ticket) = directive.pigeon_ticket else {
+        return;
+    };
+    if !crate::backend::pigeon_service::pigeon_enabled_cached(app) {
+        return;
+    }
+    let Some(client) = crate::backend::pigeon_service::pigeon_client_from_running() else {
+        return;
+    };
+    match serde_json::to_value(outcome) {
+        Ok(payload) => {
+            if let Err(e) = client.done(ticket, PIGEON_MINI_POOL_RECEIVER, payload) {
+                eprintln!("mini-coder executor: pigeon egress done(ticket {ticket}) failed: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("mini-coder executor: pigeon egress serialize failed (ticket {ticket}): {e}");
+        }
+    }
+}
+
+/// Slice 3 (seam C, bypass paths): like [`pigeon_egress_terminal`] but for the terminal
+/// reap paths that transition a directive UNDER THE LOCK without a `MiniCoderDirective` +
+/// outcome in hand (the `plan.timeouts` reap, stuck-launching reap, `fail_launching`). It
+/// re-reads the directive by id from a FRESH snapshot to get its `pigeon_ticket` AND the
+/// authoritative terminal `result` actually stamped (e.g. timeout, or killRequested-WINS
+/// aborted), then posts it. No-op for a non-Pigeon directive / disabled / not-yet-terminal.
+fn pigeon_egress_terminal_by_id(app: &AppHandle, directive_id: &str) {
+    // Cheap pre-gate so a disabled app does ZERO extra work (no snapshot read).
+    if !crate::backend::pigeon_service::pigeon_enabled_cached(app) {
+        return;
+    }
+    let Ok(snapshot) = agents::read_agent_live_state_snapshot(app) else {
+        return;
+    };
+    let Some(directive) = snapshot
+        .mini_coder_directives
+        .iter()
+        .find(|d| d.id == directive_id)
+    else {
+        return;
+    };
+    // Only act on a directive that (a) came via Pigeon and (b) is actually terminal now.
+    if directive.pigeon_ticket.is_none() {
+        return;
+    }
+    if let Some(outcome) = directive.result.clone() {
+        pigeon_egress_terminal(app, directive, &outcome);
+    } else if directive.status.is_terminal() {
+        // MAX-RECALL: a TERMINAL directive with no stamped result would otherwise leave the
+        // ticket `claimed` → the sweep requeues it → re-ingest. Close it via /fail so it can
+        // never become a double-run. (A still-running directive is left untouched.)
+        if let Some(ticket) = directive.pigeon_ticket {
+            if let Some(client) = crate::backend::pigeon_service::pigeon_client_from_running() {
+                let _ = client.fail(
+                    ticket,
+                    PIGEON_MINI_POOL_RECEIVER,
+                    "terminal mini-coder directive had no result at egress",
+                );
+            }
         }
     }
 }
@@ -3593,6 +3825,11 @@ fn fail_launching(app: &AppHandle, directive_id: &str, reason: &str) {
             mini_coder::apply_failed(d, reason.clone())
         });
     });
+    // Slice 3 (seam C, bypass path): a launch failure terminates off-finalize — close the
+    // Pigeon ticket so the Python wait unblocks AND the reclaim sweep can't re-run it. The
+    // chain shares ONE ticket (carried on every member by build_retry_directive), so posting
+    // on this id closes it once. No-op when not Pigeon-ticketed / disabled.
+    pigeon_egress_terminal_by_id(app, &id);
 }
 
 /// Apply a pure directive transition by id inside a locked mutation. The `apply`
@@ -6133,6 +6370,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             retry_directive_id: None,
+            pigeon_ticket: None,
         }
     }
 
@@ -8633,6 +8871,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             retry_directive_id: None,
+            pigeon_ticket: None,
         }
     }
 

@@ -111,13 +111,15 @@ def build_app(
         """Shared at-least-once logic for the reclaim sweep and POST /fail. Caller holds
         tx_lock and an open BEGIN IMMEDIATE transaction. Returns 'requeued' or 'failed'.
 
-        DELIVERY SEMANTICS (review S2-2): this is AT-LEAST-ONCE, not exactly-once. After a
-        requeue a second worker may run the task; if the original (slow) worker later calls
-        /done on the now-reclaimed ticket it can store a stale result. In THIS deployment that
-        race is practically unreachable: the visibility timeout (default 1920s) is set ABOVE the
-        mini-coder wall-clock cap (~1800s), so the executor has already killed the original mini
-        before the sweep reclaims. A claim-generation token (epoch) would close it fully — tracked
-        in the go-live hardening backlog, deferred to avoid coupling the Slice-3 wiring protocol.
+        DELIVERY SEMANTICS (review S2-2 / S3 MAX-RECALL): this is AT-LEAST-ONCE, not exactly-once.
+        After a requeue a second worker may run the task. Two layers keep that from double-running a
+        mini: (1) the visibility timeout (default 1920s) sits well above the mini per-attempt
+        wall-clock cap (DEFAULT_WALL_CLOCK_CAP_SECS = 600s in mini_coder.rs), so the executor has
+        already killed + terminalled the original mini long before the sweep reclaims; (2) the Rust
+        ingest DEDUPES by directive id, so a requeued ticket re-polled with an id already tracked in
+        .aspis-agents.json is NOT re-launched (it re-attempts the egress instead). A claim-generation
+        token (epoch) would close the window fully — tracked in the go-live hardening backlog,
+        deferred to avoid coupling the Slice-3 wiring protocol.
         The `AND status='claimed'` guards below are defensive (no-op under the single-process
         tx_lock today, correctness-preserving if Pigeon ever runs multi-process)."""
         if task["attempts"] < app.state.max_attempts:

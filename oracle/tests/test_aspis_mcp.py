@@ -52,6 +52,10 @@ from oracle.server.aspis_mcp import (
     dispatch_project_structure,
     dispatch_steer_mini_coder,
     dispatch_mini_coder_result,
+    dispatch_spawn_mini_coder,
+    hash_session_token,
+    now,
+    _pigeon_enabled,
     write_agents_state,
     MINI_CODER_MAX_STEER_LEN,
     MINI_CODER_MAX_STEER_QUEUE,
@@ -9835,6 +9839,100 @@ class OwnershipSteerMiniCoderTests(unittest.TestCase):
                     },
                 )
             self.assertIn("not owned by this agent", str(cm.exception))
+
+
+class PigeonFlagOffByteIdenticalTests(unittest.TestCase):
+    """Slice 3 SAFETY INVARIANT: with the Pigeon env ABSENT (the default), the
+    mini-dispatch must behave BYTE-IDENTICALLY to before this slice — the directive
+    is appended to `.aspis-agents.json` `miniCoderDirectives` and NO Pigeon HTTP is
+    ever attempted. This is the test that proves the flag-OFF path is unchanged."""
+
+    def _live_coder_state_lock(self, projects: Path) -> Path:
+        """Seed a LIVE, token-bearing coder session so `dispatch_spawn_mini_coder`
+        passes authn + the live-parent gate. Returns the state lock path."""
+        state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
+        from oracle.server.aspis_mcp import file_lock
+
+        with file_lock(state_lock):
+            state = read_agents_state(projects)
+            state["sessions"].append(
+                {
+                    "agentId": "coder-1",
+                    "role": "coder",
+                    "status": "active",
+                    "firstSeenAt": now(),
+                    "sessionTokenHash": hash_session_token("tok-coder-1"),
+                    "sessionTokenIssuedAt": now(),
+                }
+            )
+            write_agents_state(projects, state)
+        return state_lock
+
+    def test_pigeon_disabled_by_default_with_no_env(self):
+        # Defensive: the rest of the suite may have set the env — clear it for this case.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PIGEON_PORT", None)
+            os.environ.pop("PIGEON_AUTH_TOKEN", None)
+            self.assertFalse(_pigeon_enabled())
+
+    def test_pigeon_requires_both_env_vars(self):
+        with patch.dict(os.environ, {"PIGEON_PORT": "12345"}, clear=False):
+            os.environ.pop("PIGEON_AUTH_TOKEN", None)
+            self.assertFalse(_pigeon_enabled())
+        with patch.dict(os.environ, {"PIGEON_AUTH_TOKEN": "tok"}, clear=False):
+            os.environ.pop("PIGEON_PORT", None)
+            self.assertFalse(_pigeon_enabled())
+        with patch.dict(
+            os.environ, {"PIGEON_PORT": "12345", "PIGEON_AUTH_TOKEN": "tok"}, clear=False
+        ):
+            self.assertTrue(_pigeon_enabled())
+
+    def test_disabled_spawn_appends_directive_and_attempts_no_pigeon_http(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = prepare_management_root(Path(tmp))
+            state_lock = self._live_coder_state_lock(projects)
+
+            # Any Pigeon HTTP attempt would import httpx via the helper — make that fatal
+            # so a regression that fires Pigeon on the disabled path is caught loudly.
+            def _boom():
+                raise AssertionError("Pigeon HTTP must NOT be used when disabled.")
+
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PIGEON_PORT", None)
+                os.environ.pop("PIGEON_AUTH_TOKEN", None)
+                with patch("oracle.server.aspis_mcp.import_httpx", side_effect=_boom):
+                    # wait=false so we exercise seam A (the append) without blocking on
+                    # the file poll for an executor that is not running in this test.
+                    result = dispatch_spawn_mini_coder(
+                        projects,
+                        state_lock,
+                        {
+                            "agent_id": "coder-1",
+                            "role": "coder",
+                            "session_token": "tok-coder-1",
+                            "task": "tidy a docstring",
+                            "files": ["src/a.py"],
+                            "wait": False,
+                        },
+                    )
+
+            self.assertEqual(result["status"], "running")
+            directive_id = result["directiveId"]
+
+            # The directive landed in `.aspis-agents.json` exactly as before — and carries
+            # NO `pigeonTicket` (that field only exists on the Pigeon ingest path).
+            state = read_agents_state(projects)
+            directives = state.get("miniCoderDirectives", [])
+            self.assertEqual(len(directives), 1)
+            d = directives[0]
+            self.assertEqual(d["id"], directive_id)
+            self.assertEqual(d["status"], "pending")
+            self.assertEqual(d["parentAgentId"], "coder-1")
+            self.assertNotIn("pigeonTicket", d)
+            # The UI delegation event is recorded (unchanged behaviour).
+            self.assertTrue(
+                any(e.get("eventType") == "mini_coder_spawn" for e in state.get("events", []))
+            )
 
 
 if __name__ == "__main__":
