@@ -234,7 +234,10 @@ pub enum NodeStyle {
 // NOW LIVE: the live mini is a single `Spawn` entry; the `Coder` milestone row is
 // constructed by `push_coder_milestone` for the ORCHESTRATOR's coder-tier milestone stream
 // (the file-bridge tail task), so both variants are reachable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// NOTE: `Eq` is intentionally NOT derived — the `Question` variant (Kairion) carries `f32`
+// doubt fields, which are not `Eq`. Only `PartialEq` is needed (the store compares activities
+// with `PartialEq`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ConsoleEntry {
     /// A coder milestone row (teal chip + text + time).
@@ -266,6 +269,44 @@ pub enum ConsoleEntry {
         text: String,
         time: String,
     },
+    /// KAIRION (orchestrator-only): a clarification question the orchestrator raised, carrying
+    /// the text-doubt signal (unrest / candidates / lean / directionConfidence) so the UI can
+    /// render the doubt without a percentage. Tagged `type:"question"`; field names are camelCase
+    /// to match the frozen wire shape. `time` is the host clock stamp.
+    Question {
+        id: String,
+        text: String,
+        options: Vec<QOption>,
+        unrest: f32,
+        candidates: Vec<Cand>,
+        /// The leaning option (or `null` when genuinely torn). Always serialized.
+        lean: Option<String>,
+        // The enum-level `rename_all` renames VARIANTS, not struct-variant FIELDS — so this
+        // multi-word field needs an explicit camelCase rename to match the frozen wire shape
+        // (`directionConfidence`). Every other field here is already single-word.
+        #[serde(rename = "directionConfidence")]
+        direction_confidence: f32,
+        /// "open" | "reopened".
+        status: String,
+        affects: Vec<String>,
+        time: String,
+    },
+}
+
+/// One selectable option of a Kairion question (`{ "id", "label" }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// One doubt candidate (`{ "label", "pull" }`) — the orchestrator's pull toward an option.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cand {
+    pub label: String,
+    pub pull: f32,
 }
 
 /// One web page surfaced by a `websearch` bridge event: source url + title + a
@@ -622,6 +663,43 @@ pub fn push_chat(activity: &mut ConsoleActivity, role: &str, text: &str, time: &
     if entries.len() > MAX_ENTRIES_PER_AGENT {
         let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
         entries.drain(0..overflow);
+    }
+    activity.running = Some(true);
+    activity.run_count = Some(1);
+    activity.empty = None;
+}
+
+/// KAIRION: append (or UPSERT) a `Question` timeline entry. If an entry with the same `id`
+/// already exists, it is REPLACED in place — so a `"reopened"` question overwrites the prior
+/// `"open"` one rather than stacking a duplicate row. A genuinely new id is appended (with the
+/// same FIFO cap as the other pushers). Same live-state bookkeeping as [`push_coder_milestone`].
+pub fn push_question(activity: &mut ConsoleActivity, q: ParsedQuestionLine, time: &str) {
+    let entries = activity.entries.get_or_insert_with(Vec::new);
+    let qid = q.id.clone();
+    let entry = ConsoleEntry::Question {
+        id: q.id,
+        text: q.text,
+        options: q.options,
+        unrest: q.unrest,
+        candidates: q.candidates,
+        lean: q.lean,
+        direction_confidence: q.direction_confidence,
+        status: q.status,
+        affects: q.affects,
+        time: time.to_string(),
+    };
+    // UPSERT by id: a reopened question replaces the open one in place (no duplicate).
+    let existing = entries
+        .iter_mut()
+        .find(|e| matches!(e, ConsoleEntry::Question { id, .. } if *id == qid));
+    if let Some(slot) = existing {
+        *slot = entry;
+    } else {
+        entries.push(entry);
+        if entries.len() > MAX_ENTRIES_PER_AGENT {
+            let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+            entries.drain(0..overflow);
+        }
     }
     activity.running = Some(true);
     activity.run_count = Some(1);
@@ -1137,6 +1215,128 @@ fn parse_chat_delta_line(line: &str) -> Option<(u64, String)> {
     Some((event.seq, text))
 }
 
+/// The `question` bridge event wire shape (Kairion). Mirrors the frozen QUESTION wire line the
+/// cloud duplex assembles. `directionConfidence` is camelCase on the wire (via `rename_all`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionEvent {
+    kind: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    options: Vec<QOption>,
+    #[serde(default)]
+    unrest: f32,
+    #[serde(default)]
+    candidates: Vec<Cand>,
+    #[serde(default)]
+    lean: Option<String>,
+    #[serde(default)]
+    direction_confidence: f32,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    affects: Vec<String>,
+}
+
+/// A `question` line parsed off the bridge, pre-`time` (the tail adds the host clock stamp).
+/// Same shape as the [`ConsoleEntry::Question`] payload minus `time`.
+pub struct ParsedQuestionLine {
+    pub id: String,
+    pub text: String,
+    pub options: Vec<QOption>,
+    pub unrest: f32,
+    pub candidates: Vec<Cand>,
+    pub lean: Option<String>,
+    pub direction_confidence: f32,
+    pub status: String,
+    pub affects: Vec<String>,
+}
+
+/// Clamp a wire float into [0,1], mapping a non-finite (NaN/Inf) value to 0.0 — untrusted
+/// file input must never inject a NaN into the store.
+fn clamp01(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Parse ONE file line into a [`ParsedQuestionLine`], or `None` to SKIP (blank, oversized,
+/// non-JSON, not `kind == "question"`, or an empty question text). Pure + total, with the same
+/// caps/guards as [`parse_chat_delta_line`]: re-caps every untrusted string + count, clamps the
+/// floats, and normalizes the status. Mirrors the frozen QUESTION wire shape.
+fn parse_question_line(line: &str) -> Option<ParsedQuestionLine> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: QuestionEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "question" {
+        return None;
+    }
+    let text: String = event.text.chars().take(CHAT_TEXT_CAP).collect();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let id: String = event.id.chars().take(MILESTONE_TEXT_CAP).collect();
+    let id = if id.trim().is_empty() {
+        "q".to_string()
+    } else {
+        id
+    };
+    let options: Vec<QOption> = event
+        .options
+        .into_iter()
+        .take(12)
+        .map(|o| QOption {
+            id: o.id.chars().take(MILESTONE_TEXT_CAP).collect(),
+            label: o.label.chars().take(MILESTONE_TEXT_CAP).collect(),
+        })
+        .filter(|o| !o.label.trim().is_empty())
+        .collect();
+    let candidates: Vec<Cand> = event
+        .candidates
+        .into_iter()
+        .take(12)
+        .map(|c| Cand {
+            label: c.label.chars().take(MILESTONE_TEXT_CAP).collect(),
+            pull: clamp01(c.pull),
+        })
+        .filter(|c| !c.label.trim().is_empty())
+        .collect();
+    let lean = event
+        .lean
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.chars().take(MILESTONE_TEXT_CAP).collect::<String>());
+    let status = match event.status.as_str() {
+        "reopened" => "reopened",
+        _ => "open",
+    }
+    .to_string();
+    let affects: Vec<String> = event
+        .affects
+        .into_iter()
+        .take(40)
+        .map(|a| a.chars().take(MILESTONE_TEXT_CAP).collect::<String>())
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    Some(ParsedQuestionLine {
+        id,
+        text,
+        options,
+        unrest: clamp01(event.unrest),
+        candidates,
+        lean,
+        direction_confidence: clamp01(event.direction_confidence),
+        status,
+        affects,
+    })
+}
+
 /// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
 /// because the file is untrusted input the host reads back.
 const MILESTONE_TEXT_CAP: usize = 200;
@@ -1390,6 +1590,15 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
                         if let Some(store) = app.try_state::<MiniActivityStore>() {
                             store.update(&app, &agent_id, |a| {
                                 push_chat_delta(a, seq, &text)
+                            });
+                        }
+                    } else if let Some(question) = parse_question_line(&line) {
+                        // KAIRION: a clarification question (with its doubt signal) → UPSERT a
+                        // Question timeline entry by id (a reopened question replaces the open one).
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            let time = now_clock();
+                            store.update(&app, &agent_id, |a| {
+                                push_question(a, question, &time)
                             });
                         }
                     }
@@ -1837,6 +2046,130 @@ not json\n";
     }
 
     #[test]
+    fn parse_question_line_accepts_and_rejects() {
+        let line = r#"{"kind":"question","id":"q1","text":"Which DB?","options":[{"id":"pg","label":"Postgres"}],"unrest":0.6,"candidates":[{"label":"Postgres","pull":0.7}],"lean":"Postgres","directionConfidence":0.3,"status":"open","affects":["schema.rs"]}"#;
+        let q = parse_question_line(line).expect("parses a question line");
+        assert_eq!(q.id, "q1");
+        assert_eq!(q.text, "Which DB?");
+        assert_eq!(q.options[0].label, "Postgres");
+        assert_eq!(q.candidates[0].pull, 0.7);
+        assert_eq!(q.lean.as_deref(), Some("Postgres"));
+        assert_eq!(q.status, "open");
+        assert_eq!(q.affects, vec!["schema.rs".to_string()]);
+        // wrong kind / blank text / non-json -> None
+        assert!(parse_question_line(r#"{"kind":"chat","role":"assistant","text":"x"}"#).is_none());
+        assert!(parse_question_line(r#"{"kind":"question","text":"   "}"#).is_none());
+        assert!(parse_question_line("not json").is_none());
+    }
+
+    #[test]
+    fn question_entry_serializes_to_the_frozen_camelcase_wire() {
+        let q = parse_question_line(
+            r#"{"kind":"question","id":"q1","text":"Which DB?","options":[{"id":"pg","label":"Postgres"}],"unrest":0.6,"candidates":[{"label":"Postgres","pull":0.7}],"lean":null,"directionConfidence":0.25,"status":"open","affects":["a.rs"]}"#,
+        )
+        .unwrap();
+        let mut a = ConsoleActivity::empty();
+        push_question(&mut a, q, "14:00:00");
+        assert_eq!(a.running, Some(true));
+        assert!(a.empty.is_none());
+        let v = to_value(&a).unwrap();
+        let entry = &v["entries"][0];
+        assert_eq!(entry["type"], json!("question"));
+        assert_eq!(entry["id"], json!("q1"));
+        assert_eq!(entry["text"], json!("Which DB?"));
+        assert_eq!(entry["status"], json!("open"));
+        // f32 → f64 widening means an exact `0.6` literal won't match; compare with tolerance.
+        assert!((entry["unrest"].as_f64().unwrap() - 0.6).abs() < 1e-6);
+        assert!((entry["directionConfidence"].as_f64().unwrap() - 0.25).abs() < 1e-6);
+        assert_eq!(entry["lean"], Value::Null, "lean is required, null when torn");
+        assert_eq!(entry["options"][0]["label"], json!("Postgres"));
+        assert!((entry["candidates"][0]["pull"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+        assert_eq!(entry["affects"][0], json!("a.rs"));
+        assert_eq!(entry["time"], json!("14:00:00"));
+    }
+
+    #[test]
+    fn push_question_upserts_a_reopened_question_by_id() {
+        let mut a = ConsoleActivity::empty();
+        let open = parse_question_line(
+            r#"{"kind":"question","id":"q1","text":"open?","status":"open","options":[],"candidates":[]}"#,
+        )
+        .unwrap();
+        push_question(&mut a, open, "14:00:00");
+        let reopened = parse_question_line(
+            r#"{"kind":"question","id":"q1","text":"reopened?","status":"reopened","options":[],"candidates":[]}"#,
+        )
+        .unwrap();
+        push_question(&mut a, reopened, "14:00:05");
+        // exactly ONE question row (upserted), now showing the reopened state
+        let entries = a.entries.as_ref().unwrap();
+        let questions: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Question { .. }))
+            .collect();
+        assert_eq!(questions.len(), 1, "reopened replaces open — no duplicate");
+        match questions[0] {
+            ConsoleEntry::Question { status, text, time, .. } => {
+                assert_eq!(status, "reopened");
+                assert_eq!(text, "reopened?");
+                assert_eq!(time, "14:00:05");
+            }
+            _ => unreachable!(),
+        }
+        // a DIFFERENT id appends a second row
+        let other = parse_question_line(
+            r#"{"kind":"question","id":"q2","text":"other?","options":[],"candidates":[]}"#,
+        )
+        .unwrap();
+        push_question(&mut a, other, "14:00:10");
+        let count = a
+            .entries
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Question { .. }))
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_question_line_clamps_floats_and_caps_lists() {
+        // NaN / out-of-range floats are sanitized; lists are capped.
+        let line = r#"{"kind":"question","text":"x","unrest":5.0,"directionConfidence":-1.0,"candidates":[{"label":"A","pull":9.0}]}"#;
+        let q = parse_question_line(line).unwrap();
+        assert_eq!(q.unrest, 1.0, "unrest clamped to 1");
+        assert_eq!(q.direction_confidence, 0.0, "negative clamped to 0");
+        assert_eq!(q.candidates[0].pull, 1.0);
+        assert_eq!(q.id, "q", "missing id defaults to q");
+    }
+
+    #[test]
+    fn oversized_question_line_is_capped_under_max_and_round_trips() {
+        // A pathological orchestrator question (huge text + a long affects list) must NOT produce
+        // a line over MAX_LINE_BYTES — otherwise parse_question_line silently DROPS it, losing the
+        // whole question. build_question_line caps it; the capped line still round-trips here.
+        use crate::backend::doubt_sensor_text::{build_question_line, ParsedQuestion};
+        let q = ParsedQuestion {
+            id: "q1".to_string(),
+            text: "x".repeat(40_000),
+            options: vec![("a".to_string(), "Alpha".to_string())],
+            affects: (0..200).map(|i| format!("path/to/file_{i}.rs")).collect(),
+            status: "open".to_string(),
+        };
+        let line = build_question_line("maybe Alpha", &q);
+        assert!(
+            line.len() <= MAX_LINE_BYTES,
+            "capped line {} must be <= MAX_LINE_BYTES {}",
+            line.len(),
+            MAX_LINE_BYTES
+        );
+        let parsed = parse_question_line(&line).expect("capped line still round-trips");
+        assert_eq!(parsed.id, "q1");
+        assert!(!parsed.text.trim().is_empty(), "truncated text survived");
+        assert_eq!(parsed.status, "open");
+    }
+
+    #[test]
     fn chat_delta_is_a_separate_live_tail_finalized_by_push_chat() {
         let mut a = ConsoleActivity::empty();
         push_chat_delta(&mut a, 1, "He");
@@ -2277,6 +2610,7 @@ not json\n";
                 ConsoleEntry::Spawn { text, .. } => text.as_str(),
                 ConsoleEntry::WebSearch { query, .. } => query.as_str(),
                 ConsoleEntry::Chat { text, .. } => text.as_str(),
+                ConsoleEntry::Question { text, .. } => text.as_str(),
             })
             .collect();
         assert_eq!(

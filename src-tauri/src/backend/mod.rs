@@ -25,6 +25,7 @@ pub mod design_generate;
 pub mod design_llm;
 pub mod design_preview;
 pub mod devices;
+pub mod doubt_sensor_text;
 pub mod fs_replace;
 pub mod fs_watch;
 pub mod git_push;

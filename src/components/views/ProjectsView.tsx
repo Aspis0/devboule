@@ -24,6 +24,7 @@ import {
   latestWeb,
   pickProjectDesign,
   chatMessages,
+  openQuestions,
 } from "../projects/planner/plannerModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import { useDesignRequestWatcher } from "../projects/planner/useDesignRequestWatcher";
@@ -1015,6 +1016,12 @@ export function ProjectsView() {
   const orchestratorConsole = useAgentConsole(plannerActivityAgentId);
   const plannerWeb = useMemo(
     () => latestWeb(orchestratorConsole.entries),
+    [orchestratorConsole.entries],
+  );
+  // Kairion (ORCHESTRATOR-ONLY): the live orchestrator's open doubts, upserted by id.
+  // Empty until the orchestrator surfaces a fork — the Plan view then degrades to plan-only.
+  const plannerQuestions = useMemo(
+    () => openQuestions(orchestratorConsole.entries),
     [orchestratorConsole.entries],
   );
 
@@ -3036,6 +3043,7 @@ export function ProjectsView() {
             plannerModelLabel={config.localCoderBackend?.model ?? mainCoderClient}
             live={!!orchestratorAgentId || !!cloudOrchestratorAgentId}
             planCards={derivePlanCards(currentProject?.state.tasks ?? [])}
+            questions={plannerQuestions}
             pages={plannerWeb.pages}
             findings={plannerWeb.findings}
             webMode={plannerWebMode}

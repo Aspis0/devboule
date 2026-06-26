@@ -477,6 +477,11 @@ pub struct OmlxModel {
     /// `config.rs`) — already fenced + sentinel-neutralized by the trusted app. Appended to the
     /// system prompt after the user-MCP catalog. `None` keeps the prompt byte-identical.
     lang_skill: Option<String>,
+    /// Kairion (F1): `true` only when this binary runs as the ORCHESTRATOR. ONLY then does
+    /// the streaming request gain OpenAI `logprobs`/`top_logprobs` and capture the per-token
+    /// decision-token entropy for the doubt sensor. `false` (a plain coder / mini) keeps the
+    /// request body and the streaming path BYTE-IDENTICAL to before this feature.
+    orchestrator: bool,
 }
 
 impl OmlxModel {
@@ -504,7 +509,17 @@ impl OmlxModel {
             plan_first,
             user_mcp: std::sync::Arc::from(Vec::new()),
             lang_skill: None,
+            orchestrator: false,
         })
+    }
+
+    /// Kairion (F1): mark this model as the ORCHESTRATOR's, enabling logprob capture on the
+    /// streaming path. Builder-style; the default (`false`) construction stays byte-identical
+    /// (no logprobs in the request, `None` returned). Called from `config.rs` only when the
+    /// binary was launched with a seeded GOAL (i.e. it IS the orchestrator).
+    pub fn with_orchestrator(mut self, orchestrator: bool) -> Self {
+        self.orchestrator = orchestrator;
+        self
     }
 
     /// Attach the connected user MCP servers' tool catalog (B.3) for the system prompt.
@@ -695,7 +710,20 @@ fn render_action_block(action: &crate::action::AgentAction) -> String {
             tool,
             params,
         } => json!({"tool":"mcp_tool","server":server,"name":tool,"params":params}),
-        A::AskUser { question } => json!({"tool":"ask_user","question":question}),
+        A::AskUser { question, options } => {
+            // Back-compat: with no options, render the byte-identical bare form. With
+            // options, echo them so the assistant-side transcript is faithful to what
+            // the model emitted (and so a follow-up turn sees its own prior choices).
+            if options.is_empty() {
+                json!({"tool":"ask_user","question":question})
+            } else {
+                let opts: Vec<Value> = options
+                    .iter()
+                    .map(|o| json!({"id": o.id, "label": o.label}))
+                    .collect();
+                json!({"tool":"ask_user","question":question,"options":opts})
+            }
+        }
         A::Done { reply } => json!({"tool":"done","reply":reply}),
         A::Escalate { reason } => json!({"tool":"escalate","reason":reason}),
     };
@@ -732,6 +760,46 @@ fn parse_sse_delta_content(data: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Kairion (F1): extract the per-token decision-token logprobs from ONE SSE `data:` payload.
+/// OpenAI streaming carries them at `choices[0].logprobs.content[*].top_logprobs[*].logprob`;
+/// each natural-log `logprob` is exp()'d back to a probability and kept in the server's order
+/// (DESCENDING — `top_logprobs` is sorted most→least likely), matching
+/// [`crate::doubt_sensor::DecisionToken`]'s contract. PURE + total: a chunk WITHOUT logprobs
+/// (the common case, or a server that doesn't support them) yields an EMPTY vec, so the caller
+/// simply accumulates nothing and the signal stays text-only. Unit-tested against fixtures.
+fn parse_sse_logprobs(data: &str) -> Vec<crate::doubt_sensor::DecisionToken> {
+    let value: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(content) = value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("logprobs"))
+        .and_then(|lp| lp.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for token_entry in content {
+        let Some(tops) = token_entry.get("top_logprobs").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        // exp(logprob) → probability; descending order preserved from the server.
+        let top: Vec<f32> = tops
+            .iter()
+            .filter_map(|t| t.get("logprob").and_then(|l| l.as_f64()))
+            .map(|lp| (lp as f32).exp())
+            .collect();
+        if !top.is_empty() {
+            out.push(crate::doubt_sensor::DecisionToken { top });
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl CoderModel for OmlxModel {
     /// L2.1 streaming path: unused by the burst loop (the loop drives
@@ -761,13 +829,41 @@ impl CoderModel for OmlxModel {
         transcript: &Transcript,
         on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> String {
-        match self.run_completion_streaming(transcript, on_progress).await {
-            Ok(text) => text,
+        // No logprob capture on this (text-only) path: a `false` keeps the request body
+        // BYTE-IDENTICAL to the pre-Kairion shape.
+        match self
+            .run_completion_streaming(transcript, on_progress, false)
+            .await
+        {
+            Ok((text, _)) => text,
             // Streaming failed mid-flight — fall back to a clean non-streaming completion so the
             // burst always gets a well-formed result (the final emit_chat finalizes the chat).
             Err(_) => match self.run_completion(transcript).await {
                 Ok(t) => t,
                 Err(e) => format!("[model request failed: {e}]"),
+            },
+        }
+    }
+
+    /// Kairion (F1): override that ALSO returns the turn's decision-token logprobs — but ONLY
+    /// when this model is the ORCHESTRATOR's (`self.orchestrator`). For a plain coder / mini the
+    /// `capture` is `false`, so the request body and the streaming path are byte-identical to
+    /// [`next_output_streaming`] and the logprobs are `None`. A streaming failure falls back to a
+    /// non-streaming completion (text-only, `None`), exactly like the text path.
+    async fn next_output_streaming_logprobs(
+        &self,
+        transcript: &Transcript,
+        on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> (String, Option<Vec<crate::doubt_sensor::DecisionToken>>) {
+        let capture = self.orchestrator;
+        match self
+            .run_completion_streaming(transcript, on_progress, capture)
+            .await
+        {
+            Ok((text, logprobs)) => (text, logprobs),
+            Err(_) => match self.run_completion(transcript).await {
+                Ok(t) => (t, None),
+                Err(e) => (format!("[model request failed: {e}]"), None),
             },
         }
     }
@@ -804,9 +900,16 @@ impl OmlxModel {
         &self,
         transcript: &Transcript,
         on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
-    ) -> Result<String, String> {
+        capture_logprobs: bool,
+    ) -> Result<(String, Option<Vec<crate::doubt_sensor::DecisionToken>>), String> {
         let mut body = self.build_request_body(transcript);
         body["stream"] = serde_json::json!(true);
+        // Kairion (F1): attach OpenAI logprobs ONLY when capturing (orchestrator). When
+        // `false`, the body is byte-identical to the pre-Kairion streaming request.
+        if capture_logprobs {
+            body["logprobs"] = serde_json::json!(true);
+            body["top_logprobs"] = serde_json::json!(5);
+        }
         let mut resp = self
             .client
             .post(self.endpoint())
@@ -824,6 +927,11 @@ impl OmlxModel {
         // COMPLETE lines — a '\n' is single-byte ASCII, so a whole line never splits a codepoint.
         let mut byte_buf: Vec<u8> = Vec::new();
         let mut full = String::new();
+        // Kairion (F1): accumulate the whole turn's decision-token logprobs (per-token top-k,
+        // descending) when capturing. `Some(empty)` vs `None` distinguishes "orchestrator asked
+        // but the server returned no logprobs" (still works, text-only) from "never asked".
+        let mut logprobs: Option<Vec<crate::doubt_sensor::DecisionToken>> =
+            if capture_logprobs { Some(Vec::new()) } else { None };
         while let Some(chunk) = resp
             .chunk()
             .await
@@ -839,18 +947,23 @@ impl OmlxModel {
                 };
                 let payload = payload.trim();
                 if payload == "[DONE]" {
-                    return Ok(full);
+                    return Ok((full, logprobs));
+                }
+                // Capture this chunk's logprobs (if any) BEFORE the content/memory check so a
+                // late delta that trips the cap still contributes its decision tokens.
+                if let Some(acc) = logprobs.as_mut() {
+                    acc.extend(parse_sse_logprobs(payload));
                 }
                 if let Some(piece) = parse_sse_delta_content(payload) {
                     full.push_str(&piece);
                     on_progress(&full); // deliver this piece to the UI first...
                     if full.len() > crate::executor::HTTP_BODY_CAP {
-                        return Ok(full); // ...then bound memory (parity with run_completion's cap)
+                        return Ok((full, logprobs)); // ...then bound memory (parity with run_completion)
                     }
                 }
             }
         }
-        Ok(full)
+        Ok((full, logprobs))
     }
 }
 
@@ -1028,6 +1141,46 @@ mod tests {
         );
         assert_eq!(parse_sse_delta_content(r#"{"choices":[]}"#), None);
         assert_eq!(parse_sse_delta_content("not json"), None);
+    }
+
+    #[test]
+    fn parse_sse_logprobs_exps_topk_descending_and_skips_when_absent() {
+        // A chunk carrying logprobs: two tokens, each with a descending top_logprobs list.
+        // ln(p) is exp()'d back; ln(1)=0 → p=1.0, ln(0.5)≈-0.693 → p≈0.5.
+        let data = r#"{"choices":[{"delta":{"content":"a"},"logprobs":{"content":[
+            {"token":"a","logprob":0.0,"top_logprobs":[{"token":"a","logprob":0.0},{"token":"b","logprob":-0.6931472}]},
+            {"token":"c","logprob":-1.2039728,"top_logprobs":[{"token":"c","logprob":-1.2039728},{"token":"d","logprob":-2.3025851}]}
+        ]}}]}"#;
+        let toks = parse_sse_logprobs(data);
+        assert_eq!(toks.len(), 2, "one DecisionToken per content token");
+        assert_eq!(toks[0].top.len(), 2);
+        assert!((toks[0].top[0] - 1.0).abs() < 1e-4, "exp(0)=1");
+        assert!((toks[0].top[1] - 0.5).abs() < 1e-4, "exp(ln 0.5)=0.5");
+        // Descending preserved: first prob ≥ second.
+        assert!(toks[0].top[0] >= toks[0].top[1]);
+
+        // A plain content chunk WITHOUT logprobs → empty (text-only path stays intact).
+        assert!(parse_sse_logprobs(r#"{"choices":[{"delta":{"content":"x"}}]}"#).is_empty());
+        // Malformed JSON → empty, never panics.
+        assert!(parse_sse_logprobs("not json").is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_flag_gates_logprobs_in_the_streaming_body() {
+        // The non-streaming body NEVER carries logprobs (parity with before).
+        let m = OmlxModel::new("http://127.0.0.1:8000/v1", "test-model", false).unwrap();
+        let body = m.build_request_body(&Transcript::new("hi".to_string()));
+        assert!(body.get("logprobs").is_none(), "base body has no logprobs");
+
+        // build_request_body is shared; the logprobs fields are added ONLY inside the
+        // streaming path when capturing. Assert the gating value is wired: a plain coder
+        // (orchestrator=false) never captures, the orchestrator does.
+        let coder = OmlxModel::new("http://127.0.0.1:8000/v1", "m", false).unwrap();
+        assert!(!coder.orchestrator);
+        let orch = OmlxModel::new("http://127.0.0.1:8000/v1", "m", false)
+            .unwrap()
+            .with_orchestrator(true);
+        assert!(orch.orchestrator);
     }
 
     // --- loopback validator ---------------------------------------------------

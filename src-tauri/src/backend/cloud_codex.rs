@@ -18,10 +18,15 @@
 //!   {"kind":"websearch","query":..,"pages":[{"url":..,"title":..,"summary":""}]}
 //!   {"kind":"milestone","text":..,"node":"dot"}
 
+use super::doubt_sensor_text;
+
 /// Stateful normalizer for ONE Codex app-server session.
 pub struct CodexNormalizer {
     seq: u64,
     cur_text: String,
+    /// Kairion: the reasoning trace accumulated from `item/reasoning/*Delta` notifications since
+    /// the last `turn/started`. Fed to the text doubt sensor when an assistant question fires.
+    trace: String,
 }
 
 impl CodexNormalizer {
@@ -29,7 +34,13 @@ impl CodexNormalizer {
         Self {
             seq: base_seq,
             cur_text: String::new(),
+            trace: String::new(),
         }
+    }
+
+    /// The reasoning trace accumulated for the current turn (Kairion; mostly for tests).
+    pub fn trace(&self) -> &str {
+        &self.trace
     }
 
     /// Feed ONE NDJSON notification line; return 0+ bridge JSONL lines (no trailing newline).
@@ -44,6 +55,22 @@ impl CodexNormalizer {
             "turn/started" => {
                 self.seq += 1;
                 self.cur_text.clear();
+                // Kairion: the reasoning trace is per-turn.
+                self.trace.clear();
+                Vec::new()
+            }
+            // Kairion: EXTRACT the reasoning trace. `textDelta` is the raw reasoning, while
+            // `summaryTextDelta` is the (summarized) variant — accumulate whichever the app-server
+            // emits. No bridge line: the trace only feeds doubt sensing.
+            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                let delta = value
+                    .get("params")
+                    .and_then(|p| p.get("delta").or_else(|| p.get("text")))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                if !delta.is_empty() {
+                    self.trace.push_str(delta);
+                }
                 Vec::new()
             }
             "item/agentMessage/delta" => {
@@ -69,6 +96,21 @@ impl CodexNormalizer {
                         let text = str_field(item, &["text", "message"]);
                         if text.is_empty() {
                             return Vec::new();
+                        }
+                        // Kairion (orchestrator-only): a KAIRION_QUESTION marker → the frozen
+                        // question wire line (doubt from the accumulated trace) instead of a chat.
+                        if let Some((preamble, q)) =
+                            doubt_sensor_text::parse_question_marker_with_preamble(text)
+                        {
+                            // Any prose BEFORE the marker line is real reasoning — emit it as its
+                            // own chat bubble first, then the question line, so a
+                            // "preamble\nKAIRION_QUESTION {…}" turn drops nothing.
+                            let mut out = Vec::new();
+                            if let Some(pre) = preamble {
+                                out.push(serde_json::json!({"kind":"chat","role":"assistant","text":pre}).to_string());
+                            }
+                            out.push(doubt_sensor_text::build_question_line(&self.trace, &q));
+                            return out;
                         }
                         vec![serde_json::json!({"kind":"chat","role":"assistant","text":text}).to_string()]
                     }
@@ -212,5 +254,55 @@ mod tests {
         assert!(n.feed_line(r#"{"method":"thread/status/changed","params":{}}"#).is_empty());
         assert!(n.feed_line(r#"{"method":"turn/completed","params":{}}"#).is_empty());
         assert!(n.feed_line("not json").is_empty());
+    }
+
+    #[test]
+    fn reasoning_deltas_accumulate_into_the_trace_no_bridge_line() {
+        let mut n = CodexNormalizer::new(0);
+        assert!(n.feed_line(r#"{"method":"turn/started","params":{}}"#).is_empty());
+        assert!(n
+            .feed_line(r#"{"method":"item/reasoning/textDelta","params":{"delta":"maybe "}}"#)
+            .is_empty());
+        assert!(n
+            .feed_line(r#"{"method":"item/reasoning/summaryTextDelta","params":{"delta":"Postgres"}}"#)
+            .is_empty());
+        assert_eq!(n.trace(), "maybe Postgres");
+        // a new turn resets the trace
+        n.feed_line(r#"{"method":"turn/started","params":{}}"#);
+        assert_eq!(n.trace(), "");
+    }
+
+    #[test]
+    fn completed_agent_message_preamble_before_marker_emits_chat_then_question() {
+        // Reasoning prose BEFORE the KAIRION_QUESTION marker must surface as a chat bubble first,
+        // then the question line — never dropped.
+        let mut n = CodexNormalizer::new(0);
+        n.feed_line(r#"{"method":"turn/started","params":{}}"#);
+        let line = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Some preamble reasoning.\nKAIRION_QUESTION {\"id\":\"q2\",\"text\":\"A or B?\",\"options\":[{\"id\":\"a\",\"label\":\"A\"}],\"affects\":[]}"}}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 2, "preamble chat + question, got {out:?}");
+        let chat: Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(chat["kind"], "chat");
+        assert_eq!(chat["role"], "assistant");
+        assert_eq!(chat["text"], "Some preamble reasoning.");
+        let q: Value = serde_json::from_str(&out[1]).unwrap();
+        assert_eq!(q["kind"], "question");
+        assert_eq!(q["id"], "q2");
+        assert_eq!(q["text"], "A or B?");
+    }
+
+    #[test]
+    fn completed_agent_message_with_question_marker_emits_a_question_line() {
+        let mut n = CodexNormalizer::new(0);
+        n.feed_line(r#"{"method":"turn/started","params":{}}"#);
+        n.feed_line(r#"{"method":"item/reasoning/textDelta","params":{"delta":"maybe A, but perhaps B. however A. not sure."}}"#);
+        let line = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"KAIRION_QUESTION {\"id\":\"q9\",\"text\":\"A or B?\",\"options\":[{\"id\":\"a\",\"label\":\"A\"},{\"id\":\"b\",\"label\":\"B\"}],\"affects\":[\"x.rs\"]}"}}}"#;
+        let v = one(&n.feed_line(line));
+        assert_eq!(v["kind"], "question");
+        assert_eq!(v["id"], "q9");
+        assert_eq!(v["text"], "A or B?");
+        assert_eq!(v["options"][1]["label"], "B");
+        assert_eq!(v["affects"][0], "x.rs");
+        assert!(v["unrest"].as_f64().unwrap() > 0.0);
     }
 }

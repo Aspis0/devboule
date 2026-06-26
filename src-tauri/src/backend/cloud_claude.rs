@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 
+use super::doubt_sensor_text;
+
 /// Stateful normalizer for ONE Claude stream-json session. `new(base_seq)` seeds the assistant
 /// turn counter (so it never collides with deltas the local path may have emitted on the same
 /// agent — in practice base 0).
@@ -26,6 +28,9 @@ pub struct ClaudeNormalizer {
     cur_text: String,
     /// tool_use_id -> the web-search query, pending its tool_result.
     pending_ws: HashMap<String, String>,
+    /// Kairion: the (summarized) reasoning trace accumulated from `thinking_delta`s since the
+    /// last `message_start`. Fed to the text doubt sensor when an assistant question turn fires.
+    trace: String,
 }
 
 impl ClaudeNormalizer {
@@ -34,7 +39,13 @@ impl ClaudeNormalizer {
             seq: base_seq,
             cur_text: String::new(),
             pending_ws: HashMap::new(),
+            trace: String::new(),
         }
+    }
+
+    /// The reasoning trace accumulated for the current turn (Kairion; mostly for tests).
+    pub fn trace(&self) -> &str {
+        &self.trace
     }
 
     /// Feed ONE NDJSON line; return 0+ complete bridge JSONL lines (no trailing newline). Pure
@@ -56,6 +67,9 @@ impl ClaudeNormalizer {
                             // A new turn: drop any web-search queries from the prior turn that never
                             // got a tool_result, so `pending_ws` can't leak across the session.
                             self.pending_ws.clear();
+                            // Kairion: the reasoning trace is per-turn — start fresh so this turn's
+                            // doubt is computed only from THIS turn's thinking.
+                            self.trace.clear();
                             return vec![];
                         }
                         "content_block_delta" => {
@@ -65,6 +79,13 @@ impl ClaudeNormalizer {
                                     if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                                         self.cur_text.push_str(text);
                                         return vec![serde_json::json!({"kind":"chat-delta","seq":self.seq,"text":self.cur_text}).to_string()];
+                                    }
+                                } else if dt == "thinking_delta" {
+                                    // Kairion: EXTRACT the (summarized) reasoning trace. We emit no
+                                    // bridge line for it (the trace is internal to doubt sensing);
+                                    // it is consumed when an assistant question turn fires.
+                                    if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                        self.trace.push_str(t);
                                     }
                                 }
                             }
@@ -89,7 +110,26 @@ impl ClaudeNormalizer {
                         if bt == "text" {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
-                                    lines.push(serde_json::json!({"kind":"chat","role":"assistant","text":text}).to_string());
+                                    // Kairion (orchestrator-only): if this turn carries a
+                                    // KAIRION_QUESTION marker, assemble + emit the frozen question
+                                    // wire line (doubt computed from the accumulated trace) INSTEAD
+                                    // of a plain chat bubble. No marker → byte-identical chat turn.
+                                    if let Some((preamble, q)) =
+                                        doubt_sensor_text::parse_question_marker_with_preamble(text)
+                                    {
+                                        // Any prose BEFORE the marker line is real reasoning — emit
+                                        // it as its own chat bubble first, then the question line,
+                                        // so a "preamble\nKAIRION_QUESTION {…}" turn drops nothing.
+                                        if let Some(pre) = preamble {
+                                            lines.push(serde_json::json!({"kind":"chat","role":"assistant","text":pre}).to_string());
+                                        }
+                                        lines.push(doubt_sensor_text::build_question_line(
+                                            &self.trace,
+                                            &q,
+                                        ));
+                                    } else {
+                                        lines.push(serde_json::json!({"kind":"chat","role":"assistant","text":text}).to_string());
+                                    }
                                 }
                             }
                         } else if bt == "tool_use" {
@@ -227,14 +267,61 @@ mod tests {
     }
 
     #[test]
-    fn thinking_and_input_json_deltas_are_ignored() {
+    fn thinking_deltas_are_extracted_into_the_trace_input_json_ignored() {
+        // Kairion: a `thinking_delta` no longer just drops — its text accumulates into the
+        // reasoning trace (still emitting NO bridge line). `input_json_delta` stays ignored.
         let mut n = ClaudeNormalizer::new(0);
         assert!(n
-            .feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}"#)
+            .feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm, maybe "}}}"#)
+            .is_empty());
+        assert!(n
+            .feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Postgres"}}}"#)
             .is_empty());
         assert!(n
             .feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q"}}}"#)
             .is_empty());
+        // the thinking was EXTRACTED, the input_json was NOT
+        assert_eq!(n.trace(), "hmm, maybe Postgres");
+    }
+
+    #[test]
+    fn assistant_question_marker_emits_the_frozen_question_line_with_doubt() {
+        let mut n = ClaudeNormalizer::new(0);
+        // a new turn + a torn reasoning trace
+        n.feed_line(r#"{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}}}"#);
+        n.feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"maybe Postgres, but perhaps MySQL. however Postgres. not sure."}}}"#);
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"KAIRION_QUESTION {\"id\":\"q1\",\"text\":\"Which DB?\",\"options\":[{\"id\":\"pg\",\"label\":\"Postgres\"},{\"id\":\"my\",\"label\":\"MySQL\"}],\"affects\":[\"schema.rs\"]}"}]}}"#;
+        let out = n.feed_line(line);
+        let v = one(&out);
+        assert_eq!(v["kind"], "question");
+        assert_eq!(v["id"], "q1");
+        assert_eq!(v["text"], "Which DB?");
+        assert_eq!(v["status"], "open");
+        assert_eq!(v["options"][0]["label"], "Postgres");
+        assert_eq!(v["affects"][0], "schema.rs");
+        assert!(v["unrest"].as_f64().unwrap() > 0.0, "torn trace → some unrest");
+        assert!(v["directionConfidence"].as_f64().unwrap() <= 0.4, "text-only → low");
+        // a question turn must NOT also emit a plain chat bubble
+        assert!(out.iter().all(|l| !l.contains("\"kind\":\"chat\"")));
+    }
+
+    #[test]
+    fn assistant_preamble_before_marker_emits_chat_then_question() {
+        // A turn that writes reasoning prose BEFORE the KAIRION_QUESTION marker must NOT drop that
+        // preamble: it surfaces as a chat bubble first, then the question line.
+        let mut n = ClaudeNormalizer::new(0);
+        n.feed_line(r#"{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}}}"#);
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Here is my reasoning so far.\nKAIRION_QUESTION {\"id\":\"q1\",\"text\":\"Which DB?\",\"options\":[{\"id\":\"pg\",\"label\":\"Postgres\"}],\"affects\":[]}"}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 2, "preamble chat + question, got {out:?}");
+        let chat: Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(chat["kind"], "chat");
+        assert_eq!(chat["role"], "assistant");
+        assert_eq!(chat["text"], "Here is my reasoning so far.");
+        let q: Value = serde_json::from_str(&out[1]).unwrap();
+        assert_eq!(q["kind"], "question");
+        assert_eq!(q["id"], "q1");
+        assert_eq!(q["text"], "Which DB?");
     }
 
     #[test]

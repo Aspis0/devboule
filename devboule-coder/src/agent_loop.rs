@@ -22,6 +22,7 @@
 //! [`ScriptedModel`]: crate::model::ScriptedModel
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -65,6 +66,14 @@ pub const OUTPUT_HASH_WINDOW: usize = 6;
 /// transcript that is re-fed to the model every round; we truncate at a char
 /// boundary with a marker so the model still sees the head and knows it was cut.
 pub const MAX_RESULT_LEN: usize = 16_384;
+
+/// FIX 2 (Kairion): a PROCESS-MONOTONIC burst-generation counter. `turn_seq` resets to 0
+/// at the top of every [`run_burst`], so a bare `q{seq}` question id repeats every burst —
+/// and a later `"reopened"` status (already in the `question` contract) would collide across
+/// bursts. Stamping each burst with a unique generation makes [`question_id`] globally unique
+/// for the process lifetime (`b{burst}q{seq}`). Relaxed ordering is sufficient: we need
+/// uniqueness, not cross-thread happens-before (bursts are never concurrent for one process).
+static BURST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// How a burst concluded. This IS the assistant turn's conclusion: the human
 /// regains control afterwards.
@@ -155,6 +164,18 @@ pub trait ToolExecutor: Send + Sync {
     /// disabled (no-op) emitter; only [`crate::executor::RealExecutor`] returns a live one.
     fn activity_handle(&self) -> crate::activity::Activity {
         crate::activity::Activity::disabled()
+    }
+
+    /// `true` ONLY when this executor IS the orchestrator — launched with a seeded GOAL
+    /// (`DEVBOULE_GOAL`), the SAME `config::seeded_goal().is_some()` signal that marks
+    /// `OmlxModel.orchestrator`. The burst CO-ENFORCES this with `activity_handle().is_enabled()`
+    /// to gate the Kairion structured `question` emission: ONLY the orchestrator may emit a
+    /// `question` event, so a plain coder / mini launched with `DEVBOULE_ACTIVITY_FILE` set but
+    /// WITHOUT a goal stays byte-identical (no question event) regardless of env misconfiguration.
+    /// Default FALSE: every plain coder / mini / test executor is correctly NON-orchestrator;
+    /// only [`crate::executor::RealExecutor`] overrides it (set from config at launch).
+    fn is_orchestrator(&self) -> bool {
+        false
     }
 }
 
@@ -353,6 +374,10 @@ pub async fn run_burst(
     // B14b: a monotonic id for each assistant turn, so the host can tie a turn's streaming
     // chat deltas together (and a new turn replaces the previous live tail).
     let mut turn_seq: u64 = 0;
+    // FIX 2: a process-unique generation for THIS burst. `turn_seq` resets to 0 every burst,
+    // so the generation is what keeps `question_id` globally unique across bursts (no `q1`
+    // collision a later `"reopened"` could alias onto).
+    let burst_gen = BURST_GENERATION.fetch_add(1, Ordering::Relaxed);
 
     loop {
         // Wall-clock cap: check BEFORE asking the model so an already-overrun
@@ -383,8 +408,11 @@ pub async fn run_burst(
         // (default trait impl) never invokes it; a disabled activity handle makes it a no-op.
         let sink = executor.activity_handle();
         let mut reply_stream = ReplyStreamExtractor::new();
-        let raw = model
-            .next_output_streaming(&transcript, &mut move |cumulative: &str| {
+        // Kairion (F1): `next_output_streaming_logprobs` returns the SAME streamed text PLUS the
+        // turn's decision-token logprobs when the backend is the orchestrator's oMLX (else `None`,
+        // text-only). The chat-delta closure is byte-identical to before.
+        let (raw, turn_logprobs) = model
+            .next_output_streaming_logprobs(&transcript, &mut move |cumulative: &str| {
                 if let Some(partial) = reply_stream.feed(cumulative) {
                     sink.chat_delta(seq, &partial);
                 }
@@ -444,11 +472,35 @@ pub async fn run_burst(
                         executor.emit_chat("assistant", reply);
                         return BurstOutcome::Done(reply.clone());
                     }
-                    AgentAction::AskUser { question } => {
+                    AgentAction::AskUser { question, options } => {
                         emit(progress_tx, format!("❓ {}", elide(question))).await;
                         // The orchestrator's question → an assistant chat bubble (the user
-                        // answers it via the chat composer → steer → continues).
+                        // answers it via the chat composer → steer → continues). ALWAYS emitted —
+                        // this is the back-compat / degrade path that every role keeps.
                         executor.emit_chat("assistant", question);
+                        // Kairion (F3b): the ORCHESTRATOR additionally emits a STRUCTURED question
+                        // event (discrete options + the doubt sensor's reading). FIX 1: CO-ENFORCE
+                        // two independent signals — a LIVE activity bridge (`DEVBOULE_ACTIVITY_FILE`)
+                        // AND the orchestrator flag (`is_orchestrator()`, the `DEVBOULE_GOAL` /
+                        // `seeded_goal().is_some()` signal). Either one alone is insufficient: a plain
+                        // coder launched with the activity file set but WITHOUT a goal must NEVER emit a
+                        // question event. ONLY the orchestrator does — every other role skips all of this
+                        // and stays byte-identical regardless of env misconfiguration.
+                        let activity = executor.activity_handle();
+                        if activity.is_enabled() && executor.is_orchestrator() {
+                            let labels: Vec<&str> =
+                                options.iter().map(|o| o.label.as_str()).collect();
+                            // The reasoning TRACE for THIS turn: the model's <think> content if it
+                            // emitted one, else the prose preceding the action JSON in `raw`.
+                            let trace = decision_trace(&raw);
+                            // The decision span: the trailing tokens of the turn (where the model
+                            // commits to the action). DEGRADES to None ⇒ text-only signal.
+                            let span = decision_span(turn_logprobs.as_deref());
+                            let signal = crate::doubt_sensor::analyze(&trace, span, &labels);
+                            let id = question_id(burst_gen, seq);
+                            // affects: no per-task linkage in v1 → empty (field still present).
+                            activity.question(&id, question, options, &signal, "open", &[]);
+                        }
                         return BurstOutcome::AskUser(question.clone());
                     }
                     AgentAction::Escalate { reason } => {
@@ -601,6 +653,56 @@ fn hash_output(s: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Kairion (F1): how many trailing decision tokens form the "decision span" fed to the
+/// doubt sensor. The tokens just before/at the action JSON are where the model COMMITS to
+/// the choice, so a small trailing window concentrates the token-entropy signal there
+/// rather than diluting it across a long reasoning preamble.
+const DECISION_SPAN_TOKENS: usize = 32;
+
+/// Kairion (F1): narrow the turn's captured logprobs to the DECISION SPAN — the last
+/// [`DECISION_SPAN_TOKENS`] tokens (or the whole turn if shorter). `None`/empty in ⇒
+/// `None` out, so the sensor degrades cleanly to a text-only reading.
+fn decision_span(logprobs: Option<&[crate::doubt_sensor::DecisionToken]>) -> Option<&[crate::doubt_sensor::DecisionToken]> {
+    let toks = logprobs?;
+    if toks.is_empty() {
+        return None;
+    }
+    let start = toks.len().saturating_sub(DECISION_SPAN_TOKENS);
+    Some(&toks[start..])
+}
+
+/// Kairion (F3b): the model's reasoning TRACE for this turn, for the doubt sensor. Prefers
+/// an explicit `<think>…</think>` reasoning channel when the model emitted one; otherwise
+/// the prose PRECEDING the `action` block (the model's narration before it committed to the
+/// action). PURE so it is unit-testable. Returns an empty string when there is neither — the
+/// sensor then has no text signal (the no-trace degrade).
+fn decision_trace(raw: &str) -> String {
+    if let Some(open) = raw.find("<think>") {
+        let after = &raw[open + "<think>".len()..];
+        let inner = match after.find("</think>") {
+            Some(close) => &after[..close],
+            None => after, // unterminated think block: take the rest
+        };
+        return inner.trim().to_string();
+    }
+    // No explicit reasoning channel: the text before the fenced action block is the narration.
+    let prefix = match raw.find("```action") {
+        Some(idx) => &raw[..idx],
+        None => raw,
+    };
+    prefix.trim().to_string()
+}
+
+/// Kairion (F3b + FIX 2): a per-question id that is GLOBALLY unique for the process lifetime.
+/// `seq` (the burst turn) is monotonic only WITHIN a burst and resets to 0 each burst, so it
+/// is prefixed with the process-monotonic `burst` generation (`b{burst}q{seq}`). This lets the
+/// host correlate a `question` event with its later answer / `reopened` without a stale `q1`
+/// from an earlier burst aliasing onto a fresh one. Same logical question re-asked in the same
+/// burst reuses its id (same `seq`); only `"open"` is emitted today.
+fn question_id(burst: u64, seq: u64) -> String {
+    format!("b{burst}q{seq}")
 }
 
 #[cfg(test)]
@@ -1664,5 +1766,111 @@ mod tests {
                 action.tool_name()
             );
         }
+    }
+
+    #[test]
+    fn question_id_is_globally_unique_across_bursts() {
+        // FIX 2: `turn_seq` resets to 0 each burst, so a bare `q{seq}` repeats every burst —
+        // a later `"reopened"` could alias an earlier burst's `q1`. The burst-generation prefix
+        // makes the id unique for the process lifetime: SAME seq, DIFFERENT burst → DIFFERENT id.
+        assert_eq!(question_id(0, 1), "b0q1");
+        assert_eq!(question_id(1, 1), "b1q1");
+        assert_ne!(
+            question_id(0, 1),
+            question_id(1, 1),
+            "the same turn seq in two bursts must not collide"
+        );
+        // Within ONE burst, distinct turns stay distinct (the per-turn correlation key).
+        assert_ne!(question_id(7, 1), question_id(7, 2));
+    }
+
+    #[tokio::test]
+    async fn question_event_requires_the_orchestrator_flag() {
+        // FIX 1: the structured Kairion `question` event is CO-GATED on a LIVE activity bridge
+        // AND the orchestrator flag. A plain coder with the bridge ENABLED but
+        // `is_orchestrator() == false` must NEVER emit a question event; only the orchestrator
+        // does. Drives an ask_user through an executor whose activity bridge writes to a temp
+        // file, then inspects the file for a `"kind":"question"` line.
+        use crate::activity::Activity;
+
+        struct BridgedExec {
+            activity: Activity,
+            orchestrator: bool,
+        }
+        #[async_trait]
+        impl ToolExecutor for BridgedExec {
+            async fn execute(&self, _action: &AgentAction) -> ToolResult {
+                ToolResult::ok("unreached")
+            }
+            fn activity_handle(&self) -> Activity {
+                self.activity.clone()
+            }
+            fn is_orchestrator(&self) -> bool {
+                self.orchestrator
+            }
+        }
+
+        fn ask_user_model() -> ScriptedModel {
+            ScriptedModel::new(vec![action_block(
+                serde_json::json!({"tool":"ask_user","question":"which env?"}),
+            )])
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock = FixedClock(Duration::ZERO);
+
+        // NON-orchestrator: enabled bridge, but the gate's orchestrator arm is false →
+        // NO question event written (only the back-compat `chat` turn).
+        let coder_file = dir.path().join("coder.jsonl");
+        let coder = BridgedExec {
+            activity: Activity::with_path(&coder_file),
+            orchestrator: false,
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        let outcome = run_burst(
+            "x".into(),
+            &ask_user_model(),
+            &coder,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx,
+        )
+        .await;
+        assert_eq!(outcome, BurstOutcome::AskUser("which env?".to_string()));
+        let coder_body = std::fs::read_to_string(&coder_file).unwrap_or_default();
+        assert!(
+            !coder_body.contains(r#""kind":"question""#),
+            "a non-orchestrator must NEVER emit a question event, got: {coder_body}"
+        );
+
+        // ORCHESTRATOR: same enabled bridge → the question event IS written, with a
+        // globally-unique `b{burst}q{seq}` id (FIX 2).
+        let orch_file = dir.path().join("orch.jsonl");
+        let orch = BridgedExec {
+            activity: Activity::with_path(&orch_file),
+            orchestrator: true,
+        };
+        let (tx2, _rx2) = mpsc::channel(64);
+        let outcome2 = run_burst(
+            "x".into(),
+            &ask_user_model(),
+            &orch,
+            &clock,
+            DEFAULT_BURST_BUDGET,
+            true,
+            &tx2,
+        )
+        .await;
+        assert_eq!(outcome2, BurstOutcome::AskUser("which env?".to_string()));
+        let orch_body = std::fs::read_to_string(&orch_file).unwrap();
+        assert!(
+            orch_body.contains(r#""kind":"question""#),
+            "the orchestrator emits a structured question event, got: {orch_body}"
+        );
+        assert!(
+            orch_body.contains(r#""id":"b"#),
+            "the question id carries the burst-generation prefix (FIX 2): {orch_body}"
+        );
     }
 }

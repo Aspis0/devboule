@@ -1,6 +1,11 @@
 import type { ProjectTask } from "../../../types/backend";
 import type { DesignProjectEntry } from "../../../types/design";
-import type { ConsoleEntry, ChatEntry } from "../../agents/agentConsoleModel";
+import type {
+  ConsoleEntry,
+  ChatEntry,
+  QuestionEntry,
+  QuestionOption,
+} from "../../agents/agentConsoleModel";
 
 export type StageView = 'exa' | 'plan' | 'design';
 
@@ -98,6 +103,50 @@ export function chatMessages(entries: ConsoleEntry[] | undefined): PlannerMessag
   return (entries ?? [])
     .filter((e): e is ChatEntry => e.type === "chat")
     .map((e) => ({ role: e.role, text: e.text }));
+}
+
+/** Extract the orchestrator's OPEN Kairion doubts from a console timeline, upserted by
+ *  `id` so a later `reopened` (or refreshed) event replaces the earlier one IN PLACE while
+ *  keeping first-seen order (stable card positions). Empty when the orchestrator surfaced no
+ *  doubt — Kairion degrades to a plain question / no left panel. ORCHESTRATOR-ONLY: this only
+ *  reads `question` entries, which the contract emits for the orchestrator alone. Pure + total. */
+export function openQuestions(entries: ConsoleEntry[] | undefined): QuestionEntry[] {
+  if (!entries) return [];
+  const order: string[] = [];
+  const byId = new Map<string, QuestionEntry>();
+  for (const e of entries) {
+    if (e.type !== "question") continue;
+    if (!byId.has(e.id)) order.push(e.id);
+    byId.set(e.id, e);
+  }
+  return order.map((id) => byId.get(id)!);
+}
+
+/** The plain steer line a picked option rides — the SAME transport as a typed reply
+ *  (orchestrator_steer / project_cloud_orchestrator_send). Plain words the model already
+ *  parses from an ask_user reply; no new command, no sugar required. Pure + total. */
+export function steerPickOption(question: QuestionEntry, option: QuestionOption): string {
+  return `For "${question.text}" — go with ${option.label}.`;
+}
+
+/** The plain steer line "you decide" rides: hand the fork back to the orchestrator to
+ *  resolve on its own lean. Same transport as a pick. Pure + total. */
+export function steerYouDecide(question: QuestionEntry): string {
+  const dir = question.lean ? ` (your lean — ${question.lean})` : "";
+  return `For "${question.text}" — you decide${dir}.`;
+}
+
+/** Whether a doubt's `affects[]` touches a given plan card — by exact task title (trimmed,
+ *  case-insensitive) OR by 1-based task number. Drives the doubt<->task hover link. Pure + total. */
+export function doubtTouchesCard(affects: string[], card: PlanCard): boolean {
+  const title = card.title.trim().toLowerCase();
+  for (const a of affects) {
+    const key = a.trim().toLowerCase();
+    if (key.length === 0) continue;
+    if (key === title) return true;
+    if (key === String(card.n)) return true;
+  }
+  return false;
 }
 
 export interface PlannerWeb {

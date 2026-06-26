@@ -35,6 +35,7 @@ import {
   type ConsoleEntry,
   type DiffLine,
   type MiniRun,
+  type QuestionEntry,
   type Round,
   type Verdict,
   actionHasDetail,
@@ -517,7 +518,9 @@ function TimelineRow({
   first,
   last,
 }: {
-  entry: ConsoleEntry;
+  // Kairion `question` entries are rendered in the planner Plan panel, not this raw
+  // timeline (filtered out by the caller), so this row never narrows over a doubt.
+  entry: Exclude<ConsoleEntry, QuestionEntry>;
   first: boolean;
   last: boolean;
 }) {
@@ -621,7 +624,12 @@ export function AgentConsole({ activity }: AgentConsoleProps) {
     );
   }
 
-  const entries = activity.entries ?? [];
+  // Kairion `question` entries are surfaced in the planner Plan panel (DoubtPanel), not
+  // in this raw timeline — filter them out here so the console keeps its action/chat
+  // semantics (and TimelineRow never narrows over a doubt shape).
+  const entries = (activity.entries ?? []).filter(
+    (e): e is Exclude<ConsoleEntry, QuestionEntry> => e.type !== "question",
+  );
 
   return (
     <div className="relative" data-running={activity.running ? "true" : undefined}>

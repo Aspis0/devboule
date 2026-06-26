@@ -72,6 +72,23 @@ pub trait CoderModel: Send + Sync {
     ) -> String {
         self.next_output(transcript).await
     }
+
+    /// Kairion (F1): like [`next_output_streaming`], but ALSO return the turn's
+    /// decision-token logprobs as a `Vec<DecisionToken>` (top-k probabilities,
+    /// DESCENDING) when the backend can supply them. The DEFAULT returns
+    /// `(next_output_streaming(...), None)` — i.e. byte-identical streaming + NO
+    /// logprobs — so every model (Mock/Scripted/Cloud) is text-only with zero change.
+    /// ONLY the loopback [`crate::model_client::OmlxModel`], and ONLY when it is the
+    /// ORCHESTRATOR, overrides this to attach OpenAI `logprobs` to the request and
+    /// capture the per-token top-k from the SSE; a server that omits logprobs yields
+    /// `None` (still works, text-only). The chat-delta stream is unchanged either way.
+    async fn next_output_streaming_logprobs(
+        &self,
+        transcript: &Transcript,
+        on_progress: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> (String, Option<Vec<crate::doubt_sensor::DecisionToken>>) {
+        (self.next_output_streaming(transcript, on_progress).await, None)
+    }
 }
 
 /// Canned model: acknowledges the user input and emits a short markdown blob in

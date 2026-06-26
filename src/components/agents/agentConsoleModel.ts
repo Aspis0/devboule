@@ -172,8 +172,64 @@ export interface ChatEntry {
   time: string;
 }
 
+// ---- Kairion doubt (orchestrator-only) --------------------------------------
+
+/** One pickable answer to a Kairion doubt. `id` is the stable option key; `label`
+ *  is the human word shown on the button and used to phrase the steer line. */
+export interface QuestionOption {
+  id: string;
+  label: string;
+}
+
+/** One candidate direction the doubt is pulled toward, with its current `pull`
+ *  (0..1). This is the visual tension of the lean-field — NOT a percentage shown to
+ *  the user, only the relative gravitation of the marker. Mirrors `DoubtSignal.candidates`. */
+export interface DoubtCandidate {
+  label: string;
+  pull: number;
+}
+
+/** A Kairion doubt surfaced into the planner Plan view (ORCHESTRATOR-ONLY): the
+ *  orchestrator is genuinely split on a fork and shows its insecurity as instability
+ *  rather than guessing. Mirrors the frozen QUESTION wire line (serde camelCase) +
+ *  the embedded DoubtSignal fields. Degrades to a plain question when no thinking /
+ *  doubt is present (empty candidates + null lean). No persistence: present-tense only.
+ *
+ *  Wire contract (must match the Rust encoder byte-for-byte; Rust tags via
+ *  #[serde(tag="type")], so the discriminant is `type`, not `kind`):
+ *  { type:"question", id, text, options:[{id,label}], unrest, candidates:[{label,pull}],
+ *    lean:string|null, directionConfidence, status:"open"|"reopened", affects:[str], time } */
+export interface QuestionEntry {
+  type: "question";
+  /** Stable within the session, so a `reopened` event updates the doubt in place. */
+  id: string;
+  /** The fork the orchestrator is split on (the question text). */
+  text: string;
+  /** The pickable answers. */
+  options: QuestionOption[];
+  /** Overall instability 0..1 — how unsure the orchestrator is (drives the tremor). */
+  unrest: number;
+  /** The competing directions with their pulls (drives the marker gravitation). */
+  candidates: DoubtCandidate[];
+  /** The leaned option label, or `null` for "genuinely split" (honest — never faked). */
+  lean: string | null;
+  /** Confidence in the `lean` direction 0..1. Low => the lean reads as a SOFT hint,
+   *  not a verdict (the tremor stays). */
+  directionConfidence: number;
+  /** `open` = first asked; `reopened` = the orchestrator changed its own mind (destabilises). */
+  status: "open" | "reopened";
+  /** The plan task(s) this doubt shapes — drives the doubt<->task hover link. */
+  affects: string[];
+  time: string;
+}
+
 /** A single top-level row of the timeline. */
-export type ConsoleEntry = CoderEntry | SpawnEntry | WebSearchEntry | ChatEntry;
+export type ConsoleEntry =
+  | CoderEntry
+  | SpawnEntry
+  | WebSearchEntry
+  | ChatEntry
+  | QuestionEntry;
 
 /** B14b: the live, in-progress assistant reply tail — a SEPARATE slot from `entries` (so it
  *  is immune to FIFO eviction / interleaved events), rendered as the last in-progress assistant

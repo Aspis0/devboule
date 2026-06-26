@@ -17,6 +17,7 @@ mod agent_loop;
 mod app;
 mod config;
 mod conversation;
+mod doubt_sensor;
 mod executor;
 mod model;
 mod model_client;

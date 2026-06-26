@@ -3835,7 +3835,7 @@ fn cloud_goal_addendum(client: &str, initial_goal: Option<&str>) -> Option<Strin
     }
     let goal = initial_goal.map(str::trim).filter(|g| !g.is_empty())?;
     Some(format!(
-        "\n\n# Your goal for this project\n\n{goal}\n\nDiscuss this goal with the user to shape a plan. When the conversation has converged, draft the plan (plan_submit) and create the Kanban tasks (project_create_plan_tasks). Do not start coding until the plan is agreed.\n"
+        "\n\n# Your goal for this project\n\n{goal}\n\nDiscuss this goal with the user to shape a plan. When the conversation has converged, draft the plan (plan_submit) and create the Kanban tasks (project_create_plan_tasks). Do not start coding until the plan is agreed.\n\n# Surfacing genuine doubt (Kairion)\n\nWhile shaping the plan, reason OUT LOUD about the decisions you are unsure of. When a decision genuinely forks the plan and the user should weigh in, do NOT bury it in prose — emit it on its OWN line, exactly:\nKAIRION_QUESTION {{\"id\":\"<stable-id>\",\"text\":\"<the question>\",\"options\":[{{\"id\":\"<short>\",\"label\":\"<label>\"}}],\"affects\":[\"<task title or number>\"]}}\nUse 2-4 discrete options; keep ids short and stable, and re-emit the SAME id (same shape) to re-open a decision. The user's reply arrives as an ordinary turn — continue once they choose, or choose yourself if they defer. Surface only the few load-bearing forks, never every minor choice.\n"
     ))
 }
 
@@ -6032,6 +6032,14 @@ fn build_cloud_duplex_launch(
             "claude"
         }
         crate::backend::cloud_duplex::Provider::Codex => {
+            // KAIRION (orchestrator-only, always-on): force reasoning-on for the orchestrator
+            // duplex so the doubt sensor has a reasoning trace to read. `-c <key>=<value>` is a
+            // Codex global config override; placed BEFORE `app-server` (the subcommand). This
+            // path is reached ONLY for the cloud DUPLEX orchestrator (the coder/mini never build
+            // a duplex launch), so it can never widen a coder's effort. ⚠️ The exact key name is
+            // from the documented config and must be confirmed against a live `codex app-server`.
+            args.push("-c".to_string());
+            args.push("model_reasoning_effort=high".to_string());
             // codex app-server: model + MCP are configured via the JSON-RPC handshake, not argv
             // (left for e2e). The opening goal still rides in as the first stdin user turn.
             args.push("app-server".to_string());
@@ -6077,6 +6085,18 @@ fn build_cloud_duplex_launch(
         // to 300s). Kept strictly BELOW the settings hook `timeout` (600s) so the CLI never
         // kills the hook before its own poll deadline.
         envs.push(("ASPIS_CONSENT_TIMEOUT_SECS".to_string(), "300".to_string()));
+        // KAIRION (orchestrator-only, always-on): force adaptive SUMMARIZED thinking for the
+        // cloud Claude orchestrator duplex so the doubt sensor has a (summarized) reasoning trace
+        // to read. Carried as the FROZEN thinking config object. Delivered via env (NOT an argv
+        // flag) deliberately: an unknown env var is ignored by the CLI (degrades gracefully) — an
+        // unknown CLI flag would abort the launch. This is reached ONLY on the orchestrator duplex
+        // (build_cloud_duplex_launch is never called for a coder/mini), so coder PTYs are
+        // byte-identical. ⚠️ The exact mechanism the Claude CLI uses to apply this object is
+        // UNVERIFIED and must be confirmed against a live `claude` (flagged for e2e — the owner's eyes).
+        envs.push((
+            "ASPIS_ORCHESTRATOR_THINKING".to_string(),
+            r#"{"type":"adaptive","display":"summarized"}"#.to_string(),
+        ));
     }
     Some((program.to_string(), args, envs))
 }

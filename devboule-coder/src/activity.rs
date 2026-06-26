@@ -29,6 +29,10 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use serde::Serialize;
+
+use crate::action::QOption;
+use crate::doubt_sensor::{Candidate, DoubtSignal};
 use crate::executor::ExaPage;
 
 /// The env var the Tauri host sets at orchestrator launch to the per-agent activity
@@ -193,6 +197,46 @@ impl Activity {
             let _ = file.write_all(line.as_bytes());
         }
     }
+
+    /// `true` when this emitter is LIVE (a path is configured). The host sets
+    /// `DEVBOULE_ACTIVITY_FILE` ONLY at ORCHESTRATOR launch, so a live bridge is the
+    /// de-facto orchestrator-role signal the burst loop uses to gate the Kairion
+    /// structured-question emission (and to skip its doubt-sensor work entirely for a
+    /// plain coder / mini, keeping that path byte-identical). Mirrors the same implicit
+    /// gate every other bridge emission already relies on.
+    pub fn is_enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// Append ONE `question` event (Kairion): a structured `ask_user` carrying the
+    /// orchestrator's discrete `options` PLUS the doubt sensor's reading of `signal`
+    /// (unrest magnitude, per-option candidate pulls, lean + direction confidence).
+    /// `id` is a stable per-turn key, `status` is `"open"` (a fresh ask) or
+    /// `"reopened"`, and `affects` lists the plan items the answer bears on (may be
+    /// empty). Same best-effort contract as [`chat`] (None path / any I/O error
+    /// silently no-ops). Mirrors [`chat_delta`]'s shape; the wire line is the FROZEN
+    /// question contract built by [`encode_question`].
+    pub fn question(
+        &self,
+        id: &str,
+        text: &str,
+        options: &[QOption],
+        signal: &DoubtSignal,
+        status: &str,
+        affects: &[String],
+    ) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        let line = encode_question(id, text, options, signal, status, affects);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// Serialize ONE milestone event to its single-line JSON form, `text` char-capped to
@@ -276,6 +320,79 @@ fn encode_chat_delta(seq: u64, text: &str) -> String {
     line
 }
 
+/// Serialize ONE `question` event (Kairion) to its single-line JSON form — the FROZEN
+/// wire contract:
+/// `{"kind":"question","id":…,"text":…,"options":[{"id","label"}],"unrest":f,"candidates":[{"label","pull"}],"lean":…|null,"directionConfidence":f,"status":…,"affects":[…]}`
+/// + a trailing `\n`.
+///
+/// Built from a [`DoubtSignal`] (unrest / candidates / lean / direction confidence) +
+/// the question prose + the discrete options + a stable id + a status. The `text` is
+/// char-capped to [`MAX_CHAT_TEXT_CHARS`] (codepoint-safe), exactly like a chat turn.
+///
+/// KEY-ORDER NOTE: a DERIVED `Serialize` struct emits its fields in DECLARATION order
+/// (unlike `serde_json::Value`, whose `Map` is a `BTreeMap` that would re-sort the keys
+/// alphabetically), so the on-wire key order matches the frozen contract byte-for-byte.
+fn encode_question(
+    id: &str,
+    text: &str,
+    options: &[QOption],
+    signal: &DoubtSignal,
+    status: &str,
+    affects: &[String],
+) -> String {
+    #[derive(Serialize)]
+    struct WireQOption<'a> {
+        id: &'a str,
+        label: &'a str,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct QuestionEvent<'a> {
+        kind: &'static str,
+        id: &'a str,
+        text: String,
+        options: Vec<WireQOption<'a>>,
+        unrest: f32,
+        // `Candidate`'s own `#[serde(rename_all = "camelCase")]` renders each as
+        // `{"label":…,"pull":…}`, matching the contract.
+        candidates: &'a [Candidate],
+        lean: Option<&'a str>,
+        // The ONLY multi-word key — `rename_all` turns it into `directionConfidence`.
+        direction_confidence: f32,
+        status: &'a str,
+        affects: &'a [String],
+    }
+
+    let capped: String = if text.chars().count() > MAX_CHAT_TEXT_CHARS {
+        text.chars().take(MAX_CHAT_TEXT_CHARS).collect()
+    } else {
+        text.to_string()
+    };
+    let event = QuestionEvent {
+        kind: "question",
+        id,
+        text: capped,
+        options: options
+            .iter()
+            .map(|o| WireQOption {
+                id: &o.id,
+                label: &o.label,
+            })
+            .collect(),
+        unrest: signal.unrest,
+        candidates: &signal.candidates,
+        lean: signal.lean.as_deref(),
+        direction_confidence: signal.direction_confidence,
+        status,
+        affects,
+    };
+    // Serialization of this plain struct cannot realistically fail; on the impossible
+    // error we still emit a (newline-terminated) blank rather than panic — best-effort.
+    let mut line = serde_json::to_string(&event).unwrap_or_default();
+    line.push('\n');
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +415,120 @@ mod tests {
         let line = encode_chat_delta(1, &long);
         let v: Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(v["text"].as_str().unwrap().chars().count(), MAX_CHAT_TEXT_CHARS);
+    }
+
+    #[test]
+    fn encode_question_emits_the_exact_frozen_wire_line() {
+        let signal = DoubtSignal {
+            unrest: 0.5,
+            candidates: vec![
+                Candidate {
+                    label: "SQLite".to_string(),
+                    pull: 0.5,
+                },
+                Candidate {
+                    label: "Postgres".to_string(),
+                    pull: 0.25,
+                },
+            ],
+            lean: Some("SQLite".to_string()),
+            direction_confidence: 0.25,
+            // `reasons` is intentionally NOT on the wire — present here to prove the
+            // encoder drops it.
+            reasons: vec!["hedge density 0.40".to_string()],
+        };
+        let options = vec![
+            QOption {
+                id: "sqlite".to_string(),
+                label: "SQLite".to_string(),
+            },
+            QOption {
+                id: "pg".to_string(),
+                label: "Postgres".to_string(),
+            },
+        ];
+        let affects = vec!["src/db.rs".to_string()];
+        let line = encode_question("q1", "Which store?", &options, &signal, "open", &affects);
+
+        // EXACT serialized line: every key, in the frozen order, camelCase, all fields.
+        let expected = concat!(
+            r#"{"kind":"question","id":"q1","text":"Which store?","#,
+            r#""options":[{"id":"sqlite","label":"SQLite"},{"id":"pg","label":"Postgres"}],"#,
+            r#""unrest":0.5,"candidates":[{"label":"SQLite","pull":0.5},{"label":"Postgres","pull":0.25}],"#,
+            r#""lean":"SQLite","directionConfidence":0.25,"status":"open","affects":["src/db.rs"]}"#,
+            "\n"
+        );
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn encode_question_degrades_with_no_options_and_null_lean() {
+        // The DEGRADE case: no thinking trace / no options ⇒ unrest 0, empty candidates,
+        // lean null. The line is still a well-formed question event.
+        let signal = DoubtSignal {
+            unrest: 0.0,
+            candidates: vec![],
+            lean: None,
+            direction_confidence: 0.0,
+            reasons: vec![],
+        };
+        let line = encode_question("q2", "Go on?", &[], &signal, "reopened", &[]);
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "exactly one physical line");
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["kind"], "question");
+        assert_eq!(v["id"], "q2");
+        assert_eq!(v["text"], "Go on?");
+        assert_eq!(v["options"].as_array().unwrap().len(), 0);
+        assert_eq!(v["unrest"], 0.0);
+        assert_eq!(v["candidates"].as_array().unwrap().len(), 0);
+        assert!(v["lean"].is_null(), "lean serializes as JSON null when None");
+        assert_eq!(v["directionConfidence"], 0.0);
+        assert_eq!(v["status"], "reopened");
+        assert_eq!(v["affects"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn encode_question_caps_overlong_text_codepoint_safe_and_stays_one_line() {
+        let long = "é".repeat(MAX_CHAT_TEXT_CHARS + 30);
+        let signal = DoubtSignal {
+            unrest: 0.0,
+            candidates: vec![],
+            lean: None,
+            direction_confidence: 0.0,
+            reasons: vec![],
+        };
+        let line = encode_question("q3", &long, &[], &signal, "open", &[]);
+        assert_eq!(line.matches('\n').count(), 1);
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["text"].as_str().unwrap().chars().count(), MAX_CHAT_TEXT_CHARS);
+    }
+
+    #[test]
+    fn question_appends_well_formed_jsonl_and_disabled_no_ops() {
+        let signal = DoubtSignal {
+            unrest: 0.3,
+            candidates: vec![],
+            lean: None,
+            direction_confidence: 0.0,
+            reasons: vec![],
+        };
+        // Disabled emitter never touches disk.
+        let d = Activity::disabled();
+        assert!(!d.is_enabled());
+        d.question("x", "q", &[], &signal, "open", &[]); // no panic, no file
+
+        // Live emitter appends one parseable line and reports enabled.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("activity.jsonl");
+        let a = Activity::with_path(&file);
+        assert!(a.is_enabled());
+        a.question("x", "q", &[], &signal, "open", &[]);
+        let body = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["kind"], "question");
     }
 
     #[test]

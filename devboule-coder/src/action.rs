@@ -51,6 +51,19 @@ pub const MAX_PATH_LEN: usize = 1024;
 /// guarantees the L2.3 search path is ReDoS-free.
 pub const MAX_GREP_PATTERN_LEN: usize = 512;
 
+/// One DISCRETE answer choice the orchestrator offers alongside an `ask_user`
+/// question (the Kairion structured-question feature). `id` is a stable machine key
+/// the host echoes back when the human picks it; `label` is the human-readable text.
+/// Parsed leniently (no `deny_unknown_fields`) so a model that adds a stray hint key
+/// to an option does not fail the whole action — the extra key is simply ignored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct QOption {
+    /// Stable machine key for this choice (e.g. `"sqlite"`).
+    pub id: String,
+    /// Human-readable choice text (e.g. `"Use SQLite"`).
+    pub label: String,
+}
+
 /// The structured action the model emits each turn.
 ///
 /// Internally tagged on `"tool"`, so the wire form is a flat object:
@@ -133,8 +146,16 @@ pub enum AgentAction {
         tool: String,
         params: serde_json::Value,
     },
-    /// TERMINAL: hand back to the human with a question.
-    AskUser { question: String },
+    /// TERMINAL: hand back to the human with a question. `options` (Kairion) is an
+    /// OPTIONAL list of 2-4 discrete choices the orchestrator offers when it is
+    /// genuinely unsure; `#[serde(default)]` keeps the bare `{"tool":"ask_user",
+    /// "question":"…"}` form (the plain-coder contract) parsing UNCHANGED — an absent
+    /// `options` key yields an empty vec and behaves exactly as before.
+    AskUser {
+        question: String,
+        #[serde(default)]
+        options: Vec<QOption>,
+    },
     /// TERMINAL: the final answer to the human.
     Done { reply: String },
     /// TERMINAL: give up this burst with a reason.
@@ -215,7 +236,7 @@ impl AgentAction {
                 tool,
                 params,
             } => format!("{server}.{tool} {params}"),
-            AgentAction::AskUser { question } => question.clone(),
+            AgentAction::AskUser { question, .. } => question.clone(),
             AgentAction::Done { reply } => reply.clone(),
             AgentAction::Escalate { reason } => reason.clone(),
         }
@@ -299,7 +320,22 @@ impl AgentAction {
                 tool,
                 params,
             } => check_mcp_tool(server, tool, params, known_servers),
-            AgentAction::AskUser { question } => check_text("question", question),
+            AgentAction::AskUser { question, options } => {
+                check_text("question", question)?;
+                // Lenient by design: options are an optional UX nicety. Validate only
+                // that each present choice carries a non-empty id + label (so the host
+                // never renders a blank button); never reject for COUNT — a degenerate
+                // 0/1-option ask still works as a plain question.
+                for (i, opt) in options.iter().enumerate() {
+                    if opt.id.trim().is_empty() {
+                        return Err(format!("ask_user option {i} has an empty `id`"));
+                    }
+                    if opt.label.trim().is_empty() {
+                        return Err(format!("ask_user option {i} has an empty `label`"));
+                    }
+                }
+                Ok(())
+            }
             AgentAction::Done { reply } => check_text("reply", reply),
             AgentAction::Escalate { reason } => check_text("reason", reason),
         }
@@ -872,6 +908,7 @@ mod tests {
                 r#"{"tool":"ask_user","question":"which env?"}"#,
                 AgentAction::AskUser {
                     question: "which env?".into(),
+                    options: vec![],
                 },
             ),
             (
@@ -893,6 +930,38 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{json} should parse, got {e:?}"));
             assert_eq!(parsed, expected, "round-trip mismatch for {json}");
         }
+    }
+
+    #[test]
+    fn ask_user_parses_optional_discrete_options() {
+        // WITH options: the Kairion structured form parses into the new field.
+        let with = parse_action(&block(
+            r#"{"tool":"ask_user","question":"which store?","options":[{"id":"sqlite","label":"SQLite"},{"id":"pg","label":"Postgres"}]}"#,
+        ))
+        .expect("ask_user with options parses");
+        assert_eq!(
+            with,
+            AgentAction::AskUser {
+                question: "which store?".into(),
+                options: vec![
+                    QOption { id: "sqlite".into(), label: "SQLite".into() },
+                    QOption { id: "pg".into(), label: "Postgres".into() },
+                ],
+            }
+        );
+        // BACK-COMPAT: the bare plain-coder form yields an EMPTY options vec, byte-identical
+        // behaviour to before the field existed.
+        let bare = parse_action(&block(r#"{"tool":"ask_user","question":"go on?"}"#))
+            .expect("bare ask_user still parses");
+        assert_eq!(
+            bare,
+            AgentAction::AskUser { question: "go on?".into(), options: vec![] }
+        );
+        // An option with a blank label is rejected with precise feedback (never a blank button).
+        let bad = parse_action(&block(
+            r#"{"tool":"ask_user","question":"q","options":[{"id":"x","label":"  "}]}"#,
+        ));
+        assert!(bad.is_err(), "blank option label must be a format error");
     }
 
     #[test]

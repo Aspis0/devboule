@@ -1,12 +1,15 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState, useMemo } from "react";
 import gsap from "gsap";
 import { Search, ListOrdered, LayoutDashboard } from "lucide-react";
 import "./planner.css";
 import { useStageRotation } from "./useStageRotation";
 import type { PlanCard, StagePage, StageFinding, PlannerMessage } from "./plannerModel";
+import { doubtTouchesCard } from "./plannerModel";
+import type { QuestionEntry } from "../../agents/agentConsoleModel";
 import { StageWebsearch } from "./StageWebsearch";
 import { StagePlan } from "./StagePlan";
 import { StageDesign } from "./StageDesign";
+import { DoubtPanel } from "./DoubtPanel";
 import { PlannerChat } from "./PlannerChat";
 import { PlannerControls } from "./PlannerControls";
 import { AgentTerminalViewer } from "../../agents/AgentTerminalViewer";
@@ -17,6 +20,9 @@ interface PlannerPlanModeProps {
   plannerModelLabel: string;
   live: boolean;
   planCards: PlanCard[];
+  // Kairion (ORCHESTRATOR-ONLY): the orchestrator's open doubts. Empty => the Plan view
+  // renders task-cards only (degrades to a plain plan with no left doubt panel).
+  questions: QuestionEntry[];
   pages: StagePage[];
   findings: StageFinding[];
   webMode: 'auto' | 'manual';
@@ -55,6 +61,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     plannerModelLabel,
     live,
     planCards,
+    questions,
     pages,
     findings,
     webMode,
@@ -81,6 +88,33 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 
   const { view, auto, pick, toggleAuto } = useStageRotation(3800, live);
   const ref = useRef<HTMLDivElement>(null);
+
+  // Kairion doubt<->task link: hovering a doubt highlights its task card(s) and vice-versa.
+  // One source of hover at a time; the derived Sets feed both panels.
+  const [hoveredDoubtId, setHoveredDoubtId] = useState<string | null>(null);
+  const [hoveredCardN, setHoveredCardN] = useState<number | null>(null);
+
+  const highlightedTaskNums = useMemo(() => {
+    const out = new Set<number>();
+    if (hoveredDoubtId == null) return out;
+    const q = questions.find((x) => x.id === hoveredDoubtId);
+    if (!q) return out;
+    for (const card of planCards) {
+      if (doubtTouchesCard(q.affects, card)) out.add(card.n);
+    }
+    return out;
+  }, [hoveredDoubtId, questions, planCards]);
+
+  const highlightedDoubtIds = useMemo(() => {
+    const out = new Set<string>();
+    if (hoveredCardN == null) return out;
+    const card = planCards.find((c) => c.n === hoveredCardN);
+    if (!card) return out;
+    for (const q of questions) {
+      if (doubtTouchesCard(q.affects, card)) out.add(q.id);
+    }
+    return out;
+  }, [hoveredCardN, questions, planCards]);
 
   useEffect(() => {
     const el = ref.current;
@@ -351,7 +385,30 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                 onManualSearch={onManualSearch}
               />
             )}
-            {view === 'plan' && <StagePlan cards={planCards} />}
+            {view === 'plan' && (
+              questions.length > 0 ? (
+                // Kairion two-panel Plan view: LEFT = open doubts, RIGHT = the firming plan.
+                <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
+                  <DoubtPanel
+                    questions={questions}
+                    onSend={onSend}
+                    highlightedDoubtIds={highlightedDoubtIds}
+                    onHoverDoubt={setHoveredDoubtId}
+                  />
+                  <div className="pp-scroll" style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingLeft: 11 }}>
+                    <StagePlan
+                      cards={planCards}
+                      singleColumn
+                      highlightedTaskNums={highlightedTaskNums}
+                      onHoverTask={setHoveredCardN}
+                    />
+                  </div>
+                </div>
+              ) : (
+                // Degrade: no doubts -> the plan task-cards alone, exactly as before.
+                <StagePlan cards={planCards} />
+              )
+            )}
             {view === 'design' && (
               <StageDesign
                 design={design}

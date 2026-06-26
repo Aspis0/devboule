@@ -701,6 +701,13 @@ pub struct RealExecutor {
     /// between rounds to inject app-sent messages as human turns. Disabled (no-op)
     /// when the env is unset (every non-orchestrator / test executor).
     steer: crate::steer::Steer,
+    /// FIX 1: `true` ONLY when this binary IS the orchestrator (launched with a seeded
+    /// `DEVBOULE_GOAL`, the same `config::seeded_goal().is_some()` signal that marks
+    /// `OmlxModel.orchestrator`). Surfaced through [`ToolExecutor::is_orchestrator`] so the
+    /// burst CO-ENFORCES it with the activity bridge to gate the Kairion `question` emission:
+    /// a plain coder / mini (no goal) can NEVER emit a question event even if the activity file
+    /// is set. Defaults `false`; set from config via [`RealExecutor::with_orchestrator`].
+    is_orchestrator: bool,
 }
 
 impl RealExecutor {
@@ -721,6 +728,8 @@ impl RealExecutor {
             auto_create: true,
             // Resolve the steer inbox from the launch env; disabled when unset.
             steer: crate::steer::Steer::from_env(),
+            // Default NON-orchestrator; `with_orchestrator` sets it from config at launch.
+            is_orchestrator: false,
         }
     }
 
@@ -728,6 +737,14 @@ impl RealExecutor {
     /// so existing `new()` callers/tests keep the default-ON behavior unchanged.
     pub fn with_auto_create(mut self, auto_create: bool) -> Self {
         self.auto_create = auto_create;
+        self
+    }
+
+    /// FIX 1: mark this executor as the orchestrator (set from `config::seeded_goal().is_some()`
+    /// at launch). Builder-style so existing `new()` callers/tests stay NON-orchestrator (the
+    /// default), keeping the Kairion question event off for every plain coder / mini / test.
+    pub fn with_orchestrator(mut self, is_orchestrator: bool) -> Self {
+        self.is_orchestrator = is_orchestrator;
         self
     }
 
@@ -785,6 +802,13 @@ impl ToolExecutor for RealExecutor {
     /// async model call. The final `emit_chat` still lands the durable entry; deltas are ephemeral.
     fn activity_handle(&self) -> crate::activity::Activity {
         self.activity.clone()
+    }
+
+    /// FIX 1: surface the orchestrator flag so the burst co-enforces it with the activity
+    /// bridge before emitting a Kairion `question` event. `false` for any executor not built
+    /// via [`RealExecutor::with_orchestrator`] (every plain coder / mini / test path).
+    fn is_orchestrator(&self) -> bool {
+        self.is_orchestrator
     }
 
     async fn execute(&self, action: &AgentAction) -> ToolResult {

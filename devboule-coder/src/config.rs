@@ -143,6 +143,10 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
     // Backend-AGNOSTIC: read the host-rendered language persona once and pass it to whichever
     // model (Cloud or oMLX/Ollama loopback) build_model selects below.
     let lang_skill = env_nonempty(ENV_LANG_SKILL);
+    // Kairion (F1): this binary is the ORCHESTRATOR iff it was launched with a seeded GOAL
+    // (`DEVBOULE_GOAL`). ONLY then does the loopback oMLX model attach logprobs + capture the
+    // decision-token entropy. A plain coder / mini (no goal) stays byte-identical.
+    let orchestrator = seeded_goal().is_some();
 
     // 1. CLOUD first (opt-in). The PRESENCE of the cloud base URL selects this path;
     // a misconfiguration (bad https/host, empty model, missing key) fails LOUD to the
@@ -181,9 +185,11 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
     let model_id = std::env::var(ENV_OMLX_MODEL).unwrap_or_default();
     match OmlxModel::new(&base_url, model_id, plan_first) {
         // B.3: attach the user-MCP tool catalog (empty ⇒ prompt byte-identical).
+        // Kairion (F1): mark the orchestrator so the streaming path captures logprobs.
         Ok(m) => Arc::new(
             m.with_user_mcp_tools(user_mcp_tools)
-                .with_lang_skill(lang_skill),
+                .with_lang_skill(lang_skill)
+                .with_orchestrator(orchestrator),
         ),
         Err(e) => {
             // Misconfigured endpoint (non-loopback / https / empty model): refuse
@@ -333,9 +339,15 @@ async fn build_executor(
     // plan but does NOT create its tasks on approval; absent / any other value ⇒ the default
     // (tasks created on approval), byte-identical to a pre-feature run.
     let auto_create = !matches!(env_nonempty(ENV_AUTO_CREATE).as_deref(), Some("0"));
+    // FIX 1: this binary IS the orchestrator iff it was launched with a seeded GOAL — the SAME
+    // `seeded_goal().is_some()` signal that marks `OmlxModel.orchestrator` in `build_model`. The
+    // burst co-enforces this with the activity bridge to gate the Kairion `question` emission, so
+    // a plain coder launched with `DEVBOULE_ACTIVITY_FILE` set but no goal never emits one.
+    let is_orchestrator = seeded_goal().is_some();
     let executor = RealExecutor::new(mcp, fs, web)
         .with_planner(model, project_id)
-        .with_auto_create(auto_create);
+        .with_auto_create(auto_create)
+        .with_orchestrator(is_orchestrator);
     let allow_egress = executor.egress_enabled();
     (Arc::new(executor), allow_egress)
 }

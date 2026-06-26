@@ -5,9 +5,13 @@ import {
   stripLabel,
   pickProjectDesign,
   chatMessages,
+  openQuestions,
+  steerPickOption,
+  steerYouDecide,
+  doubtTouchesCard,
   type PlanCard,
 } from "./plannerModel";
-import type { ConsoleEntry } from "../../agents/agentConsoleModel";
+import type { ConsoleEntry, QuestionEntry } from "../../agents/agentConsoleModel";
 import type { ProjectTask } from "../../../types/backend";
 import type { DesignProjectEntry } from "../../../types/design";
 
@@ -22,6 +26,102 @@ function designEntry(over: Partial<DesignProjectEntry>): DesignProjectEntry {
     ...over,
   };
 }
+
+function question(over: Partial<QuestionEntry> & { id: string }): QuestionEntry {
+  return {
+    type: "question",
+    text: "How are sessions kept?",
+    options: [
+      { id: "server", label: "Server" },
+      { id: "jwt", label: "JWT" },
+    ],
+    unrest: 0.8,
+    candidates: [
+      { label: "Server", pull: 0.6 },
+      { label: "JWT", pull: 0.4 },
+    ],
+    lean: "Server",
+    directionConfidence: 0.7,
+    status: "open",
+    affects: ["Session / token layer"],
+    time: "00:01",
+    ...over,
+  };
+}
+
+describe("openQuestions (Kairion doubt extraction)", () => {
+  it("keeps only question entries, in first-seen order", () => {
+    const entries: ConsoleEntry[] = [
+      { type: "coder", text: "reading repo", time: "1" },
+      question({ id: "q1" }),
+      { type: "chat", role: "user", text: "hi", time: "2" },
+      question({ id: "q2", text: "Who owns identity?" }),
+    ];
+    const out = openQuestions(entries);
+    expect(out.map((q) => q.id)).toEqual(["q1", "q2"]);
+    expect(out[1].text).toBe("Who owns identity?");
+  });
+
+  it("upserts by id IN PLACE so a reopened event replaces the earlier one", () => {
+    const entries: ConsoleEntry[] = [
+      question({ id: "q1", status: "open", lean: "Server" }),
+      question({ id: "q2", text: "Who owns identity?" }),
+      // q1 comes back, reopened — the orchestrator changed its own mind.
+      question({ id: "q1", status: "reopened", lean: null, unrest: 0.95 }),
+    ];
+    const out = openQuestions(entries);
+    // still two cards, q1 keeps its original slot, carrying the latest (reopened) data.
+    expect(out.map((q) => q.id)).toEqual(["q1", "q2"]);
+    expect(out[0].status).toBe("reopened");
+    expect(out[0].lean).toBeNull();
+    expect(out[0].unrest).toBe(0.95);
+  });
+
+  it("returns [] for undefined / no question entries", () => {
+    expect(openQuestions(undefined)).toEqual([]);
+    expect(openQuestions([{ type: "coder", text: "x", time: "1" }])).toEqual([]);
+  });
+});
+
+describe("steer moves (pick / you-decide ride the existing steer line)", () => {
+  it("phrases a picked option as a plain steer line naming the label", () => {
+    const q = question({ id: "q1" });
+    expect(steerPickOption(q, { id: "jwt", label: "JWT" })).toBe(
+      'For "How are sessions kept?" — go with JWT.',
+    );
+  });
+
+  it("phrases you-decide with the lean as a hint when present", () => {
+    expect(steerYouDecide(question({ id: "q1", lean: "Server" }))).toBe(
+      'For "How are sessions kept?" — you decide (your lean — Server).',
+    );
+  });
+
+  it("phrases you-decide without a lean when genuinely split", () => {
+    expect(steerYouDecide(question({ id: "q1", lean: null }))).toBe(
+      'For "How are sessions kept?" — you decide.',
+    );
+  });
+});
+
+describe("doubtTouchesCard (doubt <-> task link)", () => {
+  const card: PlanCard = { n: 2, title: "Session / token layer", state: "pending" };
+
+  it("matches by exact task title, case/space-insensitive", () => {
+    expect(doubtTouchesCard(["Session / token layer"], card)).toBe(true);
+    expect(doubtTouchesCard(["  session / TOKEN layer  "], card)).toBe(true);
+  });
+
+  it("matches by 1-based task number", () => {
+    expect(doubtTouchesCard(["2"], card)).toBe(true);
+  });
+
+  it("does not match an unrelated task / empty affects", () => {
+    expect(doubtTouchesCard(["Login screen"], card)).toBe(false);
+    expect(doubtTouchesCard([], card)).toBe(false);
+    expect(doubtTouchesCard([""], card)).toBe(false);
+  });
+});
 
 describe("chatMessages", () => {
   it("keeps only chat entries, in order, mapping role+text", () => {
