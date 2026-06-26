@@ -5,7 +5,8 @@
 // Design constraints (mirror NetConsentModal):
 //   - Seatbelt cannot be widened mid-run. The grant activates on the NEXT spawn.
 //   - Copy must make this clear so the user knows to re-launch their task.
-//   - detail holds the absolute folder path; clipped to 120 chars, never raw secrets.
+//   - `detail` is the human-readable prose sentence displayed to the user; it is
+//     NOT the path passed to the backend. The machine-readable path lives in `path`.
 //   - Three decisions:
 //     AllowRemember → persists the folder in working_set (survives restart)
 //     AllowOnce     → one-shot transient grant consumed at the next spawn
@@ -30,10 +31,16 @@ export interface FolderConsentModalProps {
 }
 
 /**
- * Truncate the folder path to a safe display length.
- * `detail` from the backend is the absolute path that hit the block; it is
- * already sanitized by the backend but we clip to 120 chars so the card stays
- * compact, and run stripSpoofChars to neutralize any unicode control sequences.
+ * Clip and sanitize a raw string for compact display in the consent card.
+ *
+ * Used for both the machine-readable `path` field (the absolute folder path
+ * that triggered the block) and any other short strings. Clips to 120 chars
+ * so the card stays compact, and runs stripSpoofChars to neutralize any
+ * Unicode control sequences that could spoof UI text.
+ *
+ * Note: `detail` from the backend is a human-readable PROSE SENTENCE explaining
+ * the block — it is NOT the absolute path. The machine-readable path lives in
+ * `ConsentRequest.path`.
  */
 function safeFolder(raw: string): string {
   const sanitized = stripSpoofChars(raw.trim());
@@ -47,7 +54,12 @@ export function FolderConsentModal({
   onDecision,
 }: FolderConsentModalProps) {
   const agentId = stripSpoofChars(request.agentId).slice(0, 40);
-  const folder = safeFolder(request.detail);
+  // `path` is the machine-readable absolute folder (may be absent for net requests,
+  // but FolderWrite always provides it). `detail` is the human-readable prose sentence.
+  // Be defensive: if path is somehow absent (should not happen for FolderWrite), fall
+  // back to showing nothing rather than crashing or displaying prose as a path.
+  const folderPath = request.path ? safeFolder(request.path) : null;
+  const detailText = safeFolder(request.detail);
 
   // Track which decision is currently in-flight so "Working…" appears only on
   // the clicked button (not always on "Allow & remember" regardless of click).
@@ -93,10 +105,13 @@ export function FolderConsentModal({
           <span className="font-semibold">{agentId}</span> tried to write to a
           folder outside this project that has not been granted write access.
         </p>
-        {folder && (
+        {folderPath && (
           <p className="break-all rounded bg-cream-50 px-2 py-1 font-mono text-[11px] text-cream-600">
-            {folder}
+            {folderPath}
           </p>
+        )}
+        {detailText && (
+          <p className="text-[11px] text-cream-600">{detailText}</p>
         )}
         <p className="mt-0.5 text-[11px] text-cream-500">
           Your choice applies on the <span className="font-semibold">next run</span> — the

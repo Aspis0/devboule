@@ -560,11 +560,22 @@ export function ProjectWorkspace({
         // Branch by kind: Net → grant_net_consent, FolderWrite → grant_folder_consent.
         // Both share the same ConsentDecision enum and the same mounted-ref / FIFO logic.
         if (head.kind === "folderWrite") {
+          // BLOCKER 1 fix: use head.path (the machine-readable canonical folder), NOT
+          // head.detail (human-readable prose). head.detail is rejected by the backend's
+          // normalize_working_set_folder (!is_absolute) → AllowOnce/AllowRemember fail.
+          // Surface an error if path is somehow missing rather than silently sending prose.
+          const folder = head.path;
+          if (!folder) {
+            throw new Error(
+              "FolderWrite consent request is missing the machine-readable path field. " +
+                "This is a backend bug — please report it.",
+            );
+          }
           await invokeBackendCommand<void>(
             "grant_folder_consent",
             grantFolderConsentArgs({
               projectId: head.projectId,
-              folder: head.detail,
+              folder,
               decision,
             }),
           );
@@ -600,7 +611,10 @@ export function ProjectWorkspace({
         }
       }
     },
-    [pendingConsents, consentBusy],
+    // CHEAP FIX B: onReloadProject is used inside the callback (called after
+    // allowRemember folder grant) but was missing from the deps array — stale
+    // closure if the parent re-renders with a new onReloadProject reference.
+    [pendingConsents, consentBusy, onReloadProject],
   );
 
   return (

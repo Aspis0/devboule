@@ -2404,33 +2404,43 @@ fn normalize_working_set_folder_lexical(folder: &str) -> Result<String, String> 
 /// SANDBOX broker Slice 2: add a folder to the project's persistent working set.
 /// Canonicalizes the path; deduplicates (adding an already-present folder is a no-op).
 /// Ignores empty folder strings.
+///
+/// BLOCKER 2 fix: returns the updated canonical working-set list so the caller can adopt
+/// it directly, avoiding the /tmp → /private/tmp canonicalization mismatch on macOS.
 pub fn add_project_working_set_folder(
     app: &tauri::AppHandle,
     project_id: &str,
     folder: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let canonical = normalize_working_set_folder(folder)?;
     let path = project_path_by_id(app, project_id)?;
-    mutate_project_file_latest(&path, |project| {
+    let updated = mutate_project_file_latest(&path, |project| {
         if !project.metadata.working_set.contains(&canonical) {
             project.metadata.working_set.push(canonical.clone());
         }
         Ok(())
-    })
-    .map(|_| ())
+    })?;
+    // mutate_project_file_latest returns None when the project file is missing (benign no-op).
+    // In that case return the empty list; the frontend will adopt it and the next refetch
+    // will either find the file or show an empty set.
+    Ok(updated
+        .map(|p| p.metadata.working_set)
+        .unwrap_or_default())
 }
 
 /// SANDBOX broker Slice 2: remove a folder from the project's persistent working set.
 ///
-/// BLOCKER 2 fix: uses LEXICAL normalization (no disk access) so that removing a
-/// previously-granted folder that has since been deleted or unmounted succeeds.
-/// Adding still uses `normalize_working_set_folder` (canonicalize) to ensure only
-/// real paths enter the set.
+/// BLOCKER 2 fix (return type): returns the updated canonical working-set list so the
+/// caller can adopt it directly, avoiding the /tmp → /private/tmp mismatch on macOS.
+/// BLOCKER 2 fix (normalization): uses LEXICAL normalization (no disk access) so that
+/// removing a previously-granted folder that has since been deleted or unmounted succeeds.
+/// Adding still uses `normalize_working_set_folder` (canonicalize) to ensure only real
+/// paths enter the set.
 pub fn remove_project_working_set_folder(
     app: &tauri::AppHandle,
     project_id: &str,
     folder: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let normalized = normalize_working_set_folder_lexical(folder)?;
     let path = project_path_by_id(app, project_id)?;
     remove_project_working_set_by_path(&path, &normalized)
@@ -2439,15 +2449,19 @@ pub fn remove_project_working_set_folder(
 /// Internal helper: remove a folder string from the project file's working_set.
 /// `folder` must already be normalized (canonical form stored on disk).
 /// Extracted so tests can call it directly without needing an `AppHandle`.
+///
+/// Returns the updated working-set list after the removal.
 fn remove_project_working_set_by_path(
     project_path: &std::path::Path,
     folder: &str,
-) -> Result<(), String> {
-    mutate_project_file_latest(project_path, |project| {
+) -> Result<Vec<String>, String> {
+    let updated = mutate_project_file_latest(project_path, |project| {
         project.metadata.working_set.retain(|f| f != folder);
         Ok(())
-    })
-    .map(|_| ())
+    })?;
+    Ok(updated
+        .map(|p| p.metadata.working_set)
+        .unwrap_or_default())
 }
 
 /// Tauri command: read the project's working set.
@@ -2462,25 +2476,31 @@ pub fn project_working_set_cmd(
 }
 
 /// Tauri command: add a folder to the project's working set.
+///
+/// Returns the updated canonical working-set list so the frontend can adopt it directly,
+/// fixing the /tmp → /private/tmp canonicalization mismatch on macOS (BLOCKER 2).
 #[tauri::command]
 pub fn add_project_working_set_folder_cmd(
     project_id: String,
     folder: String,
     app: tauri::AppHandle,
     backend_state: State<'_, BackendState>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     backend_state.ensure_unlocked()?;
     add_project_working_set_folder(&app, &project_id, &folder)
 }
 
 /// Tauri command: remove a folder from the project's working set.
+///
+/// Returns the updated canonical working-set list so the frontend can adopt it directly,
+/// fixing the /tmp → /private/tmp canonicalization mismatch on macOS (BLOCKER 2).
 #[tauri::command]
 pub fn remove_project_working_set_folder_cmd(
     project_id: String,
     folder: String,
     app: tauri::AppHandle,
     backend_state: State<'_, BackendState>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     backend_state.ensure_unlocked()?;
     remove_project_working_set_folder(&app, &project_id, &folder)
 }

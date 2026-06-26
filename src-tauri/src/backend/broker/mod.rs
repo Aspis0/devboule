@@ -141,8 +141,22 @@ pub struct ConsentRequest {
     pub project_id: String,
     /// The mini-coder agent id (`mini_agent_id(directive)`) for display in the UI.
     pub agent_id: String,
-    /// Human-readable context string (e.g. the command that hit the block).
+    /// Human-readable context string displayed to the user. Never use this field
+    /// programmatically as an input to backend calls — it is display-only prose.
+    /// For machine-readable values use the `path` field (FolderWrite) or the
+    /// structured kind fields.
     pub detail: String,
+    /// Machine-readable absolute path associated with this consent request.
+    ///
+    /// Set for `FolderWrite` requests: contains the raw canonical folder path that
+    /// triggered the block (same value passed to `grant_folder_consent` as `folder`).
+    /// `None` for `Net` and other kinds that have no associated path.
+    ///
+    /// The frontend MUST use this field (not `detail`) as the `folder` argument to
+    /// `grant_folder_consent`. `detail` is a human sentence and will be rejected by
+    /// `normalize_working_set_folder` (`!is_absolute` → AllowOnce/AllowRemember fail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Decision returned by the frontend via `grant_net_consent`.
@@ -238,6 +252,68 @@ impl PermissionBrokerState {
             .unwrap_or_else(|e| e.into_inner());
         map.remove(project_id).unwrap_or_default()
     }
+
+    /// Atomically consume BOTH the net grant AND all folder grants for `project_id`
+    /// under a single combined critical section.
+    ///
+    /// # Why atomic?
+    /// `take_net_grant` and `take_folder_grants` are two separate `Mutex` acquisitions.
+    /// When two concurrent same-project directives reach `claim_and_launch` simultaneously,
+    /// one can take the net grant while the other takes the folder grants — each directive
+    /// launches with only a partial grant set ("split-grant race").  Acquiring both locks
+    /// together eliminates the window: either a caller gets both grants or neither.
+    ///
+    /// Returns `(net_taken, folder_grants_taken)`.
+    pub fn take_all_grants(&self, project_id: &str) -> (bool, HashSet<String>) {
+        // Acquire in a consistent lock order (net first, then folders) to prevent
+        // lock-order inversion between this method and any hypothetical future caller
+        // that also acquires both — the same order must be used everywhere.
+        let mut net_set = self
+            .transient_net_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut folder_map = self
+            .transient_folder_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let net_taken = net_set.remove(project_id);
+        let folders_taken = folder_map.remove(project_id).unwrap_or_default();
+        (net_taken, folders_taken)
+    }
+
+    /// Re-insert BOTH a net grant and a set of folder grants atomically under one lock
+    /// acquisition.  Used on the spawn-failure path to restore grants that were consumed
+    /// but never used (the worker never launched, so the user was never re-prompted).
+    ///
+    /// This is the mirror of `take_all_grants`: call it when `spawn_agentic_worker`
+    /// returns `Err` and the mode is non-Unattended.
+    pub fn reinsert_all_grants(
+        &self,
+        project_id: &str,
+        net: bool,
+        folders: &HashSet<String>,
+    ) {
+        // Same lock order as take_all_grants (net first, then folders).
+        let mut net_set = self
+            .transient_net_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut folder_map = self
+            .transient_folder_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if net {
+            net_set.insert(project_id.to_string());
+        }
+        if !folders.is_empty() {
+            let slot = folder_map
+                .entry(project_id.to_string())
+                .or_insert_with(HashSet::new);
+            for f in folders {
+                slot.insert(f.clone());
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -267,7 +343,11 @@ pub fn resolve_working_set(
     transient: HashSet<String>,
     mode: SandboxMode,
 ) -> Vec<String> {
-    let mut result: HashSet<&str> = persisted.iter().map(String::as_str).collect();
+    // CHEAP FIX C: use BTreeSet for deterministic (sorted) iteration order.
+    // HashSet iteration order is non-deterministic across runs; sorted output is easier
+    // to reason about in tests, logs, and when diffing seatbelt profiles.
+    use std::collections::BTreeSet;
+    let mut result: BTreeSet<&str> = persisted.iter().map(String::as_str).collect();
     if mode != SandboxMode::Unattended {
         for f in &transient {
             result.insert(f.as_str());
@@ -509,11 +589,45 @@ mod tests {
             project_id: "proj-1".to_string(),
             agent_id: "agent-42".to_string(),
             detail: "cargo fetch failed".to_string(),
+            path: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"projectId\""));
         assert!(json.contains("\"agentId\""));
         assert!(json.contains("\"net\""));
+        // Net request must NOT carry a path field (skip_serializing_if = None).
+        assert!(!json.contains("\"path\""), "Net ConsentRequest must not serialize path");
+    }
+
+    /// BLOCKER 1 regression test: FolderWrite ConsentRequest must carry `path` (the
+    /// raw canonical folder) separately from `detail` (the human-readable sentence).
+    /// The frontend passes `path` to `grant_folder_consent`; `detail` is display-only.
+    #[test]
+    fn folder_write_consent_request_carries_path_and_human_detail() {
+        let folder = "/private/tmp/my-folder".to_string();
+        let req = ConsentRequest {
+            kind: ConsentKind::FolderWrite,
+            project_id: "proj-2".to_string(),
+            agent_id: "agent-7".to_string(),
+            detail: format!(
+                "A sandboxed command attempted to write outside the project to \
+                 \"{folder}\". Grant to allow writes there and retry."
+            ),
+            path: Some(folder.clone()),
+        };
+        // `path` must equal the raw folder path (machine-readable, passes is_absolute check).
+        assert_eq!(req.path.as_deref(), Some("/private/tmp/my-folder"));
+        // `detail` is prose and is NOT absolute — the frontend must not use it as `folder`.
+        let detail = req.detail.clone();
+        assert!(!detail.starts_with('/'), "detail is prose, not an absolute path");
+        // Serialized JSON must contain `path` for FolderWrite (it is Some).
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"path\""), "FolderWrite ConsentRequest must serialize path");
+        assert!(json.contains("/private/tmp/my-folder"));
+        // Round-trip: deserialize and verify path survives.
+        let de: ConsentRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.path.as_deref(), Some("/private/tmp/my-folder"));
+        assert_eq!(de.kind, ConsentKind::FolderWrite);
     }
 
     // ── prompts_for_folder_write ──────────────────────────────────────────────
@@ -729,6 +843,117 @@ mod tests {
             !transient_net_used,
             "Unattended must not honour the net grant"
         );
+    }
+
+    // ── CHEAP FIX A: take_all_grants / reinsert_all_grants ────────────────────
+
+    /// take_all_grants: when both a net grant and folder grants are present, both are
+    /// returned and consumed in a single call — no split-grant risk.
+    #[test]
+    fn take_all_grants_returns_both_and_drains_both() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_net_once("proj-a");
+        broker.grant_folder_once("proj-a", "/tmp/folder1");
+        broker.grant_folder_once("proj-a", "/tmp/folder2");
+
+        let (net, folders) = broker.take_all_grants("proj-a");
+        assert!(net, "net grant must be returned");
+        assert_eq!(folders.len(), 2, "both folder grants must be returned");
+        assert!(folders.contains("/tmp/folder1"));
+        assert!(folders.contains("/tmp/folder2"));
+
+        // Both are consumed — a second take returns empty.
+        let (net2, folders2) = broker.take_all_grants("proj-a");
+        assert!(!net2, "net grant must be consumed");
+        assert!(folders2.is_empty(), "folder grants must be consumed");
+    }
+
+    /// take_all_grants: when only net is present, net is returned and folders are empty.
+    #[test]
+    fn take_all_grants_net_only() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_net_once("proj-b");
+
+        let (net, folders) = broker.take_all_grants("proj-b");
+        assert!(net);
+        assert!(folders.is_empty());
+    }
+
+    /// take_all_grants: when only folder grants are present, net is false and folders returned.
+    #[test]
+    fn take_all_grants_folders_only() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-c", "/tmp/x");
+
+        let (net, folders) = broker.take_all_grants("proj-c");
+        assert!(!net);
+        assert_eq!(folders.len(), 1);
+        assert!(folders.contains("/tmp/x"));
+    }
+
+    /// take_all_grants: when nothing is present, both return empty/false.
+    #[test]
+    fn take_all_grants_empty() {
+        let broker = PermissionBrokerState::new();
+        let (net, folders) = broker.take_all_grants("proj-d");
+        assert!(!net);
+        assert!(folders.is_empty());
+    }
+
+    /// take_all_grants is per-project: taking for proj-a does not affect proj-b.
+    #[test]
+    fn take_all_grants_per_project_isolation() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_net_once("proj-a");
+        broker.grant_folder_once("proj-b", "/tmp/b");
+
+        let (net_a, folders_a) = broker.take_all_grants("proj-a");
+        assert!(net_a, "proj-a net must be taken");
+        assert!(folders_a.is_empty(), "proj-a has no folders");
+
+        // proj-b's folder grant must still be present.
+        let (net_b, folders_b) = broker.take_all_grants("proj-b");
+        assert!(!net_b, "proj-b has no net grant");
+        assert_eq!(folders_b.len(), 1, "proj-b folder must survive");
+        assert!(folders_b.contains("/tmp/b"));
+    }
+
+    /// reinsert_all_grants: after a spawn failure, both grants are restored atomically
+    /// so the next spawn can pick them up.
+    #[test]
+    fn reinsert_all_grants_restores_both_after_spawn_failure() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_net_once("proj-x");
+        broker.grant_folder_once("proj-x", "/tmp/restore");
+
+        // Simulate: take_all_grants before spawn.
+        let (net_taken, folders_taken) = broker.take_all_grants("proj-x");
+        assert!(net_taken);
+        assert_eq!(folders_taken.len(), 1);
+
+        // Simulate: spawn fails → reinsert.
+        broker.reinsert_all_grants("proj-x", net_taken, &folders_taken);
+
+        // Next take must recover both.
+        let (net2, folders2) = broker.take_all_grants("proj-x");
+        assert!(net2, "net must be restored after reinsert");
+        assert_eq!(folders2.len(), 1, "folder must be restored after reinsert");
+        assert!(folders2.contains("/tmp/restore"));
+
+        // Idempotent: one shot only.
+        let (net3, folders3) = broker.take_all_grants("proj-x");
+        assert!(!net3);
+        assert!(folders3.is_empty());
+    }
+
+    /// reinsert_all_grants with net=false and empty folders is a no-op (no spurious grants).
+    #[test]
+    fn reinsert_all_grants_noop_when_nothing_to_restore() {
+        let broker = PermissionBrokerState::new();
+        broker.reinsert_all_grants("proj-y", false, &HashSet::new());
+        let (net, folders) = broker.take_all_grants("proj-y");
+        assert!(!net, "no spurious net grant inserted");
+        assert!(folders.is_empty(), "no spurious folder grants inserted");
     }
 }
 

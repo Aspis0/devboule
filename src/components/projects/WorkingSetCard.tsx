@@ -3,7 +3,9 @@
 //
 // Shows the persisted "working set" from `project.metadata.workingSet ?? []`.
 // Each folder has a Remove button that calls `remove_project_working_set_folder_cmd`
-// and is reflected optimistically (the folder disappears immediately; reverts on error).
+// and is reflected by adopting the RETURNED canonical list (BLOCKER 2 fix: the backend
+// canonicalizes /tmp → /private/tmp on macOS; trusting the return value avoids the
+// pendingFoldersRef superset-guessing that previously caused display freezes).
 // A "+ Add folder" button uses the Tauri dialog plugin (already in the repo, same
 // pattern as DesignView.tsx) to pick a new directory and calls
 // `add_project_working_set_folder_cmd`.
@@ -15,6 +17,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FolderOpen, Trash2 } from "lucide-react";
 import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
 import { stripSpoofChars } from "../agents/attentionNotifier";
+import { shouldAdoptWorkingSet } from "./workingSetModel";
 
 export interface WorkingSetCardProps {
   projectId: string;
@@ -32,23 +35,23 @@ export function WorkingSetCard({
   workingSet,
   onWorkingSetChange,
 }: WorkingSetCardProps) {
-  // Local optimistic state: starts from the prop; reflects adds/removes
-  // immediately; reverts on error.
+  // Local state: starts from the prop; on a successful add/remove is replaced by
+  // the CANONICAL list returned by the backend (BLOCKER 2 fix — avoids the
+  // /tmp → /private/tmp mismatch that caused display freezes on macOS).
   const [localFolders, setLocalFolders] = useState<string[]>(() => workingSet ?? []);
 
-  // Single in-flight mutex: only one add or remove at a time (prevents
-  // concurrent IPC calls from racing the optimistic state).
+  // Single in-flight mutex: only one add or remove at a time.
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Tracks the last confirmed on-disk state so the prop-sync effect can tell
-  // whether the incoming prop is a genuine refetch (different from what we wrote)
-  // or just the parent echoing our own optimistic write back.
-  // Set on every successful IPC write; cleared on error-revert. This prevents
-  // a stale prop from overwriting a confirmed write that hasn't reached the
-  // parent yet. Mirrors pendingModeRef in SandboxModeSelector.
-  const pendingFoldersRef = useRef<string[] | null>(null);
+  // Stale-poll guard (BLOCKER 3 fix): after a successful add/remove we adopt the
+  // CANONICAL list returned by the backend and record it here. The prop-sync
+  // effect then waits until the parent's prop has SET-EQUAL caught up before
+  // accepting it — a background poll whose disk read preceded the write cannot
+  // clobber the canonical value we already received. Cleared when the prop
+  // catches up, or when no write is pending (null = normal poll adoption).
+  const lastWrittenRef = useRef<string[] | null>(null);
 
   // Unmount guard: the Tauri folder dialog can stay open for seconds; navigating
   // away while it is open must not setState on a dead component.
@@ -60,32 +63,21 @@ export function WorkingSetCard({
     };
   }, []);
 
-  // Prop-sync effect: keep localFolders in sync when the parent prop changes
-  // (e.g. 10-second project refetch), but never clobber a confirmed optimistic
-  // state with a stale prop. Only update when not in-flight AND the incoming
-  // value differs from what we last confirmed we wrote. Mirrors the pattern
-  // in SandboxModeSelector (shouldAdoptProp equivalent inline here).
+  // Prop-sync effect: adopt external updates (e.g. 10-second project refetch, or a
+  // folder added via the "Allow & remember" consent path).
+  // Uses shouldAdoptWorkingSet to guard against a stale background poll clobbering
+  // the canonical list we just received from a successful add/remove:
+  //   - busy in-flight → skip (don't touch the optimistic state).
+  //   - lastWrittenRef set → only adopt once the prop SET-EQUALS lastWritten
+  //     (parent has caught up); then clear the ref.
+  //   - no pending write → adopt normally.
   useEffect(() => {
     const incoming = workingSet ?? [];
-    // If a write is in-flight, the incoming prop is almost certainly stale.
-    if (busyRef.current) return;
-    // If we have a pending confirmed write, don't let the parent echo a stale
-    // snapshot back. But the backend may have MORE folders than we wrote (e.g. a
-    // folder added via "Allow & remember" consent path). Accept the incoming prop
-    // as soon as it is a SUPERSET of what we wrote — i.e. every folder we wrote
-    // is present in incoming. A set-equal guard would never clear when the backend
-    // canonicalizes paths or adds extra entries, freezing the card forever.
-    if (pendingFoldersRef.current !== null) {
-      const pending = pendingFoldersRef.current;
-      if (pending.every((f) => incoming.includes(f))) {
-        // Backend has absorbed our write (and may have added more) — clear the
-        // guard and adopt the authoritative server state.
-        pendingFoldersRef.current = null;
-        setLocalFolders(incoming);
-      }
-      // If the backend hasn't caught up yet, leave localFolders as-is (it already
-      // reflects our optimistic write) and wait for the next prop update.
-      return;
+    if (!shouldAdoptWorkingSet(incoming, lastWrittenRef.current, busyRef.current)) return;
+    // If we had a pending canonical write and the prop just matched it, clear the
+    // guard so future external changes (unrelated to our write) adopt normally.
+    if (lastWrittenRef.current !== null) {
+      lastWrittenRef.current = null;
     }
     setLocalFolders(incoming);
   }, [workingSet]);
@@ -96,23 +88,24 @@ export function WorkingSetCard({
       busyRef.current = true;
       setBusy(true);
       setError(null);
-      // Optimistic: remove immediately.
+      // Optimistic: remove immediately for snappy UX; replaced by canonical list on success.
       const previous = localFolders;
-      const next = previous.filter((f) => f !== folder);
-      setLocalFolders(next);
+      setLocalFolders(previous.filter((f) => f !== folder));
       try {
-        await invokeBackendCommand<void>("remove_project_working_set_folder_cmd", {
-          projectId,
-          folder,
-        });
+        // BLOCKER 2 fix: command now returns the canonical list — adopt it directly.
+        const canonical = await invokeBackendCommand<string[]>(
+          "remove_project_working_set_folder_cmd",
+          { projectId, folder },
+        );
         if (!mountedRef.current) return;
-        pendingFoldersRef.current = next;
-        onWorkingSetChange?.(next);
+        // Record the canonical list so the prop-sync guard knows what to expect.
+        lastWrittenRef.current = canonical;
+        setLocalFolders(canonical);
+        onWorkingSetChange?.(canonical);
       } catch (e) {
         if (!mountedRef.current) return;
         // Revert on failure.
         setLocalFolders(previous);
-        pendingFoldersRef.current = null;
         setError(
           typeof e === "string"
             ? e
@@ -125,7 +118,6 @@ export function WorkingSetCard({
           busyRef.current = false;
           setBusy(false);
         } else {
-          // Release the ref lock even when unmounted so it doesn't leak.
           busyRef.current = false;
         }
       }
@@ -151,26 +143,28 @@ export function WorkingSetCard({
         // User dismissed the dialog — no-op.
         return;
       }
-      // Avoid client-side duplicates (the backend also deduplicates, but we
-      // skip the IPC call entirely if the folder is already shown).
+      // Skip if already present (the backend also deduplicates, but avoid a round-trip).
       if (localFolders.includes(picked)) return;
-      // Optimistic: add the folder immediately.
+      // Optimistic: add the raw picked path immediately; replaced by canonical on success.
       const previous = localFolders;
-      const next = [...previous, picked];
-      setLocalFolders(next);
+      setLocalFolders([...previous, picked]);
       try {
-        await invokeBackendCommand<void>("add_project_working_set_folder_cmd", {
-          projectId,
-          folder: picked,
-        });
+        // BLOCKER 2 fix: command now returns the canonical list — adopt it directly.
+        // This corrects any /tmp → /private/tmp (or similar) canonicalization so the
+        // displayed path matches what the backend stores and checks.
+        const canonical = await invokeBackendCommand<string[]>(
+          "add_project_working_set_folder_cmd",
+          { projectId, folder: picked },
+        );
         if (!mountedRef.current) return;
-        pendingFoldersRef.current = next;
-        onWorkingSetChange?.(next);
+        // Record the canonical list so the prop-sync guard knows what to expect.
+        lastWrittenRef.current = canonical;
+        setLocalFolders(canonical);
+        onWorkingSetChange?.(canonical);
       } catch (e) {
         if (!mountedRef.current) return;
         // Revert on IPC failure.
         setLocalFolders(previous);
-        pendingFoldersRef.current = null;
         setError(
           typeof e === "string"
             ? e
@@ -182,7 +176,6 @@ export function WorkingSetCard({
     } catch {
       // Dialog plugin unavailable or dialog threw — swallow, no state change.
     } finally {
-      // Release the ref lock unconditionally; only write React state when mounted.
       busyRef.current = false;
       if (mountedRef.current) setBusy(false);
     }

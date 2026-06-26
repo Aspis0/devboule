@@ -24,8 +24,22 @@ export interface ConsentRequest {
   kind: ConsentKind;
   projectId: string;
   agentId: string;
-  /** Human-readable context (e.g. the command that hit the block). Never raw secrets. */
+  /**
+   * Human-readable context displayed to the user (e.g. "A sandboxed command attempted
+   * to write outside the project to ..."). Never raw secrets.
+   *
+   * IMPORTANT: do NOT pass `detail` as the `folder` argument to `grant_folder_consent`.
+   * It is display-only prose and will be rejected by the backend's path validator.
+   * Use `path` (the machine-readable field) for any backend call.
+   */
   detail: string;
+  /**
+   * Machine-readable absolute path for FolderWrite consent requests.
+   * Contains the canonical folder path that triggered the block — pass this
+   * (not `detail`) to `grant_folder_consent` as the `folder` argument.
+   * Absent (`undefined`) for Net and other kinds that have no associated path.
+   */
+  path?: string;
 }
 
 /**

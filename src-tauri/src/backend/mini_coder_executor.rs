@@ -1500,16 +1500,17 @@ fn claim_and_launch(
             crate::backend::projects::project_sandbox_mode(app, &project_id)
                 .unwrap_or(crate::backend::broker::SandboxMode::Ask);
 
-        // WARNING 2 fix: ALWAYS drain (consume) the transient grants — even in Unattended
-        // mode.  Previously, Unattended skipped the take_* calls, leaving stale entries in
-        // the HashMap forever and risking a grant-storm if the project later switches to Ask.
-        // The fix: unconditionally call take_*, but only honour the result when NOT Unattended
-        // (fail-closed invariant preserved by resolve_net_enabled / resolve_working_set).
-        let transient_net_taken = app
+        // CHEAP FIX A + WARNING 2 fix: atomically drain BOTH net and folder grants in a
+        // single combined lock acquisition, eliminating the split-grant race where two
+        // concurrent same-project directives could each steal only part of the grant set.
+        // Always drain regardless of mode (WARNING 2: prevents unbounded HashMap growth and
+        // stale-grant storms when the project later switches from Unattended back to Ask).
+        let (transient_net_taken, transient_folders_taken) = app
             .try_state::<crate::backend::broker::PermissionBrokerState>()
-            .map(|broker| broker.take_net_grant(&project_id))
-            .unwrap_or(false);
-        // Discard in Unattended; honour in Ask / AutoAcceptInWorkspace.
+            .map(|broker| broker.take_all_grants(&project_id))
+            .unwrap_or((false, std::collections::HashSet::new()));
+
+        // Discard in Unattended (fail-closed); honour in Ask / AutoAcceptInWorkspace.
         let transient_net = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
             transient_net_taken
         } else {
@@ -1525,17 +1526,10 @@ fn claim_and_launch(
             crate::backend::sandbox::NetPolicy::None
         };
         // SANDBOX broker Slice 2: resolve the effective working set.
-        // WARNING 2 fix (folder grants): same drain-always pattern as the net grant above.
-        // ALWAYS call take_folder_grants to prevent unbounded HashMap growth; only pass the
-        // taken set to resolve_working_set when NOT Unattended (fail-closed).
+        // In Unattended: drain happened but we pass empty — transient grants are not honoured.
         let persisted_working_set =
             crate::backend::projects::project_working_set(app, &project_id)
                 .unwrap_or_default();
-        let transient_folders_taken = app
-            .try_state::<crate::backend::broker::PermissionBrokerState>()
-            .map(|broker| broker.take_folder_grants(&project_id))
-            .unwrap_or_default();
-        // In Unattended: drain happened but we pass empty — transient grants are not honoured.
         let transient_folders = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
             transient_folders_taken.clone()
         } else {
@@ -1559,28 +1553,15 @@ fn claim_and_launch(
             agentic_net,
             working_set_paths,
         );
-        // Re-insert the transient grants ONLY in non-Unattended mode if the spawn itself
-        // failed (not the run): the worker never launched, so the user never saw a blocked
-        // outcome and would not be re-prompted — put the grants back so the next
+        // Re-insert the transient grants atomically (single lock) ONLY in non-Unattended mode
+        // if the spawn itself failed: the worker never launched, so the user never saw a
+        // blocked outcome and would not be re-prompted — restore grants so the next
         // claim_and_launch attempt can use them.  Unattended never re-inserts (drain is final).
         if spawn_r.is_err() && sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
-            // Net grant.
-            if transient_net_taken {
-                if let Some(broker) =
-                    app.try_state::<crate::backend::broker::PermissionBrokerState>()
-                {
-                    broker.grant_net_once(&project_id);
-                }
-            }
-            // Folder grants.
-            if !transient_folders_taken.is_empty() {
-                if let Some(broker) =
-                    app.try_state::<crate::backend::broker::PermissionBrokerState>()
-                {
-                    for folder in &transient_folders_taken {
-                        broker.grant_folder_once(&project_id, folder);
-                    }
-                }
+            if let Some(broker) =
+                app.try_state::<crate::backend::broker::PermissionBrokerState>()
+            {
+                broker.reinsert_all_grants(&project_id, transient_net_taken, &transient_folders_taken);
             }
         }
         spawn_r
@@ -1760,6 +1741,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                     detail: "A sandboxed command needed network access, which is disabled for \
                              this project. Grant to retry."
                         .to_string(),
+                    path: None,
                 };
                 let _ = app.emit("sandbox://consent-request", req);
             } else {
@@ -1818,6 +1800,9 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                         "A sandboxed command attempted to write outside the project to \
                          \"{folder}\". Grant to allow writes there and retry."
                     ),
+                    // BLOCKER 1 fix: `path` carries the raw canonical folder so the
+                    // frontend passes it (not the prose `detail`) to grant_folder_consent.
+                    path: Some(folder.to_string()),
                 };
                 let _ = app.emit("sandbox://consent-request", req);
             } else {

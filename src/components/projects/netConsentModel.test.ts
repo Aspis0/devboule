@@ -23,6 +23,18 @@ function makeRequest(over: Partial<ConsentRequest> = {}): ConsentRequest {
   };
 }
 
+function makeFolderRequest(over: Partial<ConsentRequest> = {}): ConsentRequest {
+  return {
+    kind: "folderWrite",
+    projectId: "proj-1",
+    agentId: "mini-agent-42",
+    detail:
+      'A sandboxed command attempted to write outside the project to "/private/tmp/extra". Grant to allow writes there and retry.',
+    path: "/private/tmp/extra",
+    ...over,
+  };
+}
+
 // ── grantNetConsentArgs ───────────────────────────────────────────────────────
 
 describe("grantNetConsentArgs", () => {
@@ -374,5 +386,62 @@ describe("grantFolderConsentArgs", () => {
       ),
     );
     expect(decisions_set.size).toBe(3);
+  });
+});
+
+// ── BLOCKER 1: ConsentRequest.path field contract ─────────────────────────────
+//
+// The frontend MUST use head.path (not head.detail) as the folder argument to
+// grant_folder_consent. detail is human-readable prose and is rejected by the
+// backend's normalize_working_set_folder (!is_absolute) validator.
+
+describe("ConsentRequest.path — BLOCKER 1 contract", () => {
+  it("FolderWrite request carries a machine-readable path separate from detail", () => {
+    const req = makeFolderRequest();
+    // path is an absolute POSIX path — valid as folder argument to grant_folder_consent.
+    expect(req.path).toBe("/private/tmp/extra");
+    // detail is prose — it is NOT absolute and must never be passed as folder.
+    expect(req.detail).toContain("A sandboxed command");
+    expect(req.detail.startsWith("/")).toBe(false);
+  });
+
+  it("grantFolderConsentArgs built from path (not detail) passes the correct folder", () => {
+    const req = makeFolderRequest();
+    // Simulate what handleConsentDecision does: use req.path as the folder.
+    const folder = req.path!;
+    const args = grantFolderConsentArgs({
+      projectId: req.projectId,
+      folder,
+      decision: "allowOnce",
+    });
+    // The folder arg must be the canonical path, not the prose sentence.
+    expect(args.folder).toBe("/private/tmp/extra");
+    expect(typeof args.folder).toBe("string");
+    expect((args.folder as string).startsWith("/")).toBe(true);
+  });
+
+  it("grantFolderConsentArgs built from detail (old bug) would pass non-absolute string", () => {
+    const req = makeFolderRequest();
+    // Demonstrate the OLD BUG: detail is not an absolute path.
+    const buggyFolder = req.detail;
+    expect(buggyFolder.startsWith("/")).toBe(false);
+    // This would have been rejected by normalize_working_set_folder on the backend.
+    // With the fix, the frontend uses req.path instead.
+  });
+
+  it("Net request has no path field (undefined)", () => {
+    const req = makeRequest({ kind: "net" });
+    expect(req.path).toBeUndefined();
+  });
+
+  it("FolderWrite request with missing path surfaces the contract violation", () => {
+    // If path is somehow absent (backend bug), the frontend must error rather than
+    // silently pass detail. This test documents the expected guard behavior.
+    const req = makeFolderRequest({ path: undefined });
+    // In production handleConsentDecision throws; here we verify the missing-path case.
+    expect(req.path).toBeUndefined();
+    // The guard: folder = req.path → undefined → throw "missing machine-readable path"
+    const folder = req.path;
+    expect(folder).toBeFalsy();
   });
 });

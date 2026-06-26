@@ -1213,6 +1213,16 @@ export function ProjectsView() {
     }
   }, [reloadSelectedProject]);
 
+  // Stable callback threaded into ProjectWorkspace's `onReloadProject` prop so
+  // handleConsentDecision's useCallback dep array doesn't recreate that closure
+  // on every render. Keyed on the current project id + loadProject (both stable
+  // between renders unless the selection actually changes).
+  const onReloadProject = useCallback(() => {
+    const id = currentProject?.metadata.id;
+    if (!id) return;
+    void loadProject(id);
+  }, [currentProject?.metadata.id, loadProject]);
+
   useEffect(() => {
     let timer: number | null = null;
     let cancelled = false;
@@ -2875,7 +2885,7 @@ export function ProjectsView() {
                   : current,
               );
             }}
-            onReloadProject={() => void loadProject(currentProject.metadata.id)}
+            onReloadProject={onReloadProject}
             onCommit={(message) => void commitProject(message)}
             onPush={() => void pushProject()}
             onPull={() => void pullProject()}
