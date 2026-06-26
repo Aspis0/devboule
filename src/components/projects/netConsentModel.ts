@@ -40,6 +40,13 @@ export interface ConsentRequest {
    * Absent (`undefined`) for Net and other kinds that have no associated path.
    */
   path?: string;
+  /**
+   * Correlation id for LIVE cloud-agent requests (Slice 5, Exec/Patch from Claude/Codex).
+   * When present, the decision must be answered via `respond_cloud_consent` (which
+   * round-trips it back to the blocked agent) — NOT the fire-and-forget grant_* commands.
+   * Format `"<agentId>:<requestId>"`. Absent for the local seatbelt path (Net/FolderWrite).
+   */
+  approvalId?: string;
 }
 
 /**
@@ -90,6 +97,70 @@ export function grantFolderConsentArgs(params: {
   };
 }
 
+/**
+ * Build the args object for `invokeBackendCommand("respond_cloud_consent", ...)`.
+ *
+ * Slice 5: used for LIVE cloud-agent (Claude/Codex) Exec/Patch requests that carry an
+ * `approvalId`. The decision round-trips back to the blocked agent (vs the grant_*
+ * commands which only persist for the next spawn). Matches the Tauri command signature:
+ *   `approval_id: String, decision: ConsentDecision`  (camelCase over the JS bridge).
+ */
+export function respondCloudConsentArgs(params: {
+  approvalId: string;
+  decision: ConsentDecision;
+}): Record<string, unknown> {
+  return { approvalId: params.approvalId, decision: params.decision };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Slice 5b: Claude consent file-bridge (mirrors ConsentBridgeRequest in
+// src-tauri/src/backend/consent_bridge.rs)
+// ─────────────────────────────────────────────────────────────
+
+/** Lifecycle of a Claude file-bridge consent request (snake_case over the wire). */
+export type ConsentBridgeStatus =
+  | "pending_approval"
+  | "allowed"
+  | "denied"
+  | "timeout";
+
+/**
+ * One Claude consent request in the `.aspis-agents.json` `consentRequests` queue. Written by
+ * the `claude_consent_hook` binary (a PreToolUse hook), polled by the frontend via
+ * `consent_requests_list`, stamped terminal by `respond_cloud_consent`.
+ */
+export interface ConsentBridgeRequest {
+  id: string;
+  agentId: string;
+  projectId: string;
+  kind: ConsentKind;
+  detail: string;
+  path?: string;
+  status: ConsentBridgeStatus;
+  createdAt: string;
+}
+
+/**
+ * Map the `pending_approval` file-bridge requests for `projectId` into the SAME `ConsentRequest`
+ * shape the event-driven modal uses, carrying the file-bridge id as `approvalId` so a decision
+ * round-trips via `respond_cloud_consent`. Terminal (allowed/denied/timeout) entries are dropped.
+ */
+export function pendingConsentBridgeForProject(
+  all: ConsentBridgeRequest[],
+  projectId: string,
+): ConsentRequest[] {
+  return all
+    .filter((r) => r.status === "pending_approval" && r.projectId === projectId)
+    .map((r) => ({
+      kind: r.kind,
+      projectId: r.projectId,
+      agentId: r.agentId,
+      detail: r.detail,
+      path: r.path,
+      approvalId: r.id,
+    }));
+}
+
 // ─────────────────────────────────────────────────────────────
 // Filtering helpers (pure, tested)
 // ─────────────────────────────────────────────────────────────
@@ -132,6 +203,20 @@ export function isConsentRequestForProject(
  * would silently drop the second request and leave the agent permanently stuck.
  */
 export function sameConsentRequest(a: ConsentRequest, b: ConsentRequest): boolean {
+  // Slice 5: cloud requests carry an approvalId. A single agent can be blocked on
+  // several DISTINCT live requests over its lifetime (e.g. two sequential Exec
+  // approvals), so when an approvalId is present it is part of the identity —
+  // otherwise the second request would be silently dropped and the agent would hang.
+  // When BOTH lack an approvalId (local seatbelt path) we keep the original
+  // project+agent+kind identity so rapid duplicate net/folder events still dedupe.
+  if (a.approvalId !== undefined || b.approvalId !== undefined) {
+    return (
+      a.projectId === b.projectId &&
+      a.agentId === b.agentId &&
+      a.kind === b.kind &&
+      a.approvalId === b.approvalId
+    );
+  }
   return a.projectId === b.projectId && a.agentId === b.agentId && a.kind === b.kind;
 }
 

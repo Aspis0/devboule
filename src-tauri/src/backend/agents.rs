@@ -516,6 +516,7 @@ fn default_agent_live_state() -> AgentLiveState {
         design_request_directives: Vec::new(),
         git_push_requests: Vec::new(),
         plan_approval_requests: Vec::new(),
+        consent_requests: Vec::new(),
     }
 }
 
@@ -779,6 +780,57 @@ fn agent_state_file_lock(projects_dir: &Path) -> Result<AgentStateFileLock, Stri
         "Could not acquire agent state lock: {}",
         lock_path.display()
     ))
+}
+
+/// Slice 5b: a PATH-BASED, AppHandle-free read-modify-write of `.aspis-agents.json`,
+/// for the standalone Claude consent-hook BINARY (a separate process with no
+/// `AppHandle`/Tauri state). It acquires the SAME `agent_state_file_lock`, loads the
+/// state leniently (default when the file is absent), runs `mutate`, stamps
+/// `updated_at`, clears the read-time-only fields (as `mutate_agent_live_state` does),
+/// and writes back via the SAME `write_agent_live_state` serializer — so there is no
+/// second JSON writer and no second lock primitive. The lock is held ONLY for this
+/// in-memory mutation + write; the hook does its bounded sleep OUTSIDE this call.
+pub fn mutate_agent_live_state_at_path<T>(
+    projects_dir: &Path,
+    mutate: impl FnOnce(&mut AgentLiveState) -> T,
+) -> Result<T, String> {
+    fs::create_dir_all(projects_dir)
+        .map_err(|e| format!("Could not create projects folder: {e}"))?;
+    let state_path = projects_dir.join(AGENTS_STATE_FILE);
+    let _guard = agent_state_file_lock(projects_dir)?;
+    let mut live_state = if state_path.exists() {
+        let content = fs::read_to_string(&state_path)
+            .map_err(|e| format!("Could not read agent state file: {e}"))?;
+        serde_json::from_str::<AgentLiveState>(&content)
+            .map_err(|e| format!("Agent state file is invalid: {e}"))?
+    } else {
+        default_agent_live_state()
+    };
+    let outcome = mutate(&mut live_state);
+    live_state.updated_at = Utc::now().to_rfc3339();
+    live_state.state_path.clear();
+    live_state.mcp_command.clear();
+    live_state.mcp_client_config.clear();
+    write_agent_live_state(&state_path, &live_state)?;
+    Ok(outcome)
+}
+
+/// Slice 5b: a PATH-BASED, AppHandle-free locked READ snapshot of
+/// `.aspis-agents.json` for the consent-hook BINARY's bounded poll. Mirrors
+/// `read_agent_live_state_snapshot` but takes the `projects_dir` directly (the hook
+/// process has no `AppHandle`). Holds the lock ONLY for the read — never across the
+/// hook's sleep (the app's `respond_cloud_consent` co-writes this file).
+pub fn read_agent_live_state_at_path(projects_dir: &Path) -> Result<AgentLiveState, String> {
+    let state_path = projects_dir.join(AGENTS_STATE_FILE);
+    let _guard = agent_state_file_lock(projects_dir)?;
+    if state_path.exists() {
+        let content = fs::read_to_string(&state_path)
+            .map_err(|e| format!("Could not read agent state file: {e}"))?;
+        serde_json::from_str::<AgentLiveState>(&content)
+            .map_err(|e| format!("Agent state file is invalid: {e}"))
+    } else {
+        Ok(default_agent_live_state())
+    }
 }
 
 fn write_agent_live_state(path: &Path, state: &AgentLiveState) -> Result<(), String> {

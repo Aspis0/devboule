@@ -626,16 +626,16 @@ describe("miniKillCall (Stop safety brake)", () => {
 
 // ---- MC-P7: Compact button gating + write call ------------------------------
 
-describe("shouldShowCompact (claude-only gating)", () => {
-  it("is true ONLY for the resolved built-in client exactly 'claude'", () => {
+describe("shouldShowCompact (claude + codex gating)", () => {
+  it("is true for the resolved built-in client 'claude' or 'codex'", () => {
     expect(shouldShowCompact(session({ client: "claude" }))).toBe(true);
+    expect(shouldShowCompact(session({ client: "codex" }))).toBe(true);
     // Case/whitespace-insensitive on the resolved client.
     expect(shouldShowCompact(session({ client: "Claude" }))).toBe(true);
-    expect(shouldShowCompact(session({ client: " claude " }))).toBe(true);
+    expect(shouldShowCompact(session({ client: " codex " }))).toBe(true);
   });
 
-  it("is false for codex / powershell / ollama / custom / empty clients", () => {
-    expect(shouldShowCompact(session({ client: "codex" }))).toBe(false);
+  it("is false for powershell / ollama / custom / empty clients", () => {
     expect(shouldShowCompact(session({ client: "powershell" }))).toBe(false);
     expect(shouldShowCompact(session({ client: "ollama" }))).toBe(false);
     expect(shouldShowCompact(session({ client: "my-custom-cli" }))).toBe(false);
@@ -645,14 +645,15 @@ describe("shouldShowCompact (claude-only gating)", () => {
   });
 
   it("is NOT a substring match — 'claudex' is false", () => {
-    // A custom client id that merely CONTAINS "claude" must not trip the gate.
+    // A custom client id that merely CONTAINS "claude"/"codex" must not trip the gate.
     expect(shouldShowCompact(session({ client: "claudex" }))).toBe(false);
     expect(shouldShowCompact(session({ client: "claude-x" }))).toBe(false);
     expect(shouldShowCompact(session({ client: "myclaude" }))).toBe(false);
+    expect(shouldShowCompact(session({ client: "codexy" }))).toBe(false);
   });
 });
 
-describe("compactWriteCall (run /compact via agent_pty_write)", () => {
+describe("compactWriteCall (claude PTY /compact, codex JSON-RPC compact)", () => {
   it("writes /compact\\n via agent_pty_write for a claude session", () => {
     const call = compactWriteCall(
       session({ agentId: "coder-1", client: "claude" }),
@@ -662,9 +663,18 @@ describe("compactWriteCall (run /compact via agent_pty_write)", () => {
     expect(call?.args).toEqual({ agentId: "coder-1", data: "/compact\n" });
   });
 
-  it("returns null for a non-claude session (gating — no Compact)", () => {
-    expect(compactWriteCall(session({ client: "codex" }))).toBeNull();
+  it("invokes project_cloud_compact for a codex session", () => {
+    const call = compactWriteCall(
+      session({ agentId: "coder-2", client: "codex" }),
+    );
+    expect(call).not.toBeNull();
+    expect(call?.command).toBe("project_cloud_compact");
+    expect(call?.args).toEqual({ agentId: "coder-2" });
+  });
+
+  it("returns null for a non-claude/codex session (gating — no Compact)", () => {
     expect(compactWriteCall(session({ client: "claudex" }))).toBeNull();
+    expect(compactWriteCall(session({ client: "powershell" }))).toBeNull();
     expect(compactWriteCall(session({ client: null }))).toBeNull();
   });
 

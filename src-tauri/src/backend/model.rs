@@ -163,6 +163,44 @@ pub struct ProjectMetadata {
     /// frontmatter when empty so pre-existing project files stay byte-stable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_set: Vec<String>,
+    /// Slice 5c: per-project default agent capability/cost controls (effort, system-prompt,
+    /// turn/budget caps) for the cloud coders. NO-CHURN: the whole object is omitted from the
+    /// on-disk frontmatter when every field is unset, so pre-existing project files stay
+    /// byte-stable.
+    #[serde(default, skip_serializing_if = "AgentControls::is_default")]
+    pub agent_controls: AgentControls,
+}
+
+/// Slice 5c: per-project (or per-launch) capability/cost controls for the cloud coding CLIs.
+/// All optional — `None` means "leave the CLI default". The PERMISSION axis (sandbox_mode)
+/// is deliberately NOT here; it stays on `ProjectMetadata` and drives the broker.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentControls {
+    /// Reasoning effort. Claude `--effort` (low/medium/high/xhigh/max); Codex
+    /// `model_reasoning_effort` (none/minimal/low/medium/high/xhigh/ultra). Free string —
+    /// validated/clamped per-backend at emit time, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Extra system-prompt text. Claude `--append-system-prompt`; Codex `developer_instructions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Max agent turns (Claude `--max-turns`, print mode). No direct Codex equivalent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Max spend in USD (Claude `--max-budget-usd`, print mode). No direct Codex equivalent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
+}
+
+impl AgentControls {
+    /// True when every control is unset — drives the NO-CHURN `skip_serializing_if`.
+    pub fn is_default(&self) -> bool {
+        self.effort.is_none()
+            && self.system_prompt.is_none()
+            && self.max_turns.is_none()
+            && self.max_budget_usd.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -933,6 +971,33 @@ where
         .collect())
 }
 
+// Per-entry-lenient consent-request deserializer (Slice 5b). The `consentRequests`
+// array in `.aspis-agents.json` is written by the Claude PreToolUse hook bin and
+// round-tripped by the Rust `respond_cloud_consent` command + the Python MCP; a
+// hand-edited or half-written request (garbage `status`, missing `kind`) must DROP
+// only that entry rather than brick the whole `AgentLiveState` read. Mirrors
+// `lenient_git_push_requests`: read raw `Value`s, drop any that fail to deserialize
+// into `ConsentBridgeRequest`, degrade a non-array value to an empty queue.
+fn lenient_consent_requests<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::backend::consent_bridge::ConsentBridgeRequest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let entries = match raw {
+        serde_json::Value::Array(items) => items,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            serde_json::from_value::<crate::backend::consent_bridge::ConsentBridgeRequest>(entry)
+                .ok()
+        })
+        .collect())
+}
+
 // Per-entry-lenient plan-approval-request deserializer (Phase 1). The
 // `planApprovalRequests` array in `.aspis-agents.json` is written by the agent's MCP
 // `plan_submit` tool and round-tripped by the Rust approve/deny commands; a
@@ -1230,6 +1295,19 @@ pub struct AgentLiveState {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub plan_approval_requests: Vec<PlanApprovalRequest>,
+    // Slice 5b: Claude→human consent requests. The Claude PreToolUse hook bin appends a
+    // `pending_approval` entry; the human's `respond_cloud_consent` Tauri command claims
+    // it terminal (allowed/denied). Additive + skip-if-empty so an existing
+    // `.aspis-agents.json` with no consent activity is NOT rewritten with an injected
+    // empty `consentRequests` key (no churn), and older builds / the Python MCP round-trip
+    // still deserialize. Per-entry lenient: one malformed request is dropped, never bricks
+    // the whole state read.
+    #[serde(
+        default,
+        deserialize_with = "lenient_consent_requests",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub consent_requests: Vec<crate::backend::consent_bridge::ConsentBridgeRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2457,6 +2535,99 @@ mod tests {
         }"#;
         let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
         assert!(state.plan_approval_requests.is_empty());
+    }
+
+    // -- Slice 5b: Claude consent requests (file-bridge co-ownership) --------
+
+    #[test]
+    fn live_state_without_consent_requests_loads_and_no_churn() {
+        // CRITICAL NO-CHURN: an existing .aspis-agents.json with NO consent activity
+        // must load (empty queue) AND re-serialize byte-identically (no injected
+        // consentRequests key) — the file is co-owned by the Python MCP.
+        let json = r#"{
+            "version": 2,
+            "updatedAt": "2026-06-26T10:00:00+00:00",
+            "sessions": []
+        }"#;
+        let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
+        assert!(state.consent_requests.is_empty());
+        let back = serde_json::to_string(&state).unwrap();
+        assert!(
+            !back.contains("consentRequests"),
+            "no-churn violated: {back}"
+        );
+    }
+
+    #[test]
+    fn live_state_consent_requests_round_trip_camel_case() {
+        let json = r#"{
+            "version": 2,
+            "updatedAt": "2026-06-26T10:00:00+00:00",
+            "sessions": [],
+            "consentRequests": [
+                {
+                    "id": "0123456789abcdef0123456789abcdef",
+                    "agentId": "claude-1",
+                    "projectId": "proj-1",
+                    "kind": "exec",
+                    "detail": "cargo build",
+                    "status": "pending_approval",
+                    "createdAt": "2026-06-26T10:00:00Z"
+                }
+            ]
+        }"#;
+        let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
+        assert_eq!(state.consent_requests.len(), 1);
+        assert_eq!(
+            state.consent_requests[0].id,
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            state.consent_requests[0].status,
+            crate::backend::consent_bridge::ConsentBridgeStatus::PendingApproval
+        );
+        let back = serde_json::to_string(&state).unwrap();
+        assert!(back.contains("\"consentRequests\""), "json: {back}");
+        assert!(back.contains("\"projectId\":\"proj-1\""), "json: {back}");
+    }
+
+    #[test]
+    fn one_malformed_consent_request_does_not_brick_live_state() {
+        // A half-written / unknown-status entry among valid ones must be DROPPED, not
+        // fail the whole AgentLiveState deserialize.
+        let json = r#"{
+            "version": 2,
+            "updatedAt": "2026-06-26T10:00:00+00:00",
+            "sessions": [],
+            "consentRequests": [
+                {
+                    "id": "0123456789abcdef0123456789abcdef",
+                    "agentId": "claude-1",
+                    "projectId": "proj-1",
+                    "kind": "patch",
+                    "detail": "edit a.rs",
+                    "status": "pending_approval",
+                    "createdAt": "2026-06-26T10:00:00Z"
+                },
+                { "id": 42, "kind": "not-a-kind" },
+                "totally-not-an-object"
+            ]
+        }"#;
+        let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
+        assert_eq!(state.consent_requests.len(), 1);
+        assert_eq!(state.consent_requests[0].detail, "edit a.rs");
+    }
+
+    #[test]
+    fn consent_requests_non_array_becomes_empty() {
+        let json = r#"{
+            "version": 2,
+            "updatedAt": "2026-06-26T10:00:00+00:00",
+            "sessions": [],
+            "consentRequests": "garbage"
+        }"#;
+        let state: AgentLiveState = serde_json::from_str(json).expect("state loads");
+        assert!(state.consent_requests.is_empty());
     }
 
     #[test]

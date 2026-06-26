@@ -157,6 +157,15 @@ pub struct ConsentRequest {
     /// `normalize_working_set_folder` (`!is_absolute` → AllowOnce/AllowRemember fail).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Correlation id for LIVE cloud adapters (Slice 5). When set, the frontend must
+    /// answer via `respond_cloud_consent` (which round-trips the decision back to the
+    /// blocked cloud agent) instead of the fire-and-forget `grant_*_consent` commands.
+    ///
+    /// Format: `"<agent_id>:<request_id>"`. `None` for the local seatbelt path
+    /// (`Net`/`FolderWrite` emitted by the mini-coder), which keeps the on-disk and wire
+    /// JSON byte-identical to Slices 0-3 (NO-CHURN).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
 }
 
 /// Decision returned by the frontend via `grant_net_consent`.
@@ -357,11 +366,259 @@ pub fn resolve_working_set(
 }
 
 // ──────────────────────────────────────────────
+// Cloud live-waiter registry (Slice 5)
+// ──────────────────────────────────────────────
+
+/// Managed singleton tracking in-flight cloud consent requests that a LIVE cloud agent
+/// (Codex over the app-server JSON-RPC stream we own) is currently blocked on.
+///
+/// Flow: the Codex driver thread `register`s an `approval_id`, emits the `ConsentRequest`
+/// to the frontend, then blocks on the returned `Receiver` (with a timeout). When the user
+/// clicks a button, `respond_cloud_consent` calls `resolve`, which delivers the decision to
+/// that blocked thread, which writes the JSON-RPC approval result back to Codex.
+///
+/// Claude does NOT use this map: its hook is a separate OS process that cannot share
+/// in-memory state, so it round-trips through the `.aspis-agents.json` file-bridge instead
+/// (Slice 5b). `respond_cloud_consent` tries this in-memory map first, then the file-bridge.
+///
+/// Uses `std::sync::mpsc` (not tokio) to match the all-`std::thread` design of the cloud
+/// duplex executor. The mutex is only ever held for the brief map mutation — never across
+/// the blocking `recv`.
+pub struct CloudConsentState {
+    pending: std::sync::Mutex<HashMap<String, std::sync::mpsc::Sender<ConsentDecision>>>,
+}
+
+impl Default for CloudConsentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CloudConsentState {
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a waiter for `approval_id` and return the `Receiver` the caller blocks on.
+    /// Replaces (and drops) any existing sender for the same id — last writer wins; the
+    /// stale waiter's `recv` then returns `Err`.
+    pub fn register(&self, approval_id: &str) -> std::sync::mpsc::Receiver<ConsentDecision> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(approval_id.to_string(), tx);
+        rx
+    }
+
+    /// Deliver `decision` to a waiting registrant (one-shot: the entry is removed).
+    /// Returns `true` only if the decision was actually DELIVERED — i.e. a waiter existed
+    /// AND its `Receiver` is still alive. Returns `false` if no waiter exists OR the waiter
+    /// already timed out and dropped its `Receiver` (a `SendError`). This distinction
+    /// matters: `respond_cloud_consent` must NOT report success to the UI when the blocked
+    /// agent has already moved on, otherwise the user's decision is silently lost and the
+    /// modal is dismissed as if it took effect.
+    pub fn resolve(&self, approval_id: &str, decision: ConsentDecision) -> bool {
+        let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = map.remove(approval_id) {
+            tx.send(decision).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Drop a pending waiter without delivering a decision (session kill / EOF / timeout).
+    /// Dropping the `Sender` unblocks a thread parked in `recv`/`recv_timeout` (returns
+    /// `Err`). Returns whether an entry existed.
+    pub fn cancel(&self, approval_id: &str) -> bool {
+        let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(approval_id).is_some()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Codex thread/start policy mapping (Slice 5a)
+// ──────────────────────────────────────────────
+
+/// `approvalPolicy` value sent on Codex `thread/start`.
+///
+/// ⚠️ WIRE CASING UNVERIFIED: the public app-server example at developers.openai.com shows
+/// camelCase string values (`"never"`, `"onRequest"`), while the internal `codex-rs` core
+/// protocol enum uses kebab-case (`"on-request"`). We emit camelCase per the documented v2
+/// example; this (and the `sandbox` shape below) MUST be validated against a live
+/// `codex app-server` in e2e (the owner's eyes). `as_wire()` is the single place to flip if needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CodexApprovalPolicy {
+    Never,
+    UnlessTrusted,
+    OnRequest,
+}
+
+impl CodexApprovalPolicy {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            CodexApprovalPolicy::Never => "never",
+            CodexApprovalPolicy::UnlessTrusted => "unlessTrusted",
+            CodexApprovalPolicy::OnRequest => "onRequest",
+        }
+    }
+}
+
+/// Resolved Codex thread policy, built purely from the per-project sandbox knobs. No I/O —
+/// unit-testable. The encoder (`encode_thread_start`) emits this as the documented v2
+/// `thread/start` params shape: `approvalPolicy` (string), `sandbox: "workspaceWrite"`
+/// (a plain string, NOT a tagged object), and the writable roots in a SEPARATE
+/// `runtimeWorkspaceRoots` array. (The tagged `{type,writableRoots}` object is the RESPONSE
+/// `SandboxPolicy` shape, not the request param — fixed after review.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexThreadPolicy {
+    pub approval_policy: CodexApprovalPolicy,
+    /// Goes into `runtimeWorkspaceRoots` (root first, then working_set).
+    pub writable_roots: Vec<String>,
+    /// Best-effort `networkAccess` hint (⚠️ #10390: silently ignored by Codex's macOS seatbelt).
+    pub network_access: bool,
+    /// Slice 5c: reasoning effort (Codex `model_reasoning_effort`), emitted on thread/start when
+    /// set. ⚠️ exact field name unverified — confirm live.
+    pub effort: Option<String>,
+    /// Slice 5c: extra developer instructions, emitted on thread/start when set. ⚠️ unverified.
+    pub developer_instructions: Option<String>,
+}
+
+/// Map the per-project sandbox knobs to a Codex `thread/start` policy. `working_set` and
+/// `net_enabled` are ALREADY resolved by the caller; `root` is the canonical project root.
+///
+/// - `Ask` → `onRequest`, writable = `[root]` ONLY (every out-of-root write becomes a prompt).
+/// - `AutoAcceptInWorkspace` → `onRequest`, writable = `[root] + working_set`.
+/// - `Unattended` → `never` (Codex auto-decides, no prompt). Fail-closed parity DEPENDS on the
+///   `sandbox`/`runtimeWorkspaceRoots` actually confining Codex — verify live.
+pub fn resolve_codex_thread_policy(
+    mode: SandboxMode,
+    root: &str,
+    working_set: &[String],
+    net_enabled: bool,
+) -> CodexThreadPolicy {
+    let (approval_policy, writable_roots) = match mode {
+        SandboxMode::Ask => (CodexApprovalPolicy::OnRequest, vec![root.to_string()]),
+        SandboxMode::AutoAcceptInWorkspace => {
+            let mut roots = vec![root.to_string()];
+            roots.extend_from_slice(working_set);
+            (CodexApprovalPolicy::OnRequest, roots)
+        }
+        SandboxMode::Unattended => {
+            let mut roots = vec![root.to_string()];
+            roots.extend_from_slice(working_set);
+            (CodexApprovalPolicy::Never, roots)
+        }
+    };
+    CodexThreadPolicy {
+        approval_policy,
+        writable_roots,
+        network_access: net_enabled,
+        // Capability/cost controls (Slice 5c) are layered on by the caller from AgentControls;
+        // the sandbox-mode mapping leaves them unset.
+        effort: None,
+        developer_instructions: None,
+    }
+}
+
+// ──────────────────────────────────────────────
 // Unit tests  (TDD: written before implementation — these define the contract)
 // ──────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CloudConsentState (Slice 5) ───────────────────────────────────────────
+
+    #[test]
+    fn cloud_consent_register_then_resolve_delivers() {
+        let state = CloudConsentState::new();
+        let rx = state.register("a");
+        assert!(state.resolve("a", ConsentDecision::AllowOnce));
+        assert_eq!(rx.recv().unwrap(), ConsentDecision::AllowOnce);
+    }
+
+    #[test]
+    fn cloud_consent_resolve_unknown_is_false() {
+        let state = CloudConsentState::new();
+        assert!(!state.resolve("missing", ConsentDecision::Deny));
+    }
+
+    #[test]
+    fn cloud_consent_cancel_drops_waiter() {
+        let state = CloudConsentState::new();
+        let rx = state.register("b");
+        assert!(state.cancel("b"));
+        assert!(rx.recv().is_err());
+        assert!(!state.resolve("b", ConsentDecision::AllowOnce));
+    }
+
+    #[test]
+    fn cloud_consent_register_twice_last_wins() {
+        let state = CloudConsentState::new();
+        let r1 = state.register("c");
+        let r2 = state.register("c");
+        assert!(state.resolve("c", ConsentDecision::AllowRemember));
+        assert_eq!(r2.recv().unwrap(), ConsentDecision::AllowRemember);
+        assert!(r1.recv().is_err());
+    }
+
+    #[test]
+    fn cloud_consent_resolve_false_when_receiver_dropped() {
+        // The agent registered then timed out and dropped its Receiver. A late decision
+        // must report `false` (NOT delivered) so the UI does not dismiss the modal as if
+        // the decision took effect (silent-loss guard).
+        let state = CloudConsentState::new();
+        let rx = state.register("d");
+        drop(rx); // agent gave up
+        assert!(!state.resolve("d", ConsentDecision::AllowOnce));
+    }
+
+    // ── Codex thread policy mapping (Slice 5a) ────────────────────────────────
+
+    #[test]
+    fn codex_policy_ask_is_on_request_and_root_only_writable() {
+        let policy = resolve_codex_thread_policy(SandboxMode::Ask, "/root", &["/extra".into()], true);
+        assert_eq!(policy.approval_policy, CodexApprovalPolicy::OnRequest);
+        // Ask exposes ONLY the root as writable (out-of-root writes become prompts).
+        assert_eq!(policy.writable_roots, vec!["/root".to_string()]);
+        assert!(policy.network_access);
+    }
+
+    #[test]
+    fn codex_policy_auto_accept_includes_working_set() {
+        let policy = resolve_codex_thread_policy(
+            SandboxMode::AutoAcceptInWorkspace,
+            "/root",
+            &["/extra".into()],
+            true,
+        );
+        assert_eq!(policy.writable_roots, vec!["/root".to_string(), "/extra".to_string()]);
+    }
+
+    #[test]
+    fn codex_policy_unattended_is_never() {
+        let policy =
+            resolve_codex_thread_policy(SandboxMode::Unattended, "/root", &["/extra".into()], true);
+        assert_eq!(policy.approval_policy, CodexApprovalPolicy::Never);
+        assert_eq!(policy.writable_roots, vec!["/root".to_string(), "/extra".to_string()]);
+    }
+
+    #[test]
+    fn codex_policy_net_enabled_maps_network_access() {
+        let on = resolve_codex_thread_policy(SandboxMode::Ask, "/root", &[], true);
+        let off = resolve_codex_thread_policy(SandboxMode::Ask, "/root", &[], false);
+        assert!(on.network_access);
+        assert!(!off.network_access);
+    }
+
+    #[test]
+    fn codex_approval_policy_as_wire_is_camel_case() {
+        assert_eq!(CodexApprovalPolicy::OnRequest.as_wire(), "onRequest");
+        assert_eq!(CodexApprovalPolicy::UnlessTrusted.as_wire(), "unlessTrusted");
+        assert_eq!(CodexApprovalPolicy::Never.as_wire(), "never");
+    }
 
     // ── PermissionBrokerState one-shot grant ──────────────────────────────────
 
@@ -590,6 +847,7 @@ mod tests {
             agent_id: "agent-42".to_string(),
             detail: "cargo fetch failed".to_string(),
             path: None,
+            approval_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"projectId\""));
@@ -597,6 +855,33 @@ mod tests {
         assert!(json.contains("\"net\""));
         // Net request must NOT carry a path field (skip_serializing_if = None).
         assert!(!json.contains("\"path\""), "Net ConsentRequest must not serialize path");
+        // NO-CHURN (Slice 5.0): the local seatbelt path leaves approval_id None, so the
+        // wire JSON must NOT carry approvalId — byte-identical to Slices 0-3.
+        assert!(
+            !json.contains("\"approvalId\""),
+            "local ConsentRequest must not serialize approvalId"
+        );
+    }
+
+    /// Slice 5.0: a cloud-adapter ConsentRequest carries `approvalId` (the live-waiter
+    /// correlation key) and it serializes as camelCase. This is what tells the frontend
+    /// to answer via `respond_cloud_consent` instead of the fire-and-forget grant_* path.
+    #[test]
+    fn cloud_consent_request_serializes_approval_id_camel_case() {
+        let req = ConsentRequest {
+            kind: ConsentKind::Exec,
+            project_id: "proj-9".to_string(),
+            agent_id: "agent-cloud".to_string(),
+            detail: "cargo build".to_string(),
+            path: None,
+            approval_id: Some("agent-cloud:7".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"approvalId\":\"agent-cloud:7\""));
+        assert!(json.contains("\"exec\""));
+        let de: ConsentRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.approval_id.as_deref(), Some("agent-cloud:7"));
+        assert_eq!(de.kind, ConsentKind::Exec);
     }
 
     /// BLOCKER 1 regression test: FolderWrite ConsentRequest must carry `path` (the
@@ -614,6 +899,7 @@ mod tests {
                  \"{folder}\". Grant to allow writes there and retry."
             ),
             path: Some(folder.clone()),
+            approval_id: None,
         };
         // `path` must equal the raw folder path (machine-readable, passes is_absolute check).
         assert_eq!(req.path.as_deref(), Some("/private/tmp/my-folder"));

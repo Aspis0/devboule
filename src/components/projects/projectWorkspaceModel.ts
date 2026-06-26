@@ -427,18 +427,31 @@ export function cloneProjectCall(url: string, destParent?: string): IpcCall {
  *  custom client (validateCustomClient rejects the reserved ids), so an exact
  *  equality is the right and only safe test. Empty/absent client -> false. */
 export function shouldShowCompact(session: AgentSession): boolean {
-  return (session.client ?? "").trim().toLowerCase() === "claude";
+  // EXACT match (never substring): "claude" → its PTY `/compact` slash command;
+  // "codex" → the Codex app-server `thread/compact/start` JSON-RPC (Slice 5a), which
+  // only takes effect for a live duplex session (the backend command no-ops with a
+  // clear error for a non-duplex Codex session, so showing the button is safe).
+  const client = (session.client ?? "").trim().toLowerCase();
+  return client === "claude" || client === "codex";
 }
 
-/** MC-P7: the IPC call that runs `/compact` in the selected Claude agent's PTY.
- *  GATED: returns null unless `shouldShowCompact(session)` (resolved client is
- *  exactly "claude") — the caller renders no Compact button and fires no invoke
- *  otherwise. Reuses the EXISTING `agent_pty_write` write path (the same command
- *  the terminal reply bar uses): it writes `/compact\n` (the slash command plus a
- *  carriage return to submit it) to the agent's terminal. camelCase over IPC. No
- *  token/secret — the payload is a fixed literal. */
+/** MC-P7 + Slice 5a: the IPC call that compacts the selected agent's context.
+ *  GATED: returns null unless `shouldShowCompact(session)`.
+ *  - Claude: reuses the EXISTING `agent_pty_write` path — writes `/compact\n` (the
+ *    slash command + carriage return) to the agent's terminal.
+ *  - Codex: invokes `project_cloud_compact` which sends `thread/compact/start` over the
+ *    live app-server JSON-RPC stream (only meaningful for a duplex session; the backend
+ *    returns a clear error otherwise).
+ *  camelCase over IPC. No token/secret — fixed literals only. */
 export function compactWriteCall(session: AgentSession): IpcCall | null {
   if (!shouldShowCompact(session)) return null;
+  const client = (session.client ?? "").trim().toLowerCase();
+  if (client === "codex") {
+    return {
+      command: "project_cloud_compact",
+      args: { agentId: session.agentId },
+    };
+  }
   return {
     command: "agent_pty_write",
     args: { agentId: session.agentId, data: "/compact\n" },

@@ -8,6 +8,23 @@ edition = "2021"
 name = "aspis_management_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# The default GUI binary. Declared EXPLICITLY because adding the second `[[bin]]` below
+# disables Cargo's auto-discovery of `src/main.rs` — without this entry the app binary
+# would silently stop building.
+[[bin]]
+name = "aspis-management"
+path = "src/main.rs"
+
+# Slice 5b: the standalone Claude Code PreToolUse hook helper. A separate process (no
+# Tauri AppHandle) Claude spawns before each tool call; it bridges Patch/Exec tool calls
+# through the .aspis-agents.json consent file-bridge into the app's consent UI. The body
+# lives in the lib (`run_claude_consent_hook`) so it reuses the same file-lock +
+# serializer; this bin is a thin shim. Declared explicitly so it builds alongside the
+# default `aspis-management` GUI binary (src/main.rs).
+[[bin]]
+name = "claude_consent_hook"
+path = "src/bin/claude_consent_hook.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

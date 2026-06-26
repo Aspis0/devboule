@@ -5,7 +5,10 @@ import {
   grantNetConsentArgs,
   isConsentRequestForProject,
   isNetRequestForProject,
+  pendingConsentBridgeForProject,
+  respondCloudConsentArgs,
   sameConsentRequest,
+  type ConsentBridgeRequest,
   type ConsentDecision,
   type ConsentKind,
   type ConsentRequest,
@@ -443,5 +446,121 @@ describe("ConsentRequest.path — BLOCKER 1 contract", () => {
     // The guard: folder = req.path → undefined → throw "missing machine-readable path"
     const folder = req.path;
     expect(folder).toBeFalsy();
+  });
+});
+
+// ── Slice 5: cloud live-agent consent (Exec/Patch + approvalId) ────────────────
+
+function makeCloudRequest(over: Partial<ConsentRequest> = {}): ConsentRequest {
+  return {
+    kind: "exec",
+    projectId: "proj-1",
+    agentId: "cloud-agent-7",
+    detail: "cargo build --release",
+    approvalId: "cloud-agent-7:1",
+    ...over,
+  };
+}
+
+describe("respondCloudConsentArgs", () => {
+  it("builds camelCase approvalId + decision", () => {
+    const args = respondCloudConsentArgs({
+      approvalId: "cloud-agent-7:3",
+      decision: "allowOnce",
+    });
+    expect(args).toEqual({ approvalId: "cloud-agent-7:3", decision: "allowOnce" });
+  });
+
+  it("passes every decision verbatim", () => {
+    for (const d of ["allowRemember", "allowOnce", "deny"] as ConsentDecision[]) {
+      expect(respondCloudConsentArgs({ approvalId: "a:1", decision: d }).decision).toBe(d);
+    }
+  });
+});
+
+describe("sameConsentRequest with approvalId (Slice 5)", () => {
+  it("treats two cloud requests with DIFFERENT approvalId as distinct", () => {
+    const a = makeCloudRequest({ approvalId: "cloud-agent-7:1" });
+    const b = makeCloudRequest({ approvalId: "cloud-agent-7:2" });
+    // Same project+agent+kind but different live request → must NOT dedupe (would hang the agent).
+    expect(sameConsentRequest(a, b)).toBe(false);
+  });
+
+  it("treats two cloud requests with the SAME approvalId as identical", () => {
+    const a = makeCloudRequest({ approvalId: "cloud-agent-7:1" });
+    const b = makeCloudRequest({ approvalId: "cloud-agent-7:1" });
+    expect(sameConsentRequest(a, b)).toBe(true);
+  });
+
+  it("still dedupes local (no approvalId) net requests by project+agent+kind", () => {
+    const a = makeRequest();
+    const b = makeRequest();
+    expect(sameConsentRequest(a, b)).toBe(true);
+  });
+});
+
+describe("pendingConsentBridgeForProject (Slice 5b)", () => {
+  function bridge(over: Partial<ConsentBridgeRequest> = {}): ConsentBridgeRequest {
+    return {
+      id: "req-1",
+      agentId: "claude-1",
+      projectId: "proj-1",
+      kind: "exec",
+      detail: "rm -rf build",
+      status: "pending_approval",
+      createdAt: "2026-06-26T00:00:00Z",
+      ...over,
+    };
+  }
+
+  it("maps a pending entry to a ConsentRequest carrying the id as approvalId", () => {
+    const out = pendingConsentBridgeForProject([bridge({ id: "abc", path: "/p" })], "proj-1");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      kind: "exec",
+      projectId: "proj-1",
+      agentId: "claude-1",
+      approvalId: "abc",
+      path: "/p",
+    });
+  });
+
+  it("drops terminal (allowed/denied/timeout) entries", () => {
+    const out = pendingConsentBridgeForProject(
+      [
+        bridge({ id: "a", status: "allowed" }),
+        bridge({ id: "b", status: "denied" }),
+        bridge({ id: "c", status: "timeout" }),
+        bridge({ id: "d", status: "pending_approval" }),
+      ],
+      "proj-1",
+    );
+    expect(out.map((r) => r.approvalId)).toEqual(["d"]);
+  });
+
+  it("drops entries for other projects", () => {
+    const out = pendingConsentBridgeForProject([bridge({ projectId: "other" })], "proj-1");
+    expect(out).toHaveLength(0);
+  });
+});
+
+describe("enqueueConsent accepts exec/patch (Slice 5)", () => {
+  it("queues an exec request", () => {
+    const out = enqueueConsent([], makeCloudRequest({ kind: "exec" }));
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe("exec");
+  });
+
+  it("queues a patch request", () => {
+    const out = enqueueConsent([], makeCloudRequest({ kind: "patch", approvalId: "cloud-agent-7:9" }));
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe("patch");
+  });
+
+  it("keeps two distinct cloud exec requests (different approvalId) both queued", () => {
+    let list: ConsentRequest[] = [];
+    list = enqueueConsent(list, makeCloudRequest({ approvalId: "cloud-agent-7:1" }));
+    list = enqueueConsent(list, makeCloudRequest({ approvalId: "cloud-agent-7:2" }));
+    expect(list).toHaveLength(2);
   });
 });

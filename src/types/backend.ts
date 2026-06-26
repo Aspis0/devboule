@@ -776,6 +776,27 @@ export interface ProjectMetadata {
    * list is empty (NO-CHURN); treat `undefined` as `[]`.
    */
   workingSet?: string[];
+  /**
+   * Slice 5c: per-project default agent capability/cost controls for the cloud coders.
+   * Omitted by the backend when every field is unset (NO-CHURN); treat `undefined` as `{}`.
+   */
+  agentControls?: AgentControls;
+}
+
+/**
+ * Slice 5c: per-project (or per-launch) capability/cost controls for the cloud coding CLIs.
+ * All optional — absent means "leave the CLI default". The PERMISSION axis is `sandboxMode`,
+ * not here. Mirrors `AgentControls` in src-tauri/src/backend/model.rs.
+ */
+export interface AgentControls {
+  /** Reasoning effort. Claude low/medium/high/xhigh/max; Codex minimal…ultra. */
+  effort?: string;
+  /** Extra system-prompt text (Claude --append-system-prompt / Codex developerInstructions). */
+  systemPrompt?: string;
+  /** Max agent turns (Claude only). */
+  maxTurns?: number;
+  /** Max spend in USD (Claude only). */
+  maxBudgetUsd?: number;
 }
 
 export interface ProjectTaskCounts {

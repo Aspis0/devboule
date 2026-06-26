@@ -830,6 +830,7 @@ mod tests {
             design_request_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
         };
         clear_plan_needs_user(&mut state, "coder-1");
         assert!(state.sessions[0].needs_user.is_none());

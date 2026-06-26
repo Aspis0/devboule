@@ -1742,6 +1742,9 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                              this project. Grant to retry."
                         .to_string(),
                     path: None,
+                    // Local seatbelt path: answered by grant_net_consent, not the cloud
+                    // live-waiter. None keeps the wire JSON byte-identical (NO-CHURN).
+                    approval_id: None,
                 };
                 let _ = app.emit("sandbox://consent-request", req);
             } else {
@@ -1803,6 +1806,8 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                     // BLOCKER 1 fix: `path` carries the raw canonical folder so the
                     // frontend passes it (not the prose `detail`) to grant_folder_consent.
                     path: Some(folder.to_string()),
+                    // Local seatbelt path: answered by grant_folder_consent (NO-CHURN).
+                    approval_id: None,
                 };
                 let _ = app.emit("sandbox://consent-request", req);
             } else {
@@ -6155,6 +6160,7 @@ mod tests {
             design_request_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
         };
         // Absent parent -> gone.
         assert!(parent_is_gone(&state, "coder-1"));
@@ -6381,6 +6387,7 @@ mod tests {
             design_request_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
         };
         upsert_mini_session(
             &mut state,
@@ -7326,6 +7333,7 @@ mod tests {
             design_request_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
         }
     }
 

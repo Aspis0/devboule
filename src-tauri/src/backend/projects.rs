@@ -171,6 +171,7 @@ pub fn create_project(
         net_enabled: false,
         sandbox_mode: crate::backend::broker::SandboxMode::default(),
         working_set: Vec::new(),
+        agent_controls: Default::default(),
     };
     let state_block = ProjectStateBlock {
         version: 1,
@@ -1804,6 +1805,13 @@ fn prepare_or_launch_project_agent(
             &projects_path,
             &user_servers,
             &provider_env,
+            // Slice 5b: the per-project sandbox knobs drive the Claude --permission-mode +
+            // the generated settings (net deny + PreToolUse consent hook). Codex ignores them.
+            project.metadata.sandbox_mode,
+            project.metadata.net_enabled,
+            &agent_id,
+            &input.project_id,
+            &project.metadata.agent_controls,
         )
         .ok_or_else(|| "could not build the cloud duplex launch".to_string())?;
         let activity_file =
@@ -1813,6 +1821,27 @@ fn prepare_or_launch_project_agent(
                      Stage would be blank); aborting the launch".to_string()
                 })?;
         let sessions = app.state::<crate::backend::cloud_duplex::CloudDuplexSessions>();
+        // Slice 5a: for Codex, resolve the per-project sandbox knobs into the thread/start
+        // policy (approvalPolicy + sandbox). Codex runs in app-server mode where WE host the
+        // approval UI, so onRequest/never + writableRoots come from the project's sandbox_mode/
+        // working_set/net_enabled. Claude carries its policy via the generated settings (5b),
+        // so it passes None here.
+        let codex_policy = if provider == crate::backend::cloud_duplex::Provider::Codex {
+            let root_str = root_path.to_string_lossy().to_string();
+            let mut policy = crate::backend::broker::resolve_codex_thread_policy(
+                project.metadata.sandbox_mode,
+                &root_str,
+                &project.metadata.working_set,
+                project.metadata.net_enabled,
+            );
+            // Slice 5c: layer the per-project agent controls onto the sandbox policy.
+            policy.effort = project.metadata.agent_controls.effort.clone();
+            policy.developer_instructions =
+                project.metadata.agent_controls.system_prompt.clone();
+            Some(policy)
+        } else {
+            None
+        };
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
             &sessions,
@@ -1824,6 +1853,9 @@ fn prepare_or_launch_project_agent(
             &root_path,
             activity_file,
             input.initial_goal.as_deref(),
+            &input.project_id,
+            input.model.as_deref(),
+            codex_policy,
         )?;
         if let Err(record_err) =
             record_agent_launch(&app, &agent_id, &client, None, None, None, None, Some(HOST_APP))
@@ -2307,6 +2339,37 @@ pub fn set_project_sandbox_mode_cmd(
     set_project_sandbox_mode(&app, &project_id, mode)
 }
 
+/// Slice 5c: persist the per-project agent capability/cost controls (effort / system-prompt /
+/// turn+budget caps) via the same locked read-modify-write path (NO-CHURN omits the object when
+/// every field is unset). Permission mode is NOT here — that stays `sandbox_mode`.
+#[tauri::command]
+pub fn set_project_agent_controls_cmd(
+    project_id: String,
+    controls: crate::backend::model::AgentControls,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    let path = project_path_by_id(&app, &project_id)?;
+    // max-recall F12: sanitize at the backend boundary (independent of frontend validation).
+    // Cap the system prompt so it can never overflow the OS argv limit on launch, and drop
+    // non-positive turn/budget caps so a stored `Some(0)` never becomes `--max-turns 0`.
+    let mut controls = controls;
+    if let Some(sp) = controls.system_prompt.as_mut() {
+        const MAX_SYSTEM_PROMPT_CHARS: usize = 8000;
+        if sp.chars().count() > MAX_SYSTEM_PROMPT_CHARS {
+            *sp = sp.chars().take(MAX_SYSTEM_PROMPT_CHARS).collect();
+        }
+    }
+    controls.max_turns = controls.max_turns.filter(|&n| n > 0);
+    controls.max_budget_usd = controls.max_budget_usd.filter(|&b| b > 0.0 && b.is_finite());
+    mutate_project_file_latest(&path, |project| {
+        project.metadata.agent_controls = controls.clone();
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 /// Tauri command: apply a consent decision from the frontend net-block modal.
 ///
 /// - `AllowRemember` → persists `net_enabled = true` (survives restart).
@@ -2338,6 +2401,85 @@ pub fn grant_net_consent(
     // TODO(slice0): trigger retry on grant — reuse build_retry_directive path so the
     // directive is re-spawned immediately without waiting for the next executor pass.
     Ok(())
+}
+
+/// SANDBOX broker Slice 5: answer a LIVE cloud-agent consent request.
+///
+/// Unlike `grant_net_consent`/`grant_folder_consent` (fire-and-forget: they persist a
+/// grant for the *next* spawn), a cloud agent is blocked RIGHT NOW on a synchronous
+/// permission request, so the decision must round-trip back to it immediately. The
+/// frontend calls this (instead of the grant_* commands) whenever the `ConsentRequest`
+/// carries an `approvalId`.
+///
+/// Dispatch:
+///   1. Codex live-waiter (in-memory): `CloudConsentState::resolve` delivers the decision
+///      to the blocked driver thread, which writes the JSON-RPC approval result.
+///   2. (Slice 5b) Claude file-bridge fallback — the hook is a separate process polling
+///      `.aspis-agents.json`; the decision is stamped there. Added in 5b before the Err.
+#[tauri::command]
+pub fn respond_cloud_consent(
+    app: tauri::AppHandle,
+    approval_id: String,
+    decision: crate::backend::broker::ConsentDecision,
+    backend_state: State<'_, BackendState>,
+    cloud_consent: State<'_, crate::backend::broker::CloudConsentState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    // 1) IN-MEMORY first (Codex live-waiter). For Codex the approval_id is
+    //    "<agent_id>:<session_nonce>:<id_str>" (the nonce makes it unique across relaunches);
+    //    for Claude it is the BARE consent-request id. We pass the FULL string verbatim to both
+    //    paths — a Codex id never matches a file-bridge id and vice-versa, so trying both is
+    //    unambiguous and order-independent.
+    if cloud_consent.resolve(&approval_id, decision.clone()) {
+        return Ok(());
+    }
+
+    // 2) FILE-BRIDGE fallback (Slice 5b — Claude hook). Claim the matching
+    //    `consentRequests` entry terminal under the lock. AllowRemember/AllowOnce →
+    //    Allowed; Deny → Denied. `claim_terminal` only transitions a still-pending
+    //    request, so a double-click or a race with the hook's timeout no-ops cleanly.
+    //    On a successful claim, clear the requesting session's needs_user bell.
+    use crate::backend::broker::ConsentDecision;
+    use crate::backend::consent_bridge::{claim_terminal, ConsentBridgeStatus};
+    let target_status = match decision {
+        ConsentDecision::AllowRemember | ConsentDecision::AllowOnce => {
+            ConsentBridgeStatus::Allowed
+        }
+        ConsentDecision::Deny => ConsentBridgeStatus::Denied,
+    };
+    // 0 = no such request (genuinely unknown id), 1 = found-but-already-terminal,
+    // 2 = freshly claimed. Both 1 and 2 are SUCCESS for the caller: the request reached a
+    // terminal verdict either way, so the UI must NOT surface an error (5b reviewer F8/F9 —
+    // an already-expired request answered late is not a failure).
+    let outcome = super::agents::mutate_agent_live_state(&app, |live| {
+        let Some(req) = live
+            .consent_requests
+            .iter_mut()
+            .find(|r| r.id == approval_id)
+        else {
+            return 0u8;
+        };
+        if !claim_terminal(req, target_status) {
+            // Already terminal (double-act / hook already timed it out) — leave the recorded
+            // verdict intact and report success (no spurious error string in the UI).
+            return 1u8;
+        }
+        let agent_id = req.agent_id.clone();
+        if !agent_id.is_empty() {
+            if let Some(session) = live.sessions.iter_mut().find(|s| s.agent_id == agent_id) {
+                session.needs_user = None;
+            }
+        }
+        2u8
+    })?;
+
+    if outcome > 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "no pending cloud consent matched approval_id: {approval_id}"
+        ))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2710,6 +2852,15 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                 .or_else(|| fields.get("workingSet"))
                 .and_then(|value| serde_json::from_str(value.trim()).ok())
                 .unwrap_or_default();
+            // Slice 5c: read agent_controls — a compact JSON object on a single frontmatter line,
+            // e.g. `agent_controls: {"effort":"high"}`. Missing key → default (NO-CHURN: a project
+            // written before this feature has no key). An unparseable value degrades to default
+            // (same tolerant posture as working_set), never erroring the whole parse.
+            let agent_controls: crate::backend::model::AgentControls = fields
+                .get("agent_controls")
+                .or_else(|| fields.get("agentControls"))
+                .and_then(|value| serde_json::from_str(value.trim()).ok())
+                .unwrap_or_default();
             return Ok((
                 ProjectMetadata {
                     id,
@@ -2721,6 +2872,7 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     net_enabled,
                     sandbox_mode,
                     working_set,
+                    agent_controls,
                 },
                 offset,
             ));
@@ -2854,7 +3006,7 @@ fn write_project_file(project: &ParsedProject) -> Result<(), String> {
 fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<String, String> {
     let (_, end) = parse_frontmatter(content, Path::new("project.md"))?;
     let frontmatter = format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}---\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}{}---\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2868,6 +3020,7 @@ fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<Stri
         net_enabled_frontmatter_line(metadata.net_enabled),
         sandbox_mode_frontmatter_line(metadata.sandbox_mode),
         working_set_frontmatter_line(&metadata.working_set),
+        agent_controls_frontmatter_line(&metadata.agent_controls),
     );
     Ok(format!("{frontmatter}{}", &content[end..]))
 }
@@ -2922,12 +3075,24 @@ fn working_set_frontmatter_line(folders: &[String]) -> String {
     format!("working_set: {json}\n")
 }
 
+/// Slice 5c NO-CHURN: emit `agent_controls: {...}` ONLY when at least one control is set.
+/// The value is a compact JSON object on ONE line (serde escapes any `:`/`"`/newline inside
+/// `systemPrompt`, so it parses back cleanly via `serde_json::from_str` and never breaks the
+/// single-line frontmatter). An all-unset AgentControls emits nothing — byte-stable on disk.
+fn agent_controls_frontmatter_line(controls: &crate::backend::model::AgentControls) -> String {
+    if controls.is_default() {
+        return String::new();
+    }
+    let json = serde_json::to_string(controls).unwrap_or_else(|_| "{}".to_string());
+    format!("agent_controls: {json}\n")
+}
+
 fn initial_project_markdown(
     metadata: &ProjectMetadata,
     state: &ProjectStateBlock,
 ) -> Result<String, String> {
     Ok(format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2941,6 +3106,7 @@ fn initial_project_markdown(
         net_enabled_frontmatter_line(metadata.net_enabled),
         sandbox_mode_frontmatter_line(metadata.sandbox_mode),
         working_set_frontmatter_line(&metadata.working_set),
+        agent_controls_frontmatter_line(&metadata.agent_controls),
         serde_json::to_string_pretty(state)
             .map_err(|e| format!("Project state could not be serialized: {e}"))?
     ))
@@ -5700,6 +5866,19 @@ fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Pat
 /// path. Claude runs `--input/--output-format stream-json` in `--permission-mode plan` (read-only
 /// planning; writes prompt for native approval — the owner's policy); Codex runs `app-server`.
 /// ⚠️ The exact Codex app-server argv/handshake + Claude flag set need e2e validation.
+/// Slice 5b: map the per-project `SandboxMode` to Claude's `--permission-mode` value.
+/// Ask → `default` (Claude asks; our PreToolUse hook routes the ask into our UI),
+/// AutoAcceptInWorkspace → `acceptEdits` (in-workspace edits auto-accepted by Claude),
+/// Unattended → `bypassPermissions` (no Claude prompt; the hook still answers `deny`
+/// without prompting, fail-closed). Pure + testable.
+fn claude_permission_mode(mode: crate::backend::broker::SandboxMode) -> &'static str {
+    match mode {
+        crate::backend::broker::SandboxMode::Ask => "default",
+        crate::backend::broker::SandboxMode::AutoAcceptInWorkspace => "acceptEdits",
+        crate::backend::broker::SandboxMode::Unattended => "bypassPermissions",
+    }
+}
+
 fn build_cloud_duplex_launch(
     client: &str,
     model: Option<&str>,
@@ -5707,6 +5886,19 @@ fn build_cloud_duplex_launch(
     projects_dir: &Path,
     user_servers: &[user_mcp_config::UserMcpServer],
     provider_env: &[AgentLaunchEnv],
+    // Slice 5b: the per-project sandbox knobs. For Claude they drive `--permission-mode`
+    // + the generated settings.json (net deny rules + PreToolUse consent hook). Codex
+    // ignores them here (its policy rides the thread/start handshake — Slice 5a).
+    mode: crate::backend::broker::SandboxMode,
+    net_enabled: bool,
+    // Slice 5b: the requesting agent id, injected as ASPIS_CONSENT_AGENT_ID so the hook
+    // can attribute its consent request + light the right session's bell.
+    agent_id: &str,
+    // Slice 5b: the project id, injected as ASPIS_CONSENT_PROJECT_ID for card scoping.
+    project_id: &str,
+    // Slice 5c: per-project agent capability/cost controls → native CLI flags (Claude) /
+    // thread/start fields (Codex).
+    controls: &crate::backend::model::AgentControls,
 ) -> Option<(String, Vec<String>, Vec<(String, String)>)> {
     let provider = crate::backend::cloud_duplex::Provider::from_client(client)?;
     let python = crate::oracle::oracle_setup::resolve_oracle_python();
@@ -5716,6 +5908,79 @@ fn build_cloud_duplex_launch(
     let mut args: Vec<String> = Vec::new();
     let program = match provider {
         crate::backend::cloud_duplex::Provider::Claude => {
+            // Slice 5b: locate the sibling `claude_consent_hook` binary (next to the app
+            // binary). When resolvable, register it as a PreToolUse hook via --settings so
+            // every Patch/Exec tool call round-trips through OUR consent UI. If it cannot
+            // be resolved, we FALL BACK to omitting --settings (the launch still works,
+            // just without the consent hook) and log a milestone — never block the launch.
+            let hook_bin = resolve_app_binary().map(|mut p| {
+                p.set_file_name(if cfg!(windows) {
+                    "claude_consent_hook.exe"
+                } else {
+                    "claude_consent_hook"
+                });
+                p
+            });
+            let hook_path: Option<String> = hook_bin
+                .as_ref()
+                .filter(|p| p.is_file())
+                .map(|p| p.to_string_lossy().into_owned());
+            if hook_path.is_none() {
+                eprintln!(
+                    "cloud claude: claude_consent_hook binary not found next to the app binary; \
+                     launching Claude WITHOUT the PreToolUse consent hook (net deny rules still \
+                     applied; tool edits are not gated, so the permission mode stays 'default')."
+                );
+            }
+            // Build the settings (with the hook when available, deny-only — net rules only —
+            // when not: max-recall F11). hook timeout 600s must exceed the hook's own poll cap.
+            let settings = crate::backend::cloud_claude_config::build_claude_settings(
+                mode,
+                net_enabled,
+                hook_path.as_deref(),
+                600,
+            );
+            let settings_json = serde_json::to_string(&settings).unwrap_or_default();
+            // max-recall A: write the settings to a FILE and pass the PATH to --settings (the
+            // canonical settings.json form) instead of inline JSON, which is unverified and may
+            // be silently ignored by the CLI. Skip entirely when there is nothing to configure
+            // (net enabled + no hook → `{}`). Written to the OS temp dir (auto-reaped; mirrors
+            // `write_session_gitconfig`), overwritten per launch.
+            //
+            // adversarial-verify A2 (path traversal): `agent_id` is a frontend-supplied IPC arg,
+            // so it MUST be sanitized before it touches a filesystem path — any `/`, `\` or `..`
+            // is mapped to `_` so a crafted agent_id can never escape the temp dir.
+            let settings_path: Option<String> = if settings_json == "{}" {
+                None
+            } else {
+                let safe_agent: String = agent_id
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .collect();
+                let file = std::env::temp_dir()
+                    .join(format!("aspis-claude-settings-{safe_agent}.json"));
+                match std::fs::write(&file, &settings_json) {
+                    Ok(()) => Some(file.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        eprintln!(
+                            "cloud claude: could not write the settings file ({e}); launching \
+                             without --settings."
+                        );
+                        None
+                    }
+                }
+            };
+            // SECURITY (5b F1 + max-recall): only widen the permission mode (acceptEdits /
+            // bypassPermissions) when the consent hook is ACTUALLY registered — i.e. the hook
+            // binary exists AND its settings file was written. Otherwise nothing gates tool
+            // edits, so we MUST stay on `default` (Claude prompts interactively) and never run
+            // an Unattended project unrestricted.
+            let hook_active = hook_path.is_some() && settings_path.is_some();
+            let perm_mode = if hook_active {
+                claude_permission_mode(mode)
+            } else {
+                "default"
+            };
             for a in [
                 "-p",
                 "--input-format",
@@ -5725,15 +5990,44 @@ fn build_cloud_duplex_launch(
                 "--include-partial-messages",
                 "--verbose",
                 "--permission-mode",
-                "plan",
+                perm_mode,
                 "--mcp-config",
             ] {
                 args.push(a.to_string());
             }
             args.push(mcp);
+            // --settings <path> AFTER --mcp-config (per the plan's argv order).
+            if let Some(path) = settings_path {
+                args.push("--settings".to_string());
+                args.push(path);
+            }
             if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
                 args.push("--model".to_string());
                 args.push(m.to_string());
+            }
+            // Slice 5c: per-project agent controls → Claude native flags.
+            if let Some(effort) = controls.effort.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                args.push("--effort".to_string());
+                args.push(effort.to_string());
+            }
+            if let Some(sp) = controls
+                .system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args.push("--append-system-prompt".to_string());
+                args.push(sp.to_string());
+            }
+            // 5c reviewer W2: guard > 0 at the emission layer (independent of frontend
+            // validation) so a stored `Some(0)` never becomes `--max-turns 0` ("zero turns").
+            if let Some(n) = controls.max_turns.filter(|&n| n > 0) {
+                args.push("--max-turns".to_string());
+                args.push(n.to_string());
+            }
+            if let Some(b) = controls.max_budget_usd.filter(|&b| b > 0.0 && b.is_finite()) {
+                args.push("--max-budget-usd".to_string());
+                args.push(b.to_string());
             }
             "claude"
         }
@@ -5765,6 +6059,24 @@ fn build_cloud_duplex_launch(
             "GIT_CONFIG_GLOBAL".to_string(),
             session_gitconfig.to_string_lossy().into_owned(),
         ));
+    }
+    // Slice 5b: the consent file-bridge context the Claude PreToolUse hook reads. Only
+    // meaningful for Claude (Codex hosts approvals in-process via the app-server stream),
+    // so we gate it to the Claude provider to keep the Codex launch env byte-identical.
+    if provider == crate::backend::cloud_duplex::Provider::Claude {
+        envs.push((
+            "ASPIS_CONSENT_BRIDGE".to_string(),
+            projects_dir.to_string_lossy().into_owned(),
+        ));
+        envs.push(("ASPIS_CONSENT_AGENT_ID".to_string(), agent_id.to_string()));
+        envs.push((
+            "ASPIS_CONSENT_PROJECT_ID".to_string(),
+            project_id.to_string(),
+        ));
+        // 5b reviewer F5: actually inject the hook's poll-cap (it reads this env, defaulting
+        // to 300s). Kept strictly BELOW the settings hook `timeout` (600s) so the CLI never
+        // kills the hook before its own poll deadline.
+        envs.push(("ASPIS_CONSENT_TIMEOUT_SECS".to_string(), "300".to_string()));
     }
     Some((program.to_string(), args, envs))
 }
@@ -7268,6 +7580,22 @@ pub fn git_push_requests_list(
     })
 }
 
+/// Slice 5b: list the Claude consent file-bridge requests (read-only snapshot). The frontend
+/// polls this, enqueues any `pending_approval` entry into the SAME consent modal used by the
+/// local seatbelt + Codex paths, and answers via `respond_cloud_consent` (which stamps the
+/// verdict back into the file-bridge so the blocked hook process unblocks). No stuck-sweep is
+/// needed: the hook owns its own bounded-poll timeout, and a terminal entry is simply filtered
+/// out client-side.
+#[tauri::command]
+pub fn consent_requests_list(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+) -> Result<Vec<crate::backend::consent_bridge::ConsentBridgeRequest>, String> {
+    state.ensure_unlocked()?;
+    let snapshot = super::agents::read_agent_live_state_snapshot(&app)?;
+    Ok(snapshot.consent_requests)
+}
+
 /// GH-P4: clear the requesting agent session's `needs_user` bell. Called on EVERY
 /// terminal path of a push request (approved-pushed, approved-push-failed, denied)
 /// so the bell never lingers after the human acted. A missing session is a no-op.
@@ -8323,6 +8651,22 @@ mod tests {
         assert!(!command_exists("aspis-definitely-not-a-real-binary-xyz"));
     }
 
+    // --- Slice 5b: Claude permission-mode mapping ----------------------------
+
+    #[test]
+    fn claude_permission_mode_maps_each_sandbox_mode() {
+        use crate::backend::broker::SandboxMode;
+        assert_eq!(claude_permission_mode(SandboxMode::Ask), "default");
+        assert_eq!(
+            claude_permission_mode(SandboxMode::AutoAcceptInWorkspace),
+            "acceptEdits"
+        );
+        assert_eq!(
+            claude_permission_mode(SandboxMode::Unattended),
+            "bypassPermissions"
+        );
+    }
+
     // --- Work-mode commit/push (Phase D) argument-safety + validation ---------
 
     #[test]
@@ -9235,6 +9579,7 @@ mod tests {
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let serialized = replace_frontmatter(old, &trusted).unwrap();
         assert!(serialized.contains("censor_trusted: true"));
@@ -9244,6 +9589,7 @@ mod tests {
         // Serializing an UNTRUSTED project (default) must NOT inject the key.
         let untrusted = ProjectMetadata {
             censor_trusted: false,
+            agent_controls: Default::default(),
             ..trusted
         };
         let serialized_off = replace_frontmatter(old, &untrusted).unwrap();
@@ -9268,6 +9614,7 @@ mod tests {
             net_enabled: true,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let serialized = replace_frontmatter(old, &enabled).unwrap();
         assert!(serialized.contains("net_enabled: true"));
@@ -9277,6 +9624,7 @@ mod tests {
         // Serializing a net-DISABLED project (default) must NOT inject the key (NO-CHURN).
         let disabled = ProjectMetadata {
             net_enabled: false,
+            agent_controls: Default::default(),
             ..enabled
         };
         let serialized_off = replace_frontmatter(old, &disabled).unwrap();
@@ -9312,6 +9660,7 @@ mod tests {
             net_enabled: false,
             sandbox_mode: SandboxMode::Ask,
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let serialized_ask = replace_frontmatter(old, &ask_meta).unwrap();
         assert!(
@@ -9322,6 +9671,7 @@ mod tests {
         // Serializing AutoAcceptInWorkspace emits the key; re-parsing reads it back.
         let auto_meta = ProjectMetadata {
             sandbox_mode: SandboxMode::AutoAcceptInWorkspace,
+            agent_controls: Default::default(),
             ..ask_meta
         };
         let serialized_auto = replace_frontmatter(old, &auto_meta).unwrap();
@@ -9340,6 +9690,7 @@ mod tests {
         // Serializing Unattended emits the key; re-parsing reads it back.
         let unattended_meta = ProjectMetadata {
             sandbox_mode: SandboxMode::Unattended,
+            agent_controls: Default::default(),
             ..reparsed_auto
         };
         let serialized_unattended = replace_frontmatter(&serialized_auto, &unattended_meta).unwrap();
@@ -9414,6 +9765,7 @@ mod tests {
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -9510,6 +9862,7 @@ updated_at: 2026-05-28T00:00:00Z
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -10020,6 +10373,93 @@ updated_at: 2026-05-28T00:00:00Z
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ── Slice 5c: agent_controls NO-CHURN + frontmatter round-trip ────────────
+
+    /// `agent_controls` absent (NO-CHURN) when default; missing key → default on parse.
+    #[test]
+    fn agent_controls_no_churn_omitted_and_missing_parses_as_default() {
+        let (root, path) = write_temp_project("agent-controls-churn");
+        let initial = read_project_file(&path).unwrap();
+        assert!(
+            initial.metadata.agent_controls.is_default(),
+            "fresh project must have default agent_controls"
+        );
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !disk.contains("agent_controls"),
+            "NO-CHURN: default agent_controls must not be serialized to disk"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `agent_controls` persists through the locked write (this is the exact path the
+    /// `set_project_agent_controls_cmd` uses) and the key appears/disappears correctly.
+    /// Regression guard for the frontmatter read/write wiring.
+    #[test]
+    fn agent_controls_persists_through_locked_write_and_clears_no_churn() {
+        let (root, path) = write_temp_project("agent-controls-rw");
+
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.agent_controls = crate::backend::model::AgentControls {
+                effort: Some("high".to_string()),
+                system_prompt: Some("be terse".to_string()),
+                max_turns: Some(7),
+                max_budget_usd: None,
+            };
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+
+        let after_set = read_project_file(&path).unwrap();
+        assert_eq!(after_set.metadata.agent_controls.effort.as_deref(), Some("high"));
+        assert_eq!(
+            after_set.metadata.agent_controls.system_prompt.as_deref(),
+            Some("be terse")
+        );
+        assert_eq!(after_set.metadata.agent_controls.max_turns, Some(7));
+        assert_eq!(after_set.metadata.agent_controls.max_budget_usd, None);
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            disk.contains("agent_controls"),
+            "a non-default agent_controls MUST be serialized to disk (regression: it was dropped)"
+        );
+
+        // Clear it — key must vanish (NO-CHURN).
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.agent_controls = Default::default();
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        let after_clear = read_project_file(&path).unwrap();
+        assert!(after_clear.metadata.agent_controls.is_default());
+        let disk_after = fs::read_to_string(&path).unwrap();
+        assert!(
+            !disk_after.contains("agent_controls"),
+            "default agent_controls must NOT leave a key on disk (NO-CHURN)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A system_prompt with colons / quotes / newlines stays on ONE frontmatter line and
+    /// round-trips intact (serde escapes them inside the compact JSON value).
+    #[test]
+    fn agent_controls_system_prompt_with_special_chars_roundtrips() {
+        let (root, path) = write_temp_project("agent-controls-special");
+        let tricky = "line1: value\n\"quoted\"\n---not-a-fence";
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.agent_controls.system_prompt = Some(tricky.to_string());
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        let after = read_project_file(&path).unwrap();
+        assert_eq!(after.metadata.agent_controls.system_prompt.as_deref(), Some(tricky));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Multiple folders round-trip preserving order and content.
     #[test]
     fn working_set_multiple_folders_roundtrip() {
@@ -10486,6 +10926,7 @@ updated_at: 2026-05-28T00:00:00Z
                 net_enabled: false,
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
                 working_set: Vec::new(),
+                agent_controls: Default::default(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -10965,6 +11406,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 net_enabled: false,
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
                 working_set: Vec::new(),
+                agent_controls: Default::default(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -13437,6 +13879,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 net_enabled: false,
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
                 working_set: Vec::new(),
+                agent_controls: Default::default(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -13792,6 +14235,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -13981,6 +14425,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -14462,6 +14907,7 @@ mod broker_gate_projects {
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
+            agent_controls: Default::default(),
         };
         let state = ProjectStateBlock {
             version: 1,

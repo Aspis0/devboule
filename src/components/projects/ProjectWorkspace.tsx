@@ -53,6 +53,7 @@ import type { CustomAgentClient } from "../../types/config";
 import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { CensorPanel } from "./CensorPanel";
+import { AgentControlsCard } from "./AgentControlsCard";
 import { SandboxModeSelector } from "./SandboxModeSelector";
 import { WorkingSetCard } from "./WorkingSetCard";
 import { FocusStagePane } from "../work/FocusStagePane";
@@ -68,6 +69,7 @@ import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
 import { CensorFindingsTracker } from "./censorPanelModel";
+import { AgentConsentModal } from "./AgentConsentModal";
 import { FolderConsentModal } from "./FolderConsentModal";
 import { NetConsentModal } from "./NetConsentModal";
 import {
@@ -75,9 +77,12 @@ import {
   grantFolderConsentArgs,
   grantNetConsentArgs,
   isConsentRequestForProject,
+  respondCloudConsentArgs,
   sameConsentRequest,
+  type ConsentKind,
   type ConsentRequest,
 } from "./netConsentModel";
+import { ConsentBridgePoller } from "./ConsentBridgePoller";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { PlansDockTab } from "./PlansPanel";
 import { PushApprovalCard } from "./PushApprovalCard";
@@ -101,6 +106,16 @@ import {
 import { TokenUsageBadge } from "../agents/TokenUsageBadge";
 import { useAgentTokenUsage } from "../agents/useAgentTokenUsage";
 import type { AgentTokenUsage } from "../../types/backend";
+
+// Consent kinds the workspace can render (modal switch) AND route a decision for
+// (handleConsentDecision). Any kind outside this set is dropped at the listener so it
+// can never fall through to the NetConsentModal default and misroute to grant_net_consent.
+const HANDLED_CONSENT_KINDS = new Set<ConsentKind>([
+  "net",
+  "folderWrite",
+  "exec",
+  "patch",
+]);
 
 // Stable empty set so the Living Plan's dirty highlight doesn't churn identity (and force
 // a re-render) on every poll when the Censor is clean.
@@ -493,6 +508,15 @@ export function ProjectWorkspace({
   const [consentBusy, setConsentBusy] = useState(false);
   const [consentError, setConsentError] = useState<string | null>(null);
   const consentMountedRef = useRef(true);
+  // max-recall: a SYNCHRONOUS busy guard. `consentBusy` is React state and commits a tick
+  // late, so a rapid double-tap can fire two decisions before it flips — delivering the same
+  // decision twice to respond_cloud_consent. The ref flips synchronously, closing that race.
+  const consentBusyRef = useRef(false);
+  // 5b reviewer F3: ids of cloud consent requests we have already answered. The 4s
+  // file-bridge poll can carry a STALE `pending_approval` snapshot (captured before the
+  // backend stamped the verdict) and would otherwise RE-ENQUEUE an already-decided request,
+  // flashing a dead modal. We skip any id recorded here. Reset on project change.
+  const decidedConsentIdsRef = useRef<Set<string>>(new Set());
   // Mark unmounted so the handleConsentDecision async callback doesn't write state
   // after the component has been torn down. Runs only once on component unmount.
   // FIX 4: The current safety depends on the parent's key={projectId} triggering
@@ -526,13 +550,15 @@ export function ProjectWorkspace({
         (event) => {
           if (cancelled) return;
           const req = event.payload;
-          // Accept both Net and FolderWrite (Slice 2) for the current project.
-          // Requests for other projects or unhandled kinds are silently ignored.
+          // Accept the kinds the UI can actually render+route for the current project:
+          // Net/FolderWrite (local seatbelt, Slices 0-2) and Exec/Patch (live cloud agents,
+          // Slice 5). Requests for other projects — or any FUTURE/unknown kind the modal
+          // switch and handleConsentDecision don't handle — are dropped, so an unhandled
+          // kind can never fall through and misroute to grant_net_consent.
           if (!isConsentRequestForProject(req, project.metadata.id)) return;
-          // Only handle kinds the UI knows about; unrecognised kinds are silently dropped.
-          if (req.kind !== "net" && req.kind !== "folderWrite") return;
-          // FIX 1: append to FIFO queue, deduping by (projectId, agentId) so
-          // a duplicate event doesn't double-enqueue the same request.
+          if (!HANDLED_CONSENT_KINDS.has(req.kind)) return;
+          // FIX 1: append to FIFO queue, deduping by identity (see sameConsentRequest;
+          // cloud requests dedupe on approvalId) so a duplicate event doesn't double-enqueue.
           setPendingConsents((prev) => enqueueConsent(prev, req));
           setConsentError(null);
         },
@@ -549,17 +575,53 @@ export function ProjectWorkspace({
     };
   }, [project.metadata.id]);
 
+  // Slice 5b: the Claude consent file-bridge has no push event — the `claude_consent_hook`
+  // process writes a `pending_approval` entry into `.aspis-agents.json` and bounded-polls it.
+  // Poll `consent_requests_list` and enqueue any pending entry into the SAME FIFO the event
+  // listener feeds (dedupe by approvalId is handled in enqueueConsent), so Claude's Exec/Patch
+  // approvals render in the identical AgentConsentModal and answer via respond_cloud_consent.
+  // New project context → forget the previously-decided ids (the queue is per-project).
+  useEffect(() => {
+    decidedConsentIdsRef.current.clear();
+  }, [project.metadata.id]);
+
+  // Receives the pending Claude file-bridge requests from <ConsentBridgePoller> and enqueues
+  // them into the SAME FIFO the event listener feeds. F3: drop anything we already answered —
+  // a stale in-flight poll snapshot must not resurrect a decided request after the pop.
+  const handleBridgePending = useCallback((pending: ConsentRequest[]) => {
+    const decided = decidedConsentIdsRef.current;
+    const fresh = pending.filter((req) => !(req.approvalId && decided.has(req.approvalId)));
+    if (fresh.length > 0) {
+      setPendingConsents((prev) =>
+        fresh.reduce((acc, req) => enqueueConsent(acc, req), prev),
+      );
+    }
+  }, []);
+
   const handleConsentDecision = useCallback(
     async (decision: "allowRemember" | "allowOnce" | "deny") => {
       // FIX 1: operate on the HEAD of the FIFO queue
       const head = pendingConsents[0];
-      if (!head || consentBusy) return;
+      if (!head || consentBusyRef.current) return;
+      consentBusyRef.current = true;
       setConsentBusy(true);
       setConsentError(null);
       try {
-        // Branch by kind: Net → grant_net_consent, FolderWrite → grant_folder_consent.
-        // Both share the same ConsentDecision enum and the same mounted-ref / FIFO logic.
-        if (head.kind === "folderWrite") {
+        // Slice 5: LIVE cloud-agent requests carry an approvalId — the decision must
+        // round-trip back to the blocked Claude/Codex agent via respond_cloud_consent,
+        // NOT the fire-and-forget grant_* commands (which only persist for the next spawn).
+        // Truthy check (not `!== undefined`) so a malformed empty-string id doesn't route.
+        if (head.approvalId) {
+          // F3: record the id as decided BEFORE the await so a poll that fires mid-flight
+          // (and reads a stale pending snapshot) cannot re-enqueue this request afterwards.
+          decidedConsentIdsRef.current.add(head.approvalId);
+          await invokeBackendCommand<void>(
+            "respond_cloud_consent",
+            respondCloudConsentArgs({ approvalId: head.approvalId, decision }),
+          );
+        } else if (head.kind === "folderWrite") {
+          // Branch by kind: Net → grant_net_consent, FolderWrite → grant_folder_consent.
+          // Both share the same ConsentDecision enum and the same mounted-ref / FIFO logic.
           // BLOCKER 1 fix: use head.path (the machine-readable canonical folder), NOT
           // head.detail (human-readable prose). head.detail is rejected by the backend's
           // normalize_working_set_folder (!is_absolute) → AllowOnce/AllowRemember fail.
@@ -579,11 +641,18 @@ export function ProjectWorkspace({
               decision,
             }),
           );
-        } else {
-          // Default: treat as Net (the only other handled kind).
+        } else if (head.kind === "net") {
           await invokeBackendCommand<void>(
             "grant_net_consent",
             grantNetConsentArgs({ projectId: head.projectId, decision }),
+          );
+        } else {
+          // exec/patch without an approvalId, or any other kind, is malformed: it must
+          // NOT silently fall through to grant_net_consent (which would grant network for
+          // an unrelated request). Surface it instead of misrouting.
+          throw new Error(
+            `Cannot route a "${head.kind}" consent request without an approvalId. ` +
+              "This is a backend bug — please report it.",
           );
         }
         if (consentMountedRef.current) {
@@ -603,8 +672,17 @@ export function ProjectWorkspace({
         if (consentMountedRef.current) {
           // FIX 2: Tauri rejects with a string, not an Error — use String(e)
           setConsentError(e instanceof Error ? e.message : String(e));
+          // Slice 5: a cloud request that errors means the live waiter is GONE (the agent
+          // timed out / the session ended) — retrying always fails with the same error and
+          // there is no on-disk grant to fall back on. Pop the head so the modal can't get
+          // permanently stuck. Local net/folder errors are left queued (retry is valid there).
+          if (head.approvalId) {
+            setPendingConsents((prev) => prev.filter((r) => !sameConsentRequest(r, head)));
+          }
         }
       } finally {
+        // Always clear the synchronous guard (even when unmounted) so a remount isn't wedged.
+        consentBusyRef.current = false;
         // FIX 3: reset busy in finally so it clears even when unmounted mid-invoke
         if (consentMountedRef.current) {
           setConsentBusy(false);
@@ -775,6 +853,15 @@ export function ProjectWorkspace({
           Hidden when archived (read-only): an archived project has no live agents to
           push, and approving a push is a mutation — gate it defensively by hiding. */}
       {!readOnly && <PushApprovalCard projectId={project.metadata.id} />}
+      {/* Slice 5b: renderless poller that surfaces Claude file-bridge consent requests into
+          the shared consent modal (kept out of this component to preserve the no-self-poller
+          invariant). */}
+      {!readOnly && (
+        <ConsentBridgePoller
+          projectId={project.metadata.id}
+          onPending={handleBridgePending}
+        />
+      )}
 
       {/* Plan approval gate — surfaces pending plan-approval requests for the current
           project. Rendered beside the push card; always visible when pending requests
@@ -791,6 +878,17 @@ export function ProjectWorkspace({
         const head = pendingConsents[0];
         const decisionHandler = (d: "allowRemember" | "allowOnce" | "deny") =>
           void handleConsentDecision(d);
+        // Slice 5: Exec/Patch from a live cloud agent (Claude/Codex) → generic card.
+        if (head.kind === "exec" || head.kind === "patch") {
+          return (
+            <AgentConsentModal
+              request={head}
+              busy={consentBusy}
+              error={consentError}
+              onDecision={decisionHandler}
+            />
+          );
+        }
         if (head.kind === "folderWrite") {
           return (
             <FolderConsentModal
@@ -1097,6 +1195,13 @@ export function ProjectWorkspace({
                   projectId={project.metadata.id}
                   workingSet={project.metadata.workingSet}
                   onWorkingSetChange={onWorkingSetChange}
+                />
+              )}
+              {!readOnly && (
+                <AgentControlsCard
+                  projectId={project.metadata.id}
+                  controls={project.metadata.agentControls}
+                  onControlsChange={() => onReloadProject?.()}
                 />
               )}
               <CensorPanel

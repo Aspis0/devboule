@@ -8231,6 +8231,7 @@ import { cdn } from 'https://cdn.example.com/x';
             design_request_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
         }
     }
 
@@ -8726,6 +8727,7 @@ import { cdn } from 'https://cdn.example.com/x';
             design_request_directives: Vec::new(),
             git_push_requests: Vec::new(),
             plan_approval_requests: Vec::new(),
+            consent_requests: Vec::new(),
         }
     }
 

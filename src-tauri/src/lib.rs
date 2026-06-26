@@ -38,6 +38,16 @@ pub fn run_structure_cli_from_args() -> Option<i32> {
     backend::structure::run_structure_cli(std::env::args())
 }
 
+/// Slice 5b: the body of the standalone `claude_consent_hook` binary. It reads the
+/// Claude `PreToolUse` hook JSON from STDIN, bridges Patch/Exec tool calls through the
+/// `.aspis-agents.json` consent file-bridge into the app's existing consent UI, prints
+/// the `permissionDecision` to STDOUT, and returns the process exit code (always 0 —
+/// fail-closed deny on any error). Exposed here so the thin bin can reuse the private
+/// `backend` file-bridge primitives without making `backend` public.
+pub fn run_claude_consent_hook() -> i32 {
+    backend::consent_hook::run()
+}
+
 const ALLOWED_EXTERNAL_HOSTS: &[&str] = &[
     "aspis-bio.com",
     "console.nebius.ai",
@@ -304,6 +314,7 @@ pub fn run() {
         .manage(censor_state)
         .manage(mini_coder_state)
         .manage(PermissionBrokerState::new())
+        .manage(backend::broker::CloudConsentState::new())
         .manage(backend::mini_activity::MiniActivityStore::default())
         .manage(backend::mini_activity::ActivityTailRegistry::default())
         .manage(backend::cloud_duplex::CloudDuplexSessions::new())
@@ -442,6 +453,7 @@ pub fn run() {
             backend::agent_pty::agent_pty_resize,
             backend::agent_pty::agent_pty_kill,
             backend::cloud_duplex::project_cloud_orchestrator_send,
+            backend::cloud_duplex::project_cloud_compact,
             backend::agent_pty::agent_pty_list,
             backend::mini_coder_executor::mini_coder_kill,
             backend::mini_coder_executor::mini_coder_steer,
@@ -489,6 +501,7 @@ pub fn run() {
             backend::projects::project_git_pull,
             backend::projects::project_git_clone,
             backend::projects::git_push_requests_list,
+            backend::projects::consent_requests_list,
             backend::projects::approve_git_push_request,
             backend::projects::deny_git_push_request,
             backend::plan_approval::plan_approval_requests_list,
@@ -607,11 +620,13 @@ pub fn run() {
             backend::censor::commands::set_censor_trusted,
             backend::projects::set_project_net_enabled_cmd,
             backend::projects::set_project_sandbox_mode_cmd,
+            backend::projects::set_project_agent_controls_cmd,
             backend::projects::grant_net_consent,
             backend::projects::project_working_set_cmd,
             backend::projects::add_project_working_set_folder_cmd,
             backend::projects::remove_project_working_set_folder_cmd,
             backend::projects::grant_folder_consent,
+            backend::projects::respond_cloud_consent,
             backend::design::design_create_project,
             backend::design::design_load_project,
             backend::design::design_save_project,
