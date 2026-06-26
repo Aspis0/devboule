@@ -143,6 +143,43 @@ export function AgentControlsCard({
         </div>
       </div>
 
+      {/* Verifier work-ethic (recommended, opt-in) */}
+      <div>
+        <label className="mb-1 block text-[11px] font-semibold text-cream-600">
+          Verifier (recommended)
+        </label>
+        <div className="space-y-1.5">
+          {([
+            ["verifierPerTask", "Verifier per task", "Auto-review each task when it reaches review."],
+            ["maxRecallPerProject", "Max-recall at project end", "A 3-verifier final pass when all tasks are done."],
+          ] as const).map(([key, title, caption]) => {
+            const on = local[key] ?? false;
+            return (
+              <button
+                key={key}
+                type="button"
+                disabled={busy}
+                aria-pressed={on}
+                onClick={() => void save({ ...local, [key]: !on })}
+                className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-1.5 text-left transition-colors disabled:opacity-50 ${
+                  on ? "border-teal/40 bg-teal/[0.06]" : "border-cream-200 bg-white hover:border-cream-300"
+                }`}
+              >
+                <span
+                  className={`mt-0.5 h-3.5 w-3.5 shrink-0 rounded border ${
+                    on ? "border-teal bg-teal" : "border-cream-300 bg-white"
+                  }`}
+                />
+                <span className="text-[11px]">
+                  <span className="font-semibold text-cream-700">{title}</span>
+                  <span className="block text-cream-500">{caption}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* System prompt */}
       <div>
         <label className="mb-1 block text-[11px] font-semibold text-cream-600">

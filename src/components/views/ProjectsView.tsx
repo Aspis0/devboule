@@ -1666,6 +1666,69 @@ export function ProjectsView() {
     }
   };
 
+  // Phase 4: verifier work-ethic (opt-in). Refs use PROJECT-SCOPED keys (task ids repeat across
+  // projects) and track fan-out vs nudge SEPARATELY, so the watcher survives the frequent re-renders
+  // without double-spawning or wedging — and still retries a failed launch.
+  const verifiedTaskKeysRef = useRef<Set<string>>(new Set());
+  const maxRecallFiredRef = useRef<Set<string>>(new Set());
+  const nudgedRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!currentProject || isArchived) return;
+    const pid = currentProject.metadata.id;
+    const controls = currentProject.metadata.agentControls ?? {};
+    const tasks = currentProject.state.tasks;
+    if (tasks.length === 0) return;
+
+    // Direct launch bypasses launchAgent's busyRef gate so several auto-spawns fire in one pass.
+    // agentId carries `idx` so a same-tick fan-out never collides (each spawn needs its own token).
+    const spawnVerifier = (taskId: string | null, idx: number) =>
+      invokeBackendCommand("launch_project_agent_terminal", {
+        input: {
+          projectId: pid,
+          role: "verifier",
+          client: "claude",
+          agentId: `verifier-${taskId ?? "recall"}-${Date.now()}-${idx}`,
+          taskId,
+          host: "app",
+        },
+      });
+
+    // Per-task: a task newly in "review" → one verifier. Mark OPTIMISTICALLY (a re-render mid-launch
+    // must not double-spawn) and UN-mark on failure so a rejected launch retries on a later pass.
+    if (controls.verifierPerTask) {
+      for (const t of tasks) {
+        const key = `${pid}:${t.id}`;
+        if (t.status === "review" && !verifiedTaskKeysRef.current.has(key)) {
+          verifiedTaskKeysRef.current.add(key);
+          void spawnVerifier(t.id, 0).catch(() => verifiedTaskKeysRef.current.delete(key));
+        }
+      }
+    }
+
+    // Per-project: ALL tasks in {review, done} → a 3-verifier max-recall fan-out ONCE, else a one-time
+    // nudge. Tracked separately so enabling the toggle AFTER a nudge still fires the fan-out.
+    const allTerminal = tasks.every((t) => t.status === "review" || t.status === "done");
+    if (allTerminal) {
+      if (controls.maxRecallPerProject) {
+        if (!maxRecallFiredRef.current.has(pid)) {
+          maxRecallFiredRef.current.add(pid);
+          for (let i = 0; i < 3; i++) void spawnVerifier(null, i).catch(() => {});
+        }
+      } else if (!nudgedRef.current.has(pid)) {
+        nudgedRef.current.add(pid);
+        setLaunchMessage(
+          "All tasks are in review — turn on 'Max-recall at project end' in Agent controls for a 3-verifier final pass.",
+        );
+      }
+    }
+  }, [
+    currentProject?.state.tasks,
+    currentProject?.metadata.agentControls,
+    currentProject?.metadata.id,
+    isArchived,
+  ]);
+
   const launchAgent = async (
     role: SpawnRole,
     client: "codex" | "claude",
