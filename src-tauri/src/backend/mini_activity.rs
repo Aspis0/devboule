@@ -551,6 +551,36 @@ pub fn push_coder_milestone(
     activity.empty = None;
 }
 
+/// Append a passive ANNOTATION row — identical wire shape to [`push_coder_milestone`]
+/// (`ConsoleEntry::Coder { node, text, time }`) but does NOT touch `running`, `run_count`,
+/// or `empty`.
+///
+/// Use this for terminal log notes that must not alter the agent's live/stopped status.
+/// The canonical use-case is the Slice 3 Unattended denial note written AFTER the agent
+/// has finished: calling `push_coder_milestone` there would set `running = Some(true)` and
+/// leave the tab showing a spinner for a completed agent until `spawn_verdict_thread`
+/// clears it (up to 30 s), producing a zombie spinner in the console.
+///
+/// Respects [`MAX_ENTRIES_PER_AGENT`] with the same FIFO drop as `push_coder_milestone`.
+pub fn push_coder_note(
+    activity: &mut ConsoleActivity,
+    label: &str,
+    style: Option<NodeStyle>,
+    ts: &str,
+) {
+    let entries = activity.entries.get_or_insert_with(Vec::new);
+    entries.push(ConsoleEntry::Coder {
+        node: style,
+        text: label.to_string(),
+        time: ts.to_string(),
+    });
+    if entries.len() > MAX_ENTRIES_PER_AGENT {
+        let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+        entries.drain(0..overflow);
+    }
+    // Deliberately NOT touching `running`, `run_count`, or `empty` — passive annotation.
+}
+
 /// Append ONE `WebSearch` timeline entry (the query + the real pages just read). Same
 /// FIFO cap + live-state bookkeeping as [`push_coder_milestone`].
 pub fn push_websearch(
@@ -1961,6 +1991,67 @@ not json\n";
         assert_eq!(v["entries"][0]["type"], json!("coder"));
         assert_eq!(v["entries"][0]["node"], json!("terra"));
         assert_eq!(v["entries"][0]["text"], json!("plan submitted — awaiting approval"));
+    }
+
+    // ── push_coder_note ───────────────────────────────────────────────────────
+
+    #[test]
+    fn push_coder_note_appends_row_does_not_touch_running_or_run_count() {
+        // Case A: activity in the resting empty state (None/None) — note must NOT flip them.
+        let mut a = ConsoleActivity::empty();
+        push_coder_note(
+            &mut a,
+            "Network access denied (Unattended mode)",
+            Some(NodeStyle::Terra),
+            "14:55:01",
+        );
+        assert_eq!(a.running, None, "push_coder_note must leave running=None when it was None");
+        assert_eq!(a.run_count, None, "push_coder_note must leave run_count=None when it was None");
+        // The entry itself must have the correct wire shape.
+        let entries = a.entries.as_ref().expect("entries vec must be present");
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            ConsoleEntry::Coder { node, text, time } => {
+                assert!(
+                    matches!(node, Some(NodeStyle::Terra)),
+                    "node must be Terra"
+                );
+                assert_eq!(text, "Network access denied (Unattended mode)");
+                assert_eq!(time, "14:55:01");
+            }
+            other => panic!("expected ConsoleEntry::Coder, got {other:?}"),
+        }
+
+        // Case B: activity already marked stopped (running=Some(false)) — note must not
+        // re-enable the spinner.
+        let mut b = ConsoleActivity::empty();
+        push_coder_milestone(&mut b, "working", Some(NodeStyle::Dot), "00:00");
+        mark_coder_stopped(&mut b);
+        assert_eq!(b.running, Some(false));
+        push_coder_note(&mut b, "denial note after stop", Some(NodeStyle::Terra), "00:01");
+        assert_eq!(
+            b.running,
+            Some(false),
+            "push_coder_note must not re-enable the spinner on a stopped agent"
+        );
+        assert_eq!(
+            b.run_count,
+            Some(1),
+            "push_coder_note must not alter run_count"
+        );
+        let entries_b = b.entries.as_ref().unwrap();
+        assert_eq!(entries_b.len(), 2, "note appended after the milestone");
+
+        // Case C: FIFO cap is still respected.
+        let mut c = ConsoleActivity::empty();
+        for i in 0..(MAX_ENTRIES_PER_AGENT + 5) {
+            push_coder_note(&mut c, &format!("n{i}"), None, "00:00");
+        }
+        assert_eq!(
+            c.entries.as_ref().unwrap().len(),
+            MAX_ENTRIES_PER_AGENT,
+            "push_coder_note respects MAX_ENTRIES_PER_AGENT FIFO cap"
+        );
     }
 
     #[test]

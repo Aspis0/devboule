@@ -731,3 +731,129 @@ mod tests {
         );
     }
 }
+
+// ── Slice 3: broker gate test — gate_unattended_fails_closed_no_prompt ───────
+
+#[cfg(test)]
+mod broker_gates {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// CONTRACT (design-doc gate): Unattended is fully fail-closed across the entire
+    /// permission surface. Asserts the complete truth table:
+    ///
+    /// - `prompts_for_net() == false` and `prompts_for_folder_write() == false`
+    /// - `resolve_net_enabled(persistent=false, transient=true, Unattended) == false`
+    ///   (transient grant ignored)
+    /// - `resolve_net_enabled(persistent=true, transient=any, Unattended) == true`
+    ///   (AllowRemember is still honoured)
+    /// - `resolve_working_set` ignores transient when Unattended
+    /// - A pending transient net grant is DRAINED (consumed) — not honoured, not kept
+    #[test]
+    fn gate_unattended_fails_closed_no_prompt() {
+        // ── no prompts ────────────────────────────────────────────────────────
+        assert!(
+            !SandboxMode::Unattended.prompts_for_net(),
+            "Unattended must NOT prompt for net"
+        );
+        assert!(
+            !SandboxMode::Unattended.prompts_for_folder_write(),
+            "Unattended must NOT prompt for folder write"
+        );
+
+        // ── net resolution: transient only → disabled ─────────────────────────
+        assert!(
+            !resolve_net_enabled(false, true, SandboxMode::Unattended),
+            "Unattended + transient-only net must be disabled (fail-closed)"
+        );
+
+        // ── net resolution: persistent wins even in Unattended ────────────────
+        assert!(
+            resolve_net_enabled(true, false, SandboxMode::Unattended),
+            "Unattended + persistent net must be enabled (AllowRemember)"
+        );
+        assert!(
+            resolve_net_enabled(true, true, SandboxMode::Unattended),
+            "Unattended + persistent + transient net must be enabled (persistent wins)"
+        );
+
+        // ── net resolution: no flags → disabled (any mode) ───────────────────
+        assert!(
+            !resolve_net_enabled(false, false, SandboxMode::Unattended),
+            "Unattended + no flags must be net-disabled"
+        );
+
+        // ── working_set: transient grant is NOT honoured in Unattended ────────
+        let persisted = vec!["/kept".to_string()];
+        let transient: HashSet<String> = ["/transient".to_string()].into_iter().collect();
+        let effective = resolve_working_set(&persisted, transient, SandboxMode::Unattended);
+        assert!(
+            effective.iter().any(|s| s == "/kept"),
+            "persisted folder must be in effective working_set"
+        );
+        assert!(
+            !effective.iter().any(|s| s == "/transient"),
+            "transient folder must NOT be in effective working_set under Unattended"
+        );
+
+        // ── transient net grant is DRAINED (consumed), not merely skipped ─────
+        // This section tests broker ATOMICITY: that `take_net_grant` consumes the HashSet
+        // entry and leaves the broker empty. It does NOT reach the `claim_and_launch`
+        // call-site (which requires an AppHandle and a live PTY) — it verifies the pure
+        // helper contract that claim_and_launch relies on. The production call-site drains
+        // unconditionally in the Unattended branch; the effect here is equivalent.
+        let broker = PermissionBrokerState::new();
+        broker.grant_net_once("proj-unatt");
+
+        // Simulate the Unattended drain: always call take_net_grant so the HashSet entry
+        // is consumed and cannot persist as a stale grant across runs.
+        let _taken = broker.take_net_grant("proj-unatt");
+        // Broker must now be empty regardless of the taken value.
+        assert!(
+            !broker.take_net_grant("proj-unatt"),
+            "net grant must be drained (consumed) after Unattended path — no residual grant"
+        );
+
+        // ── transient folder grant is DRAINED (consumed), not merely skipped ──
+        let broker2 = PermissionBrokerState::new();
+        broker2.grant_folder_once("proj-unatt", "/tmp/transient-folder");
+
+        // Simulate the Unattended drain: always call take_folder_grants so the map
+        // entry is consumed and cannot persist as a stale grant across runs.
+        let _taken_folders = broker2.take_folder_grants("proj-unatt");
+        // Broker map must be empty — no stale grant survives.
+        assert!(
+            broker2.take_folder_grants("proj-unatt").is_empty(),
+            "folder grant must be drained (consumed) after Unattended path — no residual grant"
+        );
+
+        // NOTE: the production `claim_and_launch` drain decision (the branch that always
+        // calls `take_net_grant` under Unattended) cannot be tested here because
+        // `claim_and_launch` requires a live `AppHandle` and PTY infrastructure. The tests
+        // above verify the broker-level atomicity contract that `claim_and_launch` relies on.
+        // An integration test covering the full call-site would require a mock AppHandle;
+        // that is out of scope for this unit-test module.
+    }
+
+    /// Confirms that `resolve_net_enabled` honours a transient grant under Ask and
+    /// AutoAcceptInWorkspace, but NOT under Unattended — exercising the `mode != Unattended`
+    /// branch that the drain-drain section above cannot reach (it bypasses resolve_net_enabled).
+    #[test]
+    fn resolve_net_enabled_honours_transient_under_non_unattended_modes() {
+        // Ask: transient grant enables net.
+        assert!(
+            resolve_net_enabled(false, true, SandboxMode::Ask),
+            "Ask mode must honour a transient net grant"
+        );
+        // AutoAcceptInWorkspace: transient grant enables net.
+        assert!(
+            resolve_net_enabled(false, true, SandboxMode::AutoAcceptInWorkspace),
+            "AutoAcceptInWorkspace must honour a transient net grant"
+        );
+        // Unattended: transient grant is ignored (the mode != Unattended guard fires).
+        assert!(
+            !resolve_net_enabled(false, true, SandboxMode::Unattended),
+            "Unattended must ignore a transient net grant (fail-closed)"
+        );
+    }
+}

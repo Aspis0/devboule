@@ -1783,3 +1783,140 @@ mod write_tests {
         let _ = fs::remove_dir_all(&base);
     }
 }
+
+// ── Slice 3: broker gate tests (design-doc acceptance criteria) ──────────────
+
+#[cfg(test)]
+mod broker_gates {
+    use super::*;
+    use crate::backend::broker::SandboxMode;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static GATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Create a unique temp root + containing dir for parallel test isolation.
+    fn gate_root(tag: &str) -> (PathBuf, PathBuf) {
+        let n = GATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir()
+            .join(format!("aspis_gate_{}_{}_{}", tag, std::process::id(), n));
+        let root = tmp.join("root");
+        fs::create_dir_all(&root).unwrap();
+        (root, tmp)
+    }
+
+    // ── gate_out_of_scope_write_triggers_prompt ────────��──────────────────────
+
+    /// CONTRACT: a write targeting a path OUTSIDE (root + working_set) sets the
+    /// `out_of_scope_write` signal to the parent folder AND, under a prompting mode
+    /// (Ask), `SandboxMode::Ask.prompts_for_folder_write() == true`, so the consent
+    /// event WOULD be emitted. This test locks the full signal→prompt chain without an
+    /// AppHandle by exercising the pure halves on both ends.
+    ///
+    /// Additionally asserts the CRITICAL DISTINCTION: a write inside the project root
+    /// but outside the per-task allowlist does NOT set the signal (that is a
+    /// task-scope error, not a consent case).
+    #[test]
+    fn gate_out_of_scope_write_triggers_prompt() {
+        let n = GATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir()
+            .join(format!("aspis_gate1_{}_{}", std::process::id(), n));
+        let root = base.join("root");
+        let working_set_dir = base.join("wset");
+        let outside = base.join("outside"); // neither root nor working_set
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&working_set_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // ── Part A: write OUTSIDE root + working_set sets the signal ─────────
+        let mut tools =
+            ScopedAgentTools::new(root.clone()).with_working_set(vec![working_set_dir.clone()]);
+
+        let target = outside.join("secret.txt");
+        let result = tools.write_file_abs(&target, "evil");
+        assert!(result.is_err(), "write outside scope must be rejected");
+        let signal = tools.out_of_scope_write();
+        assert!(signal.is_some(), "out_of_scope_write must be set on out-of-scope write");
+        let canon_outside = outside.canonicalize().unwrap_or(outside.clone());
+        assert_eq!(
+            signal.unwrap(),
+            canon_outside.to_string_lossy().as_ref(),
+            "signal must be the parent folder (outside)"
+        );
+
+        // ── Part B: under Ask mode, prompts_for_folder_write() == true ───────
+        // This means the consent-request event WOULD be emitted.
+        assert!(
+            SandboxMode::Ask.prompts_for_folder_write(),
+            "Ask mode must prompt for folder write — consent event would be emitted"
+        );
+
+        // ── Part C: in-root-but-outside-allowlist does NOT set the signal ────
+        let (in_root, in_root_tmp) = gate_root("gate1c");
+        let mut tools_in_root =
+            ScopedAgentTools::new(in_root).with_write_allowlist(vec!["allowed.txt".to_string()]);
+        let res = tools_in_root.call("write_file", r#"{"path":"other.txt","content":"x"}"#);
+        assert!(res.is_err(), "allowlist must block the write");
+        assert!(
+            tools_in_root.out_of_scope_write().is_none(),
+            "in-root but out-of-allowlist must NOT set out_of_scope_write (task-scope error, not consent case)"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&in_root_tmp);
+    }
+
+    // ── gate_respawn_includes_widened_scope ────────────────��──────────────────
+
+    /// CONTRACT: a folder in `working_set` is included in BOTH the Seatbelt writable
+    /// policy (`agentic_run_policy_with_working_set`) AND the app-level write check
+    /// (`write_file_abs`). I.e. the widened scope takes effect on the next spawn.
+    #[test]
+    fn gate_respawn_includes_widened_scope() {
+        use crate::backend::sandbox::NetPolicy;
+
+        let n = GATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir()
+            .join(format!("aspis_gate3_{}_{}", std::process::id(), n));
+        let root = base.join("root");
+        let extra = base.join("extra"); // folder being added to working_set
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+
+        // ── Part A: sandbox policy includes the working_set folder as writable ─
+        let policy = agentic_run_policy_with_working_set(
+            &root,
+            NetPolicy::None,
+            &[extra.clone()],
+        );
+        assert!(
+            policy.writable_paths.contains(&root),
+            "project root must be in writable_paths"
+        );
+        assert!(
+            policy.writable_paths.contains(&extra),
+            "working_set folder must be in writable_paths (Seatbelt side)"
+        );
+
+        // ── Part B: app-level write to the working_set folder succeeds ────────
+        let mut tools =
+            ScopedAgentTools::new(root.clone()).with_working_set(vec![extra.clone()]);
+        let target = extra.join("widened.txt");
+        let result = tools.write_file_abs(&target, "widened content");
+        assert!(
+            result.is_ok(),
+            "write to working_set folder must succeed (app-level check): {:?}",
+            result
+        );
+        assert!(
+            tools.out_of_scope_write().is_none(),
+            "working_set write must NOT set out_of_scope_write"
+        );
+        assert!(
+            target.exists(),
+            "file must actually have been written on disk"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+}

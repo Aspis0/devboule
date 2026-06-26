@@ -1733,12 +1733,26 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // Defensive: if reading the mode errors (project not found, corrupt metadata) we
     // default to PROMPTING rather than silently failing closed — better an extra dialog
     // than a permanently silenced agent with no feedback to the user.
+    //
+    // Slice 3: when Unattended suppresses the prompt, log a Terra milestone note in the
+    // activity console so the operator sees WHY the agent was blocked (not silent).
+    // FIX 2: read sandbox mode ONCE before both block checks; two separate locked disk reads
+    // when both flags are set would be wasteful and could theoretically observe different
+    // values if the mode changed between them (window is tiny but the reads are not free).
+    // Default to Ask on error — better an extra dialog than silently suppressing consent.
+    let sandbox_mode = project_id
+        .as_deref()
+        .map(|pid| {
+            crate::backend::projects::project_sandbox_mode(app, pid)
+                .unwrap_or(crate::backend::broker::SandboxMode::Ask)
+        });
+
     if was_net_blocked {
+        let agent_id = mini_agent_id(directive);
         if let Some(pid) = project_id.as_deref() {
-            let mode = crate::backend::projects::project_sandbox_mode(app, pid)
-                .unwrap_or(crate::backend::broker::SandboxMode::Ask);
+            // sandbox_mode is Some because project_id is Some.
+            let mode = sandbox_mode.unwrap_or(crate::backend::broker::SandboxMode::Ask);
             if mode.prompts_for_net() {
-                let agent_id = mini_agent_id(directive);
                 let req = crate::backend::broker::ConsentRequest {
                     kind: crate::backend::broker::ConsentKind::Net,
                     project_id: pid.to_string(),
@@ -1748,6 +1762,38 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                         .to_string(),
                 };
                 let _ = app.emit("sandbox://consent-request", req);
+            } else {
+                // Unattended: fail-closed, no consent dialog. Log so the operator can see why.
+                // Uses push_coder_note (not push_coder_milestone) so the passive annotation
+                // does NOT flip running=true on a finished agent (zombie-spinner fix).
+                // No command bodies in the note — the terminal already shows the full output.
+                let note = unattended_denial_note("net", "");
+                if let Some(store) = console_store(app) {
+                    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                    store.update(app, &agent_id, |a| {
+                        super::mini_activity::push_coder_note(
+                            a,
+                            &note,
+                            Some(super::mini_activity::NodeStyle::Terra),
+                            &ts,
+                        );
+                    });
+                }
+            }
+        } else {
+            // FIX 3: project_id is None (snapshot lost / project deleted mid-run). The agent
+            // still blocked on net — emit a best-effort denial note without project context so
+            // the operator is not left with zero feedback.
+            if let Some(store) = console_store(app) {
+                let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                store.update(app, &agent_id, |a| {
+                    super::mini_activity::push_coder_note(
+                        a,
+                        "Network access denied — project context unavailable",
+                        Some(super::mini_activity::NodeStyle::Terra),
+                        &ts,
+                    );
+                });
             }
         }
     }
@@ -1756,12 +1802,14 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // attempt targeting a path outside root + working_set), emit a FolderWrite consent-request
     // so the frontend can prompt the user to grant that folder.
     // Pattern is symmetric with the net-blocked emit above.
+    //
+    // Slice 3: Unattended suppressed path logs a denial note (same pattern as net above).
     if let Some(ref folder) = was_folder_write_blocked {
+        let agent_id = mini_agent_id(directive);
         if let Some(pid) = project_id.as_deref() {
-            let mode = crate::backend::projects::project_sandbox_mode(app, pid)
-                .unwrap_or(crate::backend::broker::SandboxMode::Ask);
+            // sandbox_mode is Some because project_id is Some.
+            let mode = sandbox_mode.unwrap_or(crate::backend::broker::SandboxMode::Ask);
             if mode.prompts_for_folder_write() {
-                let agent_id = mini_agent_id(directive);
                 let req = crate::backend::broker::ConsentRequest {
                     kind: crate::backend::broker::ConsentKind::FolderWrite,
                     project_id: pid.to_string(),
@@ -1772,6 +1820,34 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                     ),
                 };
                 let _ = app.emit("sandbox://consent-request", req);
+            } else {
+                // Unattended: fail-closed, no consent dialog. Log so the operator can see why.
+                // Uses push_coder_note (passive annotation, no zombie-spinner).
+                let note = unattended_denial_note("folder", folder);
+                if let Some(store) = console_store(app) {
+                    let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                    store.update(app, &agent_id, |a| {
+                        super::mini_activity::push_coder_note(
+                            a,
+                            &note,
+                            Some(super::mini_activity::NodeStyle::Terra),
+                            &ts,
+                        );
+                    });
+                }
+            }
+        } else {
+            // FIX 3: project_id is None — best-effort denial note without project context.
+            if let Some(store) = console_store(app) {
+                let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                store.update(app, &agent_id, |a| {
+                    super::mini_activity::push_coder_note(
+                        a,
+                        "Out-of-scope write denied — project context unavailable",
+                        Some(super::mini_activity::NodeStyle::Terra),
+                        &ts,
+                    );
+                });
             }
         }
     }
@@ -3856,6 +3932,39 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
 /// is otherwise unchanged — the console is a pure observer).
 fn console_store(app: &AppHandle) -> Option<tauri::State<'_, super::mini_activity::MiniActivityStore>> {
     app.try_state::<super::mini_activity::MiniActivityStore>()
+}
+
+/// Slice 3 — pure, unit-testable helper for the Unattended denial note appended to the
+/// activity console when the broker fails closed without prompting. `kind` is `"net"` or
+/// `"folder"`; `detail` is the net hint string or the blocked folder path respectively.
+/// Returns a short operator-readable label (≤200 chars after truncation) suitable for a
+/// `ConsoleEntry::Coder` milestone row. No secrets are emitted: the folder path is safe
+/// (already canonicalized by the write tool and stored in `out_of_scope_write`); command
+/// bodies are never included.
+pub(crate) fn unattended_denial_note(kind: &str, detail: &str) -> String {
+    let note = match kind {
+        "net" => {
+            if detail.is_empty() {
+                "Network access denied (Unattended mode)".to_string()
+            } else {
+                // Trim the hint to avoid bloating the timeline row.
+                let hint = detail.chars().take(120).collect::<String>();
+                format!("Network access denied (Unattended mode): {hint}")
+            }
+        }
+        "folder" => {
+            let folder = detail.chars().take(140).collect::<String>();
+            format!("Write to \"{folder}\" denied (Unattended mode)")
+        }
+        other => format!("Access denied (Unattended mode, kind={other})"),
+    };
+    // Hard cap at 200 chars (the ConsoleEntry milestone label limit in mini_activity.rs).
+    if note.chars().count() <= 200 {
+        note
+    } else {
+        let truncated: String = note.chars().take(199).collect();
+        format!("{truncated}\u{2026}") // …
+    }
 }
 
 /// CONSOLE (Step B) — FIX 2: stamp the live console TERMINAL for the executor's terminal-reap
@@ -10907,5 +11016,67 @@ mod tests {
         // No / empty / whitespace question -> a plain, still-informative banner.
         assert_eq!(clarification_banner_sub(None), "needs clarification");
         assert_eq!(clarification_banner_sub(Some("   ")), "needs clarification");
+    }
+}
+
+// ── Slice 3: unattended_denial_note pure helper ───────────────────────────────
+
+#[cfg(test)]
+mod denial_note_tests {
+    use super::unattended_denial_note;
+
+    #[test]
+    fn net_with_empty_detail_omits_colon() {
+        let note = unattended_denial_note("net", "");
+        assert_eq!(note, "Network access denied (Unattended mode)");
+    }
+
+    #[test]
+    fn net_with_detail_includes_hint() {
+        let note = unattended_denial_note("net", "cargo fetch failed");
+        assert!(
+            note.contains("Network access denied (Unattended mode)"),
+            "must start with denial prefix"
+        );
+        assert!(note.contains("cargo fetch failed"), "must include the hint");
+    }
+
+    #[test]
+    fn folder_formats_path() {
+        let note = unattended_denial_note("folder", "/tmp/extra");
+        assert_eq!(note, "Write to \"/tmp/extra\" denied (Unattended mode)");
+    }
+
+    #[test]
+    fn unknown_kind_produces_generic_note() {
+        let note = unattended_denial_note("exec", "");
+        assert!(note.contains("Unattended mode"), "must mention mode");
+        assert!(note.contains("exec"), "must mention kind");
+    }
+
+    #[test]
+    fn note_is_capped_at_200_chars() {
+        // A folder path longer than the cap produces a truncated note.
+        let long_path = "x".repeat(300);
+        let note = unattended_denial_note("folder", &long_path);
+        assert!(
+            note.chars().count() <= 200,
+            "note must not exceed 200 chars; got {}",
+            note.chars().count()
+        );
+    }
+
+    #[test]
+    fn net_hint_is_capped_at_120_chars() {
+        let long_hint = "h".repeat(200);
+        let note = unattended_denial_note("net", &long_hint);
+        // The hint is truncated to 120 chars before embedding, so total stays well under 200.
+        assert!(
+            note.chars().count() <= 200,
+            "note must not exceed 200 chars; got {}",
+            note.chars().count()
+        );
+        // Hint portion present (first 120 'h' chars).
+        assert!(note.contains(&"h".repeat(120)));
     }
 }

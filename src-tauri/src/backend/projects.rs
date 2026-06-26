@@ -14414,3 +14414,133 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(label.starts_with("injectme"), "got {label:?}");
     }
 }
+
+// ── Slice 3: broker gate test — gate_approved_folder_enters_working_set_and_persists ──
+
+#[cfg(test)]
+mod broker_gate_projects {
+    use super::*;
+
+    /// Create a minimal project file in a fresh temp dir. Returns `(dir_root, file_path)`.
+    /// Inlines the logic of `tests::write_temp_project` (private to that sibling module).
+    fn make_temp_project(slug: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-gate2-{}-{}-{}",
+            slug,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let metadata = ProjectMetadata {
+            id: slug.into(),
+            title: "Gate 2 Test Project".into(),
+            status: "active".into(),
+            updated_at: "2026-06-01T00:00:00Z".into(),
+            root_path: None,
+            censor_trusted: false,
+            net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
+        };
+        let state = ProjectStateBlock {
+            version: 1,
+            tasks: vec![ProjectTask {
+                id: "T1".into(),
+                title: "Gate 2 task".into(),
+                status: "todo".into(),
+                priority: None,
+                assignee: None,
+                due: None,
+                linked_resources: Vec::new(),
+                updated_at: "2026-06-01T00:00:00Z".into(),
+                category: None,
+                description: None,
+                suspect_file_ids: Vec::new(),
+                depends_on: Vec::new(),
+                scope: Vec::new(),
+                acceptance: String::new(),
+                plan_id: None,
+            }],
+            notes: Vec::new(),
+            milestones: Vec::new(),
+        };
+        let markdown = initial_project_markdown(&metadata, &state).unwrap();
+        let path = root.join(format!("{slug}.md"));
+        fs::write(&path, &markdown).unwrap();
+        (root, path)
+    }
+
+    /// CONTRACT: the `AllowRemember` consent path persists a granted folder in the project's
+    /// `working_set` and the value survives a full parse round-trip.
+    ///
+    /// SCOPE: because `add_project_working_set_folder` requires an `AppHandle` (it resolves
+    /// the project path via the managed projects directory), this test calls the UNDERLYING
+    /// helpers directly — `normalize_working_set_folder` + `mutate_project_file_latest` +
+    /// `read_project_file` — which are the actual persistence primitives that
+    /// `add_project_working_set_folder` delegates to. It does NOT exercise
+    /// `add_project_working_set_folder` end-to-end. This matches the pattern used by
+    /// `working_set_persists_through_locked_write_and_clears_no_churn`.
+    #[test]
+    fn gate_approved_folder_enters_working_set_and_persists() {
+        // Create a real temporary folder (canonicalize requires the path to exist).
+        let folder_base = std::env::temp_dir().join(format!(
+            "aspis_gate2_{}_{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&folder_base).unwrap();
+        let canonical_folder = folder_base
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // Write a blank project, then add the folder via the locked-write path.
+        let (root, path) = make_temp_project("gate2-approved-folder");
+        let initial = read_project_file(&path).unwrap();
+        assert!(
+            initial.metadata.working_set.is_empty(),
+            "fresh project must have empty working_set"
+        );
+
+        // Simulate `add_project_working_set_folder`: normalize + locked write.
+        let normalized = normalize_working_set_folder(&canonical_folder)
+            .expect("canonical temp folder must normalize successfully");
+        mutate_project_file_latest(&path, |project| {
+            if !project.metadata.working_set.contains(&normalized) {
+                project.metadata.working_set.push(normalized.clone());
+            }
+            Ok(())
+        })
+        .unwrap()
+        .expect("project must be present");
+
+        // ── Verify 1: parsed metadata contains the folder ─────────────────────
+        let after_add = read_project_file(&path).unwrap();
+        assert!(
+            after_add.metadata.working_set.contains(&normalized),
+            "working_set must contain the granted folder after add; got: {:?}",
+            after_add.metadata.working_set
+        );
+
+        // ── Verify 2: raw disk bytes contain the actual folder path (serialized) ──
+        // Asserting the canonical folder string (not just the key substring) catches
+        // serialization bugs where working_set appears but holds the wrong value.
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            disk.contains(&canonical_folder),
+            "project file on disk must contain the canonical folder path; got disk=…{}…",
+            &disk[..disk.len().min(200)]
+        );
+
+        // ── Verify 3: a second read (simulating app restart) still returns it ─
+        let reload = read_project_file(&path).unwrap();
+        assert_eq!(
+            reload.metadata.working_set,
+            vec![normalized.clone()],
+            "working_set must survive a full parse round-trip (reload check)"
+        );
+
+        let _ = fs::remove_dir_all(&folder_base);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
