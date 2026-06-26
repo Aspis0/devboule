@@ -85,6 +85,35 @@ fn pigeon_http_client() -> &'static reqwest::blocking::Client {
     PIGEON_HTTP_CLIENT.get_or_init(|| reqwest::blocking::Client::builder().build().unwrap())
 }
 
+/// Build a Pigeon HTTP client (Slice 3a) from the loopback port + auth token, ONLY when the Pigeon
+/// child supervisor is actually spawned. The `PIGEON_*` statics stay private to this module; this is
+/// the single production entry the mini-dispatch executor will use.
+///
+/// PRECONDITION: returns `None` unless `start_if_enabled` has spawned the child (i.e. `PIGEON_CHILD`
+/// is `Some` and currently holds a live process). It does NOT re-probe `/health` — readiness is the
+/// caller's concern (use `probe_ready` semantics, or just let the first request fail with a
+/// connection error while the service is still booting). Note both `pigeon_port()` and
+/// `pigeon_auth_token()` lazily initialise the statics on first call, so the URL/token always match
+/// whatever the child was (or will be) launched with.
+#[allow(dead_code)]
+pub fn pigeon_client_from_running() -> Option<crate::backend::pigeon_client::PigeonClient> {
+    // Gate on the child actually being present, so callers can't talk to a dispatcher that was
+    // never started in this process.
+    let running = PIGEON_CHILD
+        .get()
+        .map(|slot| {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        })
+        .unwrap_or(false);
+    if !running {
+        return None;
+    }
+    let base_url = format!("http://127.0.0.1:{}", pigeon_port());
+    crate::backend::pigeon_client::PigeonClient::new(base_url, pigeon_auth_token()).ok()
+}
+
 fn pigeon_package_root(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(resource_dir) = app.path().resource_dir() {
         let pigeon_dir = resource_dir.join("pigeon");
