@@ -18,6 +18,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Play, ShieldCheck, RefreshCw, ShieldAlert, ShieldOff, XCircle } from "lucide-react";
+import { installHintFor } from "./censorInstallHints";
 import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
 import type {
   CensorDisposition,
@@ -395,18 +396,28 @@ export function CensorPanelView({
       {/* ---- tool-absent hint (optional) ---- */}
       {absentTools.length > 0 && (
         <div className="space-y-1">
-          <p className="text-[10px] text-cream-400">not installed — those Censor layers are skipped</p>
+          <p className="text-[10px] text-cream-400">
+            not installed — those Censor layers are skipped. Click a tool to copy its install command.
+          </p>
           <div className="flex flex-wrap gap-1.5">
-            {absentTools.map((t) => (
-              <span
-                key={t.name}
-                data-censor-missing-tool={t.name}
-                className="inline-flex items-center gap-1 rounded-md border border-coral/30 bg-coral/8 px-2 py-0.5 text-[10px] text-coral-dark"
-              >
-                <XCircle className="h-3 w-3" />
-                {t.name}
-              </span>
-            ))}
+            {absentTools.map((t) => {
+              const hint = installHintFor(t.name);
+              return (
+                <button
+                  key={t.name}
+                  type="button"
+                  data-censor-missing-tool={t.name}
+                  title={hint ? `Click to copy: ${hint}` : `${t.name} is not installed`}
+                  onClick={() => {
+                    if (hint) void navigator.clipboard?.writeText(hint);
+                  }}
+                  className="inline-flex items-center gap-1 rounded-md border border-coral/30 bg-coral/8 px-2 py-0.5 text-[10px] text-coral-dark hover:bg-coral/15"
+                >
+                  <XCircle className="h-3 w-3" />
+                  {t.name}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
