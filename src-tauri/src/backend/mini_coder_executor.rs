@@ -1176,6 +1176,9 @@ fn spawn_agentic_worker(
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
     net: crate::backend::sandbox::NetPolicy,
+    // Broker Slice 2: effective working set (persisted + transient, already resolved by
+    // `claim_and_launch`).  Passed through to `run_agentic_coder` → `ScopedAgentTools`.
+    working_set: Vec<std::path::PathBuf>,
 ) -> Result<(), String> {
     let state = app
         .try_state::<MiniCoderState>()
@@ -1233,18 +1236,25 @@ fn spawn_agentic_worker(
                 root,
                 allowlist,
                 net,
+                working_set,
                 max_rounds,
                 &cancel,
             ) {
-                Ok((outcome, touched, net_blocked)) => {
-                    crate::backend::agentic_runner::agentic_result_json(&outcome, &touched, net_blocked)
+                Ok((outcome, touched, net_blocked, out_of_scope_write)) => {
+                    crate::backend::agentic_runner::agentic_result_json(
+                        &outcome,
+                        &touched,
+                        net_blocked,
+                        out_of_scope_write.as_deref(),
+                    )
                 }
-                // Transport/init failure → escalate (NOT a false "done"); net_blocked=false
-                // (the LLM never got to run a tool, so no network heuristic could have fired).
+                // Transport/init failure → escalate (NOT a false "done"); net_blocked=false,
+                // out_of_scope_write=None (the LLM never got to run a tool).
                 Err(e) => crate::backend::agentic_runner::agentic_result_json(
                     &crate::backend::agentic_loop::LoopOutcome::Aborted { reason: e, rounds: 0 },
                     &[],
                     false,
+                    None,
                 ),
             };
             // Write the result the finalize path reads, BEFORE the guard releases the in-flight
@@ -1490,12 +1500,18 @@ fn claim_and_launch(
             crate::backend::projects::project_sandbox_mode(app, &project_id)
                 .unwrap_or(crate::backend::broker::SandboxMode::Ask);
 
-        // Consume the one-shot grant only when the mode would honour it.
-        // For Unattended the grant is left untouched (not consumed, not used).
+        // WARNING 2 fix: ALWAYS drain (consume) the transient grants — even in Unattended
+        // mode.  Previously, Unattended skipped the take_* calls, leaving stale entries in
+        // the HashMap forever and risking a grant-storm if the project later switches to Ask.
+        // The fix: unconditionally call take_*, but only honour the result when NOT Unattended
+        // (fail-closed invariant preserved by resolve_net_enabled / resolve_working_set).
+        let transient_net_taken = app
+            .try_state::<crate::backend::broker::PermissionBrokerState>()
+            .map(|broker| broker.take_net_grant(&project_id))
+            .unwrap_or(false);
+        // Discard in Unattended; honour in Ask / AutoAcceptInWorkspace.
         let transient_net = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
-            app.try_state::<crate::backend::broker::PermissionBrokerState>()
-                .map(|broker| broker.take_net_grant(&project_id))
-                .unwrap_or(false)
+            transient_net_taken
         } else {
             false
         };
@@ -1508,6 +1524,31 @@ fn claim_and_launch(
         } else {
             crate::backend::sandbox::NetPolicy::None
         };
+        // SANDBOX broker Slice 2: resolve the effective working set.
+        // WARNING 2 fix (folder grants): same drain-always pattern as the net grant above.
+        // ALWAYS call take_folder_grants to prevent unbounded HashMap growth; only pass the
+        // taken set to resolve_working_set when NOT Unattended (fail-closed).
+        let persisted_working_set =
+            crate::backend::projects::project_working_set(app, &project_id)
+                .unwrap_or_default();
+        let transient_folders_taken = app
+            .try_state::<crate::backend::broker::PermissionBrokerState>()
+            .map(|broker| broker.take_folder_grants(&project_id))
+            .unwrap_or_default();
+        // In Unattended: drain happened but we pass empty — transient grants are not honoured.
+        let transient_folders = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
+            transient_folders_taken.clone()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let effective_working_set = crate::backend::broker::resolve_working_set(
+            &persisted_working_set,
+            transient_folders,
+            sandbox_mode,
+        );
+        let working_set_paths: Vec<std::path::PathBuf> =
+            effective_working_set.into_iter().map(std::path::PathBuf::from).collect();
+
         let spawn_r = spawn_agentic_worker(
             app,
             &project_root,
@@ -1516,17 +1557,30 @@ fn claim_and_launch(
             &backend,
             directive,
             agentic_net,
+            working_set_paths,
         );
-        // Re-insert the transient grant if the spawn itself failed (not the run):
-        // the worker never launched, so the user never saw a net-blocked outcome and
-        // would not be re-prompted — put the grant back so the next claim_and_launch
-        // attempt can use it.
-        // NOTE: only re-insert when we actually consumed (transient_net == true).
-        if spawn_r.is_err() && transient_net {
-            if let Some(broker) =
-                app.try_state::<crate::backend::broker::PermissionBrokerState>()
-            {
-                broker.grant_net_once(&project_id);
+        // Re-insert the transient grants ONLY in non-Unattended mode if the spawn itself
+        // failed (not the run): the worker never launched, so the user never saw a blocked
+        // outcome and would not be re-prompted — put the grants back so the next
+        // claim_and_launch attempt can use them.  Unattended never re-inserts (drain is final).
+        if spawn_r.is_err() && sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
+            // Net grant.
+            if transient_net_taken {
+                if let Some(broker) =
+                    app.try_state::<crate::backend::broker::PermissionBrokerState>()
+                {
+                    broker.grant_net_once(&project_id);
+                }
+            }
+            // Folder grants.
+            if !transient_folders_taken.is_empty() {
+                if let Some(broker) =
+                    app.try_state::<crate::backend::broker::PermissionBrokerState>()
+                {
+                    for folder in &transient_folders_taken {
+                        broker.grant_folder_once(&project_id, folder);
+                    }
+                }
             }
         }
         spawn_r
@@ -1656,10 +1710,12 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         .as_deref()
         .filter(|p| !p.trim().is_empty())
         .and_then(|p| Path::new(p).parent().map(|r| r.to_path_buf()));
-    // FIX 3: capture net_blocked BEFORE apply_write_directive_edits, because the
-    // apply step can replace the outcome (e.g. failed-apply → MiniCoderOutcome::failed)
-    // which has net_blocked=false, silently zeroing the flag before the emit check below.
+    // FIX 3: capture net_blocked and folder_write_blocked BEFORE apply_write_directive_edits,
+    // because the apply step can replace the outcome (e.g. failed-apply → MiniCoderOutcome::failed)
+    // which has net_blocked=false and folder_write_blocked=None, silently zeroing both flags
+    // before the emit checks below.
     let was_net_blocked = outcome.net_blocked;
+    let was_folder_write_blocked = outcome.folder_write_blocked.clone();
     let (outcome, write_diffs) =
         apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
 
@@ -1690,6 +1746,30 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                     detail: "A sandboxed command needed network access, which is disabled for \
                              this project. Grant to retry."
                         .to_string(),
+                };
+                let _ = app.emit("sandbox://consent-request", req);
+            }
+        }
+    }
+
+    // SANDBOX broker Slice 2: if the agentic worker detected an out-of-scope write (a write
+    // attempt targeting a path outside root + working_set), emit a FolderWrite consent-request
+    // so the frontend can prompt the user to grant that folder.
+    // Pattern is symmetric with the net-blocked emit above.
+    if let Some(ref folder) = was_folder_write_blocked {
+        if let Some(pid) = project_id.as_deref() {
+            let mode = crate::backend::projects::project_sandbox_mode(app, pid)
+                .unwrap_or(crate::backend::broker::SandboxMode::Ask);
+            if mode.prompts_for_folder_write() {
+                let agent_id = mini_agent_id(directive);
+                let req = crate::backend::broker::ConsentRequest {
+                    kind: crate::backend::broker::ConsentKind::FolderWrite,
+                    project_id: pid.to_string(),
+                    agent_id,
+                    detail: format!(
+                        "A sandboxed command attempted to write outside the project to \
+                         \"{folder}\". Grant to allow writes there and retry."
+                    ),
                 };
                 let _ = app.emit("sandbox://consent-request", req);
             }
@@ -2286,7 +2366,8 @@ fn finalize_finished_mini_with(
                         let escalation = fo.escalation.clone().unwrap_or_default();
                         // FIX 2: forward net_blocked so the consent-request event fires
                         // on the escalation path (previously hardcoded to false).
-                        mini_coder::apply_escalated(d, fo.files_touched.clone(), escalation, fo.net_blocked)
+                        // Slice 2: forward folder_write_blocked similarly.
+                        mini_coder::apply_escalated(d, fo.files_touched.clone(), escalation, fo.net_blocked, fo.folder_write_blocked.clone())
                     } else {
                         // The kill won (aborted_by_human) — stamp the abort instead.
                         mini_coder::apply_result(d, fo.clone())
@@ -6606,6 +6687,7 @@ mod tests {
             question: None,
             partial: None,
             net_blocked: false,
+            folder_write_blocked: None,
         })
     }
 
@@ -7900,6 +7982,7 @@ mod tests {
                 findings: vec![],
             },
             false,
+            None,
         );
         transition_directive(&mut state, "root-r2", |d| {
             mini_coder::apply_result(d, escalated.clone())

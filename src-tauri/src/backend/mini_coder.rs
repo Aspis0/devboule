@@ -286,6 +286,13 @@ pub struct MiniCoderResult {
     /// event.  NO-CHURN: omitted from the JSON when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub net_blocked: bool,
+    /// SANDBOX broker Slice 2: set by the agentic worker when a write attempt targeted a
+    /// path outside (root + working_set). Contains the canonicalized PARENT FOLDER of the
+    /// denied write. Propagated into `MiniCoderOutcome` so `finalize_finished_mini` can
+    /// emit a `FolderWrite` consent-request event.  NO-CHURN: omitted from the JSON when
+    /// `None` so existing result files that pre-date Slice 2 continue to deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_write_blocked: Option<String>,
 }
 
 /// The app-owned terminal payload stored in `MiniCoderDirective.result`. A
@@ -361,6 +368,12 @@ pub struct MiniCoderOutcome {
     /// event.  NO-CHURN: omitted from serialized state when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub net_blocked: bool,
+    /// SANDBOX broker Slice 2: canonicalized parent folder of a write attempt that was
+    /// blocked because it targeted a path outside (root + working_set).
+    /// `finalize_finished_mini` uses this to emit the `FolderWrite` consent-request event.
+    /// NO-CHURN: omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_write_blocked: Option<String>,
 }
 
 impl MiniCoderOutcome {
@@ -377,6 +390,7 @@ impl MiniCoderOutcome {
             error: None,
             escalation: None,
             net_blocked: result.net_blocked,
+            folder_write_blocked: result.folder_write_blocked,
         }
     }
 
@@ -395,6 +409,7 @@ impl MiniCoderOutcome {
             error: None,
             escalation: None,
             net_blocked: result.net_blocked,
+            folder_write_blocked: result.folder_write_blocked,
         }
     }
 
@@ -405,10 +420,12 @@ impl MiniCoderOutcome {
     /// `net_blocked` is threaded from the LAST attempt's outcome so that
     /// `finalize_finished_mini` still emits the `sandbox://consent-request` event
     /// on the escalation path (FIX 2).
+    /// `folder_write_blocked` is similarly threaded from the LAST attempt's outcome.
     pub fn escalated(
         files_touched: Vec<String>,
         escalation: EscalationInfo,
         net_blocked: bool,
+        folder_write_blocked: Option<String>,
     ) -> Self {
         Self {
             status: MiniCoderStatus::Escalated,
@@ -423,6 +440,7 @@ impl MiniCoderOutcome {
             )),
             escalation: Some(escalation),
             net_blocked,
+            folder_write_blocked,
         }
     }
 
@@ -825,15 +843,17 @@ pub fn apply_awaiting_retry(
 ///
 /// `net_blocked` is threaded from the last attempt's outcome (FIX 2: keeps the
 /// consent-request event firing on the escalation path).
+/// `folder_write_blocked` is similarly threaded from the last attempt's outcome.
 pub fn apply_escalated(
     directive: &MiniCoderDirective,
     files_touched: Vec<String>,
     escalation: EscalationInfo,
     net_blocked: bool,
+    folder_write_blocked: Option<String>,
 ) -> Result<MiniCoderDirective, String> {
     apply_outcome(
         directive,
-        MiniCoderOutcome::escalated(files_touched, escalation, net_blocked),
+        MiniCoderOutcome::escalated(files_touched, escalation, net_blocked, folder_write_blocked),
     )
 }
 
@@ -1203,10 +1223,12 @@ pub fn verdict_gate_decision(
         };
         // FIX 2: carry net_blocked from the last attempt so finalize_finished_mini
         // can still emit the consent-request event on the escalation path.
+        // Slice 2: carry folder_write_blocked similarly.
         GateDecision::Escalate(MiniCoderOutcome::escalated(
             outcome.files_touched.clone(),
             escalation,
             outcome.net_blocked,
+            outcome.folder_write_blocked.clone(),
         ))
     }
 }
@@ -4700,14 +4722,14 @@ mod tests {
                 line: Some(42),
             }],
         };
-        let next = apply_escalated(&running, vec!["src/a.rs".into()], info.clone(), false).unwrap();
+        let next = apply_escalated(&running, vec!["src/a.rs".into()], info.clone(), false, None).unwrap();
         assert_eq!(next.status, MiniCoderStatus::Escalated);
         let out = next.result.unwrap();
         assert_eq!(out.escalation.as_ref().unwrap().attempts, 3);
         assert_eq!(out.files_touched, vec!["src/a.rs".to_string()]);
         // escalated only from an active directive.
         let pending = directive("d2", MiniCoderStatus::Pending, "t0");
-        assert!(apply_escalated(&pending, vec![], info, false).is_err());
+        assert!(apply_escalated(&pending, vec![], info, false, None).is_err());
     }
 
     // ── FIX 2: escalated outcome must propagate net_blocked ──────────────────
@@ -4722,7 +4744,7 @@ mod tests {
             findings: vec![],
         };
         // net_blocked=true must survive into the escalated outcome.
-        let o = MiniCoderOutcome::escalated(vec!["src/a.rs".into()], info, true);
+        let o = MiniCoderOutcome::escalated(vec!["src/a.rs".into()], info, true, None);
         assert!(
             o.net_blocked,
             "escalated outcome must carry net_blocked=true from the last attempt"
@@ -4735,7 +4757,7 @@ mod tests {
             attempts: 1,
             findings: vec![],
         };
-        let o = MiniCoderOutcome::escalated(vec![], info, false);
+        let o = MiniCoderOutcome::escalated(vec![], info, false, None);
         assert!(!o.net_blocked, "escalated outcome with net_blocked=false");
     }
 
@@ -4893,6 +4915,7 @@ mod tests {
             question: None,
             partial: None,
             net_blocked: false,
+            folder_write_blocked: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -4915,6 +4938,7 @@ mod tests {
             question: None,
             partial: None,
             net_blocked: true,
+            folder_write_blocked: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(

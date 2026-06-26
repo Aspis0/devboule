@@ -770,6 +770,12 @@ export interface ProjectMetadata {
    * `undefined` and `"ask"` are semantically identical on the frontend.
    */
   sandboxMode?: SandboxMode;
+  /**
+   * Extra writable folders outside the project root granted via the permission
+   * broker (Slice 2 FolderWrite consent). The backend omits this field when the
+   * list is empty (NO-CHURN); treat `undefined` as `[]`.
+   */
+  workingSet?: string[];
 }
 
 export interface ProjectTaskCounts {

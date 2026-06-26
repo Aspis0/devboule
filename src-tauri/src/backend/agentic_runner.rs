@@ -142,9 +142,14 @@ pub fn run_agentic_coder(
     root: PathBuf,
     write_allowlist: Vec<String>,
     net: crate::backend::sandbox::NetPolicy,
+    // Broker Slice 2: effective working set (persisted + transient, already resolved by
+    // `claim_and_launch`).  Passed to `ScopedAgentTools::with_working_set` so both the
+    // app-level write check and the OS sandbox policy (`agentic_run_policy_with_working_set`)
+    // treat these folders as writable.
+    working_set: Vec<PathBuf>,
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<(LoopOutcome, Vec<String>, bool), String> {
+) -> Result<(LoopOutcome, Vec<String>, bool, Option<String>), String> {
     let tools = default_tool_definitions();
     // Q1: append the per-MODEL-FAMILY thinking directive to the house-rules system prompt.
     // Gemma/North have no thinking_budget param, so their reasoning is bounded in the prompt;
@@ -161,7 +166,8 @@ pub fn run_agentic_coder(
     // allowlist (empty = no extra restriction beyond the root).
     let mut fs_tools = ScopedAgentTools::new(root)
         .with_write_allowlist(write_allowlist)
-        .with_net(net);
+        .with_net(net)
+        .with_working_set(working_set);
     let outcome = run_agent_loop(
         &mut llm,
         &mut fs_tools,
@@ -172,7 +178,8 @@ pub fn run_agentic_coder(
     );
     let touched = fs_tools.touched().to_vec();
     let net_blocked = fs_tools.net_blocked();
-    Ok((outcome, touched, net_blocked))
+    let out_of_scope_write = fs_tools.out_of_scope_write().map(str::to_string);
+    Ok((outcome, touched, net_blocked, out_of_scope_write))
 }
 
 /// Serialize an agentic run into the MiniCoderResult wire JSON the executor's finalize path
@@ -181,7 +188,14 @@ pub fn run_agentic_coder(
 /// "needs_clarification" so it ESCALATES rather than falsely claiming success.
 /// `net_blocked` is set to true when `ScopedAgentTools::net_blocked()` fired during the run
 /// (net=None + network-blocked heuristic matched); omitted (NO-CHURN) when false.
-pub fn agentic_result_json(outcome: &LoopOutcome, touched: &[String], net_blocked: bool) -> String {
+/// `out_of_scope_write` is set to the canonicalized parent folder when a write attempt
+/// targeted a path outside (root + working_set); omitted (NO-CHURN) when None.
+pub fn agentic_result_json(
+    outcome: &LoopOutcome,
+    touched: &[String],
+    net_blocked: bool,
+    out_of_scope_write: Option<&str>,
+) -> String {
     let mut value = match outcome {
         LoopOutcome::Done { output, .. } => json!({
             "status": "done",
@@ -198,6 +212,11 @@ pub fn agentic_result_json(outcome: &LoopOutcome, touched: &[String], net_blocke
     // this feature continue to deserialize cleanly (serde default = false).
     if net_blocked {
         value["netBlocked"] = json!(true);
+    }
+    // NO-CHURN: only inject when Some so existing result files pre-dating Slice 2
+    // continue to deserialize cleanly (serde default = None).
+    if let Some(folder) = out_of_scope_write {
+        value["folderWriteBlocked"] = json!(folder);
     }
     value.to_string()
 }
@@ -249,6 +268,7 @@ mod tests {
             &LoopOutcome::Done { output: "ok".into(), rounds: 2 },
             &["src/a.rs".to_string()],
             false,
+            None,
         );
         let v: Value = serde_json::from_str(&done).unwrap();
         assert_eq!(v["status"], "done");
@@ -256,11 +276,13 @@ mod tests {
         assert_eq!(v["filesTouched"][0], "src/a.rs");
         assert!(v.get("edits").is_none()); // agentic path applied edits itself
         assert!(v.get("netBlocked").is_none()); // not set when false (NO-CHURN)
+        assert!(v.get("folderWriteBlocked").is_none()); // not set when None (NO-CHURN)
 
         let aborted = agentic_result_json(
             &LoopOutcome::Aborted { reason: "max rounds (8) exceeded".into(), rounds: 8 },
             &[],
             false,
+            None,
         );
         let v2: Value = serde_json::from_str(&aborted).unwrap();
         assert_eq!(v2["status"], "needs_clarification");
@@ -273,6 +295,7 @@ mod tests {
             &LoopOutcome::Done { output: "done".into(), rounds: 1 },
             &[],
             true,
+            None,
         );
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["netBlocked"], true);
@@ -284,10 +307,35 @@ mod tests {
             &LoopOutcome::Done { output: "done".into(), rounds: 1 },
             &[],
             false,
+            None,
         );
         let v: Value = serde_json::from_str(&json).unwrap();
         // NO-CHURN: field must be absent, not `false`.
         assert!(v.get("netBlocked").is_none());
+    }
+
+    #[test]
+    fn agentic_result_json_folder_write_blocked_present_when_some() {
+        let json = agentic_result_json(
+            &LoopOutcome::Done { output: "done".into(), rounds: 1 },
+            &[],
+            false,
+            Some("/tmp/outside"),
+        );
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["folderWriteBlocked"], "/tmp/outside");
+    }
+
+    #[test]
+    fn agentic_result_json_folder_write_blocked_absent_when_none() {
+        let json = agentic_result_json(
+            &LoopOutcome::Done { output: "done".into(), rounds: 1 },
+            &[],
+            false,
+            None,
+        );
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("folderWriteBlocked").is_none());
     }
 }
 

@@ -57,6 +57,25 @@ export function grantNetConsentArgs(params: {
   return { projectId: params.projectId, decision: params.decision };
 }
 
+/**
+ * Build the args object for `invokeBackendCommand("grant_folder_consent", ...)`.
+ *
+ * Matches the `grant_folder_consent` Tauri command signature:
+ *   `project_id: String, folder: String, decision: ConsentDecision`
+ * All keys camelCase per the Tauri IPC bridge convention.
+ */
+export function grantFolderConsentArgs(params: {
+  projectId: string;
+  folder: string;
+  decision: ConsentDecision;
+}): Record<string, unknown> {
+  return {
+    projectId: params.projectId,
+    folder: params.folder,
+    decision: params.decision,
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // Filtering helpers (pure, tested)
 // ─────────────────────────────────────────────────────────────
@@ -72,17 +91,34 @@ export function isNetRequestForProject(
   return request.kind === "net" && request.projectId === projectId;
 }
 
+/**
+ * Returns true when the request belongs to the given project, regardless of kind.
+ * Used by the Slice 2 listener extension in ProjectWorkspace to accept BOTH
+ * `Net` and `FolderWrite` (and any future kinds) in a single subscription.
+ * Earlier, kind-specific call sites keep using `isNetRequestForProject` directly.
+ */
+export function isConsentRequestForProject(
+  request: ConsentRequest,
+  projectId: string,
+): boolean {
+  return request.projectId === projectId;
+}
+
 // ─────────────────────────────────────────────────────────────
 // FIFO queue helpers (pure, tested)
 // ─────────────────────────────────────────────────────────────
 
 /**
  * Returns true when two ConsentRequests have the same logical identity:
- * same projectId and agentId. Used to deduplicate rapid duplicate events from
- * the Tauri backend before they enter the pending queue.
+ * same projectId, agentId, AND kind. Used to deduplicate rapid duplicate events
+ * from the Tauri backend before they enter the pending queue.
+ *
+ * Kind is included because an agent can legitimately be blocked on BOTH a net
+ * AND a folderWrite request simultaneously — treating them as the same identity
+ * would silently drop the second request and leave the agent permanently stuck.
  */
 export function sameConsentRequest(a: ConsentRequest, b: ConsentRequest): boolean {
-  return a.projectId === b.projectId && a.agentId === b.agentId;
+  return a.projectId === b.projectId && a.agentId === b.agentId && a.kind === b.kind;
 }
 
 /**

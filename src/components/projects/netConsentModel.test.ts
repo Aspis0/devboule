@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   enqueueConsent,
+  grantFolderConsentArgs,
   grantNetConsentArgs,
+  isConsentRequestForProject,
   isNetRequestForProject,
   sameConsentRequest,
   type ConsentDecision,
@@ -136,10 +138,23 @@ describe("sameConsentRequest", () => {
     expect(sameConsentRequest(a, b)).toBe(false);
   });
 
-  it("ignores kind when comparing identity", () => {
+  it("returns false when kind differs (same projectId + agentId)", () => {
+    const a = makeRequest({ kind: "net" });
+    const b = makeRequest({ kind: "folderWrite" });
+    // An agent can be blocked on net AND folderWrite simultaneously; they must
+    // be treated as distinct identity slots so neither is deduped away.
+    expect(sameConsentRequest(a, b)).toBe(false);
+  });
+
+  it("returns false when kind differs (net vs exec)", () => {
     const a = makeRequest({ kind: "net" });
     const b = makeRequest({ kind: "exec" });
-    // same projectId + agentId → same identity regardless of kind
+    expect(sameConsentRequest(a, b)).toBe(false);
+  });
+
+  it("returns true only when projectId, agentId, AND kind are all identical", () => {
+    const a = makeRequest({ kind: "folderWrite" });
+    const b = makeRequest({ kind: "folderWrite" });
     expect(sameConsentRequest(a, b)).toBe(true);
   });
 
@@ -184,9 +199,9 @@ describe("enqueueConsent", () => {
     expect(result).toBe(list);
   });
 
-  it("deduplicates: a duplicate event for the same (projectId, agentId) is ignored", () => {
-    const req = makeRequest({ agentId: "agent-A", projectId: "proj-1" });
-    const dup = makeRequest({ agentId: "agent-A", projectId: "proj-1" });
+  it("deduplicates: a duplicate event for the same (projectId, agentId, kind) is ignored", () => {
+    const req = makeRequest({ agentId: "agent-A", projectId: "proj-1", kind: "net" });
+    const dup = makeRequest({ agentId: "agent-A", projectId: "proj-1", kind: "net" });
     const list = enqueueConsent([], req);
     const result = enqueueConsent(list, dup);
     expect(result).toHaveLength(1);
@@ -227,5 +242,137 @@ describe("enqueueConsent", () => {
     const original = [req];
     enqueueConsent(original, newReq);
     expect(original).toHaveLength(1);
+  });
+});
+
+// ── isConsentRequestForProject ────────────────────────────────────────────────
+
+describe("isConsentRequestForProject", () => {
+  it("returns true for kind=net when projectId matches", () => {
+    expect(isConsentRequestForProject(makeRequest({ kind: "net" }), "proj-1")).toBe(true);
+  });
+
+  it("returns true for kind=folderWrite when projectId matches", () => {
+    expect(
+      isConsentRequestForProject(makeRequest({ kind: "folderWrite" }), "proj-1"),
+    ).toBe(true);
+  });
+
+  it("returns true for kind=exec when projectId matches", () => {
+    expect(isConsentRequestForProject(makeRequest({ kind: "exec" }), "proj-1")).toBe(true);
+  });
+
+  it("returns true for kind=patch when projectId matches", () => {
+    expect(isConsentRequestForProject(makeRequest({ kind: "patch" }), "proj-1")).toBe(true);
+  });
+
+  it("returns false when projectId does not match, regardless of kind", () => {
+    expect(isConsentRequestForProject(makeRequest({ kind: "net" }), "proj-other")).toBe(
+      false,
+    );
+    expect(
+      isConsentRequestForProject(makeRequest({ kind: "folderWrite" }), "proj-other"),
+    ).toBe(false);
+  });
+
+  it("is case-sensitive on projectId", () => {
+    expect(
+      isConsentRequestForProject(makeRequest({ projectId: "Proj-1" }), "proj-1"),
+    ).toBe(false);
+  });
+
+  // Cross-kind independence: an agent blocked on BOTH net AND folderWrite must
+  // have BOTH requests enqueued — different kinds are different identity slots.
+  it("enqueueConsent keeps both requests when same agent has different kinds", () => {
+    const netReq = makeRequest({ kind: "net" });
+    const folderReq = makeRequest({ kind: "folderWrite" });
+    const list = enqueueConsent([], netReq);
+    // folderReq shares (projectId, agentId) but different kind → must enqueue.
+    const result = enqueueConsent(list, folderReq);
+    expect(result).toHaveLength(2);
+    expect(result[0].kind).toBe("net");
+    expect(result[1].kind).toBe("folderWrite");
+  });
+
+  // Same kind still deduplicates (a rapid duplicate net event must not double-enqueue).
+  it("enqueueConsent deduplicates exact-same-kind re-fire to 1 item", () => {
+    const netReq = makeRequest({ kind: "net", agentId: "agent-A" });
+    const netDup = makeRequest({ kind: "net", agentId: "agent-A" });
+    const list = enqueueConsent([], netReq);
+    const result = enqueueConsent(list, netDup);
+    expect(result).toHaveLength(1);
+    expect(result).toBe(list); // same array reference — no allocation
+  });
+});
+
+// ── grantFolderConsentArgs ────────────────────────────────────────────────────
+
+describe("grantFolderConsentArgs", () => {
+  it("AllowRemember: emits the exact camelCase shape the Rust backend expects", () => {
+    const args = grantFolderConsentArgs({
+      projectId: "proj-abc",
+      folder: "/tmp/extra",
+      decision: "allowRemember",
+    });
+    expect(args).toEqual({
+      projectId: "proj-abc",
+      folder: "/tmp/extra",
+      decision: "allowRemember",
+    });
+  });
+
+  it("AllowOnce: emits 'allowOnce'", () => {
+    const args = grantFolderConsentArgs({
+      projectId: "proj-abc",
+      folder: "/tmp/extra",
+      decision: "allowOnce",
+    });
+    expect(args).toEqual({
+      projectId: "proj-abc",
+      folder: "/tmp/extra",
+      decision: "allowOnce",
+    });
+  });
+
+  it("Deny: emits 'deny'", () => {
+    const args = grantFolderConsentArgs({
+      projectId: "proj-abc",
+      folder: "/tmp/extra",
+      decision: "deny",
+    });
+    expect(args).toEqual({
+      projectId: "proj-abc",
+      folder: "/tmp/extra",
+      decision: "deny",
+    });
+  });
+
+  it("contains exactly {projectId, folder, decision} — no extras", () => {
+    const args = grantFolderConsentArgs({
+      projectId: "p",
+      folder: "/f",
+      decision: "deny",
+    });
+    expect(Object.keys(args).sort()).toEqual(["decision", "folder", "projectId"]);
+  });
+
+  it("passes folder unchanged", () => {
+    const args = grantFolderConsentArgs({
+      projectId: "p",
+      folder: "/home/user/workspace",
+      decision: "allowOnce",
+    });
+    expect(args.folder).toBe("/home/user/workspace");
+  });
+
+  it("all three decisions produce distinct args objects", () => {
+    const decisions: ConsentDecision[] = ["allowRemember", "allowOnce", "deny"];
+    const decisions_set = new Set(
+      decisions.map(
+        (d) =>
+          grantFolderConsentArgs({ projectId: "p", folder: "/f", decision: d }).decision,
+      ),
+    );
+    expect(decisions_set.size).toBe(3);
   });
 });

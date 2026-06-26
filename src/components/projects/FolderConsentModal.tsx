@@ -1,24 +1,25 @@
-// NetConsentModal — inline permission-broker card shown when a mini-coder agent
-// is blocked by a missing network permission (sandbox://consent-request, kind=Net).
+// FolderConsentModal — inline permission-broker card shown when a mini-coder
+// agent is blocked by a missing folder-write permission (sandbox://consent-request,
+// kind=FolderWrite).
 //
-// Design constraints from the plan:
-//   - Seatbelt cannot be widened mid-run. The grant activates on the NEXT spawn/retry.
+// Design constraints (mirror NetConsentModal):
+//   - Seatbelt cannot be widened mid-run. The grant activates on the NEXT spawn.
 //   - Copy must make this clear so the user knows to re-launch their task.
-//   - detail is shown as a short hint only; never dump raw secrets.
+//   - detail holds the absolute folder path; clipped to 120 chars, never raw secrets.
 //   - Three decisions:
-//     AllowRemember → persists net_enabled=true for the project (survives restart)
+//     AllowRemember → persists the folder in working_set (survives restart)
 //     AllowOnce     → one-shot transient grant consumed at the next spawn
 //     Deny          → no-op; the next run will fail again
 //
-// Mirrors PlanApprovalCard.tsx for inline card style.
+// Mirrors NetConsentModal for card style, aria, layout, and button ordering.
 
 import { useEffect, useRef, useState } from "react";
-import { ShieldAlert } from "lucide-react";
+import { FolderLock } from "lucide-react";
 import { stripSpoofChars } from "../agents/attentionNotifier";
 import type { ConsentDecision, ConsentRequest } from "./netConsentModel";
 
-export interface NetConsentModalProps {
-  /** The pending consent request to show. */
+export interface FolderConsentModalProps {
+  /** The pending FolderWrite consent request to show. */
   request: ConsentRequest;
   /** Called with the user's decision — parent handles the invoke and queue pop. */
   onDecision: (d: ConsentDecision) => void;
@@ -29,32 +30,33 @@ export interface NetConsentModalProps {
 }
 
 /**
- * Truncate the detail string to a safe display length.
- * The backend sets `detail` to a human-readable context string (e.g. the command
- * that hit the block); it can contain file paths / env-var names but never raw
- * secrets. We clip to 120 chars so the card stays compact.
+ * Truncate the folder path to a safe display length.
+ * `detail` from the backend is the absolute path that hit the block; it is
+ * already sanitized by the backend but we clip to 120 chars so the card stays
+ * compact, and run stripSpoofChars to neutralize any unicode control sequences.
  */
-function safeDetail(raw: string): string {
+function safeFolder(raw: string): string {
   const sanitized = stripSpoofChars(raw.trim());
   return sanitized.length > 120 ? `${sanitized.slice(0, 117)}…` : sanitized;
 }
 
-export function NetConsentModal({
+export function FolderConsentModal({
   request,
   busy,
   error,
   onDecision,
-}: NetConsentModalProps) {
+}: FolderConsentModalProps) {
   const agentId = stripSpoofChars(request.agentId).slice(0, 40);
-  const detail = safeDetail(request.detail);
+  const folder = safeFolder(request.detail);
 
   // Track which decision is currently in-flight so "Working…" appears only on
-  // the clicked button (not always on "Allow for this project" regardless of click).
+  // the clicked button (not always on "Allow & remember" regardless of click).
   // Reset when busy goes false (action settled or error cleared).
   const [activeDecision, setActiveDecision] = useState<ConsentDecision | null>(null);
   const prevBusyRef = useRef(busy);
   useEffect(() => {
     if (prevBusyRef.current && !busy) {
+      // Action settled (success or error) — clear the in-flight indicator.
       setActiveDecision(null);
     }
     prevBusyRef.current = busy;
@@ -69,31 +71,31 @@ export function NetConsentModal({
     <div
       role="alertdialog"
       aria-modal="true"
-      aria-labelledby="net-consent-title"
-      aria-describedby="net-consent-body"
+      aria-labelledby="folder-consent-title"
+      aria-describedby="folder-consent-body"
       className="flex flex-col gap-3 rounded-2xl border border-amber/30 bg-amber/[0.05] p-3"
     >
       <div className="flex items-center gap-2">
-        <ShieldAlert className="h-4 w-4 shrink-0 text-amber-dark" aria-hidden />
+        <FolderLock className="h-4 w-4 shrink-0 text-amber-dark" aria-hidden />
         <h3
-          id="net-consent-title"
+          id="folder-consent-title"
           className="text-[12px] font-semibold text-amber-dark"
         >
-          Network access blocked
+          Folder write blocked
         </h3>
       </div>
 
       <div
-        id="net-consent-body"
+        id="folder-consent-body"
         className="flex flex-col gap-1.5 rounded-lg border border-cream-200 bg-white p-2.5"
       >
         <p className="text-[12px] text-cream-800">
-          <span className="font-semibold">{agentId}</span> tried to reach the
-          network but this project has network access disabled.
+          <span className="font-semibold">{agentId}</span> tried to write to a
+          folder outside this project that has not been granted write access.
         </p>
-        {detail && (
+        {folder && (
           <p className="break-all rounded bg-cream-50 px-2 py-1 font-mono text-[11px] text-cream-600">
-            {detail}
+            {folder}
           </p>
         )}
         <p className="mt-0.5 text-[11px] text-cream-500">
@@ -131,11 +133,11 @@ export function NetConsentModal({
           disabled={busy}
           className="rounded-lg bg-teal px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
         >
-          {activeDecision === "allowRemember" ? "Working…" : "Allow for this project"}
+          {activeDecision === "allowRemember" ? "Working…" : "Allow & remember"}
         </button>
       </div>
     </div>
   );
 }
 
-export default NetConsentModal;
+export default FolderConsentModal;

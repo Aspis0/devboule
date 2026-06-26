@@ -54,6 +54,7 @@ import type { SpawnLaunchInput, SpawnSelection } from "../agents/agentRowModel";
 import { AgentDetailDrawer } from "../agents/AgentDetailDrawer";
 import { CensorPanel } from "./CensorPanel";
 import { SandboxModeSelector } from "./SandboxModeSelector";
+import { WorkingSetCard } from "./WorkingSetCard";
 import { FocusStagePane } from "../work/FocusStagePane";
 import {
   Panel,
@@ -67,11 +68,13 @@ import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
 import { CensorFindingsTracker } from "./censorPanelModel";
+import { FolderConsentModal } from "./FolderConsentModal";
 import { NetConsentModal } from "./NetConsentModal";
 import {
   enqueueConsent,
+  grantFolderConsentArgs,
   grantNetConsentArgs,
-  isNetRequestForProject,
+  isConsentRequestForProject,
   sameConsentRequest,
   type ConsentRequest,
 } from "./netConsentModel";
@@ -170,6 +173,16 @@ export interface ProjectWorkspaceProps {
   /** Called after a successful sandbox-mode write so the parent can patch the
    *  in-memory project metadata immediately (avoids a ~10s wait for the poll). */
   onSandboxModeChange?: (mode: SandboxMode) => void;
+  /** Called after a successful working-set add or remove so the parent can patch
+   *  the in-memory project metadata immediately (avoids a ~10s wait for the poll). */
+  onWorkingSetChange?: (next: string[]) => void;
+  /**
+   * Called after a successful `grant_folder_consent` with decision=allowRemember so
+   * the parent can reload the project detail and surface the backend-canonicalized
+   * folder in WorkingSetCard without waiting for the 10s poll.
+   * Optional: if absent the card just waits for the next poll.
+   */
+  onReloadProject?: () => void;
 }
 
 export function ProjectWorkspace({
@@ -203,6 +216,8 @@ export function ProjectWorkspace({
   notesSlot,
   detailSlot,
   onSandboxModeChange,
+  onWorkingSetChange,
+  onReloadProject,
 }: ProjectWorkspaceProps) {
   const now = useNow();
   // Phase B twinning: the selection lives in the shared store so the bottom DAG board
@@ -483,7 +498,12 @@ export function ProjectWorkspace({
   // FIX 4: The current safety depends on the parent's key={projectId} triggering
   // a full remount on project switch; self-heal by resetting to true on each mount.
   useEffect(() => {
-    consentMountedRef.current = true; // FIX 4: self-heal if re-used without full remount
+    consentMountedRef.current = true;
+    // FIX 4: reset consentBusy on (re)mount so a re-used instance (one whose project
+    // prop changed without a full remount) can never start with all consent buttons
+    // permanently disabled. The parent uses key={projectId} to force full remounts on
+    // project switch, but the self-heal here is a defensive belt-and-suspenders guard.
+    setConsentBusy(false);
     return () => {
       consentMountedRef.current = false;
     };
@@ -506,7 +526,11 @@ export function ProjectWorkspace({
         (event) => {
           if (cancelled) return;
           const req = event.payload;
-          if (!isNetRequestForProject(req, project.metadata.id)) return;
+          // Accept both Net and FolderWrite (Slice 2) for the current project.
+          // Requests for other projects or unhandled kinds are silently ignored.
+          if (!isConsentRequestForProject(req, project.metadata.id)) return;
+          // Only handle kinds the UI knows about; unrecognised kinds are silently dropped.
+          if (req.kind !== "net" && req.kind !== "folderWrite") return;
           // FIX 1: append to FIFO queue, deduping by (projectId, agentId) so
           // a duplicate event doesn't double-enqueue the same request.
           setPendingConsents((prev) => enqueueConsent(prev, req));
@@ -533,15 +557,36 @@ export function ProjectWorkspace({
       setConsentBusy(true);
       setConsentError(null);
       try {
-        await invokeBackendCommand<void>(
-          "grant_net_consent",
-          grantNetConsentArgs({ projectId: head.projectId, decision }),
-        );
+        // Branch by kind: Net → grant_net_consent, FolderWrite → grant_folder_consent.
+        // Both share the same ConsentDecision enum and the same mounted-ref / FIFO logic.
+        if (head.kind === "folderWrite") {
+          await invokeBackendCommand<void>(
+            "grant_folder_consent",
+            grantFolderConsentArgs({
+              projectId: head.projectId,
+              folder: head.detail,
+              decision,
+            }),
+          );
+        } else {
+          // Default: treat as Net (the only other handled kind).
+          await invokeBackendCommand<void>(
+            "grant_net_consent",
+            grantNetConsentArgs({ projectId: head.projectId, decision }),
+          );
+        }
         if (consentMountedRef.current) {
           // FIX 1: remove head by identity so a concurrently enqueued request survives
           setPendingConsents((prev) =>
             prev.filter((r) => !sameConsentRequest(r, head)),
           );
+          // FIX 3b: after an allowRemember folder grant the backend canonicalizes the
+          // path and persists it to working_set. Trigger an immediate reload so
+          // WorkingSetCard reflects the canonical folder without waiting for the 10s
+          // poll. Net grants do not change working_set, so we only reload for folderWrite.
+          if (head.kind === "folderWrite" && decision === "allowRemember") {
+            onReloadProject?.();
+          }
         }
       } catch (e) {
         if (consentMountedRef.current) {
@@ -723,19 +768,34 @@ export function ProjectWorkspace({
           reason as the push card (approve/reject are mutations). */}
       {!readOnly && <PlanApprovalCard projectId={project.metadata.id} />}
 
-      {/* Net-consent gate — surfaces the network-permission prompt when a mini-coder
-          agent is blocked by a missing net grant. Hidden when archived (no live agents
-          to prompt). The grant applies on the NEXT spawn; NetConsentModal copy says so. */}
+      {/* Permission-broker consent gate — surfaces the head of the FIFO queue when
+          a mini-coder is blocked. Handles Net (Slice 0) and FolderWrite (Slice 2).
+          Hidden when archived (no live agents to prompt). Grant applies on NEXT spawn. */}
       {/* FIX 1: render the HEAD of the queue; subsequent requests queue up and
           become the new head once the user acts on the current one. */}
-      {!readOnly && pendingConsents.length > 0 && (
-        <NetConsentModal
-          request={pendingConsents[0]}
-          busy={consentBusy}
-          error={consentError}
-          onDecision={(d) => void handleConsentDecision(d)}
-        />
-      )}
+      {!readOnly && pendingConsents.length > 0 && (() => {
+        const head = pendingConsents[0];
+        const decisionHandler = (d: "allowRemember" | "allowOnce" | "deny") =>
+          void handleConsentDecision(d);
+        if (head.kind === "folderWrite") {
+          return (
+            <FolderConsentModal
+              request={head}
+              busy={consentBusy}
+              error={consentError}
+              onDecision={decisionHandler}
+            />
+          );
+        }
+        return (
+          <NetConsentModal
+            request={head}
+            busy={consentBusy}
+            error={consentError}
+            onDecision={decisionHandler}
+          />
+        );
+      })()}
 
       {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
       {launcherOpen && !readOnly && (
@@ -1016,6 +1076,13 @@ export function ProjectWorkspace({
                   projectId={project.metadata.id}
                   sandboxMode={project.metadata.sandboxMode}
                   onModeChange={onSandboxModeChange}
+                />
+              )}
+              {!readOnly && (
+                <WorkingSetCard
+                  projectId={project.metadata.id}
+                  workingSet={project.metadata.workingSet}
+                  onWorkingSetChange={onWorkingSetChange}
                 />
               )}
               <CensorPanel

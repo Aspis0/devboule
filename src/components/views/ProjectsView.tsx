@@ -2865,6 +2865,17 @@ export function ProjectsView() {
                   : current,
               );
             }}
+            onWorkingSetChange={(next: string[]) => {
+              setProject((current) =>
+                current?.metadata.id === currentProject.metadata.id
+                  ? {
+                      ...current,
+                      metadata: { ...current.metadata, workingSet: next },
+                    }
+                  : current,
+              );
+            }}
+            onReloadProject={() => void loadProject(currentProject.metadata.id)}
             onCommit={(message) => void commitProject(message)}
             onPush={() => void pushProject()}
             onPull={() => void pullProject()}

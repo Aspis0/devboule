@@ -170,6 +170,7 @@ pub fn create_project(
         censor_trusted: false,
         net_enabled: false,
         sandbox_mode: crate::backend::broker::SandboxMode::default(),
+        working_set: Vec::new(),
     };
     let state_block = ProjectStateBlock {
         version: 1,
@@ -2339,6 +2340,189 @@ pub fn grant_net_consent(
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// working_set — per-project extra writable folders outside the project root
+// (SANDBOX broker Slice 2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// SANDBOX broker Slice 2: read the persistent working set (extra writable folders outside root).
+pub fn project_working_set(app: &tauri::AppHandle, project_id: &str) -> Result<Vec<String>, String> {
+    Ok(read_project_by_id(app, project_id)?.metadata.working_set)
+}
+
+/// Normalize a working-set folder path for persistence: canonicalize + validate it's absolute
+/// and non-empty. Returns the canonical absolute path as a string, or Err if the path
+/// does not exist / cannot be canonicalized.
+///
+/// Used for ADD and for the AllowOnce consent path (both require the folder to exist
+/// before it can be usefully granted).
+fn normalize_working_set_folder(folder: &str) -> Result<String, String> {
+    let trimmed = folder.trim();
+    if trimmed.is_empty() {
+        return Err("folder path must not be empty".to_string());
+    }
+    let p = std::path::Path::new(trimmed);
+    if !p.is_absolute() {
+        return Err("folder path must be absolute".to_string());
+    }
+    let canon = p.canonicalize().map_err(|e| format!("cannot canonicalize folder: {e}"))?;
+    Ok(canon.to_string_lossy().into_owned())
+}
+
+/// BLOCKER 2: Normalize a working-set folder path LEXICALLY (no filesystem access).
+///
+/// Used for REMOVE so a previously-granted folder that has since been deleted or
+/// unmounted can still be removed from the stored list. Canonicalization would fail
+/// for a non-existent path; a lexical pass is sufficient here because stored entries
+/// are already canonicalized absolute paths (added via `normalize_working_set_folder`).
+///
+/// Rules (no disk access):
+///  - Must be non-empty and absolute.
+///  - Strips trailing slash(es).
+///  - Resolves `.` segments (never produces `..` — `..` segments in the input are an
+///    error since stored entries never contain them; we reject rather than guess).
+fn normalize_working_set_folder_lexical(folder: &str) -> Result<String, String> {
+    let trimmed = folder.trim();
+    if trimmed.is_empty() {
+        return Err("folder path must not be empty".to_string());
+    }
+    if !trimmed.starts_with('/') {
+        return Err("folder path must be absolute".to_string());
+    }
+    // Lexical path normalization: split on `/`, drop empty/`.`, reject `..`.
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in trimmed.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => return Err("folder path must not contain '..' segments".to_string()),
+            s => parts.push(s),
+        }
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+/// SANDBOX broker Slice 2: add a folder to the project's persistent working set.
+/// Canonicalizes the path; deduplicates (adding an already-present folder is a no-op).
+/// Ignores empty folder strings.
+pub fn add_project_working_set_folder(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    folder: &str,
+) -> Result<(), String> {
+    let canonical = normalize_working_set_folder(folder)?;
+    let path = project_path_by_id(app, project_id)?;
+    mutate_project_file_latest(&path, |project| {
+        if !project.metadata.working_set.contains(&canonical) {
+            project.metadata.working_set.push(canonical.clone());
+        }
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// SANDBOX broker Slice 2: remove a folder from the project's persistent working set.
+///
+/// BLOCKER 2 fix: uses LEXICAL normalization (no disk access) so that removing a
+/// previously-granted folder that has since been deleted or unmounted succeeds.
+/// Adding still uses `normalize_working_set_folder` (canonicalize) to ensure only
+/// real paths enter the set.
+pub fn remove_project_working_set_folder(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    folder: &str,
+) -> Result<(), String> {
+    let normalized = normalize_working_set_folder_lexical(folder)?;
+    let path = project_path_by_id(app, project_id)?;
+    remove_project_working_set_by_path(&path, &normalized)
+}
+
+/// Internal helper: remove a folder string from the project file's working_set.
+/// `folder` must already be normalized (canonical form stored on disk).
+/// Extracted so tests can call it directly without needing an `AppHandle`.
+fn remove_project_working_set_by_path(
+    project_path: &std::path::Path,
+    folder: &str,
+) -> Result<(), String> {
+    mutate_project_file_latest(project_path, |project| {
+        project.metadata.working_set.retain(|f| f != folder);
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Tauri command: read the project's working set.
+#[tauri::command]
+pub fn project_working_set_cmd(
+    project_id: String,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<Vec<String>, String> {
+    backend_state.ensure_unlocked()?;
+    project_working_set(&app, &project_id)
+}
+
+/// Tauri command: add a folder to the project's working set.
+#[tauri::command]
+pub fn add_project_working_set_folder_cmd(
+    project_id: String,
+    folder: String,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    add_project_working_set_folder(&app, &project_id, &folder)
+}
+
+/// Tauri command: remove a folder from the project's working set.
+#[tauri::command]
+pub fn remove_project_working_set_folder_cmd(
+    project_id: String,
+    folder: String,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    remove_project_working_set_folder(&app, &project_id, &folder)
+}
+
+/// Tauri command: apply a consent decision from the frontend FolderWrite consent modal.
+///
+/// - `AllowRemember` → persists the folder in the project's `working_set` (survives restart).
+/// - `AllowOnce` → inserts a one-shot transient grant consumed at the next agentic spawn.
+/// - `Deny` → no-op (the next run will fail again; user may retry manually).
+///
+/// Mirrors `grant_net_consent` exactly.
+#[tauri::command]
+pub fn grant_folder_consent(
+    project_id: String,
+    folder: String,
+    decision: crate::backend::broker::ConsentDecision,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+    broker: State<'_, crate::backend::broker::PermissionBrokerState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    match decision {
+        crate::backend::broker::ConsentDecision::AllowRemember => {
+            add_project_working_set_folder(&app, &project_id, &folder)?;
+        }
+        crate::backend::broker::ConsentDecision::AllowOnce => {
+            // WARNING 1 fix: propagate Err instead of unwrap_or(raw_string).
+            // The `folder` comes from `out_of_scope_write` which is already canonicalized
+            // by write_file_abs (via canonicalize()), so this will succeed in normal flow.
+            // Failing when the path is un-canonicalizable is the correct behavior: storing
+            // a raw unchecked string would cause an infinite consent loop (the next spawn
+            // would try to match it against a canonical path and silently fail to grant it).
+            let canonical = normalize_working_set_folder(&folder)?;
+            broker.grant_folder_once(&project_id, &canonical);
+        }
+        crate::backend::broker::ConsentDecision::Deny => {
+            // No-op: next run will fail again; the user may invoke this command again.
+        }
+    }
+    Ok(())
+}
+
 fn read_project_file(path: &Path) -> Result<ParsedProject, String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("Could not read project file {}: {e}", path.display()))?;
@@ -2496,6 +2680,16 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     _ => crate::backend::broker::SandboxMode::Ask,
                 })
                 .unwrap_or_default();
+            // SANDBOX broker Slice 2: read working_set. The value is a compact JSON array
+            // stored on a single frontmatter line, e.g. `working_set: ["/tmp/a","/tmp/b"]`.
+            // Missing key → empty (NO-CHURN: a project written before this feature was added
+            // has no key and must load with an empty working set). An unparseable value degrades
+            // to empty rather than erroring the whole parse (same tolerant posture as sandbox_mode).
+            let working_set: Vec<String> = fields
+                .get("working_set")
+                .or_else(|| fields.get("workingSet"))
+                .and_then(|value| serde_json::from_str(value.trim()).ok())
+                .unwrap_or_default();
             return Ok((
                 ProjectMetadata {
                     id,
@@ -2506,6 +2700,7 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     censor_trusted,
                     net_enabled,
                     sandbox_mode,
+                    working_set,
                 },
                 offset,
             ));
@@ -2639,7 +2834,7 @@ fn write_project_file(project: &ParsedProject) -> Result<(), String> {
 fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<String, String> {
     let (_, end) = parse_frontmatter(content, Path::new("project.md"))?;
     let frontmatter = format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}---\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}---\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2652,6 +2847,7 @@ fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<Stri
         censor_trusted_frontmatter_line(metadata.censor_trusted),
         net_enabled_frontmatter_line(metadata.net_enabled),
         sandbox_mode_frontmatter_line(metadata.sandbox_mode),
+        working_set_frontmatter_line(&metadata.working_set),
     );
     Ok(format!("{frontmatter}{}", &content[end..]))
 }
@@ -2692,12 +2888,26 @@ fn sandbox_mode_frontmatter_line(mode: crate::backend::broker::SandboxMode) -> S
     }
 }
 
+/// SANDBOX broker Slice 2 NO-CHURN: emit `working_set: [...]` ONLY when non-empty.
+/// The value is a compact JSON array on ONE line so `parse_simple_yaml` can split on the FIRST
+/// colon and still get a parseable value (the entries are JSON strings, no unescaped colons).
+/// An empty working_set emits nothing — pre-existing project files stay byte-stable.
+fn working_set_frontmatter_line(folders: &[String]) -> String {
+    if folders.is_empty() {
+        return String::new();
+    }
+    // serde_json compact array: `["/tmp/a","/tmp/b"]` — no spaces, no unescaped colons,
+    // stays on one line, parses back cleanly via `serde_json::from_str` in parse_frontmatter.
+    let json = serde_json::to_string(folders).unwrap_or_else(|_| "[]".to_string());
+    format!("working_set: {json}\n")
+}
+
 fn initial_project_markdown(
     metadata: &ProjectMetadata,
     state: &ProjectStateBlock,
 ) -> Result<String, String> {
     Ok(format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -2710,6 +2920,7 @@ fn initial_project_markdown(
         censor_trusted_frontmatter_line(metadata.censor_trusted),
         net_enabled_frontmatter_line(metadata.net_enabled),
         sandbox_mode_frontmatter_line(metadata.sandbox_mode),
+        working_set_frontmatter_line(&metadata.working_set),
         serde_json::to_string_pretty(state)
             .map_err(|e| format!("Project state could not be serialized: {e}"))?
     ))
@@ -9003,6 +9214,7 @@ mod tests {
             censor_trusted: true,
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
         };
         let serialized = replace_frontmatter(old, &trusted).unwrap();
         assert!(serialized.contains("censor_trusted: true"));
@@ -9035,6 +9247,7 @@ mod tests {
             censor_trusted: false,
             net_enabled: true,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
         };
         let serialized = replace_frontmatter(old, &enabled).unwrap();
         assert!(serialized.contains("net_enabled: true"));
@@ -9078,6 +9291,7 @@ mod tests {
             censor_trusted: false,
             net_enabled: false,
             sandbox_mode: SandboxMode::Ask,
+            working_set: Vec::new(),
         };
         let serialized_ask = replace_frontmatter(old, &ask_meta).unwrap();
         assert!(
@@ -9179,6 +9393,7 @@ mod tests {
             censor_trusted: false,
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -9274,6 +9489,7 @@ updated_at: 2026-05-28T00:00:00Z
             censor_trusted: false,
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -9727,6 +9943,196 @@ updated_at: 2026-05-28T00:00:00Z
         assert!(!broker.take_net_grant("proj-y"));
     }
 
+    // ── Slice 2: working_set NO-CHURN + round-trip ────────────────────────────
+
+    /// `working_set` field is absent (NO-CHURN) when empty; missing key → empty on parse.
+    #[test]
+    fn working_set_no_churn_empty_omitted_and_missing_parses_as_empty() {
+        let (root, path) = write_temp_project("working-set-churn");
+        let initial = read_project_file(&path).unwrap();
+        assert!(
+            initial.metadata.working_set.is_empty(),
+            "fresh project must have empty working_set"
+        );
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !disk.contains("working_set"),
+            "NO-CHURN: empty working_set must not be serialized to disk"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `working_set` persists through the locked write and the key appears/disappears correctly.
+    #[test]
+    fn working_set_persists_through_locked_write_and_clears_no_churn() {
+        let (root, path) = write_temp_project("working-set-rw");
+
+        // Add a folder.
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.working_set = vec!["/tmp/shared-libs".to_string()];
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        let after_set = read_project_file(&path).unwrap();
+        assert_eq!(after_set.metadata.working_set, vec!["/tmp/shared-libs"]);
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            disk.contains("working_set"),
+            "non-empty working_set must be serialized to disk"
+        );
+
+        // Clear it — key must vanish (NO-CHURN).
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.working_set.clear();
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+        let after_clear = read_project_file(&path).unwrap();
+        assert!(after_clear.metadata.working_set.is_empty());
+        let disk_after = fs::read_to_string(&path).unwrap();
+        assert!(
+            !disk_after.contains("working_set"),
+            "empty working_set must NOT leave key on disk (NO-CHURN)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Multiple folders round-trip preserving order and content.
+    #[test]
+    fn working_set_multiple_folders_roundtrip() {
+        let (root, path) = write_temp_project("working-set-multi");
+        let folders = vec!["/tmp/a".to_string(), "/tmp/b".to_string(), "/home/user/shared".to_string()];
+
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.working_set = folders.clone();
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+
+        let reparsed = read_project_file(&path).unwrap();
+        assert_eq!(reparsed.metadata.working_set, folders, "all folders must survive round-trip");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A frontmatter with a pre-existing `working_set` key parses back correctly.
+    #[test]
+    fn working_set_parses_from_frontmatter_json_array() {
+        // Manually craft a frontmatter with working_set as it would appear on disk.
+        let content = "---\nid: proj-ws\ntitle: WS\nstatus: active\nupdated_at: 2026-01-01T00:00:00Z\nworking_set: [\"/tmp/a\",\"/tmp/b\"]\n---\n\n```aspis-project\n{\"version\":1,\"tasks\":[],\"notes\":[]}\n```\n";
+        let (meta, _) = parse_frontmatter(content, Path::new("proj-ws.md")).unwrap();
+        assert_eq!(meta.working_set, vec!["/tmp/a", "/tmp/b"]);
+    }
+
+    // ── grant_folder_consent mapping ─────────────────────────────────────────
+
+    /// AllowOnce: transient grant inserted, readable via take_folder_grants.
+    #[test]
+    fn grant_folder_consent_allow_once_inserts_transient() {
+        let broker = crate::backend::broker::PermissionBrokerState::new();
+        broker.grant_folder_once("proj-x", "/tmp/extra");
+        let grants = broker.take_folder_grants("proj-x");
+        assert!(grants.contains("/tmp/extra"), "AllowOnce must insert transient grant");
+        assert!(broker.take_folder_grants("proj-x").is_empty(), "consumed after first take");
+    }
+
+    /// Deny: nothing in transient state.
+    #[test]
+    fn grant_folder_consent_deny_does_nothing() {
+        let broker = crate::backend::broker::PermissionBrokerState::new();
+        // No grant_folder_once called — simulates the Deny branch.
+        assert!(broker.take_folder_grants("proj-z").is_empty());
+    }
+
+    // ── BLOCKER 2: normalize_working_set_folder_lexical for remove path ───────
+
+    /// `normalize_working_set_folder_lexical` must succeed on a non-existent path (no
+    /// disk access) — enabling removal of stale/deleted working_set entries.
+    #[test]
+    fn normalize_lexical_succeeds_on_nonexistent_path() {
+        // An absolute path that does NOT exist on disk.
+        let nonexistent = "/tmp/aspis_deleted_folder_does_not_exist_xyz_blorp";
+        let result = normalize_working_set_folder_lexical(nonexistent);
+        assert!(result.is_ok(), "lexical normalize must not need the path to exist: {:?}", result);
+        // The result must be the same path (already clean, no trailing slash, no dots).
+        assert_eq!(result.unwrap(), nonexistent);
+    }
+
+    /// Lexical normalization strips trailing slashes and resolves `.` segments without
+    /// touching the filesystem.
+    #[test]
+    fn normalize_lexical_strips_trailing_slash_and_dots() {
+        assert_eq!(
+            normalize_working_set_folder_lexical("/tmp/foo/").unwrap(),
+            "/tmp/foo"
+        );
+        assert_eq!(
+            normalize_working_set_folder_lexical("/tmp/foo/./bar/").unwrap(),
+            "/tmp/foo/bar"
+        );
+    }
+
+    /// Lexical normalization rejects empty paths and relative paths (same gates as
+    /// the canonicalize path).
+    #[test]
+    fn normalize_lexical_rejects_empty_and_relative() {
+        assert!(normalize_working_set_folder_lexical("").is_err());
+        assert!(normalize_working_set_folder_lexical("relative/path").is_err());
+    }
+
+    /// `remove_project_working_set_folder_by_path` — the internal path-level helper — removes
+    /// a stored entry even after the folder has been deleted from disk.
+    #[cfg(unix)]
+    #[test]
+    fn remove_working_set_folder_after_delete_from_disk() {
+        use std::fs;
+        // Create a real folder, get its canonical path, then delete it.
+        let base = std::env::temp_dir()
+            .join(format!("aspis_rmws_{}_{}", std::process::id(), line!()));
+        fs::create_dir_all(&base).unwrap();
+        let canonical = base.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        // Simulate a project file with this folder in the working_set.
+        let (root, path) = write_temp_project("remove-ws-deleted");
+        mutate_project_file_latest(&path, |project| {
+            project.metadata.working_set = vec![canonical.clone()];
+            Ok(())
+        })
+        .unwrap()
+        .expect("present project");
+
+        // Delete the folder from disk — canonicalize now fails.
+        fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists(), "folder must be gone");
+
+        // The remove path must still work.
+        let result = remove_project_working_set_by_path(&path, &canonical);
+        assert!(result.is_ok(), "remove must succeed even after folder deleted: {:?}", result);
+
+        // Entry must be gone from the project file.
+        let reread = read_project_file(&path).unwrap();
+        assert!(
+            reread.metadata.working_set.is_empty(),
+            "working_set must be empty after remove: {:?}", reread.metadata.working_set
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── WARNING 1: grant_folder_consent AllowOnce must propagate canonicalize error ─
+
+    /// `normalize_working_set_folder` returns Err for a nonexistent path (used for
+    /// the ADD path and the AllowOnce grant path). Confirms the `?` propagation is correct.
+    #[test]
+    fn normalize_working_set_folder_fails_for_nonexistent() {
+        let nonexistent = "/tmp/aspis_absolutely_does_not_exist_xyz_warning1_blorp";
+        let result = normalize_working_set_folder(nonexistent);
+        assert!(result.is_err(), "normalize_working_set_folder must fail for nonexistent path");
+    }
+
     /// A milestone added via the locked latest-on-disk write helper (the exact
     /// helper `add_project_milestone` uses) survives a write→read cycle AND does not
     /// drop a concurrent note write — proving the locked read-modify-write prevents
@@ -10059,6 +10465,7 @@ updated_at: 2026-05-28T00:00:00Z
                 censor_trusted: false,
                 net_enabled: false,
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
+                working_set: Vec::new(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -10537,6 +10944,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 censor_trusted: false,
                 net_enabled: false,
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
+                working_set: Vec::new(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -13008,6 +13416,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 censor_trusted: false,
                 net_enabled: false,
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
+                working_set: Vec::new(),
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -13362,6 +13771,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             censor_trusted: false,
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -13550,6 +13960,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             censor_trusted: false,
             net_enabled: false,
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
         };
         let state = ProjectStateBlock {
             version: 1,

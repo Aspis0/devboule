@@ -157,6 +157,12 @@ pub struct ProjectMetadata {
     /// the on-disk frontmatter when equal to `Ask` so pre-existing project files stay byte-stable.
     #[serde(default, skip_serializing_if = "crate::backend::broker::is_default_sandbox_mode")]
     pub sandbox_mode: crate::backend::broker::SandboxMode,
+    /// SANDBOX broker Slice 2: per-project working set — extra folders OUTSIDE the project
+    /// root that the user has explicitly granted persistent write access to.  Each entry is
+    /// an absolute, canonicalized path.  Default empty.  NO-CHURN: omitted from the on-disk
+    /// frontmatter when empty so pre-existing project files stay byte-stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_set: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

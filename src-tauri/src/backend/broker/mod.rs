@@ -11,7 +11,7 @@
 //! - Consent is therefore "fail → prompt → applies at NEXT spawn/retry", never mid-run.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ──────────────────────────────────────────────
 // SandboxMode — per-project autonomy knob
@@ -63,6 +63,16 @@ impl SandboxMode {
     /// only the network-prompt behaviour, which is identical for Ask and
     /// AutoAcceptInWorkspace.
     pub fn prompts_for_net(self) -> bool {
+        !matches!(self, SandboxMode::Unattended)
+    }
+
+    /// Returns `true` when this mode should emit a FolderWrite consent prompt.
+    ///
+    /// Semantics mirror `prompts_for_net`: only `Unattended` returns `false` (fail-closed).
+    /// `AutoAcceptInWorkspace` still prompts for a NEW out-of-project folder: the
+    /// "auto-accept" only covers KNOWN workspace-internal writes; a previously-unseen
+    /// folder outside the root always requires explicit user consent regardless of mode.
+    pub fn prompts_for_folder_write(self) -> bool {
         !matches!(self, SandboxMode::Unattended)
     }
 }
@@ -162,6 +172,10 @@ pub enum ConsentDecision {
 pub struct PermissionBrokerState {
     /// Project ids that have a pending one-shot net grant (consumed on first use).
     transient_net_grants: std::sync::Mutex<HashSet<String>>,
+    /// Per-project one-shot FOLDER grants (consumed all at once on the next spawn).
+    /// `project_id → HashSet<folder_path>`. A HashSet deduplicates: adding the same
+    /// folder twice is idempotent (still exactly one shot after this call).
+    transient_folder_grants: std::sync::Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl Default for PermissionBrokerState {
@@ -174,6 +188,7 @@ impl PermissionBrokerState {
     pub fn new() -> Self {
         Self {
             transient_net_grants: std::sync::Mutex::new(HashSet::new()),
+            transient_folder_grants: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -197,6 +212,68 @@ impl PermissionBrokerState {
             .unwrap_or_else(|e| e.into_inner());
         set.remove(project_id)
     }
+
+    // ── Transient folder grants (Slice 2) ─────────────────────────────────────
+
+    /// Record a one-shot folder grant for `project_id`.  Idempotent: adding the same
+    /// folder twice still results in exactly one entry (HashSet deduplication).
+    pub fn grant_folder_once(&self, project_id: &str, folder: &str) {
+        let mut map = self
+            .transient_folder_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(project_id.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(folder.to_string());
+    }
+
+    /// Consume ALL one-shot folder grants for `project_id`.  Returns the set (possibly
+    /// empty) and removes the entry so a subsequent call returns an empty set.  The
+    /// caller should union this with the persistent `working_set`:
+    /// `working_set ∪ broker.take_folder_grants(project_id)`.
+    pub fn take_folder_grants(&self, project_id: &str) -> HashSet<String> {
+        let mut map = self
+            .transient_folder_grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(project_id).unwrap_or_default()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Slice 2: working-set resolver (pure helper)
+// ──────────────────────────────────────────────
+
+/// Pure, unit-testable working-set resolver for the agentic spawn path.
+///
+/// Returns the effective set of EXTRA writable folders for the next spawn, by unioning
+/// the project's persisted `working_set` with the one-shot `transient` grants.
+///
+/// Invariant mirrors `resolve_net_enabled`:
+///
+/// | `mode`                  | `transient` contents | result                            |
+/// |-------------------------|:--------------------:|:----------------------------------|
+/// | any                     | (irrelevant)         | persisted folders always included |
+/// | `Ask` / `AutoAccept`    | non-empty            | union(persisted, transient)       |
+/// | `Unattended`            | non-empty            | persisted only (transient ignored)|
+///
+/// `Unattended` is fail-closed: a stale one-shot grant (issued before the project was
+/// switched to `Unattended`) must NOT silently expand the writable surface.  Only a
+/// standing `AllowRemember` opt-in (which lands in the persisted `working_set`) counts.
+///
+/// This function is deliberately free of I/O so it can be unit-tested directly.
+pub fn resolve_working_set(
+    persisted: &[String],
+    transient: HashSet<String>,
+    mode: SandboxMode,
+) -> Vec<String> {
+    let mut result: HashSet<&str> = persisted.iter().map(String::as_str).collect();
+    if mode != SandboxMode::Unattended {
+        for f in &transient {
+            result.insert(f.as_str());
+        }
+    }
+    result.into_iter().map(str::to_string).collect()
 }
 
 // ──────────────────────────────────────────────
@@ -437,5 +514,220 @@ mod tests {
         assert!(json.contains("\"projectId\""));
         assert!(json.contains("\"agentId\""));
         assert!(json.contains("\"net\""));
+    }
+
+    // ── prompts_for_folder_write ──────────────────────────────────────────────
+
+    /// `Unattended` never prompts for a FolderWrite either — fail-closed.
+    /// `Ask` and `AutoAcceptInWorkspace` always prompt for a NEW out-of-project folder.
+    #[test]
+    fn prompts_for_folder_write_only_false_for_unattended() {
+        assert!(
+            SandboxMode::Ask.prompts_for_folder_write(),
+            "Ask must prompt for folder write"
+        );
+        assert!(
+            SandboxMode::AutoAcceptInWorkspace.prompts_for_folder_write(),
+            "AutoAcceptInWorkspace must still prompt for out-of-project NEW folders"
+        );
+        assert!(
+            !SandboxMode::Unattended.prompts_for_folder_write(),
+            "Unattended must NOT prompt (fail-closed)"
+        );
+    }
+
+    // ── transient folder grants ───────────────────────────────────────────────
+
+    #[test]
+    fn take_folder_grants_empty_when_no_grant() {
+        let broker = PermissionBrokerState::new();
+        assert!(broker.take_folder_grants("proj-1").is_empty());
+    }
+
+    #[test]
+    fn take_folder_grants_returns_and_consumes_all_for_project() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-1", "/tmp/extra");
+        broker.grant_folder_once("proj-1", "/tmp/other");
+        let grants = broker.take_folder_grants("proj-1");
+        assert_eq!(grants.len(), 2);
+        assert!(grants.contains("/tmp/extra"));
+        assert!(grants.contains("/tmp/other"));
+        // Consumed: second take is empty.
+        assert!(broker.take_folder_grants("proj-1").is_empty());
+    }
+
+    #[test]
+    fn folder_grants_are_per_project() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-a", "/tmp/a");
+        // proj-b has nothing.
+        assert!(broker.take_folder_grants("proj-b").is_empty());
+        // proj-a still has it.
+        assert!(!broker.take_folder_grants("proj-a").is_empty());
+    }
+
+    #[test]
+    fn double_grant_same_folder_is_idempotent() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-1", "/tmp/x");
+        broker.grant_folder_once("proj-1", "/tmp/x"); // duplicate
+        let grants = broker.take_folder_grants("proj-1");
+        // A HashSet dedupes: exactly one entry.
+        assert_eq!(grants.len(), 1);
+    }
+
+    #[test]
+    fn folder_grant_reinsertion_on_spawn_failure() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-x", "/tmp/folder");
+        let taken = broker.take_folder_grants("proj-x");
+        assert_eq!(taken.len(), 1);
+        // Spawn fails → re-insert.
+        for folder in &taken {
+            broker.grant_folder_once("proj-x", folder);
+        }
+        // Next spawn can take again.
+        assert_eq!(broker.take_folder_grants("proj-x").len(), 1);
+        assert!(broker.take_folder_grants("proj-x").is_empty());
+    }
+
+    // ── resolve_working_set (pure helper) ────────────────────────────────────
+
+    /// Unattended: transient grants are never honoured — only persisted folders.
+    #[test]
+    fn resolve_working_set_unattended_ignores_transient() {
+        use std::collections::HashSet;
+        let persisted = vec!["/kept".to_string()];
+        let transient: HashSet<String> = ["/transient".to_string()].into_iter().collect();
+        let result = resolve_working_set(&persisted, transient, SandboxMode::Unattended);
+        assert!(result.iter().any(|s| s == "/kept"), "persisted must be present");
+        assert!(!result.iter().any(|s| s == "/transient"), "Unattended must ignore transient");
+    }
+
+    /// Ask: both persisted and transient folders are included.
+    #[test]
+    fn resolve_working_set_ask_includes_both() {
+        use std::collections::HashSet;
+        let persisted = vec!["/a".to_string()];
+        let transient: HashSet<String> = ["/b".to_string()].into_iter().collect();
+        let result = resolve_working_set(&persisted, transient, SandboxMode::Ask);
+        assert!(result.iter().any(|s| s == "/a"));
+        assert!(result.iter().any(|s| s == "/b"));
+    }
+
+    /// AutoAcceptInWorkspace: same as Ask for working-set resolution.
+    #[test]
+    fn resolve_working_set_auto_accept_includes_both() {
+        use std::collections::HashSet;
+        let persisted = vec!["/a".to_string()];
+        let transient: HashSet<String> = ["/b".to_string()].into_iter().collect();
+        let result =
+            resolve_working_set(&persisted, transient, SandboxMode::AutoAcceptInWorkspace);
+        assert!(result.iter().any(|s| s == "/a"));
+        assert!(result.iter().any(|s| s == "/b"));
+    }
+
+    /// Empty inputs → empty result regardless of mode.
+    #[test]
+    fn resolve_working_set_empty_inputs() {
+        use std::collections::HashSet;
+        let empty_t: HashSet<String> = HashSet::new();
+        let result = resolve_working_set(&[], empty_t, SandboxMode::Ask);
+        assert!(result.is_empty());
+    }
+
+    /// Duplicates across persisted and transient are deduplicated.
+    #[test]
+    fn resolve_working_set_deduplicates() {
+        use std::collections::HashSet;
+        let persisted = vec!["/dup".to_string()];
+        let transient: HashSet<String> = ["/dup".to_string()].into_iter().collect();
+        let result = resolve_working_set(&persisted, transient, SandboxMode::Ask);
+        // /dup appears once.
+        let count = result.iter().filter(|s| s.as_str() == "/dup").count();
+        assert_eq!(count, 1);
+    }
+
+    // ── WARNING 2: Unattended must DRAIN (consume) transient grants, not skip ──
+
+    /// Simulates the corrected Unattended path in claim_and_launch:
+    /// ALWAYS drain (call take_folder_grants) even in Unattended mode — the grants are
+    /// consumed and discarded (not honoured). This prevents unbounded HashMap growth and
+    /// stale-grant storms when the project later switches back to Ask.
+    ///
+    /// The fix: unconditionally call `take_folder_grants` and then pass an EMPTY set
+    /// (not the taken set) to `resolve_working_set` when Unattended.
+    #[test]
+    fn unattended_must_drain_folder_grants_not_skip() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-u", "/tmp/transient-folder");
+
+        // Simulate corrected Unattended path: always drain.
+        let mode = SandboxMode::Unattended;
+        let taken = broker.take_folder_grants("proj-u");    // DRAIN
+        // Resolve: Unattended -> ignore transient, pass empty.
+        let effective = if mode != SandboxMode::Unattended {
+            resolve_working_set(&[], taken, mode)
+        } else {
+            // Drain happened; discard.
+            resolve_working_set(&[], HashSet::new(), mode)
+        };
+
+        // Broker map must be empty after drain (no growth).
+        assert!(
+            broker.take_folder_grants("proj-u").is_empty(),
+            "broker must be empty after drain in Unattended — no unbounded growth"
+        );
+        // The effective working set must NOT contain the transient grant.
+        assert!(
+            !effective.iter().any(|s| s == "/tmp/transient-folder"),
+            "Unattended must not honour transient folder grants"
+        );
+    }
+
+    /// After Unattended drains the grants, switching back to Ask on the next spawn
+    /// sees an empty broker — no stale-grant storm.
+    #[test]
+    fn after_unattended_drain_ask_sees_empty_broker() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_folder_once("proj-u", "/tmp/stale");
+
+        // Unattended path: drain without honouring.
+        let _taken = broker.take_folder_grants("proj-u");
+
+        // Now switch to Ask for next spawn — broker must be clean.
+        let grants = broker.take_folder_grants("proj-u");
+        assert!(
+            grants.is_empty(),
+            "Ask spawn after Unattended must see empty broker: stale grant was drained"
+        );
+    }
+
+    /// Simulates the corrected net-grant Unattended path: always drain take_net_grant
+    /// even in Unattended — the grant is consumed (returns false when discarded).
+    ///
+    /// The OLD bug: in Unattended the code returned `false` WITHOUT calling
+    /// `take_net_grant`, so the entry stayed in the HashSet forever.
+    #[test]
+    fn unattended_must_drain_net_grant_not_skip() {
+        let broker = PermissionBrokerState::new();
+        broker.grant_net_once("proj-n");
+
+        // Corrected Unattended path: always call take_net_grant (drain).
+        let mode = SandboxMode::Unattended;
+        let _taken = broker.take_net_grant("proj-n"); // always drain
+        // Ignore the result when Unattended (fail-closed).
+        let transient_net_used = if mode == SandboxMode::Unattended { false } else { _taken };
+
+        // Broker must be empty.
+        assert!(
+            !broker.take_net_grant("proj-n"),
+            "net grant must be drained (empty) after Unattended path"
+        );
+        assert!(
+            !transient_net_used,
+            "Unattended must not honour the net grant"
+        );
     }
 }
