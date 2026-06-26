@@ -37,6 +37,7 @@ const baseProps = {
   onReviewNow: noop,
   onRunFinalReview: noop,
   onTrust: noop,
+  onDisable: noop,
 };
 
 describe("CensorPanelView states", () => {
@@ -95,7 +96,10 @@ describe("CensorPanelView states", () => {
       <CensorPanelView {...baseProps} findings={[]} status={status} />,
     );
     expect(html).toContain("gitleaks");
-    expect(html).toContain("those layers are skipped");
+    expect(html).toContain("layers are skipped");
+    // absent tool → a red chip with the data attribute; an installed tool → no chip
+    expect(html).toContain('data-censor-missing-tool="gitleaks"');
+    expect(html).not.toContain('data-censor-missing-tool="eslint"');
   });
 
   it("exposes Review now and Run final review actions", () => {

@@ -58,4 +58,24 @@ describe("buildCensorStrip", () => {
     expect(m.items.map((i) => i.file)).toEqual(["a/dirty.ts", "b/dirty.ts", "z/clean.ts"]);
     expect(m.items.map((i) => i.status)).toEqual(["dirty", "dirty", "clean"]);
   });
+
+  it("defaults scanning/scannedFiles/missingTools when no extras given", () => {
+    const m = buildCensorStrip([]);
+    expect(m.scanning).toBe(false);
+    expect(m.scannedFiles).toBe(0);
+    expect(m.missingTools).toEqual([]);
+  });
+
+  it("carries scan progress and missing tools from extras alongside findings", () => {
+    const m = buildCensorStrip([f({ file: "a.ts", disposition: "open" })], {
+      scanning: true,
+      scannedFiles: 3,
+      missingTools: ["ruff", "gitleaks"],
+    });
+    expect(m.scanning).toBe(true);
+    expect(m.scannedFiles).toBe(3);
+    expect(m.missingTools).toEqual(["ruff", "gitleaks"]);
+    // findings still drive the file items independently of the extras
+    expect(m.items[0]).toMatchObject({ file: "a.ts", status: "dirty", openCount: 1 });
+  });
 });

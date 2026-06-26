@@ -13,11 +13,32 @@ export interface CensorStripModel {
   dirtyFiles: number;
   cleanFiles: number;
   openFindings: number;
+  /** True while a Censor pass is running (driven by the censor://scan-started event). */
+  scanning: boolean;
+  /** Number of files in the in-flight FINE pass (0 for a whole-project COARSE pass). */
+  scannedFiles: number;
+  /** Deterministic runners NOT installed on PATH — their layers are silently skipped. */
+  missingTools: string[];
 }
 
-export function buildCensorStrip(findings: CensorFinding[]): CensorStripModel {
+/** Live status that does NOT come from the findings themselves: scan progress (from the
+ *  scan-started/findings-updated events) and missing tools (from censor_status). */
+export interface CensorStripExtras {
+  scanning?: boolean;
+  scannedFiles?: number;
+  missingTools?: string[];
+}
+
+export function buildCensorStrip(
+  findings: CensorFinding[],
+  extras: CensorStripExtras = {},
+): CensorStripModel {
+  const scanning = extras.scanning ?? false;
+  const scannedFiles = extras.scannedFiles ?? 0;
+  const missingTools = extras.missingTools ?? [];
+
   if (findings.length === 0) {
-    return { items: [], dirtyFiles: 0, cleanFiles: 0, openFindings: 0 };
+    return { items: [], dirtyFiles: 0, cleanFiles: 0, openFindings: 0, scanning, scannedFiles, missingTools };
   }
 
   const fileOpenCounts = new Map<string, number>();
@@ -48,5 +69,5 @@ export function buildCensorStrip(findings: CensorFinding[]): CensorStripModel {
   const cleanFiles = items.filter((i) => i.status === "clean").length;
   const openFindings = items.reduce((sum, i) => sum + i.openCount, 0);
 
-  return { items, dirtyFiles, cleanFiles, openFindings };
+  return { items, dirtyFiles, cleanFiles, openFindings, scanning, scannedFiles, missingTools };
 }

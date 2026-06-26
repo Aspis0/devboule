@@ -46,6 +46,7 @@ import type {
   AgentRoleRule,
   AgentSession,
   CensorFinding,
+  CensorStatus,
   ProjectDetail,
   SandboxMode,
 } from "../../types/backend";
@@ -387,6 +388,9 @@ export function ProjectWorkspace({
   // Censor strip: the project-wide inspection summary (clean/dirty per file). Reuses the
   // SAME event-driven findings feed as the Censor dock tab — NO new poller.
   const [censorFindings, setCensorFindings] = useState<CensorFinding[]>([]);
+  const [censorScanning, setCensorScanning] = useState(false);
+  const [censorScannedFiles, setCensorScannedFiles] = useState(0);
+  const [censorMissingTools, setCensorMissingTools] = useState<string[]>([]);
   const censorRoot = (project.metadata.rootPath ?? "").trim();
   useEffect(() => {
     if (!isTauriRuntime() || !censorRoot) {
@@ -407,7 +411,87 @@ export function ProjectWorkspace({
     void tracker.start();
     return () => tracker.stop();
   }, [project.metadata.id, censorRoot]);
-  const censorStrip = useMemo(() => buildCensorStrip(censorFindings), [censorFindings]);
+  // Live scan state (the "linters running…" indicator) + tool-health for the strip. Listens to
+  // the same Censor events as the tracker (no new poller); censor_status feeds missing tools.
+  useEffect(() => {
+    const pid = project.metadata.id;
+    if (!isTauriRuntime() || !censorRoot) {
+      setCensorScanning(false);
+      setCensorMissingTools([]);
+      return;
+    }
+    let cancelled = false;
+    const unlistens: Array<() => void> = [];
+    // Safety timer: scan-started fires BEFORE the slow runner work; if the project is stopped
+    // mid-pass the matching findings-updated never arrives (emit_if_running skips it), which
+    // would otherwise leave the "running…" indicator stuck on. Auto-clear it after a grace
+    // window longer than the slowest linter.
+    let scanTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearScanTimer = () => {
+      if (scanTimer !== null) {
+        clearTimeout(scanTimer);
+        scanTimer = null;
+      }
+    };
+
+    const refreshMissingTools = async () => {
+      try {
+        const status = await invokeBackendCommand<CensorStatus>("censor_status", {
+          root: censorRoot,
+          projectId: pid,
+        });
+        if (!cancelled) {
+          setCensorMissingTools((status.tools ?? []).filter((t) => !t.available).map((t) => t.name));
+        }
+      } catch {
+        // Status is advisory; a failure just hides the missing-tool hints.
+      }
+    };
+
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const un1 = await listen("censor://scan-started", (event) => {
+        const payload = event.payload as { projectId: string; fileCount?: number };
+        if (payload.projectId !== pid) return;
+        setCensorScanning(true);
+        setCensorScannedFiles(payload.fileCount ?? 0);
+        clearScanTimer();
+        scanTimer = setTimeout(() => {
+          if (!cancelled) setCensorScanning(false);
+        }, 45000);
+      });
+      unlistens.push(un1);
+      const un2 = await listen("censor://findings-updated", (event) => {
+        const payload = event.payload as { projectId: string };
+        if (payload.projectId !== pid) return;
+        clearScanTimer();
+        setCensorScanning(false);
+        void refreshMissingTools();
+      });
+      unlistens.push(un2);
+      if (cancelled) {
+        unlistens.forEach((u) => u());
+        return;
+      }
+      await refreshMissingTools();
+    })();
+
+    return () => {
+      cancelled = true;
+      clearScanTimer();
+      setCensorScanning(false);
+      unlistens.forEach((u) => u());
+    };
+  }, [project.metadata.id, censorRoot]);
+  const censorStrip = useMemo(
+    () =>
+      buildCensorStrip(censorFindings, {
+        scanning: censorScanning,
+        scannedFiles: censorScannedFiles,
+        missingTools: censorMissingTools,
+      }),
+    [censorFindings, censorScanning, censorScannedFiles, censorMissingTools],
+  );
 
   // Map the Censor's DIRTY files onto the agents inhabiting them, so the Living Plan can
   // highlight a node coral when the file it edits has open findings.
