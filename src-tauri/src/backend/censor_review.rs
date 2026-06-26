@@ -13,7 +13,10 @@ pub const PIGEON_CENSOR_POOL_RECEIVER: &str = "censor-pool";
 #[serde(rename_all = "camelCase")]
 pub struct CensorReviewRequest {
     pub project_id: String,
-    /// The project working dir; the worker reads the file from disk at review time.
+    /// Optional hint of the project working dir. The worker RESOLVES the canonical root from
+    /// `project_id` (the single source of truth via `resolve_project_root_by_id`), so a producer
+    /// that only knows the project id may omit this.
+    #[serde(default)]
     pub root: String,
     /// Project-relative path to review.
     pub file: String,
@@ -66,14 +69,68 @@ impl Drop for InflightGuard {
     }
 }
 
-/// Run the Censor LLM review for one request. STUB — Phase 3 replaces this body with the real
-/// local/cloud Censor LLM call gated by the resource budget. For now it returns no findings.
-pub fn process_censor_review(request: &CensorReviewRequest) -> CensorReviewResult {
-    CensorReviewResult {
+/// Run the Censor LLM review for one request: build the configured Censor model client
+/// (Ollama / oMLX / AppleFM / cloud), and if it is available reuse the FINE pipeline's
+/// `run_fine_batch_no_rail` with a `GemmaCtx` — which runs the LLM review on the file, writes the
+/// shard, and emits `censor://findings-updated` so the strip/panel reflect the AI findings like any
+/// other. AI review is opt-in: when no model is configured/loaded, `probe_available` is false and we
+/// no-op. The returned `CensorReviewResult` is just the Pigeon receipt (the findings manifest via the
+/// shard/event, not the mailbox). `request.known_findings` is intentionally unused here — the
+/// pipeline recomputes the deterministic findings and feeds them to the LLM as "already known".
+pub fn process_censor_review(
+    app: &tauri::AppHandle,
+    request: &CensorReviewRequest,
+) -> CensorReviewResult {
+    let receipt = CensorReviewResult {
         project_id: request.project_id.clone(),
         file: request.file.clone(),
         findings: Vec::new(),
-    }
+    };
+    // Resolve the canonical working root from the project id (single source of truth — the
+    // producer need not know it). An unknown/unrooted project is a clean no-op.
+    let root = match crate::backend::projects::resolve_project_root_by_id(app, &request.project_id) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "censor-review: cannot resolve root for project {} ({e})",
+                request.project_id
+            );
+            return receipt;
+        }
+    };
+    let cfg = crate::backend::projects::read_censor_local_ai(app);
+    let client = match crate::backend::censor::gemma::build_gemma_client(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("censor-review: no Censor LLM client ({e})");
+            return receipt;
+        }
+    };
+    // The ingest pass already gated on probe_available (probed ONCE per pass, not per file —
+    // re-probing here would hit the backend O(N) and could falsely skip a file while the model is
+    // busy generating for another). run_gemma itself returns empty on any generate error, so a
+    // backend that went down between the pass-probe and now degrades gracefully to no findings.
+    let available = true;
+    // One-shot review on a detached daemon thread: the flag is permanently live — these threads die
+    // with the process and there is no (nor any need for) a per-review cancellation path.
+    let running = std::sync::atomic::AtomicBool::new(true);
+    let ctx = crate::backend::censor::orchestrator::GemmaCtx {
+        client: client.as_ref(),
+        available,
+    };
+    // NOTE: run_fine_batch_no_rail also re-runs the deterministic FINE runners (not only the LLM).
+    // Redundant with the watcher but idempotent — the per-shard lock + source-scoped merge serialize
+    // writers and never cross sources. Accepted for the high-level reuse; an LLM-only leg could be
+    // factored out later if the double-run proves costly.
+    crate::backend::censor::orchestrator::run_fine_batch_no_rail(
+        app,
+        &request.project_id,
+        &root,
+        std::slice::from_ref(&request.file),
+        Some(ctx),
+        &running,
+    );
+    receipt
 }
 
 /// Drain the `censor-pool` queue (only when Pigeon is enabled): for each review request, run the
@@ -84,10 +141,20 @@ pub fn process_censor_review(request: &CensorReviewRequest) -> CensorReviewResul
 /// Takes `app` BY VALUE (owned) so Phase 3 can `app.clone()` it into the review thread for LLM
 /// config + the resource budget gate; today it is intentionally unused.
 pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
-    let _ = &app; // Phase 3 clones `app` into the review thread (config + budget); inert for now.
     let Some(client) = crate::backend::pigeon_service::pigeon_client_from_running() else {
         return;
     };
+    // Probe the Censor model ONCE per pass (not per file). If no model is configured/loaded, AI
+    // review is a clean no-op: we DON'T drain, leaving the tasks PENDING in the durable mailbox for
+    // a later pass — never claiming work we cannot run, and never O(N)-probing the backend.
+    let cfg = crate::backend::projects::read_censor_local_ai(&app);
+    let llm_available = match crate::backend::censor::gemma::build_gemma_client(&cfg) {
+        Ok(c) => crate::backend::censor::gemma::probe_available(c.as_ref()),
+        Err(_) => false,
+    };
+    if !llm_available {
+        return;
+    }
     for _ in 0..CENSOR_REVIEW_MAX_PER_PASS {
         // Back-pressure: never claim more than we can run concurrently. Tasks stay PENDING in the
         // durable mailbox until a later pass has a free slot.
@@ -99,11 +166,12 @@ pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
             {
                 Ok(req) => {
                     CENSOR_REVIEW_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+                    let app_for_thread = app.clone();
                     std::thread::spawn(move || {
                         // Decrements the in-flight slot on ANY exit (success, error, or panic).
                         let _guard = InflightGuard;
                         let reviewed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            process_censor_review(&req)
+                            process_censor_review(&app_for_thread, &req)
                         }));
                         let Some(client) =
                             crate::backend::pigeon_service::pigeon_client_from_running()
@@ -202,18 +270,5 @@ mod tests {
         let deserialized: CensorReviewResult =
             serde_json::from_str(&json).expect("deserialization failed");
         assert_eq!(res, deserialized);
-    }
-
-    #[test]
-    fn process_censor_review_stub_returns_empty() {
-        let request = CensorReviewRequest {
-            project_id: "test-project".into(),
-            root: "/tmp/test".into(),
-            file: "src/main.rs".into(),
-            known_findings: Vec::new(),
-        };
-        let result = process_censor_review(&request);
-        assert!(result.findings.is_empty());
-        assert_eq!(result.file, request.file);
     }
 }

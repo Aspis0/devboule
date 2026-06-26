@@ -3642,6 +3642,27 @@ def _pigeon_send_censor_review(
     return ticket_no
 
 
+def _maybe_enqueue_censor_reviews(
+    *, sender_id: str, project_id: str, files: list[str]
+) -> None:
+    """Phase 3a: after a mini finishes, enqueue an async Censor LLM review per touched file
+    (best-effort, only when Pigeon is enabled). The payload carries `projectId` + `file`; the Rust
+    worker resolves the root from the project id and no-ops when no Censor model is configured.
+    NEVER raises — a review-enqueue failure must not fail the mini result the coder is waiting on.
+    """
+    if not _pigeon_enabled() or not files:
+        return
+    for rel_path in files:
+        try:
+            _pigeon_send_censor_review(
+                sender_id=sender_id,
+                project_id=project_id,
+                request={"projectId": project_id, "file": rel_path, "knownFindings": []},
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fail the mini result
+            logging.warning("censor-review enqueue skipped for %s: %s", rel_path, exc)
+
+
 def _pigeon_status_once(ticket_no: int) -> tuple[str | None, dict[str, Any] | None]:
     """Single `GET /pigeon/status/{ticket_no}` read. Returns `(status, result)`.
 
@@ -5697,7 +5718,18 @@ def dispatch_spawn_mini_coder(
     # of the file. Same bounded deadline + same `{directiveId, result}` return shape. When
     # DISABLED, this is the original file-poll — byte-identical.
     if pigeon:
-        return _await_mini_directive_pigeon(directive_id, pigeon_ticket, deadline)
+        result = _await_mini_directive_pigeon(directive_id, pigeon_ticket, deadline)
+        # Phase 3a: after a SUCCESSFUL mini, kick async Censor LLM reviews for the touched files.
+        # DETACHED in a daemon thread so a slow/unreachable Pigeon (each send can block up to the
+        # HTTP timeout × N files) never delays the result the coder is blocking on. Only on `done`
+        # — reviewing a failed/timed-out mini's files is wasteful and misattributes findings.
+        if (result.get("result") or {}).get("status") == "done":
+            threading.Thread(
+                target=_maybe_enqueue_censor_reviews,
+                kwargs=dict(sender_id=agent_id, project_id=project_id, files=files),
+                daemon=True,
+            ).start()
+        return result
     return _await_mini_directive(projects_dir, state_lock, directive_id, deadline)
 
 
