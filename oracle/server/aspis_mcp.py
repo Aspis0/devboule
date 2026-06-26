@@ -170,8 +170,14 @@ MINI_CODER_POLL_INTERVAL_SECS = 0.75
 PIGEON_PORT_ENV = "PIGEON_PORT"
 PIGEON_AUTH_TOKEN_ENV = "PIGEON_AUTH_TOKEN"
 PIGEON_MINI_POOL_RECEIVER = "mini-pool"
+# Async Censor LLM reviews route to this receiver; the Rust censor-review worker drains it.
+# Must match `PIGEON_CENSOR_POOL_RECEIVER` in `backend/censor_review.rs`.
+PIGEON_CENSOR_POOL_RECEIVER = "censor-pool"
 # The `/send` priority for a mini directive. Matches the Rust default lane.
 PIGEON_MINI_SEND_PRIORITY = 50
+# Censor reviews are POST-HOC and async; give them a lower-urgency lane (higher number = polled
+# later) so a review backlog never starves live mini dispatches queued at priority 50.
+PIGEON_CENSOR_REVIEW_PRIORITY = 80
 # Per-request HTTP timeout for the (loopback) Pigeon calls. Short — the dispatcher is a
 # local SQLite-backed FastAPI app; a slow/hung call must not wedge the MCP thread.
 PIGEON_HTTP_TIMEOUT_SECS = 10.0
@@ -3594,6 +3600,45 @@ def _pigeon_send_directive(
         raise McpError(f"Pigeon send returned invalid JSON: {exc}") from exc
     if not isinstance(ticket_no, int):
         raise McpError("Pigeon send response missing an integer ticket_no.")
+    return ticket_no
+
+
+def _pigeon_send_censor_review(
+    *, sender_id: str, project_id: str, request: dict[str, Any]
+) -> int:
+    """POST a Censor-review REQUEST into the Pigeon mailbox (receiver `censor-pool`) for the Rust
+    censor-review worker to drain. Returns the assigned `ticket_no`. Raises `McpError` on any
+    transport / non-2xx failure. Only reached when `_pigeon_enabled()`. Mirrors
+    `_pigeon_send_directive`, differing only in the receiver and the payload kind.
+    """
+    base = _pigeon_base_url()
+    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+        raise McpError("Pigeon transport requested but PIGEON_PORT is not set.")
+    httpx = import_httpx()
+    body = {
+        "sender_id": sender_id,
+        "receiver_id": PIGEON_CENSOR_POOL_RECEIVER,
+        "project_id": project_id,
+        "priority": PIGEON_CENSOR_REVIEW_PRIORITY,
+        "payload": request,
+    }
+    try:
+        resp = httpx.post(
+            f"{base}/pigeon/send",
+            headers=_pigeon_auth_headers(),
+            json=body,
+            timeout=PIGEON_HTTP_TIMEOUT_SECS,
+        )
+    except Exception as exc:
+        raise McpError(f"Pigeon censor-review send failed (transport): {exc}") from exc
+    if resp.status_code // 100 != 2:
+        raise McpError(f"Pigeon censor-review send failed (HTTP {resp.status_code}).")
+    try:
+        ticket_no = resp.json().get("ticket_no")
+    except Exception as exc:
+        raise McpError(f"Pigeon censor-review send returned invalid JSON: {exc}") from exc
+    if not isinstance(ticket_no, int):
+        raise McpError("Pigeon censor-review send response missing an integer ticket_no.")
     return ticket_no
 
 
