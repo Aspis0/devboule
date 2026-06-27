@@ -797,6 +797,10 @@ export interface AgentControls {
   maxTurns?: number;
   /** Max spend in USD (Claude only). */
   maxBudgetUsd?: number;
+  /** Verifier work-ethic (opt-in): auto-spawn one verifier when a task enters review. */
+  verifierPerTask?: boolean;
+  /** Verifier work-ethic (opt-in): a 3-verifier max-recall fan-out when all tasks are done. */
+  maxRecallPerProject?: boolean;
 }
 
 export interface ProjectTaskCounts {

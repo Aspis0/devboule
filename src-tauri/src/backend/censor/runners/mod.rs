@@ -404,8 +404,15 @@ pub fn applicable_runners(kinds: &HashSet<ProjectKind>, lang: FileLang) -> Vec<R
 /// through this helper so the CREATE_NO_WINDOW flag is set in exactly one place
 /// (no per-runner re-inlining of `0x0800_0000`, no console flash on Windows).
 pub fn build_command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    // Resolve against the augmented PATH so a GUI-launched app (stripped PATH) still finds
+    // Homebrew/npm/cargo tools; fall back to the bare name when unresolved (the command_exists
+    // gate runs before this anyway).
+    let resolved_path = crate::backend::provider_detect::resolve_program(program)
+        .unwrap_or_else(|| std::path::PathBuf::from(program));
+    let mut cmd = Command::new(&resolved_path);
     apply_no_window(&mut cmd);
+    // Child sub-processes (cargo→rustc, npm→node, eslint plugins) inherit this PATH too.
+    cmd.env("PATH", crate::backend::provider_detect::augmented_path());
     cmd
 }
 
@@ -871,8 +878,32 @@ mod tests {
     #[test]
     fn build_command_sets_program() {
         // apply_no_window is not observable cross-platform, but the program is.
-        let cmd = build_command("some-tool");
-        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("some-tool"));
+        // An UNRESOLVABLE name falls back to the bare program verbatim, so this
+        // observation is stable regardless of what is installed on the test host.
+        let cmd = build_command("some-tool-that-does-not-exist-xyz");
+        assert_eq!(
+            cmd.get_program(),
+            std::ffi::OsStr::new("some-tool-that-does-not-exist-xyz")
+        );
+    }
+
+    #[test]
+    fn build_command_injects_augmented_path() {
+        // GUI launches (Finder/Dock) inherit a stripped PATH that lacks Homebrew/npm/cargo
+        // dirs, silently disabling most runners. EVERY runner spawns through build_command,
+        // so build_command MUST override the child's PATH with the augmented one — both so the
+        // binary itself resolves and so child sub-processes (cargo→rustc, npm→node) inherit it.
+        let cmd = build_command("some-tool-that-does-not-exist-xyz");
+        let path_override = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_os_string());
+        assert_eq!(
+            path_override,
+            Some(crate::backend::provider_detect::augmented_path()),
+            "build_command must inject the augmented PATH (GUI-launched runners otherwise miss Homebrew/npm/cargo tools)"
+        );
     }
 
     #[test]

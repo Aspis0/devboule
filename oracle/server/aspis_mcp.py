@@ -170,8 +170,14 @@ MINI_CODER_POLL_INTERVAL_SECS = 0.75
 PIGEON_PORT_ENV = "PIGEON_PORT"
 PIGEON_AUTH_TOKEN_ENV = "PIGEON_AUTH_TOKEN"
 PIGEON_MINI_POOL_RECEIVER = "mini-pool"
+# Async Censor LLM reviews route to this receiver; the Rust censor-review worker drains it.
+# Must match `PIGEON_CENSOR_POOL_RECEIVER` in `backend/censor_review.rs`.
+PIGEON_CENSOR_POOL_RECEIVER = "censor-pool"
 # The `/send` priority for a mini directive. Matches the Rust default lane.
 PIGEON_MINI_SEND_PRIORITY = 50
+# Censor reviews are POST-HOC and async; give them a lower-urgency lane (higher number = polled
+# later) so a review backlog never starves live mini dispatches queued at priority 50.
+PIGEON_CENSOR_REVIEW_PRIORITY = 80
 # Per-request HTTP timeout for the (loopback) Pigeon calls. Short — the dispatcher is a
 # local SQLite-backed FastAPI app; a slow/hung call must not wedge the MCP thread.
 PIGEON_HTTP_TIMEOUT_SECS = 10.0
@@ -3632,6 +3638,66 @@ def _pigeon_send_directive(
     return ticket_no
 
 
+def _pigeon_send_censor_review(
+    *, sender_id: str, project_id: str, request: dict[str, Any]
+) -> int:
+    """POST a Censor-review REQUEST into the Pigeon mailbox (receiver `censor-pool`) for the Rust
+    censor-review worker to drain. Returns the assigned `ticket_no`. Raises `McpError` on any
+    transport / non-2xx failure. Only reached when `_pigeon_enabled()`. Mirrors
+    `_pigeon_send_directive`, differing only in the receiver and the payload kind.
+    """
+    base = _pigeon_base_url()
+    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+        raise McpError("Pigeon transport requested but PIGEON_PORT is not set.")
+    httpx = import_httpx()
+    body = {
+        "sender_id": sender_id,
+        "receiver_id": PIGEON_CENSOR_POOL_RECEIVER,
+        "project_id": project_id,
+        "priority": PIGEON_CENSOR_REVIEW_PRIORITY,
+        "payload": request,
+    }
+    try:
+        resp = httpx.post(
+            f"{base}/pigeon/send",
+            headers=_pigeon_auth_headers(),
+            json=body,
+            timeout=PIGEON_HTTP_TIMEOUT_SECS,
+        )
+    except Exception as exc:
+        raise McpError(f"Pigeon censor-review send failed (transport): {exc}") from exc
+    if resp.status_code // 100 != 2:
+        raise McpError(f"Pigeon censor-review send failed (HTTP {resp.status_code}).")
+    try:
+        ticket_no = resp.json().get("ticket_no")
+    except Exception as exc:
+        raise McpError(f"Pigeon censor-review send returned invalid JSON: {exc}") from exc
+    if not isinstance(ticket_no, int):
+        raise McpError("Pigeon censor-review send response missing an integer ticket_no.")
+    return ticket_no
+
+
+def _maybe_enqueue_censor_reviews(
+    *, sender_id: str, project_id: str, files: list[str]
+) -> None:
+    """Phase 3a: after a mini finishes, enqueue an async Censor LLM review per touched file
+    (best-effort, only when Pigeon is enabled). The payload carries `projectId` + `file`; the Rust
+    worker resolves the root from the project id and no-ops when no Censor model is configured.
+    NEVER raises — a review-enqueue failure must not fail the mini result the coder is waiting on.
+    """
+    if not _pigeon_enabled() or not files:
+        return
+    for rel_path in files:
+        try:
+            _pigeon_send_censor_review(
+                sender_id=sender_id,
+                project_id=project_id,
+                request={"projectId": project_id, "file": rel_path, "knownFindings": []},
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fail the mini result
+            logging.warning("censor-review enqueue skipped for %s: %s", rel_path, exc)
+
+
 def _pigeon_status_once(ticket_no: int) -> tuple[str | None, dict[str, Any] | None]:
     """Single `GET /pigeon/status/{ticket_no}` read. Returns `(status, result)`.
 
@@ -5687,7 +5753,18 @@ def dispatch_spawn_mini_coder(
     # of the file. Same bounded deadline + same `{directiveId, result}` return shape. When
     # DISABLED, this is the original file-poll — byte-identical.
     if pigeon:
-        return _await_mini_directive_pigeon(directive_id, pigeon_ticket, deadline)
+        result = _await_mini_directive_pigeon(directive_id, pigeon_ticket, deadline)
+        # Phase 3a: after a SUCCESSFUL mini, kick async Censor LLM reviews for the touched files.
+        # DETACHED in a daemon thread so a slow/unreachable Pigeon (each send can block up to the
+        # HTTP timeout × N files) never delays the result the coder is blocking on. Only on `done`
+        # — reviewing a failed/timed-out mini's files is wasteful and misattributes findings.
+        if (result.get("result") or {}).get("status") == "done":
+            threading.Thread(
+                target=_maybe_enqueue_censor_reviews,
+                kwargs=dict(sender_id=agent_id, project_id=project_id, files=files),
+                daemon=True,
+            ).start()
+        return result
     return _await_mini_directive(projects_dir, state_lock, directive_id, deadline)
 
 

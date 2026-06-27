@@ -191,6 +191,13 @@ pub struct AgentControls {
     /// Max spend in USD (Claude `--max-budget-usd`, print mode). No direct Codex equivalent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
+    /// Verifier work-ethic (recommended, opt-in). `verifier_per_task`: auto-spawn one verifier when
+    /// a task enters `review`. `max_recall_per_project`: spawn a max-recall verifier fan-out when
+    /// every task is in {review, done}. Both default OFF (the UI nudges).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verifier_per_task: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub max_recall_per_project: bool,
 }
 
 impl AgentControls {
@@ -200,6 +207,8 @@ impl AgentControls {
             && self.system_prompt.is_none()
             && self.max_turns.is_none()
             && self.max_budget_usd.is_none()
+            && !self.verifier_per_task
+            && !self.max_recall_per_project
     }
 }
 

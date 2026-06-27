@@ -17,7 +17,8 @@
 // engine's already-redacted summaries); nothing here logs shard contents.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Play, ShieldCheck, RefreshCw, ShieldAlert } from "lucide-react";
+import { Play, ShieldCheck, RefreshCw, ShieldAlert, ShieldOff, XCircle } from "lucide-react";
+import { installHintFor } from "./censorInstallHints";
 import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
 import type {
   CensorDisposition,
@@ -223,6 +224,24 @@ export function CensorPanel({
       }
     });
 
+  // Reverse of handleTrust: turn Censor back OFF for this project (BLOCKER B is per-project
+  // and reversible). No review sweep — disabling stops the engine.
+  const handleDisable = () =>
+    void runGuarded(async () => {
+      if (!trimmedRoot) return;
+      try {
+        await invokeBackendCommand<void>(
+          "set_censor_trusted",
+          setCensorTrustedArgs({ projectId, trusted: false }),
+        );
+        await refreshStatus();
+      } catch (e) {
+        setLoadError(
+          e instanceof Error ? e.message : "Could not disable Censor for this project.",
+        );
+      }
+    });
+
   return (
     <CensorPanelView
       findings={findings}
@@ -237,6 +256,7 @@ export function CensorPanel({
       onReviewNow={handleReviewNow}
       onRunFinalReview={handleRunFinalReview}
       onTrust={handleTrust}
+      onDisable={handleDisable}
     />
   );
 }
@@ -255,6 +275,8 @@ export interface CensorPanelViewProps {
   onRunFinalReview: () => void;
   /** "Trust & enable Censor" for an untrusted project (the trust gate). */
   onTrust: () => void;
+  /** Turn Censor back OFF for this project (reversible). */
+  onDisable: () => void;
 }
 
 /**
@@ -277,6 +299,7 @@ export function CensorPanelView({
   onReviewNow,
   onRunFinalReview,
   onTrust,
+  onDisable,
 }: CensorPanelViewProps) {
   const groups = groupFindingsByFile(findings);
   const gemmaNote = gemmaStatusNote(status?.gemmaStatus);
@@ -350,6 +373,16 @@ export function CensorPanelView({
             ? "0 open findings"
             : `${findings.length} open finding${findings.length === 1 ? "" : "s"}`}
         </span>
+        <button
+          type="button"
+          onClick={onDisable}
+          disabled={actionBusy || !hasRoot}
+          title="Turn Censor off for this project (reversible)"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-cream-200 px-3 py-1.5 text-[12px] font-semibold text-cream-500 transition-colors hover:bg-cream-50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <ShieldOff className="h-3.5 w-3.5" />
+          Disable
+        </button>
       </div>
 
       {/* ---- Gemma-offline banner ---- */}
@@ -362,10 +395,31 @@ export function CensorPanelView({
 
       {/* ---- tool-absent hint (optional) ---- */}
       {absentTools.length > 0 && (
-        <p className="text-[10px] text-cream-400">
-          Not installed (those layers are skipped):{" "}
-          {absentTools.map((t) => t.name).join(", ")}.
-        </p>
+        <div className="space-y-1">
+          <p className="text-[10px] text-cream-400">
+            not installed — those Censor layers are skipped. Click a tool to copy its install command.
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {absentTools.map((t) => {
+              const hint = installHintFor(t.name);
+              return (
+                <button
+                  key={t.name}
+                  type="button"
+                  data-censor-missing-tool={t.name}
+                  title={hint ? `Click to copy: ${hint}` : `${t.name} is not installed`}
+                  onClick={() => {
+                    if (hint) void navigator.clipboard?.writeText(hint).catch(() => {});
+                  }}
+                  className="inline-flex items-center gap-1 rounded-md border border-coral/30 bg-coral/8 px-2 py-0.5 text-[10px] text-coral-dark hover:bg-coral/15"
+                >
+                  <XCircle className="h-3 w-3" />
+                  {t.name}
+                </button>
+              );
+            })}
+          </div>
+        </div>
       )}
 
       {/* ---- soft error ---- */}

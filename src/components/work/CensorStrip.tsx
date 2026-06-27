@@ -12,8 +12,11 @@ export function CensorStrip(props: CensorStripProps) {
   const { model, onSelectFile } = props;
   const dirtyFiles = model.dirtyFiles ?? 0;
   const openFindings = model.openFindings ?? 0;
+  const scannedFiles = model.scannedFiles ?? 0;
+  const missingTools = model.missingTools ?? [];
 
   const MAX_CHIPS = 14;
+  const MAX_MISSING = 6;
   const shown = model.items.slice(0, MAX_CHIPS);
 
   const summaryText = dirtyFiles > 0
@@ -36,6 +39,18 @@ export function CensorStrip(props: CensorStripProps) {
       <span className="pp-mono" style={{ color: "#8C8578", letterSpacing: "0.05em", marginRight: "12px" }}>
         CENSOR
       </span>
+
+      {model.scanning && (
+        <span
+          data-censor-scanning="true"
+          style={{ display: "inline-flex", alignItems: "center", gap: "5px", marginRight: "12px" }}
+        >
+          <span style={{ color: "#C98A3B", animation: "wc-blink 1.2s ease-in-out infinite" }}>●</span>
+          <span className="pp-mono" style={{ color: "#C98A3B" }}>
+            {scannedFiles > 0 ? `linters running… ${scannedFiles} files` : "linters running…"}
+          </span>
+        </span>
+      )}
 
       {model.items.length === 0 ? (
         <span style={{ color: "#9c9488" }}>all clean · no open findings</span>
@@ -86,6 +101,34 @@ export function CensorStrip(props: CensorStripProps) {
             </span>
           )}
         </>
+      )}
+
+      {missingTools.slice(0, MAX_MISSING).map((tool) => (
+        <span
+          key={tool}
+          data-censor-missing-tool={tool}
+          className="pp-mono"
+          title={`${tool} is not installed — its Censor layer is skipped`}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "5px",
+            padding: "3px 8px",
+            margin: "0 4px",
+            borderRadius: "4px",
+            backgroundColor: "#FDF5F3",
+            border: "1px solid #E8C9BE",
+            color: "#C2542F",
+          }}
+        >
+          🔴 {tool}
+          <span style={{ color: "#B08C82" }}>not installed</span>
+        </span>
+      ))}
+      {missingTools.length > MAX_MISSING && (
+        <span className="pp-mono" style={{ color: "#C2542F", marginLeft: "4px" }}>
+          +{missingTools.length - MAX_MISSING} more
+        </span>
       )}
 
       <span className="pp-mono" style={{ color: "#9c9488", marginLeft: "auto" }}>

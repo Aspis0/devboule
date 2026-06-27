@@ -15,6 +15,7 @@ pub mod agentic_transport;
 pub mod auth;
 pub mod budget;
 pub mod censor;
+pub mod censor_review;
 pub mod changes;
 pub mod cli_agents;
 pub mod cloud_claude;

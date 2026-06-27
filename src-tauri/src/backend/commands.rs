@@ -1600,6 +1600,36 @@ pub fn delete_exa_key(
     vault::delete_exa_key()
 }
 
+// Censor CLOUD LLM API key — WRITE-ONLY from the UI: the key value is never returned.
+// `get_*_status` reports present/absent, `save_*` SETs it, `delete_*` CLEARs it. The async
+// Censor review reads it backend-internal (`vault::read_censor_cloud_key`) to authenticate
+// the configured https endpoint — the one Censor path that egresses code off-device (opt-in).
+
+#[tauri::command]
+pub fn get_censor_cloud_key_status(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::censor_cloud_key_status()
+}
+
+#[tauri::command]
+pub fn save_censor_cloud_key(
+    state: State<'_, BackendState>,
+    key: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::save_censor_cloud_key(&key)
+}
+
+#[tauri::command]
+pub fn delete_censor_cloud_key(
+    state: State<'_, BackendState>,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::delete_censor_cloud_key()
+}
+
 // Cloud main-coder API key for the local Devboule orchestrator's OPT-IN Cloud mode.
 // WRITE-ONLY from the UI: the key value is never returned. `get_*_status` reports
 // present/absent, `save_*` SETs it, `delete_*` CLEARs it. The orchestrator launch reads

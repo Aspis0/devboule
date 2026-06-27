@@ -485,6 +485,14 @@ fn run_loop(app: AppHandle, running: Arc<AtomicBool>) {
             if let Err(e) = client.register_agent(PIGEON_MINI_POOL_RECEIVER, "loaded") {
                 eprintln!("mini-coder executor: pigeon mini-pool registration skipped: {e}");
             }
+            // Also register the censor-pool receiver so async Censor LLM reviews route to this
+            // process's review worker (same best-effort, gated, non-fatal contract).
+            if let Err(e) = client.register_agent(
+                crate::backend::censor_review::PIGEON_CENSOR_POOL_RECEIVER,
+                "loaded",
+            ) {
+                eprintln!("mini-coder executor: pigeon censor-pool registration skipped: {e}");
+            }
         }
     }
 
@@ -847,6 +855,9 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
     // this same pass. Gated on the flag: when disabled, NO poll/client — byte-identical.
     if crate::backend::pigeon_service::pigeon_enabled_cached(app) {
         ingest_pigeon_directives(app);
+        // Also drain the censor-pool: async Censor LLM review requests from finished minis. The
+        // poll is fast (claim-or-null); the slow review runs on its own detached thread.
+        crate::backend::censor_review::ingest_pigeon_censor_reviews(app.clone());
     }
 
     // 1) Locked READ snapshot, then work entirely off the clone (lock released).

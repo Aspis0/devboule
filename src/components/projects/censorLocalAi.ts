@@ -11,7 +11,11 @@
 // PRIVACY: Censor sends FILE CONTENT to this endpoint, so the oMLX base must be a
 // LOOPBACK http origin — the same defense-in-depth refusal the backend enforces.
 
-import { MODEL_PATTERN, validateOmlxBaseUrl } from "../agents/miniCoderBackend";
+import {
+  MODEL_PATTERN,
+  validateOmlxBaseUrl,
+  validateCloudBaseUrl,
+} from "../agents/miniCoderBackend";
 import type { CensorAiProvider, CensorLocalAi } from "../../types/config";
 
 // The oMLX model id/tag cap (e.g. an mlx-community model). Generous: model ids can be
@@ -25,6 +29,7 @@ export const CENSOR_AI_PROVIDERS: readonly CensorAiProvider[] = [
   "ollama",
   "omlx",
   "appleFm",
+  "cloud",
 ] as const;
 
 export interface CensorLocalAiDraft {
@@ -117,6 +122,30 @@ export function validateCensorLocalAi(
           "Base URL must be a loopback http origin (localhost, 127.0.0.1 or [::1]).";
       }
     }
+  } else if (draft.provider === "cloud") {
+    // cloud requires BOTH a non-empty model AND an https (remote) base URL. SAME model rule
+    // as oMLX, but the base is validated with validateCloudBaseUrl (https + non-loopback +
+    // the shared SSRF-metadata denial) instead of the loopback validator. The API KEY is NOT
+    // part of this draft/value — it is saved separately to the OS vault.
+    if (model.length === 0) {
+      errors.model = "Enter the cloud model id (e.g. openai/gpt-4o-mini).";
+    } else if (model.length > CENSOR_MODEL_MAX_LENGTH) {
+      errors.model = `Model must be at most ${CENSOR_MODEL_MAX_LENGTH} characters.`;
+    } else if (!MODEL_PATTERN.test(model)) {
+      errors.model = "Model must be a bare tag (letters, digits, . _ : / -).";
+    }
+    if (baseUrl.length === 0) {
+      errors.baseUrl =
+        "Enter the cloud endpoint base URL (e.g. https://openrouter.ai/api/v1).";
+    } else if (baseUrl.length > CENSOR_BASE_URL_MAX_LENGTH) {
+      errors.baseUrl = `Base URL must be at most ${CENSOR_BASE_URL_MAX_LENGTH} characters.`;
+    } else {
+      normalizedBaseUrl = validateCloudBaseUrl(baseUrl);
+      if (normalizedBaseUrl === null) {
+        errors.baseUrl =
+          "Base URL must be an https origin (e.g. https://openrouter.ai/api/v1).";
+      }
+    }
   }
   // provider "ollama" needs no fields here — it uses the built-in loopback Ollama base
   // + the default Gemma model; any omlx-only draft fields are simply dropped below.
@@ -139,6 +168,10 @@ export function validateCensorLocalAi(
     // oMLX uses `model`; the Ollama-only override is intentionally NOT carried here (the
     // Rust validator likewise drops a stray ollama_model on the oMLX branch).
     value = { provider: "omlx", baseUrl: normalizedBaseUrl!, model };
+  } else if (draft.provider === "cloud") {
+    // normalizedBaseUrl is non-null here (ok === true ⇒ no baseUrl error ⇒ validateCloudBaseUrl
+    // returned a string). The API key is intentionally NOT carried — it lives in the vault.
+    value = { provider: "cloud", baseUrl: normalizedBaseUrl!, model };
   } else {
     // Ollama: carry the validated override when present so a provider save preserves the
     // model the CensorModelCard set (split-brain fix). Empty -> omitted, so the bare

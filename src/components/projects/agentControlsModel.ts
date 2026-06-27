@@ -39,6 +39,10 @@ export function setAgentControlsArgs(
   ) {
     clean.maxBudgetUsd = controls.maxBudgetUsd;
   }
+  // Verifier work-ethic toggles (opt-in): only persist when ON (NO-CHURN, mirrors the Rust
+  // skip_serializing_if).
+  if (controls.verifierPerTask) clean.verifierPerTask = true;
+  if (controls.maxRecallPerProject) clean.maxRecallPerProject = true;
   return { projectId, controls: clean };
 }
 

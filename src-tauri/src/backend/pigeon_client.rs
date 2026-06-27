@@ -118,6 +118,38 @@ impl PigeonClient {
             .ok_or_else(|| format!("Pigeon done: missing/invalid reply_ticket_no in response: {body}"))
     }
 
+    /// POST /pigeon/send — enqueue a task for `receiver_id`. Returns the assigned `ticket_no`.
+    /// Mirrors the Python `_pigeon_send_*` producers (same body shape); the dispatcher auto-computes
+    /// `delivery_mode`, so we omit it. Used by the executor to enqueue async Censor reviews.
+    pub fn send(
+        &self,
+        sender_id: &str,
+        receiver_id: &str,
+        project_id: &str,
+        priority: i64,
+        payload: Value,
+    ) -> Result<i64, String> {
+        let body = serde_json::json!({
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "project_id": project_id,
+            "priority": priority,
+            "payload": payload,
+        });
+        let resp = self
+            .http
+            .post(self.url("/pigeon/send"))
+            .timeout(Duration::from_secs(10))
+            .header(AUTH_HEADER, &self.token)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("Pigeon send: request failed: {e}"))?;
+        let body = parse_ok(resp, "send")?;
+        body.get("ticket_no")
+            .and_then(|t| t.as_i64())
+            .ok_or_else(|| format!("Pigeon send: missing/invalid ticket_no in response: {body}"))
+    }
+
     /// POST /pigeon/fail — report a claimed task as failed (requeue or dead-letter, server decides).
     /// Maps 403 (wrong receiver) / 409 (not claimed) / 404 (missing) into an `Err` carrying the code.
     pub fn fail(&self, ticket_no: i64, agent_id: &str, error: &str) -> Result<(), String> {
@@ -362,5 +394,35 @@ mod tests {
         assert_eq!(sent["agent_id"], "mini-1");
         assert_eq!(sent["status"], "loaded");
         assert_eq!(sent["agent_type"], DEFAULT_AGENT_TYPE);
+    }
+
+    #[test]
+    fn send_posts_fields_and_parses_ticket() {
+        let (base, handle) = spawn_mock(
+            "HTTP/1.1 200 OK",
+            r#"{"ticket_no": 99, "status": "pending", "delivery_mode": "queued"}"#,
+        );
+        let client = PigeonClient::new(base, TOKEN).unwrap();
+        let ticket = client
+            .send(
+                "executor",
+                "censor-pool",
+                "proj-1",
+                80,
+                serde_json::json!({"file": "src/a.rs"}),
+            )
+            .unwrap();
+
+        let cap = handle.join().unwrap();
+        assert!(cap.request_line.starts_with("POST /pigeon/send "), "{}", cap.request_line);
+        assert_eq!(cap.header(AUTH_HEADER), Some(TOKEN));
+
+        let sent: Value = serde_json::from_str(&cap.body).expect("body is JSON");
+        assert_eq!(sent["sender_id"], "executor");
+        assert_eq!(sent["receiver_id"], "censor-pool");
+        assert_eq!(sent["project_id"], "proj-1");
+        assert_eq!(sent["priority"], 80);
+        assert_eq!(sent["payload"]["file"], "src/a.rs");
+        assert_eq!(ticket, 99);
     }
 }

@@ -46,6 +46,7 @@ import type {
   DetectedProvider,
 } from "../../types/config";
 import type {
+  AuxCredentialStatus,
   WorkspaceClassificationEntry,
   WorkspaceDecryptResult,
   WorkspaceGitRepoStatus,
@@ -945,6 +946,166 @@ function inferIsAppleHostMac(): boolean | null {
   return null;
 }
 
+// Cloud Censor API-key field — rendered INSIDE the CensorLocalAiCard grid only when the
+// provider is "cloud". WRITE-ONLY (mirrors ExaSearchKeyCard): the value goes straight to the
+// OS keychain via `save_censor_cloud_key` and is NEVER read back — only present/absent is
+// surfaced. CRITICAL: the key is NEVER put into the `set_censor_local_ai` config object; it
+// lives only in the vault. A synchronous in-flight ref drops double-clicks before `busy`
+// re-renders.
+function CensorCloudKeyField() {
+  const [status, setStatus] = useState<AuxCredentialStatus | null>(null);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingRemove, setPendingRemove] = useState(false);
+  const mountedRef = useRef(true);
+  const inflightRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      const next = await invokeBackendCommand<AuxCredentialStatus>(
+        "get_censor_cloud_key_status",
+      );
+      if (!mountedRef.current) return;
+      setStatus(next);
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setError(
+        e instanceof Error ? e.message : "Could not read the Censor cloud key status.",
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const handleSave = useCallback(async () => {
+    const key = draft.trim();
+    if (!key) return;
+    if (inflightRef.current) return;
+    inflightRef.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invokeBackendCommand<AuxCredentialStatus>(
+        "save_censor_cloud_key",
+        { key },
+      );
+      if (!mountedRef.current) return;
+      setStatus(next);
+      setPendingRemove(false);
+      // Never retain the secret in component state — it lives only in the keychain now.
+      setDraft("");
+      if (!next.configured) {
+        setError(next.message ?? "The Censor cloud key was not accepted.");
+      }
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setError(e instanceof Error ? e.message : "Saving the Censor cloud key failed.");
+    } finally {
+      inflightRef.current = false;
+      if (mountedRef.current) setBusy(false);
+    }
+  }, [draft]);
+
+  const handleRemove = useCallback(async () => {
+    if (!pendingRemove) {
+      setPendingRemove(true);
+      return;
+    }
+    if (inflightRef.current) return;
+    inflightRef.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invokeBackendCommand<AuxCredentialStatus>(
+        "delete_censor_cloud_key",
+      );
+      if (!mountedRef.current) return;
+      setStatus(next);
+      setDraft("");
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setError(e instanceof Error ? e.message : "Removing the Censor cloud key failed.");
+    } finally {
+      inflightRef.current = false;
+      if (mountedRef.current) {
+        setBusy(false);
+        setPendingRemove(false);
+      }
+    }
+  }, [pendingRemove]);
+
+  const hasKey = status?.configured === true;
+
+  return (
+    <div className="md:col-span-2">
+      <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+        API key
+        <div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <input
+            type="password"
+            value={draft}
+            onChange={(event) => {
+              setError(null);
+              setPendingRemove(false);
+              setDraft(event.target.value);
+            }}
+            placeholder={hasKey ? "Paste a new key to rotate" : "Paste your provider API key"}
+            autoComplete="off"
+            spellCheck={false}
+            className="min-w-0 flex-1 rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+          />
+          <button
+            type="button"
+            onClick={() => void handleSave()}
+            disabled={busy || draft.trim().length === 0}
+            className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            {hasKey ? "Rotate" : "Save key"}
+          </button>
+          {hasKey ? (
+            <button
+              type="button"
+              onClick={() => void handleRemove()}
+              disabled={busy}
+              className="inline-flex items-center justify-center gap-1 rounded-md border border-cream-200 bg-white px-3 py-2 text-[11px] font-semibold normal-case tracking-normal text-cream-500 hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {pendingRemove ? "Confirm" : "Clear"}
+            </button>
+          ) : null}
+        </div>
+      </label>
+      <p className="mt-1.5 text-[11px] normal-case tracking-normal text-cream-400">
+        {hasKey ? (
+          <>
+            Saved <span className="font-mono text-cream-300">••••••••</span> (hidden,
+            in your OS keychain). The async Censor review authenticates with it.
+          </>
+        ) : (
+          "No key — the cloud Censor review stays off until you save one."
+        )}
+      </p>
+      {error && (
+        <p className="mt-2 flex items-start gap-2 rounded-2xl border border-coral/30 bg-coral/[0.05] px-3 py-2 text-[11px] normal-case leading-4 tracking-normal text-coral-dark">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{error}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function CensorLocalAiCard() {
   const { config } = useAppContext();
   const { refreshConfig } = useAppActions();
@@ -1026,9 +1187,11 @@ export function CensorLocalAiCard() {
   // The oMLX base/model are REQUIRED, so surface their errors even when empty (mirroring
   // the mini-coder card) — an empty/invalid field just greys out Save otherwise, with no
   // inline reason for WHY.
-  const showBaseUrlError = provider === "omlx" && Boolean(validation.errors.baseUrl);
+  const showBaseUrlError =
+    (provider === "omlx" || provider === "cloud") &&
+    Boolean(validation.errors.baseUrl);
   const showModelError =
-    (provider === "omlx" || provider === "appleFm") &&
+    (provider === "omlx" || provider === "appleFm" || provider === "cloud") &&
     Boolean(validation.errors.model);
 
   const save = useCallback(
@@ -1074,8 +1237,8 @@ export function CensorLocalAiCard() {
   return (
     <section
       className="rounded-2xl border border-cream-200 bg-white p-4"
-      data-help-title="Censor's tier-2 model can run on Ollama, local oMLX, or Apple on-device."
-      data-help-lines="Ollama is the default (today's behavior, no setup). oMLX points Censor at a local MLX server exposing an OpenAI-compatible HTTP API; Apple on-device uses the local Apple runtime. Censor sends file content to tier-2 models, so remote endpoints are loopback-only.|Stored in your local config.json; absent means the Ollama default."
+      data-help-title="Censor's tier-2 model can run on Ollama, local oMLX, Apple on-device, or an opt-in Cloud endpoint."
+      data-help-lines="Ollama is the default (today's behavior, no setup). oMLX points Censor at a local MLX server exposing an OpenAI-compatible HTTP API; Apple on-device uses the local Apple runtime. These keep file content ON your machine (loopback only). Cloud is the OPT-IN exception: it sends file content to a remote HTTPS endpoint authenticated with an API key (kept in your OS keychain) — your code leaves the device.|Stored in your local config.json (the API key lives only in the OS keychain); absent means the Ollama default."
     >
       <div className="mb-3 flex items-center gap-2">
         <Cpu className="h-4 w-4 text-teal" />
@@ -1084,9 +1247,10 @@ export function CensorLocalAiCard() {
         </h3>
       </div>
       <p className="mb-4 max-w-3xl text-[12px] leading-5 text-cream-500">
-        Choose the on-device model provider Censor uses for its optional tier-2
-        (Gemma) review. Ollama is the default; oMLX points Censor at a local MLX
-        server; Apple on-device uses macOS Foundation Models.
+        Choose the model provider Censor uses for its optional tier-2 (Gemma)
+        review. Ollama is the default; oMLX points Censor at a local MLX server;
+        Apple on-device uses macOS Foundation Models. Cloud is an opt-in remote
+        HTTPS endpoint — it sends your code off-device, so use it deliberately.
       </p>
 
       <div className="grid gap-3 rounded-2xl border border-cream-200 p-3 md:grid-cols-2">
@@ -1104,16 +1268,23 @@ export function CensorLocalAiCard() {
             <option value="appleFm" disabled={isAppleHostMac === false}>
               Apple on-device
             </option>
+            <option value="cloud">Cloud (HTTPS endpoint)</option>
           </select>
         </label>
 
-        {provider === "omlx" || provider === "appleFm" ? (
+        {provider === "omlx" || provider === "appleFm" || provider === "cloud" ? (
           <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
             Model {provider === "appleFm" ? "(optional)" : "tag"}
             <input
               value={model}
               onChange={(event) => setModel(event.target.value)}
-              placeholder={provider === "appleFm" ? "default" : "mlx-community/gemma"}
+              placeholder={
+                provider === "appleFm"
+                  ? "default"
+                  : provider === "cloud"
+                    ? "openai/gpt-4o-mini"
+                    : "mlx-community/gemma"
+              }
               maxLength={CENSOR_MODEL_MAX_LENGTH}
               list={detectedModels.length ? "censor-detected-models" : undefined}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
@@ -1163,13 +1334,17 @@ export function CensorLocalAiCard() {
           </p>
         ) : null}
 
-        {provider === "omlx" ? (
+        {provider === "omlx" || provider === "cloud" ? (
           <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
             Base URL
             <input
               value={baseUrl}
               onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder="http://localhost:8000/v1"
+              placeholder={
+                provider === "cloud"
+                  ? "https://openrouter.ai/api/v1"
+                  : "http://localhost:8000/v1"
+              }
               maxLength={CENSOR_BASE_URL_MAX_LENGTH}
               className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             />
@@ -1188,6 +1363,21 @@ export function CensorLocalAiCard() {
             non-loopback host is refused to keep your code on this machine. No API
             key — loopback only.
           </p>
+        ) : null}
+
+        {provider === "cloud" ? (
+          <>
+            <CensorCloudKeyField />
+            <p className="md:col-span-2 flex items-start gap-2 rounded-2xl border border-amber/30 bg-amber/[0.05] px-3 py-2 text-[11px] leading-4 text-amber-dark">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                Remote HTTPS endpoint (e.g. OpenRouter). Censor sends file content
+                OFF your machine to this provider — opt-in. The API key is stored in
+                your OS keychain, never in config. Requires the Pigeon mailbox (Labs)
+                for the async review.
+              </span>
+            </p>
+          </>
         ) : null}
 
         {appleFmAvailabilityNote ? (

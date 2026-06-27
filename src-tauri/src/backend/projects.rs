@@ -132,6 +132,26 @@ pub fn get_project(
     ))
 }
 
+/// Auto-trust the Censor only for a brand-new (empty or non-existent) project folder.
+/// A populated folder may be an imported/cloned third-party repo whose tool-configs
+/// (`.eslintrc.js`, etc.) would RCE when linted, so it stays opt-in (BLOCKER B). `None`
+/// (no folder chosen yet) and any non-`NotFound` read error are conservatively NOT trusted.
+///
+/// NOTE: from `create_project` the `NotFound` branch is effectively dead — the caller validates
+/// the root via `validate_project_root_for_save` (which errors unless the dir already exists), so
+/// the path here is always an existing dir; the branch is kept for general/direct callers. The
+/// empty-check is a TOCTOU against an external process populating the dir between validation and
+/// here, but it runs under the project write-lock and an empty dir carries no tool-config to
+/// exploit, so the residual window is accepted.
+fn project_folder_is_new(root: Option<&str>) -> bool {
+    let Some(path) = root else { return false };
+    match std::fs::read_dir(path) {
+        Ok(mut dir) => dir.next().is_none(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 #[tauri::command]
 pub fn create_project(
     app: tauri::AppHandle,
@@ -155,6 +175,7 @@ pub fn create_project(
         return Err("Project already exists.".into());
     }
     let now = now();
+    let root_path = validate_project_root_for_save(input.root_path.as_deref())?;
     let metadata = ProjectMetadata {
         id,
         title,
@@ -164,10 +185,11 @@ pub fn create_project(
         // silent default — a no-folder project stays root_path=None and the user is prompted to
         // set one before launch (resolve_project_agent_root errors clearly), instead of getting
         // a surprise default (~/Desktop/aspis bio) or the app's own dir.
-        root_path: validate_project_root_for_save(input.root_path.as_deref())?,
-        // BLOCKER B: a freshly created project is UNTRUSTED for Censor by default;
-        // the user must explicitly opt in via `set_censor_trusted`.
-        censor_trusted: false,
+        root_path: root_path.clone(),
+        // Auto-trust the Censor only for a brand-new (empty/absent) folder; an imported or
+        // cloned folder stays opt-in (anti-RCE — see project_folder_is_new / BLOCKER B). The
+        // user can still toggle trust afterwards via set_censor_trusted.
+        censor_trusted: project_folder_is_new(root_path.as_deref()),
         net_enabled: false,
         sandbox_mode: crate::backend::broker::SandboxMode::default(),
         working_set: Vec::new(),
@@ -6218,51 +6240,12 @@ fn toml_array(values: &[&str]) -> String {
     format!("[{values}]")
 }
 
-#[cfg(windows)]
+/// Resolve a command against the AUGMENTED PATH so a GUI-launched app (stripped PATH) still
+/// finds Homebrew/npm/cargo tools. Pure scan, no shell spawn (no argv injection surface) — see
+/// `provider_detect::resolve_program`, which is cross-platform (handles path-bearing names and
+/// Windows extensions), so the old windows/unix split is no longer needed.
 pub(crate) fn command_exists(executable: &str) -> bool {
-    use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW so the where.exe probe never flashes a console window.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    Command::new("where.exe")
-        .arg(executable)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-// UNVERIFIED on macOS — needs testing on a real Mac.
-/// Unix variant: resolve a command on PATH WITHOUT spawning a shell. The previous
-/// `sh -c "command -v {} ..."` interpolated the executable into a shell string;
-/// even with single-quote escaping a name carrying shell metacharacters could be
-/// executed as code (argv injection). Now that this fn is `pub(crate)` its callers
-/// (incl. the Censor runners, fed paths from the MCP boundary) widen that exposure,
-/// so we do a pure PATH scan instead: iterate the `PATH` entries and accept the
-/// first that contains an executable regular file named `executable`. No shell, no
-/// interpolation, no spawn.
-#[cfg(unix)]
-pub(crate) fn command_exists(executable: &str) -> bool {
-    /// A path is runnable if it is an existing regular file with any execute bit set.
-    fn is_executable_file(candidate: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(candidate) {
-            Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
-            Err(_) => false,
-        }
-    }
-
-    // An absolute / path-bearing name is checked directly (mirrors how a shell
-    // would resolve `./tool` or `/usr/bin/tool` without consulting PATH).
-    if executable.contains('/') {
-        return is_executable_file(Path::new(executable));
-    }
-    let path_var = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return false,
-    };
-    std::env::split_paths(&path_var)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .any(|dir| is_executable_file(&dir.join(executable)))
+    crate::backend::provider_detect::resolve_program(executable).is_some()
 }
 
 pub(crate) fn ps_single_quote(value: &str) -> String {
@@ -9582,6 +9565,36 @@ mod tests {
     }
 
     #[test]
+    fn project_folder_is_new_only_for_empty_or_absent_dirs() {
+        // Auto-trust the Censor only for a brand-new (empty/absent) project folder:
+        // a populated folder may be a hostile clone whose tool-configs (eslintrc, etc.)
+        // would RCE when linted, so it stays opt-in.
+        let base =
+            std::env::temp_dir().join(format!("aspis-folder-is-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // None (no folder chosen yet) → not auto-trusted.
+        assert!(!project_folder_is_new(None));
+
+        // Absent path → brand-new → auto-trust.
+        let absent = base.join("does-not-exist");
+        assert!(project_folder_is_new(absent.to_str()));
+
+        // Existing EMPTY dir → brand-new → auto-trust.
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(project_folder_is_new(empty.to_str()));
+
+        // Existing dir with ANY content → imported/clone → NOT auto-trusted.
+        let populated = base.join("populated");
+        std::fs::create_dir_all(&populated).unwrap();
+        std::fs::write(populated.join("README.md"), b"x").unwrap();
+        assert!(!project_folder_is_new(populated.to_str()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn censor_trusted_roundtrips_and_old_files_default_false() {
         // An old file with NO censor_trusted line parses as untrusted (back-compat).
         let old = "---\nid: proj-x\ntitle: P\nstatus: active\nupdated_at: t\n---\n";
@@ -10425,6 +10438,8 @@ updated_at: 2026-05-28T00:00:00Z
                 system_prompt: Some("be terse".to_string()),
                 max_turns: Some(7),
                 max_budget_usd: None,
+                verifier_per_task: false,
+                max_recall_per_project: false,
             };
             Ok(())
         })

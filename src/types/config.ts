@@ -192,7 +192,10 @@ export interface DetectedProvider {
 // POSTs chat-completions to `<baseUrl>/chat/completions`. PRIVACY: `baseUrl` MUST be a
 // LOOPBACK http origin (http only) — Censor sends FILE CONTENT to it, so it must never leave
 // the device (enforced backend-side by validate_censor_local_ai + the client clamp).
-export type CensorAiProvider = "ollama" | "omlx" | "appleFm";
+// "cloud" is the OPT-IN exception: a remote HTTPS OpenAI-compatible endpoint reached with a
+// Bearer API key — the ONE provider that sends file content off-device. The key lives in the
+// OS vault (provider:censor_cloud), NEVER in this config; only present/absent is surfaced.
+export type CensorAiProvider = "ollama" | "omlx" | "appleFm" | "cloud";
 
 export interface CensorLocalAi {
   provider: CensorAiProvider;

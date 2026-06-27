@@ -77,6 +77,22 @@ pub struct FindingsUpdatedPayload {
     pub files: Vec<String>,
 }
 
+/// Tauri event emitted when a Censor pass STARTS, before the slow runner work, so the UI can
+/// show a live "linters running…" indicator; the matching `findings-updated` (pass end) clears
+/// it. Payload: `{ projectId, kind: "fine"|"coarse", fileCount }` (camelCase).
+pub const SCAN_STARTED_EVENT: &str = "censor://scan-started";
+
+/// Payload for [`SCAN_STARTED_EVENT`]. `kind` is the pass type; `file_count` is the number of
+/// changed files in a FINE pass (0 for a whole-project COARSE pass).
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanStartedPayload {
+    pub project_id: String,
+    /// "fine" | "coarse"
+    pub kind: &'static str,
+    pub file_count: usize,
+}
+
 // ---------------------------------------------------------------------------
 // PURE planning + grouping (no IO).
 // ---------------------------------------------------------------------------
@@ -502,7 +518,7 @@ pub fn run_fine_batch(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
 ) {
-    run_fine_batch_inner(app, project_id, root, files, gemma, running, true);
+    run_fine_batch_inner(app, project_id, root, files, gemma, running, true, true);
 }
 
 /// WARNING 4 (P6 verdict gate): like [`run_fine_batch`] but SKIPS the training-rail
@@ -520,7 +536,7 @@ pub fn run_fine_batch_no_rail(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
 ) {
-    run_fine_batch_inner(app, project_id, root, files, gemma, running, false);
+    run_fine_batch_inner(app, project_id, root, files, gemma, running, false, false);
 }
 
 /// Shared core of [`run_fine_batch`] / [`run_fine_batch_no_rail`]. `record_rail`
@@ -533,9 +549,16 @@ fn run_fine_batch_inner(
     gemma: Option<GemmaCtx<'_>>,
     running: &AtomicBool,
     record_rail: bool,
+    emit_scan: bool,
 ) {
     if !running.load(Ordering::SeqCst) {
         return;
+    }
+    // Only the LIVE watcher lights the "linters running…" indicator. The verdict gate and the async
+    // Censor review reuse this pass too, but they must NOT flicker the indicator (findings-updated
+    // still fires below so their findings surface).
+    if emit_scan {
+        emit_scan_started(app, project_id, "fine", files.len(), running);
     }
     let changed = fine_batch_collect(root, files, gemma);
     // TRAINING RAIL: record findings for every changed file while the project is
@@ -704,6 +727,7 @@ pub fn run_coarse_pass(app: &AppHandle, project_id: &str, root: &Path, running: 
     if !running.load(Ordering::SeqCst) {
         return;
     }
+    emit_scan_started(app, project_id, "coarse", 0, running);
     let changed = coarse_pass_collect(root);
     // TRAINING RAIL: same lock-ordering discipline as run_fine_batch.
     if running.load(Ordering::SeqCst) && !changed.is_empty() {
@@ -894,6 +918,28 @@ fn emit_if_running(app: &AppHandle, project_id: &str, files: Vec<String>, runnin
     }
 }
 
+/// Emit [`SCAN_STARTED_EVENT`] iff the project is still running — mirrors `emit_if_running`'s
+/// stop-flag check so a torn-down/replaced project never receives a stale scan-started.
+fn emit_scan_started(
+    app: &AppHandle,
+    project_id: &str,
+    kind: &'static str,
+    file_count: usize,
+    running: &AtomicBool,
+) {
+    if !running.load(Ordering::SeqCst) {
+        return;
+    }
+    let payload = ScanStartedPayload {
+        project_id: project_id.to_string(),
+        kind,
+        file_count,
+    };
+    if let Err(e) = app.emit(SCAN_STARTED_EVENT, &payload) {
+        eprintln!("censor orchestrator: emit {SCAN_STARTED_EVENT} failed: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,6 +1083,19 @@ mod tests {
         assert!(json.contains("\"projectId\":\"proj-1\""), "json: {json}");
         assert!(json.contains("\"files\":[\"src/a.rs\"]"), "json: {json}");
         assert!(!json.contains("project_id"), "snake_case leaked: {json}");
+    }
+
+    #[test]
+    fn scan_started_payload_serializes_camel_case() {
+        let payload = ScanStartedPayload {
+            project_id: "proj-x".into(),
+            kind: "fine",
+            file_count: 3,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"projectId\":\"proj-x\""), "json: {json}");
+        assert!(json.contains("\"kind\":\"fine\""), "json: {json}");
+        assert!(json.contains("\"fileCount\":3"), "json: {json}");
     }
 
     #[test]
