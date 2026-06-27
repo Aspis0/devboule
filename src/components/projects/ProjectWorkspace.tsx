@@ -66,6 +66,7 @@ import {
 } from "react-resizable-panels";
 import { LivingPlan } from "../work/LivingPlan";
 import { SpawnPanel } from "../agents/SpawnPanel";
+import { SkillsToolsModal } from "../work/SkillsToolsModal";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
@@ -254,6 +255,8 @@ export function ProjectWorkspace({
   // Split view: when set, pins a SECOND agent's focus pane beside the primary selection.
   // Local to the console (not shared with the board) — split is a pure view concern.
   const [splitAgentId, setSplitAgentId] = useState<string | null>(null);
+  // Work Console "Skills & Tools" modal (per-role skills/tools for this project).
+  const [skillsOpen, setSkillsOpen] = useState(false);
   // defaultSize is initial-mount-only in react-resizable-panels, so drive the proportions
   // imperatively: toggling split rebalances to 50/50, unsplit restores the primary to 100%.
   const panelGroupRef = useRef<ImperativePanelGroupHandle>(null);
@@ -372,7 +375,10 @@ export function ProjectWorkspace({
 
   // Archiving (readOnly) closes the launcher so a stale-open SpawnPanel can't re-mount on unarchive.
   useEffect(() => {
-    if (readOnly) setLauncherOpen(false);
+    if (readOnly) {
+      setLauncherOpen(false);
+      setSkillsOpen(false);
+    }
   }, [readOnly]);
   // Split: the model rebuilds only when sessions/tasks change (the 5s poll), and the node
   // lookup re-runs when the SELECTION changes — so switching agents doesn't rebuild the model.
@@ -1001,6 +1007,12 @@ export function ProjectWorkspace({
       })()}
 
       {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
+      {skillsOpen && (
+        <SkillsToolsModal
+          projectRoot={censorRoot}
+          onClose={() => setSkillsOpen(false)}
+        />
+      )}
       {launcherOpen && !readOnly && (
         <SpawnPanel
           projects={[{ id: project.metadata.id, title: project.metadata.title }]}
@@ -1150,6 +1162,22 @@ export function ProjectWorkspace({
                   >
                     <Columns2 className="h-3 w-3" aria-hidden />
                     {splitAgentId ? "unsplit" : "split"}
+                  </button>
+                  {/* Skills & Tools: per-role skills/tools for this project's agents.
+                      Opens the modal; needs a resolved project root. */}
+                  <button
+                    type="button"
+                    onClick={() => setSkillsOpen(true)}
+                    disabled={!censorRoot}
+                    title={
+                      censorRoot
+                        ? "Manage skills & tools for this project's agents"
+                        : "Open a project folder first"
+                    }
+                    className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-terracotta disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Sparkles className="h-3 w-3" aria-hidden />
+                    skills &amp; tools
                   </button>
                   <button
                     type="button"
