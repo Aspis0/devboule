@@ -1,0 +1,219 @@
+/*
+ * Device frame skins for the interactive-artifact renderer (Phase 4,
+ * plan `bubbly-hopping-valiant.md`).
+ *
+ * SOURCES (all MIT):
+ *
+ * 1. picturepan2/devices.css — MIT License
+ *    Copyright (c) 2017 Yan Zhu
+ *    https://github.com/picturepan2/devices.css
+ *    Sections: `.device`, `.device-iphone-14-pro`, `.device-google-pixel-6-pro`.
+ *    Adaptation: `.device-screen` child is an `<iframe>` (not `<img>`); added
+ *    `overflow:hidden` on `.device-frame` to clip the iframe to the bezel's
+ *    border-radius; added `transform:translateZ(0)` (Safari clip fix — forces GPU
+ *    compositing so `overflow:hidden + border-radius` actually clips the iframe,
+ *    since WKWebView requires a promoted layer for this to work correctly).
+ *    The `overflow:hidden` rule is intentionally on `.device-frame` / `.device-screen`
+ *    ONLY — NEVER on the `<iframe>` itself (that would kill internal scroll).
+ *
+ * 2. jhildenbiddle/css-device-frames — MIT License
+ *    Copyright (c) 2021 John Hildenbiddle
+ *    https://github.com/jhildenbiddle/css-device-frames
+ *    Sections: `.app-frame` browser chrome wrapper and `data-url` address bar.
+ *    Adaptation: children are an `<ArtifactView>` wrapper div (not a bare `<iframe>`),
+ *    so the `iframe:only-child` fill rule is widened to `.af-frame-content > *`; the
+ *    address-bar chrome bar is self-implemented (structural only, no code copied) to
+ *    match the described `::before`/`data-url::after` pattern.
+ *
+ * Open WebUI is NOT used (its license is incompatible — custom anti-rebrand clause).
+ * See THIRD_PARTY_NOTICES.md at the repository root for the full attribution list.
+ */
+
+/* ==========================================================================
+   Shared device reset (picturepan2/devices.css — verbatim)
+   ========================================================================== */
+
+.device,
+.device * {
+  box-sizing: border-box;
+  display: block;
+}
+.device {
+  position: relative;
+  transform: scale(1);
+  z-index: 1;
+}
+.device .device-screen {
+  background-color: #000;
+  object-fit: cover;
+  position: relative;
+}
+
+/* ==========================================================================
+   iPhone 14 Pro skin — picturepan2/devices.css (verbatim + overflow fix)
+   Copyright (c) 2017 Yan Zhu — MIT
+   ========================================================================== */
+
+.device-iphone-14-pro {
+  height: 868px;
+  width: 428px;
+}
+
+.device-iphone-14-pro .device-frame {
+  background: #010101;
+  border: 1px solid #1b1721;
+  border-radius: 68px;
+  box-shadow: inset 0 0 4px 2px #c0b7cd, inset 0 0 0 6px #342c3f;
+  height: 868px;
+  padding: 19px;
+  width: 428px;
+  /* Clip the iframe to the rounded bezel edges. The overflow must live HERE (on the
+     frame, not on the iframe element) so internal iframe scroll is preserved. */
+  overflow: hidden;
+  /* Safari / WKWebView clip fix: promote to a GPU layer so overflow+border-radius
+     actually clips the iframe content (WKWebView requires compositing for this). */
+  transform: translateZ(0);
+}
+
+.device-iphone-14-pro .device-screen {
+  border-radius: 49px;
+  height: 830px;
+  width: 390px;
+  overflow: hidden;
+}
+
+/* ==========================================================================
+   Google Pixel 6 Pro skin — picturepan2/devices.css (verbatim + overflow fix)
+   Copyright (c) 2017 Yan Zhu — MIT
+   ========================================================================== */
+
+.device-google-pixel-6-pro {
+  height: 862px;
+  width: 404px;
+}
+
+.device-google-pixel-6-pro .device-frame {
+  background: #121212;
+  border-radius: 28px;
+  box-shadow: inset 0 0 12px #8d8d86, inset 0 7px 0 3px #fdfdfc,
+    inset 0 -6px 0 3px #fdfdfc;
+  height: 862px;
+  margin: 0 2px;
+  padding: 20px 12px 26px 12px;
+  width: 400px;
+  overflow: hidden;
+  transform: translateZ(0);
+}
+
+.device-google-pixel-6-pro .device-screen {
+  border-radius: 27px;
+  height: 816px;
+  width: 376px;
+  overflow: hidden;
+}
+
+/* iframe inside device-screen: fill the screen slot completely */
+.device .device-screen > *,
+.device .device-screen iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  margin: 0;
+}
+
+/* ==========================================================================
+   Browser / web chrome — adapted from jhildenbiddle/css-device-frames
+   Copyright (c) 2021 John Hildenbiddle — MIT
+   Structural adaptation: ArtifactView wraps the iframe in a div, so we target
+   `.af-frame-content` (our slot div) rather than `iframe:only-child`.
+   The visual chrome bar (traffic lights + address bar) is self-implemented.
+   ========================================================================== */
+
+.app-frame {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #d0ccc7;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #f5f3f0;
+  /* Safari clip fix for the rounded frame */
+  transform: translateZ(0);
+}
+
+/* macOS-style traffic-light dots + address bar — self-authored, structure from
+   css-device-frames `::before` / `[data-url]::after` pattern */
+.app-frame::before {
+  content: "";
+  display: block;
+  height: 36px;
+  flex-shrink: 0;
+  background: #ebebeb;
+  border-bottom: 1px solid #d0ccc7;
+  /* traffic-light dots via radial gradients */
+  background-image: radial-gradient(circle at 14px 18px, #ff5f57 5px, transparent 5px),
+    radial-gradient(circle at 32px 18px, #ffbd2e 5px, transparent 5px),
+    radial-gradient(circle at 50px 18px, #28c940 5px, transparent 5px);
+}
+
+/* Address bar (rendered when data-url is set) — jhildenbiddle/css-device-frames pattern */
+.app-frame[data-url]::after {
+  content: attr(data-url);
+  display: block;
+  height: 28px;
+  flex-shrink: 0;
+  background: #fff;
+  border: 1px solid #d0ccc7;
+  border-radius: 5px;
+  margin: 0 64px 6px;
+  padding: 0 10px;
+  font-size: 11px;
+  line-height: 28px;
+  color: #888;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* The ::after is a flex child of .app-frame (flex-direction:column) */
+}
+
+/* Content slot: the ArtifactView wrapper div fills remaining height */
+.af-frame-content {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Fill rule — mirrors jhildenbiddle's `iframe:only-child` rule, adapted for our
+   ArtifactView div wrapper */
+.af-frame-content > * {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ==========================================================================
+   Viewport scaler — the outer/inner pair used by ArtifactFrame
+   ========================================================================== */
+
+/* Outer scaler: clips scaled content; height is set inline (= deviceH * scale) */
+.af-scaler-outer {
+  position: relative;
+  overflow: hidden;
+}
+
+/* Inner scaler: positioned at natural device size, then scaled down/up */
+.af-scaler-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: top left;
+}
+
+/* ==========================================================================
+   Component (bare) frame — no chrome, just fill
+   ========================================================================== */
+
+.af-component-bare {
+  display: block;
+  width: 100%;
+}

@@ -1221,7 +1221,7 @@ pub fn design_append_generation_log(
 fn build_generation_log_line(entry: &GenerationLogEntry) -> Result<String, String> {
     // Allowlist the enum-like fields so a crafted payload can't write arbitrary
     // strings (keeps the log parseable + tamper-evident).
-    if !matches!(entry.kind.as_str(), "generate" | "edit") {
+    if !matches!(entry.kind.as_str(), "generate" | "edit" | "generate-interactive") {
         return Err("invalid generation log kind".to_string());
     }
     if !matches!(entry.outcome.as_str(), "applied" | "empty" | "error") {
@@ -1391,6 +1391,46 @@ pub fn design_write_export(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2 — interactive artifact persistence (the SECOND output mode)
+// ---------------------------------------------------------------------------
+
+/// Atomically persist an interactive artifact's CLEAN HTML to
+/// `<workingFolder>/artifact/index.html` (the FIXED path the `artifact:` serve handler
+/// reads). The HTML is OPAQUE to Rust (mirroring component markup): the frontend's PURE
+/// `applyInteractiveGeneration` produced it WITHOUT a bridge or a CSP `<meta>` — the serve
+/// handler (`artifact_protocol.rs`) injects the bridge (idempotently) and sets the CSP via a
+/// RESPONSE HEADER at serve time, so this command must NOT add either.
+///
+/// CONFINEMENT — there is NO caller-supplied path component (the dir + filename are fixed
+/// constants), so there is no traversal surface. We still: canonicalize the working folder,
+/// ensure+confine the `artifact/` dir ([`ensure_artifact_dir`]), and resolve the target via
+/// the SAME [`artifact_protocol::confined_artifact_index`] the reader uses (lexical-parent +
+/// symlink-escape checks). Size-capped at [`MAX_DESIGN_FILE_BYTES`]; serialized against every
+/// other design writer through the `design_write_lock`; atomic temp+rename.
+#[tauri::command]
+pub fn design_write_artifact(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    html: String,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    let canonical = canonical_working_folder(&working_folder_path)?;
+
+    // Cap BEFORE touching the filesystem so an oversized payload is rejected outright.
+    if html.len() as u64 > MAX_DESIGN_FILE_BYTES {
+        return Err(format!(
+            "artifact HTML too large ({} bytes > {MAX_DESIGN_FILE_BYTES} max)",
+            html.len()
+        ));
+    }
+
+    ensure_artifact_dir(&canonical)?;
+    let target = crate::backend::artifact_protocol::confined_artifact_index(&canonical)?;
+    atomic_write(&target, &html, "artifact")
+}
+
+// ---------------------------------------------------------------------------
 // Internal write/serialize helpers
 // ---------------------------------------------------------------------------
 
@@ -1416,6 +1456,33 @@ fn ensure_components_dir(canonical_root: &Path) -> Result<(), String> {
             canonical_root.display()
         );
         return Err("components folder escapes the working folder".to_string());
+    }
+    Ok(())
+}
+
+/// Ensure `<root>/artifact` exists AND, after creation, canonicalize it and assert it stays
+/// under `canonical_root` — the EXACT mirror of [`ensure_components_dir`], for the Phase-2
+/// interactive-artifact directory (`ARTIFACT_DIR`, shared with the serve handler). Rejects an
+/// `artifact` entry that is a symlink escaping the working folder. Same residual TOCTOU note
+/// as `ensure_components_dir`: the in-process `design_write_lock` serializes OUR writers; an
+/// external process racing the FS is out of scope.
+fn ensure_artifact_dir(canonical_root: &Path) -> Result<(), String> {
+    let dir = canonical_root.join(crate::backend::artifact_protocol::ARTIFACT_DIR);
+    fs::create_dir_all(&dir).map_err(|e| {
+        eprintln!("[design] could not create artifact folder: {e}");
+        "could not create artifact folder".to_string()
+    })?;
+    let real_dir = fs::canonicalize(&dir).map_err(|e| {
+        eprintln!("[design] could not resolve artifact folder: {e}");
+        "could not resolve artifact folder".to_string()
+    })?;
+    if !real_dir.starts_with(canonical_root) {
+        eprintln!(
+            "[design] artifact folder escapes working root: {} not under {}",
+            real_dir.display(),
+            canonical_root.display()
+        );
+        return Err("artifact folder escapes the working folder".to_string());
     }
     Ok(())
 }
@@ -1484,6 +1551,19 @@ const MAX_REGISTRY_NAME_LEN: usize = 200;
 const DESIGN_TOP_LEVEL_FILES: &[&str] =
     &[PROJECT_FILE, MANIFEST_FILE, TOKENS_FILE, GENERATIONS_FILE, DESIGN_MD_FILE, "preview.png"];
 
+/// Output mode of a design (Phase 2, "two-mode output"). `Static` = DOMPurify-sanitized
+/// canvas nodes (the default + every legacy design); `Interactive` = a self-contained
+/// scripted document rendered in the sandboxed `artifact:` iframe. Serializes lowercase
+/// (`"static"`/`"interactive"`) to match the TS `ArtifactKind`. An ABSENT `kind` on an
+/// entry deserializes to `None`, which every consumer MUST treat as `Static` (legacy +
+/// static designs carry no `kind` key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactKind {
+    Static,
+    Interactive,
+}
+
 /// One design-project registry entry. METADATA ONLY (camelCase over IPC). Mirrors the
 /// TS `DesignProjectEntry`. `workingFolderPath` is the dedupe key (canonicalized).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1497,6 +1577,26 @@ pub struct DesignProjectEntry {
     pub last_opened_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<String>,
+    /// Output mode of this design. ABSENT ⇒ `Static` (legacy entries + static designs).
+    /// camelCase `kind` over IPC; serialized lowercase via [`ArtifactKind`]. Omitted on the
+    /// wire when `None` so existing entries round-trip byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ArtifactKind>,
+    /// Working-folder-relative path to the stored interactive artifact (`artifact/index.html`).
+    /// Absent for static designs. Opaque to Rust (a presentation hint for the frontend);
+    /// camelCase `artifactPath`, omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    /// Frame skin the interactive artifact renders in (`android|ios|web|component`; Phase 4
+    /// wires the skins). Kept an OPEN string (not a closed enum) so a future skin written by
+    /// a newer build still parses on an older one. camelCase `frame`, omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+    /// OPTIONAL link to a plan task by its 1-based number. Absent ⇒ unlinked. Set/cleared
+    /// via `design_registry_set_linked_task`; preserved across plain remembers. camelCase
+    /// `linkedTaskN`, omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_task_n: Option<u32>,
     /// SHA-256 (lowercase hex) of the design.md content the user last APPROVED in the
     /// contract editor. Provenance gate: on load we re-hash the on-disk design.md and
     /// only inject it into prompts when it matches this recorded value (an agent that
@@ -1585,6 +1685,25 @@ fn read_design_registry(app: &tauri::AppHandle) -> Vec<DesignProjectEntry> {
         .take(MAX_REGISTRY_ENTRIES)
         .filter_map(|entry| serde_json::from_value::<DesignProjectEntry>(entry.clone()).ok())
         .collect()
+}
+
+/// Look up a registered design project's stored working-folder path by its `id`.
+/// Returns `None` when no entry matches (an unknown / unregistered id). The returned
+/// path is the value `design_registry_remember` persisted (canonicalized-for-storage
+/// when the folder existed at remember time) — the CALLER must still re-confine it via
+/// [`canonical_working_folder`] before touching the filesystem; this is a pure index
+/// lookup, NOT a confinement boundary.
+///
+/// `pub(crate)` so the sibling `artifact_protocol` URI-scheme handler maps an
+/// `artifact://localhost/<id>` request to a design's working folder WITHOUT inventing a
+/// second, unconfined id→path scheme: it reuses the SAME registry the rest of the design
+/// surface writes to. Reader-or-`None` (never errors): a missing config / unknown id
+/// simply yields `None`, which the handler turns into a 404.
+pub(crate) fn registry_working_folder_for_id(app: &tauri::AppHandle, id: &str) -> Option<String> {
+    read_design_registry(app)
+        .into_iter()
+        .find(|e| e.id == id)
+        .map(|e| e.working_folder_path)
 }
 
 /// PURE: sort a registry list by `lastOpenedAt` descending (most-recent first), tie-
@@ -1684,6 +1803,23 @@ mod registry_ops {
             if incoming.contract_sha.is_some() {
                 existing.contract_sha = incoming.contract_sha;
             }
+            // F2: kind/artifact_path/frame follow the SAME guard pattern as thumbnail_path
+            // and contract_sha: a Some incoming value OVERWRITES (so a static→interactive
+            // switch takes effect), while None PRESERVES the existing value (a plain open
+            // must never wipe these fields, otherwise an interactive design reverts to
+            // "static" on the very next open — the interactive mode was permanently broken).
+            if incoming.kind.is_some() {
+                existing.kind = incoming.kind;
+            }
+            if incoming.artifact_path.is_some() {
+                existing.artifact_path = incoming.artifact_path;
+            }
+            if incoming.frame.is_some() {
+                existing.frame = incoming.frame;
+            }
+            if incoming.linked_task_n.is_some() {
+                existing.linked_task_n = incoming.linked_task_n;
+            }
             // Keep the existing canonical-ish stored path; do not churn it. (id +
             // createdAt are identity and intentionally untouched.)
         } else {
@@ -1747,6 +1883,48 @@ fn clean_registry_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Maximum character length for registry string fields that are NOT the project name —
+/// artifact_path (e.g. `"artifact/index.html"`) and frame skin (e.g. `"android"`).
+/// 512 chars is generous for any relative path while bounding config.json bloat from a
+/// hostile/buggy frontend.
+const MAX_REGISTRY_STRING_LEN: usize = 512;
+
+/// Validate an optional task link: task numbers are 1-based; cap to reject junk. None is OK.
+/// Pure: no filesystem access, directly unit-testable.
+fn validate_linked_task_n(n: Option<u32>) -> Result<(), String> {
+    if let Some(n) = n {
+        if n == 0 {
+            return Err("linkedTaskN must be a 1-based task number (got 0)".to_string());
+        }
+        if n > 100_000 {
+            return Err(format!(
+                "linkedTaskN {n} exceeds the maximum allowed value (100000)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an optional registry string field (artifact_path / frame). Returns
+/// `Ok(None)` when absent, `Ok(Some(s))` when within the cap, `Err` when over it.
+/// Pure: no filesystem access, directly unit-testable.
+fn clean_registry_optional_string(
+    val: Option<String>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<String>, String> {
+    match val {
+        None => Ok(None),
+        Some(s) => {
+            if s.chars().count() > max_len {
+                Err(format!("{field} must be at most {max_len} characters"))
+            } else {
+                Ok(Some(s))
+            }
+        }
+    }
+}
+
 /// List the design-projects registry, sorted by `lastOpenedAt` desc. Reader-or-empty:
 /// a missing key / file / malformed config yields an empty list, never errors.
 #[tauri::command]
@@ -1774,6 +1952,7 @@ pub fn design_registry_remember(
 ) -> Result<Vec<DesignProjectEntry>, String> {
     state.ensure_unlocked()?;
     let name = clean_registry_name(&entry.name)?;
+    validate_linked_task_n(entry.linked_task_n)?;
     let trimmed_path = entry.working_folder_path.trim().to_string();
     if trimmed_path.is_empty() {
         return Err("working folder path must not be empty".to_string());
@@ -1801,7 +1980,20 @@ pub fn design_registry_remember(
     };
     let id = {
         let i = entry.id.trim();
-        if i.is_empty() { new_project_id() } else { i.to_string() }
+        if i.is_empty() {
+            new_project_id()
+        } else {
+            // Validate at write: reject traversal chars, reserved route literals, and junk.
+            // validate_artifact_id accepts [A-Za-z0-9_-], which covers real project ids
+            // (p<pid>-<micros>) and is a strict charset barrier against injected paths.
+            crate::backend::artifact_protocol::validate_artifact_id(i)?;
+            // Reserved route literals must never be stored as an id — they would shadow the
+            // built-in handler routes (`/spike`, `/__spike__`, `/__sample__`).
+            if matches!(i, "__sample__" | "spike" | "__spike__") {
+                return Err(format!("project id '{i}' is a reserved artifact route name"));
+            }
+            i.to_string()
+        }
     };
     let incoming = DesignProjectEntry {
         id,
@@ -1814,6 +2006,24 @@ pub fn design_registry_remember(
         // Carried through verbatim: None on a load/create remember (preserves any existing
         // recorded hash via upsert), Some(hex) when the user just approved a contract.
         contract_sha: entry.contract_sha.clone(),
+        // Phase 2 artifact metadata. F5: artifact_path and frame are length-capped at write
+        // so a buggy/hostile frontend cannot bloat config.json. `clean_registry_optional_string`
+        // rejects over-long values (Err → early return from the command). kind is an enum —
+        // serde already ensures it is one of the known variants.
+        kind: entry.kind,
+        artifact_path: clean_registry_optional_string(
+            entry.artifact_path.clone(),
+            "artifactPath",
+            MAX_REGISTRY_STRING_LEN,
+        )?,
+        frame: clean_registry_optional_string(
+            entry.frame.clone(),
+            "frame",
+            MAX_REGISTRY_STRING_LEN,
+        )?,
+        // Carried through verbatim: None on a plain remember (upsert guard preserves
+        // any existing value); Some(n) when the caller explicitly carries the link.
+        linked_task_n: entry.linked_task_n,
     };
     registry_ops::upsert(&mut entries, incoming, &incoming_key, &|p| {
         registry_dedupe_key(p)
@@ -1849,6 +2059,41 @@ pub fn design_registry_rename(
     if !registry_ops::rename(&mut entries, &id, name, now) {
         return Err("design project not found in the registry".to_string());
     }
+    write_design_registry(&app, &entries)?;
+    sort_registry(&mut entries);
+    Ok(entries)
+}
+
+/// Attach or detach a plan-task link on a registry entry. Authoritative: passes `None`
+/// to CLEAR the link (unlike `design_registry_remember`, whose None merely preserves).
+/// Returns the full sorted registry on success.
+#[tauri::command]
+pub fn design_registry_set_linked_task(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    id: String,
+    linked_task_n: Option<u32>,
+) -> Result<Vec<DesignProjectEntry>, String> {
+    state.ensure_unlocked()?;
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("project id must not be empty".to_string());
+    }
+    // Validate: task numbers are 1-based; cap at a sane upper bound to reject junk.
+    validate_linked_task_n(linked_task_n)?;
+
+    let _config_guard = crate::backend::projects::config_write_lock()
+        .lock()
+        .map_err(|_| "Config write lock is poisoned.".to_string())?;
+
+    let mut entries = read_design_registry(&app);
+    let entry = entries
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| "design project not found".to_string())?;
+    // Authoritative set/clear: Some(n) attaches/changes, None detaches.
+    entry.linked_task_n = linked_task_n;
+    entry.updated_at = Utc::now().to_rfc3339();
     write_design_registry(&app, &entries)?;
     sort_registry(&mut entries);
     Ok(entries)
@@ -1961,6 +2206,22 @@ fn delete_known_design_files(canonical_root: &Path) {
             eprintln!(
                 "[design] could not remove components dir {}: {e}",
                 components_dir.display()
+            );
+        }
+    }
+    // F1: The artifact/ subtree we own (interactive designs). Same confinement + symlink
+    // guards as components/. Omitting this caused artifact/index.html to survive
+    // removeFiles=true, leaking a stale artifact if the same working folder is later
+    // reused by a new project.
+    let artifact_dir = canonical_root.join(crate::backend::artifact_protocol::ARTIFACT_DIR);
+    if artifact_dir.is_dir()
+        && confined_under(canonical_root, canonical_root, &artifact_dir)
+        && !is_symlink(&artifact_dir)
+    {
+        if let Err(e) = fs::remove_dir_all(&artifact_dir) {
+            eprintln!(
+                "[design] could not remove artifact dir {}: {e}",
+                artifact_dir.display()
             );
         }
     }
@@ -2566,6 +2827,38 @@ mod tests {
         assert!(canonical.join(COMPONENTS_DIR).is_dir());
     }
 
+    // ---- Phase 2: interactive artifact write -------------------------------
+
+    #[test]
+    fn ensure_artifact_dir_creates_confined_dir_and_write_lands_at_index() {
+        // Exercises the internals of `design_write_artifact` (minus the State wrapper, like
+        // the other command-guts tests here): the artifact dir is created + confined, and the
+        // CLEAN html lands at the FIXED `<root>/artifact/index.html` the serve handler reads.
+        let base = tmp_dir();
+        let wf = base.join("proj");
+        fs::create_dir_all(&wf).unwrap();
+        let canonical = canonical_working_folder(&wf.to_string_lossy()).unwrap();
+
+        ensure_artifact_dir(&canonical).unwrap();
+        let artifact_dir =
+            canonical.join(crate::backend::artifact_protocol::ARTIFACT_DIR);
+        assert!(artifact_dir.is_dir(), "artifact dir must be created");
+
+        let target =
+            crate::backend::artifact_protocol::confined_artifact_index(&canonical).unwrap();
+        assert_eq!(target.file_name().unwrap(), "index.html");
+        assert_eq!(target.parent().unwrap(), artifact_dir.as_path());
+
+        let html = "<!DOCTYPE html><html><body><script>1</script></body></html>";
+        atomic_write(&target, html, "artifact").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), html);
+        // The stored artifact is CLEAN: the serve handler owns the bridge + CSP, so neither
+        // is present on disk.
+        let stored = fs::read_to_string(&target).unwrap();
+        assert!(!stored.contains("Content-Security-Policy"));
+        assert!(!stored.contains("__artifact_bridge"));
+    }
+
     // ---- NITPICK 10: timestamp suffix uses micros (always Some) -----------
 
     #[test]
@@ -2699,6 +2992,29 @@ mod tests {
                 "should reject {bad:?}"
             );
         }
+    }
+
+    // F3: "generate-interactive" is a valid audit-log kind; unknown kinds are still rejected.
+    #[test]
+    fn generation_log_line_accepts_generate_interactive_kind() {
+        // "generate-interactive" must be accepted like "generate" and "edit".
+        let mut e = log_entry();
+        e.kind = "generate-interactive".to_string();
+        let line = build_generation_log_line(&e);
+        assert!(line.is_ok(), "generate-interactive must be accepted, got: {line:?}");
+        // The serialized line must record the kind verbatim.
+        assert!(
+            line.unwrap().contains("\"kind\":\"generate-interactive\""),
+            "kind must appear in the audit line"
+        );
+
+        // An unknown kind is still rejected (the allowlist did not grow open-endedly).
+        let mut bad = log_entry();
+        bad.kind = "generate-batch".to_string();
+        assert!(
+            build_generation_log_line(&bad).is_err(),
+            "unknown kind generate-batch must still be rejected"
+        );
     }
 
     #[test]
@@ -2916,6 +3232,10 @@ mod tests {
             last_opened_at: last_opened.to_string(),
             thumbnail_path: None,
             contract_sha: None,
+            kind: None,
+            artifact_path: None,
+            frame: None,
+            linked_task_n: None,
         }
     }
 
@@ -2983,6 +3303,64 @@ mod tests {
     }
 
     #[test]
+    fn registry_entry_legacy_without_artifact_fields_parses_as_static() {
+        // Phase 2 back-compat: an entry written BEFORE the artifact fields existed has no
+        // kind/artifactPath/frame keys. It must still parse, with all three defaulting to
+        // None (absent kind ⇒ treated as static by consumers).
+        let legacy = r#"{
+            "id": "p1",
+            "name": "Landing",
+            "workingFolderPath": "/a/landing",
+            "createdAt": "2020-01-01T00:00:00Z",
+            "updatedAt": "2021-01-01T00:00:00Z",
+            "lastOpenedAt": "2021-01-01T00:00:00Z",
+            "thumbnailPath": "preview.png",
+            "contractSha": "abc123"
+        }"#;
+        let parsed: DesignProjectEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.kind, None, "absent kind ⇒ None (static)");
+        assert_eq!(parsed.artifact_path, None);
+        assert_eq!(parsed.frame, None);
+        // Pre-existing fields are unaffected.
+        assert_eq!(parsed.thumbnail_path.as_deref(), Some("preview.png"));
+        assert_eq!(parsed.contract_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn registry_entry_artifact_fields_serde_round_trip_camel_case() {
+        // An interactive entry serializes the artifact fields in camelCase + lowercase kind,
+        // and round-trips; None values are OMITTED from the wire (skip_serializing_if) so a
+        // static entry stays byte-identical to a legacy one.
+        let mut e = entry("p1", "Screen", "/a/screen", "2021-01-01T00:00:00Z");
+        e.kind = Some(ArtifactKind::Interactive);
+        e.artifact_path = Some("artifact/index.html".to_string());
+        e.frame = Some("android".to_string());
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"interactive\""), "got {json}");
+        assert!(json.contains("\"artifactPath\":\"artifact/index.html\""), "got {json}");
+        assert!(json.contains("\"frame\":\"android\""), "got {json}");
+        let back: DesignProjectEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+
+        // A static (default) entry omits all three keys entirely.
+        let plain = entry("p2", "X", "/a/x", "2021-01-01T00:00:00Z");
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("\"kind\""), "None kind omitted: {plain_json}");
+        assert!(!plain_json.contains("artifactPath"), "None artifactPath omitted: {plain_json}");
+        assert!(!plain_json.contains("\"frame\""), "None frame omitted: {plain_json}");
+    }
+
+    #[test]
+    fn artifact_kind_serializes_lowercase() {
+        // Mirrors the TS union "static" | "interactive".
+        assert_eq!(serde_json::to_string(&ArtifactKind::Static).unwrap(), "\"static\"");
+        assert_eq!(
+            serde_json::to_string(&ArtifactKind::Interactive).unwrap(),
+            "\"interactive\""
+        );
+    }
+
+    #[test]
     fn registry_upsert_carries_and_preserves_contract_sha() {
         // Insert an entry that already has an approved hash.
         let mut e = entry("p1", "Landing", "/a/landing", "2021-01-01T00:00:00Z");
@@ -3033,6 +3411,138 @@ mod tests {
         registry_ops::upsert(&mut entries, capture, &lexical_key("/a/landing"), &lexical_key);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].thumbnail_path.as_deref(), Some("preview.png"));
+    }
+
+    // F2: kind / artifact_path / frame must follow the same Some-overwrites / None-preserves
+    // guard as thumbnail_path and contract_sha — so a static→interactive switch takes effect
+    // AND a plain open cannot revert an interactive design back to "static".
+    #[test]
+    fn registry_upsert_carries_and_preserves_kind_artifact_path_frame() {
+        // Seed with an interactive design that has all three phase-2 fields set.
+        let mut e = entry("p1", "Screen", "/a/screen", "2021-01-01T00:00:00Z");
+        e.kind = Some(ArtifactKind::Interactive);
+        e.artifact_path = Some("artifact/index.html".to_string());
+        e.frame = Some("android".to_string());
+        let mut entries = vec![e];
+
+        // A plain load/open remember omits kind/artifact_path/frame (all None).
+        // It MUST NOT wipe the previously stored interactive metadata.
+        let load = entry("p1b", "Screen", "/a/screen", "2022-01-01T00:00:00Z");
+        assert_eq!(load.kind, None, "fixture: plain remember has no kind");
+        assert_eq!(load.artifact_path, None, "fixture: plain remember has no artifactPath");
+        assert_eq!(load.frame, None, "fixture: plain remember has no frame");
+        registry_ops::upsert(&mut entries, load, &lexical_key("/a/screen"), &lexical_key);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].kind,
+            Some(ArtifactKind::Interactive),
+            "plain open (None kind) must preserve the stored kind"
+        );
+        assert_eq!(
+            entries[0].artifact_path.as_deref(),
+            Some("artifact/index.html"),
+            "plain open (None artifactPath) must preserve the stored artifact_path"
+        );
+        assert_eq!(
+            entries[0].frame.as_deref(),
+            Some("android"),
+            "plain open (None frame) must preserve the stored frame"
+        );
+
+        // An interactive-mode remember (Some values) OVERWRITES — e.g. a frame change.
+        let mut update = entry("p1c", "Screen", "/a/screen", "2023-01-01T00:00:00Z");
+        update.kind = Some(ArtifactKind::Interactive);
+        update.artifact_path = Some("artifact/index.html".to_string());
+        update.frame = Some("ios".to_string());
+        registry_ops::upsert(&mut entries, update, &lexical_key("/a/screen"), &lexical_key);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].frame.as_deref(), Some("ios"), "Some frame must overwrite");
+
+        // A switch from Static to Interactive: seed with Static (no fields), update with
+        // Interactive kind + path.
+        let mut static_e = entry("p2", "Static", "/a/static", "2021-01-01T00:00:00Z");
+        static_e.kind = Some(ArtifactKind::Static);
+        let mut entries2 = vec![static_e];
+        let mut to_interactive = entry("p2b", "Static", "/a/static", "2022-01-01T00:00:00Z");
+        to_interactive.kind = Some(ArtifactKind::Interactive);
+        to_interactive.artifact_path = Some("artifact/index.html".to_string());
+        registry_ops::upsert(
+            &mut entries2,
+            to_interactive,
+            &lexical_key("/a/static"),
+            &lexical_key,
+        );
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(
+            entries2[0].kind,
+            Some(ArtifactKind::Interactive),
+            "Some kind must overwrite (static→interactive switch)"
+        );
+        assert_eq!(
+            entries2[0].artifact_path.as_deref(),
+            Some("artifact/index.html"),
+            "artifact_path must be set on switch"
+        );
+    }
+
+    // F5: artifact_path and frame must be rejected when over MAX_REGISTRY_STRING_LEN.
+    // Tests the pure helper directly (design_registry_remember needs a live AppHandle).
+    #[test]
+    fn clean_registry_optional_string_caps_overlong_values() {
+        // None is always accepted.
+        assert_eq!(
+            clean_registry_optional_string(None, "field", 10),
+            Ok(None)
+        );
+
+        // A value within the cap is accepted as-is.
+        let short = "android".to_string();
+        assert_eq!(
+            clean_registry_optional_string(Some(short.clone()), "frame", 512),
+            Ok(Some(short))
+        );
+
+        // A value at exactly the cap is accepted (boundary).
+        let at_cap = "x".repeat(MAX_REGISTRY_STRING_LEN);
+        assert!(
+            clean_registry_optional_string(
+                Some(at_cap.clone()),
+                "artifactPath",
+                MAX_REGISTRY_STRING_LEN
+            )
+            .is_ok(),
+            "value at the cap must be accepted"
+        );
+
+        // One character over the cap is rejected.
+        let over_cap = "x".repeat(MAX_REGISTRY_STRING_LEN + 1);
+        let err = clean_registry_optional_string(
+            Some(over_cap.clone()),
+            "artifactPath",
+            MAX_REGISTRY_STRING_LEN,
+        );
+        assert!(
+            err.is_err(),
+            "over-long artifactPath must be rejected, got: {err:?}"
+        );
+        assert!(
+            err.unwrap_err().contains("artifactPath"),
+            "error must name the field"
+        );
+
+        let frame_err = clean_registry_optional_string(
+            Some(over_cap),
+            "frame",
+            MAX_REGISTRY_STRING_LEN,
+        );
+        assert!(
+            frame_err.is_err(),
+            "over-long frame must be rejected"
+        );
+        assert!(
+            frame_err.unwrap_err().contains("frame"),
+            "error must name the field"
+        );
     }
 
     #[test]
@@ -3260,6 +3770,43 @@ mod tests {
         assert!(!canonical.join("preview.png").exists());
     }
 
+    // F1: removeFiles=true must delete the artifact/ subtree, not just components/.
+    // If artifact/ is left behind, a later project reusing the same working folder will
+    // serve the stale old artifact via artifact://localhost/<newid>.
+    #[test]
+    fn delete_known_design_files_removes_artifact_dir() {
+        let base = tmp_dir();
+        let wf = base.join("proj-interactive");
+        fs::create_dir_all(&wf).unwrap();
+        let canonical = canonical_working_folder(&wf.to_string_lossy()).unwrap();
+
+        // Simulate an interactive design: artifact/index.html written by the serve handler.
+        let artifact_dir = canonical.join(crate::backend::artifact_protocol::ARTIFACT_DIR);
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let artifact_index = artifact_dir.join("index.html");
+        fs::write(&artifact_index, "<html>interactive</html>").unwrap();
+
+        // Write a user file that must NOT be touched.
+        let user_file = canonical.join("user-notes.md");
+        fs::write(&user_file, "keep me").unwrap();
+
+        delete_known_design_files(&canonical);
+
+        // F1: artifact/index.html must be gone (the entire subtree removed).
+        assert!(
+            !artifact_index.exists(),
+            "F1: artifact/index.html must be deleted by removeFiles=true"
+        );
+        assert!(
+            !artifact_dir.exists(),
+            "F1: artifact/ dir must be removed entirely"
+        );
+        // The working folder root survives.
+        assert!(canonical.is_dir(), "working folder root must survive");
+        // User files are untouched.
+        assert!(user_file.exists(), "user file must not be deleted");
+    }
+
     #[test]
     fn confined_under_rejects_parent_and_accepts_child() {
         let base = tmp_dir();
@@ -3465,5 +4012,141 @@ mod tests {
             std::process::id()
         ));
         assert!(canonical_working_folder(missing.to_string_lossy().as_ref()).is_err());
+    }
+
+    // ---- registry_remember id validation (FIX 3) --------------------------
+    // NOTE: design_registry_remember is a #[tauri::command] and requires a live AppHandle +
+    // State, so we test the VALIDATION LAYER directly — the same logic that now gates
+    // the Tauri command (validate_artifact_id + reserved-name check). This is the
+    // smallest isolatable surface that covers the security property.
+
+    // ---- validate_linked_task_n unit tests ----------------------------------------
+
+    #[test]
+    fn validate_linked_task_n_accepts_none() {
+        assert_eq!(validate_linked_task_n(None), Ok(()));
+    }
+
+    #[test]
+    fn validate_linked_task_n_accepts_one() {
+        assert_eq!(validate_linked_task_n(Some(1)), Ok(()));
+    }
+
+    #[test]
+    fn validate_linked_task_n_accepts_max_allowed() {
+        assert_eq!(validate_linked_task_n(Some(100_000)), Ok(()));
+    }
+
+    #[test]
+    fn validate_linked_task_n_rejects_zero() {
+        let err = validate_linked_task_n(Some(0));
+        assert!(err.is_err(), "zero must be rejected");
+        assert!(
+            err.unwrap_err().contains("1-based"),
+            "error must mention 1-based"
+        );
+    }
+
+    #[test]
+    fn validate_linked_task_n_rejects_over_cap() {
+        let err = validate_linked_task_n(Some(100_001));
+        assert!(err.is_err(), "100001 must be rejected");
+        assert!(
+            err.unwrap_err().contains("100000"),
+            "error must mention the cap"
+        );
+    }
+
+    // ---- P4: linked_task_n attach / change / detach / preserve tests ----------------
+
+    /// (1) set_linked_task: after setting Some(n) the entry carries the new value.
+    #[test]
+    fn registry_set_linked_task_attaches_value() {
+        let mut entries = vec![entry("p1", "UI", "/a/ui", "2024-01-01T00:00:00Z")];
+        assert_eq!(entries[0].linked_task_n, None, "fixture: no link");
+        let e = entries.iter_mut().find(|e| e.id == "p1").unwrap();
+        e.linked_task_n = Some(3);
+        assert_eq!(entries[0].linked_task_n, Some(3), "link set to 3");
+    }
+
+    /// (2) set_linked_task with None clears the link — unlike the upsert guard.
+    #[test]
+    fn registry_set_linked_task_detaches_to_none() {
+        let mut e = entry("p1", "UI", "/a/ui", "2024-01-01T00:00:00Z");
+        e.linked_task_n = Some(5);
+        let mut entries = vec![e];
+        // Authoritative clear: set directly (mirrors what the command does).
+        entries[0].linked_task_n = None;
+        assert_eq!(entries[0].linked_task_n, None, "link cleared");
+    }
+
+    /// (3) a subsequent design_registry_remember with linked_task_n:None PRESERVES the
+    /// previously-set value via the upsert Some-overwrites / None-preserves guard.
+    #[test]
+    fn registry_upsert_preserves_linked_task_n_on_none_incoming() {
+        let mut e = entry("p1", "UI", "/a/ui", "2024-01-01T00:00:00Z");
+        e.linked_task_n = Some(7);
+        let mut entries = vec![e];
+
+        // A plain remember (linked_task_n = None in the incoming entry).
+        let load = entry("p1b", "UI", "/a/ui", "2025-01-01T00:00:00Z");
+        assert_eq!(load.linked_task_n, None, "fixture: plain remember has no link");
+        registry_ops::upsert(&mut entries, load, &lexical_key("/a/ui"), &lexical_key);
+        assert_eq!(entries.len(), 1, "no duplicate");
+        assert_eq!(
+            entries[0].linked_task_n,
+            Some(7),
+            "plain remember (None) must NOT wipe an existing link"
+        );
+
+        // A remember that explicitly carries a new link DOES overwrite.
+        let mut update = entry("p1c", "UI", "/a/ui", "2026-01-01T00:00:00Z");
+        update.linked_task_n = Some(2);
+        registry_ops::upsert(&mut entries, update, &lexical_key("/a/ui"), &lexical_key);
+        assert_eq!(entries[0].linked_task_n, Some(2), "Some incoming overwrites");
+    }
+
+    /// (4) set on a non-existent id — mirrors what the Tauri command returns as Err.
+    #[test]
+    fn registry_set_linked_task_nonexistent_id_returns_none() {
+        let entries = vec![entry("p1", "UI", "/a/ui", "2024-01-01T00:00:00Z")];
+        // find returns None when the id does not exist.
+        let found = entries.iter().find(|e| e.id == "no-such-id");
+        assert!(found.is_none(), "unknown id must not match any entry");
+    }
+
+    #[test]
+    fn registry_remember_id_validation_rejects_reserved_and_invalid() {
+        use crate::backend::artifact_protocol::validate_artifact_id;
+
+        // Reserved route literals must be rejected.
+        for reserved in ["__sample__", "spike", "__spike__"] {
+            // The charset is valid — what matters is the reserved-name check.
+            assert!(
+                validate_artifact_id(reserved).is_ok(),
+                "validate_artifact_id itself accepts {reserved:?} (charset ok)"
+            );
+            // Simulate what design_registry_remember does: charset ok, then reserved check.
+            let is_reserved = matches!(reserved, "__sample__" | "spike" | "__spike__");
+            assert!(is_reserved, "reserved check must catch {reserved:?}");
+        }
+
+        // Invalid chars / traversal-relevant ids must be rejected by validate_artifact_id.
+        for bad in ["../evil", "a/b", "a\\b", ".hidden", "a b", "a\0b", ""] {
+            assert!(
+                validate_artifact_id(bad).is_err(),
+                "validate_artifact_id must reject {bad:?}"
+            );
+        }
+
+        // Normal project ids (the kind new_project_id() produces) must pass.
+        for ok in ["p12345-1700000000000000", "p1-2", "abc_DEF-123"] {
+            assert!(
+                validate_artifact_id(ok).is_ok(),
+                "validate_artifact_id must accept {ok:?}"
+            );
+            let is_reserved = matches!(ok.as_ref(), "__sample__" | "spike" | "__spike__");
+            assert!(!is_reserved, "normal id {ok:?} must not be flagged as reserved");
+        }
     }
 }

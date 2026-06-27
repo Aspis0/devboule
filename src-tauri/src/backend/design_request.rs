@@ -64,6 +64,13 @@ pub struct DesignRequestDirective {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_context: Option<String>,
+    /// Phase 3: output mode ("static" | "interactive"). Absent ⇒ the watcher defaults to
+    /// "static" for backward compat. New user-triggered generations default to "interactive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Phase 3: device frame skin ("android" | "ios" | "web" | "component"). Absent ⇒ default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub result_path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -152,6 +159,42 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"parentAgentId\""), "camelCase field: {json}");
         assert!(json.contains("\"planContext\""), "camelCase field: {json}");
+        let back: DesignRequestDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn directive_backward_compat_no_mode_or_frame() {
+        // Old JSON produced before Phase 3 (no mode / frame fields) must deserialize
+        // cleanly with mode=None and frame=None — no migration needed.
+        let old_json = r#"{
+            "id": "legacy-1",
+            "parentAgentId": "orch-old",
+            "status": "pending",
+            "prompt": "a landing page"
+        }"#;
+        let d: DesignRequestDirective = serde_json::from_str(old_json).unwrap();
+        assert_eq!(d.id, "legacy-1");
+        assert_eq!(d.mode, None, "absent mode must deserialize as None");
+        assert_eq!(d.frame, None, "absent frame must deserialize as None");
+    }
+
+    #[test]
+    fn directive_round_trips_mode_and_frame() {
+        let d = DesignRequestDirective {
+            id: "d2".into(),
+            parent_agent_id: "orch-2".into(),
+            status: DesignRequestStatus::Pending,
+            prompt: "Android home screen".into(),
+            mode: Some("interactive".into()),
+            frame: Some("android".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"mode\""), "mode field in JSON: {json}");
+        assert!(json.contains("\"frame\""), "frame field in JSON: {json}");
+        assert!(json.contains("\"interactive\""), "mode value: {json}");
+        assert!(json.contains("\"android\""), "frame value: {json}");
         let back: DesignRequestDirective = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
     }

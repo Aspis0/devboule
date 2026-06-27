@@ -17,6 +17,12 @@
  * design.md (injected for ALL providers, including CLI — see the trust note below). */
 export const DESIGN_PROMPT_VERSION = 2;
 
+/** Contract revision for the INTERACTIVE artifact prompt (separate from the static
+ * `DESIGN_PROMPT_VERSION`). Bump on ANY wording change to
+ * {@link DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1} or how its blocks are framed, so an audit
+ * line can be tied to the exact interactive contract that produced an artifact. */
+export const DESIGN_INTERACTIVE_PROMPT_VERSION = 1;
+
 /** The fence sentinels around the injected contract DATA block. The opening sentinel
  * is `<<<` + the token; the closing sentinel is the bare token alone on its own line. */
 const CONTRACT_FENCE_TOKEN = "DESIGN_CONTRACT";
@@ -185,4 +191,83 @@ export function buildEditPrompt(
     "CURRENT MARKUP:",
     nodeMarkup.trim(),
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// INTERACTIVE mode (Phase 2) — a SEPARATE artifact, NOT a canvas DesignNode.
+// ---------------------------------------------------------------------------
+
+/**
+ * The versioned system prompt for the INTERACTIVE artifact mode. Unlike
+ * {@link DESIGN_SYSTEM_PROMPT_V1} (which forbids scripts and emits canvas node
+ * fragments routed through DOMPurify), this asks for ONE complete, self-contained,
+ * runnable `<!DOCTYPE html>` document. Inline `<script>`/`<style>`/`on*` handlers ARE
+ * allowed — the document is rendered inside a sandboxed, opaque-origin iframe served
+ * from the separate `artifact:` scheme with its OWN CSP header, so it can run real JS
+ * yet exfiltrate nothing (`connect-src 'none'`). The CONSTRAINTS below mirror that CSP
+ * exactly: CDN libraries are loadable from the allowlist; the network is blocked; images
+ * and fonts must be inline (`data:`/inline SVG) because `img-src`/`font-src` are `data:`
+ * only. The artifact carries NO `data-node-id` (it is not a canvas component).
+ */
+export const DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1 = [
+  "You are an interactive UI artifact generator. You produce ONE complete, self-contained, runnable web document that is rendered inside a sandboxed iframe.",
+  "",
+  "OUTPUT FORMAT — follow EXACTLY:",
+  "- Output ONE complete HTML document and NOTHING ELSE. It MUST start with <!DOCTYPE html> and contain a single <html> … </html>.",
+  "- NO prose, NO explanations, NO Markdown, NO code fences around the document.",
+  "- Do NOT add any data-node-id attributes — this is a standalone document, not a canvas component.",
+  "",
+  "INTERACTIVITY — real JavaScript runs in the sandbox:",
+  "- Inline <script>, inline <style>, and inline event-handler attributes (onclick, oninput, …) ARE allowed and encouraged. Make it actually work.",
+  "- You MAY load JavaScript/CSS LIBRARIES from these CDNs ONLY, via <script src> / <link href>:",
+  "    https://cdnjs.cloudflare.com   https://cdn.jsdelivr.net   https://unpkg.com",
+  "  Any other origin is blocked and will silently fail.",
+  "",
+  "NETWORK IS BLOCKED — the document cannot reach the network at runtime:",
+  "- Do NOT use fetch(), XMLHttpRequest, WebSocket, EventSource, navigator.sendBeacon, or any other network call. They are blocked and will throw. Use only in-memory / hardcoded data.",
+  "",
+  "IMAGES & FONTS — inline only:",
+  "- Every image MUST be an inline SVG or a data: URI. Every font MUST be a system font or an inline @font-face data: URI.",
+  "- Do NOT reference external image or font URLs (e.g. https://…/img.png, Google Fonts) — they are blocked by the sandbox and will not load.",
+  "",
+  "RESPONSIVE & ACCESSIBLE:",
+  '- Include <meta name="viewport" content="width=device-width, initial-scale=1"> and use CSS media queries so the document looks correct in narrow phone frames AND wide browser frames.',
+  "- Use semantic HTML, label controls, keep sufficient color contrast, and keep keyboard focus usable.",
+  "",
+  "STYLE:",
+  "- Clean, modern, polished. Self-contained: all CSS and JS live inside this one document.",
+].join("\n");
+
+/** Options accepted by the interactive prompt builder. Same shape/semantics as
+ * {@link GeneratePromptOptions}: an optional grounding `context` block and the project's
+ * `designContract` (design.md), both injected verbatim before the user instruction. */
+export interface InteractivePromptOptions {
+  /** Grounding/context block inserted verbatim before the instruction (pure pass-through). */
+  context?: string;
+  /** The project's design.md contract (already clamped by the caller). Injected as a
+   * fenced DATA block via {@link designContractBlock} — see its trust rationale. */
+  designContract?: string;
+}
+
+/**
+ * Build the INTERACTIVE-GENERATION prompt: ONE complete self-contained HTML document is
+ * expected back. Mirrors {@link buildGeneratePrompt} (same context + design-contract
+ * framing) but swaps in {@link DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1} and a single-document
+ * task line. PURE. Provider-agnostic: the wording is identical for every backend.
+ */
+export function buildInteractivePrompt(
+  userInstruction: string,
+  opts: InteractivePromptOptions = {},
+): string {
+  const parts = [DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1, ""];
+  parts.push(...designContractBlock(opts.designContract));
+  const context = (opts.context ?? "").trim();
+  if (context.length > 0) {
+    parts.push("CONTEXT (use to stay coherent with the product):");
+    parts.push(context);
+    parts.push("");
+  }
+  parts.push("TASK — generate ONE complete interactive HTML document for:");
+  parts.push(userInstruction.trim());
+  return parts.join("\n");
 }

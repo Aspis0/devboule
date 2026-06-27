@@ -25,6 +25,10 @@ export function useStageRotation(
   // Only auto-rotate while the orchestrator is actually working. When idle the
   // stage holds still (no fake cycling through views with nothing happening).
   enabled: boolean = true,
+  // Phase 5: suspend rotation while an interactive artifact is actively shown.
+  // DOES NOT mutate `auto` — when hold releases, rotation resumes iff
+  // `auto && enabled` are still true (the user's toggle is untouched).
+  hold: boolean = false,
 ): StageRotation {
   const [view, setView] = useState<StageView>("exa");
   const [auto, setAuto] = useState<boolean>(true);
@@ -39,7 +43,7 @@ export function useStageRotation(
   }, []);
 
   useEffect(() => {
-    if (!auto || !enabled) return;
+    if (!auto || !enabled || hold) return;
     const timer = setInterval(() => {
       setView((current) => {
         const next = (STAGES.indexOf(current) + 1) % STAGES.length;
@@ -47,7 +51,7 @@ export function useStageRotation(
       });
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [auto, enabled, intervalMs]);
+  }, [auto, enabled, hold, intervalMs]);
 
   return { view, auto, pick, toggleAuto };
 }

@@ -319,6 +319,15 @@ pub fn run() {
         .manage(backend::mini_activity::ActivityTailRegistry::default())
         .manage(backend::cloud_duplex::CloudDuplexSessions::new())
         .manage(design_gen_state)
+        // `artifact:` scheme — PATH B (separate-origin) interactive-artifact render surface.
+        // Serves a stored design artifact's `index.html` (path-confined via the design
+        // registry) from `artifact://localhost/<id>` (macOS/Linux) / `http://artifact.localhost/<id>`
+        // (Windows) with its OWN CSP response header (CDN allowlist + `connect-src 'none'`),
+        // so the artifact's inline <script> does NOT inherit the app's `script-src 'self'` and
+        // can run real JS while exfiltrating nothing. Also serves the throwaway `/__spike__`
+        // A-vs-B test doc and a `/__sample__` interactive demo. Reachable only from inside the
+        // app's webviews; the app CSP grants it via `frame-src` in tauri.conf.json.
+        .register_uri_scheme_protocol("artifact", backend::artifact_protocol::handle_artifact_request)
         .setup(|app| {
             // Record the bundled, read-only `oracle/` location so release builds
             // run Oracle Python only from there, never from a user "drop" dir.
@@ -639,6 +648,7 @@ pub fn run() {
             backend::design::design_write_tokens,
             backend::design::design_append_generation_log,
             backend::design::design_write_export,
+            backend::design::design_write_artifact,
             backend::project_skill::skills_list,
             backend::project_skill::skills_save,
             backend::project_skill::skills_set_enabled,
@@ -674,6 +684,7 @@ pub fn run() {
             backend::design::design_registry_list,
             backend::design::design_registry_remember,
             backend::design::design_registry_rename,
+            backend::design::design_registry_set_linked_task,
             backend::design::design_registry_remove,
             backend::design_generate::design_generate,
             backend::design_generate::design_cancel_generation,

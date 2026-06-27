@@ -1,5 +1,10 @@
 pub mod agent_pty;
 pub mod api_fuzz;
+// `artifact:` custom URI scheme — the PATH B separate-origin interactive-artifact render
+// surface (plan `bubbly-hopping-valiant.md`, Phase 1). Registered via
+// `.register_uri_scheme_protocol("artifact", …)` in lib.rs; the app CSP grants it through
+// the `frame-src` entry in tauri.conf.json.
+pub mod artifact_protocol;
 pub mod agents;
 pub mod broker;
 pub mod agent_notifications;
