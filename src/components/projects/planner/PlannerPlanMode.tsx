@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState, useMemo } from "react";
+import { useRef, useEffect, useState, useMemo, useCallback } from "react";
+import { invokeBackendCommand } from "../../../context/AppContext";
 import gsap from "gsap";
 import { Search, ListOrdered, LayoutDashboard } from "lucide-react";
 import "./planner.css";
@@ -28,9 +29,30 @@ interface PlannerPlanModeProps {
   webMode: 'auto' | 'manual';
   onWebModeChange: (m: 'auto' | 'manual') => void;
   onManualSearch: (q: string) => void;
-  design: { name: string; version: string | null; ago: string | null; thumbnailUri: string | null } | null;
+  design: {
+    name: string;
+    version: string | null;
+    ago: string | null;
+    thumbnailUri: string | null;
+    /** Registry entry id — forwarded to StageDesign for the task-link command. */
+    id?: string;
+    /** Phase 3: present when the registry entry is an interactive artifact. */
+    kind?: import('../../../types/design').ArtifactKind;
+    /** Phase 3: the registry entry id — used to build the artifact:// URL. */
+    artifactId?: string;
+    /** Phase 4 (Fix 3): device-frame skin stored on the registry entry. Forwarded
+     *  to StageDesign so effectiveFrameKind resolves the user's stored frame before
+     *  the heuristic. Absent ⇒ inferred. */
+    frame?: import('../../../types/design').ArtifactFrameKind;
+    /** OPTIONAL linked plan-task number (1-based). Absent ⇒ unlinked. */
+    linkedTaskN?: number;
+  } | null;
   linkedTask: number | null;
   onOpenInDesign: () => void;
+  /** Phase 3: absolute project root path forwarded to StageDesign for generation. */
+  projectRoot: string | null;
+  /** Phase 3: called when a user-triggered design generation completes. */
+  onGenerated: () => void;
   messages: PlannerMessage[];
   awaitingReply: boolean;
   onSend: (text: string) => void;
@@ -70,6 +92,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     design,
     linkedTask,
     onOpenInDesign,
+    projectRoot,
+    onGenerated,
     messages,
     awaitingReply,
     onSend,
@@ -86,7 +110,39 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     canCreatePlan,
   } = props;
 
-  const { view, auto, pick, toggleAuto } = useStageRotation(3800, live);
+  // Phase 5: hold rotation while an interactive artifact is actively shown inside
+  // StageDesign. The signal originates inside StageDesign and never propagates
+  // to PlannerPlanModeProps — it is fully self-contained here.
+  const [artifactActive, setArtifactActive] = useState(false);
+  const handleArtifactActiveChange = useCallback((active: boolean) => {
+    setArtifactActive(active);
+  }, []);
+
+  // Task-link: derive { n, title } list from planCards for the StageDesign selector.
+  const taskOptions = useMemo(
+    () => planCards.map((c) => ({ n: c.n, title: c.title })),
+    [planCards],
+  );
+
+  // onLinkTask: invoke the backend command and trigger a design reload via onGenerated.
+  // design?.id is the registry entry id (set in ProjectsView when loading the entry).
+  // Errors propagate to the caller (StageDesign) so it can surface them near the control.
+  // onGenerated is only called on success; a failure leaves the UI consistent without reload.
+  const handleLinkTask = useCallback(
+    async (n: number | null): Promise<void> => {
+      const entryId = design?.id;
+      if (!entryId) return;
+      await invokeBackendCommand('design_registry_set_linked_task', {
+        id: entryId,
+        linkedTaskN: n,
+      });
+      // Re-load the design entry so the new linkedTaskN is reflected in the UI.
+      onGenerated();
+    },
+    [design?.id, onGenerated],
+  );
+
+  const { view, auto, pick, toggleAuto } = useStageRotation(3800, live, artifactActive);
   const ref = useRef<HTMLDivElement>(null);
 
   // Kairion doubt<->task link: hovering a doubt highlights its task card(s) and vice-versa.
@@ -414,6 +470,11 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                 design={design}
                 linkedTask={linkedTask}
                 onOpenInDesign={onOpenInDesign}
+                projectRoot={projectRoot}
+                onGenerated={onGenerated}
+                onArtifactActiveChange={handleArtifactActiveChange}
+                tasks={taskOptions}
+                onLinkTask={handleLinkTask}
               />
             )}
           </div>

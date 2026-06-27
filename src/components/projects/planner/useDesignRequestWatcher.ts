@@ -1,49 +1,20 @@
 import { useEffect, useRef } from 'react';
 import { invokeBackendCommand } from '../../../context/AppContext';
-import { startDesignGeneration } from '../../design/useDesignStream';
-import { applyGeneration } from '../../design/generation/pipeline';
-import { buildGeneratePrompt } from '../../design/generation/prompt';
-import type { DesignProject, DesignProjectEntry } from '../../../types/design';
+import { generateAndRegisterDesign } from '../../design/generation/generateAndRegister';
+import type { ArtifactFrameKind } from '../../../types/design';
 
+// Mirror of the Rust `DesignRequestDirective` (camelCase). Only the fields the watcher
+// reads are declared here; extra Rust-side fields are safely ignored by TS.
 interface DesignRequestDirective {
   id: string;
   parentAgentId: string;
   status: string;
   prompt: string;
   planContext?: string;
-}
-
-async function generateAndRegisterDesign(
-  prompt: string,
-  context: string | undefined,
-  workingFolderPath: string,
-  designName: string
-): Promise<string> {
-  const blank = await invokeBackendCommand<DesignProject>('design_create_project', { workingFolderPath, name: designName });
-  const fullPrompt = buildGeneratePrompt(prompt, { context });
-  const finalText = await new Promise<string>((resolve, reject) => {
-    let acc = '';
-    startDesignGeneration(fullPrompt, {
-      onText: t => { acc = t; },
-      onStatus: (s, m) => {
-        if (s === 'done') {
-          if (acc.trim()) resolve(acc);
-          else reject(new Error('the designer returned no content'));
-        } else if (s === 'error') reject(new Error(m ?? 'generation failed'));
-        else if (s === 'cancelled') reject(new Error('cancelled'));
-      }
-    }, undefined, workingFolderPath).catch(reject);
-  });
-  const { project: next } = applyGeneration(blank, finalText);
-  await invokeBackendCommand('design_save_project', { workingFolderPath, project: next });
-  const list = await invokeBackendCommand<DesignProjectEntry[]>('design_registry_remember', {
-    entry: { id: '', name: next.meta.name, workingFolderPath: workingFolderPath.trim(), createdAt: '', updatedAt: '', lastOpenedAt: '' }
-  });
-  const normalizePath = (p: string) => p.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-  const targetPath = normalizePath(workingFolderPath);
-  const found = (list ?? []).find(e => normalizePath(e.workingFolderPath) === targetPath);
-  if (!found) throw new Error('Design project not found in registry');
-  return found.id;
+  /** Phase 3: output mode. Absent on legacy directives ⇒ treated as 'static'. */
+  mode?: 'static' | 'interactive';
+  /** Phase 3: device frame skin for interactive artifacts. */
+  frame?: ArtifactFrameKind;
 }
 
 export function useDesignRequestWatcher(
@@ -79,8 +50,17 @@ export function useDesignRequestWatcher(
 
           const workingFolderPath = `${projectRoot}/.aspis-design/${d.id}`;
           const name = (d.prompt || 'Design').slice(0, 60);
+          // Legacy directives without a `mode` field default to 'static' (backward compat).
+          const mode = d.mode ?? 'static';
           try {
-            const registryId = await generateAndRegisterDesign(d.prompt, d.planContext, workingFolderPath, name);
+            const registryId = await generateAndRegisterDesign({
+              mode,
+              frame: d.frame,
+              prompt: d.prompt,
+              context: d.planContext,
+              workingFolderPath,
+              designName: name,
+            });
             // The design is SAVED + REGISTERED now. Stamp the directive done (best-effort:
             // may race with the Python timeout write-back — harmless) and ALWAYS refresh the
             // Stage, because the design exists in the registry regardless of the directive.

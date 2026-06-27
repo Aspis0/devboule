@@ -3,9 +3,12 @@
 import { describe, it, expect } from "vitest";
 import {
   DESIGN_PROMPT_VERSION,
+  DESIGN_INTERACTIVE_PROMPT_VERSION,
   DESIGN_SYSTEM_PROMPT_V1,
+  DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1,
   buildGeneratePrompt,
   buildEditPrompt,
+  buildInteractivePrompt,
 } from "./prompt";
 
 describe("DESIGN_SYSTEM_PROMPT_V1 contract", () => {
@@ -126,5 +129,69 @@ describe("buildEditPrompt", () => {
     expect(withC).toContain("Rounded corners only.");
     const without = buildEditPrompt("<button>Go</button>", "bigger");
     expect(without).not.toContain("DESIGN CONTRACT");
+  });
+});
+
+describe("DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1 contract", () => {
+  it("is a versioned, stable constant", () => {
+    expect(DESIGN_INTERACTIVE_PROMPT_VERSION).toBe(1);
+    expect(DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1).toMatchSnapshot();
+  });
+
+  it("ALLOWS scripts/styles/handlers and asks for one complete document", () => {
+    const p = DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1;
+    expect(p).toContain("<!DOCTYPE html>");
+    expect(p).toContain("<script>");
+    expect(p).toContain("ARE allowed and encouraged");
+    expect(p).toContain("Do NOT add any data-node-id");
+  });
+
+  it("encodes the CSP constraints (network blocked, inline media, CDN allowlist)", () => {
+    const p = DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1;
+    expect(p).toContain("fetch()");
+    expect(p).toContain("WebSocket");
+    expect(p).toContain("data:");
+    expect(p).toContain("https://cdnjs.cloudflare.com");
+    expect(p).toContain("https://cdn.jsdelivr.net");
+    expect(p).toContain("https://unpkg.com");
+    expect(p).toContain("viewport");
+  });
+
+  it("is distinct from the static prompt (interactive permits what static forbids)", () => {
+    // Static forbids <script>; interactive permits it. Guards against accidentally
+    // routing interactive content through the DOMPurify static contract.
+    expect(DESIGN_SYSTEM_PROMPT_V1.toLowerCase()).toContain("never include <script>");
+    expect(DESIGN_SYSTEM_PROMPT_INTERACTIVE_V1).not.toBe(DESIGN_SYSTEM_PROMPT_V1);
+  });
+});
+
+describe("buildInteractivePrompt", () => {
+  it("snapshots a basic interactive prompt", () => {
+    expect(buildInteractivePrompt("an Android app screen")).toMatchSnapshot();
+  });
+
+  it("includes the user instruction (trimmed) under a single-document task line", () => {
+    const out = buildInteractivePrompt("  a clickable kanban board  ");
+    expect(out).toContain("TASK — generate ONE complete interactive HTML document for:");
+    expect(out).toContain("a clickable kanban board");
+    expect(out).not.toContain("  a clickable kanban board  ");
+  });
+
+  it("inserts a context block only when provided", () => {
+    expect(buildInteractivePrompt("x")).not.toContain("CONTEXT");
+    const withCtx = buildInteractivePrompt("x", { context: "brand color #c2410c" });
+    expect(withCtx).toContain("CONTEXT");
+    expect(withCtx).toContain("brand color #c2410c");
+    expect(buildInteractivePrompt("x", { context: "   " })).not.toContain("CONTEXT");
+  });
+
+  it("injects/omits the design-contract block", () => {
+    const withC = buildInteractivePrompt("a screen", {
+      designContract: "# Rules\nUse #4f46e5 as primary.",
+    });
+    expect(withC).toContain("DESIGN CONTRACT (project file, follow its rules):");
+    expect(withC).toContain("Use #4f46e5 as primary.");
+    expect(withC.indexOf("DESIGN CONTRACT")).toBeLessThan(withC.indexOf("TASK —"));
+    expect(buildInteractivePrompt("a screen")).not.toContain("DESIGN CONTRACT");
   });
 });
