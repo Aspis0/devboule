@@ -1040,19 +1040,20 @@ export function ProjectWorkspace({
                   <TokenUsageBadge usage={tokenUsage} />
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  {/* MC-P7: the Compact action — ONLY for a selected Claude agent
-                      (resolved client === "claude"). Runs `/compact` in the agent's
-                      terminal to shrink its context window. Independent of the mini
-                      Stop brake: a claude coder shows Compact (not Stop); a mini
-                      shows Stop (not Compact, unless it is itself a claude mini). */}
+                  {/* MC-P7: the Compact action — for a selected Claude OR Codex agent
+                      (resolved client === "claude" || client === "codex"). Claude runs
+                      `/compact` in its terminal; Codex calls the app-server thread compact
+                      JSON-RPC. Both shrink the agent's context window. Independent of the
+                      mini Stop brake: a coder shows Compact (not Stop); a mini shows Stop
+                      (not Compact, unless it is itself a claude/codex mini). */}
                   {selectedCanCompact && (
                     <button
                       type="button"
                       onClick={compactSelected}
                       disabled={readOnly}
                       className="inline-flex items-center gap-1 rounded-2xl border border-teal bg-teal px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
-                      data-help-title="Runs /compact in this Claude agent to shrink its context."
-                      data-help-lines="Sends the /compact slash command to this Claude agent's terminal.|Claude Code summarizes the conversation so far, freeing context window so the agent can keep working longer.|Only Claude agents show this button — /compact is a Claude Code command.|It is a one-click convenience; you can also type /compact yourself in the reply bar."
+                      data-help-title="Compacts this agent's context to free up its context window."
+                      data-help-lines="Sends a compact command to this agent.|The agent summarizes the conversation so far, freeing context window so it can keep working longer.|Shown for Claude and Codex agents — both support context compaction.|A one-click convenience."
                     >
                       <Minimize2 className="h-3 w-3" aria-hidden />
                       Compact
