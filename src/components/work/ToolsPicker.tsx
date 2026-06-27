@@ -22,6 +22,9 @@ export function ToolsPicker({
   const [available, setAvailable] = useState<McpServer[]>([]);
   const [assigned, setAssigned] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Serialize writes: only one assignment mutation in flight at a time. Prevents the
+  // rapid-toggle race where a failed earlier write rolls back a later successful one.
+  const [busy, setBusy] = useState(false);
 
   // Fetch Effect
   useEffect(() => {
@@ -43,8 +46,10 @@ export function ToolsPicker({
 
         if (cancelled) return;
 
-        setAvailable(catalog as McpServer[]);
-        setAssigned(assignedNames as string[]);
+        setAvailable(Array.isArray(catalog) ? (catalog as McpServer[]) : []);
+        setAssigned(
+          Array.isArray(assignedNames) ? (assignedNames as string[]) : [],
+        );
       } catch {
         if (!cancelled) setError("Failed to load MCP tools.");
       }
@@ -60,11 +65,13 @@ export function ToolsPicker({
   // Toggle Handler
   const toggleTool = useCallback(
     async (server: McpServer) => {
+      if (busy) return; // serialized — ignore clicks while a write is in flight
       const isAssigned = assigned.includes(server.name);
       const next = isAssigned
         ? assigned.filter((n) => n !== server.name)
         : [...assigned, server.name];
 
+      setBusy(true);
       setAssigned(next);
 
       try {
@@ -75,16 +82,13 @@ export function ToolsPicker({
         });
         setError(null);
       } catch {
-        // Undo ONLY this toggle (functional form) so a concurrent toggle isn't clobbered.
-        setAssigned((prev) =>
-          isAssigned
-            ? [...prev, server.name]
-            : prev.filter((n) => n !== server.name),
-        );
+        setAssigned(assigned); // revert to the pre-toggle set (no concurrent write possible)
         setError("Failed to update tools.");
+      } finally {
+        setBusy(false);
       }
     },
-    [assigned, projectRoot, profile],
+    [assigned, busy, projectRoot, profile],
   );
 
   // Render Mini-small
@@ -117,6 +121,15 @@ export function ToolsPicker({
       >
         {assigned.length} / {MAX_TOOLS}
       </div>
+      {profile === "mini-big" && (
+        <div
+          data-testid="tools-deferred-note"
+          className="rounded-lg border border-amber/40 bg-amber/[0.07] px-2 py-1 text-[11px] text-amber-dark"
+        >
+          Tool injection for mini agents is coming soon — assignments are saved
+          and will apply once it ships.
+        </div>
+      )}
       {error && (
         <div
           data-testid="tools-error"
@@ -135,7 +148,7 @@ export function ToolsPicker({
             data-testid={`tools-row-${server.name}`}
             type="button"
             aria-pressed={isAssigned}
-            disabled={isDisabled}
+            disabled={isDisabled || busy}
             onClick={() => toggleTool(server)}
             className={`rounded-xl border px-3 py-2 text-[12px] ${
               isAssigned

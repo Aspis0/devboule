@@ -127,6 +127,13 @@ pub fn inject_servers_for_profile(
     profile: &str,
     servers: Vec<UserMcpServer>,
 ) -> Vec<UserMcpServer> {
+    // Precondition: only a valid ASSIGNMENT_PROFILE may narrow. An unknown profile must NOT
+    // silently fall through `resolve_injected_tools`'s None→"all servers" default (which would
+    // hand a future, unwired role the entire user-MCP set). Return the input UNNARROWED — the
+    // caller passes a fixed literal, so this only fires on a programming error.
+    if validate_profile(profile).is_err() {
+        return servers;
+    }
     let available: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
     // Malformed/unreadable ⇒ None (absent semantics) so the profile default applies fail-open.
     let assigned = tools_assignment_opt_impl(working_folder_path, profile).unwrap_or(None);

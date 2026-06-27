@@ -329,8 +329,13 @@ pub(crate) fn active_profile_skill_or_legacy(
     profile: &str,
     legacy_role: &str,
 ) -> Option<String> {
-    // A tier file present (regardless of its toggle) takes ownership: respect ONLY its toggle.
-    if read_project_skill(project_root, profile).is_some() {
+    // Ownership is decided by FILE EXISTENCE, not content: an EMPTY tier SKILL.md still
+    // takes ownership (so clearing a tier deliberately suppresses the legacy skill rather
+    // than silently resurrecting it). `read_skill_raw().0` = a regular file exists; using
+    // `read_project_skill().is_some()` here was wrong — it returns None for an empty file
+    // AND re-opens the file (a TOCTOU double-read). One existence check, no double-open.
+    let (tier_exists, _, _) = read_skill_raw(project_root, profile);
+    if tier_exists {
         return active_project_skill(project_root, profile);
     }
     // No tier file → the legacy role skill (toggle-aware) so nothing regresses.
@@ -400,6 +405,19 @@ mod profile_skill_tests {
     fn none_when_neither_present() {
         let root = fresh_dir("tier_none");
         assert!(active_profile_skill_or_legacy(&root, "mini-small", "mini").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_tier_file_owns_and_suppresses_legacy() {
+        // An EMPTY tier SKILL.md must still TAKE OWNERSHIP (existence, not content) — so
+        // deliberately clearing a tier suppresses the legacy skill instead of resurrecting it.
+        let root = fresh_dir("tier_empty");
+        write_skill(&root, "mini", "LEGACY MINI");
+        fs::create_dir_all(root.join(".claude/skills/mini-big")).unwrap();
+        fs::write(root.join(".claude/skills/mini-big/SKILL.md"), "").unwrap();
+        // Tier owns (empty content -> no body), legacy NOT resurrected.
+        assert!(active_profile_skill_or_legacy(&root, "mini-big", "mini").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

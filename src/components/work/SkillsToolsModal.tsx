@@ -4,6 +4,7 @@ import {
   useState,
   useCallback,
   type MouseEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { invokeBackendCommand } from "../../context/AppContext";
 import { Sparkles, X } from "lucide-react";
@@ -69,7 +70,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           workingFolderPath: projectRoot,
         });
         if (cancelled) return;
-        setEntries(result as SkillEntry[]);
+        setEntries(Array.isArray(result) ? (result as SkillEntry[]) : []);
         setStatus("ok");
       } catch {
         if (cancelled) return;
@@ -113,6 +114,30 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   // Stable so LibrarySearch's apply callback isn't recreated each parent render.
   const handleApplied = useCallback(() => setReload((r) => r + 1), []);
 
+  // Focus trap: aria-modal promises focus stays inside, so cycle Tab/Shift+Tab at the
+  // boundaries instead of letting focus escape to the work console behind the scrim.
+  const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const root = dialogRef.current;
+    if (!root) return;
+    const focusable = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const activeEl = document.activeElement;
+    if (e.shiftKey && (activeEl === first || activeEl === root)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && activeEl === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }, []);
+
   const skillBody =
     status === "loading"
       ? "Loading skills…"
@@ -136,6 +161,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
         data-testid="skills-tools-modal"
         className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-2xl border border-cream-200 bg-white shadow-xl outline-none"
         onClick={handleCardClick}
+        onKeyDown={handleKeyDown}
       >
         <div className="flex items-center justify-between border-b border-cream-100 px-5 py-4">
           <div className="flex items-center gap-2">
@@ -155,11 +181,17 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           </button>
         </div>
 
-        <div className="flex gap-2 border-b border-cream-100 px-5 py-3">
+        <div
+          role="tablist"
+          aria-label="Agent profiles"
+          className="flex gap-2 border-b border-cream-100 px-5 py-3"
+        >
           {PROFILES.map(({ profile, label, enabled }) => (
             <button
               key={profile}
               type="button"
+              role="tab"
+              aria-selected={active === profile}
               data-testid={`skills-tools-tab-${profile}`}
               onClick={() => handleTabClick(profile)}
               disabled={!enabled}
@@ -181,7 +213,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           ))}
         </div>
 
-        <div className="overflow-y-auto px-5 py-4">
+        <div role="tabpanel" className="overflow-y-auto px-5 py-4">
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             Skills
           </div>

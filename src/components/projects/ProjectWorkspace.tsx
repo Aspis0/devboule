@@ -257,6 +257,8 @@ export function ProjectWorkspace({
   const [splitAgentId, setSplitAgentId] = useState<string | null>(null);
   // Work Console "Skills & Tools" modal (per-role skills/tools for this project).
   const [skillsOpen, setSkillsOpen] = useState(false);
+  // Stable so the modal's Escape-key effect isn't re-registered on every parent render.
+  const closeSkills = useCallback(() => setSkillsOpen(false), []);
   // defaultSize is initial-mount-only in react-resizable-panels, so drive the proportions
   // imperatively: toggling split rebalances to 50/50, unsplit restores the primary to 100%.
   const panelGroupRef = useRef<ImperativePanelGroupHandle>(null);
@@ -279,7 +281,11 @@ export function ProjectWorkspace({
   // twin + a reaped-mini→parent fallback stay in sync across the live (DOM) poll.
   const selectedAgentId = useMemo(
     () =>
-      reconcileSelectedAgentId(storeSelectedAgentId, sessions, prevSessionsRef.current),
+      reconcileSelectedAgentId(
+        storeSelectedAgentId,
+        sessions,
+        prevSessionsRef.current,
+      ),
     [storeSelectedAgentId, sessions],
   );
 
@@ -442,12 +448,17 @@ export function ProjectWorkspace({
 
     const refreshMissingTools = async () => {
       try {
-        const status = await invokeBackendCommand<CensorStatus>("censor_status", {
-          root: censorRoot,
-          projectId: pid,
-        });
+        const status = await invokeBackendCommand<CensorStatus>(
+          "censor_status",
+          {
+            root: censorRoot,
+            projectId: pid,
+          },
+        );
         if (!cancelled) {
-          setCensorMissingTools((status.tools ?? []).filter((t) => !t.available).map((t) => t.name));
+          setCensorMissingTools(
+            (status.tools ?? []).filter((t) => !t.available).map((t) => t.name),
+          );
         }
       } catch {
         // Status is advisory; a failure just hides the missing-tool hints.
@@ -459,7 +470,10 @@ export function ProjectWorkspace({
       if (cancelled) return; // torn down before the dynamic import resolved — register nothing.
       const un1 = await listen("censor://scan-started", (event) => {
         if (cancelled) return;
-        const payload = event.payload as { projectId: string; fileCount?: number };
+        const payload = event.payload as {
+          projectId: string;
+          fileCount?: number;
+        };
         if (payload.projectId !== pid) return;
         setCensorScanning(true);
         setCensorScannedFiles(payload.fileCount ?? 0);
@@ -523,7 +537,6 @@ export function ProjectWorkspace({
     workConsoleModel.unplaced.forEach(walk);
     return ids;
   }, [censorStrip, workConsoleModel]);
-
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
   // two-step confirm): `mini_coder_kill` records killRequested THEN kills the PTY so
@@ -687,7 +700,9 @@ export function ProjectWorkspace({
   // a stale in-flight poll snapshot must not resurrect a decided request after the pop.
   const handleBridgePending = useCallback((pending: ConsentRequest[]) => {
     const decided = decidedConsentIdsRef.current;
-    const fresh = pending.filter((req) => !(req.approvalId && decided.has(req.approvalId)));
+    const fresh = pending.filter(
+      (req) => !(req.approvalId && decided.has(req.approvalId)),
+    );
     if (fresh.length > 0) {
       setPendingConsents((prev) =>
         fresh.reduce((acc, req) => enqueueConsent(acc, req), prev),
@@ -774,7 +789,9 @@ export function ProjectWorkspace({
           // there is no on-disk grant to fall back on. Pop the head so the modal can't get
           // permanently stuck. Local net/folder errors are left queued (retry is valid there).
           if (head.approvalId) {
-            setPendingConsents((prev) => prev.filter((r) => !sameConsentRequest(r, head)));
+            setPendingConsents((prev) =>
+              prev.filter((r) => !sameConsentRequest(r, head)),
+            );
           }
         }
       } finally {
@@ -971,51 +988,52 @@ export function ProjectWorkspace({
           Hidden when archived (no live agents to prompt). Grant applies on NEXT spawn. */}
       {/* FIX 1: render the HEAD of the queue; subsequent requests queue up and
           become the new head once the user acts on the current one. */}
-      {!readOnly && pendingConsents.length > 0 && (() => {
-        const head = pendingConsents[0];
-        const decisionHandler = (d: "allowRemember" | "allowOnce" | "deny") =>
-          void handleConsentDecision(d);
-        // Slice 5: Exec/Patch from a live cloud agent (Claude/Codex) → generic card.
-        if (head.kind === "exec" || head.kind === "patch") {
+      {!readOnly &&
+        pendingConsents.length > 0 &&
+        (() => {
+          const head = pendingConsents[0];
+          const decisionHandler = (d: "allowRemember" | "allowOnce" | "deny") =>
+            void handleConsentDecision(d);
+          // Slice 5: Exec/Patch from a live cloud agent (Claude/Codex) → generic card.
+          if (head.kind === "exec" || head.kind === "patch") {
+            return (
+              <AgentConsentModal
+                request={head}
+                busy={consentBusy}
+                error={consentError}
+                onDecision={decisionHandler}
+              />
+            );
+          }
+          if (head.kind === "folderWrite") {
+            return (
+              <FolderConsentModal
+                request={head}
+                busy={consentBusy}
+                error={consentError}
+                onDecision={decisionHandler}
+              />
+            );
+          }
           return (
-            <AgentConsentModal
+            <NetConsentModal
               request={head}
               busy={consentBusy}
               error={consentError}
               onDecision={decisionHandler}
             />
           );
-        }
-        if (head.kind === "folderWrite") {
-          return (
-            <FolderConsentModal
-              request={head}
-              busy={consentBusy}
-              error={consentError}
-              onDecision={decisionHandler}
-            />
-          );
-        }
-        return (
-          <NetConsentModal
-            request={head}
-            busy={consentBusy}
-            error={consentError}
-            onDecision={decisionHandler}
-          />
-        );
-      })()}
+        })()}
 
       {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
       {skillsOpen && (
-        <SkillsToolsModal
-          projectRoot={censorRoot}
-          onClose={() => setSkillsOpen(false)}
-        />
+        <SkillsToolsModal projectRoot={censorRoot} onClose={closeSkills} />
       )}
       {launcherOpen && !readOnly && (
         <SpawnPanel
-          projects={[{ id: project.metadata.id, title: project.metadata.title }]}
+          projects={[
+            { id: project.metadata.id, title: project.metadata.title },
+          ]}
           lockedProjectId={project.metadata.id}
           selectedProjectId={project.metadata.id}
           tasks={project.state.tasks}
@@ -1168,7 +1186,7 @@ export function ProjectWorkspace({
                   <button
                     type="button"
                     onClick={() => setSkillsOpen(true)}
-                    disabled={!censorRoot}
+                    disabled={!censorRoot || readOnly}
                     title={
                       censorRoot
                         ? "Manage skills & tools for this project's agents"
@@ -1341,7 +1359,6 @@ export function ProjectWorkspace({
             <PlansDockTab projectId={project.metadata.id} />
           )}
 
-
           {dockTab === "mcp" &&
             (project.metadata.rootPath ? (
               <ProjectMcpServersCard projectRoot={project.metadata.rootPath} />
@@ -1378,7 +1395,10 @@ function DockGit({ project }: { project: ProjectDetail }) {
   const rows: { label: string; value: string }[] = [
     { label: "Branch", value: git.branch ?? "—" },
     { label: "Upstream", value: git.upstream ?? "no upstream" },
-    { label: "Ahead / Behind", value: `↑${git.aheadCount} / ↓${git.behindCount}` },
+    {
+      label: "Ahead / Behind",
+      value: `↑${git.aheadCount} / ↓${git.behindCount}`,
+    },
     { label: "Staged", value: String(git.stagedCount) },
     { label: "Unstaged", value: String(git.unstagedCount) },
     { label: "Untracked", value: String(git.untrackedCount) },
@@ -1388,7 +1408,10 @@ function DockGit({ project }: { project: ProjectDetail }) {
   return (
     <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
       {rows.map((row) => (
-        <div key={row.label} className="flex items-center justify-between gap-3">
+        <div
+          key={row.label}
+          className="flex items-center justify-between gap-3"
+        >
           <dt className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
             {row.label}
           </dt>
