@@ -20,8 +20,18 @@ import { LibrarySearch } from "./LibrarySearch";
 ).IS_REACT_ACT_ENVIRONMENT = true;
 
 const LIB = [
-  { name: "plan-first", content: "PLAN FIRST BODY", bytes: 14, truncated: false },
-  { name: "review-hard", content: "REVIEW HARD BODY", bytes: 16, truncated: false },
+  {
+    name: "plan-first",
+    content: "PLAN FIRST BODY",
+    bytes: 14,
+    truncated: false,
+  },
+  {
+    name: "review-hard",
+    content: "REVIEW HARD BODY",
+    bytes: 16,
+    truncated: false,
+  },
 ];
 
 describe("LibrarySearch (P4)", () => {
@@ -30,6 +40,7 @@ describe("LibrarySearch (P4)", () => {
   const projectRoot = "/proj";
 
   beforeEach(() => {
+    vi.spyOn(window, "confirm").mockReturnValue(true); // Apply confirms overwrite
     invokeMock.mockImplementation(async (...args: unknown[]) => {
       if ((args[0] as string) === "global_skills_list") return LIB;
       return undefined; // skills_save_profile -> ok

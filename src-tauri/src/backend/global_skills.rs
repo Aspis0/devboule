@@ -53,6 +53,11 @@ use std::path::{Path, PathBuf};
                    Ok(n) => n,
                    Err(_) => continue,
                };
+               // Skip dirs whose name isn't a valid skill name (e.g. hand-created
+               // "my.skill") — listing them would show debris that save/delete reject.
+               if validate_skill_name(&name).is_err() {
+                   continue;
+               }
                let skill_path = dir_path.join("SKILL.md");
                if !skill_path.is_file() {
                    continue;
@@ -61,8 +66,13 @@ use std::path::{Path, PathBuf};
                    Ok(f) => f,
                    Err(_) => continue,
                };
-               let mut buf = Vec::with_capacity(MAX_SKILL_BYTES + 1);
-               let bytes_read = file.read_to_end(&mut buf).unwrap_or(0);
+               // Bounded read: cap the bytes so a giant global SKILL.md can never fully
+               // allocate (one extra byte only to detect truncation). Mirrors project_skill.
+               let mut buf = Vec::new();
+               let bytes_read = file
+                   .take(MAX_SKILL_BYTES as u64 + 1)
+                   .read_to_end(&mut buf)
+                   .unwrap_or(0);
                let truncated = bytes_read > MAX_SKILL_BYTES;
                let content_bytes = if truncated { &buf[..MAX_SKILL_BYTES] } else { &buf[..] };
                let content = String::from_utf8_lossy(content_bytes).into_owned();

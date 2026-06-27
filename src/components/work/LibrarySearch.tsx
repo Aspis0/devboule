@@ -30,9 +30,9 @@ export function LibrarySearch({
       try {
         const result = await invokeBackendCommand("global_skills_list", {});
         if (!cancelled) {
-          // Cast via unknown as requested
-          const skills = result as unknown as GlobalSkill[];
-          setLibrary(skills);
+          // Guard against a non-array result (null/() IPC response) — library.length
+          // is read during render and would throw on null.
+          setLibrary(Array.isArray(result) ? (result as GlobalSkill[]) : []);
         }
       } catch (err: unknown) {
         if (!cancelled) {
@@ -64,6 +64,22 @@ export function LibrarySearch({
   // Apply function
   const apply = useCallback(
     async (s: GlobalSkill) => {
+      // Block applying a truncated library skill (it would write only the head and
+      // silently lose the tail).
+      if (s.truncated) {
+        setError(
+          `"${s.name}" is truncated — expand it in the global library before applying.`,
+        );
+        return;
+      }
+      // Apply OVERWRITES the profile's current SKILL.md — confirm to avoid data loss.
+      if (
+        !window.confirm(
+          `Apply "${s.name}" to the ${profile} profile? This overwrites its current skill manual.`,
+        )
+      ) {
+        return;
+      }
       setApplying(s.name);
       setError(null);
       try {

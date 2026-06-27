@@ -110,6 +110,9 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
     e.stopPropagation();
   }, []);
 
+  // Stable so LibrarySearch's apply callback isn't recreated each parent render.
+  const handleApplied = useCallback(() => setReload((r) => r + 1), []);
+
   const skillBody =
     status === "loading"
       ? "Loading skills…"
@@ -194,7 +197,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           <LibrarySearch
             projectRoot={projectRoot}
             profile={active}
-            onApplied={() => setReload((r) => r + 1)}
+            onApplied={handleApplied}
           />
           <div className="mb-2 mt-5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             Tools
