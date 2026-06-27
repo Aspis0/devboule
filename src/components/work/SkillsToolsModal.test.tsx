@@ -29,13 +29,23 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
   const onCloseMock = vi.fn();
 
   beforeEach(() => {
-    invokeMock.mockResolvedValue([
-      { role: "coder", exists: true, enabled: true, content: "CODER MANUAL BODY", bytes: 0, truncated: false },
-      { role: "mini-big", exists: true, enabled: true, content: "MINI BIG MANUAL BODY", bytes: 0, truncated: false },
-      { role: "mini-small", exists: true, enabled: true, content: "MINI SMALL MANUAL BODY", bytes: 0, truncated: false },
-      { role: "design", exists: true, enabled: true, content: "DESIGN MANUAL BODY", bytes: 0, truncated: false },
-      { role: "orchestrator", exists: true, enabled: true, content: "ORCH MANUAL BODY", bytes: 0, truncated: false },
-    ]);
+    // Command-aware: skills_list_profiles returns the manuals; the ToolsPicker's
+    // tools_* commands return empty so the embedded picker renders cleanly.
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const cmd = args[0] as string;
+      if (cmd === "skills_list_profiles") {
+        return [
+          { role: "coder", exists: true, enabled: true, content: "CODER MANUAL BODY", bytes: 0, truncated: false },
+          { role: "mini-big", exists: true, enabled: true, content: "MINI BIG MANUAL BODY", bytes: 0, truncated: false },
+          { role: "mini-small", exists: true, enabled: true, content: "MINI SMALL MANUAL BODY", bytes: 0, truncated: false },
+          { role: "design", exists: true, enabled: true, content: "DESIGN MANUAL BODY", bytes: 0, truncated: false },
+          { role: "orchestrator", exists: true, enabled: true, content: "ORCH MANUAL BODY", bytes: 0, truncated: false },
+        ];
+      }
+      if (cmd === "tools_library_list") return [];
+      if (cmd === "tools_assignment_list") return [];
+      return undefined;
+    });
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);

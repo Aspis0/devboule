@@ -7,6 +7,7 @@ import {
 } from "react";
 import { invokeBackendCommand } from "../../context/AppContext";
 import { Sparkles, X } from "lucide-react";
+import { ToolsPicker } from "./ToolsPicker";
 
 // Work Console ASSIGNMENT PROFILES (capability tiers), mirroring the backend's
 // `ASSIGNMENT_PROFILES`. The single legacy `mini` role splits into two tiers here:
@@ -195,12 +196,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           <div className="mb-2 mt-5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             Tools
           </div>
-          <div
-            data-testid="skills-tools-tools-placeholder"
-            className="text-[12px] text-cream-500"
-          >
-            Per-role tools — coming soon.
-          </div>
+          <ToolsPicker key={active} projectRoot={projectRoot} profile={active} />
         </div>
 
         <div className="border-t border-cream-100 px-5 py-3 text-[11px] text-cream-500">

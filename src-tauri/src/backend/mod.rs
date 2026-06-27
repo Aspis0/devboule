@@ -61,6 +61,7 @@ pub mod state;
 pub mod structure;
 pub mod tdd_strict;
 pub mod token_usage;
+pub mod tools_assignment;
 pub mod training_export;
 pub mod user_mcp_config;
 pub mod design_request;

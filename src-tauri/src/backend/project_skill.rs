@@ -99,10 +99,8 @@ pub(crate) const ASSIGNMENT_PROFILES: &[&str] =
 /// Gate on every assignment write so a crafted profile can never become a directory name. NOTE:
 /// `mini` is intentionally NOT a valid profile (it split into the two tiers); the legacy role
 /// stays addressable only via the unchanged [`KNOWN_ROLES`]/[`validate_role`] injection gate.
-// Consumed by the assignment WRITE paths landing in P3 (per-profile tools/skills assignment);
-// in P2 it is exercised only by tests, so suppress the non-test dead-code warning for now.
-#[cfg_attr(not(test), allow(dead_code))]
-fn validate_profile(profile: &str) -> Result<(), String> {
+// Consumed by the per-profile assignment write paths (P3 tools_assignment).
+pub(crate) fn validate_profile(profile: &str) -> Result<(), String> {
     if ASSIGNMENT_PROFILES.contains(&profile) {
         Ok(())
     } else {
