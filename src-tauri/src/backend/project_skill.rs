@@ -1399,17 +1399,54 @@ fn skills_set_enabled_impl(
 ) -> Result<(), String> {
     validate_role(&role)?;
     let canonical = canonical_working_folder(working_folder_path)?;
-    // Read the current state and mutate ONLY this role so the other roles' explicit entries
+    apply_skill_toggle(&canonical, role, enabled)
+}
+
+/// Mirrors [`skills_set_enabled`] but validates against [`ASSIGNMENT_PROFILES`] (the Work
+/// Console capability tiers, e.g. "mini-big" / "mini-small") instead of [`KNOWN_ROLES`], so
+/// the per-tier toggle in the "Skills & Tools" modal can disable a profile the legacy role
+/// gate would reject. Same RMW + design-write-guard semantics as the role command.
+#[tauri::command]
+pub fn skills_set_enabled_profile(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    profile: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_set_enabled_profile_impl(&working_folder_path, profile, enabled)
+}
+
+fn skills_set_enabled_profile_impl(
+    working_folder_path: &str,
+    profile: String,
+    enabled: bool,
+) -> Result<(), String> {
+    validate_profile(&profile)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    apply_skill_toggle(&canonical, profile, enabled)
+}
+
+/// Read-modify-write of skills-state.json shared by the role and profile toggle commands.
+/// `canonical` MUST already be the canonicalized working folder; `key` MUST already be
+/// validated by the caller (`validate_role` / `validate_profile`).
+fn apply_skill_toggle(
+    canonical: &std::path::Path,
+    key: String,
+    enabled: bool,
+) -> Result<(), String> {
+    // Read the current state and mutate ONLY this key so the other entries' explicit values
     // survive the write. CRUCIAL: distinguish ABSENT from CORRUPT. `read_skills_state`
     // returns None for both, but treating a corrupt/oversized/non-regular file as an empty
-    // map would let this read-modify-write DROP every other role's entry on the next save.
+    // map would let this read-modify-write DROP every other entry on the next save.
     // So: only an actually-missing file fails open to a fresh map; an existing-but-unreadable
     // file is a hard error the user must fix or delete first (we never silently overwrite it).
     let state_path = canonical
         .join(".claude")
         .join("skills")
         .join("skills-state.json");
-    let mut current = match read_skills_state(&canonical) {
+    let mut current = match read_skills_state(canonical) {
         Some(s) => s,
         None => {
             if state_path.exists() {
@@ -1418,7 +1455,7 @@ fn skills_set_enabled_impl(
             SkillsState::default()
         }
     };
-    current.skills.entry(role).or_default().enabled = enabled;
+    current.skills.entry(key).or_default().enabled = enabled;
     let json = serde_json::to_string_pretty(&current)
         .map_err(|e| format!("could not serialize skills state: {e}"))?;
     let dir = canonical.join(".claude").join("skills");
@@ -2331,6 +2368,70 @@ mod tests {
             "unexpected error: {err}"
         );
         // The corrupt file is left exactly as-is (no silent overwrite, no other-role wipe).
+        let on_disk = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("skills-state.json"),
+        )
+        .unwrap();
+        assert_eq!(on_disk, corrupt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- Per-PROFILE toggle (Work Console tiers) — skills_set_enabled_profile ---
+
+    #[test]
+    fn set_enabled_profile_false_reflects_in_list_profiles_and_preserves_others() {
+        let root = fresh_root("toggle-profile-list");
+        // Pre-seed an explicit OTHER-profile entry so we can prove the RMW preserves it.
+        write_state(&root, r#"{ "skills": { "coder": { "enabled": false } } }"#);
+        // Disable the mini-big TIER — a profile the legacy validate_role gate would REJECT,
+        // so this proves the new command validates against ASSIGNMENT_PROFILES, not KNOWN_ROLES.
+        skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), false).unwrap();
+        let entries = skills_list_profiles_impl(&root_str(&root)).unwrap();
+        assert!(!entries.iter().find(|e| e.role == "mini-big").unwrap().enabled);
+        assert!(!entries.iter().find(|e| e.role == "coder").unwrap().enabled);
+        assert!(entries.iter().find(|e| e.role == "mini-small").unwrap().enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_enabled_profile_reenable_flips_back_to_true() {
+        let root = fresh_root("toggle-profile-reenable");
+        skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), false).unwrap();
+        skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), true).unwrap();
+        let entries = skills_list_profiles_impl(&root_str(&root)).unwrap();
+        assert!(entries.iter().find(|e| e.role == "mini-big").unwrap().enabled);
+        // The on-disk JSON carries the explicit re-enabled value (not just a fail-open default).
+        let state =
+            read_skills_state(&std::fs::canonicalize(&root).unwrap()).expect("state parses");
+        assert_eq!(state.skills.get("mini-big").map(|t| t.enabled), Some(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_enabled_profile_rejects_legacy_mini_and_unknown() {
+        let root = fresh_root("toggle-profile-reject");
+        // `mini` is NOT a valid assignment profile (it split into mini-big / mini-small).
+        assert!(
+            skills_set_enabled_profile_impl(&root_str(&root), "mini".to_string(), false).is_err()
+        );
+        assert!(
+            skills_set_enabled_profile_impl(&root_str(&root), "reviewer".to_string(), false)
+                .is_err()
+        );
+        assert!(
+            skills_set_enabled_profile_impl(&root_str(&root), "../etc".to_string(), false).is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_enabled_profile_errors_on_corrupt_state_and_leaves_it_untouched() {
+        let root = fresh_root("toggle-profile-corrupt");
+        let corrupt = "{ not json";
+        write_state(&root, corrupt);
+        let err = skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), false)
+            .unwrap_err();
+        assert!(err.contains("unreadable or corrupt"), "unexpected error: {err}");
         let on_disk = std::fs::read_to_string(
             root.join(".claude").join("skills").join("skills-state.json"),
         )

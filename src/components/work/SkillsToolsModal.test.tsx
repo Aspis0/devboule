@@ -185,4 +185,68 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     const content = document.querySelector("[data-testid='skills-tools-skill-content']")?.textContent;
     expect(content).toContain("Couldn't load");
   });
+
+  // --- Per-tier enable/disable toggle (skills_set_enabled_profile) ---
+
+  it("renders an enable/disable toggle reflecting the active profile's enabled state", async () => {
+    await mount();
+    const toggle = document.querySelector("[data-testid='skills-tools-toggle']") as HTMLButtonElement;
+    expect(toggle).toBeTruthy();
+    expect(toggle.getAttribute("role")).toBe("switch");
+    expect(toggle.getAttribute("aria-checked")).toBe("true"); // coder starts enabled
+  });
+
+  it("calls skills_set_enabled_profile with the active profile when the toggle is clicked", async () => {
+    await mount();
+    await act(async () => {
+      document
+        .querySelector("[data-testid='skills-tools-toggle']")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const call = invokeMock.mock.calls.find((c) => c[0] === "skills_set_enabled_profile");
+    expect(call).toBeTruthy();
+    expect(call![1]).toMatchObject({
+      workingFolderPath: projectRoot,
+      profile: "coder",
+      enabled: false, // coder was enabled → toggling turns it off
+    });
+  });
+
+  it("disables the toggle when the active profile has no skill manual", async () => {
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const cmd = args[0] as string;
+      if (cmd === "skills_list_profiles") {
+        return [
+          { role: "coder", exists: false, enabled: true, content: "", bytes: 0, truncated: false },
+        ];
+      }
+      if (cmd === "tools_library_list") return [];
+      if (cmd === "tools_assignment_list") return [];
+      if (cmd === "global_skills_list") return [];
+      return undefined;
+    });
+    await mount();
+    const toggle = document.querySelector("[data-testid='skills-tools-toggle']") as HTMLButtonElement;
+    expect(toggle).toBeTruthy();
+    expect(toggle.disabled).toBe(true);
+  });
+
+  it("ignores a second toggle click while the first is in flight (busy guard)", async () => {
+    await mount();
+    // Two synchronous clicks before the first IPC resolves: a synchronous in-flight
+    // guard must let exactly ONE skills_set_enabled_profile call through.
+    await act(async () => {
+      const t = document.querySelector("[data-testid='skills-tools-toggle']");
+      t?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      t?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const calls = invokeMock.mock.calls.filter((c) => c[0] === "skills_set_enabled_profile");
+    expect(calls.length).toBe(1);
+  });
 });

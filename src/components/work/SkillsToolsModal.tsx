@@ -52,6 +52,11 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   // Bumped after a library skill is applied so the active profile's content refreshes.
   const [reload, setReload] = useState(0);
   const dialogRef = useRef<HTMLDivElement>(null);
+  // Synchronous in-flight guard: a useState bool alone loses to a stale closure on a
+  // rapid double-click, so the ref gates the second call; `toggling` only drives the
+  // disabled styling (mirrors ToolsPicker's busy pattern).
+  const togglingRef = useRef(false);
+  const [toggling, setToggling] = useState(false);
 
   // Reset the active tab to the always-enabled default when the project changes.
   useEffect(() => {
@@ -113,6 +118,28 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
 
   // Stable so LibrarySearch's apply callback isn't recreated each parent render.
   const handleApplied = useCallback(() => setReload((r) => r + 1), []);
+
+  // Per-tier enable/disable toggle. No-op if the active profile has no manual yet.
+  // On success bump `reload` so the refetched entry reflects the new enabled state;
+  // on error leave the UI unchanged (the toggle simply doesn't flip).
+  const handleToggle = useCallback(async () => {
+    if (!activeEntry?.exists || togglingRef.current) return;
+    togglingRef.current = true;
+    setToggling(true);
+    try {
+      await invokeBackendCommand("skills_set_enabled_profile", {
+        workingFolderPath: projectRoot,
+        profile: active,
+        enabled: !activeEntry.enabled,
+      });
+      setReload((r) => r + 1);
+    } catch (e) {
+      console.error("skills_set_enabled_profile failed", e);
+    } finally {
+      togglingRef.current = false;
+      setToggling(false);
+    }
+  }, [activeEntry, active, projectRoot]);
 
   // Focus trap: aria-modal promises focus stays inside, so cycle Tab/Shift+Tab at the
   // boundaries instead of letting focus escape to the work console behind the scrim.
@@ -221,8 +248,26 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           aria-labelledby={`skills-tools-tab-id-${active}`}
           className="overflow-y-auto px-5 py-4"
         >
-          <div className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
-            Skills
+          <div className="mb-2 flex items-center justify-between">
+            <div className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+              Skills
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!activeEntry?.enabled}
+              aria-label={`Toggle the ${activeLabel} skill`}
+              aria-busy={status === "loading"}
+              disabled={status !== "ok" || !activeEntry?.exists || toggling}
+              onClick={handleToggle}
+              data-testid="skills-tools-toggle"
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${activeEntry?.enabled ? "bg-teal" : "bg-cream-300"}`}
+            >
+              <span
+                aria-hidden="true"
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${activeEntry?.enabled ? "translate-x-4" : "translate-x-0.5"}`}
+              />
+            </button>
           </div>
           <pre
             data-testid="skills-tools-skill-content"
