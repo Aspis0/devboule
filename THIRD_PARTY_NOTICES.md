@@ -81,3 +81,25 @@ Concepts drawn from Open WebUI that are uncopyrightable and self-reimplemented h
 - Injecting `<meta http-equiv="Content-Security-Policy">` into the artifact document.
 - `event.source === iframe.contentWindow` as the postMessage trust anchor (this is a
   standard web platform pattern documented on MDN/web.dev).
+
+---
+
+## cmdk — command-score
+
+**Source:** https://github.com/pacocoursey/cmdk (`cmdk/src/command-score.ts`)
+**License:** MIT — Copyright (c) 2022 Paco Coursey.
+
+```
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction... (full MIT text). THE SOFTWARE IS PROVIDED
+"AS IS", WITHOUT WARRANTY OF ANY KIND.
+```
+
+**Usage in this project:**
+`src/vendor/commandScore.ts` is a verbatim copy of the file above (zero dependencies).
+It scores fuzzy/abbreviation matches and powers the Work Console "Skills & Tools"
+library search: `commandScore(item.name, query, [item.description, item.kind])`,
+filtering scores `> 0` and sorting descending.
