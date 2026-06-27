@@ -47,25 +47,6 @@ const SkillsView = lazy(() =>
   })),
 );
 
-// THROWAWAY Phase-0 spike (artifact renderer). Lazy so it never bloats the main bundle;
-// mounted ONLY when the app is opened with `?spike=1` (see the guard in App() below),
-// before the vault-unlock gate, so it is trivially reachable in dev. Remove this import
-// + the guard to delete the spike.
-const ArtifactSpikePanel = lazy(() =>
-  import("./components/dev/ArtifactSpikePanel").then((m) => ({
-    default: m.ArtifactSpikePanel,
-  })),
-);
-
-// Phase-1 dev harness for the interactive-artifact render surface. Lazy + mounted ONLY when
-// the app is opened with `?artifact=1` (see the guard in App() below), before the vault-unlock
-// gate. Lets the owner see a real interactive artifact running + resizing independent of Phase 2.
-const ArtifactDevPanel = lazy(() =>
-  import("./components/dev/ArtifactDevPanel").then((m) => ({
-    default: m.ArtifactDevPanel,
-  })),
-);
-
 function ViewFallback() {
   return (
     <div className="flex items-center gap-2 text-[12px] font-medium text-cream-500">
@@ -273,38 +254,6 @@ function AppShell() {
 }
 
 function App() {
-  // THROWAWAY Phase-0 spike: `?spike=1` renders the artifact render-path test panel and
-  // nothing else, BEFORE the AppProvider/unlock gate, so it needs no vault unlock. Remove
-  // this block + the lazy ArtifactSpikePanel import above to delete the spike.
-  if (
-    typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).get("spike") === "1"
-  ) {
-    return (
-      <ErrorBoundary label="ArtifactSpike">
-        <Suspense fallback={<ViewFallback />}>
-          <ArtifactSpikePanel />
-        </Suspense>
-      </ErrorBoundary>
-    );
-  }
-
-  // Phase-1 dev harness: `?artifact=1` renders the interactive-artifact render surface and
-  // nothing else, BEFORE the AppProvider/unlock gate, so it needs no vault unlock. Remove this
-  // block + the lazy ArtifactDevPanel import above to delete the harness.
-  if (
-    typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).get("artifact") === "1"
-  ) {
-    return (
-      <ErrorBoundary label="ArtifactDev">
-        <Suspense fallback={<ViewFallback />}>
-          <ArtifactDevPanel />
-        </Suspense>
-      </ErrorBoundary>
-    );
-  }
-
   return (
     <AppProvider>
       <ErrorBoundary label="App">
