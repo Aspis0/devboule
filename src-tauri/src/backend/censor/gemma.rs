@@ -140,6 +140,10 @@ pub enum CensorAiProvider {
     Omlx,
     #[serde(rename = "appleFm")]
     AppleFm,
+    /// A remote HTTPS OpenAI-compatible endpoint reached with a `Bearer` API key (the key
+    /// lives in the OS vault, NEVER in this config). The ONE Censor provider that sends file
+    /// content OFF-device — strictly opt-in (provider + key + Pigeon must all be enabled).
+    Cloud,
 }
 
 /// The parsed `censorLocalAi` config. PRIVACY: for the oMLX provider, `base_url` is a
@@ -189,6 +193,8 @@ impl CensorLocalAi {
             (None, CensorAiProvider::Ollama) => OLLAMA_BASE.to_string(),
             (None, CensorAiProvider::Omlx) => OMLX_DEFAULT_BASE.to_string(),
             (None, CensorAiProvider::AppleFm) => String::new(),
+            // Cloud always needs an explicit https base_url — there is no default.
+            (None, CensorAiProvider::Cloud) => String::new(),
         }
     }
 
@@ -296,6 +302,36 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                 ollama_model: None,
             })
         }
+        CensorAiProvider::Cloud => {
+            // SAME shape as the Omlx arm (base + model REQUIRED, same model char-class +
+            // length cap) EXCEPT the base is validated by `validate_cloud_base_for_censor`
+            // (https remote allowed — the deliberate off-device egress) instead of the
+            // loopback validator.
+            if base.is_empty() {
+                return Err("Cloud censorLocalAi requires a base URL.".into());
+            }
+            if model.is_empty() {
+                return Err("Cloud censorLocalAi requires a model.".into());
+            }
+            if model.len() > CENSOR_OMLX_MODEL_MAX_LEN {
+                return Err(format!(
+                    "Cloud censorLocalAi model must be at most {CENSOR_OMLX_MODEL_MAX_LEN} characters."
+                ));
+            }
+            if !is_valid_omlx_model(model) {
+                return Err(
+                    "Cloud censorLocalAi model must be a bare tag (letters, digits, . _ : / -)."
+                        .into(),
+                );
+            }
+            let normalized_base = validate_cloud_base_for_censor(base)?;
+            Ok(CensorLocalAi {
+                provider: CensorAiProvider::Cloud,
+                base_url: Some(normalized_base),
+                model: Some(model.to_string()),
+                ollama_model: None,
+            })
+        }
         CensorAiProvider::AppleFm => {
             if !model.is_empty() {
                 if model.len() > CENSOR_OMLX_MODEL_MAX_LEN {
@@ -355,6 +391,96 @@ fn validate_omlx_base_for_censor(base: &str) -> Result<String, String> {
         );
     }
     // Strip a single trailing slash so `<base>/chat/completions` is clean.
+    Ok(trimmed.strip_suffix('/').unwrap_or(trimmed).to_string())
+}
+
+/// Validate + normalize a CLOUD base URL for Censor. The deliberate exception to the
+/// loopback rule (Cloud is the one path that egresses file content off-device, strictly
+/// opt-in), but with the SAME SSRF/privacy hardening as the TS `validateCloudBaseUrl` and
+/// the Rust `local_coder::validate_cloud_base_url` so a value the UI accepts the backend
+/// accepts and vice-versa (config.json is the real trust boundary — the UI is only a gate):
+/// REQUIRE `https://` (TLS); reject userinfo (`user@host`), IPv6 literals, `localhost`, bare
+/// IPv4 / numeric-quad literals, the cloud-metadata FQDN + `.internal`/`.local` intranet
+/// suffixes, and single-label hosts (require a dot); each DNS label must be alnum+hyphen.
+/// Same empty / length-cap / forbidden-char guards; trailing slash stripped.
+fn validate_cloud_base_for_censor(base: &str) -> Result<String, String> {
+    let trimmed = base.trim();
+    if trimmed.is_empty() {
+        return Err("Cloud censorLocalAi requires a base URL.".into());
+    }
+    if trimmed.len() > OMLX_BASE_URL_MAX_LEN {
+        return Err(format!(
+            "Cloud base URL must be at most {OMLX_BASE_URL_MAX_LEN} characters."
+        ));
+    }
+    if trimmed
+        .chars()
+        .any(crate::backend::mini_coder::is_forbidden_command_char)
+    {
+        return Err("Cloud base URL must not contain control, bidi or invisible characters.".into());
+    }
+    let Some(rest) = trimmed.strip_prefix("https://") else {
+        return Err("Cloud base URL must be an https origin.".into());
+    };
+    // Authority = everything before the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("Cloud base URL must include a host.".into());
+    }
+    // Userinfo hides the real host + credentials belong in the Authorization header.
+    if authority.contains('@') {
+        return Err("Cloud base URL must not contain userinfo (user@host).".into());
+    }
+    // IPv6 literal `[..]`: a cloud provider is addressed by hostname, not a raw IP.
+    if authority.starts_with('[') {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    // Split off an optional `:port`.
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if let Some(p) = port {
+        if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("Cloud base URL has an invalid :port.".into());
+        }
+        if p.parse::<u32>().map(|n| n > 65535).unwrap_or(true) {
+            return Err("Cloud base URL has an invalid :port.".into());
+        }
+    }
+    if host.is_empty() {
+        return Err("Cloud base URL must include a host.".into());
+    }
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "localhost" {
+        return Err("Cloud base URL must be a remote host (not localhost).".into());
+    }
+    // Bare IPv4 / numeric dotted-quad literals are an SSRF surface (e.g. 169.254.169.254).
+    let labels: Vec<&str> = host.split('.').collect();
+    let is_numeric_quad =
+        labels.len() == 4 && labels.iter().all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
+    if is_numeric_quad {
+        return Err("Cloud base URL must be a hostname, not an IP literal.".into());
+    }
+    // Cloud-metadata FQDN + conventional intranet suffixes (partial SSRF mitigation, mirrors
+    // the TS/local_coder rule; full protection needs post-DNS IP filtering — a follow-up).
+    if host_lower == "metadata.google.internal"
+        || host_lower.ends_with(".internal")
+        || host_lower.ends_with(".local")
+    {
+        return Err("Cloud base URL targets a disallowed intranet/metadata host.".into());
+    }
+    // Require a dot so a single-label intranet name can't be targeted, and each DNS label
+    // must be non-empty alphanumeric + hyphen.
+    if !host.contains('.') {
+        return Err("Cloud base URL must be a fully-qualified host (needs a dot).".into());
+    }
+    if !labels
+        .iter()
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    {
+        return Err("Cloud base URL has an invalid host label.".into());
+    }
     Ok(trimmed.strip_suffix('/').unwrap_or(trimmed).to_string())
 }
 
@@ -602,6 +728,10 @@ pub struct OmlxClient {
     http: reqwest::blocking::Client,
     base: String,
     model: String,
+    /// `Some(_)` ONLY for the Cloud provider → a `Bearer` Authorization header is sent AND a
+    /// non-loopback https base is permitted (the off-device exception). `None` = local oMLX:
+    /// loopback-clamped, no auth header (the privacy fail-safe is unchanged).
+    api_key: Option<String>,
     generate_timeout: Duration,
     probe_timeout: Duration,
 }
@@ -642,20 +772,58 @@ impl OmlxClient {
         generate_timeout: Duration,
         probe_timeout: Duration,
     ) -> Self {
-        // SELF-CONTAINED clamp (max-recall FIX 7): accept `base` ONLY if it satisfies the
-        // FULL config-time validator's rules — loopback http origin AND within the length
-        // cap AND free of control/bidi/invisible chars — rather than relying on the caller
-        // having already validated it (the old check tested loopback only, "safe by
-        // emergent caller invariant"). Any failure clamps to the safe loopback default so
-        // the type can NEVER be constructed pointing at a remote/oversized/obfuscated base,
-        // regardless of how it is called.
+        // LOCAL oMLX: no key → loopback-only clamp (the existing privacy fail-safe). Every
+        // pre-cloud caller keeps this exact behavior.
+        Self::with_config_and_key(base, model, None, generate_timeout, probe_timeout)
+    }
+
+    /// Construct with explicit config AND an optional Cloud API key. The base clamp is
+    /// BRANCH-AWARE on `api_key`:
+    /// - `None` (LOCAL oMLX): accept `base` ONLY if it is a loopback http origin within the
+    ///   length cap and free of control/bidi/invisible chars — the UNCHANGED privacy
+    ///   fail-safe; any failure clamps to [`OMLX_DEFAULT_BASE`] so file content can never
+    ///   leave the device even on a bad base.
+    /// - `Some(_)` (CLOUD): accept `base` only if it passes [`validate_cloud_base_for_censor`]
+    ///   (https origin, remote allowed — the deliberate off-device egress). On failure clamp
+    ///   to [`OMLX_DEFAULT_BASE`] (an unreachable localhost) so a misconfigured cloud base can
+    ///   NEVER silently point at an UNEXPECTED remote host. The key drives a `Bearer` header
+    ///   in [`generate`]/[`probe`] and is NEVER logged (excluded from `cache_identity`).
+    pub(crate) fn with_config_and_key(
+        base: &str,
+        model: &str,
+        api_key: Option<&str>,
+        generate_timeout: Duration,
+        probe_timeout: Duration,
+    ) -> Self {
+        // Shared hardening for BOTH branches: length cap + no control/bidi/invisible chars.
         let base = if base.len() <= OMLX_BASE_URL_MAX_LEN
             && !base
                 .chars()
                 .any(crate::backend::mini_coder::is_forbidden_command_char)
-            && is_loopback_omlx_base(base)
         {
-            base.to_string()
+            match api_key {
+                // CLOUD: https remote allowed; invalid → unreachable loopback default.
+                Some(_) => match validate_cloud_base_for_censor(base) {
+                    Ok(normalized) => normalized,
+                    Err(_) => {
+                        eprintln!(
+                            "censor gemma: refusing invalid cloud base; falling back to loopback default"
+                        );
+                        OMLX_DEFAULT_BASE.to_string()
+                    }
+                },
+                // LOCAL: loopback only (the unchanged privacy guarantee).
+                None => {
+                    if is_loopback_omlx_base(base) {
+                        base.to_string()
+                    } else {
+                        eprintln!(
+                            "censor gemma: refusing invalid oMLX base; falling back to loopback default"
+                        );
+                        OMLX_DEFAULT_BASE.to_string()
+                    }
+                }
+            }
         } else {
             eprintln!(
                 "censor gemma: refusing invalid oMLX base; falling back to loopback default"
@@ -670,6 +838,7 @@ impl OmlxClient {
             http,
             base,
             model: model.to_string(),
+            api_key: api_key.map(str::to_string),
             generate_timeout,
             probe_timeout,
         }
@@ -825,7 +994,12 @@ impl GemmaClient for OmlxClient {
         // probe's "reachable AND model present" so the tier degrades identically when the
         // server is up but the model isn't pulled).
         let url = format!("{}/models", self.base);
-        let resp = match self.http.get(&url).timeout(self.probe_timeout).send() {
+        let mut req = self.http.get(&url).timeout(self.probe_timeout);
+        // Cloud provider only: authenticate the remote list-models probe.
+        if let Some(k) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {k}"));
+        }
+        let resp = match req.send() {
             Ok(r) => r,
             Err(_) => return false,
         };
@@ -859,11 +1033,17 @@ impl GemmaClient for OmlxClient {
             "stream": false,
             "temperature": 0.1
         });
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
             .timeout(self.generate_timeout)
-            .json(&payload)
+            .json(&payload);
+        // Cloud provider only: authenticate the remote endpoint. Local oMLX (api_key None)
+        // sends no header — unchanged loopback behavior.
+        if let Some(k) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {k}"));
+        }
+        let resp = req
             .send()
             .map_err(|e| {
                 if e.is_timeout() {
@@ -883,7 +1063,13 @@ impl GemmaClient for OmlxClient {
     }
 
     fn provider_label(&self) -> &'static str {
-        "omlx"
+        // A keyed client is the Cloud provider; an unkeyed one is local oMLX. Both are
+        // 'static — the label is identity-only (never the base/key).
+        if self.api_key.is_some() {
+            "cloud"
+        } else {
+            "omlx"
+        }
     }
 
     fn model_label(&self) -> String {
@@ -891,9 +1077,12 @@ impl GemmaClient for OmlxClient {
     }
 
     fn cache_identity(&self) -> String {
-        // Fold in the base so changing the oMLX base (same provider) re-probes. NEVER
-        // logged — opaque in-memory cache key only (see the trait doc).
-        format!("omlx|{}|{}", self.base, self.model)
+        // Fold in the base so changing the base (same provider) re-probes. The PREFIX tracks
+        // cloud-vs-local so a cloud client never collides with a local oMLX one in the probe
+        // cache. NEVER logged — opaque in-memory key only; the api_key is deliberately
+        // EXCLUDED (it could otherwise leak into a log of this identity).
+        let prefix = if self.api_key.is_some() { "cloud" } else { "omlx" };
+        format!("{}|{}|{}", prefix, self.base, self.model)
     }
 }
 
@@ -1224,6 +1413,19 @@ fn tag_names(body: &serde_json::Value) -> Vec<String> {
 /// constructor re-clamps a non-loopback base as defense in depth. The base/model are
 /// NEVER logged here — provider identity only (see [`GemmaClient::provider_label`]).
 pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Result<Box<dyn GemmaClient>, String> {
+    // No key: every local provider (Ollama/oMLX/AppleFm) keeps its exact prior behavior.
+    build_gemma_client_with_key(cfg, None)
+}
+
+/// Build the Censor tier-2 client, threading an optional Cloud API key. Identical to
+/// [`build_gemma_client`] for every local provider (which IGNORE `api_key`); ONLY the
+/// `Cloud` provider consumes it (passed to [`OmlxClient::with_config_and_key`] for the
+/// `Bearer` header). The key is read from the OS vault by the caller
+/// (`censor_review::build_censor_client`) — never from `cfg`.
+pub(crate) fn build_gemma_client_with_key(
+    cfg: &CensorLocalAi,
+    api_key: Option<&str>,
+) -> Result<Box<dyn GemmaClient>, String> {
     let base = cfg.effective_base();
     match cfg.provider {
         // The Ollama client takes the CONFIGURED override (`ollama_model`, may be `None`)
@@ -1237,7 +1439,9 @@ pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Result<Box<dyn GemmaCli
             GEMMA_PROBE_TIMEOUT,
         ))),
         // oMLX has no `/api/tags` equivalent; its model is REQUIRED + validated, so the
-        // configured `effective_model` is used verbatim (opt-in: no auto-default).
+        // configured `effective_model` is used verbatim (opt-in: no auto-default). LOCAL —
+        // `with_config` delegates to the keyless (`None`) clamp branch, so the loopback
+        // privacy fail-safe stays intact.
         CensorAiProvider::Omlx => Ok(Box::new(OmlxClient::with_config(
             &base,
             &cfg.effective_model(),
@@ -1251,6 +1455,15 @@ pub(crate) fn build_gemma_client(cfg: &CensorLocalAi) -> Result<Box<dyn GemmaCli
         ))),
         #[cfg(not(target_os = "macos"))]
         CensorAiProvider::AppleFm => Err("Apple on-device requires macOS 27+.".to_string()),
+        // Cloud reuses the OpenAI-compatible OmlxClient WITH the key → `Bearer` auth + the
+        // https (non-loopback) base permitted by the keyed clamp branch.
+        CensorAiProvider::Cloud => Ok(Box::new(OmlxClient::with_config_and_key(
+            &base,
+            &cfg.effective_model(),
+            api_key,
+            GEMMA_GENERATE_TIMEOUT,
+            GEMMA_PROBE_TIMEOUT,
+        ))),
     }
 }
 
@@ -2466,6 +2679,165 @@ mod tests {
             ollama_model: None,
         })
         .is_err());
+    }
+
+    // ---- Cloud provider (opt-in remote HTTPS egress): validator + branch-aware clamp ----
+
+    #[test]
+    fn validate_censor_local_ai_cloud_accepts_https_and_normalizes() {
+        let v = validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::Cloud,
+            base_url: Some("https://openrouter.ai/api/v1/".into()),
+            model: Some("openai/gpt-4o-mini".into()),
+            ollama_model: None,
+        })
+        .unwrap();
+        assert_eq!(v.provider, CensorAiProvider::Cloud);
+        // Trailing slash stripped; remote https host preserved (the deliberate exception).
+        assert_eq!(v.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(v.model.as_deref(), Some("openai/gpt-4o-mini"));
+        assert_eq!(v.effective_base(), "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn validate_censor_local_ai_cloud_rejects_http() {
+        // Cloud requires TLS — a plaintext http base would leak file content in clear.
+        assert!(validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::Cloud,
+            base_url: Some("http://openrouter.ai/api/v1".into()),
+            model: Some("m".into()),
+            ollama_model: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn validate_censor_local_ai_cloud_requires_base_and_model() {
+        // Missing base.
+        assert!(validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::Cloud,
+            base_url: None,
+            model: Some("m".into()),
+            ollama_model: None,
+        })
+        .is_err());
+        // Missing model.
+        assert!(validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::Cloud,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            model: None,
+            ollama_model: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn validate_censor_local_ai_cloud_rejects_ssrf_and_intranet_hosts() {
+        // SSRF/privacy parity with the TS validateCloudBaseUrl + local_coder rule: a
+        // hand-edited config that points the keyed cloud client at a metadata/loopback/IP/
+        // single-label host must be REFUSED at the backend boundary, not just by the UI.
+        for base in [
+            "https://localhost:8000/v1",
+            "https://127.0.0.1/v1",
+            "https://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal/v1",
+            "https://api.internal/v1",
+            "https://router.local/v1",
+            "https://intranet/v1", // single label, no dot
+            "https://user@openrouter.ai/v1", // userinfo
+            "https://[::1]/v1", // IPv6 literal
+            "http://openrouter.ai/v1", // not https
+        ] {
+            assert!(
+                validate_censor_local_ai(&CensorLocalAi {
+                    provider: CensorAiProvider::Cloud,
+                    base_url: Some(base.into()),
+                    model: Some("m".into()),
+                    ollama_model: None,
+                })
+                .is_err(),
+                "cloud base {base:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_censor_local_ai_cloud_accepts_remote_host_with_port() {
+        let v = validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::Cloud,
+            base_url: Some("https://api.openai.com:443/v1".into()),
+            model: Some("gpt-4o-mini".into()),
+            ollama_model: None,
+        })
+        .unwrap();
+        assert_eq!(v.base_url.as_deref(), Some("https://api.openai.com:443/v1"));
+    }
+
+    #[test]
+    fn omlx_with_config_and_key_cloud_keeps_remote_https_base() {
+        // SECURITY-CRITICAL: with a key present (Cloud), a VALID https remote base must be
+        // PRESERVED (not clamped to the loopback default) so the cloud review can reach it.
+        let c = OmlxClient::with_config_and_key(
+            "https://openrouter.ai/api/v1",
+            "openai/gpt-4o-mini",
+            Some("sk-secret"),
+            GEMMA_GENERATE_TIMEOUT,
+            GEMMA_PROBE_TIMEOUT,
+        );
+        // cache_identity folds in the base; it must show the remote host, prefixed "cloud".
+        assert!(c.cache_identity().starts_with("cloud|https://openrouter.ai/api/v1|"));
+        assert_eq!(c.provider_label(), "cloud");
+        // The key MUST NOT appear anywhere identity-bearing (it could be logged).
+        assert!(!c.cache_identity().contains("sk-secret"));
+    }
+
+    #[test]
+    fn omlx_with_config_no_key_still_clamps_non_loopback() {
+        // PRIVACY: with NO key (local oMLX), a non-loopback base is STILL clamped to the
+        // loopback default — the cloud branch must not weaken the local privacy guarantee.
+        let c = OmlxClient::with_config_and_key(
+            "https://openrouter.ai/api/v1",
+            "m",
+            None,
+            GEMMA_GENERATE_TIMEOUT,
+            GEMMA_PROBE_TIMEOUT,
+        );
+        assert_eq!(c.cache_identity(), format!("omlx|{OMLX_DEFAULT_BASE}|m"));
+        assert_eq!(c.provider_label(), "omlx");
+    }
+
+    #[test]
+    fn omlx_with_config_and_key_invalid_cloud_base_clamps_to_default() {
+        // Defense in depth: a misconfigured cloud base (http, not https) with a key falls
+        // back to the unreachable loopback default — NEVER an unexpected remote host.
+        let c = OmlxClient::with_config_and_key(
+            "http://evil.example.com/v1",
+            "m",
+            Some("sk-secret"),
+            GEMMA_GENERATE_TIMEOUT,
+            GEMMA_PROBE_TIMEOUT,
+        );
+        assert!(c.cache_identity().ends_with(&format!("|{OMLX_DEFAULT_BASE}|m")));
+    }
+
+    #[test]
+    fn build_gemma_client_with_key_cloud_is_cloud_labeled() {
+        let cfg = validate_censor_local_ai(&CensorLocalAi {
+            provider: CensorAiProvider::Cloud,
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            model: Some("openai/gpt-4o-mini".into()),
+            ollama_model: None,
+        })
+        .unwrap();
+        let client = build_gemma_client_with_key(&cfg, Some("sk-secret")).unwrap();
+        assert_eq!(client.provider_label(), "cloud");
+    }
+
+    #[test]
+    fn build_gemma_client_default_still_passes_no_key() {
+        // The no-key wrapper keeps the existing provider identity for local providers.
+        let client = build_gemma_client(&CensorLocalAi::default()).unwrap();
+        assert_eq!(client.provider_label(), "ollama");
     }
 
     #[test]

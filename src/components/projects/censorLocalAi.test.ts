@@ -223,6 +223,58 @@ describe("validateCensorLocalAi", () => {
     expect(v.value).not.toHaveProperty("ollamaModel");
   });
 
+  it("accepts a valid cloud config and normalizes the https base (trailing slash stripped)", () => {
+    const v = validateCensorLocalAi({
+      provider: "cloud",
+      baseUrl: "https://openrouter.ai/api/v1/",
+      model: "openai/gpt-4o-mini",
+    });
+    expect(v.ok).toBe(true);
+    expect(v.value).toEqual({
+      provider: "cloud",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "openai/gpt-4o-mini",
+    });
+  });
+
+  it("requires a base URL AND a model for cloud", () => {
+    const v = validateCensorLocalAi({ provider: "cloud", baseUrl: "", model: "" });
+    expect(v.ok).toBe(false);
+    expect(v.errors.baseUrl).toBeTruthy();
+    expect(v.errors.model).toBeTruthy();
+  });
+
+  it("rejects a non-https cloud base (TLS required for off-device egress)", () => {
+    const v = validateCensorLocalAi({
+      provider: "cloud",
+      baseUrl: "http://openrouter.ai/api/v1",
+      model: "m",
+    });
+    expect(v.ok).toBe(false);
+    expect(v.errors.baseUrl).toMatch(/https origin/);
+  });
+
+  it("rejects a loopback cloud base (cloud is remote — validateCloudBaseUrl denies loopback)", () => {
+    const v = validateCensorLocalAi({
+      provider: "cloud",
+      baseUrl: "https://localhost:8000/v1",
+      model: "m",
+    });
+    expect(v.ok).toBe(false);
+    expect(v.errors.baseUrl).toBeTruthy();
+  });
+
+  it("NEVER carries an api key in the cloud value (the key lives in the vault)", () => {
+    const v = validateCensorLocalAi({
+      provider: "cloud",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "openai/gpt-4o-mini",
+    });
+    expect(v.ok).toBe(true);
+    // Only provider/baseUrl/model — no apiKey field ever leaks into the persisted config.
+    expect(Object.keys(v.value ?? {}).sort()).toEqual(["baseUrl", "model", "provider"]);
+  });
+
   it("rejects an omlx model over the 200-char cap (matches Rust CENSOR_OMLX_MODEL_MAX_LEN)", () => {
     // PARITY (max-recall FIX 2): the model cap is 200, matching the Rust constant.
     const atCap = "a".repeat(200);

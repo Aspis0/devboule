@@ -83,6 +83,15 @@ fn exa_key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, "provider:exa").map_err(|_| vault_error("open"))
 }
 
+/// Censor CLOUD LLM API key. Stored under `provider:censor_cloud` (the same `provider:*`
+/// convention as `provider:exa`). WRITE-ONLY from the UI: only present/absent is ever
+/// surfaced via [`censor_cloud_key_status`]; the raw value is read backend-internal by the
+/// async Censor review ([`read_censor_cloud_key`]) to send a `Bearer` header to the
+/// configured https endpoint — the ONLY Censor path that egresses code off-device (opt-in).
+fn censor_cloud_key_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, "provider:censor_cloud").map_err(|_| vault_error("open"))
+}
+
 /// The CLOUD LLM bearer key for the LOCAL Devboule orchestrator's OPT-IN Cloud mode.
 /// Stored under `provider:cloud_llm` (the same `provider:*` convention as `provider:exa`
 /// and `provider:github`). The launch reads it (`read_cloud_llm_key`) and sets
@@ -339,6 +348,98 @@ pub fn exa_key_status() -> Result<AuxCredentialStatus, String> {
         Err(e) => Ok(AuxCredentialStatus {
             id: EXA_KEY_ID.into(),
             label: EXA_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(e),
+        }),
+    }
+}
+
+// --- Censor CLOUD LLM key (opt-in remote Censor review) ----------------------
+//
+// Stored under `provider:censor_cloud`. WRITE-ONLY from the UI: `save`/`delete` mutate it
+// and `censor_cloud_key_status` reports present/absent ONLY — the raw value is NEVER
+// returned to the frontend. The async Censor review reads it via `read_censor_cloud_key`
+// (backend-internal) to authenticate the configured https endpoint.
+
+const CENSOR_CLOUD_KEY_ID: &str = "censor_cloud_api_key";
+const CENSOR_CLOUD_KEY_LABEL: &str = "Censor cloud LLM API key";
+
+pub fn save_censor_cloud_key(key: &str) -> Result<AuxCredentialStatus, String> {
+    let cleaned = key.trim();
+    // Same minimum-length + no-whitespace guard the exa/scaleway keys use: a too-short /
+    // whitespace-bearing value is a paste error, not a real key.
+    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
+        return Ok(AuxCredentialStatus {
+            id: CENSOR_CLOUD_KEY_ID.into(),
+            label: CENSOR_CLOUD_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Censor cloud API key is too short or contains whitespace.".into()),
+        });
+    }
+    // Reject non-whitespace control chars (mirrors `save_cloud_llm_key`): they pass the
+    // whitespace guard but make an invalid `Bearer` header value, so the review would fail at
+    // the transport layer with no actionable reason. Catch it here at save time instead.
+    if cleaned.chars().any(char::is_control) {
+        return Ok(AuxCredentialStatus {
+            id: CENSOR_CLOUD_KEY_ID.into(),
+            label: CENSOR_CLOUD_KEY_LABEL.into(),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some("Censor cloud API key must not contain control characters.".into()),
+        });
+    }
+    censor_cloud_key_entry()?
+        .set_password(cleaned)
+        .map_err(|_| vault_error("save"))?;
+    censor_cloud_key_status()
+}
+
+pub fn delete_censor_cloud_key() -> Result<AuxCredentialStatus, String> {
+    match censor_cloud_key_entry()?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err(vault_error("delete")),
+    }
+    censor_cloud_key_status()
+}
+
+/// Backend-INTERNAL reader: returns the raw key (or `None`). Used ONLY by the async Censor
+/// review to set the `Bearer` header. NOT exposed as a command — the UI can only ever see
+/// present/absent via [`censor_cloud_key_status`].
+pub fn read_censor_cloud_key() -> Result<Option<String>, String> {
+    match censor_cloud_key_entry()?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(_) => Err(vault_error("read")),
+    }
+}
+
+/// Present/absent status ONLY — never the value. Mirrors [`exa_key_status`].
+pub fn censor_cloud_key_status() -> Result<AuxCredentialStatus, String> {
+    match read_censor_cloud_key() {
+        Ok(Some(_)) => Ok(AuxCredentialStatus {
+            id: CENSOR_CLOUD_KEY_ID.into(),
+            label: CENSOR_CLOUD_KEY_LABEL.into(),
+            configured: true,
+            status: "configured".into(),
+            last_checked_at: Some(now()),
+            message: None,
+        }),
+        Ok(None) => Ok(AuxCredentialStatus {
+            id: CENSOR_CLOUD_KEY_ID.into(),
+            label: CENSOR_CLOUD_KEY_LABEL.into(),
+            configured: false,
+            status: "missing".into(),
+            last_checked_at: Some(now()),
+            message: Some("Required for the opt-in Censor cloud LLM review.".into()),
+        }),
+        Err(e) => Ok(AuxCredentialStatus {
+            id: CENSOR_CLOUD_KEY_ID.into(),
+            label: CENSOR_CLOUD_KEY_LABEL.into(),
             configured: false,
             status: "error".into(),
             last_checked_at: Some(now()),
@@ -1929,6 +2030,42 @@ mod tests {
         let del_status = save_cloud_llm_key(with_del).expect("status");
         assert!(!del_status.configured);
         assert_eq!(del_status.status, "error");
+    }
+
+    #[test]
+    fn censor_cloud_key_save_rejects_too_short_whitespace_and_control_without_leaking() {
+        // Same up-front (pre-keyring) reject path as the cloud-llm key, so it is safe to run
+        // unconditionally and must never echo the rejected value.
+        let short = save_censor_cloud_key("abc").expect("save returns a status, not Err");
+        assert!(!short.configured);
+        assert_eq!(short.status, "error");
+        assert_eq!(short.id, "censor_cloud_api_key");
+
+        let whitespace = save_censor_cloud_key("has space inside it").expect("status");
+        assert!(!whitespace.configured);
+        assert_eq!(whitespace.status, "error");
+
+        // Non-whitespace control char (\x01) passes the whitespace guard but must be rejected.
+        let with_ctrl = "sk-censor\u{0001}key-1234";
+        let ctrl = save_censor_cloud_key(with_ctrl).expect("status");
+        assert!(!ctrl.configured);
+        assert_eq!(ctrl.status, "error");
+
+        for status in [&short, &whitespace, &ctrl] {
+            let json = serde_json::to_string(status).unwrap();
+            assert!(!json.contains("has space inside it"));
+            assert!(!json.contains("sk-censor"));
+            assert!(!json.contains('\u{0001}'));
+        }
+    }
+
+    #[test]
+    fn censor_cloud_status_struct_never_carries_the_value() {
+        let status = censor_cloud_key_status().expect("status");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"configured\""));
+        assert!(!json.contains("\"value\""));
+        assert!(!json.contains("\"key\""));
     }
 
     #[test]

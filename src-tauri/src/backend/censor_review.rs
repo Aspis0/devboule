@@ -69,6 +69,31 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Build the Censor LLM client for `cfg`, reading the cloud API key from the vault ONLY when
+/// the provider is `Cloud` (the opt-in remote-egress path). For every LOCAL provider the key
+/// is `None`, so the loopback privacy clamp inside `OmlxClient` is untouched.
+///
+/// SECURITY: a `Cloud` provider with NO key (never saved / vault read error / deleted
+/// mid-flight) returns `Err` instead of a client — NOT a key-less client. Without this, the
+/// key-less Cloud client would clamp its remote https base to the loopback default and could
+/// POST file content to a local `:8000` server (wrong endpoint). Returning `Err` makes a
+/// keyless Cloud a clean no-op at BOTH call sites (ingest skips the drain; process logs +
+/// returns), preserving the once-per-pass probe design (no per-file re-probe needed).
+fn build_censor_client(
+    cfg: &crate::backend::censor::gemma::CensorLocalAi,
+) -> Result<Box<dyn crate::backend::censor::gemma::GemmaClient>, String> {
+    let api_key = if cfg.provider == crate::backend::censor::gemma::CensorAiProvider::Cloud {
+        let key = crate::backend::vault::read_censor_cloud_key().ok().flatten();
+        if key.is_none() {
+            return Err("Cloud Censor provider has no API key configured.".into());
+        }
+        key
+    } else {
+        None
+    };
+    crate::backend::censor::gemma::build_gemma_client_with_key(cfg, api_key.as_deref())
+}
+
 /// Run the Censor LLM review for one request: build the configured Censor model client
 /// (Ollama / oMLX / AppleFM / cloud), and if it is available reuse the FINE pipeline's
 /// `run_fine_batch_no_rail` with a `GemmaCtx` — which runs the LLM review on the file, writes the
@@ -105,7 +130,7 @@ pub fn process_censor_review(
         }
     };
     let cfg = crate::backend::projects::read_censor_local_ai(app);
-    let client = match crate::backend::censor::gemma::build_gemma_client(&cfg) {
+    let client = match build_censor_client(&cfg) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("censor-review: no Censor LLM client ({e})");
@@ -154,7 +179,7 @@ pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
     // review is a clean no-op: we DON'T drain, leaving the tasks PENDING in the durable mailbox for
     // a later pass — never claiming work we cannot run, and never O(N)-probing the backend.
     let cfg = crate::backend::projects::read_censor_local_ai(&app);
-    let llm_available = match crate::backend::censor::gemma::build_gemma_client(&cfg) {
+    let llm_available = match build_censor_client(&cfg) {
         Ok(c) => crate::backend::censor::gemma::probe_available(c.as_ref()),
         Err(_) => false,
     };
