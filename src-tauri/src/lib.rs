@@ -653,6 +653,7 @@ pub fn run() {
             backend::design::design_write_export,
             backend::design::design_write_artifact,
             backend::project_skill::skills_list,
+            backend::project_skill::skills_list_profiles,
             backend::project_skill::skills_save,
             backend::project_skill::skills_set_enabled,
             backend::project_skill::skills_catalog,

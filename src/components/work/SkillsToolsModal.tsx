@@ -8,10 +8,19 @@ import {
 import { invokeBackendCommand } from "../../context/AppContext";
 import { Sparkles, X } from "lucide-react";
 
-type SkillRole = "mini" | "coder" | "design" | "orchestrator";
+// Work Console ASSIGNMENT PROFILES (capability tiers), mirroring the backend's
+// `ASSIGNMENT_PROFILES`. The single legacy `mini` role splits into two tiers here:
+// `mini-big` (capable local model) and `mini-small` (8B, edits-only). This is the
+// assignment layer — separate from the backend injection/traversal `KNOWN_ROLES` gate.
+type SkillProfile =
+  | "coder"
+  | "mini-big"
+  | "mini-small"
+  | "design"
+  | "orchestrator";
 
 interface SkillEntry {
-  role: SkillRole;
+  role: SkillProfile;
   exists: boolean;
   enabled: boolean;
   content: string;
@@ -26,16 +35,20 @@ type Props = {
 
 type Status = "loading" | "ok" | "error";
 
-const ROLES: { role: SkillRole; enabled: boolean }[] = [
-  { role: "coder", enabled: true },
-  { role: "mini", enabled: true },
-  { role: "design", enabled: false },
-  { role: "orchestrator", enabled: false },
+// `coder` + both mini tiers are active now; `design`/`orchestrator` are predisposed but
+// disabled ("coming soon", managed in the sidebar for now). `label` carries the nice
+// human form since the tier names aren't a simple capitalize.
+const PROFILES: { profile: SkillProfile; label: string; enabled: boolean }[] = [
+  { profile: "coder", label: "Coder", enabled: true },
+  { profile: "mini-big", label: "Mini · big", enabled: true },
+  { profile: "mini-small", label: "Mini · small", enabled: true },
+  { profile: "design", label: "Design", enabled: false },
+  { profile: "orchestrator", label: "Orchestrator", enabled: false },
 ];
 
 export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   const [entries, setEntries] = useState<SkillEntry[]>([]);
-  const [active, setActive] = useState<SkillRole>("coder");
+  const [active, setActive] = useState<SkillProfile>("coder");
   const [status, setStatus] = useState<Status>("loading");
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -45,9 +58,10 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
     let cancelled = false;
     setStatus("loading");
     setEntries([]); // clear stale content before the new fetch resolves
+    setActive("coder"); // reset the active tab with the project (always-enabled default)
     (async () => {
       try {
-        const result = await invokeBackendCommand("skills_list", {
+        const result = await invokeBackendCommand("skills_list_profiles", {
           workingFolderPath: projectRoot,
         });
         if (cancelled) return;
@@ -80,10 +94,12 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   }, []);
 
   const activeEntry = entries.find((e) => e.role === active);
+  const activeLabel =
+    PROFILES.find((p) => p.profile === active)?.label ?? active;
 
-  const handleTabClick = useCallback((role: SkillRole) => {
-    const roleDef = ROLES.find((r) => r.role === role);
-    if (roleDef?.enabled) setActive(role);
+  const handleTabClick = useCallback((profile: SkillProfile) => {
+    const profileDef = PROFILES.find((p) => p.profile === profile);
+    if (profileDef?.enabled) setActive(profile);
   }, []);
 
   const handleCardClick = useCallback((e: MouseEvent) => {
@@ -133,22 +149,22 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
         </div>
 
         <div className="flex gap-2 border-b border-cream-100 px-5 py-3">
-          {ROLES.map(({ role, enabled }) => (
+          {PROFILES.map(({ profile, label, enabled }) => (
             <button
-              key={role}
+              key={profile}
               type="button"
-              data-testid={`skills-tools-tab-${role}`}
-              onClick={() => handleTabClick(role)}
+              data-testid={`skills-tools-tab-${profile}`}
+              onClick={() => handleTabClick(profile)}
               disabled={!enabled}
               className={`rounded-lg border px-3 py-1.5 text-[12px] font-semibold transition-colors ${
-                active === role
+                active === profile
                   ? "border-teal/30 bg-teal/10 text-teal"
                   : enabled
                     ? "border-cream-200 bg-white text-cream-600 hover:border-cream-300"
                     : "cursor-not-allowed border-cream-200 text-cream-400 opacity-50"
               }`}
             >
-              {role.charAt(0).toUpperCase() + role.slice(1)}
+              {label}
               {!enabled && (
                 <span className="ml-1 text-[10px] font-normal opacity-70">
                   · coming soon
@@ -189,7 +205,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
 
         <div className="border-t border-cream-100 px-5 py-3 text-[11px] text-cream-500">
           The active skill manual for the{" "}
-          <span className="font-semibold">{active}</span> role.
+          <span className="font-semibold">{activeLabel}</span> profile.
         </div>
       </div>
     </div>
