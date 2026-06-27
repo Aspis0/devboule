@@ -311,6 +311,110 @@ pub(crate) fn active_project_skill(project_root: &Path, role: &str) -> Option<St
     read_project_skill(project_root, role)
 }
 
+/// P5 (Work Console): the toggle-aware SKILL.md for a launched MINI, resolved by its capability
+/// TIER PROFILE (`profile`, e.g. "mini-big" / "mini-small") with a NON-REGRESSING fallback to the
+/// LEGACY `legacy_role` ("mini") skill. Resolution:
+/// - If a tier-specific `.claude/skills/<profile>/SKILL.md` FILE exists, it OWNS injection: its own
+///   toggle decides (enabled → its body; disabled → None). NO legacy fallback in this case — an
+///   author who created a tier file expressed intent for that tier, so a disabled tier skill must
+///   not silently resurrect the legacy one.
+/// - If NO tier file exists, fall back to the legacy `legacy_role` skill (toggle-aware) — so a
+///   project that only ever authored `.claude/skills/mini/SKILL.md` keeps injecting exactly as
+///   before (the tiers are additive, not a breaking rename).
+///
+/// `profile`/`legacy_role` are FIXED caller literals (derived from the model tier + the legacy
+/// role), never user input — same path-safety contract as [`read_project_skill`].
+pub(crate) fn active_profile_skill_or_legacy(
+    project_root: &Path,
+    profile: &str,
+    legacy_role: &str,
+) -> Option<String> {
+    // A tier file present (regardless of its toggle) takes ownership: respect ONLY its toggle.
+    if read_project_skill(project_root, profile).is_some() {
+        return active_project_skill(project_root, profile);
+    }
+    // No tier file → the legacy role skill (toggle-aware) so nothing regresses.
+    active_project_skill(project_root, legacy_role)
+}
+
+#[cfg(test)]
+mod profile_skill_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("devboule_profskill_{}_{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_skill(root: &std::path::Path, profile: &str, body: &str) {
+        let d = root.join(".claude/skills").join(profile);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn tier_file_present_wins() {
+        let root = fresh_dir("tier_present");
+        write_skill(&root, "mini", "LEGACY MINI");
+        write_skill(&root, "mini-big", "BIG TIER");
+        assert_eq!(
+            active_profile_skill_or_legacy(&root, "mini-big", "mini").as_deref(),
+            Some("BIG TIER")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn falls_back_to_legacy_when_no_tier_file() {
+        let root = fresh_dir("tier_absent");
+        write_skill(&root, "mini", "LEGACY MINI");
+        assert_eq!(
+            active_profile_skill_or_legacy(&root, "mini-big", "mini").as_deref(),
+            Some("LEGACY MINI")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disabled_tier_does_not_fall_back_to_legacy() {
+        // A tier file that exists but is toggled OFF must suppress injection entirely — it must
+        // NOT silently resurrect the legacy mini skill.
+        let root = fresh_dir("tier_disabled");
+        write_skill(&root, "mini", "LEGACY MINI");
+        write_skill(&root, "mini-big", "BIG TIER");
+        fs::write(
+            root.join(".claude/skills/skills-state.json"),
+            r#"{"skills":{"mini-big":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(active_profile_skill_or_legacy(&root, "mini-big", "mini").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn none_when_neither_present() {
+        let root = fresh_dir("tier_none");
+        assert!(active_profile_skill_or_legacy(&root, "mini-small", "mini").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mini_small_tier_file_is_read() {
+        let root = fresh_dir("tier_small");
+        write_skill(&root, "mini-small", "SMALL TIER");
+        assert_eq!(
+            active_profile_skill_or_legacy(&root, "mini-small", "mini").as_deref(),
+            Some("SMALL TIER")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 /// The bundled LANGUAGE-persona pack — the ONE source of truth for the (role × language) layer.
 /// Add a PERSONA = drop `assets/skills/lang/<key>.md` and add ONE line here (`include_str!` needs
 /// the path at compile time). Everything in THIS module (the allowlist `is_known_lang`, the key

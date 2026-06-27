@@ -3,9 +3,23 @@
 //! launch configs (claude `.mcp.json` / codex `-c mcp_servers.*`). See
 //! `docs/design-user-mcp-servers-2026-06.md`.
 //!
-//! HARD invariant (design §6): the MINI coder NEVER receives user MCP servers. This
-//! module is wired ONLY into the MAIN-coder launch path (`projects.rs`). Nothing in
-//! `mini_coder_executor.rs` references it.
+//! ROLE-SCOPED injection (Work Console P5 — supersedes the original "minis never get user
+//! MCP" §6 invariant): user MCP servers are injected PER LAUNCH PROFILE.
+//! - MAIN coder (role `coder`): the merged catalog, NARROWED to the `coder` profile's
+//!   `.claude/tools/coder/tools.json` assignment when present (intersected with this merged,
+//!   §9-allowlisted, enabled set via `tools_assignment::inject_servers_for_profile`). An ABSENT
+//!   assignment keeps ALL merged servers — byte-identical to the pre-P5 launch.
+//! - `mini-small`: NEVER receives any user MCP server (edits-only; enforced both at assignment
+//!   time and at the injection resolver `tools_assignment::resolve_injected_tools`).
+//! - `mini-big`: MAY be assigned servers, but the mini executor does NOT YET wire user-MCP
+//!   injection. The agentic mini runs an IN-PROCESS oMLX tool-loop (`agentic_runner`) with a fixed
+//!   `ScopedAgentTools` set and NO sandboxed MCP-client; the one-shot mini is text-only (its only
+//!   MCP is the codex `oracle_context` read-only grant). Spawning arbitrary external MCP child
+//!   processes from that path would escape the mini's OS sandbox, so it is DEFERRED until a
+//!   sandboxed MCP-client subsystem exists. Until then a mini receives NO user MCP in practice —
+//!   the historic §6 exclusion still HOLDS for minis at runtime.
+//! This module is wired into the MAIN-coder launch path (`projects.rs`); the per-profile narrowing
+//! lives in `tools_assignment.rs`.
 //!
 //! Two scopes (design §2.1):
 //! - GLOBAL  — `<app-data>/user-mcp-servers.json` (every project, resolved via the same
