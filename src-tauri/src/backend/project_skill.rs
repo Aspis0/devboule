@@ -2533,3 +2533,74 @@ mod assignment_profile_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[tauri::command]
+   pub fn skills_save_profile(
+       state: State<'_, BackendState>,
+       working_folder_path: String,
+       profile: String,
+       content: String,
+   ) -> Result<(), String> {
+       state.ensure_unlocked()?;
+       let _guard = design_write_guard()?;
+       skills_save_profile_impl(&working_folder_path, &profile, &content)
+   }
+
+   fn skills_save_profile_impl(
+       working_folder_path: &str,
+       profile: &str,
+       content: &str,
+   ) -> Result<(), String> {
+       validate_profile(profile)?;
+       if content.len() > MAX_SKILL_BYTES {
+           return Err(format!(
+               "Content exceeds maximum allowed size of {} bytes",
+               MAX_SKILL_BYTES
+           ));
+       }
+       let canonical = canonical_working_folder(working_folder_path)?;
+       write_skill_file(&canonical, profile, content)
+   }
+
+   #[cfg(test)]
+   mod save_profile_tests {
+       use super::*;
+       use std::env;
+       use std::fs::{self, create_dir_all, remove_dir_all};
+       use std::path::PathBuf;
+       use std::process;
+
+       fn fresh_dir(tag: &str) -> PathBuf {
+           let dir = env::temp_dir().join(format!("skill_test_{}_{}", process::id(), tag));
+           create_dir_all(&dir).expect("Failed to create temp dir");
+           dir
+       }
+
+       #[test]
+       fn test_save_profile_impl_ok() {
+           let dir = fresh_dir("ok");
+           let canonical = fs::canonicalize(&dir).unwrap();
+           assert!(skills_save_profile_impl(dir.to_str().unwrap(), "mini-big", "BODY").is_ok());
+           let (exists, content, _) = read_skill_raw(&canonical, "mini-big");
+           assert!(exists);
+           assert_eq!(content, "BODY");
+           remove_dir_all(&dir).ok();
+       }
+
+       #[test]
+       fn test_save_profile_impl_bad_profile() {
+           let dir = fresh_dir("bad_profile");
+           let result = skills_save_profile_impl(dir.to_str().unwrap(), "mini", "BODY");
+           assert!(result.is_err());
+           remove_dir_all(&dir).ok();
+       }
+
+       #[test]
+       fn test_save_profile_impl_too_large() {
+           let dir = fresh_dir("too_large");
+           let large_content = "A".repeat(MAX_SKILL_BYTES + 1);
+           let result = skills_save_profile_impl(dir.to_str().unwrap(), "mini-big", &large_content);
+           assert!(result.is_err());
+           remove_dir_all(&dir).ok();
+       }
+   }

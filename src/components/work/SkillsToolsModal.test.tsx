@@ -44,6 +44,7 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
       }
       if (cmd === "tools_library_list") return [];
       if (cmd === "tools_assignment_list") return [];
+      if (cmd === "global_skills_list") return [];
       return undefined;
     });
     container = document.createElement("div");

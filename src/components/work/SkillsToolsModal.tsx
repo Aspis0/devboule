@@ -8,17 +8,14 @@ import {
 import { invokeBackendCommand } from "../../context/AppContext";
 import { Sparkles, X } from "lucide-react";
 import { ToolsPicker } from "./ToolsPicker";
+import { LibrarySearch } from "./LibrarySearch";
 
 // Work Console ASSIGNMENT PROFILES (capability tiers), mirroring the backend's
 // `ASSIGNMENT_PROFILES`. The single legacy `mini` role splits into two tiers here:
 // `mini-big` (capable local model) and `mini-small` (8B, edits-only). This is the
 // assignment layer — separate from the backend injection/traversal `KNOWN_ROLES` gate.
 type SkillProfile =
-  | "coder"
-  | "mini-big"
-  | "mini-small"
-  | "design"
-  | "orchestrator";
+  "coder" | "mini-big" | "mini-small" | "design" | "orchestrator";
 
 interface SkillEntry {
   role: SkillProfile;
@@ -51,15 +48,21 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   const [entries, setEntries] = useState<SkillEntry[]>([]);
   const [active, setActive] = useState<SkillProfile>("coder");
   const [status, setStatus] = useState<Status>("loading");
+  // Bumped after a library skill is applied so the active profile's content refreshes.
+  const [reload, setReload] = useState(0);
   const dialogRef = useRef<HTMLDivElement>(null);
 
-  // Fetch per-role skills for the project. Re-runs if the root changes; the
-  // cancelled flag prevents setState after unmount or on a superseded fetch.
+  // Reset the active tab to the always-enabled default when the project changes.
+  useEffect(() => {
+    setActive("coder");
+  }, [projectRoot]);
+
+  // Fetch per-role skills for the project. Re-runs on project change OR after an
+  // apply (reload). The cancelled flag prevents setState after unmount / superseded fetch.
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
     setEntries([]); // clear stale content before the new fetch resolves
-    setActive("coder"); // reset the active tab with the project (always-enabled default)
     (async () => {
       try {
         const result = await invokeBackendCommand("skills_list_profiles", {
@@ -76,7 +79,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [projectRoot]);
+  }, [projectRoot, reload]);
 
   // Escape-to-close (WAI-ARIA modal requirement).
   useEffect(() => {
@@ -179,24 +182,28 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             Skills
           </div>
-          <input
-            data-testid="skills-tools-search"
-            type="text"
-            disabled
-            title="Library search — coming soon"
-            placeholder="Search the library — skills and tools… (coming soon)"
-            className="mb-3 w-full max-w-xs rounded-2xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] text-cream-400 focus:outline-none"
-          />
           <pre
             data-testid="skills-tools-skill-content"
             className="whitespace-pre-wrap rounded-xl border border-cream-100 bg-cream-50 p-3 text-[12px] text-cream-800"
           >
             {skillBody}
           </pre>
+          <div className="mb-2 mt-4 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+            From your global library
+          </div>
+          <LibrarySearch
+            projectRoot={projectRoot}
+            profile={active}
+            onApplied={() => setReload((r) => r + 1)}
+          />
           <div className="mb-2 mt-5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             Tools
           </div>
-          <ToolsPicker key={active} projectRoot={projectRoot} profile={active} />
+          <ToolsPicker
+            key={active}
+            projectRoot={projectRoot}
+            profile={active}
+          />
         </div>
 
         <div className="border-t border-cream-100 px-5 py-3 text-[11px] text-cream-500">
