@@ -127,12 +127,11 @@ pub fn inject_servers_for_profile(
     profile: &str,
     servers: Vec<UserMcpServer>,
 ) -> Vec<UserMcpServer> {
-    // Precondition: only a valid ASSIGNMENT_PROFILE may narrow. An unknown profile must NOT
-    // silently fall through `resolve_injected_tools`'s None→"all servers" default (which would
-    // hand a future, unwired role the entire user-MCP set). Return the input UNNARROWED — the
-    // caller passes a fixed literal, so this only fires on a programming error.
+    // Precondition: only a valid ASSIGNMENT_PROFILE may narrow. An unknown profile is a
+    // programming error (the live callers pass fixed literals) — FAIL CLOSED to NO servers
+    // rather than risk handing a future, unwired role the entire user-MCP set.
     if validate_profile(profile).is_err() {
-        return servers;
+        return Vec::new();
     }
     let available: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
     // Malformed/unreadable ⇒ None (absent semantics) so the profile default applies fail-open.
@@ -442,6 +441,17 @@ mod tests {
         let dir = fresh_dir("inject_mini_small");
         let servers = vec![server("fs"), server("git")];
         let got = inject_servers_for_profile(dir.to_str().unwrap(), "mini-small", servers);
+        assert!(got.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inject_invalid_profile_fails_closed_to_zero() {
+        // An unknown profile (programming error) must FAIL CLOSED — never hand a role the
+        // whole user-MCP set.
+        let dir = fresh_dir("inject_bad_profile");
+        let servers = vec![server("fs"), server("git")];
+        let got = inject_servers_for_profile(dir.to_str().unwrap(), "verifier", servers);
         assert!(got.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

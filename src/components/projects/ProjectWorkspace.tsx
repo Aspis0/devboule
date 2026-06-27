@@ -1188,9 +1188,11 @@ export function ProjectWorkspace({
                     onClick={() => setSkillsOpen(true)}
                     disabled={!censorRoot || readOnly}
                     title={
-                      censorRoot
-                        ? "Manage skills & tools for this project's agents"
-                        : "Open a project folder first"
+                      readOnly
+                        ? "Archived project — skills & tools are read-only"
+                        : censorRoot
+                          ? "Manage skills & tools for this project's agents"
+                          : "Open a project folder first"
                     }
                     className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-terracotta disabled:cursor-not-allowed disabled:opacity-50"
                   >

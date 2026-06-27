@@ -191,7 +191,9 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
               key={profile}
               type="button"
               role="tab"
+              id={`skills-tools-tab-id-${profile}`}
               aria-selected={active === profile}
+              aria-controls="skills-tools-panel"
               data-testid={`skills-tools-tab-${profile}`}
               onClick={() => handleTabClick(profile)}
               disabled={!enabled}
@@ -213,7 +215,12 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
           ))}
         </div>
 
-        <div role="tabpanel" className="overflow-y-auto px-5 py-4">
+        <div
+          role="tabpanel"
+          id="skills-tools-panel"
+          aria-labelledby={`skills-tools-tab-id-${active}`}
+          className="overflow-y-auto px-5 py-4"
+        >
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             Skills
           </div>
