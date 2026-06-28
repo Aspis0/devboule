@@ -1135,7 +1135,7 @@ pub struct LibrarySkillTemplate {
 /// The 6 bundled library skills (devboule originals, agentskills.io-conformant — they pass our own
 /// `validate_skill`). Bodies are `include_str!`'d from `assets/skills/library/<id>/SKILL.md`, the
 /// same in-binary pattern as the language personas; name+description are parsed from each body.
-fn bundled_library_skills() -> Vec<LibrarySkillTemplate> {
+pub(crate) fn bundled_library_skills() -> Vec<LibrarySkillTemplate> {
     let raw_bodies: &[&str] = &[
         include_str!("../../assets/skills/library/code-review/SKILL.md"),
         include_str!("../../assets/skills/library/debugging/SKILL.md"),
@@ -1185,6 +1185,10 @@ mod bundled_library_tests {
         }
         // Catch drift: a skill added to the include_str! list without updating EXPECTED (or vice versa).
         assert_eq!(skills.len(), EXPECTED.len(), "bundled_library_skills count != EXPECTED");
+        // Names must be pairwise distinct: `install_bundled_impl` selects by name via `find`,
+        // so a duplicate name would make the second skill permanently unreachable to install.
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "bundled library skill names must be unique");
     }
 
     #[test]

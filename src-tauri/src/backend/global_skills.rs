@@ -134,6 +134,27 @@ use std::path::{Path, PathBuf};
        delete_impl(&base, &name)
    }
 
+   pub fn install_bundled_impl(base: &Path, skill_name: &str) -> Result<(), String> {
+       let tpl = super::project_skill::bundled_library_skills()
+           .into_iter()
+           .find(|t| t.name == skill_name)
+           .ok_or_else(|| format!("unknown bundled library skill '{skill_name}'"))?;
+       save_impl(base, &tpl.name, &tpl.body)
+   }
+
+   /// Copies a shipped bundled library skill into the user's global store.
+   #[tauri::command]
+   pub fn global_skills_install_bundled(
+       app: AppHandle,
+       state: State<'_, BackendState>,
+       skill_name: String,
+   ) -> Result<(), String> {
+       state.ensure_unlocked()?;
+       let _g = design_write_guard()?;
+       let base = global_base(&app)?;
+       install_bundled_impl(&base, &skill_name)
+   }
+
    #[cfg(test)]
    mod tests {
        use super::*;
@@ -191,6 +212,27 @@ use std::path::{Path, PathBuf};
        #[test]
        fn test_list_empty_base() {
            let base = fresh_base("empty");
+           assert!(list_impl(&base).is_empty());
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_install_bundled_known_lands_in_global_store() {
+           let base = fresh_base("install-bundled");
+           // "code-review" is one of the shipped bundled library skills.
+           install_bundled_impl(&base, "code-review").unwrap();
+           let entries = list_impl(&base);
+           assert_eq!(entries.len(), 1);
+           assert_eq!(entries[0].name, "code-review");
+           assert!(!entries[0].content.trim().is_empty());
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_install_bundled_unknown_errs() {
+           let base = fresh_base("install-bundled-unknown");
+           assert!(install_bundled_impl(&base, "does-not-exist").is_err());
+           // Nothing was written.
            assert!(list_impl(&base).is_empty());
            std::fs::remove_dir_all(base.parent().unwrap()).ok();
        }

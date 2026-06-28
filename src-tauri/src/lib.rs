@@ -660,6 +660,7 @@ pub fn run() {
             backend::global_skills::global_skills_list,
             backend::global_skills::global_skills_save,
             backend::global_skills::global_skills_delete,
+            backend::global_skills::global_skills_install_bundled,
             backend::project_skill::skills_save,
             backend::project_skill::skills_save_profile,
             backend::project_skill::skills_set_enabled,

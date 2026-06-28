@@ -16,6 +16,7 @@ import {
 import { invokeBackendCommand } from "../../context/AppContext";
 import { MarketplaceInstall } from "./MarketplaceInstall";
 import { SkillsDiscovery } from "./SkillsDiscovery";
+import { GlobalLibraryPanel } from "./GlobalLibraryPanel";
 import { CollapsibleSection } from "./CollapsibleSection";
 import { UserMcpServersCard } from "../settings/UserMcpServersCard";
 import {
@@ -97,7 +98,7 @@ export function SkillsView() {
   const [langCatalog, setLangCatalog] = useState<LangCatalogEntry[]>([]);
   // Phase 3c — Installed (manage what the project has) vs Discover (browse + install the bundled
   // catalog), plus a global search that filters language rows + Discover cards across all roles.
-  const [view, setView] = useState<"installed" | "discover" | "tools">("installed");
+  const [view, setView] = useState<"installed" | "discover" | "library" | "tools">("installed");
   const [query, setQuery] = useState<string>("");
   // Local editor drafts keyed by role. Seeded from each list, edited freely.
   const [drafts, setDrafts] = useState<Record<SkillRole, string>>(
@@ -657,7 +658,7 @@ export function SkillsView() {
               role="tablist"
               aria-label="Skills view"
             >
-              {(["installed", "discover", "tools"] as const).map((v) => (
+              {(["installed", "discover", "library", "tools"] as const).map((v) => (
                 <button
                   key={v}
                   type="button"
@@ -670,11 +671,17 @@ export function SkillsView() {
                       : "text-cream-500 hover:text-cream-800"
                   }`}
                 >
-                  {v === "installed" ? "Installed" : v === "discover" ? "Discover" : "Tools"}
+                  {v === "installed"
+                    ? "Installed"
+                    : v === "discover"
+                      ? "Discover"
+                      : v === "library"
+                        ? "Library"
+                        : "Tools"}
                 </button>
               ))}
             </div>
-            {view !== "tools" && (
+            {view !== "tools" && view !== "library" && (
               <input
                 type="search"
                 value={query}
@@ -688,6 +695,8 @@ export function SkillsView() {
 
           {view === "tools" ? (
             <UserMcpServersCard />
+          ) : view === "library" ? (
+            <GlobalLibraryPanel />
           ) : view === "discover" ? (
             <div className="space-y-3">
               <CollapsibleSection title="Bundled skills" defaultOpen forceOpen={query.trim().length > 0}>
