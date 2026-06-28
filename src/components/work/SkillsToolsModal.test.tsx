@@ -82,7 +82,7 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     expect(document.querySelector("[data-testid='skills-tools-modal']")).toBeTruthy();
   });
 
-  it("renders profile tabs: coder + both mini tiers enabled, design + orchestrator disabled", async () => {
+  it("renders all five profile tabs enabled (design + orchestrator now edited here too)", async () => {
     await mount();
     const coder = document.querySelector("[data-testid='skills-tools-tab-coder']") as HTMLButtonElement;
     const big = document.querySelector("[data-testid='skills-tools-tab-mini-big']") as HTMLButtonElement;
@@ -97,14 +97,16 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     expect(coder.disabled).toBe(false);
     expect(big.disabled).toBe(false);
     expect(small.disabled).toBe(false);
-    expect(design.disabled).toBe(true);
-    expect(orch.disabled).toBe(true);
+    expect(design.disabled).toBe(false);
+    expect(orch.disabled).toBe(false);
   });
 
   it("shows the coder manual content by default", async () => {
     await mount();
-    const content = document.querySelector("[data-testid='skills-tools-skill-content']")?.textContent;
-    expect(content).toContain("CODER MANUAL BODY");
+    const editor = document.querySelector(
+      "[data-testid='skills-tools-skill-editor']",
+    ) as HTMLTextAreaElement;
+    expect(editor.value).toContain("CODER MANUAL BODY");
   });
 
   it("switches to the mini-big manual when the mini-big tab is clicked", async () => {
@@ -117,8 +119,10 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     await act(async () => {
       await Promise.resolve();
     });
-    const content = document.querySelector("[data-testid='skills-tools-skill-content']")?.textContent;
-    expect(content).toContain("MINI BIG MANUAL BODY");
+    const editor = document.querySelector(
+      "[data-testid='skills-tools-skill-editor']",
+    ) as HTMLTextAreaElement;
+    expect(editor.value).toContain("MINI BIG MANUAL BODY");
   });
 
   it("treats mini-big and mini-small as DISTINCT tabs with distinct manuals", async () => {
@@ -132,7 +136,9 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     await act(async () => {
       await Promise.resolve();
     });
-    const small = document.querySelector("[data-testid='skills-tools-skill-content']")?.textContent;
+    const small = (document.querySelector(
+      "[data-testid='skills-tools-skill-editor']",
+    ) as HTMLTextAreaElement).value;
     expect(small).toContain("MINI SMALL MANUAL BODY");
     expect(small).not.toContain("MINI BIG MANUAL BODY");
     // The two tabs are different DOM nodes.
@@ -169,11 +175,14 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     expect(onCloseMock).toHaveBeenCalledOnce();
   });
 
-  it("shows an empty-state when skills_list_profiles returns no entries", async () => {
+  it("shows an empty editor when the active profile has no skill manual", async () => {
     invokeMock.mockResolvedValue([]);
     await mount();
-    const content = document.querySelector("[data-testid='skills-tools-skill-content']")?.textContent;
-    expect(content).toContain("No skill manual");
+    const editor = document.querySelector(
+      "[data-testid='skills-tools-skill-editor']",
+    ) as HTMLTextAreaElement;
+    expect(editor).toBeTruthy();
+    expect(editor.value).toBe("");
   });
 
   it("shows an error state when skills_list_profiles rejects", async () => {
@@ -248,5 +257,81 @@ describe("SkillsToolsModal (P2 — profile tiers)", () => {
     });
     const calls = invokeMock.mock.calls.filter((c) => c[0] === "skills_set_enabled_profile");
     expect(calls.length).toBe(1);
+  });
+
+  // --- Per-profile SKILL.md editor (skills_save_profile) ---
+
+  it("edits the active profile skill and saves via skills_save_profile", async () => {
+    await mount();
+    const editor = document.querySelector(
+      "[data-testid='skills-tools-skill-editor']",
+    ) as HTMLTextAreaElement;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!;
+    await act(async () => {
+      setter.call(editor, "NEW BODY");
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      document
+        .querySelector("[data-testid='skills-tools-skill-save']")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const call = invokeMock.mock.calls.find((c) => c[0] === "skills_save_profile");
+    expect(call).toBeTruthy();
+    expect(call![1]).toMatchObject({
+      workingFolderPath: projectRoot,
+      profile: "coder",
+      content: "NEW BODY",
+    });
+  });
+
+  it("blocks saving a truncated profile skill until acknowledged", async () => {
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const cmd = args[0] as string;
+      if (cmd === "skills_list_profiles") {
+        return [
+          { role: "coder", exists: true, enabled: true, content: "HEAD", bytes: 8192, truncated: true },
+        ];
+      }
+      if (cmd === "tools_library_list") return [];
+      if (cmd === "tools_assignment_list") return [];
+      if (cmd === "global_skills_list") return [];
+      return undefined;
+    });
+    await mount();
+    const editor = document.querySelector(
+      "[data-testid='skills-tools-skill-editor']",
+    ) as HTMLTextAreaElement;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!;
+    // Edit so the "no change" disable doesn't apply — the truncation guard must still block.
+    await act(async () => {
+      setter.call(editor, "HEAD2");
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(
+      (document.querySelector(
+        "[data-testid='skills-tools-skill-save']",
+      ) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    const ack = document.querySelector(
+      "[data-testid='skills-tools-skill-ack']",
+    ) as HTMLInputElement;
+    await act(async () => {
+      ack.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(
+      (document.querySelector(
+        "[data-testid='skills-tools-skill-save']",
+      ) as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
 });

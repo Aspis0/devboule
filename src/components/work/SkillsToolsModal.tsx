@@ -11,6 +11,8 @@ import { invokeBackendCommand } from "../../context/AppContext";
 import { Sparkles, X } from "lucide-react";
 import { ToolsPicker } from "./ToolsPicker";
 import { LibrarySearch } from "./LibrarySearch";
+import { ModalLanguages } from "./ModalLanguages";
+import { SkillEditor } from "./SkillEditor";
 
 // Work Console ASSIGNMENT PROFILES (capability tiers), mirroring the backend's
 // `ASSIGNMENT_PROFILES`. The single legacy `mini` role splits into two tiers here:
@@ -42,8 +44,10 @@ const PROFILES: { profile: SkillProfile; label: string; enabled: boolean }[] = [
   { profile: "coder", label: "Coder", enabled: true },
   { profile: "mini-big", label: "Mini · big", enabled: true },
   { profile: "mini-small", label: "Mini · small", enabled: true },
-  { profile: "design", label: "Design", enabled: false },
-  { profile: "orchestrator", label: "Orchestrator", enabled: false },
+  // design/orchestrator are now edited HERE (the sidebar Skills view became global-only), so all
+  // five capability profiles are first-class tabs in the Work Console modal.
+  { profile: "design", label: "Design", enabled: true },
+  { profile: "orchestrator", label: "Orchestrator", enabled: true },
 ];
 
 export function SkillsToolsModal({ projectRoot, onClose }: Props) {
@@ -176,15 +180,6 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
     }
   }, []);
 
-  const skillBody =
-    status === "loading"
-      ? "Loading skills…"
-      : status === "error"
-        ? "Couldn't load skills for this project."
-        : activeEntry?.exists
-          ? activeEntry.content
-          : "No skill manual for this role yet.";
-
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-cream-900/40 p-4"
@@ -280,12 +275,33 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
               />
             </button>
           </div>
-          <pre
-            data-testid="skills-tools-skill-content"
-            className="whitespace-pre-wrap rounded-xl border border-cream-100 bg-cream-50 p-3 text-[12px] text-cream-800"
-          >
-            {skillBody}
-          </pre>
+          {status === "loading" || status === "error" ? (
+            <div
+              data-testid="skills-tools-skill-content"
+              className="whitespace-pre-wrap rounded-xl border border-cream-100 bg-cream-50 p-3 text-[12px] text-cream-800"
+            >
+              {status === "loading"
+                ? "Loading skills…"
+                : "Couldn't load skills for this project."}
+            </div>
+          ) : (
+            <SkillEditor
+              key={`skill-${active}`}
+              projectRoot={projectRoot}
+              profile={active}
+              content={activeEntry?.content ?? ""}
+              truncated={!!activeEntry?.truncated}
+              onSaved={() => setReload((r) => r + 1)}
+            />
+          )}
+          {status === "ok" && (
+            <>
+              <div className="mb-2 mt-5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+                Languages
+              </div>
+              <ModalLanguages key={`lang-${active}`} projectRoot={projectRoot} profile={active} />
+            </>
+          )}
           <div className="mb-2 mt-4 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
             From your global library
           </div>
@@ -298,7 +314,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
             Tools
           </div>
           <ToolsPicker
-            key={active}
+            key={`tools-${active}`}
             projectRoot={projectRoot}
             profile={active}
           />
