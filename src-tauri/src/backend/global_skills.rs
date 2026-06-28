@@ -139,6 +139,13 @@ use std::path::{Path, PathBuf};
            .into_iter()
            .find(|t| t.name == skill_name)
            .ok_or_else(|| format!("unknown bundled library skill '{skill_name}'"))?;
+       let dest = base.join(&tpl.name).join("SKILL.md");
+       if dest.exists() {
+           return Err(format!(
+               "'{}' is already in your global library; delete it first to reinstall",
+               tpl.name
+           ));
+       }
        save_impl(base, &tpl.name, &tpl.body)
    }
 
@@ -234,6 +241,27 @@ use std::path::{Path, PathBuf};
            assert!(install_bundled_impl(&base, "does-not-exist").is_err());
            // Nothing was written.
            assert!(list_impl(&base).is_empty());
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_install_bundled_refuses_when_already_present() {
+           let base = fresh_base("install-bundled-twice");
+           install_bundled_impl(&base, "code-review").unwrap();
+           // A second install must NOT silently clobber a possibly-customized global skill.
+           assert!(install_bundled_impl(&base, "code-review").is_err());
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_all_bundled_library_skills_install_under_cap() {
+           // Every shipped bundled skill must install cleanly (each body under MAX_SKILL_BYTES);
+           // names are distinct so there is no refuse-if-present collision.
+           let base = fresh_base("install-bundled-all");
+           for tpl in super::super::project_skill::bundled_library_skills() {
+               install_bundled_impl(&base, &tpl.name)
+                   .unwrap_or_else(|e| panic!("bundled skill {} failed to install: {e}", tpl.name));
+           }
            std::fs::remove_dir_all(base.parent().unwrap()).ok();
        }
    }

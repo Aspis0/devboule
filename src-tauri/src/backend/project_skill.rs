@@ -1132,7 +1132,7 @@ pub struct LibrarySkillTemplate {
     pub body: String,
 }
 
-/// The 6 bundled library skills (devboule originals, agentskills.io-conformant — they pass our own
+/// The 7 bundled library skills (devboule originals, agentskills.io-conformant — they pass our own
 /// `validate_skill`). Bodies are `include_str!`'d from `assets/skills/library/<id>/SKILL.md`, the
 /// same in-binary pattern as the language personas; name+description are parsed from each body.
 pub(crate) fn bundled_library_skills() -> Vec<LibrarySkillTemplate> {

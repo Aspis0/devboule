@@ -76,12 +76,15 @@ export function GlobalLibraryPanel() {
     setBusy(name);
     try {
       await invokeBackendCommand("global_skills_delete", { name });
+      // Drop any stale per-row draft/ack so a future skill reusing this name re-seeds fresh.
+      setEditDrafts((prev) => { const c = { ...prev }; delete c[name]; return c; });
+      setAckTruncated((prev) => { const c = { ...prev }; delete c[name]; return c; });
       await refresh();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to delete skill");
+      if (mountedRef.current) setError(e instanceof Error ? e.message : "Failed to delete skill");
     } finally {
       busyRef.current = false;
-      setBusy(null);
+      if (mountedRef.current) setBusy(null);
     }
   };
 
@@ -93,17 +96,17 @@ export function GlobalLibraryPanel() {
       await invokeBackendCommand("global_skills_install_bundled", { skillName: name });
       await refresh();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to add bundled skill");
+      if (mountedRef.current) setError(e instanceof Error ? e.message : "Failed to add bundled skill");
     } finally {
       busyRef.current = false;
-      setBusy(null);
+      if (mountedRef.current) setBusy(null);
     }
   };
 
   const handleCreate = async () => {
     const n = newName.trim();
     if (busyRef.current) return;
-    if (!n || !newContent) return;
+    if (!n || !newContent.trim()) return;
     busyRef.current = true;
     setBusy(n);
     try {
@@ -112,10 +115,10 @@ export function GlobalLibraryPanel() {
       setNewContent("");
       await refresh();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to create skill");
+      if (mountedRef.current) setError(e instanceof Error ? e.message : "Failed to create skill");
     } finally {
       busyRef.current = false;
-      setBusy(null);
+      if (mountedRef.current) setBusy(null);
     }
   };
 
@@ -127,22 +130,14 @@ export function GlobalLibraryPanel() {
     try {
       await invokeBackendCommand("global_skills_save", { name, content });
       setEditing(null);
-      setEditDrafts(prev => {
-        const c = { ...prev };
-        delete c[name];
-        return c;
-      });
-      setAckTruncated(prev => {
-        const c = { ...prev };
-        delete c[name];
-        return c;
-      });
+      setEditDrafts((prev) => { const c = { ...prev }; delete c[name]; return c; });
+      setAckTruncated((prev) => { const c = { ...prev }; delete c[name]; return c; });
       await refresh();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to save skill");
+      if (mountedRef.current) setError(e instanceof Error ? e.message : "Failed to save skill");
     } finally {
       busyRef.current = false;
-      setBusy(null);
+      if (mountedRef.current) setBusy(null);
     }
   };
 
@@ -187,7 +182,7 @@ export function GlobalLibraryPanel() {
           type="button"
           data-testid="global-library-new-save"
           onClick={() => void handleCreate()}
-          disabled={busy !== null || !newName.trim() || !newContent}
+          disabled={busy !== null || !newName.trim() || !newContent.trim()}
           className="self-end rounded-lg border border-teal/30 bg-teal/10 px-3 py-1 text-[12px] font-semibold text-teal disabled:opacity-50"
         >
           Create skill
@@ -210,7 +205,7 @@ export function GlobalLibraryPanel() {
                   type="button"
                   data-testid={`global-skill-edit-${s.name}`}
                   onClick={() => openEdit(s)}
-                  disabled={busy === s.name}
+                  disabled={busy !== null}
                   className="rounded-lg border border-cream-200 bg-cream-50 px-2 py-1 text-[11px] font-semibold text-cream-700 hover:bg-cream-100 disabled:opacity-50"
                 >
                   Edit
@@ -219,7 +214,7 @@ export function GlobalLibraryPanel() {
                   type="button"
                   data-testid={`global-skill-delete-${s.name}`}
                   onClick={() => void handleDelete(s.name)}
-                  disabled={busy === s.name}
+                  disabled={busy !== null}
                   className="rounded-lg border border-coral/30 bg-coral/10 px-2 py-1 text-[11px] font-semibold text-coral-dark disabled:opacity-50"
                 >
                   Delete
@@ -232,25 +227,27 @@ export function GlobalLibraryPanel() {
                   <div className="flex items-center gap-2 rounded-lg border border-coral/30 bg-coral/10 p-2 text-[11px] text-coral-dark">
                     <input
                       type="checkbox"
+                      id={`global-skill-ack-input-${s.name}`}
                       data-testid={`global-skill-ack-${s.name}`}
                       checked={!!ackTruncated[s.name]}
                       onChange={e => setAckTruncated(prev => ({ ...prev, [s.name]: e.target.checked }))}
                       className="mr-1"
                     />
-                    <label>This skill was truncated on read — saving will discard everything past the cap. I understand, save anyway.</label>
+                    <label htmlFor={`global-skill-ack-input-${s.name}`}>This skill was truncated on read — saving will discard everything past the cap. I understand, save anyway.</label>
                   </div>
                 )}
                 <textarea
                   data-testid={`global-skill-textarea-${s.name}`}
                   value={editDrafts[s.name] ?? s.content}
                   onChange={e => setEditDrafts(prev => ({ ...prev, [s.name]: e.target.value }))}
-                  className="w-full rounded-xl border border-cream-200 bg-cream-50 px-2 py-1 text-[11px] text-cream-800 focus:border-teal/40 focus:outline-none min-h-[80px]"
+                  disabled={busy !== null}
+                  className="w-full rounded-xl border border-cream-200 bg-cream-50 px-2 py-1 text-[11px] text-cream-800 focus:border-teal/40 focus:outline-none min-h-[80px] disabled:opacity-50"
                 />
                 <button
                   type="button"
                   data-testid={`global-skill-save-${s.name}`}
                   onClick={() => void handleEditSave(s.name)}
-                  disabled={busy === s.name || (s.truncated && !ackTruncated[s.name])}
+                  disabled={busy !== null || (s.truncated && !ackTruncated[s.name])}
                   className="self-end rounded-lg border border-teal/30 bg-teal/10 px-3 py-1 text-[11px] font-semibold text-teal disabled:opacity-50"
                 >
                   Save
@@ -273,7 +270,7 @@ export function GlobalLibraryPanel() {
               type="button"
               data-testid={`bundled-skill-add-${b.name}`}
               onClick={() => void handleAddBundled(b.name)}
-              disabled={busy === b.name}
+              disabled={busy !== null}
               className="rounded-lg border border-teal/30 bg-teal/10 px-2 py-1 text-[11px] font-semibold text-teal disabled:opacity-50"
             >
               Add to my library

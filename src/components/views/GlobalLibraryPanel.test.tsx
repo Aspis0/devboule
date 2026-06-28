@@ -253,4 +253,59 @@ describe("GlobalLibraryPanel (B2 — sidebar global library)", () => {
     ) as HTMLTextAreaElement;
     expect(reopened.value).toBe("EDITED A"); // not clobbered by opening code-review
   });
+
+  it("associates the truncation-ack checkbox with its label (a11y)", async () => {
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const cmd = args[0] as string;
+      if (cmd === "global_skills_list") {
+        return [{ name: "big-skill", content: "HEAD", bytes: 8192, truncated: true }];
+      }
+      if (cmd === "skills_library_catalog") return [];
+      return undefined;
+    });
+    await mount();
+    await act(async () => {
+      document
+        .querySelector("[data-testid='global-skill-edit-big-skill']")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    const ack = document.querySelector(
+      "[data-testid='global-skill-ack-big-skill']",
+    ) as HTMLInputElement;
+    expect(ack.id).toBeTruthy();
+    const label = document.querySelector(`label[for='${ack.id}']`);
+    expect(label).toBeTruthy();
+  });
+
+  it("does not create a skill whose content is whitespace-only", async () => {
+    await mount();
+    const setVal = (el: HTMLInputElement | HTMLTextAreaElement, v: string) => {
+      const proto =
+        el instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value")!.set!.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    await act(async () => {
+      setVal(
+        document.querySelector("[data-testid='global-library-new-name']") as HTMLInputElement,
+        "ok-name",
+      );
+      setVal(
+        document.querySelector(
+          "[data-testid='global-library-new-content']",
+        ) as HTMLTextAreaElement,
+        "   ",
+      );
+    });
+    const save = document.querySelector(
+      "[data-testid='global-library-new-save']",
+    ) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    await act(async () => {
+      save.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(invokeMock.mock.calls.some((c) => c[0] === "global_skills_save")).toBe(false);
+  });
 });

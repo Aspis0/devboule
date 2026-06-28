@@ -3,6 +3,7 @@ import {
   useRef,
   useState,
   useCallback,
+  useMemo,
   type MouseEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
@@ -103,7 +104,17 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
     return () => prev?.focus?.();
   }, []);
 
-  const activeEntry = entries.find((e) => e.role === active);
+  const activeEntry = useMemo(
+    () => entries.find((e) => e.role === active),
+    [entries, active],
+  );
+
+  // Clear the in-flight toggle lock when the profile changes, so switching tabs while a
+  // toggle IPC is in flight doesn't leave the new tab's toggle wrongly disabled.
+  useEffect(() => {
+    togglingRef.current = false;
+    setToggling(false);
+  }, [active]);
   const activeLabel =
     PROFILES.find((p) => p.profile === active)?.label ?? active;
 
@@ -259,7 +270,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
               aria-label={`Toggle the ${activeLabel} skill`}
               aria-busy={status === "loading"}
               disabled={status !== "ok" || !activeEntry?.exists || toggling}
-              onClick={handleToggle}
+              onClick={() => void handleToggle()}
               data-testid="skills-tools-toggle"
               className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${activeEntry?.enabled ? "bg-teal" : "bg-cream-300"}`}
             >
