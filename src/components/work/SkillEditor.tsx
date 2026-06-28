@@ -19,6 +19,7 @@ export function SkillEditor({
   const [draft, setDraft] = useState(content);
   const [ackTrunc, setAckTrunc] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const savingRef = useRef(false);
   const mountedRef = useRef(true);
   const prevContentRef = useRef(content);
@@ -32,8 +33,7 @@ export function SkillEditor({
 
   // Reflect EXTERNAL content changes (a save's refetch, or a library "apply") only when the user
   // hasn't diverged from the last server value — so unsaved edits are preserved but applied/saved
-  // content is shown. Because the parent keys this component by profile, this never fires across
-  // a profile switch (that remounts), so there's no cross-profile clobber.
+  // content is shown. The parent keys this by profile, so this never fires across a profile switch.
   useEffect(() => {
     if (draft === prevContentRef.current) {
       setDraft(content);
@@ -41,11 +41,16 @@ export function SkillEditor({
     prevContentRef.current = content;
   }, [content, draft]);
 
+  const bytes = ENCODER.encode(draft).length;
+  const overCap = bytes > 8192;
+
   const handleSave = async () => {
     if (savingRef.current) return;
+    if (overCap) return;
     if (truncated && !ackTrunc) return;
     savingRef.current = true;
     setSaving(true);
+    setError(null);
     try {
       await invokeBackendCommand("skills_save_profile", {
         workingFolderPath: projectRoot,
@@ -56,6 +61,7 @@ export function SkillEditor({
       onSaved();
     } catch (e) {
       console.error("skills_save_profile failed", e);
+      if (mountedRef.current) setError(e instanceof Error ? e.message : "Failed to save");
     } finally {
       savingRef.current = false;
       if (mountedRef.current) setSaving(false);
@@ -70,9 +76,17 @@ export function SkillEditor({
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
       />
+      {error && (
+        <div data-testid="skills-tools-skill-error" className="text-[11px] text-coral-dark">
+          {error}
+        </div>
+      )}
       <div className="flex items-center justify-between gap-2">
-        <span data-testid="skills-tools-skill-bytes" className="text-[11px] text-cream-600">
-          {ENCODER.encode(draft).length} / 8192 bytes
+        <span
+          data-testid="skills-tools-skill-bytes"
+          className={`text-[11px] ${overCap ? "text-coral-dark" : "text-cream-600"}`}
+        >
+          {bytes} / 8192 bytes
         </span>
         {truncated && (
           <div className="flex items-center gap-2 text-[11px] text-coral-dark">
@@ -91,7 +105,7 @@ export function SkillEditor({
           type="button"
           data-testid="skills-tools-skill-save"
           onClick={() => void handleSave()}
-          disabled={saving || draft === content || (truncated && !ackTrunc)}
+          disabled={saving || draft === content || (truncated && !ackTrunc) || overCap}
           className="rounded-lg border border-teal/30 bg-teal/10 px-3 py-1 text-[11px] font-semibold text-teal disabled:opacity-50"
         >
           {saving ? "Saving…" : "Save"}

@@ -57,6 +57,9 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   // Bumped after a library skill is applied so the active profile's content refreshes.
   const [reload, setReload] = useState(0);
   const dialogRef = useRef<HTMLDivElement>(null);
+  // Tracks the last project so a reload-only refetch (after save/apply/toggle) keeps the current
+  // entries + the mounted SkillEditor visible instead of flashing the loading state.
+  const prevRootRef = useRef<string | null>(null);
   // Synchronous in-flight guard: a useState bool alone loses to a stale closure on a
   // rapid double-click, so the ref gates the second call; `toggling` only drives the
   // disabled styling (mirrors ToolsPicker's busy pattern).
@@ -72,8 +75,14 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
   // apply (reload). The cancelled flag prevents setState after unmount / superseded fetch.
   useEffect(() => {
     let cancelled = false;
-    setStatus("loading");
-    setEntries([]); // clear stale content before the new fetch resolves
+    const isProjectChange = prevRootRef.current !== projectRoot;
+    prevRootRef.current = projectRoot;
+    // Only clear to the loading state on a PROJECT change — a reload-only refetch keeps the
+    // current entries (and the mounted editor) and updates them in place when the fetch resolves.
+    if (isProjectChange) {
+      setStatus("loading");
+      setEntries([]);
+    }
     (async () => {
       try {
         const result = await invokeBackendCommand("skills_list_profiles", {
@@ -306,6 +315,7 @@ export function SkillsToolsModal({ projectRoot, onClose }: Props) {
             From your global library
           </div>
           <LibrarySearch
+            key={`library-${active}`}
             projectRoot={projectRoot}
             profile={active}
             onApplied={handleApplied}

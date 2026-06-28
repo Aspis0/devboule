@@ -99,6 +99,13 @@ export function ModalLanguages({ projectRoot, profile }: { projectRoot: string; 
         lang,
       });
       if (mountedRef.current) {
+        // Drop the stale per-row draft so re-opening shows the freshly-reset bundled content.
+        setEditing(null);
+        setDrafts((prev) => {
+          const c = { ...prev };
+          delete c[lang];
+          return c;
+        });
         await refresh();
       }
     } catch (e: unknown) {

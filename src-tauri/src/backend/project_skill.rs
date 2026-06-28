@@ -141,7 +141,17 @@ fn migrate_legacy_mini(canonical_root: &Path) -> Result<(), String> {
     }
     // Copy into mini-big (create_dir_all + atomic_write). "mini-big" is a fixed literal from
     // ASSIGNMENT_PROFILES, never user input, so it is a safe directory segment.
-    write_skill_file(canonical_root, "mini-big", &mini_content)
+    write_skill_file(canonical_root, "mini-big", &mini_content)?;
+    // Also migrate per-language overrides so the tier keeps the customized personas (it now OWNS
+    // the skill via active_language_profile_skill_or_legacy and won't fall back to mini/lang-*.md).
+    // Skip a truncated source (same data-loss guard as the SKILL.md above).
+    for lang in bundled_lang_keys() {
+        let (source, content, truncated) = read_lang_raw(canonical_root, "mini", lang);
+        if source == "project" && !truncated {
+            write_lang_file(canonical_root, "mini-big", lang, &content)?;
+        }
+    }
+    Ok(())
 }
 
 /// Largest char-boundary byte offset at or below `max` in `s` (a stable-Rust
@@ -2516,6 +2526,22 @@ mod tests {
         assert!(skills_save_lang_profile_impl(&root_str(&root), "mini", "rust", "x").is_err());
         assert!(skills_save_lang_profile_impl(&root_str(&root), "bogus", "rust", "x").is_err());
         assert!(skills_save_lang_profile_impl(&root_str(&root), "mini-big", "klingon", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_legacy_mini_also_copies_language_overrides() {
+        let root = fresh_root("migrate-lang");
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        // Legacy mini with a SKILL.md + a rust language override.
+        write_skill_file(&canonical, "mini", "legacy mini skill").unwrap();
+        write_lang_file(&canonical, "mini", "rust", "LEGACY RUST OVERRIDE").unwrap();
+        migrate_legacy_mini(&canonical).unwrap();
+        // mini-big (which now OWNS the skill) must inherit the language override, else it would be
+        // silently lost (active_language_profile_skill_or_legacy reads the tier, not legacy mini).
+        let (source, content, _) = read_lang_raw(&canonical, "mini-big", "rust");
+        assert_eq!(source, "project");
+        assert_eq!(content, "LEGACY RUST OVERRIDE");
         let _ = std::fs::remove_dir_all(&root);
     }
 
