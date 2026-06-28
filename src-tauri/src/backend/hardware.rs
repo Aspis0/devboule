@@ -282,7 +282,7 @@ fn parse_vram_size(s: &str) -> Option<f64> {
 /// Read core count + total/available RAM into a fresh [`HardwareInfo`] (GPU fields left at
 /// their `unknown` defaults; a later GPU probe fills them). Only the memory + cpu refresh
 /// kinds are requested, never the (heavier) process/disk/network info.
-fn read_cpu_ram() -> HardwareInfo {
+pub(crate) fn read_cpu_ram() -> HardwareInfo {
     let sys = System::new_with_specifics(
         RefreshKind::nothing()
             .with_memory(MemoryRefreshKind::nothing().with_ram())

@@ -124,6 +124,18 @@ pub fn default_tool_definitions() -> Value {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "oracle_ask",
+                "description": "Ask the project's Oracle a natural-language question about THIS codebase (how a module/database works, where a symbol is defined, how data flows). Returns a grounded answer over the project's indexed files. Read-only — prefer it over guessing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string", "description": "The question about this codebase." } },
+                    "required": ["query"]
+                }
+            }
         }
     ])
 }
@@ -150,6 +162,12 @@ pub fn run_agentic_coder(
     max_rounds: u32,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(LoopOutcome, Vec<String>, bool, Option<String>), String> {
+    // A4 (§4c live wiring): hold a compute permit for the WHOLE local agentic decode so the
+    // coordinator's `active_local_decodes` reflects real GPU activity (what `admit_local_spawn`
+    // gates on). RAII over this synchronous call → decremented on EVERY return/panic path. A `None`
+    // (cap reached) does NOT hard-block here — the placement gate upstream owns admission; this keeps
+    // the count honest without regressing an in-flight run.
+    let _decode_permit = crate::backend::oracle_coordinator::coordinator().try_acquire_decode();
     let tools = default_tool_definitions();
     // Q1: append the per-MODEL-FAMILY thinking directive to the house-rules system prompt.
     // Gemma/North have no thinking_budget param, so their reasoning is bounded in the prompt;
@@ -164,10 +182,15 @@ pub fn run_agentic_coder(
     let mut llm = HttpAgentLlm::new(base_url, model, tools, params, enable_thinking)?;
     // Reads are project-wide (for context); WRITES are confined to the directive's file
     // allowlist (empty = no extra restriction beyond the root).
+    // A3: resolve the read-only Oracle scope (the project's indexed file_ids) BEFORE `root` is
+    // moved into ScopedAgentTools. Best-effort: empty on any failure → the oracle_ask tool is
+    // present but the bounded endpoint answers grounded-empty.
+    let oracle_scope = crate::oracle::python_oracle::oracle_agent_scope_file_ids(&root);
     let mut fs_tools = ScopedAgentTools::new(root)
         .with_write_allowlist(write_allowlist)
         .with_net(net)
-        .with_working_set(working_set);
+        .with_working_set(working_set)
+        .with_oracle(oracle_scope);
     let outcome = run_agent_loop(
         &mut llm,
         &mut fs_tools,
@@ -230,7 +253,7 @@ mod tests {
     fn default_tool_definitions_are_well_formed() {
         let tools = default_tool_definitions();
         let arr = tools.as_array().expect("tools must be a JSON array");
-        assert_eq!(arr.len(), 6);
+        assert_eq!(arr.len(), 7);
 
         let mut names = HashSet::new();
         for tool in arr {
@@ -240,7 +263,7 @@ mod tests {
             names.insert(func["name"].as_str().unwrap().to_string());
         }
         let expected: HashSet<String> =
-            ["read_file", "list_dir", "grep", "edit_file", "write_file", "run"]
+            ["read_file", "list_dir", "grep", "edit_file", "write_file", "run", "oracle_ask"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();

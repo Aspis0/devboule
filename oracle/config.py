@@ -7,6 +7,7 @@ LANCE_DB_PATH = Path(os.getenv("LANCE_DB_PATH", ORACLE_DIR / "vectors.lancedb"))
 CHUNK_DB_PATH = Path(os.getenv("CHUNK_DB_PATH", ORACLE_DIR / "chunks.lancedb"))
 CHUNK_MANIFEST_PATH = Path(os.getenv("CHUNK_MANIFEST_PATH", ORACLE_DIR / "chunk-index-manifest.json"))
 SQLITE_PATH = Path(os.getenv("SQLITE_PATH", ORACLE_DIR / "metadata.sqlite"))
+CKG_DB_PATH = Path(os.getenv("CKG_DB_PATH", ORACLE_DIR / "ckg.sqlite"))
 LEGACY_GRAPH_JSON = Path(os.getenv("LEGACY_GRAPH_JSON", "graph.json"))
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBED_DIMS = 1024

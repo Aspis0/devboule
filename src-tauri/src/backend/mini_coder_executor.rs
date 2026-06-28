@@ -5180,6 +5180,9 @@ fn build_omlx_run_windows(
     // repetition penalty, the only runaway guards on this stream:false path. Both ride
     // the body via ConvertTo-Json (never string-concatenated). PowerShell numeric
     // literals: an integer for max_tokens, a decimal for the penalty.
+    // One-shot emit-edits path: keep the BOUNDED cap (here max_tokens IS the sole runaway wall, so a
+    // machine-tiered raise would regress the worst-case runaway on a slow model). Only the AGENTIC
+    // path (max_rounds-guarded) auto-tunes via the coordinator.
     let max_tokens = OMLX_MAX_TOKENS_DEFAULT;
     let rep_penalty = OMLX_REPETITION_PENALTY;
     let model_q = ps_single_quote(model);

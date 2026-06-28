@@ -908,6 +908,8 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
+                "get_neighborhood",
+                "find_imports",
                 "censor_findings",
                 "censor_dispose",
                 "visual_check",
@@ -1015,6 +1017,8 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
+                "get_neighborhood",
+                "find_imports",
                 "censor_findings",
                 "censor_dispose",
                 "visual_check",
@@ -1058,7 +1062,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
             // test_allowed_tools_match_rust_default_role_rules.
             role: "mini".into(),
             summary: "One-shot read-only sub-agent: reads the codebase via oracle_context and the architectural spine via project_structure, nothing else.".into(),
-            allowed_tools: vec!["agent_register", "oracle_context", "project_structure"]
+            allowed_tools: vec!["agent_register", "oracle_context", "project_structure", "get_neighborhood", "find_imports"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -3051,6 +3055,8 @@ mod tests {
             "oracle_ask",
             "oracle_context",
             "project_structure",
+            "get_neighborhood",
+            "find_imports",
             "censor_findings",
             "censor_dispose",
             "visual_check",
@@ -3079,6 +3085,8 @@ mod tests {
             "oracle_ask",
             "oracle_context",
             "project_structure",
+            "get_neighborhood",
+            "find_imports",
             "censor_findings",
             "censor_dispose",
             "visual_check",

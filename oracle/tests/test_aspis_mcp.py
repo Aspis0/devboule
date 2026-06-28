@@ -644,7 +644,13 @@ root_path: "{escaped_work_root}"
         # SERVER-side (the prompt is advisory; this is the wall).
         self.assertEqual(
             ROLE_ALLOWED_TOOLS["mini"],
-            {"agent_register", "oracle_context", "project_structure"},
+            {
+                "agent_register",
+                "oracle_context",
+                "project_structure",
+                "get_neighborhood",
+                "find_imports",
+            },
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3636,6 +3642,8 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
+                "get_neighborhood",
+                "find_imports",
                 "spawn_mini_coder",
                 "steer_mini_coder",
                 "mini_coder_result",

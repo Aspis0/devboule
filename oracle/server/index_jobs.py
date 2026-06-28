@@ -284,6 +284,29 @@ class OracleIndexJobManager:
             self.thread.start()
             return dict(self.job)
 
+    def _refresh_ckg_best_effort(self, index_root) -> None:
+        """Best-effort full CKG rebuild after a vector re-index fires. CPU-only (the tree-sitter
+        parse does not touch the GPU), run on a daemon thread so it never blocks the watcher, and
+        fully exception-swallowing — the CKG is auxiliary and must NEVER break the vector index.
+        No-op when ASPIS_APP_BIN is unset (the resident server must be launched with it)."""
+        import os
+        import threading
+        from pathlib import Path
+
+        app_bin = (os.environ.get("ASPIS_APP_BIN") or "").strip()
+        if not app_bin:
+            return
+
+        def _run() -> None:
+            try:
+                from oracle.ingestion.ckg_index import build_ckg
+
+                build_ckg(Path(str(index_root)), app_bin)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True, name="ckg-refresh").start()
+
     def start_watcher(self, *, root: str | None = None, mode: str | None = None) -> dict:
         """Arm the auto-reindex watcher.
 
@@ -310,9 +333,11 @@ class OracleIndexJobManager:
             # keeps the RAM/GPU back-pressure guards; the single-job guard in
             # start_background prevents pileup.
             self.start_background(root=str(index_root), force=False, max_batches=None, idle=True)
+            self._refresh_ckg_best_effort(index_root)
 
         def on_batch_ready(_paths: list[str]) -> None:
             self.start_background(root=str(index_root), force=False, max_batches=1, idle=True)
+            self._refresh_ckg_best_effort(index_root)
 
         # Three-phase teardown-before-arm so there is NEVER a window with two
         # live watchers (the old one could otherwise fire a spurious index while

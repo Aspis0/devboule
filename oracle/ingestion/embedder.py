@@ -182,6 +182,7 @@ def choose_device(
     free_vram_gb: float | None,
     mps_available: bool,
     override: str,
+    free_unified_gb: float | None = None,
 ) -> str:
     """Pure device-selection policy (no torch calls — unit testable).
 
@@ -192,7 +193,12 @@ def choose_device(
          weak or already-occupied GPU would OOM). Unknown free VRAM
          (``mem_get_info`` failed) is treated as insufficient — never risk an
          OOM on a guess.
-      3. Otherwise MPS (Apple unified memory; no VRAM check) when available.
+      3. Otherwise MPS (Apple unified memory) when available, BUT only if free
+         unified memory is known to be above the GPU floor. If ``free_unified_gb``
+         is not None and below ``MIN_GPU_FREE_GB``, return "cpu" to PRE-EMPTIVELY
+         avoid the OOM (the resident embedder loads once; the post-commit index
+         burst keeps the GPU). If ``free_unified_gb`` is None (unknown) or above
+         the floor, return "mps" — the OOM→CPU retry remains the backstop.
       4. Otherwise CPU.
     """
     if override:
@@ -200,6 +206,8 @@ def choose_device(
     if cuda_available and free_vram_gb is not None and free_vram_gb >= MIN_GPU_FREE_GB:
         return "cuda"
     if mps_available:
+        if free_unified_gb is not None and free_unified_gb < MIN_GPU_FREE_GB:
+            return "cpu"
         return "mps"
     return "cpu"
 
@@ -232,7 +240,28 @@ def embedding_device() -> str | None:
                 free_vram_gb = None
         mps = getattr(torch.backends, "mps", None)
         mps_available = bool(mps is not None and mps.is_available())
-        return choose_device(cuda_available, free_vram_gb, mps_available, override="")
+
+        # Lazily compute free unified memory only when MPS is a candidate (the
+        # vm_stat probe has a cost). Import here to avoid the circular import —
+        # chunk_index imports embedder, so a top-level import would cycle.
+        free_unified_gb: float | None = None
+        if mps_available:
+            try:
+                from oracle.ingestion.chunk_index import free_memory_gb
+
+                probed = free_memory_gb()
+                # free_memory_gb() returns 0.0 on a probe FAILURE (vm_stat absent,
+                # parse error) as well as on genuine zero. Genuine zero free on a
+                # live macOS box is near-impossible (the OS OOM-kills first), so
+                # treat 0.0 as UNKNOWN -> None -> stay on MPS (the "unknown => GPU,
+                # OOM-retry is the backstop" contract), not a forced CPU divert.
+                free_unified_gb = None if probed <= 0.0 else probed
+            except Exception:
+                free_unified_gb = None
+
+        return choose_device(
+            cuda_available, free_vram_gb, mps_available, override="", free_unified_gb=free_unified_gb
+        )
     except Exception:
         return None
 
@@ -294,7 +323,11 @@ def embed_texts(
             model = _sentence_model()
             # FIX 3: bound CPU threads before encoding to avoid the Windows/CPU
             # thread-contention hang (no-op on CUDA, runs once).
-            _bound_cpu_threads(embedding_device())
+            # PERF: gate on _CPU_THREADS_BOUNDED at the CALL SITE so we don't even
+            # EVALUATE embedding_device() after the first bind — it now probes
+            # vm_stat/pressure (subprocess) on MPS, which must not run per-batch.
+            if not _CPU_THREADS_BOUNDED:
+                _bound_cpu_threads(embedding_device())
             try:
                 embeddings = model.encode(
                     texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=False
