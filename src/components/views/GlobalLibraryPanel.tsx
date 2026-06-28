@@ -5,7 +5,7 @@ import { commandScore } from "../../vendor/commandScore";
 interface GlobalSkill { name: string; content: string; bytes: number; truncated: boolean; }
 interface BundledEntry { name: string; description: string; }
 
-export function GlobalLibraryPanel() {
+export function GlobalLibraryPanel({ reloadToken = 0 }: { reloadToken?: number } = {}) {
   const [library, setLibrary] = useState<GlobalSkill[]>([]);
   const [bundled, setBundled] = useState<BundledEntry[]>([]);
   const [query, setQuery] = useState("");
@@ -45,6 +45,11 @@ export function GlobalLibraryPanel() {
       mountedRef.current = false;
     };
   }, [refresh]);
+
+  // Refetch when the parent bumps reloadToken (e.g. after a global marketplace URL install).
+  useEffect(() => {
+    if (reloadToken > 0) void refresh();
+  }, [reloadToken, refresh]);
 
   const filteredLibrary = useMemo(() => {
     if (query.trim() === "") {

@@ -2,12 +2,15 @@ import { useState } from "react";
 import type { MarketplacePreview, RiskSeverity } from "../../types/skills";
 
 interface Props {
-  /** Canonical project working folder (where the skill installs under .claude/skills/). */
-  folderPath: string;
+  /** Canonical project working folder (where a PROJECT-scope skill installs under .claude/skills/).
+   *  Optional: unused (and not required) for scope="global". */
+  folderPath?: string;
   /** Backend invoker (passed in so the component is unit-testable without Tauri). */
   invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
   /** Called after a successful install so the parent can refresh its lists. */
   onInstalled?: (dest: string) => void;
+  /** Install target: "project" (default, into the working folder) or "global" (the user library). */
+  scope?: "project" | "global";
 }
 
 const SEVERITY: Record<RiskSeverity, { label: string; chip: string; dot: string }> = {
@@ -21,7 +24,7 @@ const SEVERITY: Record<RiskSeverity, { label: string; chip: string; dot: string 
  * auto-installs: paste a URL → Preview (fetch is SSRF-guarded + the body is risk-scanned) → review
  * the findings → confirm. A Danger finding gates the install behind an explicit acknowledgement.
  */
-export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
+export function MarketplaceInstall({ folderPath, invoke, onInstalled, scope = "project" }: Props) {
   const [url, setUrl] = useState("");
   const [preview, setPreview] = useState<MarketplacePreview | null>(null);
   const [skillName, setSkillName] = useState("");
@@ -53,16 +56,32 @@ export function MarketplaceInstall({ folderPath, invoke, onInstalled }: Props) {
 
   async function doInstall() {
     if (!preview || busy) return;
+    if (scope !== "global" && !folderPath) {
+      setError("No project folder selected for a project-scope install.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      const dest = (await invoke("skills_marketplace_install", {
-        workingFolderPath: folderPath,
-        url: preview.source_url,
-        skillName: skillName.trim(),
-        expectedSha256: preview.sha256,
-        fetchedAt: new Date().toISOString(),
-      })) as string;
+      const dest = (await invoke(
+        scope === "global"
+          ? "global_skills_marketplace_install"
+          : "skills_marketplace_install",
+        scope === "global"
+          ? {
+              url: preview.source_url,
+              skillName: skillName.trim(),
+              expectedSha256: preview.sha256,
+              fetchedAt: new Date().toISOString(),
+            }
+          : {
+              workingFolderPath: folderPath!,
+              url: preview.source_url,
+              skillName: skillName.trim(),
+              expectedSha256: preview.sha256,
+              fetchedAt: new Date().toISOString(),
+            },
+      )) as string;
       setInstalled(dest);
       setPreview(null);
       setUrl("");
