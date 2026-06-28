@@ -3,6 +3,9 @@ name = "aspis-management"
 version = "0.1.0"
 description = "Aspis Bio Management Dashboard"
 edition = "2021"
+# Two `[[bin]]` targets exist (the GUI app + claude_consent_hook), so `cargo run` / `tauri dev`
+# cannot infer which to launch. Pin the GUI binary as the default-run target.
+default-run = "aspis-management"
 
 [lib]
 name = "aspis_management_lib"
