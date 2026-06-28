@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
    const MAX_SKILL_BYTES: usize = 8192;
    const MAX_NAME_LEN: usize = 64;
+   const MARKETPLACE_FETCH_MAX_BYTES: usize = 256 * 1024;
+   const MARKETPLACE_FETCH_TIMEOUT_SECS: u64 = 15;
 
    #[derive(Debug, Clone, Serialize, Deserialize)]
    #[serde(rename_all = "camelCase")]
@@ -162,6 +164,57 @@ use std::path::{Path, PathBuf};
        install_bundled_impl(&base, &skill_name)
    }
 
+   /// Network-free core of the global marketplace install: verifies the SHA-256 pin against the
+   /// already-fetched `content`, then writes it into the global store via `install_skill_package`.
+   /// Separated so it is unit-testable without a live fetch.
+   pub fn install_marketplace_content_into(base: &Path, skill_name: &str, content: &str, expected_sha256: &str, fetched_at: &str, source_url: &str) -> Result<String, String> {
+       // Gate the name with the GLOBAL-store rule (stricter than skill_marketplace's valid_skill_name,
+       // which allows dots): otherwise a "foo.v3" install would land on disk but be invisible to
+       // global_skills_list and unremovable by global_skills_delete (both reject dotted names).
+       validate_skill_name(skill_name)?;
+       if expected_sha256.is_empty() {
+           return Err("expected_sha256 is required — preview the skill before installing".to_string());
+       }
+       let sha = super::skill_marketplace::sha256_hex(content);
+       if sha != expected_sha256 {
+           return Err("the skill content changed since the preview — re-preview before installing".to_string());
+       }
+       let prov = super::skill_marketplace::SkillProvenance {
+           source_url: source_url.to_string(),
+           fetched_at: fetched_at.to_string(),
+           sha256: sha,
+       };
+       std::fs::create_dir_all(base).map_err(|e| format!("create library failed: {e}"))?;
+       let dest = super::skill_marketplace::install_skill_package(base, skill_name, content, &[], &prov)?;
+       Ok(dest.to_string_lossy().into_owned())
+   }
+
+   /// Install a skill from a public URL into the user's GLOBAL store (mirrors the per-project
+   /// `skills_marketplace_install` but targets `global_base`). Same SSRF + SHA-256 pin guarantees.
+   #[tauri::command]
+   pub async fn global_skills_marketplace_install(
+       app: AppHandle,
+       state: State<'_, BackendState>,
+       url: String,
+       skill_name: String,
+       expected_sha256: String,
+       fetched_at: String,
+   ) -> Result<String, String> {
+       state.ensure_unlocked()?;
+       let app_clone = app.clone();
+       tokio::task::spawn_blocking(move || {
+           let base = global_base(&app_clone)?;
+           let (validated, addrs) = super::skill_marketplace::validate_public_url(&url)?;
+           let content = super::skill_marketplace::fetch_text_capped(&validated, &addrs, MARKETPLACE_FETCH_MAX_BYTES, MARKETPLACE_FETCH_TIMEOUT_SECS)?;
+           // Take the design write guard ONLY around the local write (not the network fetch) so the
+           // global store can't be raced by a concurrent delete/save mid-install.
+           let _g = design_write_guard()?;
+           install_marketplace_content_into(&base, &skill_name, &content, &expected_sha256, &fetched_at, validated.as_str())
+       })
+       .await
+       .map_err(|e| format!("install task failed: {e}"))?
+   }
+
    #[cfg(test)]
    mod tests {
        use super::*;
@@ -262,6 +315,51 @@ use std::path::{Path, PathBuf};
                install_bundled_impl(&base, &tpl.name)
                    .unwrap_or_else(|e| panic!("bundled skill {} failed to install: {e}", tpl.name));
            }
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_marketplace_content_installs_into_base_with_correct_sha() {
+           let base = fresh_base("mkt-ok");
+           let content = "# Fetched skill\n\nSome body text.";
+           let sha = super::super::skill_marketplace::sha256_hex(content);
+           install_marketplace_content_into(
+               &base, "fetched-skill", content, &sha, "2026-01-01T00:00:00Z",
+               "https://example.com/s.md",
+           )
+           .unwrap();
+           let entries = list_impl(&base);
+           assert!(entries.iter().any(|e| e.name == "fetched-skill"));
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_marketplace_content_rejects_sha_mismatch_and_empty() {
+           let base = fresh_base("mkt-sha");
+           // Wrong sha → reject (server can't swap payload between preview and install).
+           assert!(install_marketplace_content_into(
+               &base, "x", "body", "deadbeef", "t", "https://e.com/s"
+           )
+           .is_err());
+           // Empty expected sha → hard error (never trust the frontend to always send it).
+           assert!(install_marketplace_content_into(&base, "x", "body", "", "t", "https://e.com/s")
+               .is_err());
+           assert!(list_impl(&base).is_empty());
+           std::fs::remove_dir_all(base.parent().unwrap()).ok();
+       }
+
+       #[test]
+       fn test_marketplace_content_rejects_name_the_global_store_cant_list() {
+           let base = fresh_base("mkt-badname");
+           let content = "body";
+           let sha = super::super::skill_marketplace::sha256_hex(content);
+           // A dotted name would pass skill_marketplace's valid_skill_name but be invisible/unremovable
+           // in the global store → must be rejected up front.
+           assert!(install_marketplace_content_into(
+               &base, "foo.v3", content, &sha, "t", "https://e.com/s"
+           )
+           .is_err());
+           assert!(list_impl(&base).is_empty());
            std::fs::remove_dir_all(base.parent().unwrap()).ok();
        }
    }

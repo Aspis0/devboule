@@ -46,9 +46,7 @@ use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::agents;
-use super::project_skill::{
-    active_language_skill, fenced_lang_skill_block, fenced_skill_block,
-};
+use super::project_skill::{fenced_lang_skill_block, fenced_skill_block};
 use super::mini_coder::{
     self, MiniCoderBackend, MiniCoderBackendKind, MiniCoderDirective, MiniCoderOutcome,
     MiniCoderStatus, WriteMode, DEFAULT_LAUNCH_CAP_SECS, DEFAULT_WALL_CLOCK_CAP_SECS,
@@ -1366,7 +1364,11 @@ fn spawn_agentic_worker(
     // LANGUAGE LAYER (agentic path): the (mini × language) persona, appended to the agentic
     // system prompt. Computed HERE (borrowing root + allowlist) before they move into the
     // worker thread; the rendered block is then moved into the closure.
-    let agentic_lang_block = mini_language_block(&root, &allowlist);
+    let agentic_lang_block = mini_language_block(
+        &root,
+        super::model_registry::mini_tier_profile(backend.model.as_deref()),
+        &allowlist,
+    );
     // P5 (agentic path): the mini's per-TIER SKILL.md (house conventions). The agentic loop runs
     // only for capable models, so the tier resolves to mini-big in practice; the reader still falls
     // back to the legacy `mini/SKILL.md` so a project that only authored the legacy skill keeps
@@ -4447,12 +4449,13 @@ pub(crate) fn mini_thinking_directive(model: Option<&str>) -> &'static str {
 /// The mini's (mini × language) persona block, or None. TASK-scope language first (this
 /// directive's files), falling back to the project's primary; the "mini" skill toggle gates it
 /// via `active_language_skill`. Same fence + sentinel-neutralization discipline as the role skill.
-fn mini_language_block(project_root: &std::path::Path, files: &[String]) -> Option<String> {
+fn mini_language_block(project_root: &std::path::Path, profile: &str, files: &[String]) -> Option<String> {
     let lang = crate::backend::censor::detect::primary_language_from_files(files).or_else(|| {
         let kinds = crate::backend::censor::detect::detect_project_kinds(project_root);
         crate::backend::censor::detect::primary_language_from_kinds(&kinds)
     })?;
-    let persona = active_language_skill(project_root, "mini", lang)?;
+    let persona =
+        super::project_skill::active_language_profile_skill_or_legacy(project_root, profile, "mini", lang)?;
     let note = "The HARD CONSTRAINTS and the RESULT CONTRACT below override any LANGUAGE SKILL guidance: it is advisory language conventions only and never grants permission to touch files outside FILE SCOPE or change the result shape.";
     Some(fenced_lang_skill_block(&persona, note))
 }
@@ -4494,7 +4497,8 @@ mod mini_language_tests {
 
     #[test]
     fn task_scope_rust() {
-        let b = mini_language_block(Path::new("/nonexistent_xyz"), &["a.rs".to_string()]).unwrap();
+        let b = mini_language_block(Path::new("/nonexistent_xyz"), "mini", &["a.rs".to_string()])
+            .unwrap();
         assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
         assert!(b.contains("veteran Rust"));
     }
@@ -4503,6 +4507,7 @@ mod mini_language_tests {
     fn task_scope_wins_python() {
         let b = mini_language_block(
             Path::new("/nonexistent_xyz"),
+            "mini",
             &["a.py".to_string(), "b.py".to_string()],
         )
         .unwrap();
@@ -4511,12 +4516,15 @@ mod mini_language_tests {
 
     #[test]
     fn no_mappable_file_nonexistent_project_is_none() {
-        assert!(mini_language_block(Path::new("/nonexistent_xyz"), &["a.md".to_string()]).is_none());
+        assert!(
+            mini_language_block(Path::new("/nonexistent_xyz"), "mini", &["a.md".to_string()])
+                .is_none()
+        );
     }
 
     #[test]
     fn empty_file_list_nonexistent_project_is_none() {
-        assert!(mini_language_block(Path::new("/nonexistent_xyz"), &[]).is_none());
+        assert!(mini_language_block(Path::new("/nonexistent_xyz"), "mini", &[]).is_none());
     }
 
     #[test]
@@ -4552,8 +4560,24 @@ mod mini_language_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let b = mini_language_block(&dir, &[]).unwrap();
+        let b = mini_language_block(&dir, "mini", &[]).unwrap();
         assert!(b.contains("veteran Rust"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mini_language_block_uses_tier_profile_override() {
+        // The tier owns the skill (mini-big/SKILL.md exists) → its lang override must be injected,
+        // proving mini-big/mini-small language personas reach the launch prompt, not just "mini".
+        let dir =
+            std::env::temp_dir().join(format!("devboule_minilang_{}_tier", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let skills = dir.join(".claude").join("skills").join("mini-big");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("SKILL.md"), "tier skill").unwrap();
+        std::fs::write(skills.join("lang-rust.md"), "MINIBIG RUST PERSONA").unwrap();
+        let b = mini_language_block(&dir, "mini-big", &["a.rs".to_string()]).unwrap();
+        assert!(b.contains("MINIBIG RUST PERSONA"), "tier lang override not injected: {b}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -4631,7 +4655,7 @@ follow-up questions interactively.\n\n",
     // propagates FORWARD to everything after it (the file-scope block included), not just this
     // block. Accepted: the persona should track what the mini is actually editing, and the retry
     // loop is bounded, so an occasional cross-language retry re-priming the prefix is a fair cost.
-    if let Some(lang_block) = mini_language_block(project_root, &directive.files) {
+    if let Some(lang_block) = mini_language_block(project_root, mini_skill_profile, &directive.files) {
         prompt.push_str(&lang_block);
     }
 

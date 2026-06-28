@@ -342,6 +342,23 @@ pub(crate) fn active_profile_skill_or_legacy(
     active_project_skill(project_root, legacy_role)
 }
 
+/// Mirrors [`active_profile_skill_or_legacy`] for the LANGUAGE layer: ownership follows the tier's
+/// SKILL.md (an existing tier SKILL.md means the tier owns the skill, so read the tier's lang
+/// override too); otherwise fall back to the legacy role's language persona. Toggle-aware via
+/// [`active_language_skill`]. This is what lets mini-big/mini-small carry per-language overrides.
+pub(crate) fn active_language_profile_skill_or_legacy(
+    project_root: &Path,
+    profile: &str,
+    legacy_role: &str,
+    lang: &str,
+) -> Option<String> {
+    let (tier_exists, _, _) = read_skill_raw(project_root, profile);
+    if tier_exists {
+        return active_language_skill(project_root, profile, lang);
+    }
+    active_language_skill(project_root, legacy_role, lang)
+}
+
 #[cfg(test)]
 mod profile_skill_tests {
     use super::*;
@@ -497,10 +514,12 @@ fn read_project_lang_file(project_root: &Path, role: &str, lang: &str) -> Option
     if !is_known_lang(lang) {
         return None;
     }
-    // Same allowlist discipline for the role path segment (defense-in-depth): callers already
-    // pre-validate, but a future caller must never be able to thread an untrusted `role` into the
-    // path even though canonicalize-and-contain below would still block actual traversal.
-    if !KNOWN_ROLES.contains(&role) {
+    // Same allowlist discipline for the role/profile path segment (defense-in-depth): callers already
+    // pre-validate, but a future caller must never be able to thread an untrusted segment into the
+    // path even though canonicalize-and-contain below would still block actual traversal. Accept both
+    // the legacy injection roles (KNOWN_ROLES) AND the Work Console capability tiers
+    // (ASSIGNMENT_PROFILES, e.g. mini-big/mini-small) so per-tier language overrides are injected.
+    if !KNOWN_ROLES.contains(&role) && validate_profile(role).is_err() {
         return None;
     }
     let rel = format!(".claude/skills/{role}/lang-{lang}.md");
@@ -1866,6 +1885,70 @@ fn skills_reset_lang_impl(working_folder_path: &str, role: &str, lang: &str) -> 
     Ok(())
 }
 
+// --- PROFILE-AWARE language personas (Work Console modal): mirror the role versions above but
+// validate ASSIGNMENT_PROFILES so the capability tiers (mini-big/mini-small) can carry per-language
+// overrides at `.claude/skills/<profile>/lang-<lang>.md`. read_lang_raw/write_lang_file take the
+// segment as-is and are traversal-safe, so they work unchanged with a profile segment. ---
+
+/// Mirrors `skills_list_langs_impl` but validates ASSIGNMENT_PROFILES (tiers like mini-big/mini-small).
+fn skills_list_langs_profile_impl(working_folder_path: &str, profile: &str) -> Result<Vec<LangEntry>, String> {
+    validate_profile(profile)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    let entries = bundled_lang_keys().map(|lang| {
+        let (source, content, truncated) = read_lang_raw(&canonical, profile, lang);
+        LangEntry { role: profile.to_string(), lang: lang.to_string(), bytes: content.len(), source, content, truncated }
+    }).collect();
+    Ok(entries)
+}
+
+/// List a PROFILE's language personas (Work Console modal). Mirrors `skills_list_langs`.
+#[tauri::command]
+pub fn skills_list_langs_profile(state: State<'_, BackendState>, working_folder_path: String, profile: String) -> Result<Vec<LangEntry>, String> {
+    state.ensure_unlocked()?;
+    skills_list_langs_profile_impl(&working_folder_path, &profile)
+}
+
+/// Mirrors `skills_save_lang_impl` but validates ASSIGNMENT_PROFILES.
+fn skills_save_lang_profile_impl(working_folder_path: &str, profile: &str, lang: &str, content: &str) -> Result<(), String> {
+    validate_profile(profile)?;
+    validate_lang(lang)?;
+    if content.len() > MAX_SKILL_BYTES {
+        return Err(format!("skill too large ({} bytes > {MAX_SKILL_BYTES} max); trim it before saving", content.len()));
+    }
+    let canonical = canonical_working_folder(working_folder_path)?;
+    write_lang_file(&canonical, profile, lang, content)
+}
+
+/// Save a PROFILE's language persona override (Work Console modal). Mirrors `skills_save_lang`.
+#[tauri::command]
+pub fn skills_save_lang_profile(state: State<'_, BackendState>, working_folder_path: String, profile: String, lang: String, content: String) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_save_lang_profile_impl(&working_folder_path, &profile, &lang, &content)
+}
+
+/// Mirrors `skills_reset_lang_impl` but validates ASSIGNMENT_PROFILES.
+fn skills_reset_lang_profile_impl(working_folder_path: &str, profile: &str, lang: &str) -> Result<(), String> {
+    validate_profile(profile)?;
+    validate_lang(lang)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    let target = canonical.join(".claude").join("skills").join(profile).join(format!("lang-{lang}.md"));
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_file() => std::fs::remove_file(&target)
+            .map_err(|e| format!("could not reset language persona: {e}"))?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Reset a PROFILE's language persona to the bundled default (Work Console modal). Mirrors `skills_reset_lang`.
+#[tauri::command]
+pub fn skills_reset_lang_profile(state: State<'_, BackendState>, working_folder_path: String, profile: String, lang: String) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_reset_lang_profile_impl(&working_folder_path, &profile, &lang)
+}
+
 /// The installable bundled language personas (Discover tab). No folder/lock needed (pure binary).
 #[tauri::command]
 pub fn skills_lang_catalog() -> Vec<LangCatalogEntry> {
@@ -2408,6 +2491,31 @@ mod tests {
         let state =
             read_skills_state(&std::fs::canonicalize(&root).unwrap()).expect("state parses");
         assert_eq!(state.skills.get("mini-big").map(|t| t.enabled), Some(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lang_profile_save_list_reset_roundtrip_for_a_tier() {
+        let root = fresh_root("lang-profile");
+        // mini-big is an ASSIGNMENT_PROFILE, NOT a KNOWN_ROLE — the role-based lang command rejects it.
+        skills_save_lang_profile_impl(&root_str(&root), "mini-big", "rust", "VETERAN RUST").unwrap();
+        let langs = skills_list_langs_profile_impl(&root_str(&root), "mini-big").unwrap();
+        let rust = langs.iter().find(|e| e.lang == "rust").unwrap();
+        assert_eq!(rust.source, "project");
+        assert_eq!(rust.content, "VETERAN RUST");
+        // reset removes the override → back to the bundled default
+        skills_reset_lang_profile_impl(&root_str(&root), "mini-big", "rust").unwrap();
+        let langs2 = skills_list_langs_profile_impl(&root_str(&root), "mini-big").unwrap();
+        assert_eq!(langs2.iter().find(|e| e.lang == "rust").unwrap().source, "bundled");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lang_profile_rejects_legacy_mini_unknown_and_bad_lang() {
+        let root = fresh_root("lang-profile-reject");
+        assert!(skills_save_lang_profile_impl(&root_str(&root), "mini", "rust", "x").is_err());
+        assert!(skills_save_lang_profile_impl(&root_str(&root), "bogus", "rust", "x").is_err());
+        assert!(skills_save_lang_profile_impl(&root_str(&root), "mini-big", "klingon", "x").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
