@@ -116,30 +116,38 @@ pub fn compact_built_prompt(
         .map(|i| i + 1)
         .unwrap_or(files_section.len());
     let body = &files_section[header_end..];
-    // Parse fence-aware (blocker 4): a "- " line INSIDE a file's fenced content
-    // (markdown bullets, YAML lists) must NOT start a new block, so we always advance
-    // PAST the closing fence before scanning for the next path line.
-    let mut rest = body;
-    while let Some(dash) = rest.find("- ") {
-        let after = &rest[dash + 2..]; // past "- "
-        let nl = match after.find('\n') {
-            Some(n) => n,
-            None => break,
+    // Parse line-based (blocker 4): a "- <path>" line at a line START, optionally
+    // followed by a ```-fenced content block. A "- " line INSIDE a file's fenced content
+    // (markdown bullets, YAML lists) is consumed within the fence, so it never starts a
+    // new block. An UNFENCED "- path" line — a not-yet-existing file, a path-only entry
+    // beyond MAX_PROMPT_FILES, or a rejected path — yields EMPTY content and must NOT
+    // swallow the next file's content: we never break the loop on a missing fence, and
+    // we never scan forward across a subsequent path line for a fence.
+    let mut lines = body.lines().peekable();
+    while let Some(line) = lines.next() {
+        let path = match line.strip_prefix("- ") {
+            Some(p) => p.trim().to_string(),
+            None => continue,
         };
-        let path = after[..nl].trim().to_string();
-        let after_path = &after[nl + 1..]; // line following the path line
-        // Content lives in the next ```\n … \n``` fence.
-        let open = match after_path.find("```\n") {
-            Some(o) => o,
-            None => break, // malformed: no fence for this path — stop.
-        };
-        let content_area = &after_path[open + 4..]; // past "```\n"
-        let (content, advance) = match content_area.find("\n```") {
-            Some(close) => (content_area[..close].to_string(), close + 4), // past "\n```"
-            None => (content_area.to_string(), content_area.len()),
-        };
+        let mut content = String::new();
+        // Capture fenced content ONLY if the very next line opens a fence.
+        if lines
+            .peek()
+            .map(|l| l.trim_start().starts_with("```"))
+            .unwrap_or(false)
+        {
+            lines.next(); // consume the opening fence line
+            for cl in lines.by_ref() {
+                if cl.trim_start().starts_with("```") {
+                    break; // closing fence
+                }
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(cl);
+            }
+        }
         file_blocks.push((path, content));
-        rest = &content_area[advance.min(content_area.len())..];
     }
 
     // BM25 score each file vs the task description.
@@ -475,5 +483,24 @@ mod tests {
         assert_eq!(budget.files_kept, 1, "must parse exactly one file block, not split on bullets");
         assert!(out.contains("- not a new file"), "bullet content line must survive");
         assert!(out.contains("- still same file"), "bullet content line must survive");
+    }
+
+    #[test]
+    fn compact_unfenced_path_between_fenced_files_keeps_all() {
+        // Review BLOCKER regression: an UNFENCED "- path" line (e.g. a not-yet-existing
+        // "create this file" target) sitting BETWEEN two fenced files must NOT swallow
+        // the following file's content or make it disappear.
+        let prompt = "sys\n\nFILE SCOPE (operate on ONLY these files):\n\
+            - src/a.rs\n```\nfn a() {}\n```\n\
+            - src/new.rs\n\
+            - src/z.rs\n```\nfn z() {}\n```\n\
+            \nHARD CONSTRAINTS (safety):\n- obey\n\nTASK (do EXACTLY this):\nfix\n";
+        let (out, budget) = compact_built_prompt(prompt, "fix", 200_000, 0);
+        assert_eq!(budget.files_kept, 3, "all three paths must parse as blocks (unfenced included)");
+        assert!(out.contains("src/a.rs"), "a path survives");
+        assert!(out.contains("src/new.rs"), "unfenced new-file path survives");
+        assert!(out.contains("src/z.rs"), "z path survives (the bug dropped it)");
+        assert!(out.contains("fn a() {}"), "a content survives");
+        assert!(out.contains("fn z() {}"), "z content survives");
     }
 }

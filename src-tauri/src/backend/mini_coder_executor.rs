@@ -2048,8 +2048,10 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         }
     }
 
-    // Step 8: verdict gate removed. Phase A injection (above) feeds findings
-    // to the main coder. The console gets a simple terminal stamp.
+    // Step 8: verdict gate removed. Phase A (above) now runs the Censor wait OFF this
+    // thread (async) and no longer injects into the outcome; findings reach the main
+    // coder via the persistent Censor ledger (the `censor_findings` MCP tool). The
+    // console gets a simple terminal stamp.
     if let Some(agent_id) = directive.agent_id.as_deref() {
         if let Some(store) = console_store(app) {
             let round = directive.attempt.saturating_add(1);
@@ -3800,21 +3802,6 @@ pub(crate) fn censor_phase_a_summary(
         .filter(|f| f.severity == Severity::Low)
         .count();
     (high, medium, low, findings.len())
-}
-
-fn inject_censor_into_output(outcome: &mut MiniCoderOutcome) {
-    if let Some(ref findings) = outcome.censor_findings {
-        if !findings.is_empty() {
-            let text = format!(
-                "\n=== [Censor Fast Check] ===\n{}\n=== [End Censor] ===\n",
-                crate::backend::censor::commands::format_findings_text(findings)
-            );
-            match outcome.output {
-                Some(ref mut existing) => existing.insert_str(0, &text),
-                None => outcome.output = Some(text),
-            }
-        }
-    }
 }
 
 #[cfg(test)]
