@@ -81,11 +81,10 @@ export function subagentFigureScale(): number {
 //   augur        -> never drawn (skipped off-map in setAgents)
 //   anything else-> citizen  (plain Polites)
 //
-// PHASE B MERGE: "orchestrator" is no longer a spawn role — the `type` slug is a
-// DERIVED state computed on the Rust side (polis/scanner.rs `derived_agent_type`):
-// a session reads as "orchestrator" (noble) when it carries the legacy stored
-// role OR is a coder currently fanning out to subagents. So this figure map stays
-// type-driven and unchanged; the derivation lives upstream where subagents exist.
+// ROLE UNTANGLE (2026-07): "orchestrator" is a FIRST-CLASS stored role again and
+// the `type` slug is a pass-through of it (polis/scanner.rs `derived_agent_type`
+// no longer promotes a coder that fans out to subagents). Only a real stored
+// role:"orchestrator" session renders the noble; this figure map stays type-driven.
 //
 // NOTE: `firefighter` is deliberately NOT produced here. It is reserved for the
 // Censor presence feed (Polis-P5), which is NOT an Agent and drives its figure

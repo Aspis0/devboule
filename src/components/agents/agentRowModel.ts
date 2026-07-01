@@ -12,6 +12,7 @@
 import type {
   AgentClaim,
   AgentEvent,
+  AgentRole,
   AgentSession,
   AgentSubagent,
   ProjectTask,
@@ -288,7 +289,11 @@ export interface SpawnSelection {
 // caller appends agentId; this builder owns the host + model threading only.
 export interface SpawnLaunchInput {
   projectId: string;
-  role: SpawnRole;
+  // ROLE UNTANGLE: the launch role is the WIDER AgentRole (not just the panel's
+  // SpawnRole) — planner launches pass role:"orchestrator" so the ledger stores
+  // the truth for local AND cloud-duplex planners alike. The panel still only
+  // builds coder/verifier selections.
+  role: AgentRole;
   // See SpawnSelection.client: built-in CLI id or a custom agent client id.
   client: string;
   taskId: string | null;

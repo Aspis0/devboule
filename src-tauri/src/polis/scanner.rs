@@ -4448,22 +4448,15 @@ pub fn agent_type_for_role(role: &str) -> String {
     }
 }
 
-/// Phase B merge: derive the Polis agent `type` slug from the session role AND
-/// whether it currently fans out to subagents. "orchestrator" is no longer a
-/// spawn role — it is a DERIVED state: a session is shown as an orchestrator
-/// (Polis noble figure) when EITHER it still carries the legacy stored
-/// role="orchestrator" (back-compat for old `.aspis-agents.json`) OR it is a
-/// coder that currently has at least one subagent. Everything else maps through
-/// `agent_type_for_role` unchanged (coder→builder, verifier→armorer/citizen).
-/// Null-safe: `has_subagents` is computed by the caller from a possibly-empty
-/// subagents vec, so an absent/empty list never derives an orchestrator.
-pub fn derived_agent_type(role: &str, has_subagents: bool) -> String {
-    let base = agent_type_for_role(role);
-    if base == agent_type::CODER && has_subagents {
-        agent_type::ORCHESTRATOR.to_string()
-    } else {
-        base
-    }
+/// ROLE UNTANGLE (2026-07): the Polis agent `type` slug is a PASS-THROUGH of the
+/// stored session role — "orchestrator" is a first-class role again and the ledger
+/// stores it truthfully for every planner launch (local binary AND cloud duplex),
+/// so the former "promote a coder with subagents" derivation is dead. A coder that
+/// fans out to minis is still a coder (builder); only a real orchestrator session
+/// shows the Polis noble figure. Mirrors backend/agent_role.rs (the ONE fold) and
+/// the frontend roleDisplay.ts pass-through.
+pub fn derived_agent_type(role: &str) -> String {
+    agent_type_for_role(role)
 }
 
 /// Glow/omino color for a Polis agent `type` slug.
@@ -4901,16 +4894,11 @@ pub fn attach_agents(
     let mut present: BTreeMap<String, String> = BTreeMap::new();
 
     for s in sessions {
-        // Phase B merge: an agent reads as an "orchestrator" (Polis noble) when it
-        // has the legacy stored role OR it is a coder currently fanning out to
-        // subagents. Empty/absent subagents never derive an orchestrator.
-        // A mini-coder (parent_agent_id set) is NEVER an orchestrator — it is a
-        // leaf helper (watercarrier), so it must not derive the noble figure even
-        // if a malformed payload also lists subagents on it (single-signal
-        // invariant for the P2 walker: parentAgentId and orchestrator are
-        // mutually exclusive).
-        let has_subagents = !s.subagents.is_empty() && s.parent_agent_id.is_none();
-        let agent_type = derived_agent_type(&s.role, has_subagents);
+        // ROLE UNTANGLE (2026-07): the Polis type is a pass-through of the STORED
+        // role (derived_agent_type no longer promotes a fanning-out coder to the
+        // noble; the ledger stores role:"orchestrator" truthfully). A mini-coder
+        // (parent_agent_id set) still renders as a leaf helper via its own role.
+        let agent_type = derived_agent_type(&s.role);
         let status = agent_status_for_session(&s.status, &agent_type);
         let color = agent_color_for_type(&agent_type).to_string();
 
@@ -8279,32 +8267,25 @@ import { cdn } from 'https://cdn.example.com/x';
     }
 
     #[test]
-    fn derived_agent_type_drives_orchestrator_off_subagents_and_legacy_role() {
-        // Back-compat: a legacy stored orchestrator role -> orchestrator (noble),
-        // with or without subagents.
+    fn derived_agent_type_is_a_pass_through_of_the_stored_role() {
+        // ROLE UNTANGLE: the stored role IS the type — orchestrator is first-class
+        // and truthfully stored; the former subagent-count promotion (and its
+        // has_subagents parameter) is gone.
         assert_eq!(
-            derived_agent_type("orchestrator", false),
+            derived_agent_type("orchestrator"),
             agent_type::ORCHESTRATOR
         );
-        assert_eq!(
-            derived_agent_type("orchestrator", true),
-            agent_type::ORCHESTRATOR
-        );
-        // A coder WITH subagents derives orchestrator (noble); without, stays coder.
-        assert_eq!(derived_agent_type("coder", true), agent_type::ORCHESTRATOR);
-        assert_eq!(derived_agent_type("coder", false), agent_type::CODER);
-        // Verifier is never promoted, regardless of subagents (null-safe both ways).
-        assert_eq!(derived_agent_type("verifier", true), agent_type::VERIFIER);
-        assert_eq!(derived_agent_type("verifier", false), agent_type::VERIFIER);
+        assert_eq!(derived_agent_type("coder"), agent_type::CODER);
+        assert_eq!(derived_agent_type("verifier"), agent_type::VERIFIER);
         // Unknown roles are preserved and never promoted.
-        assert_eq!(derived_agent_type("inspector", true), "inspector");
+        assert_eq!(derived_agent_type("inspector"), "inspector");
     }
 
     #[test]
-    fn attach_agents_marks_coder_with_subagents_as_orchestrator() {
-        // End-to-end through attach_agents: a live coder that fans out to
-        // subagents must surface as a Polis orchestrator (noble) so the derived
-        // badge/figure is consistent with the TS displayRole helper.
+    fn attach_agents_types_follow_stored_roles_only() {
+        // End-to-end through attach_agents: a coder that fans out to subagents
+        // stays a CODER (builder); only a stored role:"orchestrator" session shows
+        // the Polis noble — consistent with the TS displayRole pass-through.
         let mut city = CityState::empty("Aspis Bio", "Alpha");
         let mut coder = session("coder-fanout", "coder", "active");
         coder.subagents = vec![crate::backend::model::AgentSubagent {
@@ -8314,8 +8295,8 @@ import { cdn } from 'https://cdn.example.com/x';
             role: Some("coder".into()),
         }];
         let plain = session("coder-solo", "coder", "active");
-        let legacy = session("orch-legacy", "orchestrator", "active");
-        let live = live_with(vec![coder, plain, legacy]);
+        let orch = session("orch-real", "orchestrator", "active");
+        let live = live_with(vec![coder, plain, orch]);
         attach_agents(&mut city, &live, Path::new("."), &BTreeMap::new());
 
         let by_id: BTreeMap<&str, &Agent> = city
@@ -8323,9 +8304,9 @@ import { cdn } from 'https://cdn.example.com/x';
             .iter()
             .map(|a| (a.agent_id.as_str(), a))
             .collect();
-        assert_eq!(by_id["coder-fanout"].agent_type, agent_type::ORCHESTRATOR);
+        assert_eq!(by_id["coder-fanout"].agent_type, agent_type::CODER);
         assert_eq!(by_id["coder-solo"].agent_type, agent_type::CODER);
-        assert_eq!(by_id["orch-legacy"].agent_type, agent_type::ORCHESTRATOR);
+        assert_eq!(by_id["orch-real"].agent_type, agent_type::ORCHESTRATOR);
     }
 
     #[test]
@@ -9043,9 +9024,10 @@ import { cdn } from 'https://cdn.example.com/x';
         assert_eq!(subs[0].count, 3);
         assert_eq!(subs[1].role, "verifier");
         assert_eq!(subs[1].count, 1);
-        // A coder fanning out to subagents stays an orchestrator (noble):
-        // derived_agent_type behavior is unchanged by carrying the breakdown.
-        assert_eq!(city.agents[0].agent_type, agent_type::ORCHESTRATOR);
+        // ROLE UNTANGLE: a coder fanning out to subagents STAYS a coder (builder)
+        // — the type is a pass-through of the stored role, and carrying the
+        // subagent breakdown does not change it.
+        assert_eq!(city.agents[0].agent_type, agent_type::CODER);
         // Not a mini -> no parent.
         assert!(city.agents[0].parent_agent_id.is_none());
     }

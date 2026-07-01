@@ -192,7 +192,7 @@ describe("railRows", () => {
     expect(rows[1].role).toBe("verifier");
   });
 
-  it("derives the orchestrator badge from subagents (legacy folds to coder)", () => {
+  it("keeps a stored orchestrator role first-class (role untangle pass-through)", () => {
     const rows = railRows(
       [
         session({
@@ -200,11 +200,19 @@ describe("railRows", () => {
           role: "orchestrator",
           subagents: [{ label: "s", model: "m", count: 1 }],
         }),
+        session({
+          agentId: "b",
+          role: "coder",
+          subagents: [{ label: "s", model: "m", count: 2 }],
+        }),
       ],
       null,
     );
-    expect(rows[0].role).toBe("coder");
+    expect(rows[0].role).toBe("orchestrator");
     expect(rows[0].orchestratorBadge).toBe(true);
+    // A coder with subagents is NOT promoted — the derivation heuristic is dead.
+    expect(rows[1].role).toBe("coder");
+    expect(rows[1].orchestratorBadge).toBe(false);
   });
 });
 

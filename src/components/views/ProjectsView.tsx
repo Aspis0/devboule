@@ -256,12 +256,6 @@ export function ProjectsView() {
   // can't create a duplicate project or launch a second Planner. A timeout safety clears it
   // if the session never registers (e.g. the orchestrator crashes on start).
   const [plannerLaunching, setPlannerLaunching] = useState(false);
-  // B2 F2: the EXACT agentId of the cloud orchestrator (claude/codex) captured at
-  // launch, so its terminal binds to the right session instead of `.find(by client)`
-  // — which after a hand-off can match a CODER of the same CLI.
-  const [cloudOrchestratorLaunchedId, setCloudOrchestratorLaunchedId] = useState<
-    string | null
-  >(null);
   const plannerLaunchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The project's most-recent design (read-only preview in the planner's Design tab).
   const [plannerDesign, setPlannerDesign] = useState<{
@@ -628,8 +622,6 @@ export function ProjectsView() {
     // the new project never briefly renders the previous project's conversation
     // while its own read_activity_chat round-trips.
     setDurableChat([]);
-    // B2 F2: a captured cloud-orchestrator id belongs to the project we're leaving.
-    setCloudOrchestratorLaunchedId(null);
     // Phase B twinning (reviewer F1): the work-selection store is a global singleton, so a
     // stale agent/task selection from the project we're leaving would otherwise highlight a
     // card / focus an agent in the new project. Wipe it on a real project switch.
@@ -930,27 +922,45 @@ export function ProjectsView() {
   // orchestrator is local, or when no cloud session is running yet (pre-launch).
   const cloudOrchestratorAgentId = useMemo(() => {
     if (plannerOrchestratorClient === "orchestrator") return null;
-    // B2 F2: prefer the EXACT id captured at launch, validated against this
-    // project's live sessions (so it can't point at a stale/other-project agent).
-    // Only if that's unavailable fall back to the first session of this CLI — which
-    // can collide with a hand-off coder, hence the captured id takes precedence.
-    if (
-      cloudOrchestratorLaunchedId &&
-      currentProjectSessions.some(
-        (s) => s.agentId === cloudOrchestratorLaunchedId,
-      )
-    ) {
-      return cloudOrchestratorLaunchedId;
-    }
+    // ROLE UNTANGLE: the ledger stores role:"orchestrator" for cloud planner
+    // launches, so the binding is ROLE-based — the captured-launch-id workaround
+    // (cloudOrchestratorLaunchedId) is gone. A hand-off coder of the same CLI has
+    // role:"coder", so it can no longer collide. When TWO orchestrator sessions of
+    // the same client coexist (e.g. "Recall" launched a fresh one while the old is
+    // still live), bind the NEWEST by firstSeenAt — the ledger appends sessions
+    // oldest-first, so a plain .find() would misroute the Stage + composer to the
+    // stale session (hostile-review finding).
+    const newestBy = (
+      matches: typeof currentProjectSessions,
+    ): string | null => {
+      let best: (typeof currentProjectSessions)[number] | null = null;
+      let bestSeen = -1;
+      for (const s of matches) {
+        const seen = Date.parse(s.firstSeenAt ?? "") || 0;
+        if (seen >= bestSeen) {
+          best = s;
+          bestSeen = seen;
+        }
+      }
+      return best?.agentId ?? null;
+    };
     return (
-      currentProjectSessions.find((s) => s.client === plannerOrchestratorClient)
-        ?.agentId ?? null
+      newestBy(
+        currentProjectSessions.filter(
+          (s) =>
+            s.role === "orchestrator" &&
+            s.client === plannerOrchestratorClient,
+        ),
+      ) ??
+      // Back-compat: sessions launched BEFORE the role untangle stored
+      // role:"coder" — fall back to the newest session of this CLI.
+      newestBy(
+        currentProjectSessions.filter(
+          (s) => s.client === plannerOrchestratorClient,
+        ),
+      )
     );
-  }, [
-    plannerOrchestratorClient,
-    currentProjectSessions,
-    cloudOrchestratorLaunchedId,
-  ]);
+  }, [plannerOrchestratorClient, currentProjectSessions]);
   // Phase D: the agent whose activity bridge feeds the planner Stage — the LOCAL orchestrator, or
   // (when the orchestrator is a CLOUD CLI in duplex mode) the cloud agent, whose reader thread
   // writes the SAME bridge file. So cloud + local drive the identical Stage (chat/websearch).
@@ -2049,10 +2059,10 @@ export function ProjectsView() {
     setIsBusy(true);
     setError(null);
     setLaunchMessage(null);
-    // B2 F2: generate the launched agentId HERE (once) so the caller can capture
-    // the EXACT id — binding the cloud orchestrator's terminal by a captured id is
-    // robust, vs `.find(by client)` which collides with a hand-off coder of the
-    // same CLI.
+    // Generate the launched agentId HERE (once) and return it to the caller.
+    // (The former cloud-orchestrator captured-id binding is gone — the Stage now
+    // binds by the stored role:"orchestrator", role untangle 2026-07 — but a
+    // stable, caller-visible id remains useful for any future exact binding.)
     const launchedAgentId = `${input.role}-${Date.now()}`;
     try {
       const result = await invokeBackendCommand<ProjectAgentLaunchResult>(
@@ -2167,9 +2177,12 @@ export function ProjectsView() {
         }),
       );
       beginPlannerLaunch();
-      const launchedId = await launchFromSpawnPanel({
+      // ROLE UNTANGLE: a planner launch IS an orchestrator launch — pass the role
+      // truthfully so the ledger stores role:"orchestrator" for the local binary
+      // AND for a cloud CLI in duplex mode (the Stage binding is role-based now).
+      await launchFromSpawnPanel({
         projectId: detail.metadata.id,
-        role: "coder",
+        role: "orchestrator",
         // The chosen orchestrator backend: local Devboule ("orchestrator") or a cloud CLI
         // ("claude"/"codex"). plan-first is a local-orchestrator concept; cloud CLIs drive
         // their own loop, so only gate it on local.
@@ -2186,20 +2199,15 @@ export function ProjectsView() {
         // Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
         cloudDuplex: plannerOrchestratorClient !== "orchestrator",
       });
-      // B2 F2: capture the cloud orchestrator's exact agentId for binding (Stage in duplex mode).
-      if (plannerOrchestratorClient !== "orchestrator") {
-        setCloudOrchestratorLaunchedId(launchedId);
-      }
     } finally {
       orchestratorPlanRef.current = false;
     }
   };
 
   // Orchestrator composer "Plan it": record the typed goal as a project note (the orchestrator
-  // reads project state), then launch the LOCAL orchestrator in plan-first mode — the SAME path as
-  // the SpawnPanel "Plan first" toggle (role "coder" + client "orchestrator" + planFirst). The
-  // drafted plan flows through the EXISTING plan-approval surface (bell / PlanApprovalCard); on
-  // approval its tasks land on the board. No new backend, no new approval UI.
+  // reads project state), then launch the planner (role "orchestrator" + the chosen client +
+  // planFirst). The drafted plan flows through the EXISTING plan-approval surface (bell /
+  // PlanApprovalCard); on approval its tasks land on the board. No new backend, no new approval UI.
   const planWithOrchestrator = async (
     goal: string,
     coderId: string,
@@ -2227,9 +2235,11 @@ export function ProjectsView() {
       );
       if (!detail) return;
       beginPlannerLaunch();
-      const launchedId = await launchFromSpawnPanel({
+      // ROLE UNTANGLE: pass the planner's true role — the ledger stores
+      // role:"orchestrator" for local and cloud-duplex planners alike.
+      await launchFromSpawnPanel({
         projectId: currentProject.metadata.id,
-        role: "coder",
+        role: "orchestrator",
         client: plannerOrchestratorClient,
         taskId: null,
         host: "app",
@@ -2245,10 +2255,6 @@ export function ProjectsView() {
         // Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
         cloudDuplex: plannerOrchestratorClient !== "orchestrator",
       });
-      // B2 F2: capture the cloud orchestrator's exact agentId for binding (Stage in duplex mode).
-      if (plannerOrchestratorClient !== "orchestrator") {
-        setCloudOrchestratorLaunchedId(launchedId);
-      }
     } finally {
       orchestratorPlanRef.current = false;
     }

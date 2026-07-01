@@ -725,16 +725,17 @@ export interface OracleIndexStatus {
 export type ProjectStatus = "active" | "paused" | "done" | "archived";
 export type ProjectTaskStatus = "todo" | "wip" | "review" | "blocked" | "done";
 export type ProjectEditableTaskStatus = Exclude<ProjectTaskStatus, "done">;
-// Phase B role merge: spawn-time roles collapse to {coder, verifier} (see
-// SpawnRole below). "orchestrator" is KEPT as a
-// valid INBOUND value here so stored sessions / old `.aspis-agents.json` and any
-// archived claims/events with role:"orchestrator" still deserialize without
-// error; it is no longer offered as a spawn choice and renders as a derived badge
-// via displayRole(). Mirrors VALID_ROLES + ROLE_ALIASES in aspis_mcp.py.
+// ROLE UNTANGLE (2026-07): FOUR first-class roles — orchestrator (plans+delegates,
+// never writes), coder ("Main coder"), verifier, mini. The ledger stores them
+// truthfully (a planner launch persists role:"orchestrator" whether local Devboule
+// binary or cloud CLI in duplex mode); displayRole() is a pass-through, not a fold.
+// Mirrors VALID_ROLES in aspis_mcp.py and backend/agent_role.rs (the ONE fold —
+// only legacy aliases architect/code fold to coder). "mini" sessions are typed via
+// their own surfaces, not this union.
 export type AgentRole = "orchestrator" | "coder" | "verifier";
-// Phase B role merge: the only roles a NEW agent can be SPAWNED with. "orchestrator"
-// is excluded — it survives only as an inbound back-compat value (see AgentRole) and
-// a derived badge (see displayRole). Mirrors VALID_ROLES in aspis_mcp.py.
+// The roles a NEW agent can be spawned with from the SpawnPanel role radio. The
+// orchestrator is launched via the planner ("Plan it") or the Devboule client
+// selection, not the radio — the Roles-table phase may widen this.
 export type SpawnRole = "coder" | "verifier";
 export type AgentClaimStatus =
   | ProjectTaskStatus

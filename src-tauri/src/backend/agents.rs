@@ -650,8 +650,10 @@ pub fn record_manual_task_status(
                     id: format!("E{}-manual-repair", Utc::now().timestamp_millis()),
                     timestamp: Utc::now().to_rfc3339(),
                     agent_id: "app-user".into(),
-                    // Phase B merge: app-authored coordination events use the
-                    // merged "coder" role (orchestrator is no longer a role).
+                    // App-authored (human) coordination events audit under the
+                    // "coder" role: a manual Kanban move has coder-like transition
+                    // semantics. NOT a session role — unrelated to the first-class
+                    // orchestrator role (see backend/agent_role.rs).
                     role: "coder".into(),
                     event_type: "manual_repair".into(),
                     project_id: Some(project_id.into()),
@@ -686,8 +688,9 @@ pub fn record_manual_task_status(
         id: format!("E{}-manual", Utc::now().timestamp_millis()),
         timestamp: timestamp.clone(),
         agent_id: "app-user".into(),
-        // Phase B merge: app-authored coordination events use the merged "coder"
-        // role (orchestrator is no longer a role).
+        // App-authored (human) coordination events audit under the "coder" role: a
+        // manual Kanban move has coder-like transition semantics. NOT a session
+        // role — unrelated to the first-class orchestrator role (agent_role.rs).
         role: "coder".into(),
         event_type: "manual_move".into(),
         project_id: Some(project_id.into()),

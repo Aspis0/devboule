@@ -2,21 +2,26 @@ import { describe, expect, it } from "vitest";
 import { displayRole } from "./roleDisplay";
 import { ROLE_OPTIONS } from "./SpawnPanel";
 
+// ROLE UNTANGLE (2026-07): displayRole is a PASS-THROUGH of the stored role for
+// the four first-class roles. The former "derived orchestrator badge from
+// subagent count" heuristic is DEAD: the ledger stores role:"orchestrator"
+// truthfully for every planner launch (local binary AND cloud duplex), so the
+// badge simply reflects the stored role.
 describe("displayRole", () => {
-  it("maps a stored legacy 'orchestrator' role to coder + badge", () => {
+  it("keeps a stored 'orchestrator' role first-class (with badge)", () => {
     expect(displayRole({ role: "orchestrator" })).toEqual({
-      role: "coder",
+      role: "orchestrator",
       orchestratorBadge: true,
     });
   });
 
-  it("raises the badge for a coder that currently has subagents", () => {
+  it("does NOT promote a coder with subagents (the heuristic is dead)", () => {
     expect(
       displayRole({
         role: "coder",
         subagents: [{ label: "helpers", model: "haiku", count: 2 }],
       }),
-    ).toEqual({ role: "coder", orchestratorBadge: true });
+    ).toEqual({ role: "coder", orchestratorBadge: false });
   });
 
   it("plain coder with no subagents -> coder, no badge", () => {
@@ -26,23 +31,14 @@ describe("displayRole", () => {
     });
   });
 
-  it("verifier -> verifier, no badge (even with no subagents field)", () => {
+  it("verifier -> verifier, no badge", () => {
     expect(displayRole({ role: "verifier" })).toEqual({
       role: "verifier",
       orchestratorBadge: false,
     });
   });
 
-  it("is null-safe on an empty subagents array (no badge)", () => {
-    expect(displayRole({ role: "coder", subagents: [] })).toEqual({
-      role: "coder",
-      orchestratorBadge: false,
-    });
-  });
-
-  it("a verifier WITH subagents is NEVER promoted (no orchestrator badge)", () => {
-    // NITPICK 1: a verifier is never an orchestrator, even when it fans out. This
-    // mirrors the Rust Polis `derived_agent_type`, which only promotes a coder.
+  it("a verifier WITH subagents is never promoted", () => {
     expect(
       displayRole({
         role: "verifier",
@@ -64,7 +60,7 @@ describe("displayRole", () => {
 
   it("normalizes case and surrounding whitespace on the stored role", () => {
     expect(displayRole({ role: " Orchestrator " })).toEqual({
-      role: "coder",
+      role: "orchestrator",
       orchestratorBadge: true,
     });
     expect(displayRole({ role: "VERIFIER" })).toEqual({
@@ -75,6 +71,9 @@ describe("displayRole", () => {
 });
 
 describe("SpawnPanel ROLE_OPTIONS", () => {
+  // The SpawnPanel role picker stays {coder, verifier}: an orchestrator is
+  // launched via the planner ("Plan it") or the Devboule client selection, not
+  // via the role radio. (The Roles-table phase may revisit this.)
   it("offers only the two spawnable roles (no orchestrator)", () => {
     expect(ROLE_OPTIONS.map((option) => option.id)).toEqual([
       "coder",

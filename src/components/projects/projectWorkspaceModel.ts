@@ -132,9 +132,10 @@ export function subagentRailLabel(sub: AgentSubagent): string {
 
 export interface RailAgentRow {
   agentId: string;
-  /** Canonical display role (folds legacy orchestrator → coder). */
-  role: "coder" | "verifier";
-  /** Whether to show the derived orchestrator badge. */
+  /** Canonical display role — pass-through of the stored role (role untangle:
+   *  orchestrator is first-class, no fold, no derived badge). */
+  role: "coder" | "verifier" | "orchestrator";
+  /** True exactly when the stored role is "orchestrator" (ledger truth). */
   orchestratorBadge: boolean;
   selected: boolean;
   /** The agent's reported subagents, formatted small with the "- " prefix in the
