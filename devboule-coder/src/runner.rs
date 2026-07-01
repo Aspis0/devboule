@@ -135,6 +135,10 @@ struct TaskView {
     /// The task's `updatedAt` (raw ISO string), used ONLY to break a tie between multiple
     /// concurrently-active plans. Lexicographic max of ISO-8601 timestamps == most recent.
     updated_at: String,
+    /// The task's persisted review evidence (the mini's real output+files), read back
+    /// from the board. Empty when the task has no evidence yet. Used to feed a task's
+    /// completed-dependency context even across a fresh `run_tasks` re-invocation.
+    evidence: String,
 }
 
 /// The next thing the linear runner should do given the active plan's current state.
@@ -320,10 +324,24 @@ pub async fn run_tasks(
                 let t = plan[idx].clone();
                 // Gather the summaries of this task's already-completed dependencies (they
                 // ran in a prior iteration; batch siblings never depend on each other).
+                // If the in-memory `summaries` map has NO entry for a dependency, fall back to
+                // that dependency's `evidence` field from the current `plan` views (the board
+                // is authoritative and survives re-invocation).
                 let deps: Vec<(String, String)> = t
                     .depends_on
                     .iter()
-                    .filter_map(|d| summaries.get(d).map(|s| (d.clone(), s.clone())))
+                    .filter_map(|d| {
+                        let s = summaries
+                            .get(d)
+                            .cloned()
+                            .or_else(|| {
+                                plan.iter()
+                                    .find(|v| &v.id == d)
+                                    .map(|v| v.evidence.clone())
+                                    .filter(|e| !e.trim().is_empty())
+                            });
+                        s.map(|s| (d.clone(), s))
+                    })
                     .collect();
                 (idx, t, deps)
             })
@@ -509,6 +527,11 @@ async fn read_plan_views(mcp: &dyn McpBackend, project_id: &str) -> Result<Vec<T
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let evidence = t
+            .get("evidence")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let updated_at = t
             .get("updatedAt")
             .and_then(|v| v.as_str())
@@ -525,6 +548,7 @@ async fn read_plan_views(mcp: &dyn McpBackend, project_id: &str) -> Result<Vec<T
             depends_on,
             scope,
             acceptance,
+            evidence,
             plan_id,
             updated_at,
         });
@@ -832,6 +856,10 @@ fn parse_mini_status(text: &str) -> MiniVerdict {
                 )
             }
         );
+        // Cap the evidence at 1_200 chars (same ceiling as `set_blocked`); a verbose
+        // mini output cannot bloat the board field. The fixed prefix already guarantees
+        // ≥12 chars, so the minimum is satisfied.
+        let evidence = cap_chars(&evidence, 1_200);
         return MiniVerdict::Done(evidence);
     }
     // For needs_clarification, use the `question` field as the reason (it holds the
@@ -914,6 +942,7 @@ mod tests {
             depends_on: vec!["T1".into()],
             scope: vec!["src/auth.rs".into()],
             acceptance: "cargo test auth".into(),
+            evidence: String::new(),
             plan_id: "P".into(),
             updated_at: "t".into(),
         };
