@@ -250,6 +250,59 @@ pub fn compact_built_prompt(
     out.push_str(&prompt[hard_start..task_start]);
     out.push_str(task_block);
 
+    // Safety guard: if immutable parts (preamble + hard constraints + task)
+    // alone exceed the budget, truncate the preamble to the remaining budget
+    // while keeping the hard constraints and task block intact.
+    // The file section + hard constraints + task block is the minimum viable
+    // output; if that still exceeds budget, we cannot drop the task — that
+    // is the caller's pre-spawn size gate's job.
+    // Compute the token cost of everything except the preamble.
+    // Slice: everything between preamble and (hard constraints + task block).
+    // Guard against underflow when there's no file section (e.g., empty files).
+    let non_preamble_len = prompt[hard_start..task_start].len() + task_block.len();
+    let file_section = if out.len() > non_preamble_len {
+        &out[preamble.len()..out.len() - non_preamble_len]
+    } else {
+        ""
+    };
+    let hard_task_tokens = estimate_tokens(&prompt[hard_start..task_start]) + estimate_tokens(task_block);
+    let file_section_tokens = estimate_tokens(file_section);
+    let non_preamble_tokens = file_section_tokens + hard_task_tokens;
+    // If the non-preamble portion alone exceeds budget, there's nothing to fix
+    // (we can't drop the task); leave out as-is.
+    if non_preamble_tokens <= budget {
+        if estimate_tokens(&out) > budget {
+            // Rebuild out with a truncated preamble (dropping it ENTIRELY when its
+            // budget is 0 — build(0) yields "" safely), keeping the file section,
+            // hard constraints and task block intact. NOTE: no `preamble_budget > 0`
+            // guard — that edge (preamble_budget == 0) is exactly when the preamble
+            // must be dropped hardest, and skipping it returned an over-budget prompt.
+            let build = |pb: usize| {
+                let mut fixed = String::new();
+                fixed.push_str(&truncate_to_token_budget(preamble, pb));
+                fixed.push_str(file_section);
+                fixed.push_str(&prompt[hard_start..task_start]);
+                fixed.push_str(task_block);
+                fixed
+            };
+            let mut pb = budget.saturating_sub(non_preamble_tokens);
+            let mut fixed = build(pb);
+            // Integer len/4 estimates under-count the concatenated whole, so the
+            // summed budget can overshoot by a few tokens. Shrink the preamble in a
+            // bounded loop until it fits (converges in 1-2 passes; once pb hits 0 the
+            // preamble is gone and any residual is the caller's pre-spawn gate's job).
+            for _ in 0..4 {
+                let after = estimate_tokens(&fixed);
+                if after <= budget || pb == 0 {
+                    break;
+                }
+                pb = pb.saturating_sub(after - budget);
+                fixed = build(pb);
+            }
+            out = fixed;
+        }
+    }
+
     let tokens_after = estimate_tokens(&out);
     (
         out,
@@ -335,6 +388,72 @@ mod tests {
             "task block must survive compaction"
         );
         // Hard constraints always survive
+        assert!(out.contains("HARD CONSTRAINTS"), "constraints must survive");
+    }
+
+    #[test]
+    fn compact_built_prompt_truncates_preamble_when_over_budget() {
+        // A huge preamble (e.g. a 100k-char system prompt) with a tiny context
+        // window (4096). The immutable parts (preamble + hard + task) alone
+        // exceed budget, so the preamble should be truncated to fit.
+        let preamble = "You are a highly capable mini-coder. ".repeat(25_000);
+        let prompt = format!(
+            "{preamble}\n\nFILE SCOPE (operate on ONLY these files):\n\nHARD CONSTRAINTS (safety — you MUST obey):\n- NEVER delete.\n\nTASK (do EXACTLY this, honoring all rules above):\nFix the bug.\n"
+        );
+        let (out, budget) = compact_built_prompt(&prompt, "Fix the bug.", 4_096, 0);
+        let budget_tokens = 4_096 * 70 / 100; // 2867
+        let out_tokens = estimate_tokens(&out);
+        // The preamble was huge (100k chars ≈ 25k tokens), so it should have
+        // been truncated. The hard constraints + task block should still be
+        // present.
+        assert!(
+            out_tokens <= budget_tokens,
+            "compacted {} tokens must be <= 70% of 4096 ({}), got {}",
+            out_tokens,
+            budget_tokens,
+            out_tokens
+        );
+        // Task and hard constraints always survive (even if preamble is dropped)
+        assert!(
+            out.contains("TASK (do EXACTLY"),
+            "task block must survive compaction"
+        );
+        assert!(
+            out.contains("HARD CONSTRAINTS"),
+            "constraints must survive"
+        );
+        // The preamble should be truncated (shorter than original).
+        assert!(
+            out.len() < 100_000,
+            "preamble should have been truncated (out len: {})",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn compact_built_prompt_fits_budget_when_immutable_near_full() {
+        // The immutable task block nearly fills the whole budget, leaving almost no
+        // room for the preamble — this drives preamble_budget to ~0 and exercises the
+        // guard branch that the old `preamble_budget > 0` check wrongly skipped
+        // (regression: it returned a prompt tens of thousands of tokens over budget).
+        let preamble = "You are a highly capable mini-coder. ".repeat(25_000); // ~925k chars
+        let big_task = "do the thing ".repeat(800); // ~10.4k chars ≈ 2600 tokens
+        let prompt = format!(
+            "{preamble}\n\nFILE SCOPE (operate on ONLY these files):\n\nHARD CONSTRAINTS (safety — you MUST obey):\n- NEVER delete.\n\nTASK (do EXACTLY this, honoring all rules above):\n{big_task}\n"
+        );
+        let (out, _budget) = compact_built_prompt(&prompt, "do the thing", 4_096, 0);
+        let budget_tokens = 4_096 * 70 / 100; // 2867
+        // MUST fit the budget — the whole point of the guard.
+        assert!(
+            estimate_tokens(&out) <= budget_tokens,
+            "over budget: {} > {}",
+            estimate_tokens(&out),
+            budget_tokens
+        );
+        // The 925k-char preamble must have been (near-)fully dropped.
+        assert!(out.len() < 50_000, "preamble not dropped: out len {}", out.len());
+        // Task + hard constraints still survive.
+        assert!(out.contains("TASK (do EXACTLY"), "task must survive");
         assert!(out.contains("HARD CONSTRAINTS"), "constraints must survive");
     }
 }

@@ -63,12 +63,6 @@ const STATUS_BLOCKED: &str = "blocked";
 const STATUS_DONE: &str = "done";
 
 /// Evidence string attached to a runner-driven `project_update_status`. The server
-/// REQUIRES ≥12 chars of evidence for the `review`/`blocked` transitions
-/// (`validate_transition` in `oracle/server/aspis_mcp.py`), so a runner update must
-/// always carry a concrete, ≥12-char note. These are fixed, descriptive, and well over
-/// the floor.
-const EVIDENCE_REVIEW: &str = "devboule runner: mini-coder applied the edits and reported done; awaiting human/verifier review.";
-
 /// A task that stopped the run, with enough detail for the orchestrator to `ask_user`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedTask {
@@ -116,9 +110,10 @@ impl RunReport {
 }
 
 /// The mini's per-task verdict, reduced to the only distinction the runner acts on:
-/// `done` (proceed) vs everything-else (block, with a reason).
+/// `done` (proceed) vs everything-else (block, with a reason). When done, carries the
+/// mini's output text so the review evidence can reflect the real outcome.
 enum MiniVerdict {
-    Done,
+    Done(String),
     Blocked(String),
 }
 
@@ -328,8 +323,8 @@ pub async fn run_tasks(
         for (idx, verdict) in results {
             let task = &plan[idx];
             match verdict {
-                MiniVerdict::Done => {
-                    if let Err(e) = set_review(mcp, project_id, &task.id).await {
+                MiniVerdict::Done(evidence) => {
+                    if let Err(e) = set_review(mcp, project_id, &task.id, &evidence).await {
                         let reason = format!(
                             "mini finished but could not set the task to review: {}; \
                              please update it manually",
@@ -620,14 +615,14 @@ async fn claim_task(mcp: &dyn McpBackend, project_id: &str, task_id: &str) -> Re
 /// Set a task to `review` on the board. Params:
 /// `{project_id, task_id, status: "review", evidence}` (the server REQUIRES ≥12-char
 /// evidence for the review transition; the backend injects the identity).
-async fn set_review(mcp: &dyn McpBackend, project_id: &str, task_id: &str) -> Result<(), String> {
+async fn set_review(mcp: &dyn McpBackend, project_id: &str, task_id: &str, evidence: &str) -> Result<(), String> {
     mcp.call_tool(
         "project_update_status",
         serde_json::json!({
             "project_id": project_id,
             "task_id": task_id,
             "status": STATUS_REVIEW,
-            "evidence": EVIDENCE_REVIEW,
+            "evidence": evidence,
         }),
     )
     .await
@@ -751,17 +746,61 @@ fn parse_mini_status(text: &str) -> MiniVerdict {
         .trim()
         .to_ascii_lowercase();
     if status == "done" {
-        return MiniVerdict::Done;
+        // Build review evidence from the mini's real output and files_touched.
+        let output = result
+            .and_then(|r| r.get("output"))
+            .and_then(|o| o.as_str())
+            .unwrap_or("")
+            .trim();
+        let files_touched = result
+            .and_then(|r| r.get("files_touched"))
+            .and_then(|f| f.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        let evidence = format!(
+            "mini reports done; output: {}{}",
+            output,
+            if files_touched.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; touched: {}",
+                    files_touched
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect::<Vec<&str>>()
+                        .join(", ")
+                )
+            }
+        );
+        return MiniVerdict::Done(evidence);
     }
+    // For needs_clarification, use the `question` field as the reason (it holds the
+    // mini's actual clarification question); fall back to `error` only if `question` is
+    // empty/None.
     let detail = result
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.as_str())
+        .and_then(|r| r.get("question"))
+        .and_then(|q| q.as_str())
         .unwrap_or("")
         .trim();
     let reason = if status.is_empty() {
         "mini returned no status".to_string()
     } else if detail.is_empty() {
-        format!("mini status '{status}'")
+        // Fall back to `error` when `question` is empty (e.g. a clean needs_clarification)
+        let error = result
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("")
+            .trim();
+        if error.is_empty() {
+            format!("mini status '{status}'")
+        } else {
+            format!("mini status '{status}': {}", elide(error))
+        }
     } else {
         format!("mini status '{status}': {}", elide(detail))
     };
