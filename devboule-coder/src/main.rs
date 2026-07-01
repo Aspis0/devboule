@@ -223,7 +223,15 @@ async fn run_session(goal: String) -> std::io::Result<()> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from);
-    let resumed = session_file.as_deref().and_then(session_persist::load);
+    // Only RESUME when the persisted conversation belongs to THIS goal. The conversation
+    // always begins with the launch goal (it starts as `goal` and only appends), so a
+    // persisted transcript that does NOT start with the current goal is a DIFFERENT run on
+    // the same project — ignore it and start fresh (fixes: a new goal must not replay the
+    // previous goal's stale conversation). The per-turn save below then overwrites it.
+    let resumed = session_file
+        .as_deref()
+        .and_then(session_persist::load)
+        .filter(|prev| prev.starts_with(&goal));
 
     // Surface the launch goal as the FIRST user chat turn ONLY on a fresh start (on a
     // resume the goal is already the head of the restored conversation).

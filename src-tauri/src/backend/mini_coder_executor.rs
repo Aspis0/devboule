@@ -902,6 +902,20 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             // after the directive transition is durably applied. Without this the console is
             // stuck running:true (shimmer on) and the store entry stays pinned forever.
             console_mark_stopped(app, directive);
+            // v6 Phase 5: real wall-clock timeouts are reaped HERE (they bypass
+            // `finalize_finished_mini`), so emit the structured stuck report from this path
+            // too — otherwise the Timeout arm in finalize is unreachable for real timeouts.
+            // Skip when the human hit Stop (that's an abort, not a stuck mini).
+            if !directive.kill_requested {
+                let report = crate::backend::stuck_report::StuckReport::new(
+                    directive.id.clone(),
+                    "timeout",
+                    directive.attempt.saturating_add(1),
+                    "",
+                    Vec::new(),
+                );
+                let _ = app.emit("mini://stuck", report);
+            }
             // Slice 3 (seam C, bypass path): this terminal reap does NOT go through
             // `finalize_finished_mini`, so close the Pigeon ticket here too — both to unblock
             // the Python wait promptly AND to prevent the reclaim sweep from re-queuing +
@@ -2063,7 +2077,16 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                 super::mini_activity::set_terminal(
                     a,
                     super::mini_activity::Banner {
-                        kind: super::mini_activity::BannerKind::Done,
+                        // A failed/timed-out mini must NOT show a green "Done ✓" — use the
+                        // neutral Stop banner (same as the other terminal-reap paths).
+                        kind: if matches!(
+                            outcome.status,
+                            MiniCoderStatus::Failed | MiniCoderStatus::Timeout
+                        ) {
+                            super::mini_activity::BannerKind::Stop
+                        } else {
+                            super::mini_activity::BannerKind::Done
+                        },
                         title: None,
                         sub: Some(format!(
                             "{} · {} round{}",

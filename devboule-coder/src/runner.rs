@@ -743,9 +743,19 @@ fn build_spawn_params(task: &TaskView, dep_summaries: &[(String, String)]) -> se
     // produced, so the mini has the context without re-deriving it. Bounded per-dependency;
     // the whole text is capped below at MAX_DELEGATED_TASK_CHARS.
     if !dep_summaries.is_empty() {
+        // Cap the NUMBER of dep summaries so a many-dependency "integration" task can't
+        // blow the per-spawn char budget and silently drop the tail (the whole text is
+        // capped below, which truncates from the END). Keep the first N, name the rest.
+        const MAX_DEP_SUMMARIES: usize = 8;
         text.push_str("\n\nContext from completed dependencies (already done):");
-        for (id, summary) in dep_summaries {
+        for (id, summary) in dep_summaries.iter().take(MAX_DEP_SUMMARIES) {
             text.push_str(&format!("\n- {}: {}", id, cap_chars(summary.trim(), 400)));
+        }
+        let omitted = dep_summaries.len().saturating_sub(MAX_DEP_SUMMARIES);
+        if omitted > 0 {
+            text.push_str(&format!(
+                "\n- (+{omitted} earlier dependencies omitted for length)"
+            ));
         }
     }
     let text = cap_chars(&text, MAX_DELEGATED_TASK_CHARS);
