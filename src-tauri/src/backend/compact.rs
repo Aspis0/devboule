@@ -89,22 +89,26 @@ pub fn compact_built_prompt(
     //  - hard constraints block ("HARD CONSTRAINTS" … up to next marker) — IMMUTABLE
     //  - task block ("TASK (do EXACTLY" … to end) — IMMUTABLE
     //  - file blocks (between "FILE SCOPE" and "HARD CONSTRAINTS") — COMPACTABLE via BM25
-    let preamble_end = prompt.find("FILE SCOPE").unwrap_or(prompt.len());
+    // Blocker 2 mitigation: match the DISTINCTIVE header prefixes, not the bare words
+    // ("FILE SCOPE" / "HARD CONSTRAINTS" / "TASK"). A file's own content colliding with
+    // these longer, unusual prefixes is far less likely than colliding with the words.
+    // These prefixes match both the production headers ("… — you MUST obey):", "…,
+    // honoring all rules above):") and the shorter forms used in tests. A miss falls
+    // back to prompt.len() (safe: that section just isn't split out).
+    let preamble_end = prompt.find("FILE SCOPE (operate on ONLY").unwrap_or(prompt.len());
     let preamble = &prompt[..preamble_end];
 
     let files_section_start = preamble_end;
-    // Search for HARD CONSTRAINTS only within the file section (not the whole prompt),
-    // so file content that happens to contain "HARD CONSTRAINTS" doesn't mislead us.
+    // Search for HARD CONSTRAINTS only within the file section (not the whole prompt).
     let hard_start = prompt[files_section_start..]
-        .find("HARD CONSTRAINTS")
+        .find("HARD CONSTRAINTS (safety")
         .map(|i| i + files_section_start)
         .unwrap_or(prompt.len());
     let files_section = &prompt[files_section_start..hard_start];
 
-    // Search for TASK only within the section after hard constraints (not the whole prompt),
-    // so file content that happens to contain "TASK (do EXACTLY" doesn't mislead us.
+    // Search for TASK only within the section after hard constraints.
     let task_start = prompt[hard_start..]
-        .find("TASK (do EXACTLY")
+        .find("TASK (do EXACTLY this")
         .map(|i| i + hard_start)
         .unwrap_or(prompt.len());
     let task_block = &prompt[task_start..];
