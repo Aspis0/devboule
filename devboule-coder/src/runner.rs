@@ -255,7 +255,7 @@ pub async fn run_tasks(
         // here — only READ it for the cap check; we charge an attempt below, ONLY for tasks we
         // actually dispatch, so a task that is selected-but-never-run (the batch cut short by
         // an over-cap sibling) is never charged an attempt it didn't use.
-        let mut selected_indices = Vec::new();
+        let mut selected_indices: Vec<usize> = Vec::new();
         let mut blocked_report: Option<RunReport> = None;
         for &idx in &batch {
             let task = &plan[idx];
@@ -282,6 +282,16 @@ pub async fn run_tasks(
                     }),
                 });
                 break;
+            }
+            // v6 Phase 5 (isolation): never run two tasks with OVERLAPPING scope in the
+            // SAME parallel batch — two minis writing the same file would corrupt each
+            // other's edits (the minis share one working tree). Defer this task to a later
+            // batch; it stays ready and runs once the conflicting sibling has finished.
+            if selected_indices
+                .iter()
+                .any(|&s| scopes_overlap(plan[s].scope.as_slice(), task.scope.as_slice()))
+            {
+                continue;
             }
             selected_indices.push(idx);
             if selected_indices.len() >= MAX_PARALLEL_TASKS {
@@ -731,6 +741,13 @@ async fn block_best_effort(
 /// instruction stream. The mini's own prompt-injection firewall (it treats the whole
 /// delegated task as untrusted input, see `mini_coder.rs`) is the BACKSTOP; this is a
 /// labelling/bounding layer, not the security boundary itself.
+/// Two task scopes OVERLAP when they name at least one file in common — such tasks must
+/// not run in the same parallel batch (both minis would write the shared file in one
+/// working tree). Scopes are tiny (≤ MAX_TASK_SCOPE), so a linear check is fine.
+fn scopes_overlap(a: &[String], b: &[String]) -> bool {
+    a.iter().any(|p| b.contains(p))
+}
+
 fn build_spawn_params(task: &TaskView, dep_summaries: &[(String, String)]) -> serde_json::Value {
     let mut text = task.title.trim().to_string();
     if !task.acceptance.trim().is_empty() {
@@ -876,6 +893,17 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    #[test]
+    fn scopes_overlap_detects_shared_file() {
+        assert!(
+            scopes_overlap(&["a.rs".into(), "b.rs".into()], &["b.rs".into()]),
+            "shared b.rs must overlap"
+        );
+        assert!(!scopes_overlap(&["a.rs".into()], &["b.rs".into()]), "disjoint must not overlap");
+        let empty: &[String] = &[];
+        assert!(!scopes_overlap(empty, &["b.rs".into()]), "empty scope never overlaps");
+    }
 
     #[test]
     fn build_spawn_params_front_loads_dependency_summaries() {
