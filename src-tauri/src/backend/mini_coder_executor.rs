@@ -2086,6 +2086,32 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             d.result = Some(outcome.clone());
         }
     });
+    // v6 Phase 5: on a terminal failure/timeout, emit a structured stuck report so the
+    // human gets an actionable record (task, attempts, reason, last-output excerpt)
+    // instead of a bare block. Fire-and-forget (a missing listener is fine).
+    if matches!(
+        outcome.status,
+        MiniCoderStatus::Failed | MiniCoderStatus::Timeout
+    ) {
+        let reason = if matches!(outcome.status, MiniCoderStatus::Timeout) {
+            "timeout"
+        } else {
+            "failed"
+        };
+        let raw = outcome
+            .error
+            .as_deref()
+            .or(outcome.output.as_deref())
+            .unwrap_or("");
+        let report = crate::backend::stuck_report::StuckReport::new(
+            directive.id.clone(),
+            reason,
+            directive.attempt.saturating_add(1),
+            raw,
+            outcome.files_touched.clone(),
+        );
+        let _ = app.emit("mini://stuck", report);
+    }
     // Clean up result file
     if let Some(scratch) = directive
         .scratch_path

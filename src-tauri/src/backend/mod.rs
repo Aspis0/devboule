@@ -14,6 +14,7 @@ pub mod censor_review;
 pub mod changes;
 pub mod compact;
 pub mod task_size;
+pub mod stuck_report;
 pub mod cli_agents;
 pub mod cloud_claude;
 pub mod cloud_claude_config;
