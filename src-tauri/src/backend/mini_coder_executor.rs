@@ -878,6 +878,9 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         if let Some(directive) = directives.iter().find(|d| &d.id == timed_out_id) {
             kill_mini_pty(app, directive);
             let agent_id = directive.agent_id.clone();
+            // v6 Phase 5 (B3): capture the LIVE abort decision so the stuck-report emit
+            // below uses it, not the stale pass-snapshot `directive.kill_requested`.
+            let mut was_aborted = false;
             let _ = agents::mutate_agent_live_state(app, |state| {
                 // P5: killRequested WINS. If the human hit Stop, the human's intent
                 // overrides a same-pass timeout — consult the LIVE `d.kill_requested`
@@ -885,6 +888,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
                 // pass snapshot was taken) and synthesize aborted_by_human instead.
                 transition_directive(state, timed_out_id, |d| {
                     if d.kill_requested {
+                        was_aborted = true;
                         mini_coder::apply_aborted(d, "stopped by human (Stop button)")
                     } else {
                         mini_coder::apply_timeout(d, "wall-clock cap exceeded")
@@ -905,8 +909,9 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             // v6 Phase 5: real wall-clock timeouts are reaped HERE (they bypass
             // `finalize_finished_mini`), so emit the structured stuck report from this path
             // too — otherwise the Timeout arm in finalize is unreachable for real timeouts.
-            // Skip when the human hit Stop (that's an abort, not a stuck mini).
-            if !directive.kill_requested {
+            // Skip when the human hit Stop (that's an abort, not a stuck mini) — use the
+            // LIVE decision, not the stale snapshot, so a Stop that raced this reap wins.
+            if !was_aborted {
                 let report = crate::backend::stuck_report::StuckReport::new(
                     directive.id.clone(),
                     "timeout",
@@ -956,6 +961,19 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             // only flips running=Some(false): it stops "running", never paints a phantom
             // timeline. A directive that DID seed a console gets the neutral Stop banner.
             console_mark_stopped(app, directive);
+            // v6 Phase 5: emit the structured stuck report from this reap path too
+            // (stuck-launching is a terminal failure, not a normal abort). Skip when
+            // the human hit Stop (that's an abort, not a stuck mini).
+            if !directive.kill_requested {
+                let report = crate::backend::stuck_report::StuckReport::new(
+                    directive.id.clone(),
+                    "failed",
+                    directive.attempt.saturating_add(1),
+                    "",
+                    Vec::new(),
+                );
+                let _ = app.emit("mini://stuck", report);
+            }
             // Slice 3 (seam C, bypass path): close the Pigeon ticket for this terminal reap too.
             pigeon_egress_terminal_by_id(app, stuck_id);
         }
@@ -1019,6 +1037,19 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             // FIX 2: terminate the live console too (parent-gone reap) — OUTSIDE the lock,
             // before the `continue`. Without this the console is stuck running:true forever.
             console_mark_stopped(app, directive);
+            // v6 Phase 5: emit the structured stuck report from this reap path too
+            // (parent-gone is a terminal failure, not a normal abort). Skip when
+            // the human hit Stop (that's an abort, not a stuck mini).
+            if !directive.kill_requested {
+                let report = crate::backend::stuck_report::StuckReport::new(
+                    id.clone(),
+                    "failed",
+                    directive.attempt.saturating_add(1),
+                    "",
+                    Vec::new(),
+                );
+                let _ = app.emit("mini://stuck", report);
+            }
             // Slice 3 (seam C, bypass path): close the Pigeon ticket for this terminal reap.
             pigeon_egress_terminal_by_id(app, &id);
             continue;
@@ -2077,15 +2108,13 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
                 super::mini_activity::set_terminal(
                     a,
                     super::mini_activity::Banner {
-                        // A failed/timed-out mini must NOT show a green "Done ✓" — use the
-                        // neutral Stop banner (same as the other terminal-reap paths).
-                        kind: if matches!(
-                            outcome.status,
-                            MiniCoderStatus::Failed | MiniCoderStatus::Timeout
-                        ) {
-                            super::mini_activity::BannerKind::Stop
-                        } else {
+                        // A failed/timed-out/aborted mini must NOT show a green "Done ✓" —
+                        // ONLY a real Done shows Done; everything else is Stop (same as
+                        // the other terminal-reap paths).
+                        kind: if matches!(outcome.status, MiniCoderStatus::Done) {
                             super::mini_activity::BannerKind::Done
+                        } else {
+                            super::mini_activity::BannerKind::Stop
                         },
                         title: None,
                         sub: Some(format!(
