@@ -5656,6 +5656,25 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     if !config.project_id.trim().is_empty() {
         pairs.push(("DEVBOULE_PROJECT_ID", config.project_id.clone()));
     }
+    // v6 Phase 4 (resume): a STABLE-per-project session file so a re-spawned orchestrator
+    // resumes its cumulative conversation instead of starting fresh. Placed in the steer
+    // file's directory (the per-agent-state area), keyed by project id. SAFE by design: if
+    // the path is not actually stable across re-spawns, resume simply never triggers and
+    // the orchestrator starts fresh (today's behavior) — never a regression.
+    if !config.project_id.trim().is_empty() && !config.steer_file.trim().is_empty() {
+        if let Some(dir) = std::path::Path::new(&config.steer_file).parent() {
+            let safe_id: String = config
+                .project_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let session_path = dir.join(format!("devboule-session-{safe_id}.txt"));
+            pairs.push((
+                "DEVBOULE_SESSION_FILE",
+                session_path.to_string_lossy().into_owned(),
+            ));
+        }
+    }
     // 3b — plan-first bias. Appended ONLY when set ("1"); when the toggle was OFF the
     // field is empty and the pair is omitted entirely, so a non-plan-first launch is
     // byte-identical to a pre-3b one. Non-secret.

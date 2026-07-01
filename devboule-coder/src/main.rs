@@ -27,6 +27,7 @@ mod prompt;
 mod reply_stream;
 mod rmcp_backend;
 mod runner;
+mod session_persist;
 mod skills;
 mod steer;
 mod terminal;
@@ -215,17 +216,34 @@ async fn run_session(goal: String) -> std::io::Result<()> {
     println!("goal: {goal}");
     println!("--- transcript ---");
 
-    // Surface the launch goal as the FIRST user chat turn (so the panel chat shows
-    // the user side from the bridge, in order, like every later steer).
-    runtime.executor.emit_chat("user", &goal);
+    // v6 Phase 4 (resume): if the launcher set DEVBOULE_SESSION_FILE and a prior
+    // conversation was persisted there, resume from it instead of starting fresh from the
+    // goal — so a restarted orchestrator keeps its planning context.
+    let session_file = std::env::var("DEVBOULE_SESSION_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    let resumed = session_file.as_deref().and_then(session_persist::load);
 
-    let mut conversation = goal;
+    // Surface the launch goal as the FIRST user chat turn ONLY on a fresh start (on a
+    // resume the goal is already the head of the restored conversation).
+    if resumed.is_none() {
+        runtime.executor.emit_chat("user", &goal);
+    } else {
+        println!("--- resumed prior session ---");
+    }
+
+    let mut conversation = resumed.unwrap_or(goal);
     loop {
         // Reviewer F3: the cumulative conversation is the NON-evictable `human`
         // message of every burst, so it must be bounded or a long planning session
         // overflows the model context. Keep the head (the original goal + early
         // framing) and the recent tail.
         conversation = trim_conversation(conversation, conversation_budget_chars());
+        // v6 Phase 4: persist the accumulated conversation each turn (best-effort).
+        if let Some(ref f) = session_file {
+            let _ = session_persist::save(f, &conversation);
+        }
         let outcome = run_one_burst(&runtime, conversation.clone()).await?;
         let prior = match outcome {
             // The reply was already emitted as a chat bubble by the burst — do NOT
