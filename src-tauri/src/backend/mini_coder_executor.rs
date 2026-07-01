@@ -1908,8 +1908,37 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // before the emit checks below.
     let was_net_blocked = outcome.net_blocked;
     let was_folder_write_blocked = outcome.folder_write_blocked.clone();
-    let (outcome, write_diffs) =
+    let (mut outcome, write_diffs) =
         apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
+
+    // v6 Phase 2 (anti-cheat): scan the mini's edits for attempts to GAME the tests
+    // (skip/ignore markers, trivial always-true asserts, test-infra edits) instead of
+    // making the code pass. Non-blocking — surface it in the outcome for the human/verifier.
+    if !outcome.edits.is_empty() {
+        // Scope the EditView borrow of `outcome.edits` so it ends before we mutate
+        // `outcome.output` below (`detect_test_gaming` returns an owned Vec).
+        let gaming = {
+            let edits: Vec<crate::backend::tdd_strict::EditView> = outcome
+                .edits
+                .iter()
+                .map(|e| crate::backend::tdd_strict::EditView {
+                    path: e.path.as_str(),
+                    new_string: e.new_string.as_str(),
+                })
+                .collect();
+            crate::backend::tdd_strict::detect_test_gaming(&edits)
+        };
+        if !gaming.is_empty() {
+            let note = format!(
+                "\n\n⚠️ TDD anti-gaming: this change may be gaming the tests:\n- {}",
+                gaming.join("\n- ")
+            );
+            match outcome.output {
+                Some(ref mut o) => o.push_str(&note),
+                None => outcome.output = Some(note),
+            }
+        }
+    }
 
     // Phase A: async Censor fast runners on modified files (3s timeout, non-blocking).
     // Findings now reach the UI via the "censor://mini-findings" event and remain
