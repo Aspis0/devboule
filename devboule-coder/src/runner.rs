@@ -195,6 +195,11 @@ pub async fn run_tasks(
     );
 
     let mut attempts: HashMap<String, u32> = HashMap::new();
+    // v6 Phase 4 (SUMMARY-feeding): completed-task summaries recorded IN THIS RUN so a
+    // dependent task's spawn can carry what its dependencies actually produced. In-memory
+    // only — a dep completed in a PRIOR run (pre-restart) simply yields no summary
+    // (graceful; cross-run persistence is a separate concern).
+    let mut summaries: HashMap<String, String> = HashMap::new();
     const MAX_ITER_BOUND: usize = crate::planner::MAX_TASKS
         .saturating_mul(MAX_TASK_ATTEMPTS as usize + 1)
         .saturating_add(1);
@@ -299,13 +304,23 @@ pub async fn run_tasks(
         // whole `plan` Vec into the closure, and we still need `plan` afterwards); TaskView is
         // Clone + cheap. mcp/activity are shared refs (Send+Sync), copied into each future. Sort
         // by idx so the post-batch processing + any block report is deterministic.
-        let selected: Vec<(usize, TaskView)> = selected_indices
+        let selected: Vec<(usize, TaskView, Vec<(String, String)>)> = selected_indices
             .iter()
-            .map(|&idx| (idx, plan[idx].clone()))
+            .map(|&idx| {
+                let t = plan[idx].clone();
+                // Gather the summaries of this task's already-completed dependencies (they
+                // ran in a prior iteration; batch siblings never depend on each other).
+                let deps: Vec<(String, String)> = t
+                    .depends_on
+                    .iter()
+                    .filter_map(|d| summaries.get(d).map(|s| (d.clone(), s.clone())))
+                    .collect();
+                (idx, t, deps)
+            })
             .collect();
         let mut results: Vec<(usize, MiniVerdict)> = futures::stream::iter(selected)
-            .map(|(idx, task)| async move {
-                (idx, run_one_task(mcp, project_id, &task, activity).await)
+            .map(|(idx, task, deps)| async move {
+                (idx, run_one_task(mcp, project_id, &task, activity, &deps).await)
             })
             .buffer_unordered(MAX_PARALLEL_TASKS)
             .collect()
@@ -346,6 +361,9 @@ pub async fn run_tasks(
                     }
                     newly_reviewed += 1;
                     activity.milestone(&format!("review {}", task.id), Node::Sage);
+                    // v6 Phase 4: record this task's summary so its dependents can be
+                    // spoon-fed what it produced (consumed in build_spawn_params).
+                    summaries.insert(task.id.clone(), evidence);
                 }
                 MiniVerdict::Blocked(reason) => {
                     let (status, reason) =
@@ -408,6 +426,7 @@ async fn run_one_task(
     project_id: &str,
     task: &TaskView,
     activity: &Activity,
+    dep_summaries: &[(String, String)],
 ) -> MiniVerdict {
     if let Err(e) = claim_task(mcp, project_id, &task.id).await {
         return MiniVerdict::Blocked(format!("could not claim the task: {}", elide(&e)));
@@ -416,7 +435,7 @@ async fn run_one_task(
         &format!("running {}: {}", task.id, elide(&task.title)),
         Node::Hollow,
     );
-    let params = build_spawn_params(task);
+    let params = build_spawn_params(task, dep_summaries);
     match mcp.call_tool("spawn_mini_coder", params).await {
         Ok(text) => parse_mini_status(&text),
         Err(e) => MiniVerdict::Blocked(format!("spawn_mini_coder failed: {}", elide(&e))),
@@ -712,13 +731,22 @@ async fn block_best_effort(
 /// instruction stream. The mini's own prompt-injection firewall (it treats the whole
 /// delegated task as untrusted input, see `mini_coder.rs`) is the BACKSTOP; this is a
 /// labelling/bounding layer, not the security boundary itself.
-fn build_spawn_params(task: &TaskView) -> serde_json::Value {
+fn build_spawn_params(task: &TaskView, dep_summaries: &[(String, String)]) -> serde_json::Value {
     let mut text = task.title.trim().to_string();
     if !task.acceptance.trim().is_empty() {
         // Bound the model-generated acceptance behind its own LABEL (see the trust-model
         // note above) so it reads as the success bar, distinct from the title/task above.
         text.push_str("\n\nAcceptance: ");
         text.push_str(task.acceptance.trim());
+    }
+    // v6 Phase 4 (SUMMARY-feeding): front-load what this task's completed dependencies
+    // produced, so the mini has the context without re-deriving it. Bounded per-dependency;
+    // the whole text is capped below at MAX_DELEGATED_TASK_CHARS.
+    if !dep_summaries.is_empty() {
+        text.push_str("\n\nContext from completed dependencies (already done):");
+        for (id, summary) in dep_summaries {
+            text.push_str(&format!("\n- {}: {}", id, cap_chars(summary.trim(), 400)));
+        }
     }
     let text = cap_chars(&text, MAX_DELEGATED_TASK_CHARS);
     serde_json::json!({
@@ -838,6 +866,33 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    #[test]
+    fn build_spawn_params_front_loads_dependency_summaries() {
+        let task = TaskView {
+            id: "T2".into(),
+            title: "implement login".into(),
+            status: "todo".into(),
+            depends_on: vec!["T1".into()],
+            scope: vec!["src/auth.rs".into()],
+            acceptance: "cargo test auth".into(),
+            plan_id: "P".into(),
+            updated_at: "t".into(),
+        };
+        // With a completed-dependency summary → it is front-loaded.
+        let deps = vec![("T1".to_string(), "created the auth module in auth.rs".to_string())];
+        let params = build_spawn_params(&task, &deps);
+        let text = params["task"].as_str().unwrap();
+        assert!(text.contains("Context from completed dependencies"), "dep section present");
+        assert!(text.contains("T1"), "dep id present");
+        assert!(text.contains("created the auth module"), "dep summary present");
+        // With no dependency summaries → no section (unchanged behavior).
+        let none = build_spawn_params(&task, &[]);
+        assert!(
+            !none["task"].as_str().unwrap().contains("Context from completed dependencies"),
+            "no dep section when there are no summaries"
+        );
+    }
 
     /// A MOCK Kanban backend. It holds the project's task list (mutated in place as the
     /// runner advances cards, so a re-read reflects prior transitions), returns SCRIPTED
