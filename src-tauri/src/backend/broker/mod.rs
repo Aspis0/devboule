@@ -39,17 +39,14 @@ use std::collections::{HashMap, HashSet};
 /// The default is `Ask`, which is equivalent to omitting the field from disk (NO-CHURN).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum SandboxMode {
+    #[default]
     Ask,
     AutoAcceptInWorkspace,
     Unattended,
 }
 
-impl Default for SandboxMode {
-    fn default() -> Self {
-        SandboxMode::Ask
-    }
-}
 
 impl SandboxMode {
     /// Returns `true` when this mode should emit a net-consent prompt to the frontend.
@@ -268,7 +265,7 @@ impl PermissionBrokerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         map.entry(project_id.to_string())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(folder.to_string());
     }
 
@@ -339,7 +336,7 @@ impl PermissionBrokerState {
         if !folders.is_empty() {
             let slot = folder_map
                 .entry(project_id.to_string())
-                .or_insert_with(HashSet::new);
+                .or_default();
             for f in folders {
                 slot.insert(f.clone());
             }

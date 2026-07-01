@@ -733,7 +733,7 @@ fn handle_codex_approval(
     // Codex could otherwise exhaust the OS thread limit).
     if codex.in_flight_approvals() >= MAX_INFLIGHT_APPROVALS {
         append_codex_milestone(
-            &activity_file.to_path_buf(),
+            activity_file,
             "⚠ Too many pending Codex approvals — declined",
         );
         write_codex_line(
@@ -965,7 +965,7 @@ fn is_response(v: &serde_json::Value) -> bool {
 /// `requestApproval` with a string id would otherwise be misclassified as a notification, dropped,
 /// and leave the Codex turn hanging.
 fn is_server_request(v: &serde_json::Value) -> bool {
-    v.get("id").map_or(false, |i| !i.is_null()) && msg_method(v).is_some()
+    v.get("id").is_some_and(|i| !i.is_null()) && msg_method(v).is_some()
 }
 
 /// A one-way notification: has `method` and no `id`. The dispatcher routes notifications by
@@ -976,7 +976,7 @@ fn is_notification(v: &serde_json::Value) -> bool {
     // id-type-agnostic (mirror is_server_request): a notification has a method and NO id of any
     // type (absent or null). Using `msg_id` (u64) here would misclassify a string-id server
     // request as a notification — adversarial-verify C1.
-    msg_method(v).is_some() && v.get("id").map_or(true, |i| i.is_null())
+    msg_method(v).is_some() && v.get("id").is_none_or(|i| i.is_null())
 }
 
 /// The session-scoped decision we send back as the `result` of an approval request.

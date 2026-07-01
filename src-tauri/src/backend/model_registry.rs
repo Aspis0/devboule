@@ -30,6 +30,20 @@ pub struct ModelRegistryEntry {
     pub top_p: Option<f64>,
     pub top_k: Option<u32>,
     pub thinking_budget: Option<u32>,
+    /// Model context window in tokens (e.g. 262144 for Qwopus 35B, 160000 for Qwen 27B).
+    /// Used to compute the 70% compaction threshold. Default 8192 (safe minimum).
+    #[serde(default = "default_context_window", deserialize_with = "deserialize_context_window")]
+    pub context_window: usize,
+}
+
+#[allow(dead_code)]
+fn default_context_window() -> usize { 8192 }
+
+fn deserialize_context_window<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<usize>::deserialize(d)?.unwrap_or_else(default_context_window))
 }
 
 const MAX_REGISTRY_ENTRIES: usize = 64;
@@ -81,6 +95,22 @@ pub fn validate_model_registry(
             if b > 32_768 {
                 return Err(format!("thinking_budget {b} exceeds maximum (32768)."));
             }
+        }
+
+        // context_window bounds: reject 0 (would make Phase B's 0.7*window threshold 0 →
+        // divide-by-zero / always-compact) and absurd values. Floor 1024 (tiny but sane),
+        // ceiling 2_097_152 (2M tokens — covers every 2026 model, blocks garbage).
+        if entry.context_window < 1024 {
+            return Err(format!(
+                "context_window {} is below minimum (1024). Set a real context window (tokens).",
+                entry.context_window
+            ));
+        }
+        if entry.context_window > 2_097_152 {
+            return Err(format!(
+                "context_window {} exceeds maximum (2097152). Set a real context window (tokens).",
+                entry.context_window
+            ));
         }
 
         let key = (entry.backend.clone(), entry.id.clone());
@@ -190,6 +220,13 @@ pub struct DiscoveredModel {
     /// Size-RECOMMENDED tier ("agentic" >= 20B / "emitEdits" < 20B). A UI hint ONLY —
     /// the user's curated tier always wins and nothing gates on this.
     pub recommended_tier: String,
+    /// Model context window in tokens, if detected from the backend API.
+    /// Best-effort: omlx `/v1/models` and ollama `/api/tags` do NOT always expose this,
+    /// so it may be None. The curated `ModelRegistryEntry.context_window` (default 8192)
+    /// is the source of truth; this is a detection hint only. (Serialize-only type — no
+    /// serde default needed.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
 }
 
 /// Best-effort parameter count in billions: from the Ollama `param_size` ("30B") when
@@ -258,6 +295,8 @@ pub async fn discover_installed_models() -> Result<Vec<DiscoveredModel>, String>
                             size_bytes: 0,
                             param_size: None,
                             quant: None,
+                            // omlx /v1/models does not expose context_length; leave None.
+                            context_window: None,
                             // oMLX gives no size → recommend from the model name.
                             recommended_tier: recommended_tier(id, None),
                         });
@@ -291,6 +330,11 @@ pub async fn discover_installed_models() -> Result<Vec<DiscoveredModel>, String>
                             size_bytes: size,
                             param_size,
                             quant,
+                            // Best-effort: some ollama models expose context_length in details.
+                            context_window: details
+                                .and_then(|d| d.get("context_length"))
+                                .and_then(|c| c.as_u64())
+                                .map(|c| c as usize),
                             recommended_tier: rec_tier,
                         });
                     }
@@ -326,5 +370,78 @@ mod tests {
         assert_eq!(model_param_billions("Qwen3.5-9B-MLX-4bit", None), Some(9.0));
         assert_eq!(model_param_billions("no-size", None), None);
         assert_eq!(model_param_billions("x", Some("405B")), Some(405.0));
+    }
+
+    #[test]
+    fn model_registry_entry_has_context_window_field() {
+        let entry = ModelRegistryEntry {
+            id: "m".into(),
+            backend: "omlx".into(),
+            size_bytes: 0,
+            tier: "agentic".into(),
+            roles: vec![],
+            enabled: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking_budget: None,
+            context_window: 160000,
+        };
+        assert_eq!(entry.context_window, 160000);
+    }
+
+    #[test]
+    fn discovered_model_has_optional_context_window() {
+        let dm = DiscoveredModel {
+            id: "x".into(),
+            backend: "omlx".into(),
+            size_bytes: 0,
+            param_size: None,
+            quant: None,
+            recommended_tier: "emitEdits".into(),
+            context_window: Some(32768),
+        };
+        assert_eq!(dm.context_window, Some(32768));
+
+        // None must also be valid (model without detected window)
+        let dm_none = DiscoveredModel {
+            id: "y".into(),
+            backend: "ollama".into(),
+            size_bytes: 0,
+            param_size: None,
+            quant: None,
+            recommended_tier: "emitEdits".into(),
+            context_window: None,
+        };
+        assert_eq!(dm_none.context_window, None);
+    }
+
+    #[test]
+    fn validate_model_registry_rejects_zero_context_window() {
+        let bad = ModelRegistryEntry {
+            id: "m".into(),
+            backend: "omlx".into(),
+            size_bytes: 0,
+            tier: "agentic".into(),
+            roles: vec![],
+            enabled: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking_budget: None,
+            context_window: 0,
+        };
+        let res = validate_model_registry(&[bad]);
+        assert!(res.is_err(), "context_window 0 must be rejected");
+        assert!(res.unwrap_err().to_lowercase().contains("context_window"));
+    }
+
+    #[test]
+    fn deserialize_config_without_context_window_uses_default() {
+        // Note: size_bytes is required (no default). The test ensures contextWindow
+        // defaults to 8192 when omitted, but all required fields must be present.
+        let json = r#"{"id":"m","backend":"omlx","sizeBytes":0,"tier":"agentic","roles":[],"enabled":true}"#;
+        let entry: ModelRegistryEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.context_window, 8192, "backward compat: missing contextWindow backfills default 8192");
     }
 }

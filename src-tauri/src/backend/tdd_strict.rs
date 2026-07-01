@@ -95,7 +95,7 @@ pub fn detect_test_gaming(edits: &[EditView]) -> Vec<String> {
 
         // Check test-infrastructure files
         let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        let is_infra = infra_names.iter().any(|name| file_name == *name)
+        let is_infra = infra_names.contains(&file_name)
             || infra_prefixes.iter().any(|prefix| file_name.starts_with(prefix));
 
         if is_infra {

@@ -35,6 +35,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter};
 
+use crate::backend::censor::schema::{Disposition, Finding, FindingBatch};
 use crate::backend::training_export::{self, FindingLite};
 
 /// The source name the Gemma tier stamps onto its findings. Centralized so the
@@ -561,13 +562,31 @@ fn run_fine_batch_inner(
         emit_scan_started(app, project_id, "fine", files.len(), running);
     }
     let changed = fine_batch_collect(root, files, gemma);
+    // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
+    // and write a steer file so the main coder sees them next turn.
+    // Phase A already delivers fine findings synchronously. Write the steer
+    // cache for immediate delivery, but do NOT enqueue to persistent queue.
+    let steer_dir = root.join(".aspis");
+    let _ = std::fs::create_dir_all(&steer_dir);
+    let steer_findings = collect_open_findings(root, &changed);
+    if !steer_findings.is_empty() {
+        let text = format!(
+            "=== [Censor fine Check] ===\n{}\n=== [End Censor] ===\n",
+            crate::backend::censor::commands::format_findings_text(&steer_findings)
+        );
+        std::fs::write(steer_dir.join("steer_censor"), text).ok();
+    }
     // TRAINING RAIL: record findings for every changed file while the project is
     // still running. Agent-state snapshot is read under its lock, cloned to owned
     // Vecs, and the lock is released BEFORE calling into training_export (lock-
     // ordering contract: training_export's JSONL lock must never nest inside the
     // agent-state lock). SKIPPED when `record_rail` is false (the verdict gate path —
     // the watcher records the same file change to avoid duplicate pairs.jsonl lines).
-    if should_record_rail(record_rail, running.load(Ordering::SeqCst), changed.is_empty()) {
+    if should_record_rail(
+        record_rail,
+        running.load(Ordering::SeqCst),
+        changed.is_empty(),
+    ) {
         record_findings_for_batch(app, root, &changed);
     }
     emit_if_running(app, project_id, changed, running);
@@ -729,6 +748,10 @@ pub fn run_coarse_pass(app: &AppHandle, project_id: &str, root: &Path, running: 
     }
     emit_scan_started(app, project_id, "coarse", 0, running);
     let changed = coarse_pass_collect(root);
+    // DEEP CHECK STEER (Step 6): collect open findings from changed-file shards
+    // and write a steer file so the main coder sees them next turn.
+    let steer_findings = collect_open_findings(root, &changed);
+    enqueue_censor_findings(root, &steer_findings, &changed, "coarse");
     // TRAINING RAIL: same lock-ordering discipline as run_fine_batch.
     if running.load(Ordering::SeqCst) && !changed.is_empty() {
         record_findings_for_batch(app, root, &changed);
@@ -868,8 +891,7 @@ fn files_with_sources(root: &Path, sources: &BTreeSet<String>) -> Vec<String> {
 /// never propagated here — a training hiccup must never perturb the live pipeline.
 fn record_findings_for_batch(app: &AppHandle, root: &Path, changed: &[String]) {
     // 1) Read agent-state snapshot under its lock, clone to owned Vecs, release.
-    let (directives, sessions) = match crate::backend::agents::read_agent_live_state_snapshot(app)
-    {
+    let (directives, sessions) = match crate::backend::agents::read_agent_live_state_snapshot(app) {
         Ok(snap) => (snap.mini_coder_directives, snap.sessions),
         Err(_) => {
             // Agent state unreadable (e.g. first run before state file exists): proceed
@@ -940,10 +962,93 @@ fn emit_scan_started(
     }
 }
 
+/// Collect all Open findings for the given files by reading their Censor shards.
+fn collect_open_findings(root: &Path, files: &[String]) -> Vec<Finding> {
+    files
+        .iter()
+        .filter_map(|file| {
+            crate::backend::censor::ledger::read_shard(root, file)
+                .ok()
+                .flatten()
+        })
+        .flat_map(|shard| shard.findings)
+        .filter(|f| f.disposition == Disposition::Open)
+        .collect()
+}
+
+/// Emit a steer file so the main coder sees deep-check findings next turn.
+/// Called after slow/deep Censor runners complete (Step 6 of the injection plan).
+/// Enqueue Censor findings to the persistent queue AND write the immediate
+/// steer file as best-effort cache. The queue survives restarts; the steer
+/// file is a shortcut for the local devboule-coder's burst loop.
+fn enqueue_censor_findings(root: &Path, findings: &[Finding], files: &[String], pass_type: &str) {
+    if findings.is_empty() {
+        return;
+    }
+    // ── persistent queue (survives restart, accumulates) ──
+    let queue_dir = root.join(".aspis").join("censor_queue").join("pending");
+    if let Err(e) = std::fs::create_dir_all(&queue_dir) {
+        eprintln!(
+            "censor queue: failed to create {}: {e}",
+            queue_dir.display()
+        );
+        return; // FIX 4: don't silently swallow — log and bail
+    }
+
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in findings {
+        f.id.hash(&mut h);
+    }
+    let hash_suffix = format!("{:04x}", h.finish() & 0xFFFF);
+
+    let now = chrono::Utc::now();
+    // FIX 1: no colons in filename (illegal on Windows)
+    let batch = FindingBatch {
+        batch_id: format!("{}_{}", now.format("%Y-%m-%dT%H%M%S"), hash_suffix),
+        timestamp: now.to_rfc3339(),
+        pass_type: pass_type.to_string(),
+        files: files.to_vec(),
+        findings: findings.to_vec(),
+    };
+    let path = queue_dir.join(format!("{}.json", batch.batch_id));
+    // FIX 2: don't write empty string on serialize failure
+    match serde_json::to_string(&batch) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, &json) {
+                eprintln!("censor queue: write failed for {}: {e}", path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "censor queue: serialize failed for batch {}: {e}",
+                batch.batch_id
+            );
+        }
+    }
+
+    // ── immediate steer cache (best-effort, for burst loop) ──
+    let steer_dir = root.join(".aspis");
+    let _ = std::fs::create_dir_all(&steer_dir);
+    let text = format!(
+        "=== [Censor {} Check] ===\n{}\n=== [End Censor] ===\n",
+        pass_type,
+        crate::backend::censor::commands::format_findings_text(findings)
+    );
+    std::fs::write(steer_dir.join("steer_censor"), text).ok();
+
+    // FIX 3 (documented): narrow TOCTOU window between collect_open_findings
+    // shard read and this queue write — the Python MCP can censor_dispose a
+    // finding in between. Accepted: the queue delivers a best-effort snapshot
+    // and the main coder can re-dispose stale findings. Full fix would require
+    // re-checking disposition after collect, but the window is microseconds
+    // and the cost is correctness, not data loss.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::censor::schema::{Category, Severity};
+    use crate::backend::censor::schema::{Category, FindingBatch, Severity};
 
     fn kinds(list: &[ProjectKind]) -> HashSet<ProjectKind> {
         list.iter().copied().collect()
@@ -1949,8 +2054,15 @@ mod tests {
         };
         let refreshed: std::collections::BTreeSet<String> =
             [source.to_string()].into_iter().collect();
-        read_supersede_write_shard(root, vec![f], &hash, &refreshed, rel, "2026-01-01T00:00:00Z")
-            .unwrap();
+        read_supersede_write_shard(
+            root,
+            vec![f],
+            &hash,
+            &refreshed,
+            rel,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1971,8 +2083,8 @@ mod tests {
         // AppHandle for agent state), so we call `training_export::record_findings_batch`
         // directly — which is the exact call site it dispatches to, reproducing the same
         // behaviour without needing a Tauri runtime.
-        use crate::backend::training_export;
         use crate::backend::censor::schema::Severity;
+        use crate::backend::training_export;
 
         let dir = unique_temp_root("train-batch");
         let root = dir.as_path();
@@ -2024,9 +2136,7 @@ mod tests {
         training_export::record_findings_batch(root, &changed, shard_lookup, &[], &[]);
 
         // Verify findings.jsonl was written with two lines.
-        let findings_path = root
-            .join(".aspis-training")
-            .join("findings.jsonl");
+        let findings_path = root.join(".aspis-training").join("findings.jsonl");
         assert!(
             findings_path.exists(),
             ".aspis-training/findings.jsonl must be created"
@@ -2094,7 +2204,59 @@ mod tests {
             "gate path (record_rail=false) must skip the training rail"
         );
         // Defensive: even the watcher path skips when stopped or nothing changed.
-        assert!(!should_record_rail(true, false, false), "stopped worker skips rail");
-        assert!(!should_record_rail(true, true, true), "no changed shards -> no rail");
+        assert!(
+            !should_record_rail(true, false, false),
+            "stopped worker skips rail"
+        );
+        assert!(
+            !should_record_rail(true, true, true),
+            "no changed shards -> no rail"
+        );
+    }
+
+    #[test]
+    fn enqueue_censor_findings_creates_batch_file() {
+        let root =
+            std::env::temp_dir().join(format!("aspis-censor-queue-test-{}", std::process::id()));
+        // Clean up after test
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let f = vec![Finding {
+            id: "abc".into(),
+            severity: Severity::High,
+            title: "test bug".into(),
+            file: "src/a.rs".into(),
+            source: "clippy".into(),
+            line: Some(42),
+            category: Category::Correctness,
+            ..Default::default()
+        }];
+        enqueue_censor_findings(&root, &f, &["src/a.rs".into()], "coarse");
+        let queue_dir = root.join(".aspis").join("censor_queue").join("pending");
+        let entries: Vec<_> = std::fs::read_dir(&queue_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "one batch file created");
+        assert!(entries[0].path().to_str().unwrap().ends_with(".json"));
+        // Steer cache also written for immediate delivery
+        assert!(root.join(".aspis").join("steer_censor").exists());
+    }
+
+    #[test]
+    fn enqueue_censor_findings_empty_skips() {
+        let root =
+            std::env::temp_dir().join(format!("aspis-censor-empty-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        enqueue_censor_findings(&root, &[], &[], "coarse");
+        assert!(
+            !root.join(".aspis").join("censor_queue").exists(),
+            "no queue dir when findings empty"
+        );
+        assert!(
+            !root.join(".aspis").join("steer_censor").exists(),
+            "no steer file when findings empty"
+        );
     }
 }

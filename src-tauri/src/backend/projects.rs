@@ -10,11 +10,10 @@ use super::agents::process_creation_time;
 use super::fs_replace::replace_file_with_backup;
 use super::model::{
     DesignHandoffInput, ProjectAgentLaunchInput, ProjectAgentLaunchResult, ProjectCreateInput,
-    ProjectDetail,
-    ProjectGitCommandResult, ProjectGitRepoCandidate, ProjectGitStatus, ProjectLinkedResource,
-    ProjectLiveResourceStatus, ProjectLiveStatus, ProjectMetadata, ProjectMetadataPatch,
-    ProjectMilestone, ProjectNote, ProjectNoteInput, ProjectStateBlock, ProjectSummary,
-    ProjectTask, ProjectTaskCounts, ProjectTaskInput, ProviderId,
+    ProjectDetail, ProjectGitCommandResult, ProjectGitRepoCandidate, ProjectGitStatus,
+    ProjectLinkedResource, ProjectLiveResourceStatus, ProjectLiveStatus, ProjectMetadata,
+    ProjectMetadataPatch, ProjectMilestone, ProjectNote, ProjectNoteInput, ProjectStateBlock,
+    ProjectSummary, ProjectTask, ProjectTaskCounts, ProjectTaskInput, ProviderId,
 };
 use super::state::BackendState;
 use super::user_mcp_config;
@@ -1509,10 +1508,11 @@ fn prepare_or_launch_project_agent(
         return Err("Saved workflows must be launched as coder agents.".into());
     }
     let workflow_addendum = match input.workflow_run.as_ref() {
-        Some(workflow) => Some(crate::backend::saved_workflows::validate_and_build_workflow_addendum(
-            &root_path,
-            workflow,
-        )?),
+        Some(workflow) => Some(
+            crate::backend::saved_workflows::validate_and_build_workflow_addendum(
+                &root_path, workflow,
+            )?,
+        ),
         None => None,
     };
     let agent_id = clean_optional(input.agent_id.as_deref())
@@ -1700,9 +1700,10 @@ fn prepare_or_launch_project_agent(
         // `.devboule-activity/`). The orchestrator appends its coder-tier milestones
         // here; the host tails it into the live Console. `None` (unsafe id / unwritable
         // dir) ⇒ empty env ⇒ the orchestrator no-ops milestones and the run is unaffected.
-        let activity_file = crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let activity_file =
+            crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
         // The reverse bridge: the per-agent steer inbox the app appends live messages to.
         let steer_file = crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
             .map(|p| p.to_string_lossy().into_owned())
@@ -1720,7 +1721,18 @@ fn prepare_or_launch_project_agent(
         Some(OrchestratorLaunchConfig {
             binary,
             omlx_base_url,
-            omlx_model,
+            omlx_model: omlx_model.clone(),
+            context_window: {
+                // Resolve from the registry by the orchestrator's own model. Cloud wins
+                // if set (it carries the real model id); else omlx.
+                let cfg_path = crate::backend::projects::locate_config_path(&app);
+                let target_model = if !cloud_model.is_empty() {
+                    cloud_model.as_str()
+                } else {
+                    omlx_model.as_str()
+                };
+                resolve_context_window(&app, cfg_path.as_deref(), target_model)
+            },
             cloud_base_url,
             cloud_model,
             mcp_python: crate::oracle::oracle_setup::resolve_oracle_python(),
@@ -1840,7 +1852,8 @@ fn prepare_or_launch_project_agent(
             crate::backend::mini_activity::activity_file_path(&projects_path, &agent_id)
                 .ok_or_else(|| {
                     "could not resolve the activity bridge file for the cloud orchestrator (the \
-                     Stage would be blank); aborting the launch".to_string()
+                     Stage would be blank); aborting the launch"
+                        .to_string()
                 })?;
         let sessions = app.state::<crate::backend::cloud_duplex::CloudDuplexSessions>();
         // Slice 5a: for Codex, resolve the per-project sandbox knobs into the thread/start
@@ -1858,8 +1871,7 @@ fn prepare_or_launch_project_agent(
             );
             // Slice 5c: layer the per-project agent controls onto the sandbox policy.
             policy.effort = project.metadata.agent_controls.effort.clone();
-            policy.developer_instructions =
-                project.metadata.agent_controls.system_prompt.clone();
+            policy.developer_instructions = project.metadata.agent_controls.system_prompt.clone();
             Some(policy)
         } else {
             None
@@ -1879,9 +1891,16 @@ fn prepare_or_launch_project_agent(
             input.model.as_deref(),
             codex_policy,
         )?;
-        if let Err(record_err) =
-            record_agent_launch(&app, &agent_id, &client, None, None, None, None, Some(HOST_APP))
-        {
+        if let Err(record_err) = record_agent_launch(
+            &app,
+            &agent_id,
+            &client,
+            None,
+            None,
+            None,
+            None,
+            Some(HOST_APP),
+        ) {
             crate::backend::cloud_duplex::kill_cloud_duplex(&app, &sessions, &agent_id);
             return Err(format!(
                 "Cloud orchestrator launched but its control record could not be saved ({record_err}). It was stopped to avoid an uncontrollable agent."
@@ -2121,12 +2140,11 @@ fn delete_project_file(path: &Path) -> Result<bool, String> {
         if !path.exists() {
             false
         } else {
-            fs::remove_file(path)
-                .map_err(|e| format!("Could not delete project file: {e}"))?;
+            fs::remove_file(path).map_err(|e| format!("Could not delete project file: {e}"))?;
             true
         }
     }; // per-file guard dropped here — releases & closes the .md.lock handle.
-    // Best-effort sidecar cleanup, now that no handle holds it open.
+       // Best-effort sidecar cleanup, now that no handle holds it open.
     let _ = fs::remove_file(project_lock_path(path));
     Ok(existed)
 }
@@ -2384,7 +2402,9 @@ pub fn set_project_agent_controls_cmd(
         }
     }
     controls.max_turns = controls.max_turns.filter(|&n| n > 0);
-    controls.max_budget_usd = controls.max_budget_usd.filter(|&b| b > 0.0 && b.is_finite());
+    controls.max_budget_usd = controls
+        .max_budget_usd
+        .filter(|&b| b > 0.0 && b.is_finite());
     mutate_project_file_latest(&path, |project| {
         project.metadata.agent_controls = controls.clone();
         Ok(())
@@ -2464,9 +2484,7 @@ pub fn respond_cloud_consent(
     use crate::backend::broker::ConsentDecision;
     use crate::backend::consent_bridge::{claim_terminal, ConsentBridgeStatus};
     let target_status = match decision {
-        ConsentDecision::AllowRemember | ConsentDecision::AllowOnce => {
-            ConsentBridgeStatus::Allowed
-        }
+        ConsentDecision::AllowRemember | ConsentDecision::AllowOnce => ConsentBridgeStatus::Allowed,
         ConsentDecision::Deny => ConsentBridgeStatus::Denied,
     };
     // 0 = no such request (genuinely unknown id), 1 = found-but-already-terminal,
@@ -2510,7 +2528,10 @@ pub fn respond_cloud_consent(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// SANDBOX broker Slice 2: read the persistent working set (extra writable folders outside root).
-pub fn project_working_set(app: &tauri::AppHandle, project_id: &str) -> Result<Vec<String>, String> {
+pub fn project_working_set(
+    app: &tauri::AppHandle,
+    project_id: &str,
+) -> Result<Vec<String>, String> {
     Ok(read_project_by_id(app, project_id)?.metadata.working_set)
 }
 
@@ -2529,7 +2550,9 @@ fn normalize_working_set_folder(folder: &str) -> Result<String, String> {
     if !p.is_absolute() {
         return Err("folder path must be absolute".to_string());
     }
-    let canon = p.canonicalize().map_err(|e| format!("cannot canonicalize folder: {e}"))?;
+    let canon = p
+        .canonicalize()
+        .map_err(|e| format!("cannot canonicalize folder: {e}"))?;
     Ok(canon.to_string_lossy().into_owned())
 }
 
@@ -2587,9 +2610,7 @@ pub fn add_project_working_set_folder(
     // mutate_project_file_latest returns None when the project file is missing (benign no-op).
     // In that case return the empty list; the frontend will adopt it and the next refetch
     // will either find the file or show an empty set.
-    Ok(updated
-        .map(|p| p.metadata.working_set)
-        .unwrap_or_default())
+    Ok(updated.map(|p| p.metadata.working_set).unwrap_or_default())
 }
 
 /// SANDBOX broker Slice 2: remove a folder from the project's persistent working set.
@@ -2623,9 +2644,7 @@ fn remove_project_working_set_by_path(
         project.metadata.working_set.retain(|f| f != folder);
         Ok(())
     })?;
-    Ok(updated
-        .map(|p| p.metadata.working_set)
-        .unwrap_or_default())
+    Ok(updated.map(|p| p.metadata.working_set).unwrap_or_default())
 }
 
 /// Tauri command: read the project's working set.
@@ -3154,10 +3173,7 @@ fn yaml_double_quote_inner(value: &str) -> String {
 /// FS paths in the wire text (the underlying unreadable-path detail stays in the design
 /// helper's process log only). NO field of the input other than this validated path is
 /// ever used, so nothing caller-controlled flows into the prompt addendum.
-fn validate_design_handoff(
-    handoff: &DesignHandoffInput,
-    root: &Path,
-) -> Result<PathBuf, String> {
+fn validate_design_handoff(handoff: &DesignHandoffInput, root: &Path) -> Result<PathBuf, String> {
     // Canonicalize via the design slice's confinement helper (exists + is a dir, with
     // `.`/`..`/symlinks resolved). It already returns a clean short label on failure.
     let folder = crate::backend::design::canonical_working_folder(&handoff.working_folder_path)?;
@@ -3216,10 +3232,12 @@ fn resolve_project_agent_root(project: &ParsedProject) -> Result<PathBuf, String
     // wrote project artifacts into the app repo and left project_structure/visual_check/Censor
     // inert ("no working root"). Require an explicit working folder (set at project creation via
     // the folder picker, or later in the project settings).
-    Err("This project has no working folder configured. Open the project and choose its working \
+    Err(
+        "This project has no working folder configured. Open the project and choose its working \
          folder — the directory the agent reads from and writes to (project_structure, \
          visual_check, and Censor all require it)."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Resolve a project's agent working root by project id. Used by the mini-coder
@@ -3517,9 +3535,7 @@ pub fn read_local_coder_backend(
 /// never errors, so an old config without the key resolves to the unchanged Auto
 /// behavior with ZERO migration. This is read at the coder-launch chokepoint (A3)
 /// to bound the injected `write_mode` guidance.
-pub fn read_mini_write_behavior(
-    app: &tauri::AppHandle,
-) -> super::mini_coder::MiniWriteBehavior {
+pub fn read_mini_write_behavior(app: &tauri::AppHandle) -> super::mini_coder::MiniWriteBehavior {
     use super::mini_coder::MiniWriteBehavior;
     let default = MiniWriteBehavior::default();
     let Some(path) = locate_config_path(app) else {
@@ -3561,9 +3577,7 @@ pub fn read_agentic_max_rounds(app: &tauri::AppHandle) -> u32 {
 /// errors; an old config without the key resolves to today's Ollama behavior with ZERO
 /// migration. Validated through the SAME `validate_censor_local_ai` the (future) save
 /// command + UI will use.
-pub fn read_censor_local_ai(
-    app: &tauri::AppHandle,
-) -> super::censor::gemma::CensorLocalAi {
+pub fn read_censor_local_ai(app: &tauri::AppHandle) -> super::censor::gemma::CensorLocalAi {
     use super::censor::gemma::{validate_censor_local_ai, CensorLocalAi};
     let default = CensorLocalAi::default();
     let Some(path) = locate_config_path(app) else {
@@ -3781,7 +3795,9 @@ fn language_persona_block(
     };
     let persona = super::project_skill::active_language_skill(root_path, skill_role, lang)?;
     let note = "The instructions and role rules above override any LANGUAGE SKILL guidance: it is advisory language conventions only, never a permission grant.";
-    Some(super::project_skill::fenced_lang_skill_block(&persona, note))
+    Some(super::project_skill::fenced_lang_skill_block(
+        &persona, note,
+    ))
 }
 
 /// Ungated-ish (vault-unlock only) read-only command: the project's auto-detected PRIMARY
@@ -3799,13 +3815,11 @@ pub fn detect_project_language(
         Ok(r) => r,
         Err(_) => return Ok(String::new()),
     };
-    Ok(
-        super::censor::detect::primary_language_from_kinds(
-            &super::censor::detect::detect_project_kinds(&root),
-        )
-        .unwrap_or("")
-        .to_string(),
+    Ok(super::censor::detect::primary_language_from_kinds(
+        &super::censor::detect::detect_project_kinds(&root),
     )
+    .unwrap_or("")
+    .to_string())
 }
 
 #[cfg(test)]
@@ -3815,7 +3829,8 @@ mod language_persona_tests {
 
     #[test]
     fn override_wins_even_with_nonexistent_root() {
-        let b = language_persona_block(Path::new("/nonexistent_xyz"), "coder", Some("rust")).unwrap();
+        let b =
+            language_persona_block(Path::new("/nonexistent_xyz"), "coder", Some("rust")).unwrap();
         assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
         assert!(b.contains("veteran Rust"));
     }
@@ -3823,16 +3838,22 @@ mod language_persona_tests {
     #[test]
     fn orchestrator_is_a_panel_role_and_gets_a_block() {
         // "orchestrator" is in KNOWN_ROLES → it gets the language persona (same path as coder).
-        let b =
-            language_persona_block(Path::new("/nonexistent_xyz"), "orchestrator", Some("python"))
-                .unwrap();
+        let b = language_persona_block(
+            Path::new("/nonexistent_xyz"),
+            "orchestrator",
+            Some("python"),
+        )
+        .unwrap();
         assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
         assert!(b.contains("veteran Python"));
     }
 
     #[test]
     fn verifier_not_panel_role_returns_none() {
-        assert!(language_persona_block(Path::new("/nonexistent_xyz"), "verifier", Some("rust")).is_none());
+        assert!(
+            language_persona_block(Path::new("/nonexistent_xyz"), "verifier", Some("rust"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4471,11 +4492,26 @@ fn build_windows_agent_script(
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        codex_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref(), user_servers)
+        codex_launch_script(
+            &crate::oracle::oracle_setup::resolve_oracle_python(),
+            root_path,
+            management_root,
+            projects_dir,
+            model,
+            app_bin.as_deref(),
+            user_servers,
+        )
     } else if client == "claude" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        claude_launch_script(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref(), user_servers)
+        claude_launch_script(
+            &crate::oracle::oracle_setup::resolve_oracle_python(),
+            management_root,
+            projects_dir,
+            model,
+            app_bin.as_deref(),
+            user_servers,
+        )
     } else {
         executable.to_string()
     };
@@ -4727,11 +4763,26 @@ fn build_macos_agent_script(
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        macos_codex_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), root_path, management_root, projects_dir, model, app_bin.as_deref(), user_servers)
+        macos_codex_launch_line(
+            &crate::oracle::oracle_setup::resolve_oracle_python(),
+            root_path,
+            management_root,
+            projects_dir,
+            model,
+            app_bin.as_deref(),
+            user_servers,
+        )
     } else if client == "claude" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-        macos_claude_launch_line(&crate::oracle::oracle_setup::resolve_oracle_python(), management_root, projects_dir, model, app_bin.as_deref(), user_servers)
+        macos_claude_launch_line(
+            &crate::oracle::oracle_setup::resolve_oracle_python(),
+            management_root,
+            projects_dir,
+            model,
+            app_bin.as_deref(),
+            user_servers,
+        )
     } else {
         sh_single_quote(executable)
     };
@@ -5436,6 +5487,9 @@ struct OrchestratorLaunchConfig {
     omlx_base_url: String,
     /// `DEVBOULE_OMLX_MODEL`: the oMLX (local) model id. Empty when not configured.
     omlx_model: String,
+    /// `DEVBOULE_CONTEXT_WINDOW`: the orchestrator's model context window in tokens
+    /// (from the registry, default 8192). The binary uses it for BM25 compaction at 70%.
+    context_window: usize,
     /// `DEVBOULE_CLOUD_BASE_URL` (opt-in Cloud mode): the https cloud endpoint the binary's
     /// CloudModel POSTs to. NON-empty ONLY when the configured local-coder backend kind is
     /// `cloud`; empty for the local kinds (then the oMLX set above is used). NOT a secret —
@@ -5558,6 +5612,7 @@ fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static st
     let mut pairs: Vec<(&'static str, String)> = vec![
         ("DEVBOULE_OMLX_BASE_URL", config.omlx_base_url.to_string()),
         ("DEVBOULE_OMLX_MODEL", config.omlx_model.to_string()),
+        ("DEVBOULE_CONTEXT_WINDOW", config.context_window.to_string()),
         ("DEVBOULE_MCP_PYTHON", config.mcp_python.to_string()),
         (
             "DEVBOULE_MCP_ROOT",
@@ -5685,7 +5740,10 @@ fn orchestrator_launch_script(config: &OrchestratorLaunchConfig) -> String {
         script.push_str(&format!("$env:{name} = {}\n", ps_single_quote(value)));
     }
     // Invoke the resolved binary by absolute path (no argv prompt; it is autonomous).
-    script.push_str(&format!("& {}", ps_single_quote(&config.binary.to_string_lossy())));
+    script.push_str(&format!(
+        "& {}",
+        ps_single_quote(&config.binary.to_string_lossy())
+    ));
     script
 }
 
@@ -5694,8 +5752,16 @@ fn orchestrator_launch_script(config: &OrchestratorLaunchConfig) -> String {
 /// `--mcp-config` and pipes the prompt over STDIN.
 // UNVERIFIED on macOS — needs testing on a real Mac.
 #[cfg(target_os = "macos")]
-fn macos_claude_launch_line(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>, user_servers: &[user_mcp_config::UserMcpServer]) -> String {
-    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers);
+fn macos_claude_launch_line(
+    python: &str,
+    management_root: &Path,
+    projects_dir: &Path,
+    model: Option<&str>,
+    app_bin: Option<&str>,
+    user_servers: &[user_mcp_config::UserMcpServer],
+) -> String {
+    let config =
+        mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers);
     let model_flag = match model {
         Some(model) => format!("--model {} ", sh_single_quote(model)),
         None => String::new(),
@@ -5839,14 +5905,28 @@ fn codex_user_server_config_tokens(server: &user_mcp_config::UserMcpServer) -> V
     out
 }
 
-fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>, user_servers: &[user_mcp_config::UserMcpServer]) -> String {
+fn codex_launch_script(
+    python: &str,
+    root_path: &Path,
+    management_root: &Path,
+    projects_dir: &Path,
+    model: Option<&str>,
+    app_bin: Option<&str>,
+    user_servers: &[user_mcp_config::UserMcpServer],
+) -> String {
     let root_s = root_path.to_string_lossy().into_owned();
     let mut args = vec!["--cd".to_string(), root_s];
     if let Some(model) = model {
         args.push("-m".to_string());
         args.push(model.to_string());
     }
-    args.extend(codex_mcp_config_args(python, management_root, projects_dir, app_bin, user_servers));
+    args.extend(codex_mcp_config_args(
+        python,
+        management_root,
+        projects_dir,
+        app_bin,
+        user_servers,
+    ));
     let args = args
         .iter()
         .map(|value| ps_single_quote(value))
@@ -5866,8 +5946,17 @@ fn codex_launch_script(python: &str, root_path: &Path, management_root: &Path, p
     format!("$codexArgs = @({args})\n$prompt | & codex @codexArgs")
 }
 
-fn claude_launch_script(python: &str, management_root: &Path, projects_dir: &Path, model: Option<&str>, app_bin: Option<&str>, user_servers: &[user_mcp_config::UserMcpServer]) -> String {
-    let config = mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers).replace("'@", "' @");
+fn claude_launch_script(
+    python: &str,
+    management_root: &Path,
+    projects_dir: &Path,
+    model: Option<&str>,
+    app_bin: Option<&str>,
+    user_servers: &[user_mcp_config::UserMcpServer],
+) -> String {
+    let config =
+        mcp_client_config_json(python, management_root, projects_dir, app_bin, user_servers)
+            .replace("'@", "' @");
     let model_flag = match model {
         Some(model) => format!("--model {} ", ps_single_quote(model)),
         None => String::new(),
@@ -5925,7 +6014,13 @@ fn build_cloud_duplex_launch(
     let provider = crate::backend::cloud_duplex::Provider::from_client(client)?;
     let python = crate::oracle::oracle_setup::resolve_oracle_python();
     let app_bin = resolve_app_binary().map(|p| p.to_string_lossy().into_owned());
-    let mcp = mcp_client_config_json(&python, management_root, projects_dir, app_bin.as_deref(), user_servers);
+    let mcp = mcp_client_config_json(
+        &python,
+        management_root,
+        projects_dir,
+        app_bin.as_deref(),
+        user_servers,
+    );
 
     let mut args: Vec<String> = Vec::new();
     let program = match provider {
@@ -5977,10 +6072,16 @@ fn build_cloud_duplex_launch(
             } else {
                 let safe_agent: String = agent_id
                     .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
                     .collect();
-                let file = std::env::temp_dir()
-                    .join(format!("aspis-claude-settings-{safe_agent}.json"));
+                let file =
+                    std::env::temp_dir().join(format!("aspis-claude-settings-{safe_agent}.json"));
                 match std::fs::write(&file, &settings_json) {
                     Ok(()) => Some(file.to_string_lossy().into_owned()),
                     Err(e) => {
@@ -6028,7 +6129,12 @@ fn build_cloud_duplex_launch(
                 args.push(m.to_string());
             }
             // Slice 5c: per-project agent controls → Claude native flags.
-            if let Some(effort) = controls.effort.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(effort) = controls
+                .effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 args.push("--effort".to_string());
                 args.push(effort.to_string());
             }
@@ -6047,7 +6153,10 @@ fn build_cloud_duplex_launch(
                 args.push("--max-turns".to_string());
                 args.push(n.to_string());
             }
-            if let Some(b) = controls.max_budget_usd.filter(|&b| b > 0.0 && b.is_finite()) {
+            if let Some(b) = controls
+                .max_budget_usd
+                .filter(|&b| b > 0.0 && b.is_finite())
+            {
                 args.push("--max-budget-usd".to_string());
                 args.push(b.to_string());
             }
@@ -6069,10 +6178,15 @@ fn build_cloud_duplex_launch(
         }
     };
 
-    let mut envs: Vec<(String, String)> =
-        provider_env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
+    let mut envs: Vec<(String, String)> = provider_env
+        .iter()
+        .map(|e| (e.name.clone(), e.value.clone()))
+        .collect();
     // Mirror the env the PTY launch script sets for the CLI process itself.
-    envs.push(("ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".to_string(), "1".to_string()));
+    envs.push((
+        "ASPIS_MCP_CLOUDFLARE_PROFILE_MODE".to_string(),
+        "1".to_string(),
+    ));
     envs.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
     envs.push((
         "PYTHONPATH".to_string(),
@@ -6135,7 +6249,10 @@ fn mcp_client_config_json(
     user_servers: &[user_mcp_config::UserMcpServer],
 ) -> String {
     let mut env = serde_json::Map::new();
-    env.insert("PYTHONPATH".into(), management_root.to_string_lossy().into_owned().into());
+    env.insert(
+        "PYTHONPATH".into(),
+        management_root.to_string_lossy().into_owned().into(),
+    );
     env.insert("PYTHONIOENCODING".into(), "utf-8".into());
     env.insert("HF_HUB_OFFLINE".into(), "1".into());
     env.insert("TRANSFORMERS_OFFLINE".into(), "1".into());
@@ -6918,10 +7035,7 @@ fn wait_with_drained_output(
 /// the timeout-kill path of `wait_with_drained_output`, where a killed git's
 /// surviving grandchild can hold a pipe open and make a plain `join()` block forever
 /// (see FIX 5). Polls `is_finished()` so we never block past the deadline.
-fn join_with_deadline(
-    handle: thread::JoinHandle<Vec<u8>>,
-    deadline: Duration,
-) -> Option<Vec<u8>> {
+fn join_with_deadline(handle: thread::JoinHandle<Vec<u8>>, deadline: Duration) -> Option<Vec<u8>> {
     let started_at = Instant::now();
     loop {
         if handle.is_finished() {
@@ -7182,7 +7296,9 @@ fn reject_unsafe_git_args(args: &[&str]) -> Result<(), String> {
     for arg in args {
         let lowered = arg.to_ascii_lowercase();
         if lowered.contains("http.extraheader") {
-            return Err("Refusing to run authenticated git: http.extraHeader is not allowed.".into());
+            return Err(
+                "Refusing to run authenticated git: http.extraHeader is not allowed.".into(),
+            );
         }
         if lowered.contains("credential.helper") {
             return Err(
@@ -7287,7 +7403,10 @@ fn git_run_authenticated(
         Err(e) => {
             // guard drops here, removing the script. FIX 5: redact the token from
             // the spawn error too (cheap; the OS error is unlikely to carry it).
-            return Err(redact_token(&token, &format!("git could not be started: {e}")));
+            return Err(redact_token(
+                &token,
+                &format!("git could not be started: {e}"),
+            ));
         }
     };
 
@@ -7295,23 +7414,18 @@ fn git_run_authenticated(
     // authenticated push (lots of progress on stderr) cannot deadlock the pipe and
     // get falsely timed out. FIX 5: the poll/timeout error strings from the helper
     // are routed through redact_token before surfacing.
-    let drained = wait_with_drained_output(child, timeout)
-        .map_err(|e| redact_token(&token, &e))?;
+    let drained = wait_with_drained_output(child, timeout).map_err(|e| redact_token(&token, &e))?;
 
     // FIX 8: cap stdout as well as stderr (untrusted hook output / large progress),
     // then run BOTH through the prefix sanitizer AND the identity redactor so a
     // token echoed by git — in any encoding — is scrubbed before it reaches the UI.
     let stderr = redact_token(
         &token,
-        &super::github::sanitize_error(&cap_git_stderr(&String::from_utf8_lossy(
-            &drained.stderr,
-        ))),
+        &super::github::sanitize_error(&cap_git_stderr(&String::from_utf8_lossy(&drained.stderr))),
     );
     let stdout = redact_token(
         &token,
-        &super::github::sanitize_error(&cap_git_stderr(&String::from_utf8_lossy(
-            &drained.stdout,
-        ))),
+        &super::github::sanitize_error(&cap_git_stderr(&String::from_utf8_lossy(&drained.stdout))),
     );
     Ok(GitRunOutcome {
         exit_code: drained.exit_code.unwrap_or(-1),
@@ -7388,7 +7502,7 @@ fn validate_push_remote(remote: Option<&str>) -> Result<String, String> {
     }
     let mut chars = raw.chars();
     let first = chars.next().unwrap(); // non-empty checked above
-    // A leading '-' would be parsed as a flag by git; reject it outright.
+                                       // A leading '-' would be parsed as a flag by git; reject it outright.
     if !first.is_ascii_alphanumeric() {
         return Err("Remote name must start with a letter or digit.".into());
     }
@@ -7644,32 +7758,28 @@ pub fn approve_git_push_request(
     // 1) CLAIM under the lock: pending_approval -> approved. Re-reads the LIVE status
     //    so a double-approve / approve-after-terminal is a no-op. Returns the claimed
     //    request (a clone) on success, or None if it was not claimable.
-    let claimed: Option<GitPushRequest> =
-        super::agents::mutate_agent_live_state(&app, |live| {
-            let result = {
-                let Some(req) = live
-                    .git_push_requests
-                    .iter_mut()
-                    .find(|r| r.id == request_id)
-                else {
-                    return None;
-                };
-                // FIX F2: stamp the approval time so list-time reconciliation can
-                // tell a live in-flight push from a stuck one.
-                match git_push::apply_approve(req, Utc::now().to_rfc3339()) {
-                    Ok(next) => {
-                        *req = next.clone();
-                        Some(next)
-                    }
-                    Err(_) => None, // not pending_approval (double-approve / terminal).
-                }
+    let claimed: Option<GitPushRequest> = super::agents::mutate_agent_live_state(&app, |live| {
+        let result = {
+            let Some(req) = live
+                .git_push_requests
+                .iter_mut()
+                .find(|r| r.id == request_id)
+            else {
+                return None;
             };
-            git_push::cap_push_requests(
-                &mut live.git_push_requests,
-                git_push::MAX_PUSH_REQUESTS,
-            );
-            result
-        })?;
+            // FIX F2: stamp the approval time so list-time reconciliation can
+            // tell a live in-flight push from a stuck one.
+            match git_push::apply_approve(req, Utc::now().to_rfc3339()) {
+                Ok(next) => {
+                    *req = next.clone();
+                    Some(next)
+                }
+                Err(_) => None, // not pending_approval (double-approve / terminal).
+            }
+        };
+        git_push::cap_push_requests(&mut live.git_push_requests, git_push::MAX_PUSH_REQUESTS);
+        result
+    })?;
 
     let Some(claimed) = claimed else {
         // Did not win the claim: surface the current (terminal/in-flight) request so
@@ -7724,14 +7834,13 @@ pub fn approve_git_push_request(
             // (already a REAL terminal — pushed/push_failed/denied — e.g. a racing
             // duplicate finalize) is swallowed so a late result never clobbers a
             // recorded real outcome or a human denial.
-            let resolved = if let Ok(done) =
-                git_push::apply_push_result_override(req, push_outcome.clone())
-            {
-                *req = done.clone();
-                Some(done)
-            } else {
-                Some(req.clone())
-            };
+            let resolved =
+                if let Ok(done) = git_push::apply_push_result_override(req, push_outcome.clone()) {
+                    *req = done.clone();
+                    Some(done)
+                } else {
+                    Some(req.clone())
+                };
             (resolved, live_agent_id)
         };
         // needs_user cleared on every terminal path (pushed AND push_failed), using
@@ -7776,41 +7885,37 @@ pub fn deny_git_push_request(
     if request_id.is_empty() {
         return Err("Missing push request id.".into());
     }
-    let result: Option<GitPushRequest> =
-        super::agents::mutate_agent_live_state(&app, |live| {
-            // FIX F10: track whether the deny ACTUALLY transitioned the request, so we
-            // only clear the bell when it did. The no-op path (request not
-            // pending_approval — e.g. it is `pushing`) must NOT clear `needs_user`:
-            // clearing it while a push is in flight would drop the bell prematurely.
-            let (resolved, agent_id, transitioned) = {
-                let Some(req) = live
-                    .git_push_requests
-                    .iter_mut()
-                    .find(|r| r.id == request_id)
-                else {
-                    return None;
-                };
-                let agent_id = req.agent_id.clone();
-                match git_push::apply_deny(req) {
-                    Ok(next) => {
-                        *req = next.clone();
-                        (Some(next), agent_id, true)
-                    }
-                    // Not pending (already approved/pushing/terminal): no-op, return
-                    // current WITHOUT clearing the bell.
-                    Err(_) => (Some(req.clone()), agent_id, false),
-                }
+    let result: Option<GitPushRequest> = super::agents::mutate_agent_live_state(&app, |live| {
+        // FIX F10: track whether the deny ACTUALLY transitioned the request, so we
+        // only clear the bell when it did. The no-op path (request not
+        // pending_approval — e.g. it is `pushing`) must NOT clear `needs_user`:
+        // clearing it while a push is in flight would drop the bell prematurely.
+        let (resolved, agent_id, transitioned) = {
+            let Some(req) = live
+                .git_push_requests
+                .iter_mut()
+                .find(|r| r.id == request_id)
+            else {
+                return None;
             };
-            // needs_user cleared ONLY on the real denied terminal transition.
-            if transitioned {
-                clear_request_needs_user(live, &agent_id);
+            let agent_id = req.agent_id.clone();
+            match git_push::apply_deny(req) {
+                Ok(next) => {
+                    *req = next.clone();
+                    (Some(next), agent_id, true)
+                }
+                // Not pending (already approved/pushing/terminal): no-op, return
+                // current WITHOUT clearing the bell.
+                Err(_) => (Some(req.clone()), agent_id, false),
             }
-            git_push::cap_push_requests(
-                &mut live.git_push_requests,
-                git_push::MAX_PUSH_REQUESTS,
-            );
-            resolved
-        })?;
+        };
+        // needs_user cleared ONLY on the real denied terminal transition.
+        if transitioned {
+            clear_request_needs_user(live, &agent_id);
+        }
+        git_push::cap_push_requests(&mut live.git_push_requests, git_push::MAX_PUSH_REQUESTS);
+        resolved
+    })?;
     result.ok_or_else(|| "Push request not found (it may have been evicted).".to_string())
 }
 
@@ -7915,7 +8020,9 @@ fn clone_dir_name(repo: &str) -> Result<String, String> {
     // guard is platform-independent so a clone made on macOS that is later opened
     // on Windows can never carry a name Windows refuses to create.
     if is_windows_reserved_device_name(name) {
-        return Err("Repository name is a reserved device name and is not a safe directory name.".into());
+        return Err(
+            "Repository name is a reserved device name and is not a safe directory name.".into(),
+        );
     }
     Ok(name.to_string())
 }
@@ -7931,9 +8038,11 @@ fn is_windows_reserved_device_name(name: &str) -> bool {
         "CON" | "PRN" | "AUX" | "NUL" => true,
         _ => {
             // COM1–COM9 / LPT1–LPT9: a 3-char prefix + a single 1–9 digit.
-            (upper.strip_prefix("COM").or_else(|| upper.strip_prefix("LPT")))
-                .map(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'))
-                .unwrap_or(false)
+            (upper
+                .strip_prefix("COM")
+                .or_else(|| upper.strip_prefix("LPT")))
+            .map(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'))
+            .unwrap_or(false)
         }
     }
 }
@@ -7985,8 +8094,8 @@ fn clone_base_dir(dest_parent: Option<&str>) -> Result<PathBuf, String> {
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let home = home
-        .ok_or_else(|| "Could not determine a home directory for the clone.".to_string())?;
+    let home =
+        home.ok_or_else(|| "Could not determine a home directory for the clone.".to_string())?;
     let desktop = home.join("Desktop");
     let base = if desktop.is_dir() { desktop } else { home };
     base.canonicalize()
@@ -8013,8 +8122,9 @@ pub fn project_git_clone(
     state.ensure_unlocked()?;
 
     // 1) Validate the remote with the canonical parser (https/github.com only).
-    let (owner, repo) = super::github::parse_github_repo(&url)
-        .ok_or_else(|| "Enter a valid GitHub repository URL (https://github.com/owner/repo).".to_string())?;
+    let (owner, repo) = super::github::parse_github_repo(&url).ok_or_else(|| {
+        "Enter a valid GitHub repository URL (https://github.com/owner/repo).".to_string()
+    })?;
 
     // 2) Safe destination: <base>/<safe repo name>. Both pieces validated.
     let dir_name = clone_dir_name(&repo)?;
@@ -8329,8 +8439,9 @@ fn reject_broad_project_root(path: &Path) -> Result<(), String> {
         if raw == "/" {
             return Err("Agent working root is too broad.".into());
         }
-        if let Some(home) =
-            std::env::var_os("HOME").map(PathBuf::from).and_then(|p| p.canonicalize().ok())
+        if let Some(home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|p| p.canonicalize().ok())
         {
             if same_path(path, &home) {
                 return Err("Agent working root cannot be the whole home directory.".into());
@@ -8603,6 +8714,37 @@ fn resolve_orchestrator_binary() -> Result<PathBuf, String> {
     ))
 }
 
+/// Resolve a model's context window from config.json's modelRegistry. Default 8192.
+fn resolve_context_window(
+    _app: &tauri::AppHandle,
+    cfg_path: Option<&std::path::Path>,
+    model_id: &str,
+) -> usize {
+    if model_id.is_empty() {
+        return 8192;
+    }
+    let Some(path) = cfg_path else {
+        return 8192;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 8192;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return 8192;
+    };
+    let Some(registry) = config.get("modelRegistry").and_then(|v| v.as_array()) else {
+        return 8192;
+    };
+    for entry in registry {
+        if entry.get("id").and_then(|v| v.as_str()) == Some(model_id) {
+            if let Some(cw) = entry.get("contextWindow").and_then(|v| v.as_u64()) {
+                return cw as usize;
+            }
+        }
+    }
+    8192
+}
+
 /// Resolve the RUNNING app binary path (`aspis-management`), which owns the headless
 /// `structure --root <path>` subcommand. Threaded to every MCP launch site as the
 /// `ASPIS_APP_BIN` env var so the shared, read-only `project_structure` MCP tool can shell
@@ -8647,10 +8789,7 @@ mod tests {
         let known = "cmd"; // cmd.exe is always on a Windows PATH
         #[cfg(not(windows))]
         let known = "sh"; // /bin/sh is always present on unix
-        assert!(
-            command_exists(known),
-            "expected {known} to resolve on PATH"
-        );
+        assert!(command_exists(known), "expected {known} to resolve on PATH");
         assert!(!command_exists("aspis-definitely-not-a-real-binary-xyz"));
     }
 
@@ -8969,7 +9108,10 @@ mod tests {
         let token = "AbCdEf0123_no_prefix_here_456";
         let dirty = format!("Authorization: Basic eA=={token} more text and {token}again");
         let clean = redact_token(token, &dirty);
-        assert!(!clean.contains(token), "literal token must be removed: {clean}");
+        assert!(
+            !clean.contains(token),
+            "literal token must be removed: {clean}"
+        );
         assert!(clean.contains("[redacted-github-token]"));
         // An empty token must be a no-op (never replace the empty string everywhere).
         assert_eq!(redact_token("", "anything stays"), "anything stays");
@@ -8981,7 +9123,9 @@ mod tests {
     fn reject_unsafe_git_args_blocks_credential_smuggling() {
         // FIX 6: a future caller must NOT be able to put a credential back on argv.
         // http.extraHeader (Authorization header on argv).
-        assert!(reject_unsafe_git_args(&["-c", "http.extraHeader=Authorization: Basic x"]).is_err());
+        assert!(
+            reject_unsafe_git_args(&["-c", "http.extraHeader=Authorization: Basic x"]).is_err()
+        );
         assert!(reject_unsafe_git_args(&["-c", "HTTP.ExtraHeader=foo"]).is_err());
         // credential.helper override.
         assert!(reject_unsafe_git_args(&["-c", "credential.helper=store"]).is_err());
@@ -9022,8 +9166,19 @@ mod tests {
         // case-insensitively, including as the stem before a dot (`NUL.txt` is the
         // NUL device). GitHub rejects these but this validator is the authority.
         for name in [
-            "CON", "con", "PRN", "AUX", "NUL", "nul", "COM1", "com9", "LPT1", "lpt9",
-            "NUL.txt", "Com1.tar.gz", "aux.md",
+            "CON",
+            "con",
+            "PRN",
+            "AUX",
+            "NUL",
+            "nul",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "NUL.txt",
+            "Com1.tar.gz",
+            "aux.md",
         ] {
             assert!(
                 clone_dir_name(name).is_err(),
@@ -9031,7 +9186,15 @@ mod tests {
             );
         }
         // Near-misses that are NOT reserved must still pass.
-        for name in ["COM0", "COM10", "LPT0", "CONSOLE", "container", "comet", "lptest"] {
+        for name in [
+            "COM0",
+            "COM10",
+            "LPT0",
+            "CONSOLE",
+            "container",
+            "comet",
+            "lptest",
+        ] {
             assert!(
                 clone_dir_name(name).is_ok(),
                 "non-reserved name must be accepted: {name}"
@@ -9083,7 +9246,10 @@ mod tests {
         let desktop = PathBuf::from(format!("C:{sep}Users{sep}me{sep}Desktop{sep}repo"));
         assert!(!path_is_under_forbidden_ancestor(&desktop, &forbidden));
         // An empty forbidden entry never matches (guards against a blank env var).
-        assert!(!path_is_under_forbidden_ancestor(&desktop, &[PathBuf::new()]));
+        assert!(!path_is_under_forbidden_ancestor(
+            &desktop,
+            &[PathBuf::new()]
+        ));
     }
 
     #[test]
@@ -9097,7 +9263,9 @@ mod tests {
         );
         // The smuggling guard validates only CALLER args; our internal `-c` config
         // is prepended after this check, so a clone/pull caller arg-set is clean.
-        assert!(reject_unsafe_git_args(&["clone", "--", "https://github.com/o/r.git", "dest"]).is_ok());
+        assert!(
+            reject_unsafe_git_args(&["clone", "--", "https://github.com/o/r.git", "dest"]).is_ok()
+        );
         assert!(reject_unsafe_git_args(&["pull", "--ff-only"]).is_ok());
     }
 
@@ -9162,10 +9330,16 @@ mod tests {
         // NEVER contain userinfo (no `user:token@`) — the PAT goes via GIT_ASKPASS.
         let url = plain_clone_url("Saurias92", "Aspis-bio");
         assert_eq!(url, "https://github.com/Saurias92/Aspis-bio.git");
-        assert!(!url.contains('@'), "clone URL must not embed userinfo: {url}");
+        assert!(
+            !url.contains('@'),
+            "clone URL must not embed userinfo: {url}"
+        );
         // No documented GitHub token prefix may appear in the URL we build.
         for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"] {
-            assert!(!url.contains(prefix), "token prefix {prefix} leaked into URL");
+            assert!(
+                !url.contains(prefix),
+                "token prefix {prefix} leaked into URL"
+            );
         }
         // Defense in depth: the URL we build is accepted by the argv-smuggling guard
         // (no credentialed-URL pattern), so it can be passed to git_run_authenticated.
@@ -9175,7 +9349,8 @@ mod tests {
     #[test]
     fn dir_is_non_empty_refuses_existing_occupied_destination() {
         // Missing dir → not a blocker.
-        let missing = std::env::temp_dir().join(format!("aspis-clone-missing-{}", std::process::id()));
+        let missing =
+            std::env::temp_dir().join(format!("aspis-clone-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
         assert!(!dir_is_non_empty(&missing));
 
@@ -9205,7 +9380,9 @@ mod tests {
         assert_eq!(args, vec!["pull".to_string(), "--ff-only".to_string()]);
         assert!(args.iter().any(|a| a == "--ff-only"));
         // No force / no rebase / no merge-strategy flags sneak in.
-        assert!(!args.iter().any(|a| a == "--rebase" || a == "-f" || a == "--force"));
+        assert!(!args
+            .iter()
+            .any(|a| a == "--rebase" || a == "-f" || a == "--force"));
     }
 
     #[test]
@@ -9354,7 +9531,10 @@ mod tests {
             let mut c = Command::new("cmd");
             // Launch a detached child that inherits this stdout and lingers ~30s,
             // then the parent cmd exits — but the pipe stays open via the grandchild.
-            c.args(["/C", "start /b cmd /C ping -n 30 127.0.0.1 & ping -n 30 127.0.0.1"]);
+            c.args([
+                "/C",
+                "start /b cmd /C ping -n 30 127.0.0.1 & ping -n 30 127.0.0.1",
+            ]);
             c.creation_flags(CREATE_NO_WINDOW);
             c
         };
@@ -9569,8 +9749,7 @@ mod tests {
         // Auto-trust the Censor only for a brand-new (empty/absent) project folder:
         // a populated folder may be a hostile clone whose tool-configs (eslintrc, etc.)
         // would RCE when linted, so it stays opt-in.
-        let base =
-            std::env::temp_dir().join(format!("aspis-folder-is-new-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("aspis-folder-is-new-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
 
         // None (no folder chosen yet) → not auto-trusted.
@@ -9726,7 +9905,8 @@ mod tests {
             agent_controls: Default::default(),
             ..reparsed_auto
         };
-        let serialized_unattended = replace_frontmatter(&serialized_auto, &unattended_meta).unwrap();
+        let serialized_unattended =
+            replace_frontmatter(&serialized_auto, &unattended_meta).unwrap();
         assert!(
             serialized_unattended.contains("sandbox_mode: unattended"),
             "Unattended must write the key"
@@ -9751,7 +9931,8 @@ mod tests {
         use crate::backend::broker::SandboxMode;
 
         // Plain unrecognised token.
-        let bogus = "---\nid: proj-g\ntitle: G\nstatus: active\nupdated_at: t\nsandbox_mode: bogus\n---\n";
+        let bogus =
+            "---\nid: proj-g\ntitle: G\nstatus: active\nupdated_at: t\nsandbox_mode: bogus\n---\n";
         let (meta, _) = parse_frontmatter(bogus, Path::new("proj-g.md"))
             .expect("parse must succeed even with an unrecognised sandbox_mode value");
         assert_eq!(
@@ -10338,7 +10519,10 @@ updated_at: 2026-05-28T00:00:00Z
         let broker = crate::backend::broker::PermissionBrokerState::new();
         broker.grant_net_once("proj-x");
         assert!(broker.take_net_grant("proj-x"), "first take must be true");
-        assert!(!broker.take_net_grant("proj-x"), "second take must be false (consumed)");
+        assert!(
+            !broker.take_net_grant("proj-x"),
+            "second take must be false (consumed)"
+        );
     }
 
     #[test]
@@ -10447,7 +10631,10 @@ updated_at: 2026-05-28T00:00:00Z
         .expect("present project");
 
         let after_set = read_project_file(&path).unwrap();
-        assert_eq!(after_set.metadata.agent_controls.effort.as_deref(), Some("high"));
+        assert_eq!(
+            after_set.metadata.agent_controls.effort.as_deref(),
+            Some("high")
+        );
         assert_eq!(
             after_set.metadata.agent_controls.system_prompt.as_deref(),
             Some("be terse")
@@ -10491,7 +10678,10 @@ updated_at: 2026-05-28T00:00:00Z
         .unwrap()
         .expect("present project");
         let after = read_project_file(&path).unwrap();
-        assert_eq!(after.metadata.agent_controls.system_prompt.as_deref(), Some(tricky));
+        assert_eq!(
+            after.metadata.agent_controls.system_prompt.as_deref(),
+            Some(tricky)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -10499,7 +10689,11 @@ updated_at: 2026-05-28T00:00:00Z
     #[test]
     fn working_set_multiple_folders_roundtrip() {
         let (root, path) = write_temp_project("working-set-multi");
-        let folders = vec!["/tmp/a".to_string(), "/tmp/b".to_string(), "/home/user/shared".to_string()];
+        let folders = vec![
+            "/tmp/a".to_string(),
+            "/tmp/b".to_string(),
+            "/home/user/shared".to_string(),
+        ];
 
         mutate_project_file_latest(&path, |project| {
             project.metadata.working_set = folders.clone();
@@ -10509,7 +10703,10 @@ updated_at: 2026-05-28T00:00:00Z
         .expect("present project");
 
         let reparsed = read_project_file(&path).unwrap();
-        assert_eq!(reparsed.metadata.working_set, folders, "all folders must survive round-trip");
+        assert_eq!(
+            reparsed.metadata.working_set, folders,
+            "all folders must survive round-trip"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -10530,8 +10727,14 @@ updated_at: 2026-05-28T00:00:00Z
         let broker = crate::backend::broker::PermissionBrokerState::new();
         broker.grant_folder_once("proj-x", "/tmp/extra");
         let grants = broker.take_folder_grants("proj-x");
-        assert!(grants.contains("/tmp/extra"), "AllowOnce must insert transient grant");
-        assert!(broker.take_folder_grants("proj-x").is_empty(), "consumed after first take");
+        assert!(
+            grants.contains("/tmp/extra"),
+            "AllowOnce must insert transient grant"
+        );
+        assert!(
+            broker.take_folder_grants("proj-x").is_empty(),
+            "consumed after first take"
+        );
     }
 
     /// Deny: nothing in transient state.
@@ -10551,7 +10754,11 @@ updated_at: 2026-05-28T00:00:00Z
         // An absolute path that does NOT exist on disk.
         let nonexistent = "/tmp/aspis_deleted_folder_does_not_exist_xyz_blorp";
         let result = normalize_working_set_folder_lexical(nonexistent);
-        assert!(result.is_ok(), "lexical normalize must not need the path to exist: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "lexical normalize must not need the path to exist: {:?}",
+            result
+        );
         // The result must be the same path (already clean, no trailing slash, no dots).
         assert_eq!(result.unwrap(), nonexistent);
     }
@@ -10585,8 +10792,8 @@ updated_at: 2026-05-28T00:00:00Z
     fn remove_working_set_folder_after_delete_from_disk() {
         use std::fs;
         // Create a real folder, get its canonical path, then delete it.
-        let base = std::env::temp_dir()
-            .join(format!("aspis_rmws_{}_{}", std::process::id(), line!()));
+        let base =
+            std::env::temp_dir().join(format!("aspis_rmws_{}_{}", std::process::id(), line!()));
         fs::create_dir_all(&base).unwrap();
         let canonical = base.canonicalize().unwrap().to_string_lossy().into_owned();
 
@@ -10605,13 +10812,18 @@ updated_at: 2026-05-28T00:00:00Z
 
         // The remove path must still work.
         let result = remove_project_working_set_by_path(&path, &canonical);
-        assert!(result.is_ok(), "remove must succeed even after folder deleted: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "remove must succeed even after folder deleted: {:?}",
+            result
+        );
 
         // Entry must be gone from the project file.
         let reread = read_project_file(&path).unwrap();
         assert!(
             reread.metadata.working_set.is_empty(),
-            "working_set must be empty after remove: {:?}", reread.metadata.working_set
+            "working_set must be empty after remove: {:?}",
+            reread.metadata.working_set
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -10625,7 +10837,10 @@ updated_at: 2026-05-28T00:00:00Z
     fn normalize_working_set_folder_fails_for_nonexistent() {
         let nonexistent = "/tmp/aspis_absolutely_does_not_exist_xyz_warning1_blorp";
         let result = normalize_working_set_folder(nonexistent);
-        assert!(result.is_err(), "normalize_working_set_folder must fail for nonexistent path");
+        assert!(
+            result.is_err(),
+            "normalize_working_set_folder must fail for nonexistent path"
+        );
     }
 
     /// A milestone added via the locked latest-on-disk write helper (the exact
@@ -11003,7 +11218,8 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
 
         assert!(prompt.contains("Working root: C:\\Users\\gualt\\Desktop\\aspis bio"));
@@ -11028,7 +11244,8 @@ updated_at: 2026-05-28T00:00:00Z
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(hinted.contains("model=\"opus\""));
         assert!(!hinted.contains("model=\"<your model>\""));
@@ -11052,7 +11269,18 @@ updated_at: 2026-05-28T00:00:00Z
 
         // Absent skill -> no injection.
         let without = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(!without.contains("BEGIN PROJECT SKILL"));
 
@@ -11060,11 +11288,23 @@ updated_at: 2026-05-28T00:00:00Z
         let skill_dir = root.join(".claude").join("skills").join("coder");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let mut f = std::fs::File::create(skill_dir.join("SKILL.md")).unwrap();
-        f.write_all(b"HOUSE RULE: run cargo fmt before every commit.").unwrap();
+        f.write_all(b"HOUSE RULE: run cargo fmt before every commit.")
+            .unwrap();
         drop(f);
 
         let with_skill = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         let _ = std::fs::remove_dir_all(&root);
 
@@ -11099,14 +11339,25 @@ updated_at: 2026-05-28T00:00:00Z
             let dir = root.join(".claude").join("skills").join(role);
             std::fs::create_dir_all(&dir).unwrap();
             let mut f = std::fs::File::create(dir.join("SKILL.md")).unwrap();
-            f.write_all(format!("HOUSE RULE for {role}.").as_bytes()).unwrap();
+            f.write_all(format!("HOUSE RULE for {role}.").as_bytes())
+                .unwrap();
             drop(f);
         }
 
         // "verifier" is NOT in KNOWN_ROLES ⇒ no injection even though its SKILL.md exists.
         let verifier = project_agent_prompt(
-            &project, "verifier", "verifier-1", Some("T1"), &root, "tok", None, false, None, None,
-            None, None,
+            &project,
+            "verifier",
+            "verifier-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(
             !verifier.contains("BEGIN PROJECT SKILL"),
@@ -11116,7 +11367,18 @@ updated_at: 2026-05-28T00:00:00Z
 
         // "coder" IS in KNOWN_ROLES ⇒ its skill still injects in the same project.
         let coder = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         let _ = std::fs::remove_dir_all(&root);
         assert!(
@@ -11143,11 +11405,31 @@ updated_at: 2026-05-28T00:00:00Z
         // ABSENT: with no orchestrator SKILL.md, the Some("orchestrator") override
         // produces a prompt BYTE-IDENTICAL to the None (skill_role == role) prompt.
         let none_override = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
             None,
         );
         let orch_absent = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("orchestrator"),
         );
         assert_eq!(
@@ -11164,7 +11446,17 @@ updated_at: 2026-05-28T00:00:00Z
         cf.write_all(b"HOUSE RULE for coder.").unwrap();
         drop(cf);
         let orch_with_coder_only = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("orchestrator"),
         );
         assert!(
@@ -11176,10 +11468,21 @@ updated_at: 2026-05-28T00:00:00Z
         let orch_dir = root.join(".claude").join("skills").join("orchestrator");
         std::fs::create_dir_all(&orch_dir).unwrap();
         let mut of = std::fs::File::create(orch_dir.join("SKILL.md")).unwrap();
-        of.write_all(b"HOUSE RULE: ground in the repo first.").unwrap();
+        of.write_all(b"HOUSE RULE: ground in the repo first.")
+            .unwrap();
         drop(of);
         let orch_present = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("orchestrator"),
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -11216,15 +11519,30 @@ updated_at: 2026-05-28T00:00:00Z
             crate::backend::mini_coder::MiniWriteBehavior::Auto,
         )
         .expect("a configured backend yields a block");
-        assert!(block.contains("qwen3.6-27b"), "names the configured model: {block}");
-        assert!(block.contains("a local Ollama model"), "names the backend runtime: {block}");
-        assert!(block.contains("agentic-iterative"), "mentions agentic-iterative: {block}");
+        assert!(
+            block.contains("qwen3.6-27b"),
+            "names the configured model: {block}"
+        );
+        assert!(
+            block.contains("a local Ollama model"),
+            "names the backend runtime: {block}"
+        );
+        assert!(
+            block.contains("agentic-iterative"),
+            "mentions agentic-iterative: {block}"
+        );
         assert!(block.contains("emit-edits"), "mentions emit-edits: {block}");
         // FIX 2: the SETTABLE value the coder is told to pass must be the EXACT MCP wire
         // token (camelCase), not the hyphenated human gloss — a coder taking the imperative
         // literally must pass a token the MCP enum (`MINI_CODER_WRITE_MODES`) accepts.
-        assert!(block.contains("'agenticIterative'"), "quotes the camelCase wire token: {block}");
-        assert!(block.contains("'emitEdits'"), "quotes the camelCase wire token: {block}");
+        assert!(
+            block.contains("'agenticIterative'"),
+            "quotes the camelCase wire token: {block}"
+        );
+        assert!(
+            block.contains("'emitEdits'"),
+            "quotes the camelCase wire token: {block}"
+        );
         assert!(block.contains("write_mode"), "names the param: {block}");
         assert!(
             block.contains("this project: Python, TypeScript/JavaScript"),
@@ -11232,7 +11550,10 @@ updated_at: 2026-05-28T00:00:00Z
         );
         // Product-general: no product/cloud hardcoding in the injected text.
         for needle in ["Aspis", "Cloudflare", "Scaleway"] {
-            assert!(!block.contains(needle), "must be product-general; found {needle}: {block}");
+            assert!(
+                !block.contains(needle),
+                "must be product-general; found {needle}: {block}"
+            );
         }
     }
 
@@ -11247,7 +11568,10 @@ updated_at: 2026-05-28T00:00:00Z
             crate::backend::mini_coder::MiniWriteBehavior::Auto,
         )
         .expect("a configured backend yields a block");
-        assert!(block.contains("this project: none"), "empty coverage -> 'none': {block}");
+        assert!(
+            block.contains("this project: none"),
+            "empty coverage -> 'none': {block}"
+        );
         assert!(block.contains("tiny-1b"), "still names the model: {block}");
     }
 
@@ -11277,7 +11601,10 @@ updated_at: 2026-05-28T00:00:00Z
             crate::backend::mini_coder::MiniWriteBehavior::Auto,
         )
         .expect("a configured backend yields a block");
-        assert!(block.contains("your configured mini model"), "generic model label: {block}");
+        assert!(
+            block.contains("your configured mini model"),
+            "generic model label: {block}"
+        );
     }
 
     // E1/FIX 2 — the Auto-default A3 block, pinned EXACTLY. The settable values are the
@@ -11301,7 +11628,10 @@ updated_at: 2026-05-28T00:00:00Z
 - 'emitEdits' (emit-edits, default) = one write + one fix. Use for mechanical/well-scoped edits, for uncovered languages, or for a small/weak local model.\n\
 You decide per task; default to 'emitEdits' when unsure.\n\
 TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable mini needs SMALLER, tightly-scoped tasks — split a big phase into several 'nanophase' tasks (each with its own files + dependsOn) so the mini can finish each one; a more capable mini can take a bigger task.\n";
-        assert_eq!(block, expected, "Auto block must match the pinned camelCase-token string");
+        assert_eq!(
+            block, expected,
+            "Auto block must match the pinned camelCase-token string"
+        );
     }
 
     // E1 — Safe policy: emit-edits ONLY, with NO agentic-iterative encouragement.
@@ -11340,7 +11670,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
         // Product-general: still no product/cloud hardcoding.
         for needle in ["Aspis", "Cloudflare", "Scaleway"] {
-            assert!(!block.contains(needle), "product-general; found {needle}: {block}");
+            assert!(
+                !block.contains(needle),
+                "product-general; found {needle}: {block}"
+            );
         }
     }
 
@@ -11354,13 +11687,28 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             crate::backend::mini_coder::MiniWriteBehavior::AgenticAllowed,
         )
         .expect("a configured backend yields a block");
-        assert!(block.contains("ALLOWS agentic-iterative"), "names the policy: {block}");
+        assert!(
+            block.contains("ALLOWS agentic-iterative"),
+            "names the policy: {block}"
+        );
         assert!(block.contains("PREFER it"), "encourages agentic: {block}");
-        assert!(block.contains("agentic-iterative"), "mentions agentic: {block}");
-        assert!(block.contains("emit-edits"), "keeps emit-edits fallback: {block}");
+        assert!(
+            block.contains("agentic-iterative"),
+            "mentions agentic: {block}"
+        );
+        assert!(
+            block.contains("emit-edits"),
+            "keeps emit-edits fallback: {block}"
+        );
         // FIX 2: the settable values are the camelCase wire tokens.
-        assert!(block.contains("'agenticIterative'"), "quotes the camelCase wire token: {block}");
-        assert!(block.contains("'emitEdits'"), "quotes the camelCase wire token: {block}");
+        assert!(
+            block.contains("'agenticIterative'"),
+            "quotes the camelCase wire token: {block}"
+        );
+        assert!(
+            block.contains("'emitEdits'"),
+            "quotes the camelCase wire token: {block}"
+        );
         assert!(
             block.contains("this project: Python, Go"),
             "lists the covered languages: {block}"
@@ -11400,29 +11748,84 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         .unwrap();
 
         let coder = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None,
-            Some(block.as_str()), None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            Some(block.as_str()),
+            None,
         );
-        assert!(coder.contains("qwen3.6-27b"), "coder prompt names the model");
-        assert!(coder.contains("MINI-CODER DELEGATION write_mode"), "carries the A3 block");
-        assert!(coder.contains("this project: Python"), "carries the covered langs");
+        assert!(
+            coder.contains("qwen3.6-27b"),
+            "coder prompt names the model"
+        );
+        assert!(
+            coder.contains("MINI-CODER DELEGATION write_mode"),
+            "carries the A3 block"
+        );
+        assert!(
+            coder.contains("this project: Python"),
+            "carries the covered langs"
+        );
         // The routing addendum still leads the mini-coder section.
-        assert!(coder.contains("you MAY delegate to spawn_mini_coder"), "routing addendum kept");
+        assert!(
+            coder.contains("you MAY delegate to spawn_mini_coder"),
+            "routing addendum kept"
+        );
 
         // No block supplied -> coder prompt is the pre-A3 wording (no delegation block).
         let coder_plain = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false, None, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
-        assert!(!coder_plain.contains("MINI-CODER DELEGATION write_mode"), "absent without a block");
-        assert!(coder_plain.contains("you MAY delegate to spawn_mini_coder"), "routing addendum kept");
+        assert!(
+            !coder_plain.contains("MINI-CODER DELEGATION write_mode"),
+            "absent without a block"
+        );
+        assert!(
+            coder_plain.contains("you MAY delegate to spawn_mini_coder"),
+            "routing addendum kept"
+        );
 
         // A verifier never gets the mini-coder section at all (block ignored even if Some).
         let verifier = project_agent_prompt(
-            &project, "verifier", "verifier-1", None, &root, "tok", None, false, None, None,
-            Some(block.as_str()), None,
+            &project,
+            "verifier",
+            "verifier-1",
+            None,
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            Some(block.as_str()),
+            None,
         );
-        assert!(!verifier.contains("MINI-CODER DELEGATION write_mode"), "verifier omits the block");
-        assert!(!verifier.contains("you MAY delegate to spawn_mini_coder"), "verifier has no mini section");
+        assert!(
+            !verifier.contains("MINI-CODER DELEGATION write_mode"),
+            "verifier omits the block"
+        );
+        assert!(
+            !verifier.contains("you MAY delegate to spawn_mini_coder"),
+            "verifier has no mini section"
+        );
     }
 
     // Build a minimal ParsedProject for prompt tests (no tasks; the prompt is
@@ -11474,7 +11877,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             prompt.contains("censor_findings(project_id, file=<files you just touched>)"),
@@ -11517,7 +11921,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             prompt.contains("aborted_by_human"),
@@ -11569,7 +11974,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             prompt.contains("spawn_mini_coder(task, files"),
@@ -11623,7 +12029,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             prompt.contains("commit freely"),
@@ -11672,7 +12079,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             !prompt.contains("aborted_by_human"),
@@ -11707,7 +12115,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             !prompt.contains("NEVER run a raw `git push`"),
@@ -11745,7 +12154,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             !plain.contains("residual ledger"),
@@ -11768,7 +12178,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             true,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             final_review.contains("censor_findings(project_id) for the residual ledger"),
@@ -11892,7 +12303,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 .into_owned(),
         };
         let err = validate_design_handoff(&input, &root).expect_err("missing folder rejected");
-        assert!(err.contains("does not exist") || err.contains("unreadable"), "{err}");
+        assert!(
+            err.contains("does not exist") || err.contains("unreadable"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -11903,8 +12317,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let input = DesignHandoffInput {
             working_folder_path: bare.to_string_lossy().into_owned(),
         };
-        let err =
-            validate_design_handoff(&input, &root).expect_err("no project.json => rejected");
+        let err = validate_design_handoff(&input, &root).expect_err("no project.json => rejected");
         assert!(err.contains("project.json"), "{err}");
     }
 
@@ -11916,8 +12329,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let input = DesignHandoffInput {
             working_folder_path: outside.to_string_lossy().into_owned(),
         };
-        let err =
-            validate_design_handoff(&input, &root).expect_err("outside-root bundle rejected");
+        let err = validate_design_handoff(&input, &root).expect_err("outside-root bundle rejected");
         assert!(err.contains("inside the project root"), "{err}");
     }
 
@@ -11962,13 +12374,16 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             Some(design.as_path()),
             None,
-            None, None,
+            None,
+            None,
         );
 
         // The addendum is present and cites the RELATIVE bundle path (forward slashes),
         // not an absolute path.
         assert!(
-            prompt.contains("a design bundle has been saved in this repo at .devboule-design/landing"),
+            prompt.contains(
+                "a design bundle has been saved in this repo at .devboule-design/landing"
+            ),
             "addendum must cite the relative bundle path: {prompt}"
         );
         assert!(
@@ -12014,7 +12429,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             None,
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             !plain.contains("a design bundle has been saved"),
@@ -12034,7 +12450,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             false,
             Some(root.as_path()),
             None,
-            None, None,
+            None,
+            None,
         );
         assert!(
             !verifier.contains("a design bundle has been saved"),
@@ -12084,7 +12501,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // folds the orchestrator role-string alias), but the STORED session role is
         // first-class "orchestrator" so agent_register matches.
         assert_eq!(normalize_agent_role("orchestrator").unwrap(), "coder");
-        assert_eq!(pending_session_role("orchestrator", "coder"), "orchestrator");
+        assert_eq!(
+            pending_session_role("orchestrator", "coder"),
+            "orchestrator"
+        );
         // Every other client persists the canonical role verbatim (byte-identical to
         // pre-FIX behavior).
         assert_eq!(pending_session_role("codex", "coder"), "coder");
@@ -12104,7 +12524,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[test]
     fn orchestrator_stored_role_keeps_coder_permissions() {
         // Registration identity stored = "orchestrator".
-        assert_eq!(pending_session_role("orchestrator", "coder"), "orchestrator");
+        assert_eq!(
+            pending_session_role("orchestrator", "coder"),
+            "orchestrator"
+        );
         // ...but the Cloudflare/token PERMISSION role still resolves to the coder write
         // profile (the orchestrator plans AND writes), so no privilege regression.
         assert_eq!(
@@ -12185,9 +12608,9 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // The guard condition the launch evaluates: workflow present AND orchestrator.
         let client = "orchestrator";
         let role = normalize_agent_role("orchestrator").unwrap(); // "coder"
-        // Pre-FIX, `role != "coder"` was FALSE for an orchestrator (role == "coder"),
-        // so the old guard would have WRONGLY ALLOWED it. The new client-keyed guard
-        // catches it.
+                                                                  // Pre-FIX, `role != "coder"` was FALSE for an orchestrator (role == "coder"),
+                                                                  // so the old guard would have WRONGLY ALLOWED it. The new client-keyed guard
+                                                                  // catches it.
         assert_eq!(role, "coder");
         assert!(client == "orchestrator", "client-keyed guard rejects this");
     }
@@ -12217,26 +12640,43 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let projects = root.join("projects");
         let app_bin = "/opt/aspis/aspis-management";
 
-        let codex_with = codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).join(" ");
+        let codex_with =
+            codex_mcp_config_args("python3", &root, &projects, Some(app_bin), &[]).join(" ");
         let claude_with = mcp_client_config_json("python3", &root, &projects, Some(app_bin), &[]);
         assert!(
             codex_with.contains("mcp_servers.aspis-management.env.ASPIS_APP_BIN="),
             "codex args must set ASPIS_APP_BIN: {codex_with}"
         );
-        assert!(codex_with.contains(app_bin), "codex args must carry the binary path");
+        assert!(
+            codex_with.contains(app_bin),
+            "codex args must carry the binary path"
+        );
         assert!(
             claude_with.contains("\"ASPIS_APP_BIN\""),
             "claude env must set ASPIS_APP_BIN: {claude_with}"
         );
-        assert!(claude_with.contains(app_bin), "claude env must carry the binary path");
+        assert!(
+            claude_with.contains(app_bin),
+            "claude env must carry the binary path"
+        );
 
         // None / empty → the key is omitted entirely.
         let codex_none = codex_mcp_config_args("python3", &root, &projects, None, &[]).join(" ");
         let claude_none = mcp_client_config_json("python3", &root, &projects, None, &[]);
-        let codex_blank = codex_mcp_config_args("python3", &root, &projects, Some("   "), &[]).join(" ");
-        assert!(!codex_none.contains("ASPIS_APP_BIN"), "absent app bin ⇒ no codex key");
-        assert!(!claude_none.contains("ASPIS_APP_BIN"), "absent app bin ⇒ no claude key");
-        assert!(!codex_blank.contains("ASPIS_APP_BIN"), "blank app bin ⇒ no codex key");
+        let codex_blank =
+            codex_mcp_config_args("python3", &root, &projects, Some("   "), &[]).join(" ");
+        assert!(
+            !codex_none.contains("ASPIS_APP_BIN"),
+            "absent app bin ⇒ no codex key"
+        );
+        assert!(
+            !claude_none.contains("ASPIS_APP_BIN"),
+            "absent app bin ⇒ no claude key"
+        );
+        assert!(
+            !codex_blank.contains("ASPIS_APP_BIN"),
+            "blank app bin ⇒ no codex key"
+        );
     }
 
     // --- Phase A.2: user MCP server injection into claude/codex configs --------
@@ -12269,9 +12709,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let codex = codex_mcp_config_args("python3", &root, &projects, None, &servers).join(" ");
 
         // Oracle ALWAYS first (design §5.1): its key precedes the user server's in both.
-        let oracle_pos_claude = claude.find("\"aspis-management\"").expect("oracle key present");
+        let oracle_pos_claude = claude
+            .find("\"aspis-management\"")
+            .expect("oracle key present");
         let user_pos_claude = claude.find("\"my-db\"").expect("user key present");
-        assert!(oracle_pos_claude < user_pos_claude, "Oracle must come before the user server");
+        assert!(
+            oracle_pos_claude < user_pos_claude,
+            "Oracle must come before the user server"
+        );
         // The user server carries its command, args, and env into the claude config.
         assert!(claude.contains("\"my-db\""));
         assert!(claude.contains("\"mydb_mcp\""));
@@ -12279,9 +12724,16 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(claude.contains("postgres://x"));
 
         // Codex: Oracle tokens come first, then the user-server tokens.
-        let oracle_pos_codex = codex.find("mcp_servers.aspis-management.command").expect("oracle command");
-        let user_pos_codex = codex.find("mcp_servers.my-db.command").expect("user command");
-        assert!(oracle_pos_codex < user_pos_codex, "Oracle tokens must precede the user server's");
+        let oracle_pos_codex = codex
+            .find("mcp_servers.aspis-management.command")
+            .expect("oracle command");
+        let user_pos_codex = codex
+            .find("mcp_servers.my-db.command")
+            .expect("user command");
+        assert!(
+            oracle_pos_codex < user_pos_codex,
+            "Oracle tokens must precede the user server's"
+        );
         assert!(codex.contains("mcp_servers.my-db.args="));
         assert!(codex.contains("mydb_mcp"));
         assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
@@ -12301,7 +12753,11 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let codex_empty = codex_mcp_config_args("python3", &root, &projects, None, &[]).join(" ");
 
         // Exactly ONE server key in the claude config (the Oracle), no user-server noise.
-        assert_eq!(claude_empty.matches("\"command\":").count(), 1, "only the Oracle command");
+        assert_eq!(
+            claude_empty.matches("\"command\":").count(),
+            1,
+            "only the Oracle command"
+        );
         assert!(claude_empty.contains("\"aspis-management\""));
         // The codex args carry only `mcp_servers.aspis-management.*` tokens.
         assert!(codex_empty.contains("mcp_servers.aspis-management.command"));
@@ -12334,9 +12790,13 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(codex.contains("mcp_servers.my-db.env.DB_URL="));
 
         // And the same for the macOS launch line (it shares codex_user_server_config_settings).
-        let macos = macos_codex_launch_line("python3", &root, &root, &projects, None, None, &servers);
+        let macos =
+            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &servers);
         assert!(macos.contains("mcp_servers.my-db.command="));
-        assert!(!macos.contains("mcp_servers.my-db.args="), "macOS line must omit empty args: {macos}");
+        assert!(
+            !macos.contains("mcp_servers.my-db.args="),
+            "macOS line must omit empty args: {macos}"
+        );
     }
 
     // --- Phase B: orchestrator DEVBOULE_USER_MCP_SERVERS wiring --------------
@@ -12377,7 +12837,11 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             .iter()
             .find(|(n, _)| *n == "DEVBOULE_USER_MCP_SERVERS")
             .expect("the var is set when servers exist");
-        assert!(found.1.contains("\"my-db\""), "carries the server: {}", found.1);
+        assert!(
+            found.1.contains("\"my-db\""),
+            "carries the server: {}",
+            found.1
+        );
 
         // WITHOUT servers (the base fixture has it empty): the var is OMITTED entirely,
         // so a no-user-servers orchestrator launch is byte-identical to a pre-B one.
@@ -12398,8 +12862,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         config.user_mcp_servers_json =
             user_mcp_config::orchestrator_env_json(&[user_server_fixture()]);
         let script = orchestrator_launch_script(&config);
-        assert!(script.contains("DEVBOULE_USER_MCP_SERVERS"), "var on the script: {script}");
-        assert!(script.contains("my-db"), "server name on the script: {script}");
+        assert!(
+            script.contains("DEVBOULE_USER_MCP_SERVERS"),
+            "var on the script: {script}"
+        );
+        assert!(
+            script.contains("my-db"),
+            "server name on the script: {script}"
+        );
 
         // And the base (no-servers) launch script must NOT mention it.
         let plain = orchestrator_launch_script(&orchestrator_fixture());
@@ -12481,6 +12951,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             binary: PathBuf::from("/repo/devboule-coder/target/release/devboule-coder"),
             omlx_base_url: "http://localhost:8745/v1".to_string(),
             omlx_model: "qwen-coder-sentinel".to_string(),
+            context_window: 8192,
             // Local-mode fixture: the cloud vars are EMPTY (no DEVBOULE_CLOUD_* emitted), so
             // the launch line/script stays byte-identical to the pre-cloud output.
             cloud_base_url: String::new(),
@@ -12605,7 +13076,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // the orchestrator falls back to its silent no-op writer. Present when set.
         let mut config = orchestrator_fixture();
         config.activity_file = String::new();
-        let names: Vec<&str> = orchestrator_env_pairs(&config).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<&str> = orchestrator_env_pairs(&config)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(
             !names.contains(&"DEVBOULE_ACTIVITY_FILE"),
             "empty activity_file ⇒ no DEVBOULE_ACTIVITY_FILE pair"
@@ -12613,7 +13087,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
         // Present when set (mirrors the app_bin omission discipline).
         let with = orchestrator_fixture();
-        let names: Vec<&str> = orchestrator_env_pairs(&with).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<&str> = orchestrator_env_pairs(&with)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(names.contains(&"DEVBOULE_ACTIVITY_FILE"));
     }
 
@@ -12648,7 +13125,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let pairs = orchestrator_env_pairs(&cloud);
         let base = pairs.iter().find(|(n, _)| *n == "DEVBOULE_CLOUD_BASE_URL");
         let model = pairs.iter().find(|(n, _)| *n == "DEVBOULE_CLOUD_MODEL");
-        assert_eq!(base.map(|(_, v)| v.as_str()), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(
+            base.map(|(_, v)| v.as_str()),
+            Some("https://openrouter.ai/api/v1")
+        );
         assert_eq!(model.map(|(_, v)| v.as_str()), Some("openrouter/auto"));
         // The KEY env var must NEVER be one of the inline (non-secret) pairs.
         assert!(
@@ -12679,7 +13159,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
         let mut empty = orchestrator_fixture();
         empty.project_id = String::new();
-        let names: Vec<&str> = orchestrator_env_pairs(&empty).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<&str> = orchestrator_env_pairs(&empty)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(
             !names.contains(&"DEVBOULE_PROJECT_ID"),
             "empty project_id ⇒ no DEVBOULE_PROJECT_ID pair"
@@ -12702,7 +13185,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
         let mut off = orchestrator_fixture();
         off.plan_first = String::new();
-        let names: Vec<&str> = orchestrator_env_pairs(&off).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<&str> = orchestrator_env_pairs(&off)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(
             !names.contains(&"DEVBOULE_PLAN_FIRST"),
             "plan-first OFF ⇒ no DEVBOULE_PLAN_FIRST pair (byte-identical default launch)"
@@ -12715,9 +13201,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // ride ONLY when set; an interactive launch (fixture defaults: both empty) omits both,
         // byte-identical to a pre-feature launch.
         let base = orchestrator_fixture(); // initial_goal = "", auto_create = ""
-        let base_names: Vec<&str> =
-            orchestrator_env_pairs(&base).into_iter().map(|(n, _)| n).collect();
-        assert!(!base_names.contains(&"DEVBOULE_GOAL"), "no goal ⇒ no DEVBOULE_GOAL");
+        let base_names: Vec<&str> = orchestrator_env_pairs(&base)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            !base_names.contains(&"DEVBOULE_GOAL"),
+            "no goal ⇒ no DEVBOULE_GOAL"
+        );
         assert!(
             !base_names.contains(&"DEVBOULE_AUTO_CREATE"),
             "auto-create default ⇒ no DEVBOULE_AUTO_CREATE"
@@ -12728,12 +13219,18 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         set.auto_create = "0".to_string();
         let pairs = orchestrator_env_pairs(&set);
         assert_eq!(
-            pairs.iter().find(|(n, _)| *n == "DEVBOULE_GOAL").map(|(_, v)| v.as_str()),
+            pairs
+                .iter()
+                .find(|(n, _)| *n == "DEVBOULE_GOAL")
+                .map(|(_, v)| v.as_str()),
             Some("Add Stripe billing"),
             "a typed goal ⇒ DEVBOULE_GOAL carries it verbatim"
         );
         assert_eq!(
-            pairs.iter().find(|(n, _)| *n == "DEVBOULE_AUTO_CREATE").map(|(_, v)| v.as_str()),
+            pairs
+                .iter()
+                .find(|(n, _)| *n == "DEVBOULE_AUTO_CREATE")
+                .map(|(_, v)| v.as_str()),
             Some("0"),
             "auto-create OFF ⇒ DEVBOULE_AUTO_CREATE=0"
         );
@@ -12773,7 +13270,9 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert_orchestrator_launch_text(&line);
         // POSIX `NAME=value ... '<binary>'` shape: env precedes the exec'd binary.
         assert!(line.contains("DEVBOULE_OMLX_BASE_URL="));
-        assert!(line.trim_end().ends_with("'/repo/devboule-coder/target/release/devboule-coder'"));
+        assert!(line
+            .trim_end()
+            .ends_with("'/repo/devboule-coder/target/release/devboule-coder'"));
     }
 
     #[test]
@@ -12830,7 +13329,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
-        let codex_with = codex_launch_script("python3", &root, &root, &projects, Some(model), None, &[]);
+        let codex_with =
+            codex_launch_script("python3", &root, &root, &projects, Some(model), None, &[]);
         let claude_with = claude_launch_script("python3", &root, &projects, Some(model), None, &[]);
         let codex_none = codex_launch_script("python3", &root, &root, &projects, None, None, &[]);
         let claude_none = claude_launch_script("python3", &root, &projects, None, None, &[]);
@@ -12840,7 +13340,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(claude_with.contains(model));
         assert!(codex_with.contains(model));
         assert!(codex_with.contains("'-m'")); // the codex flag itself (ps_single_quote'd)
-        // No model selected -> no model token injected (CLI default is used).
+                                              // No model selected -> no model token injected (CLI default is used).
         assert!(!claude_none.contains("--model"));
         assert!(!claude_none.contains(model));
         assert!(!codex_none.contains(model));
@@ -12854,9 +13354,12 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let projects = root.join("projects");
         let model = "test-model-xyz";
 
-        let codex_with = macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None, &[]);
-        let claude_with = macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[]);
-        let codex_none = macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[]);
+        let codex_with =
+            macos_codex_launch_line("python3", &root, &root, &projects, Some(model), None, &[]);
+        let claude_with =
+            macos_claude_launch_line("python3", &root, &projects, Some(model), None, &[]);
+        let codex_none =
+            macos_codex_launch_line("python3", &root, &root, &projects, None, None, &[]);
         let claude_none = macos_claude_launch_line("python3", &root, &projects, None, None, &[]);
 
         assert!(claude_with.contains("--model"));
@@ -12900,8 +13403,8 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[test]
     fn cloud_goal_addendum_only_for_cloud_with_goal() {
         // Cloud client + a goal ⇒ the goal section is injected.
-        let block = cloud_goal_addendum("claude", Some("Add Stripe billing"))
-            .expect("cloud + goal ⇒ Some");
+        let block =
+            cloud_goal_addendum("claude", Some("Add Stripe billing")).expect("cloud + goal ⇒ Some");
         assert!(block.contains("Add Stripe billing"));
         assert!(block.contains("# Your goal for this project"));
         assert!(block.contains("plan_submit"));
@@ -13057,11 +13560,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             script.contains("session.gitconfig"),
             "GIT_CONFIG_GLOBAL must point at the per-session config file: {script}"
         );
-        for stale in [
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_0",
-        ] {
+        for stale in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
             assert!(
                 !script.contains(stale),
                 "broken {stale} env triple must be removed: {script}"
@@ -13105,11 +13604,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         fs::create_dir_all(&sandbox).expect("sandbox dir");
 
         let store_file = sandbox.join("git-credentials-store");
-        fs::write(
-            &store_file,
-            "https://fakeuser:fakepass123@github.com\n",
-        )
-        .expect("write store");
+        fs::write(&store_file, "https://fakeuser:fakepass123@github.com\n").expect("write store");
         let store_fwd = store_file.display().to_string().replace('\\', "/");
 
         let real_global = sandbox.join("realglobal.gitconfig");
@@ -13197,7 +13692,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             "must reset credential.helper to empty: {body}"
         );
         // Forward slashes only in any include path (git mangles backslashes).
-        for line in body.lines().filter(|l| l.trim_start().starts_with("path =")) {
+        for line in body
+            .lines()
+            .filter(|l| l.trim_start().starts_with("path ="))
+        {
             assert!(
                 !line.contains('\\'),
                 "include path must use forward slashes: {line}"
@@ -13250,11 +13748,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             script.contains("session.gitconfig"),
             "GIT_CONFIG_GLOBAL must point at the per-session config file: {script}"
         );
-        for stale in [
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_0",
-        ] {
+        for stale in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
             assert!(
                 !script.contains(stale),
                 "broken {stale} env triple must be removed: {script}"
@@ -13296,7 +13790,11 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // Windows arm emits `$env:NAME = '...'`; macOS arm emits `export NAME='...'`.
         // NEW mechanism (F1/F2): the three neutralizers are GIT_TERMINAL_PROMPT,
         // GIT_CONFIG_NOSYSTEM and GIT_CONFIG_GLOBAL (per-session include+reset).
-        for needle in ["GIT_TERMINAL_PROMPT", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"] {
+        for needle in [
+            "GIT_TERMINAL_PROMPT",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+        ] {
             assert!(
                 windows_body.contains(needle),
                 "Windows builder missing {needle}"
@@ -13763,7 +14261,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
         let rm_at = script.find(self_delete).unwrap();
         let title_at = script.find("printf '\\033]0;").unwrap();
-        assert!(rm_at < title_at, "self-delete must precede the title: {script}");
+        assert!(
+            rm_at < title_at,
+            "self-delete must precede the title: {script}"
+        );
         // On THIS path the provider_env secrets ARE exported in-script (the only channel).
         assert!(script.contains("export DEVBOULE_MCP_LAUNCH_TOKEN="));
         assert!(script.contains("export EXA_API_KEY="));
@@ -13778,7 +14279,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert_eq!(normalize_agent_client("CLAUDE").unwrap(), "claude");
         assert_eq!(normalize_agent_client("powershell").unwrap(), "powershell");
         // L2.4: the local Devboule orchestrator is a new built-in client id.
-        assert_eq!(normalize_agent_client(" Orchestrator ").unwrap(), "orchestrator");
+        assert_eq!(
+            normalize_agent_client(" Orchestrator ").unwrap(),
+            "orchestrator"
+        );
         assert!(normalize_agent_client("deepseek").is_err());
         assert!(normalize_agent_client("").is_err());
     }
@@ -13796,7 +14300,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             &HashSet::new(),
         )
         .unwrap_err();
-        assert!(err.contains("reserved"), "orchestrator id must be reserved: {err}");
+        assert!(
+            err.contains("reserved"),
+            "orchestrator id must be reserved: {err}"
+        );
     }
 
     #[test]
@@ -13810,7 +14317,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 assert!(path.to_string_lossy().contains("devboule-coder"));
             }
             Err(e) => {
-                assert!(e.contains("devboule-coder"), "error must name the binary: {e}");
+                assert!(
+                    e.contains("devboule-coder"),
+                    "error must name the binary: {e}"
+                );
                 assert!(e.contains("Looked in"), "error must list lookup paths: {e}");
             }
         }
@@ -14553,9 +15063,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     // proving a value the command writes reads back identically, the no-churn rule on
     // the Ollama default, and that an invalid input never reaches the file.
 
-    use super::super::censor::gemma::{
-        validate_censor_local_ai, CensorAiProvider, CensorLocalAi,
-    };
+    use super::super::censor::gemma::{validate_censor_local_ai, CensorAiProvider, CensorLocalAi};
 
     /// Simulate what set_censor_local_ai does (validate, then merge into config.json),
     /// then read the value back exactly as read_censor_local_ai does. Returns the
@@ -14597,7 +15105,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             value.get("censorLocalAi").is_none(),
             "bare ollama default must not write the key (no churn): {value}"
         );
-        assert_eq!(read_back, None, "absent key reads back as the default (None)");
+        assert_eq!(
+            read_back, None,
+            "absent key reads back as the default (None)"
+        );
     }
 
     #[test]
@@ -14632,7 +15143,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             value, original,
             "Auto must not touch an existing config (no churn): {value}"
         );
-        assert!(value.get("miniWriteBehavior").is_none(), "Auto writes no key");
+        assert!(
+            value.get("miniWriteBehavior").is_none(),
+            "Auto writes no key"
+        );
     }
 
     #[test]
@@ -14668,7 +15182,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             let parsed: MiniWriteBehavior =
                 serde_json::from_value(value["miniWriteBehavior"].clone())
                     .expect("written token must parse");
-            assert_eq!(parsed, behavior, "{behavior:?} round-trips through config.json");
+            assert_eq!(
+                parsed, behavior,
+                "{behavior:?} round-trips through config.json"
+            );
         }
     }
 
@@ -14683,9 +15200,18 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         let mut sorted = langs.clone();
         sorted.sort_unstable();
         assert_eq!(langs, sorted, "must be sorted (no churn)");
-        assert!(langs.contains(&"Python"), "manifest-gated Python is in the potential set");
-        assert!(langs.contains(&"HTML"), "manifest-less HTML is in the potential set");
-        assert!(!langs.contains(&"Rust"), "Rust has only Coarse runners -> excluded");
+        assert!(
+            langs.contains(&"Python"),
+            "manifest-gated Python is in the potential set"
+        );
+        assert!(
+            langs.contains(&"HTML"),
+            "manifest-less HTML is in the potential set"
+        );
+        assert!(
+            !langs.contains(&"Rust"),
+            "Rust has only Coarse runners -> excluded"
+        );
         for needle in ["Aspis", "Cloudflare", "Scaleway"] {
             assert!(!langs.contains(&needle), "product-general; found {needle}");
         }
@@ -14736,7 +15262,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         })
         .and_then(|normalized| apply_censor_local_ai_to_config(&mut value, &normalized));
         assert!(result.is_err(), "non-loopback omlx base must be rejected");
-        assert_eq!(value, original, "a rejected input must never touch config.json");
+        assert_eq!(
+            value, original,
+            "a rejected input must never touch config.json"
+        );
 
         // Missing model is likewise rejected before any write.
         assert!(validate_censor_local_ai(&CensorLocalAi {
@@ -14986,7 +15515,9 @@ mod broker_gate_projects {
     fn gate_approved_folder_enters_working_set_and_persists() {
         // Create a real temporary folder (canonicalize requires the path to exist).
         let folder_base = std::env::temp_dir().join(format!(
-            "aspis_gate2_{}_{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            "aspis_gate2_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
         fs::create_dir_all(&folder_base).unwrap();
         let canonical_folder = folder_base

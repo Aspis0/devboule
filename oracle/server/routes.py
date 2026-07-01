@@ -27,9 +27,9 @@ def strip_windows_verbatim_prefix(value: str) -> str:
     can never transiently mismatch. Pure string strip — a no-op on non-Windows /
     non-verbatim paths (they pass through unchanged)."""
     if value.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + value[len("\\\\?\\UNC\\"):]
+        return "\\\\" + value[len("\\\\?\\UNC\\") :]
     if value.startswith("\\\\?\\"):
-        return value[len("\\\\?\\"):]
+        return value[len("\\\\?\\") :]
     return value
 
 
@@ -43,7 +43,9 @@ def create_router():
     try:
         from fastapi import APIRouter, Depends, HTTPException, Request
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("Install oracle/requirements.txt to run the Oracle server.") from exc
+        raise RuntimeError(
+            "Install oracle/requirements.txt to run the Oracle server."
+        ) from exc
     try:
         import hmac
 
@@ -74,7 +76,9 @@ def create_router():
                     ),
                 )
             if not _matches(_provided_token(request), expected):
-                raise HTTPException(status_code=401, detail="Oracle server authentication failed")
+                raise HTTPException(
+                    status_code=401, detail="Oracle server authentication failed"
+                )
 
         def require_oracle_auth(request: Request) -> None:
             # BOUNDED tier: operator-OR-agent. Used ONLY by the /*-bounded
@@ -98,7 +102,9 @@ def create_router():
             provided = _provided_token(request)
             if _matches(provided, operator) or _matches(provided, agent):
                 return
-            raise HTTPException(status_code=401, detail="Oracle server authentication failed")
+            raise HTTPException(
+                status_code=401, detail="Oracle server authentication failed"
+            )
 
         # `router` carries OPERATOR-only auth for every existing endpoint.
         # `bounded_router` is a SIBLING router whose only dependency is the
@@ -207,7 +213,9 @@ def create_router():
         prefer_lexical = index_job_manager.indexing_in_progress()
         return {
             "query": q,
-            "chunks": make_engine().context(q, limit, allowed_file_ids=allowed, prefer_lexical=prefer_lexical),
+            "chunks": make_engine().context(
+                q, limit, allowed_file_ids=allowed, prefer_lexical=prefer_lexical
+            ),
         }
 
     @bounded_router.post("/ask-bounded")
@@ -221,8 +229,39 @@ def create_router():
         # index job is actively running so the agent stays under its timeout.
         prefer_lexical = index_job_manager.indexing_in_progress()
         return make_engine().ask(
-            q, limit, llm_config=server_side_llm_config(), allowed_file_ids=allowed, prefer_lexical=prefer_lexical
+            q,
+            limit,
+            llm_config=server_side_llm_config(),
+            allowed_file_ids=allowed,
+            prefer_lexical=prefer_lexical,
         )
+
+    @bounded_router.post("/embed-bounded")
+    def embed_bounded(payload: dict):
+        # Phase B.5: hybrid search embedding for the compactor. Returns dense
+        # vectors for the given texts via the Qwen embedder. If the embedder is
+        # unavailable or busy (indexing), return 503 so the caller falls back to
+        # BM25-only (graceful degradation, no crash).
+        texts = payload.get("texts")
+        if not isinstance(texts, list) or not texts:
+            raise HTTPException(
+                status_code=400, detail="texts must be a non-empty list"
+            )
+        if len(texts) > 64:
+            raise HTTPException(status_code=400, detail="too many texts (max 64)")
+        if index_job_manager.indexing_in_progress():
+            raise HTTPException(
+                status_code=503, detail="embedder busy (indexing); use BM25-only"
+            )
+        try:
+            from oracle.ingestion.embedder import embed_texts
+
+            embeddings = embed_texts(texts)
+            return {"embeddings": embeddings, "dims": config.EMBED_DIMS}
+        except Exception:
+            raise HTTPException(
+                status_code=503, detail="embedder unavailable; use BM25-only"
+            )
 
     @router.get("/node/{node_id:path}")
     def node(node_id: str):
@@ -282,7 +321,9 @@ def create_router():
 
     @router.post("/index/sync")
     def index_sync(root: str | None = None):
-        return index_job_manager.run_once(root=root, force=False, max_batches=0, idle=False)
+        return index_job_manager.run_once(
+            root=root, force=False, max_batches=0, idle=False
+        )
 
     @router.post("/index/run")
     def index_run(
@@ -297,7 +338,9 @@ def create_router():
         # idle=False (never deferred by the idle RAM floor) + unbounded batches
         # (process all pending, not just one ~16-file batch). The AUTO warm/watch
         # path keeps its opportunistic idle/single-batch behavior.
-        params = resolve_index_run_params(manual=manual, max_batches=max_batches, idle=idle)
+        params = resolve_index_run_params(
+            manual=manual, max_batches=max_batches, idle=idle
+        )
         if background:
             return index_job_manager.start_background(
                 root=root,
@@ -306,7 +349,10 @@ def create_router():
                 idle=params["idle"],
             )
         return index_job_manager.run_once(
-            root=root, force=force, max_batches=params["max_batches"], idle=params["idle"]
+            root=root,
+            force=force,
+            max_batches=params["max_batches"],
+            idle=params["idle"],
         )
 
     @router.post("/index/watch/start")
@@ -330,6 +376,7 @@ def create_router():
     parent.include_router(bounded_router)
     return parent
 
+
 def server_side_llm_config() -> dict | None:
     """Provider config for /ask, derived server-side only.
 
@@ -346,7 +393,9 @@ MAX_BOUNDED_LIMIT = 100
 MAX_BOUNDED_ALLOWED_IDS = 10000
 
 
-def parse_bounded_payload(payload: dict, default_limit: int) -> tuple[str, int, set[str]]:
+def parse_bounded_payload(
+    payload: dict, default_limit: int
+) -> tuple[str, int, set[str]]:
     """Parse a bounded-endpoint body into (query, limit, allowed_file_ids).
 
     SECURITY: `allowed_file_ids` is returned as a set so the engine constrains
@@ -379,7 +428,9 @@ def parse_bounded_payload(payload: dict, default_limit: int) -> tuple[str, int, 
     if raw_ids is None:
         return q, limit, allowed
     if not isinstance(raw_ids, (list, tuple)):
-        raise HTTPException(status_code=422, detail="allowed_file_ids must be a list or null.")
+        raise HTTPException(
+            status_code=422, detail="allowed_file_ids must be a list or null."
+        )
     if len(raw_ids) > MAX_BOUNDED_ALLOWED_IDS:
         raise HTTPException(
             status_code=422,

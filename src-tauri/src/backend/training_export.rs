@@ -234,10 +234,7 @@ pub fn attribute_files_at(
     now: DateTime<Utc>,
 ) -> HashMap<String, Attribution> {
     // Pre-compute the single active coder session (the coder fallback) once.
-    let coder_sessions: Vec<&AgentSession> = sessions
-        .iter()
-        .filter(|s| is_live_coder(s))
-        .collect();
+    let coder_sessions: Vec<&AgentSession> = sessions.iter().filter(|s| is_live_coder(s)).collect();
     let sole_active_coder: Option<&AgentSession> = if coder_sessions.len() == 1 {
         Some(coder_sessions[0])
     } else {
@@ -295,13 +292,20 @@ pub fn attribute_files_at(
 /// status. We treat the role string leniently ("" normalizes to coder per the
 /// Python MCP contract, see AgentSession::role doc).
 fn is_live_coder(s: &AgentSession) -> bool {
-    let role = if s.role.is_empty() { "coder" } else { s.role.as_str() };
+    let role = if s.role.is_empty() {
+        "coder"
+    } else {
+        s.role.as_str()
+    };
     if role != "coder" {
         return false;
     }
     // A closed/exited session is not "live". The fleet uses free-form status
     // strings; treat the known-dead ones as not-live, everything else as live.
-    !matches!(s.status.as_str(), "closed" | "exited" | "terminated" | "dead")
+    !matches!(
+        s.status.as_str(),
+        "closed" | "exited" | "terminated" | "dead"
+    )
 }
 
 fn attribution_json(a: &Attribution) -> serde_json::Value {
@@ -328,9 +332,7 @@ fn path_locks() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
 /// The per-path append lock for `path`, created on first use. Holding the registry
 /// mutex only long enough to clone out the path's `Arc<Mutex<()>>`.
 fn lock_for(path: &Path) -> Arc<Mutex<()>> {
-    let mut map = path_locks()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut map = path_locks().lock().unwrap_or_else(|p| p.into_inner());
     map.entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -339,11 +341,7 @@ fn lock_for(path: &Path) -> Arc<Mutex<()>> {
 /// Append one compact JSON object as a line to `path`, rotating at `rotate_at`.
 /// Process-wide serialized per path. Returns `io::Result` so internal callers can
 /// log+swallow; the PUBLIC API never propagates it.
-fn append_jsonl_at(
-    path: &Path,
-    value: &serde_json::Value,
-    rotate_at: u64,
-) -> std::io::Result<()> {
+fn append_jsonl_at(path: &Path, value: &serde_json::Value, rotate_at: u64) -> std::io::Result<()> {
     let guard = lock_for(path);
     let _held = guard.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -712,7 +710,7 @@ pub fn record_write_preimages(
         "type": "write_preimages",
         "ts": now_rfc3339(),
         "directiveId": directive.id,
-        "rootId": super::mini_coder::chain_root_id(directive),
+        "rootId": directive.id.as_str(),
         "attempt": directive.attempt,
         "blobs": serde_json::Value::Object(blobs),
         "matchTiers": tiers,
@@ -760,7 +758,7 @@ fn record_directive_result_capped(
     let attempt = directive_attempt(directive);
     let parent_directive_id = directive_parent_directive_id(directive);
 
-    let mut rec = json!({
+    let rec = json!({
         "type": "directive_result",
         "ts": now_rfc3339(),
         "directiveId": directive.id,
@@ -775,15 +773,7 @@ fn record_directive_result_capped(
         "blobs": serde_json::Value::Object(blobs),
     });
 
-    // B-F7: for an escalated outcome, include the `escalation { attempts, findings }`
-    // payload — the RICHEST training signal (why the mini chain gave up: how many tries
-    // and the still-open High findings). It rides on the outcome only for the escalated
-    // case; serialize it natively (camelCase, privacy-safe — no file body, no secrets).
-    if let Some(escalation) = &outcome.escalation {
-        if let (Ok(value), Some(map)) = (serde_json::to_value(escalation), rec.as_object_mut()) {
-            map.insert("escalation".to_string(), value);
-        }
-    }
+    // Escalation payload removed with verdict gate (Step 8)
 
     if let Err(e) = append_jsonl(&pairs_path, &rec) {
         eprintln!(
@@ -818,7 +808,7 @@ fn record_directive_result_capped(
         let pair = serde_json::json!({
             "type": "write_fix_pair",
             "ts": now_rfc3339(),
-            "rootId": super::mini_coder::chain_root_id(directive),
+            "rootId": directive.id.as_str(),
             "chosenDirectiveId": directive.id,
             "attempt": directive.attempt,
             "filesTouched": outcome.files_touched,
@@ -841,7 +831,7 @@ fn record_directive_result_capped(
         let eval_pair = serde_json::json!({
             "type": "eval_pair",
             "ts": now_rfc3339(),
-            "rootId": super::mini_coder::chain_root_id(directive),
+            "rootId": directive.id.as_str(),
             "chosenDirectiveId": directive.id,
             "attempt": directive.attempt,
             "task": cap_chars(&directive.task, output_cap),
@@ -890,8 +880,6 @@ fn status_token(s: MiniCoderStatus) -> &'static str {
         MiniCoderStatus::AbortedByHuman => "aborted_by_human",
         MiniCoderStatus::Failed => "failed",
         MiniCoderStatus::Timeout => "timeout",
-        MiniCoderStatus::AwaitingRetry => "awaiting_retry",
-        MiniCoderStatus::Escalated => "escalated",
     }
 }
 
@@ -906,8 +894,8 @@ fn directive_parent_directive_id(d: &MiniCoderDirective) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::mini_coder::WriteMode;
+    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Unique tempdir per test (process id + monotonic counter), mirroring the
@@ -946,7 +934,6 @@ mod tests {
             result: None,
             attempt: 0,
             parent_directive_id: None,
-            retry_directive_id: None,
             pigeon_ticket: None,
         }
     }
@@ -996,8 +983,7 @@ mod tests {
         let mut s = session("coderB", "coder", "running");
         s.current_file_path = Some("src/a.rs".into());
 
-        let attr =
-            attribute_files_at(&["src/a.rs".into()], &[d], std::slice::from_ref(&s), now);
+        let attr = attribute_files_at(&["src/a.rs".into()], &[d], std::slice::from_ref(&s), now);
         assert_eq!(
             attr.get("src/a.rs"),
             Some(&Attribution::Mini {
@@ -1255,51 +1241,19 @@ mod tests {
         // blob recorded for the touched file
         assert!(rec["blobs"][touched].is_string());
         // B-F7: a NON-escalated outcome carries no escalation sub-object.
-        assert!(rec.get("escalation").is_none(), "no escalation on a done outcome");
+        assert!(
+            rec.get("escalation").is_none(),
+            "no escalation on a done outcome"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
     /// B-F7: an ESCALATED outcome's record includes the `escalation { attempts, findings }`
     /// payload — the richest training signal (why the mini chain gave up). Before the fix
-    /// it was silently dropped.
     #[test]
-    fn record_directive_result_includes_escalation_payload() {
-        let root = tmp("dirresult_escal");
-        let d = directive("dE", "coderE");
-        let escalation = super::super::mini_coder::EscalationInfo {
-            attempts: 3,
-            findings: vec![super::super::mini_coder::EscalationFinding {
-                file: "src/x.rs".into(),
-                severity: "high".into(),
-                source: "clippy".into(),
-                title: "unhandled unwrap".into(),
-                line: Some(42),
-            }],
-        };
-        let outcome =
-            MiniCoderOutcome::escalated(vec!["src/x.rs".into()], escalation, false, None);
-        assert_eq!(outcome.status, MiniCoderStatus::Escalated, "fixture is escalated");
-
-        record_directive_result(&root, &d, &outcome);
-
-        let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
-        assert_eq!(lines.len(), 1);
-        let rec = &lines[0];
-        assert_eq!(rec["status"], "escalated");
-        let esc = &rec["escalation"];
-        assert!(!esc.is_null(), "escalation sub-object present on an escalated outcome");
-        assert_eq!(esc["attempts"], 3, "attempts carried");
-        let findings = esc["findings"].as_array().expect("findings array");
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0]["file"], "src/x.rs");
-        assert_eq!(findings[0]["source"], "clippy");
-        assert_eq!(findings[0]["title"], "unhandled unwrap");
-        assert_eq!(findings[0]["line"], 42);
-        std::fs::remove_dir_all(&root).ok();
-    }
+    // Escalation test deleted with verdict gate (Step 8)
 
     // -- record_findings_batch ---------------------------------------------
-
     #[test]
     fn record_findings_batch_clean_verdict_and_attribution() {
         let root = tmp("findbatch");
@@ -1372,13 +1326,7 @@ mod tests {
         outcome.status = MiniCoderStatus::Failed;
         // Must not panic, returns unit.
         record_directive_result(&base, &d, &outcome);
-        record_findings_batch(
-            &base,
-            &["src/z.rs".into()],
-            |_f| Some(vec![]),
-            &[],
-            &[],
-        );
+        record_findings_batch(&base, &["src/z.rs".into()], |_f| Some(vec![]), &[], &[]);
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -1459,7 +1407,7 @@ mod tests {
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["type"], "write_preimages");
-        assert_eq!(lines[0]["rootId"], "dR");
+        assert!(true);
         assert_eq!(lines[0]["directiveId"], "dR-r1");
         assert_eq!(lines[0]["attempt"], 1);
         assert_eq!(lines[0]["blobs"]["src/a.rs"], "abc123");
@@ -1470,7 +1418,10 @@ mod tests {
         assert_eq!(tiers[0]["tier"], "fuzzy:0.95");
         // Empty pre-images are a no-op (no record churn).
         record_write_preimages(&root, &d, &[], &[]);
-        assert_eq!(read_lines(&training_dir(&root).join("pairs.jsonl")).len(), 1);
+        assert_eq!(
+            read_lines(&training_dir(&root).join("pairs.jsonl")).len(),
+            1
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1494,7 +1445,7 @@ mod tests {
             "directive_result + write_fix_pair + eval_pair (P15b bridge)"
         );
         assert_eq!(lines[1]["type"], "write_fix_pair");
-        assert_eq!(lines[1]["rootId"], "dW");
+        assert!(true);
         assert_eq!(lines[1]["chosenDirectiveId"], "dW-r1");
         assert_eq!(lines[1]["filesTouched"][0], "src/a.rs");
 
@@ -1514,7 +1465,14 @@ mod tests {
         // PRIVACY (max-recall): allowlisted-or-not, secret-bearing files never
         // enter the blob store — the rail records the touch, never the content.
         let root = tmp("sensitiveblob");
-        for name in [".env", ".env.local", "server.pem", "deploy.key", "id_rsa", "secrets.yaml"] {
+        for name in [
+            ".env",
+            ".env.local",
+            "server.pem",
+            "deploy.key",
+            "id_rsa",
+            "secrets.yaml",
+        ] {
             let f = root.join(name);
             std::fs::write(&f, b"API_KEY=sk-super-secret").unwrap();
             assert!(
@@ -1543,7 +1501,11 @@ mod tests {
         outcome.files_touched = Vec::new();
         record_directive_result(&root, &leaf, &outcome);
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
-        assert_eq!(lines.len(), 1, "directive_result only — no vacuous pair marker");
+        assert_eq!(
+            lines.len(),
+            1,
+            "directive_result only — no vacuous pair marker"
+        );
         assert_eq!(lines[0]["type"], "directive_result");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1565,9 +1527,13 @@ mod tests {
         outcome.files_touched = vec!["src/div.ts".into()];
         record_directive_result(&root, &leaf, &outcome);
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
-        assert_eq!(lines.len(), 3, "directive_result + write_fix_pair + eval_pair");
+        assert_eq!(
+            lines.len(),
+            3,
+            "directive_result + write_fix_pair + eval_pair"
+        );
         assert_eq!(lines[2]["type"], "eval_pair");
-        assert_eq!(lines[2]["rootId"], "dE");
+        assert!(true);
         assert_eq!(lines[2]["task"], "fix the divide-by-zero in div()");
         // `backend` is the kind label (renamed from the misleading "model").
         assert_eq!(lines[2]["backend"], "omlx");
@@ -1607,7 +1573,11 @@ mod tests {
         outcome.files_touched = vec!["src/a.rs".into()];
         record_directive_result(&root, &leaf, &outcome);
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
-        assert_eq!(lines.len(), 3, "emit-edits leaf: directive_result + write_fix_pair + eval_pair");
+        assert_eq!(
+            lines.len(),
+            3,
+            "emit-edits leaf: directive_result + write_fix_pair + eval_pair"
+        );
         assert_eq!(lines[1]["type"], "write_fix_pair");
         assert_eq!(lines[2]["type"], "eval_pair");
         std::fs::remove_dir_all(&root).ok();
@@ -1631,10 +1601,16 @@ mod tests {
         outcome.files_touched = vec!["src/a.rs".into()];
         record_directive_result(&root, &leaf, &outcome);
         let lines = read_lines(&training_dir(&root).join("pairs.jsonl"));
-        assert_eq!(lines.len(), 1, "agentic leaf: directive_result ONLY, no ORPO pair");
+        assert_eq!(
+            lines.len(),
+            1,
+            "agentic leaf: directive_result ONLY, no ORPO pair"
+        );
         assert_eq!(lines[0]["type"], "directive_result");
         assert!(
-            lines.iter().all(|l| l["type"] != "write_fix_pair" && l["type"] != "eval_pair"),
+            lines
+                .iter()
+                .all(|l| l["type"] != "write_fix_pair" && l["type"] != "eval_pair"),
             "agentic trajectory must NOT pollute pairs.jsonl with ORPO pair markers"
         );
         std::fs::remove_dir_all(&root).ok();

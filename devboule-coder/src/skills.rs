@@ -178,7 +178,7 @@ pub fn skills_catalog_block(skills: &[LibrarySkill]) -> Option<String> {
         return None;
     }
     let mut sorted = skills.to_vec();
-    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    sorted.sort_by_key(|a| a.name.to_lowercase());
     // name/description come from repo-writable SKILL.md (semi-trusted). sanitize_metadata closes the
     // STRUCTURAL escapes (a newline forging a new prompt section, a fence-breaker); the untrusted-data
     // framing + fence below keep a hostile description from posing as an instruction (mirrors the
@@ -208,7 +208,7 @@ fn fuzzy_suggest(query: &str, skills: &[LibrarySkill]) -> Vec<String> {
             n.contains(&q) || q.contains(&n)
         })
         .collect();
-    matches.sort_by(|a, b| a.name.len().cmp(&b.name.len()));
+    matches.sort_by_key(|a| a.name.len());
     matches.into_iter().take(3).map(|s| s.name.clone()).collect()
 }
 

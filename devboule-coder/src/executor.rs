@@ -785,14 +785,19 @@ impl ToolExecutor for RealExecutor {
         self.mcp.user_server_names()
     }
 
-    /// Drain the live steer inbox (app → running orchestrator). Empty when no
-    /// `DEVBOULE_STEER_FILE` was set at launch.
+    /// Drain the live steer inbox (app → running orchestrator) AND the Censor
+    /// steer file at `<project_root>/.aspis/steer_censor` (Phase B deep findings).
+    /// Empty when no steer sources are active.
     fn drain_steer(&self) -> Vec<String> {
-        self.steer.drain()
+        let mut msgs = self.steer.drain();
+        // Phase B: immediate steer cache from Censor passes
+        drain_steer_cache(&self.fs.root, &mut msgs);
+        // NOTE: the persistent queue (.aspis/censor_queue/) is NOT drained here.
+        // It survives restarts and is consumed by cloud coders via MCP
+        // `censor_findings(drain_queue=true)`. The local coder gets findings
+        // via the steer_cache file (overwritten each Censor pass).
+        msgs
     }
-
-    /// Surface a conversational chat turn through the activity bridge (no-op when no
-    /// `DEVBOULE_ACTIVITY_FILE`). Makes the planner chat a real two-way conversation.
     fn emit_chat(&self, role: &str, text: &str) {
         self.activity.chat(role, text);
     }
@@ -1042,6 +1047,48 @@ impl RealExecutor {
             Ok(text) => ToolResult::ok(text),
             Err(e) => ToolResult::err(format!("{name}: {e}")),
         }
+    }
+}
+
+/// Drain the immediate steer cache file (overwritten each Censor pass).
+fn drain_steer_cache(root: &Path, msgs: &mut Vec<String>) {
+    let path = root.join(".aspis").join("steer_censor");
+    if !path.exists() {
+        return;
+    }
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let trimmed = content.trim().to_string();
+        if !trimmed.is_empty() {
+            msgs.push(trimmed);
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Drain the persistent Censor queue directory (accumulated batch files).
+fn drain_censor_queue_dir(root: &Path, msgs: &mut Vec<String>) {
+    let queue_dir = root.join(".aspis").join("censor_queue").join("pending");
+    if !queue_dir.exists() {
+        return;
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&queue_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "json") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    for path in &files {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let trimmed = content.trim().to_string();
+            if !trimmed.is_empty() {
+                msgs.push(trimmed);
+            }
+        }
+        let _ = std::fs::remove_file(path);
     }
 }
 

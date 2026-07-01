@@ -45,6 +45,19 @@ const MAX_TOKENS: u32 = 2048;
 /// blob. Sized to comfortably hold several full-size rounds.
 const MAX_TRANSCRIPT_CHARS: usize = 100_000;
 
+/// Phase B (plan v5): env var controlling the model's context window (tokens).
+/// Used by the BM25 compactor to compute the char budget at 70% of the window.
+const ENV_CONTEXT_WINDOW: &str = "DEVBOULE_CONTEXT_WINDOW";
+const DEFAULT_CONTEXT_WINDOW: usize = 8192;
+
+fn context_window_tokens() -> usize {
+    std::env::var(ENV_CONTEXT_WINDOW)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&w| w >= 1024)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
 /// Is a char forbidden in a launch/URL string? Mirrors
 /// `mini_coder::is_forbidden_command_char`: control chars plus the bidi /
 /// invisible / format blocklist, so a right-to-left override or zero-width char
@@ -622,11 +635,9 @@ fn build_messages(
         json!({ "role": "user", "content": transcript.human_message() }),
     ];
 
-    // Render each entry to a (role, content) message and roll off the OLDEST once
-    // the cumulative history would exceed MAX_TRANSCRIPT_CHARS — keeping the most
-    // recent rounds. We measure by `content` chars (the dominant cost) and keep
-    // entries from the BACK (newest) until the budget is spent, then restore
-    // chronological order.
+    // Render each entry to a (role, content) message. BM25 selects the most relevant
+    // entries within 70% of the model's context window (replacing the old "keep last N
+    // chars" trim). The system prompt + human message are always kept (non-evictable).
     let rendered: Vec<(&'static str, String)> = transcript
         .entries()
         .iter()
@@ -649,18 +660,34 @@ fn build_messages(
         })
         .collect();
 
-    // Walk newest-first, accumulating until the next entry would blow the budget.
+    // Phase B (plan v5): BM25-select the most relevant entries vs the human message,
+    // at 70% of the model's context window (tokens→chars via ~4 chars/token).
+    // Replaces the old "keep last N chars" stupid trim.
+    let budget_chars = context_window_tokens() * 70 / 100 * 4; // tokens → chars (~4 chars/token)
+    let kept_owned: Vec<(&'static str, String)> = if budget_chars >= MAX_TRANSCRIPT_CHARS
+        || rendered.is_empty()
+    {
+        // Budget huge or empty → keep everything (old behavior on large windows).
+        rendered.iter().map(|(r, c)| (*r, c.clone())).collect()
+    } else {
+        select_transcript_bm25(&rendered, transcript.human_message(), budget_chars)
+    };
+    // Build kept_rev as refs into rendered by matching (role, content),
+    // using a bool vec to track used indices so identical values map to distinct
+    // successive entries, preserving chronological order.
+    let mut used = vec![false; rendered.len()];
     let mut kept_rev: Vec<&(&'static str, String)> = Vec::new();
-    let mut used = 0usize;
-    for item in rendered.iter().rev() {
-        let cost = item.1.chars().count();
-        if !kept_rev.is_empty() && used + cost > MAX_TRANSCRIPT_CHARS {
-            break; // older than this is evicted; keep at least the newest entry
+    for owned in &kept_owned {
+        for (idx, r) in rendered.iter().enumerate() {
+            if !used[idx] && r.0 == owned.0 && r.1 == owned.1 {
+                used[idx] = true;
+                kept_rev.push(r);
+                break;
+            }
         }
-        used += cost;
-        kept_rev.push(item);
     }
-    kept_rev.reverse();
+    // kept_owned is chronological; kept_rev is chronological. Downstream expects kept_rev
+    // already chronological (the old code reversed it). So do NOT reverse.
 
     // After trimming, the kept window may START on a tool result/feedback whose
     // preceding action was evicted — a stranded result confuses the model. Drop
@@ -1124,6 +1151,70 @@ impl CoderModel for CloudModel {
     }
 }
 
+/// BM25-select the most relevant transcript entries vs the query, within a char budget.
+/// Replaces the old "keep last N chars" stupid trim. Each entry is (role, content).
+/// Returns the selected entries in chronological (original) order.
+pub fn select_transcript_bm25(
+    entries: &[(&'static str, String)],
+    query: &str,
+    budget_chars: usize,
+) -> Vec<(&'static str, String)> {
+    if entries.is_empty() { return vec![]; }
+    if budget_chars == 0 { return vec![]; }
+
+    // BM25 params (standard Okapi).
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+
+    let docs: Vec<Vec<String>> = entries.iter()
+        .map(|(_, c)| c.to_lowercase().split_whitespace().map(String::from).collect())
+        .collect();
+    let n = docs.len();
+    let avg_len = if n > 0 { docs.iter().map(|d| d.len()).sum::<usize>() as f64 / n as f64 } else { 1.0 };
+    let avg = avg_len.max(1.0);
+
+    // Term document frequencies.
+    let mut dfs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for doc in &docs {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for t in doc { if seen.insert(t.as_str()) { *dfs.entry(t.clone()).or_insert(0) += 1; } }
+    }
+
+    // Score each entry.
+    let q_terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+    let scores: Vec<f64> = docs.iter().map(|doc| {
+        let dl = doc.len() as f64;
+        q_terms.iter().map(|qt| {
+            let tf = doc.iter().filter(|t| *t == qt).count() as f64;
+            if tf == 0.0 { return 0.0; }
+            let df = *dfs.get(qt).unwrap_or(&1) as f64;
+            let idf = ((n as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / avg))
+        }).sum()
+    }).collect();
+
+    // Greedy: pick highest-score entries first until budget is spent, then restore chronological order.
+    // Tiebreaker: when BM25 scores are equal, prefer entries closer to the end (newer)
+    // so the behavior is equivalent to the old "keep last N" trim.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.cmp(&a)) // newer index wins on tie
+    });
+    let mut picked: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for &i in &order {
+        let cost = entries[i].1.chars().count();
+        if !picked.is_empty() && used + cost > budget_chars { break; }
+        picked.push(i);
+        used += cost;
+    }
+    picked.sort(); // restore chronological order
+    picked.iter().map(|&i| (entries[i].0, entries[i].1.clone())).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,7 +1403,14 @@ mod tests {
             ))));
         }
 
+        // Set a small context window so BM25 actually trims (default 8192 tokens
+        // → 8192 * 0.7 * 4 = 22,937 chars budget). With 20 rounds of ~16KB each
+        // (320KB total), only the newest ~1 round fits. The recency tiebreaker
+        // ensures the newest entries are kept (matching old behavior).
+        std::env::set_var(ENV_CONTEXT_WINDOW, "8192");
         let body = model.build_request_body(&transcript);
+        // Restore default after test.
+        std::env::remove_var(ENV_CONTEXT_WINDOW);
         let messages = body["messages"].as_array().expect("messages array");
 
         // System + human are always present and first.
@@ -1663,6 +1761,28 @@ mod tests {
     /// to minimise token cost while still exercising the full transport + parsing
     /// path: `CloudModel::new` → SSRF resolver + TLS → `/chat/completions` →
     /// `parse_chat_response` → non-empty string.
+    #[test]
+    fn bm25_transcript_selects_relevant_entries() {
+        // 5 entries: 3 relevant to "auth bug", 2 irrelevant (css styling)
+        let entries = vec![
+            ("assistant", "let me fix the auth login bug in src/auth.rs".to_string()),
+            ("user", "TOOL RESULT:\nbody { color: red; } css styling only".to_string()),
+            ("assistant", "the auth bug is on line 42, password check".to_string()),
+            ("user", "TOOL RESULT:\nmargin: 0; padding: 0; unrelated".to_string()),
+            ("assistant", "fixing the login auth password verification".to_string()),
+        ];
+        let query = "fix auth login bug in password check";
+        // Budget: keep only ~120 chars worth (~30 tokens) → must pick the most relevant
+        let budget_chars = 120;
+        let selected = select_transcript_bm25(&entries, query, budget_chars);
+        // Must include at least one auth-relevant entry
+        assert!(selected.iter().any(|(_, c)| c.contains("auth") || c.contains("password")),
+            "BM25 must keep auth-relevant entries over css");
+        // Must NOT include only css entries
+        assert!(!selected.iter().all(|(_, c)| c.contains("css") || c.contains("margin")),
+            "BM25 must not keep only irrelevant css entries");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_cloud_model_completion_via_openrouter() {

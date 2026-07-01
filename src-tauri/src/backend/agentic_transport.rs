@@ -123,7 +123,10 @@ pub fn parse_llm_turn(resp: &Value) -> Result<LlmTurn, String> {
                 Some(ToolCall {
                     id: tc["id"].as_str().unwrap_or("").to_string(),
                     name: name.to_string(),
-                    arguments: tc["function"]["arguments"].as_str().unwrap_or("{}").to_string(),
+                    arguments: tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}")
+                        .to_string(),
                 })
             })
             .collect();
@@ -163,14 +166,26 @@ impl HttpAgentLlm {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { base_url, model, tools, params, enable_thinking, client })
+        Ok(Self {
+            base_url,
+            model,
+            tools,
+            params,
+            enable_thinking,
+            client,
+        })
     }
 }
 
 impl AgentLlm for HttpAgentLlm {
     fn next_turn(&mut self, messages: &[ChatMsg]) -> Result<LlmTurn, String> {
-        let body =
-            build_chat_request(&self.model, messages, &self.tools, &self.params, self.enable_thinking);
+        let body = build_chat_request(
+            &self.model,
+            messages,
+            &self.tools,
+            &self.params,
+            self.enable_thinking,
+        );
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
             .client
@@ -215,8 +230,12 @@ mod tests {
 
     #[test]
     fn parse_message_response() {
-        let raw = json!({ "choices": [{ "message": { "role": "assistant", "content": "all done" } }] });
-        assert_eq!(parse_llm_turn(&raw).unwrap(), LlmTurn::Message("all done".to_string()));
+        let raw =
+            json!({ "choices": [{ "message": { "role": "assistant", "content": "all done" } }] });
+        assert_eq!(
+            parse_llm_turn(&raw).unwrap(),
+            LlmTurn::Message("all done".to_string())
+        );
     }
 
     #[test]
@@ -230,7 +249,10 @@ mod tests {
         assert!(body["tools"].is_null());
         assert!(body["tool_choice"].is_null());
         assert!(body.get("thinking_budget").is_none());
-        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(false));
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
         assert_eq!(body["model"], "m");
     }
 
@@ -258,6 +280,7 @@ mod tests {
             top_p: None,
             top_k: Some(40),
             thinking_budget: None,
+            context_window: 8192,
         };
         let p = SamplingParams::from_registry(&entry);
         assert_eq!(p.temperature, 0.3); // from entry

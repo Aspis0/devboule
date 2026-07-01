@@ -537,8 +537,8 @@ fn find_occurrences(hay: &str, needle: &str) -> Vec<usize> {
     if needle.is_empty() {
         return out;
     }
-    let first_alnum = needle.chars().next().map_or(false, |c| c.is_alphanumeric());
-    let last_alnum = needle.chars().last().map_or(false, |c| c.is_alphanumeric());
+    let first_alnum = needle.chars().next().is_some_and(|c| c.is_alphanumeric());
+    let last_alnum = needle.chars().last().is_some_and(|c| c.is_alphanumeric());
 
     let mut start = 0usize;
     while let Some(rel) = hay[start..].find(needle) {
@@ -549,12 +549,12 @@ fn find_occurrences(hay: &str, needle: &str) -> Vec<usize> {
             || hay[..abs]
                 .chars()
                 .next_back()
-                .map_or(true, |c| !c.is_alphanumeric());
+                .is_none_or(|c| !c.is_alphanumeric());
         let right_ok = !last_alnum
             || hay[end..]
                 .chars()
                 .next()
-                .map_or(true, |c| !c.is_alphanumeric());
+                .is_none_or(|c| !c.is_alphanumeric());
 
         if left_ok && right_ok {
             out.push(abs);

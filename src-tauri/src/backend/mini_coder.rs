@@ -80,12 +80,6 @@ pub const DEFAULT_LAUNCH_CAP_SECS: i64 = 60;
 /// runaway and degrades to `failed` rather than reading unbounded (OOM guard).
 pub(crate) const MAX_RESULT_BYTES: u64 = 1 << 20; // 1 MiB
 
-/// P6: maximum number of AUTOMATIC retries a dirty mini gets before the chain is
-/// escalated to the orchestrator. The root directive is attempt 0; retries are
-/// attempts 1..=MAX_MINI_RETRIES. So a file gets up to 1 + MAX_MINI_RETRIES total
-/// mini attempts before `Escalated`.
-pub const MAX_MINI_RETRIES: u32 = 2;
-
 /// B1 (agentic-iterative): retry budget for an `AgenticIterative` WRITE directive on a
 /// language WITH deterministic Tier-A coverage. The agentic loop is just the existing P6
 /// retry chain run for more rounds — each round re-emits edits, Rust applies them, the
@@ -127,49 +121,6 @@ pub const MAX_MINI_RETRIES: u32 = 2;
 /// re-checked); the test `budget_max_agentic_fix_rounds_fits_the_python_poll_budget` pins it.
 pub const MAX_AGENTIC_FIX_ROUNDS: u32 = 2;
 
-/// P6/B1: retry budget by directive kind, language coverage, and write mode.
-///
-/// Budget table (the ONLY behavioral lever of agentic-iterative):
-///   * `write` + `AgenticIterative` + `covered`  -> [`MAX_AGENTIC_FIX_ROUNDS`] (the
-///     N-round loop: deterministic feedback exists, so iterating pays off).
-///   * `write` (any other case: `EmitEdits`, OR `AgenticIterative` with NO coverage)
-///     -> 1 (the master plan's bounded inner loop: write -> det-Censor -> fix once ->
-///     stop/escalate). `AgenticIterative` with no deterministic coverage falls back to
-///     this single pass — iterating without a per-round verdict buys nothing (B2).
-///   * non-write -> historical [`MAX_MINI_RETRIES`] (`covered` is irrelevant here).
-///
-/// `covered` is the caller-resolved "this directive touches >=1 file whose language has a
-/// language-SPECIFIC Tier-A runner" signal (computed in the impure executor from the
-/// directive's files + the project's detected kinds, so this stays pure/IO-free). It is
-/// consulted ONLY in the agentic+write branch; for every other directive the result is
-/// identical to the pre-B1 behavior regardless of `covered`, so the default emit-edits and
-/// the non-write paths stay byte-identical.
-///
-/// E1 (FIX 1): `write_mode` is the EFFECTIVE mode supplied by the caller, NOT
-/// `directive.write_mode`. The executor reads the global [`MiniWriteBehavior`] policy at
-/// DECISION time and clamps a `Safe` policy to [`WriteMode::EmitEdits`] BEFORE calling this,
-/// so a directive that arrived with `write_mode == AgenticIterative` (coder hallucination /
-/// prompt-injection / replayed directive) is FORCED to the single-pass budget under Safe —
-/// the policy is now a HARD ceiling at the budget gate, not just launch-prompt guidance.
-/// `Auto`/`AgenticAllowed` pass `directive.write_mode` through unchanged (today's behavior).
-pub fn max_mini_retries_for(
-    directive: &MiniCoderDirective,
-    write_mode: WriteMode,
-    covered: bool,
-) -> u32 {
-    if directive.write {
-        if write_mode == WriteMode::AgenticIterative && covered {
-            MAX_AGENTIC_FIX_ROUNDS
-        } else {
-            // EmitEdits write, or agentic-but-uncovered (B2 fallback): one fix pass.
-            1
-        }
-    } else {
-        // Non-write directive: the historical budget, unchanged. `covered` is ignored.
-        MAX_MINI_RETRIES
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -192,26 +143,11 @@ pub enum MiniCoderStatus {
     AbortedByHuman,
     Failed,
     Timeout,
-    /// P6: a `done` mini whose deterministic Censor verdict was dirty and that has
-    /// retries left. The directive is NEITHER active (its PTY is gone — it holds no
-    /// concurrency slot) NOR terminal (a freshly-appended retry directive will, on
-    /// reaching a terminal state, PROPAGATE that outcome back to this predecessor).
-    /// Must NOT be evicted (it is awaiting its retry's verdict) and must NOT be
-    /// re-claimed (it already ran). Distinct from every other state precisely
-    /// because it is the one non-active, non-terminal limbo.
-    AwaitingRetry,
-    /// P6: terminal. The retry chain exhausted `MAX_MINI_RETRIES` and Censor was
-    /// still dirty. The orchestrator must redo the file itself; the escalation
-    /// payload (attempts + findings) rides back through the blocking
-    /// `spawn_mini_coder` poll on the ROOT directive's id.
-    Escalated,
 }
 
 impl MiniCoderStatus {
     /// `true` once the directive has reached a terminal state (no further
     /// transition). Only terminal directives are eligible for eviction.
-    /// `Escalated` is terminal; `AwaitingRetry` is deliberately NOT (it is still
-    /// awaiting its retry chain's propagated verdict, so it must survive eviction).
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -220,14 +156,11 @@ impl MiniCoderStatus {
                 | MiniCoderStatus::AbortedByHuman
                 | MiniCoderStatus::Failed
                 | MiniCoderStatus::Timeout
-                | MiniCoderStatus::Escalated
         )
     }
 
     /// `true` while the directive is live (claimed/launching/running) and must
-    /// NEVER be evicted nor re-claimed. `AwaitingRetry` is NOT active: its PTY is
-    /// gone and it holds no concurrency slot (so a retry directive can claim one),
-    /// yet it is also not terminal — see [`MiniCoderStatus::is_terminal`].
+    /// NEVER be evicted nor re-claimed.
     pub fn is_active(self) -> bool {
         matches!(self, MiniCoderStatus::Launching | MiniCoderStatus::Running)
     }
@@ -304,38 +237,6 @@ pub struct MiniCoderResult {
 /// Keeping this DISTINCT from `MiniCoderResult` is intentional: the result file
 /// is the mini's narrow self-report, while the outcome is the authoritative
 /// app-side verdict the coder's `spawn_mini_coder` call returns. Conflating them
-/// would force the mini's schema to carry app-only fields it must never set.
-/// P6: one Censor finding summarized for the escalation payload + the retry
-/// directive's appended feedback. A thin, privacy-safe projection of a Censor
-/// `Finding` (no file body, no secrets) — just enough for the orchestrator to
-/// understand why the mini's output was rejected.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct EscalationFinding {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub file: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub severity: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-}
-
-/// P6: escalation payload attached to an `Escalated` outcome. Rides back through
-/// the blocking `spawn_mini_coder` poll so the orchestrator knows the mini chain
-/// gave up after `attempts` tries and WHY (the still-open findings).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct EscalationInfo {
-    /// Total mini attempts spent on this chain (root + retries) before giving up.
-    #[serde(default)]
-    pub attempts: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub findings: Vec<EscalationFinding>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -358,10 +259,6 @@ pub struct MiniCoderOutcome {
     /// `done`/`needs_clarification` reported by the mini.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// P6: present ONLY on an `Escalated` outcome. The retry chain's give-up
-    /// summary that the orchestrator reads to redo the file itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub escalation: Option<EscalationInfo>,
     /// SANDBOX broker: true when the agentic worker set `net_blocked` in its result
     /// JSON (network-blocked failure detected while `net == NetPolicy::None`).
     /// `finalize_finished_mini` uses this to emit the `sandbox://consent-request`
@@ -374,6 +271,9 @@ pub struct MiniCoderOutcome {
     /// NO-CHURN: omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_write_blocked: Option<String>,
+    /// Phase A Censor findings (fast runners, ≤3s). None = no issues or timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub censor_findings: Option<Vec<crate::backend::censor::schema::Finding>>,
 }
 
 impl MiniCoderOutcome {
@@ -388,62 +288,11 @@ impl MiniCoderOutcome {
             question: None,
             partial: result.partial,
             error: None,
-            escalation: None,
             net_blocked: result.net_blocked,
             folder_write_blocked: result.folder_write_blocked,
+            censor_findings: None,
         }
     }
-
-    /// Outcome synthesized from a valid mini-written `MiniCoderResult` reporting
-    /// `needs_clarification`. Carries the mini's question/partial, no error.
-    pub fn needs_clarification(result: MiniCoderResult) -> Self {
-        Self {
-            status: MiniCoderStatus::NeedsClarification,
-            output: result.output,
-            files_touched: result.files_touched,
-            // P4: a needs_clarification result never applies edits — only a
-            // clean `done` may touch disk, so any emitted edits are dropped.
-            edits: Vec::new(),
-            question: result.question,
-            partial: result.partial,
-            error: None,
-            escalation: None,
-            net_blocked: result.net_blocked,
-            folder_write_blocked: result.folder_write_blocked,
-        }
-    }
-
-    /// P6: app-synthesized `escalated` (retry chain exhausted, Censor still dirty).
-    /// Carries the give-up summary back to the orchestrator. `files_touched` is the
-    /// last attempt's touched set so the orchestrator knows which files to redo.
-    ///
-    /// `net_blocked` is threaded from the LAST attempt's outcome so that
-    /// `finalize_finished_mini` still emits the `sandbox://consent-request` event
-    /// on the escalation path (FIX 2).
-    /// `folder_write_blocked` is similarly threaded from the LAST attempt's outcome.
-    pub fn escalated(
-        files_touched: Vec<String>,
-        escalation: EscalationInfo,
-        net_blocked: bool,
-        folder_write_blocked: Option<String>,
-    ) -> Self {
-        Self {
-            status: MiniCoderStatus::Escalated,
-            output: None,
-            files_touched,
-            edits: Vec::new(),
-            question: None,
-            partial: None,
-            error: Some(format!(
-                "Censor still dirty after {} mini attempt(s); escalated to the orchestrator.",
-                escalation.attempts
-            )),
-            escalation: Some(escalation),
-            net_blocked,
-            folder_write_blocked,
-        }
-    }
-
     /// App-synthesized `failed` (no/invalid result file, parent gone, etc).
     pub fn failed(error: impl Into<String>) -> Self {
         Self {
@@ -468,6 +317,22 @@ impl MiniCoderOutcome {
             status: MiniCoderStatus::AbortedByHuman,
             error: Some(error.into()),
             ..Self::default()
+        }
+    }
+
+    /// App-synthesized `needs_clarification`. Carries the mini's question.
+    pub fn needs_clarification(result: MiniCoderResult) -> Self {
+        Self {
+            status: MiniCoderStatus::NeedsClarification,
+            output: result.output,
+            files_touched: result.files_touched,
+            edits: result.edits,
+            question: result.question.clone(),
+            partial: result.partial,
+            error: None,
+            net_blocked: result.net_blocked,
+            folder_write_blocked: result.folder_write_blocked,
+            censor_findings: None,
         }
     }
 }
@@ -669,12 +534,6 @@ pub struct MiniCoderDirective {
     /// outcome, so the poll watching the ROOT id unblocks. NO-CHURN: omitted when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_directive_id: Option<String>,
-    /// P6: forward link stamped on a predecessor when it transitions to
-    /// `AwaitingRetry` — the id of the freshly-appended retry directive. Lets a
-    /// startup sweep detect a predecessor whose retry was lost (evicted / never
-    /// appended) and fail it rather than leave it in limbo. NO-CHURN: omitted when None.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_directive_id: Option<String>,
     /// Slice 3 (Pigeon transport): the Pigeon mailbox ticket this directive arrived on,
     /// stamped by the executor's INGEST when it drains `mini-pool` (seam B). The EGRESS
     /// (seam C) posts the terminal outcome back to THIS ticket (`/pigeon/done`) so the
@@ -819,87 +678,6 @@ pub fn apply_failed(
     apply_outcome(directive, MiniCoderOutcome::failed(reason))
 }
 
-// ---------------------------------------------------------------------------
-// P6: retry / escalation transitions + propagation (all pure, clock-split)
-// ---------------------------------------------------------------------------
-
-/// P6: transition an ACTIVE (`Running`) directive whose `done` mini was found dirty
-/// by the deterministic Censor verdict into `AwaitingRetry`, stamping the forward
-/// link to its freshly-minted retry directive. Only a `Running` directive may enter
-/// `AwaitingRetry` (the verdict gate fires on the EOF/done path, where the directive
-/// is still `Running`); anything else is an error. The directive keeps its `result`
-/// UNSET — `AwaitingRetry` is limbo, the terminal verdict arrives later via
-/// propagation from the retry chain's leaf.
-pub fn apply_awaiting_retry(
-    directive: &MiniCoderDirective,
-    retry_directive_id: impl Into<String>,
-) -> Result<MiniCoderDirective, String> {
-    if directive.status != MiniCoderStatus::Running {
-        return Err(format!(
-            "cannot move directive {} to awaiting_retry from status {:?} (expected running)",
-            directive.id, directive.status
-        ));
-    }
-    let mut next = directive.clone();
-    next.status = MiniCoderStatus::AwaitingRetry;
-    next.retry_directive_id = Some(retry_directive_id.into());
-    Ok(next)
-}
-
-/// P6: synthesize the terminal `Escalated` outcome (retry chain exhausted, Censor
-/// still dirty) on an ACTIVE (`Running`) directive — the LEAF of the chain. The
-/// escalation payload rides back to the orchestrator. Propagation then stamps the
-/// same outcome onto the chain's `AwaitingRetry` predecessors.
-///
-/// `net_blocked` is threaded from the last attempt's outcome (FIX 2: keeps the
-/// consent-request event firing on the escalation path).
-/// `folder_write_blocked` is similarly threaded from the last attempt's outcome.
-pub fn apply_escalated(
-    directive: &MiniCoderDirective,
-    files_touched: Vec<String>,
-    escalation: EscalationInfo,
-    net_blocked: bool,
-    folder_write_blocked: Option<String>,
-) -> Result<MiniCoderDirective, String> {
-    apply_outcome(
-        directive,
-        MiniCoderOutcome::escalated(files_touched, escalation, net_blocked, folder_write_blocked),
-    )
-}
-
-/// P6: the ROOT id of a directive's retry chain — the id the blocking
-/// `spawn_mini_coder` poll watches. A retry carries `parent_directive_id =
-/// Some(root)`; the root carries None and IS its own root.
-pub fn chain_root_id(directive: &MiniCoderDirective) -> &str {
-    directive
-        .parent_directive_id
-        .as_deref()
-        .unwrap_or(directive.id.as_str())
-}
-
-/// P6: given the LEAF directive that just reached a terminal state and the full
-/// directive snapshot, return the ids of every `AwaitingRetry` predecessor in the
-/// SAME lineage that must be stamped with the leaf's terminal outcome (so the poll
-/// watching the ROOT id unblocks). The lineage is keyed on the shared root id: a
-/// directive belongs to it when it is the root itself or carries
-/// `parent_directive_id == Some(root)`. The leaf is excluded (it is stamped
-/// directly by the caller). Pure: the caller does the actual stamping under lock.
-pub fn awaiting_retry_ancestors(
-    directives: &[MiniCoderDirective],
-    leaf: &MiniCoderDirective,
-) -> Vec<String> {
-    let root = chain_root_id(leaf);
-    directives
-        .iter()
-        .filter(|d| {
-            d.id != leaf.id
-                && d.status == MiniCoderStatus::AwaitingRetry
-                && (d.id == root || d.parent_directive_id.as_deref() == Some(root))
-        })
-        .map(|d| d.id.clone())
-        .collect()
-}
-
 /// ASYNC STEERING (piece a): the reserved `steer_queue` message that maps to the kill
 /// path instead of a queued correction. A steerer who sends this (case-insensitive,
 /// after trimming) is asking to STOP the mini — handled by `mini_coder_steer` /
@@ -992,7 +770,9 @@ pub fn fold_steer_block(messages: &[String]) -> Option<String> {
     if truncated {
         body.push_str("\n- [… additional steering corrections truncated]");
     }
-    Some(format!("SUPERVISOR STEERING (apply these corrections this round):\n{body}"))
+    Some(format!(
+        "SUPERVISOR STEERING (apply these corrections this round):\n{body}"
+    ))
 }
 
 /// P6: build the PENDING retry directive appended when a predecessor goes
@@ -1007,247 +787,6 @@ pub fn fold_steer_block(messages: &[String]) -> Option<String> {
 /// shape the Censor feedback uses) — the retry STARTS with `steer_queue` empty (consumed),
 /// so a steer takes effect exactly once, at this round boundary.
 #[allow(clippy::too_many_arguments)]
-pub fn build_retry_directive(
-    predecessor: &MiniCoderDirective,
-    files_touched: &[String],
-    censor_feedback: &str,
-    new_id: impl Into<String>,
-    result_path: impl Into<String>,
-    created_at: impl Into<String>,
-) -> MiniCoderDirective {
-    let root = chain_root_id(predecessor).to_string();
-    // Union files[] with files_touched, preserving order and de-duping.
-    let mut files = predecessor.files.clone();
-    for f in files_touched {
-        if !files.iter().any(|existing| existing == f) {
-            files.push(f.clone());
-        }
-    }
-    let mut task = format!(
-        "{}\n\nCENSOR FEEDBACK (attempt {}):\n{}",
-        predecessor.task,
-        predecessor.attempt + 1,
-        censor_feedback,
-    );
-    // ASYNC STEERING (piece a): DRAIN the predecessor's steer queue into THIS round's
-    // task, REUSING the same `\n\n<HEADER>:\n<body>` append shape as the Censor feedback
-    // above. The retry is born with `steer_queue` empty (the messages were consumed here),
-    // so a correction lands exactly once, at this round boundary. A queue of only blank /
-    // stop entries folds to nothing (the stop sentinel is handled by the kill path).
-    if let Some(steer) = fold_steer_block(&predecessor.steer_queue) {
-        task.push_str("\n\n");
-        task.push_str(&steer);
-    }
-    MiniCoderDirective {
-        id: new_id.into(),
-        parent_agent_id: predecessor.parent_agent_id.clone(),
-        status: MiniCoderStatus::Pending,
-        task,
-        files,
-        backend: predecessor.backend.clone(),
-        write: predecessor.write,
-        write_mode: predecessor.write_mode,
-        allow_oracle: predecessor.allow_oracle,
-        kill_requested: false,
-        // ASYNC STEERING: consumed — the retry starts with an empty queue (omitted on the
-        // wire by the Vec::is_empty serde skip), so steering does not re-apply next round.
-        steer_queue: Vec::new(),
-        result_path: result_path.into(),
-        agent_id: None,
-        created_at: created_at.into(),
-        claimed_at: None,
-        scratch_path: None,
-        started_at: None,
-        result: None,
-        attempt: predecessor.attempt + 1,
-        parent_directive_id: Some(root),
-        retry_directive_id: None,
-        // Slice 3: there is ONE Pigeon ticket for the whole retry chain (the ROOT's task,
-        // which the Python wait polls). CARRY it forward so the LEAF directive — the one
-        // `finalize_finished_mini` terminates — knows the ticket and its egress (seam C)
-        // posts the terminal outcome back to it, unblocking the root's `/status` poll.
-        pigeon_ticket: predecessor.pigeon_ticket,
-    }
-}
-
-/// P6: summarize a set of High Censor findings into the one-block `censor_feedback` the
-/// retry directive appends to its task. One line per finding (`file:line [severity] —
-/// title`), capped at [`MAX_FEEDBACK_FINDINGS`] lines so a pathological finding storm
-/// can't bloat the prompt. Privacy-safe: only the projection fields (no file body, no
-/// secrets) — the same fields that ride the escalation payload.
-pub const MAX_FEEDBACK_FINDINGS: usize = 20;
-
-pub fn summarize_findings_for_feedback(findings: &[EscalationFinding]) -> String {
-    if findings.is_empty() {
-        return "Censor reported issues but provided no detail.".to_string();
-    }
-    let mut lines: Vec<String> = findings
-        .iter()
-        .take(MAX_FEEDBACK_FINDINGS)
-        .map(|f| {
-            let line = f.line.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
-            let sev = if f.severity.is_empty() { "high" } else { &f.severity };
-            let source = f.source.trim();
-            let tag = if source.is_empty() {
-                sev.to_string()
-            } else {
-                format!("{sev}/{source}")
-            };
-            format!("- {}:{} [{}] — {}", f.file, line, tag, f.title)
-        })
-        .collect();
-    if findings.len() > MAX_FEEDBACK_FINDINGS {
-        lines.push(format!(
-            "...and {} more finding(s).",
-            findings.len() - MAX_FEEDBACK_FINDINGS
-        ));
-    }
-    lines.join("\n")
-}
-
-pub fn blocking_censor_findings(findings: &[EscalationFinding]) -> Vec<EscalationFinding> {
-    findings
-        .iter()
-        .filter(|f| {
-            f.severity.eq_ignore_ascii_case("high")
-                && !f.source.eq_ignore_ascii_case("visual")
-        })
-        .cloned()
-        .collect()
-}
-
-pub const VISUAL_ADVISORY_TITLE_MAX_CHARS: usize = 500;
-
-/// Injection point for visual findings arriving via the MCP `visual_check` path: turns a
-/// local vision critique into an `info`/`visual` advisory `EscalationFinding`.
-pub(crate) fn visual_advisory_finding(file: &str, critique: &str) -> Option<EscalationFinding> {
-    let trimmed = critique.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let title = match trimmed.char_indices().nth(VISUAL_ADVISORY_TITLE_MAX_CHARS) {
-        Some((idx, _)) => format!("{}...", &trimmed[..idx]),
-        None => trimmed.to_string(),
-    };
-    Some(EscalationFinding {
-        file: file.to_string(),
-        severity: "info".into(),
-        source: "visual".into(),
-        title,
-        line: None,
-    })
-}
-
-/// P6: the pure decision the post-`done` verdict gate produces, computed from the
-/// finished directive, its computed outcome, whether the project is Censor-TRUSTED, and
-/// the deterministic High findings collected on its touched files. Split out of the
-/// impure `finalize_finished_mini` so the gate logic is unit-testable with NO AppHandle,
-/// lock, or installed linters (the executor injects `trusted` + `high_findings`).
-///
-/// The IMPURE caller resolves `trusted` (project Censor trust) and `high_findings` (the
-/// deterministic-only Censor pass, Gemma DISABLED) OUTSIDE any lock, then applies the
-/// returned decision in ONE atomic locked mutate (crash-safety: never half-applied).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GateDecision {
-    /// Stamp this terminal outcome on the directive as today (clean done, or a
-    /// non-`done` terminal, or an untrusted tree we never lint).
-    StampTerminal(MiniCoderOutcome),
-    /// Dirty with retries left: move the directive to AwaitingRetry (stamping the
-    /// forward link to `retry.id`) AND append `retry` (Pending) — one atomic mutate.
-    AwaitingRetryWith { retry: Box<MiniCoderDirective> },
-    /// Dirty and retries exhausted: stamp this terminal Escalated outcome (then the
-    /// caller propagates it to the chain's AwaitingRetry ancestors).
-    Escalate(MiniCoderOutcome),
-}
-
-/// P6: compute the [`GateDecision`] for a finished mini.
-///
-/// * NOT a clean `done` (the outcome is needs_clarification/failed/timeout/aborted) OR
-///   the project is NOT trusted (we never lint an untrusted tree) OR there are NO High
-///   findings → `StampTerminal(outcome)` (today's behavior).
-/// * Clean `done`, trusted, dirty (High findings present), `attempt < budget`
-///   → `AwaitingRetryWith { retry }` where `retry` is built by [`build_retry_directive`]
-///   with the High findings summarized into its feedback.
-/// * Clean `done`, trusted, dirty, `attempt >= budget` → `Escalate(escalated)`.
-///
-/// The retry `budget` is [`max_mini_retries_for`]`(directive, effective_write_mode, covered)`:
-/// 1 for an emit-edits (or agentic-but-uncovered) write, [`MAX_AGENTIC_FIX_ROUNDS`] for an
-/// agentic-iterative write on a covered language (the N-round loop — raising the budget IS
-/// the loop), [`MAX_MINI_RETRIES`] for a non-write directive. `covered` is the caller's
-/// "this directive's files include a language with deterministic Tier-A coverage" signal;
-/// it is consulted ONLY for the agentic+write case, so emit-edits/non-write decisions are
-/// byte-identical to before regardless of its value.
-///
-/// E1 (FIX 1): `effective_write_mode` is the policy-clamped write mode the caller decided
-/// (Safe ⇒ [`WriteMode::EmitEdits`]; Auto/AgenticAllowed ⇒ `directive.write_mode`). It is
-/// threaded straight into [`max_mini_retries_for`] so a `Safe` policy forces budget 1 even
-/// when the directive on disk says `AgenticIterative`. The gate consults the EFFECTIVE mode,
-/// never `directive.write_mode`, for the budget — the policy is a HARD ceiling here.
-///
-/// `new_retry_id`/`retry_result_path`/`now` are supplied by the impure caller (fresh id,
-/// scratch-relative result path, RFC3339 clock) so this stays clock/IO-free.
-pub fn verdict_gate_decision(
-    directive: &MiniCoderDirective,
-    outcome: &MiniCoderOutcome,
-    trusted: bool,
-    effective_write_mode: WriteMode,
-    covered: bool,
-    high_findings: Vec<EscalationFinding>,
-    new_retry_id: impl Into<String>,
-    retry_result_path: impl Into<String>,
-    now: impl Into<String>,
-) -> GateDecision {
-    // The gate fires ONLY on a clean self-reported `done`. Any synthesized terminal
-    // (failed/timeout/aborted) or a needs_clarification stamps straight through.
-    if outcome.status != MiniCoderStatus::Done {
-        return GateDecision::StampTerminal(outcome.clone());
-    }
-    // Never lint an untrusted tree: stamp Done as today.
-    if !trusted {
-        return GateDecision::StampTerminal(outcome.clone());
-    }
-    let blocking_findings = blocking_censor_findings(&high_findings);
-    // Clean (no blocking High findings) → Done as today. Visual findings are advisory
-    // only and never force a retry by themselves.
-    if blocking_findings.is_empty() {
-        return GateDecision::StampTerminal(outcome.clone());
-    }
-    // Dirty. Retry if budget remains, else escalate. The budget depends on the
-    // directive kind + EFFECTIVE write mode + language coverage (see max_mini_retries_for):
-    // emit-edits/uncovered-agentic write -> 1; agentic-iterative write on a covered
-    // language -> MAX_AGENTIC_FIX_ROUNDS (the N-round loop); non-write -> MAX_MINI_RETRIES.
-    // `effective_write_mode` is the policy-clamped mode (Safe ⇒ EmitEdits), so a Safe
-    // policy forces budget 1 regardless of `directive.write_mode` (FIX 1).
-    if directive.attempt < max_mini_retries_for(directive, effective_write_mode, covered) {
-        let feedback = summarize_findings_for_feedback(&high_findings);
-        let retry = build_retry_directive(
-            directive,
-            &outcome.files_touched,
-            &feedback,
-            new_retry_id,
-            retry_result_path,
-            now,
-        );
-        GateDecision::AwaitingRetryWith {
-            retry: Box::new(retry),
-        }
-    } else {
-        let escalation = EscalationInfo {
-            attempts: directive.attempt + 1,
-            findings: high_findings,
-        };
-        // FIX 2: carry net_blocked from the last attempt so finalize_finished_mini
-        // can still emit the consent-request event on the escalation path.
-        // Slice 2: carry folder_write_blocked similarly.
-        GateDecision::Escalate(MiniCoderOutcome::escalated(
-            outcome.files_touched.clone(),
-            escalation,
-            outcome.net_blocked,
-            outcome.folder_write_blocked.clone(),
-        ))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Pure scheduler (clock-split: caller supplies `now`)
 // ---------------------------------------------------------------------------
@@ -1424,8 +963,11 @@ pub fn plan_tick_excluding(
             if claims.len() >= remaining {
                 break;
             }
-            let normalized: Vec<String> =
-                d.files.iter().map(|f| normalize_path_for_compare(f)).collect();
+            let normalized: Vec<String> = d
+                .files
+                .iter()
+                .map(|f| normalize_path_for_compare(f))
+                .collect();
             // Disjoint from the union (active ∪ already-claimed-this-pass files)?
             if normalized.iter().any(|f| union.contains(f)) {
                 continue; // overlaps — leave Pending, re-evaluate next tick.
@@ -1461,7 +1003,11 @@ pub fn plan_tick_excluding(
                     };
                     let elapsed = now_dt.signed_duration_since(started_dt).num_seconds();
                     // P6: a retry (attempt >= 1) is held to the shorter retry cap.
-                    let effective_cap = if d.attempt >= 1 { retry_cap_secs } else { cap_secs };
+                    let effective_cap = if d.attempt >= 1 {
+                        retry_cap_secs
+                    } else {
+                        cap_secs
+                    };
                     if elapsed >= effective_cap {
                         timeouts.push(d.id.clone());
                     }
@@ -1488,82 +1034,6 @@ pub fn plan_tick_excluding(
         timeouts,
         stuck_launching,
     }
-}
-
-/// P6: ids of `AwaitingRetry` directives whose `retry_directive_id` points at a directive
-/// that is ABSENT from the queue (evicted, or never appended after a crash between the
-/// awaiting-retry stamp and the retry append). Such a predecessor is stuck in limbo: no
-/// retry will ever propagate a verdict back to it. The executor's startup sweep fails
-/// these (`failed("retry lost")`) and propagates to their lineage. Pure: the caller does
-/// the stamping under lock. A predecessor with no `retry_directive_id` is NOT reported
-/// (it never reached the append point — its own attempt is still being finalized, or it
-/// is a legitimately-not-yet-stamped state guarded elsewhere).
-pub fn awaiting_retry_with_lost_child(directives: &[MiniCoderDirective]) -> Vec<String> {
-    let present: std::collections::HashSet<&str> =
-        directives.iter().map(|d| d.id.as_str()).collect();
-    directives
-        .iter()
-        .filter(|d| d.status == MiniCoderStatus::AwaitingRetry)
-        .filter(|d| match d.retry_directive_id.as_deref() {
-            Some(rid) => !present.contains(rid),
-            None => false,
-        })
-        .map(|d| d.id.clone())
-        .collect()
-}
-
-/// BLOCKER 1 (second sweep rule): what the executor must do to an `AwaitingRetry`
-/// predecessor that its retry-chain leaf can no longer reach via the normal
-/// finalize propagation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetrySweepAction {
-    /// The forward-linked retry directive is ABSENT (evicted / never appended after a
-    /// crash). No leaf will ever propagate a verdict — synthesize `failed("retry lost")`.
-    FailLost,
-    /// The forward-linked retry directive IS present and TERMINAL, yet this predecessor
-    /// was never stamped (the finalize that stamped the leaf failed to propagate — e.g.
-    /// the BLOCKER-1 `fail_launching` gap before this fix, or a crash mid-propagation).
-    /// Re-propagate the CHILD's own terminal outcome to the predecessor (carry index of
-    /// the child directive so the caller can read its `result`).
-    PropagateChildTerminal { child_id: String },
-}
-
-/// BLOCKER 1: the SUPERSET sweep over [`awaiting_retry_with_lost_child`]. For every
-/// `AwaitingRetry` predecessor whose forward-linked retry child is either ABSENT or
-/// already TERMINAL while the predecessor itself is still un-stamped (`status` is still
-/// `AwaitingRetry`), return `(predecessor_id, action)`. A predecessor whose child is
-/// still ACTIVE/Pending/AwaitingRetry is correctly left alone (the chain is live; the
-/// leaf's finalize will propagate). A predecessor with no `retry_directive_id` is skipped
-/// (it never reached the append point).
-///
-/// This closes the STRANDED-ROOT window: if a retry fails at launch (or any propagation
-/// is missed), the startup/periodic sweep now re-stamps the predecessor from the child's
-/// terminal outcome instead of leaving it AwaitingRetry forever.
-pub fn awaiting_retry_needing_terminal(
-    directives: &[MiniCoderDirective],
-) -> Vec<(String, RetrySweepAction)> {
-    use std::collections::HashMap;
-    let by_id: HashMap<&str, &MiniCoderDirective> =
-        directives.iter().map(|d| (d.id.as_str(), d)).collect();
-    directives
-        .iter()
-        .filter(|d| d.status == MiniCoderStatus::AwaitingRetry)
-        .filter_map(|d| {
-            let rid = d.retry_directive_id.as_deref()?;
-            match by_id.get(rid) {
-                // Absent child -> lost retry (the original rule).
-                None => Some((d.id.clone(), RetrySweepAction::FailLost)),
-                // Present + TERMINAL child but predecessor still AwaitingRetry -> a missed
-                // propagation: re-stamp from the child's terminal outcome.
-                Some(child) if child.status.is_terminal() => Some((
-                    d.id.clone(),
-                    RetrySweepAction::PropagateChildTerminal { child_id: rid.to_string() },
-                )),
-                // Present + still-live child -> the chain is alive; leave it.
-                Some(_) => None,
-            }
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1975,9 +1445,7 @@ pub(crate) fn validate_omlx_base_url(base_url: &str) -> Result<String, String> {
     // The URL is embedded verbatim into the launch line; reject the SAME control/
     // bidi/invisible blocklist as the `api` command (WARNING 6).
     if trimmed.chars().any(is_forbidden_command_char) {
-        return Err(
-            "oMLX base URL must not contain control, bidi or invisible characters.".into(),
-        );
+        return Err("oMLX base URL must not contain control, bidi or invisible characters.".into());
     }
 
     // Scheme: http only (loopback, like Ollama). `https://` is rejected: a self-signed
@@ -2204,6 +1672,59 @@ pub trait MiniLauncher {
 
 #[cfg(test)]
 mod tests {
+    use super::MiniCoderOutcome;
+
+    #[test]
+    fn outcome_censor_findings_defaults_to_none() {
+        let outcome = MiniCoderOutcome::default();
+        assert!(outcome.censor_findings.is_none());
+    }
+
+    #[test]
+    fn outcome_censor_findings_skips_when_none_in_json() {
+        let outcome = MiniCoderOutcome::default();
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !json.contains("censorFindings"),
+            "None must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn outcome_censor_findings_some_round_trips() {
+        let outcome = MiniCoderOutcome {
+            censor_findings: Some(vec![crate::backend::censor::schema::Finding {
+                id: "abc".into(),
+                file: "src/x.rs".into(),
+                title: "unused var".into(),
+                severity: crate::backend::censor::schema::Severity::High,
+                category: crate::backend::censor::schema::Category::Correctness,
+                source: "clippy".into(),
+                disposition: crate::backend::censor::schema::Disposition::Open,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("censorFindings"), "Some must appear in JSON");
+        assert!(json.contains("unused var"), "finding title must be in JSON");
+
+        let back: MiniCoderOutcome = serde_json::from_str(&json).unwrap();
+        let findings = back.censor_findings.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "unused var");
+    }
+
+    #[test]
+    fn outcome_censor_findings_respects_skip_serializing_when_none() {
+        let outcome = MiniCoderOutcome::default();
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !json.contains("censorFindings"),
+            "None must be absent from JSON"
+        );
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::io::Write;
@@ -2274,7 +1795,6 @@ mod tests {
             result: None,
             attempt: 0,
             parent_directive_id: None,
-            retry_directive_id: None,
             pigeon_ticket: None,
         }
     }
@@ -2304,7 +1824,6 @@ mod tests {
             result: None,
             attempt: 0,
             parent_directive_id: None,
-            retry_directive_id: None,
             pigeon_ticket: None,
         };
         let json = serde_json::to_string(&d).unwrap();
@@ -2321,7 +1840,10 @@ mod tests {
         assert!(json.contains("\"status\":\"running\""), "json: {json}");
         // Slice 3 NO-CHURN: a directive that never went through Pigeon (pigeon_ticket None)
         // OMITS the field entirely — byte-identical to before this slice.
-        assert!(!json.contains("pigeonTicket"), "None ticket must be omitted: {json}");
+        assert!(
+            !json.contains("pigeonTicket"),
+            "None ticket must be omitted: {json}"
+        );
 
         let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
@@ -2444,27 +1966,6 @@ mod tests {
             serde_json::to_string(&WriteMode::AgenticIterative).unwrap(),
             "\"agenticIterative\""
         );
-    }
-
-    #[test]
-    fn retry_directive_preserves_write_mode() {
-        // A1: the predecessor copy at build_retry_directive must carry write_mode.
-        let mut pred = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        pred.write = true;
-        pred.write_mode = WriteMode::AgenticIterative;
-        let retry = build_retry_directive(&pred, &[], "feedback", "root-r1", "root-r1.json", "t");
-        assert_eq!(
-            retry.write_mode,
-            WriteMode::AgenticIterative,
-            "retry must inherit the predecessor's write_mode"
-        );
-
-        // An EmitEdits predecessor stays EmitEdits (default carried verbatim).
-        let mut pred_default = directive("root2", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        pred_default.write = true;
-        let retry_default =
-            build_retry_directive(&pred_default, &[], "fb", "root2-r1", "root2-r1.json", "t");
-        assert_eq!(retry_default.write_mode, WriteMode::EmitEdits);
     }
 
     #[test]
@@ -2737,9 +2238,11 @@ mod tests {
         // A mix keeps the real correction, drops the stop.
         let mixed = fold_steer_block(&["stop".into(), "real correction".into()]).unwrap();
         assert!(mixed.contains("- real correction"), "mixed: {mixed}");
-        assert!(!mixed.contains("- stop"), "stop must not be folded: {mixed}");
+        assert!(
+            !mixed.contains("- stop"),
+            "stop must not be folded: {mixed}"
+        );
     }
-
     #[test]
     fn fold_steer_block_caps_aggregate_size() {
         // P2 (AGGREGATE BLOAT CAP): a full queue of max-length messages must NOT fold into a
@@ -2750,9 +2253,12 @@ mod tests {
         let block = fold_steer_block(&queue).unwrap();
         // The body (block minus the header line) stays within budget + the short marker.
         assert!(
-            block.chars().count() <= "SUPERVISOR STEERING (apply these corrections this round):\n".chars().count()
-                + MAX_STEER_BLOCK_LEN
-                + 64,
+            block.chars().count()
+                <= "SUPERVISOR STEERING (apply these corrections this round):\n"
+                    .chars()
+                    .count()
+                    + MAX_STEER_BLOCK_LEN
+                    + 64,
             "folded block must be capped, got {} chars",
             block.chars().count()
         );
@@ -2768,7 +2274,10 @@ mod tests {
             "rename foo to bar".into(),
         ])
         .unwrap();
-        assert!(!small.contains("truncated"), "small block untouched: {small}");
+        assert!(
+            !small.contains("truncated"),
+            "small block untouched: {small}"
+        );
         assert!(small.contains("- use a HashMap"));
         assert!(small.contains("- rename foo to bar"));
     }
@@ -2816,28 +2325,6 @@ mod tests {
 
         // The stop sentinel survives sanitize so the kill path still recognizes it.
         assert!(is_steer_stop(&sanitize_steer_message("  STOP  ")));
-    }
-
-    #[test]
-    fn build_retry_directive_folds_steer_queue_and_clears_it() {
-        // ASYNC STEERING (a): a predecessor carrying a steer_queue produces a retry whose
-        // task carries BOTH the Censor feedback AND the SUPERVISOR STEERING block, and
-        // whose own steer_queue is EMPTY (consumed exactly once at this boundary).
-        let mut pred = directive("root", MiniCoderStatus::Done, "2026-06-06T00:00:00Z");
-        pred.task = "original task".into();
-        pred.steer_queue = vec!["prefer iterators".into()];
-        let retry = build_retry_directive(&pred, &[], "censor says X", "root-r1", "root-r1.json", "t");
-        assert!(retry.task.contains("original task"), "task: {}", retry.task);
-        assert!(retry.task.contains("CENSOR FEEDBACK"), "task: {}", retry.task);
-        assert!(retry.task.contains("SUPERVISOR STEERING"), "task: {}", retry.task);
-        assert!(retry.task.contains("- prefer iterators"), "task: {}", retry.task);
-        assert!(retry.steer_queue.is_empty(), "retry must start drained");
-
-        // No steer queue -> no SUPERVISOR STEERING block (no spurious header).
-        let mut pred2 = directive("root2", MiniCoderStatus::Done, "2026-06-06T00:00:00Z");
-        pred2.task = "original".into();
-        let retry2 = build_retry_directive(&pred2, &[], "fb", "root2-r1", "root2-r1.json", "t");
-        assert!(!retry2.task.contains("SUPERVISOR STEERING"), "task: {}", retry2.task);
     }
 
     #[test]
@@ -3145,49 +2632,6 @@ mod tests {
         assert_eq!(plan.claims, vec!["d1".to_string(), "d3".to_string()]);
     }
 
-    #[test]
-    fn plan_tick_retry_sharing_files_with_awaiting_retry_predecessor_is_claimable() {
-        // CRITICAL: an AwaitingRetry predecessor (files src/a.rs) does NOT block its
-        // Pending retry (same file) from being claimed — AwaitingRetry holds no slot and
-        // is excluded from the active file union.
-        let mut pred = pending_with_files("root", "2026-06-06T00:00:01Z", &["src/a.rs"]);
-        pred.status = MiniCoderStatus::AwaitingRetry;
-        let mut retry = pending_with_files("root-r1", "2026-06-06T00:00:02Z", &["src/a.rs"]);
-        retry.attempt = 1;
-        retry.parent_directive_id = Some("root".into());
-        let directives = vec![pred, retry];
-        let plan = plan_tick(
-            &directives,
-            "2026-06-06T00:01:00Z",
-            DEFAULT_WALL_CLOCK_CAP_SECS,
-            DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
-            DEFAULT_LAUNCH_CAP_SECS,
-            2,
-        );
-        assert_eq!(plan.claims, vec!["root-r1".to_string()]);
-    }
-
-    #[test]
-    fn plan_tick_active_count_excludes_awaiting_retry() {
-        // 1 Running [a] + 1 AwaitingRetry [b] + 1 Pending [c], max_concurrent=2.
-        // active_count counts ONLY the Running one (1) -> below ceiling -> Pending claimed.
-        let mut running = pending_with_files("run", "2026-06-06T00:00:01Z", &["src/a.rs"]);
-        running.status = MiniCoderStatus::Running;
-        let mut awaiting = pending_with_files("await", "2026-06-06T00:00:02Z", &["src/b.rs"]);
-        awaiting.status = MiniCoderStatus::AwaitingRetry;
-        let pending = pending_with_files("pend", "2026-06-06T00:00:03Z", &["src/c.rs"]);
-        let directives = vec![running, awaiting, pending];
-        let plan = plan_tick(
-            &directives,
-            "2026-06-06T00:01:00Z",
-            DEFAULT_WALL_CLOCK_CAP_SECS,
-            DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
-            DEFAULT_LAUNCH_CAP_SECS,
-            2,
-        );
-        assert_eq!(plan.claims, vec!["pend".to_string()]);
-    }
-
     #[cfg(windows)]
     #[test]
     fn plan_tick_windows_path_normalization_treats_backslash_and_case_equal() {
@@ -3208,103 +2652,9 @@ mod tests {
         assert_eq!(plan.claims, vec!["d1".to_string()]);
     }
 
-    #[test]
-    fn plan_tick_retry_uses_shorter_retry_cap() {
-        // A Running RETRY (attempt=1) blows the 300s retry cap at 350s elapsed even though
-        // it is well under the 600s root cap. A Running ROOT (attempt=0) at the same
-        // elapsed does NOT time out.
-        let mut retry = directive("r1", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        retry.attempt = 1;
-        retry.started_at = Some("2026-06-06T00:00:00Z".into());
-        let mut root = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        root.started_at = Some("2026-06-06T00:00:00Z".into());
-        // 350s elapsed.
-        let plan = plan_tick(
-            &[retry, root],
-            "2026-06-06T00:05:50Z",
-            DEFAULT_WALL_CLOCK_CAP_SECS,
-            DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
-            DEFAULT_LAUNCH_CAP_SECS,
-            4,
-        );
-        assert_eq!(plan.timeouts, vec!["r1".to_string()]);
-    }
-
-    #[test]
-    fn awaiting_retry_with_lost_child_detects_absent_retry() {
-        // An AwaitingRetry directive whose retry_directive_id is not present -> reported.
-        let mut pred = directive("root", MiniCoderStatus::AwaitingRetry, "2026-06-06T00:00:00Z");
-        pred.retry_directive_id = Some("ghost".into());
-        // A second AwaitingRetry whose retry IS present -> not reported.
-        let mut ok = directive("root2", MiniCoderStatus::AwaitingRetry, "2026-06-06T00:00:00Z");
-        ok.retry_directive_id = Some("root2-r1".into());
-        let child = directive("root2-r1", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let directives = vec![pred, ok, child];
-        assert_eq!(
-            awaiting_retry_with_lost_child(&directives),
-            vec!["root".to_string()]
-        );
-    }
-
     /// BLOCKER 1 (second sweep rule): an AwaitingRetry predecessor whose retry child is
     /// now TERMINAL (not absent) but which is itself still un-stamped must be caught and
     /// re-propagated from the child's terminal outcome — closing the STRANDED-ROOT window
-    /// where a retry that failed at LAUNCH left the root AwaitingRetry forever.
-    #[test]
-    fn awaiting_retry_needing_terminal_catches_terminal_child_and_absent_child() {
-        // root -> r1(FAILED): missed propagation, root still AwaitingRetry.
-        let mut root = directive("root", MiniCoderStatus::AwaitingRetry, "2026-06-06T00:00:00Z");
-        root.retry_directive_id = Some("r1".into());
-        let mut r1 = directive("r1", MiniCoderStatus::Failed, "2026-06-06T00:00:01Z");
-        r1.parent_directive_id = Some("root".into());
-        r1.result = Some(MiniCoderOutcome::failed("mini spawn failed"));
-        // ghostroot -> ghost(absent): lost child.
-        let mut ghostroot =
-            directive("ghostroot", MiniCoderStatus::AwaitingRetry, "2026-06-06T00:00:00Z");
-        ghostroot.retry_directive_id = Some("ghost".into());
-        // liveroot -> live(Running): chain alive, must NOT be reported.
-        let mut liveroot =
-            directive("liveroot", MiniCoderStatus::AwaitingRetry, "2026-06-06T00:00:00Z");
-        liveroot.retry_directive_id = Some("live".into());
-        let mut live = directive("live", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        live.parent_directive_id = Some("liveroot".into());
-
-        let directives = vec![root, r1, ghostroot, liveroot, live];
-        let mut got = awaiting_retry_needing_terminal(&directives);
-        got.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            got,
-            vec![
-                (
-                    "ghostroot".to_string(),
-                    RetrySweepAction::FailLost
-                ),
-                (
-                    "root".to_string(),
-                    RetrySweepAction::PropagateChildTerminal { child_id: "r1".to_string() }
-                ),
-            ],
-            "terminal child -> propagate; absent child -> fail-lost; live child -> skip"
-        );
-    }
-
-    #[test]
-    fn files_disjoint_from_active_excludes_awaiting_retry() {
-        let mut running = pending_with_files("run", "t", &["src/a.rs"]);
-        running.status = MiniCoderStatus::Running;
-        let mut awaiting = pending_with_files("await", "t", &["src/b.rs"]);
-        awaiting.status = MiniCoderStatus::AwaitingRetry;
-        let directives = vec![running, awaiting];
-        // Candidate touching the AwaitingRetry's file (b) IS disjoint from active.
-        let cand_b = pending_with_files("c", "t", &["src/b.rs"]);
-        assert!(files_disjoint_from_active(&cand_b, &directives));
-        // Candidate touching the Running file (a) is NOT disjoint.
-        let cand_a = pending_with_files("c", "t", &["src/a.rs"]);
-        assert!(!files_disjoint_from_active(&cand_a, &directives));
-        // A candidate with no files overlaps nothing.
-        let cand_none = pending_with_files("c", "t", &[]);
-        assert!(files_disjoint_from_active(&cand_none, &directives));
-    }
 
     // -- P6: backend max_concurrent config -----------------------------------
 
@@ -3376,297 +2726,6 @@ mod tests {
         assert_eq!(n3.max_concurrent, None, "None preserved (no-churn)");
     }
 
-    // -- P6: verdict_gate_decision (pure) ------------------------------------
-
-    fn high_finding() -> EscalationFinding {
-        EscalationFinding {
-            file: "src/a.rs".into(),
-            severity: "high".into(),
-            source: "clippy".into(),
-            title: "unwrap on None".into(),
-            line: Some(12),
-        }
-    }
-
-    #[test]
-    fn gate_untrusted_done_stamps_terminal_done() {
-        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-        // Untrusted: even WITH a high finding present, the gate is skipped -> Done.
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            false,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding()],
-            "root-r1",
-            "root-r1.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert_eq!(decision, GateDecision::StampTerminal(outcome));
-    }
-
-    #[test]
-    fn gate_trusted_clean_stamps_terminal_done() {
-        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            ..Default::default()
-        });
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![],
-            "root-r1",
-            "root-r1.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert_eq!(decision, GateDecision::StampTerminal(outcome));
-    }
-
-    #[test]
-    fn gate_visual_only_finding_is_advisory_not_retry() {
-        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["dist/page.html".into()],
-            ..Default::default()
-        });
-        let visual = visual_advisory_finding("dist/page.html", "Header text overflows").unwrap();
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![visual],
-            "root-r1",
-            "root-r1.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert_eq!(decision, GateDecision::StampTerminal(outcome));
-    }
-
-    #[test]
-    fn gate_trusted_dirty_with_budget_builds_retry() {
-        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding()],
-            "root-r1",
-            "root-r1.json",
-            "2026-06-06T00:00:10Z",
-        );
-        match decision {
-            GateDecision::AwaitingRetryWith { retry } => {
-                assert_eq!(retry.id, "root-r1");
-                assert_eq!(retry.attempt, 1);
-                assert_eq!(retry.status, MiniCoderStatus::Pending);
-                assert_eq!(retry.parent_directive_id.as_deref(), Some("root"));
-                assert!(retry.task.contains("unwrap on None"), "feedback: {}", retry.task);
-                assert!(retry.task.contains("[high/clippy]"), "feedback: {}", retry.task);
-                assert!(retry.files.contains(&"src/a.rs".to_string()));
-            }
-            other => panic!("expected AwaitingRetryWith, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gate_mixed_visual_and_blocking_findings_includes_visual_in_retry_feedback() {
-        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into(), "dist/page.html".into()],
-            ..Default::default()
-        });
-        let visual = visual_advisory_finding("dist/page.html", "Button overlaps footer").unwrap();
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding(), visual],
-            "root-r1",
-            "root-r1.json",
-            "2026-06-06T00:00:10Z",
-        );
-        match decision {
-            GateDecision::AwaitingRetryWith { retry } => {
-                assert!(retry.task.contains("[info/visual]"), "feedback: {}", retry.task);
-                assert!(retry.task.contains("Button overlaps footer"), "feedback: {}", retry.task);
-            }
-            other => panic!("expected AwaitingRetryWith, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gate_trusted_dirty_exhausted_escalates() {
-        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        d.attempt = MAX_MINI_RETRIES; // exhausted
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding()],
-            "root-r3",
-            "root-r3.json",
-            "2026-06-06T00:00:10Z",
-        );
-        match decision {
-            GateDecision::Escalate(o) => {
-                assert_eq!(o.status, MiniCoderStatus::Escalated);
-                let esc = o.escalation.expect("escalation payload");
-                assert_eq!(esc.attempts, MAX_MINI_RETRIES + 1);
-                assert_eq!(esc.findings.len(), 1);
-                assert_eq!(o.files_touched, vec!["src/a.rs".to_string()]);
-            }
-            other => panic!("expected Escalate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gate_write_directive_escalates_after_one_fix_pass() {
-        // P6 bounded inner loop: a WRITE directive gets exactly ONE censor-driven
-        // fix pass — dirty at attempt 1 escalates (a non-write directive at the
-        // same attempt would still retry, pinned below).
-        let mut w = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        w.write = true;
-        w.attempt = 1; // the one allowed fix pass already ran
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-        let decision = verdict_gate_decision(
-            &w,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding()],
-            "root-r2",
-            "root-r2.json",
-            "2026-06-06T00:00:10Z",
-        );
-        match decision {
-            GateDecision::Escalate(o) => {
-                assert_eq!(o.status, MiniCoderStatus::Escalated);
-                assert_eq!(o.escalation.expect("escalation").attempts, 2);
-            }
-            other => panic!("write directive must escalate after 1 fix pass, got {other:?}"),
-        }
-
-        // Same attempt, NON-write: the historical budget still allows a retry.
-        let mut nw = directive("root2", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        nw.attempt = 1;
-        let decision = verdict_gate_decision(
-            &nw,
-            &outcome,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding()],
-            "root2-r2",
-            "root2-r2.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert!(
-            matches!(decision, GateDecision::AwaitingRetryWith { .. }),
-            "non-write at attempt 1 must still retry"
-        );
-        // And the retry of a write directive stays a write directive.
-        let retry = build_retry_directive(&w, &[], "feedback", "root-rX", "root-rX.json", "t");
-        assert!(retry.write, "fix passes must stay write passes");
-    }
-
-    #[test]
-    fn gate_non_done_outcome_stamps_terminal_unchanged() {
-        // A failed/timeout/aborted/needs_clarification outcome never enters the gate even
-        // when trusted with findings (those terminal states are not a clean `done`).
-        let d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        let failed = MiniCoderOutcome::failed("no result file");
-        let decision = verdict_gate_decision(
-            &d,
-            &failed,
-            true,
-            WriteMode::EmitEdits,
-            false,
-            vec![high_finding()],
-            "x",
-            "x.json",
-            "t",
-        );
-        assert_eq!(decision, GateDecision::StampTerminal(failed));
-    }
-
-    // -- B1/B2: agentic-iterative budget table -------------------------------
-
-    #[test]
-    fn budget_table_covers_every_write_mode_x_coverage_case() {
-        // The ONLY behavioral lever of agentic-iterative is this budget. Pin the full table.
-        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-
-        // Non-write: always MAX_MINI_RETRIES; `covered` and write_mode are irrelevant.
-        d.write = false;
-        assert_eq!(max_mini_retries_for(&d, WriteMode::EmitEdits, false), MAX_MINI_RETRIES);
-        assert_eq!(max_mini_retries_for(&d, WriteMode::EmitEdits, true), MAX_MINI_RETRIES);
-        // write=false -> the effective write_mode is ignored.
-        assert_eq!(max_mini_retries_for(&d, WriteMode::AgenticIterative, true), MAX_MINI_RETRIES);
-        assert_eq!(max_mini_retries_for(&d, WriteMode::AgenticIterative, false), MAX_MINI_RETRIES);
-
-        // EmitEdits write: always exactly 1 (covered must NOT change it — NO-CHURN).
-        d.write = true;
-        assert_eq!(max_mini_retries_for(&d, WriteMode::EmitEdits, false), 1);
-        assert_eq!(
-            max_mini_retries_for(&d, WriteMode::EmitEdits, true),
-            1,
-            "covered must not affect emit-edits"
-        );
-
-        // AgenticIterative write + COVERED: the N-round loop.
-        assert_eq!(
-            max_mini_retries_for(&d, WriteMode::AgenticIterative, true),
-            MAX_AGENTIC_FIX_ROUNDS
-        );
-        // AgenticIterative write + UNCOVERED: B2 fallback to a single fix pass.
-        assert_eq!(max_mini_retries_for(&d, WriteMode::AgenticIterative, false), 1);
-
-        // E1 (FIX 1): the EFFECTIVE mode is what the budget reads, NOT `directive.write_mode`.
-        // A directive that says AgenticIterative on disk but whose policy clamped the effective
-        // mode to EmitEdits (Safe) gets the single-pass budget even WITH coverage.
-        d.write_mode = WriteMode::AgenticIterative;
-        assert_eq!(
-            max_mini_retries_for(&d, WriteMode::EmitEdits, true),
-            1,
-            "Safe-clamped effective EmitEdits forces budget 1 despite directive.write_mode=Agentic + covered"
-        );
-    }
-
     #[test]
     fn budget_max_agentic_fix_rounds_fits_the_python_poll_budget() {
         // POLL-BUDGET INVARIANT (mirrors the doc on MAX_AGENTIC_FIX_ROUNDS): the worst-case
@@ -3687,7 +2746,10 @@ mod tests {
         let worst_case = DEFAULT_WALL_CLOCK_CAP_SECS
             + n * DEFAULT_RETRY_WALL_CLOCK_CAP_SECS
             + (n + 1) * DEFAULT_LAUNCH_CAP_SECS;
-        assert_eq!(worst_case, 1380, "600 + 2*300 + 3*60 (caps-only, incl. launch caps)");
+        assert_eq!(
+            worst_case, 1380,
+            "600 + 2*300 + 3*60 (caps-only, incl. launch caps)"
+        );
         // Strictly under, with headroom: the deferred fine-verdict pass between rounds runs
         // OUTSIDE these caps, so a thin margin (the old 1500s == 300s) is NOT enough — assert
         // a generous slack (>= 300s) absorbs those out-of-cap passes.
@@ -3697,234 +2759,6 @@ mod tests {
              {PYTHON_POLL_TIMEOUT_SECS}s poll budget for the out-of-cap fine-verdict passes; \
              raising MAX_AGENTIC_FIX_ROUNDS requires extending MINI_CODER_POLL_TIMEOUT_SECS"
         );
-    }
-
-    #[test]
-    fn gate_agentic_covered_loops_to_max_rounds_then_escalates() {
-        // An AgenticIterative+covered write that stays DIRTY appends a retry on every
-        // attempt 0..MAX_AGENTIC_FIX_ROUNDS, then escalates at the budget. Simulate the
-        // GateDecision/append loop with a STUBBED always-dirty verdict (no live model).
-        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        d.write = true;
-        d.write_mode = WriteMode::AgenticIterative;
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-
-        // attempts 0..(N-1) each get an AwaitingRetryWith (the loop keeps going).
-        for attempt in 0..MAX_AGENTIC_FIX_ROUNDS {
-            d.attempt = attempt;
-            let decision = verdict_gate_decision(
-                &d,
-                &outcome,
-                true,  // trusted
-                WriteMode::AgenticIterative, // effective mode (Auto/AgenticAllowed passthrough)
-                true,  // covered
-                vec![high_finding()],
-                format!("root-r{}", attempt + 1),
-                format!("root-r{}.json", attempt + 1),
-                "2026-06-06T00:00:10Z",
-            );
-            match decision {
-                GateDecision::AwaitingRetryWith { retry } => {
-                    assert_eq!(retry.attempt, attempt + 1);
-                    assert_eq!(retry.write_mode, WriteMode::AgenticIterative,
-                        "agentic fix rounds stay agentic");
-                    assert!(retry.write, "fix rounds stay write passes");
-                }
-                other => panic!("attempt {attempt}: expected AwaitingRetryWith, got {other:?}"),
-            }
-        }
-
-        // At the budget the chain is exhausted -> Escalate (attempts = budget + 1).
-        d.attempt = MAX_AGENTIC_FIX_ROUNDS;
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::AgenticIterative,
-            true,
-            vec![high_finding()],
-            "root-rN",
-            "root-rN.json",
-            "2026-06-06T00:00:10Z",
-        );
-        match decision {
-            GateDecision::Escalate(o) => {
-                assert_eq!(o.status, MiniCoderStatus::Escalated);
-                assert_eq!(o.escalation.expect("escalation").attempts, MAX_AGENTIC_FIX_ROUNDS + 1);
-            }
-            other => panic!("expected Escalate at the budget, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gate_agentic_uncovered_escalates_after_one_pass_like_emit_edits() {
-        // B2 fallback: an AgenticIterative write on an UNCOVERED language behaves exactly
-        // like emit-edits — ONE fix pass, then escalate. Dirty at attempt 1 -> Escalate.
-        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        d.write = true;
-        d.write_mode = WriteMode::AgenticIterative;
-        d.attempt = 1; // the single allowed fix pass already ran
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["notes.md".into()],
-            ..Default::default()
-        });
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            WriteMode::AgenticIterative,
-            false, // UNCOVERED -> budget 1
-            vec![high_finding()],
-            "root-r2",
-            "root-r2.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert!(
-            matches!(decision, GateDecision::Escalate(_)),
-            "agentic+uncovered must escalate after one pass, got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn gate_safe_policy_clamps_agentic_directive_to_single_pass_budget() {
-        // E1 (FIX 1): the Safe policy is a HARD CEILING enforced at the budget gate, NOT just
-        // in the launch prompt. A directive that arrived with write_mode=AgenticIterative
-        // (coder hallucination / prompt-injection / replayed directive) on a COVERED language
-        // gets budget 1 — NOT MAX_AGENTIC_FIX_ROUNDS — once the policy clamp resolves the
-        // EFFECTIVE write mode to EmitEdits. Auto/AgenticAllowed pass the directive's mode
-        // through, so the same directive keeps the N-round budget under those policies.
-        //
-        // This mirrors the executor's `match policy { Safe => EmitEdits, _ => directive.write_mode }`
-        // clamp (mini_coder_executor.rs ~:1600) at the pure layer the executor delegates to.
-        let mut d = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        d.write = true;
-        d.write_mode = WriteMode::AgenticIterative; // what the (possibly tampered) directive requested
-
-        let effective_for = |policy: MiniWriteBehavior| match policy {
-            MiniWriteBehavior::Safe => WriteMode::EmitEdits,
-            MiniWriteBehavior::Auto | MiniWriteBehavior::AgenticAllowed => d.write_mode,
-        };
-
-        // SAFE + covered: budget == 1 (single pass), so dirty at attempt 1 escalates.
-        assert_eq!(
-            max_mini_retries_for(&d, effective_for(MiniWriteBehavior::Safe), true),
-            1,
-            "Safe must force budget 1 even for an AgenticIterative directive on a covered language"
-        );
-        // AUTO / AGENTIC_ALLOWED + covered: budget == MAX_AGENTIC_FIX_ROUNDS (the N-round loop).
-        for policy in [MiniWriteBehavior::Auto, MiniWriteBehavior::AgenticAllowed] {
-            assert_eq!(
-                max_mini_retries_for(&d, effective_for(policy), true),
-                MAX_AGENTIC_FIX_ROUNDS,
-                "{policy:?} must keep the N-round budget for a covered agentic directive"
-            );
-        }
-
-        // End-to-end through the gate: dirty Done at attempt 1, covered. Under SAFE the
-        // single-pass budget is exhausted -> Escalate; under AGENTIC_ALLOWED a round remains
-        // -> AwaitingRetryWith. (The covered flag the executor computes is true here.)
-        d.attempt = 1;
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/app.py".into()],
-            ..Default::default()
-        });
-        let safe_dec = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            effective_for(MiniWriteBehavior::Safe),
-            true,
-            vec![high_finding()],
-            "root-r2",
-            "root-r2.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert!(
-            matches!(safe_dec, GateDecision::Escalate(_)),
-            "Safe-clamped agentic directive must escalate after one pass, got {safe_dec:?}"
-        );
-        let allowed_dec = verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            effective_for(MiniWriteBehavior::AgenticAllowed),
-            true,
-            vec![high_finding()],
-            "root-r2",
-            "root-r2.json",
-            "2026-06-06T00:00:10Z",
-        );
-        assert!(
-            matches!(allowed_dec, GateDecision::AwaitingRetryWith { .. }),
-            "AgenticAllowed must still have a round left at attempt 1, got {allowed_dec:?}"
-        );
-
-        // Emit-edits / non-write directives are unaffected by the policy clamp: their budget
-        // is identical under every policy (the clamp only ever narrows Agentic -> Emit).
-        let mut emit = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        emit.write = true; // write_mode defaults to EmitEdits
-        for policy in [MiniWriteBehavior::Safe, MiniWriteBehavior::Auto, MiniWriteBehavior::AgenticAllowed] {
-            let eff = match policy {
-                MiniWriteBehavior::Safe => WriteMode::EmitEdits,
-                _ => emit.write_mode,
-            };
-            assert_eq!(max_mini_retries_for(&emit, eff, true), 1, "emit-edits budget is 1 under {policy:?}");
-        }
-        let nonwrite = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-        for policy in [MiniWriteBehavior::Safe, MiniWriteBehavior::Auto, MiniWriteBehavior::AgenticAllowed] {
-            let eff = match policy {
-                MiniWriteBehavior::Safe => WriteMode::EmitEdits,
-                _ => nonwrite.write_mode,
-            };
-            assert_eq!(
-                max_mini_retries_for(&nonwrite, eff, true),
-                MAX_MINI_RETRIES,
-                "non-write budget is MAX_MINI_RETRIES under {policy:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn gate_emit_edits_write_is_byte_identical_regardless_of_covered() {
-        // NO-CHURN guard: the default (emit-edits) write path produces the SAME decision
-        // whether `covered` is true or false (the budget fn ignores coverage for it). Pin
-        // both the retry-at-attempt-0 and the escalate-at-attempt-1 transitions.
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-        for &covered in &[false, true] {
-            // attempt 0, dirty -> AwaitingRetryWith (the one fix pass).
-            let mut d0 = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-            d0.write = true; // write_mode defaults to EmitEdits
-            let dec0 = verdict_gate_decision(
-                &d0, &outcome, true, WriteMode::EmitEdits, covered, vec![high_finding()],
-                "root-r1", "root-r1.json", "2026-06-06T00:00:10Z",
-            );
-            assert!(
-                matches!(dec0, GateDecision::AwaitingRetryWith { .. }),
-                "emit-edits attempt 0 dirty must retry (covered={covered})"
-            );
-            // attempt 1, dirty -> Escalate (budget exhausted at 1).
-            let mut d1 = directive("root", MiniCoderStatus::Running, "2026-06-06T00:00:00Z");
-            d1.write = true;
-            d1.attempt = 1;
-            let dec1 = verdict_gate_decision(
-                &d1, &outcome, true, WriteMode::EmitEdits, covered, vec![high_finding()],
-                "root-r2", "root-r2.json", "2026-06-06T00:00:10Z",
-            );
-            assert!(
-                matches!(dec1, GateDecision::Escalate(_)),
-                "emit-edits attempt 1 dirty must escalate (covered={covered})"
-            );
-        }
     }
 
     #[test]
@@ -4009,10 +2843,16 @@ mod tests {
         cap_directives_protecting(&mut directives, 2, &["root".to_string()]);
         let ids: std::collections::HashSet<&str> =
             directives.iter().map(|d| d.id.as_str()).collect();
-        assert!(ids.contains("root"), "protected just-finalized root must survive the cap");
+        assert!(
+            ids.contains("root"),
+            "protected just-finalized root must survive the cap"
+        );
         assert!(ids.contains("active"), "active is never evicted");
         // We had to shed 2 terminal slots; with root protected, other-old + newest go.
-        assert!(!ids.contains("other-old"), "an unprotected terminal is shed instead");
+        assert!(
+            !ids.contains("other-old"),
+            "an unprotected terminal is shed instead"
+        );
         assert_eq!(directives.len(), 2);
     }
 
@@ -4029,7 +2869,10 @@ mod tests {
         cap_directives(&mut directives, 2);
         let ids: std::collections::HashSet<&str> =
             directives.iter().map(|d| d.id.as_str()).collect();
-        assert!(!ids.contains("root"), "unprotected oldest root IS evicted (the bug)");
+        assert!(
+            !ids.contains("root"),
+            "unprotected oldest root IS evicted (the bug)"
+        );
     }
 
     // -- read_result_file ---------------------------------------------------
@@ -4551,8 +3394,8 @@ mod tests {
             "http://127.0.0.1:8000/v1",
             "http://127.5.4.3:8000/v1", // anywhere in 127.0.0.0/8
             "http://[::1]:8000/v1",
-            "http://localhost/v1",  // no port
-            "http://127.0.0.1",     // bare loopback, no path
+            "http://localhost/v1", // no port
+            "http://127.0.0.1",    // bare loopback, no path
         ] {
             let n = validate_mini_coder_backend(&omlx(Some("  qwen2.5-coder  "), Some(url)))
                 .unwrap_or_else(|e| panic!("url {url:?} should be accepted, got: {e}"));
@@ -4582,17 +3425,17 @@ mod tests {
     #[test]
     fn omlx_rejects_non_loopback_userinfo_and_suffix_trick() {
         for bad in [
-            "http://evil.com/v1",                  // non-loopback host
-            "http://192.168.0.1:8000/v1",          // LAN, not loopback
-            "http://127.0.0.1.evil.com/v1",        // suffix trick (must NOT match 127.)
-            "http://127.0.0.1@evil.com/v1",        // userinfo trick
-            "http://localhost.evil.com/v1",        // localhost suffix trick
-            "ftp://localhost:8000/v1",             // bad scheme
-            "localhost:8000/v1",                   // missing scheme
-            "http://[::1]extra/v1",                // malformed ipv6 authority
-            "http://[::1]:8000@evil.com/v1",       // F1: ipv6 userinfo bypass
-            "http://[::1]:@evil.com/v1",           // F1: minimal ipv6 userinfo bypass
-            "http://[::1]@evil.com/v1",            // F1: ipv6 userinfo, no port
+            "http://evil.com/v1",            // non-loopback host
+            "http://192.168.0.1:8000/v1",    // LAN, not loopback
+            "http://127.0.0.1.evil.com/v1",  // suffix trick (must NOT match 127.)
+            "http://127.0.0.1@evil.com/v1",  // userinfo trick
+            "http://localhost.evil.com/v1",  // localhost suffix trick
+            "ftp://localhost:8000/v1",       // bad scheme
+            "localhost:8000/v1",             // missing scheme
+            "http://[::1]extra/v1",          // malformed ipv6 authority
+            "http://[::1]:8000@evil.com/v1", // F1: ipv6 userinfo bypass
+            "http://[::1]:@evil.com/v1",     // F1: minimal ipv6 userinfo bypass
+            "http://[::1]@evil.com/v1",      // F1: ipv6 userinfo, no port
         ] {
             assert!(
                 validate_mini_coder_backend(&omlx(Some("qwen2.5-coder"), Some(bad))).is_err(),
@@ -4670,27 +3513,36 @@ mod tests {
     fn omlx_normalizes_trailing_slash() {
         // A trailing slash is stripped so `<baseUrl>/chat/completions` never
         // double-slashes. Stored normalized.
-        let n =
-            validate_mini_coder_backend(&omlx(Some("qwen2.5-coder"), Some("http://localhost:8000/v1/")))
-                .unwrap();
+        let n = validate_mini_coder_backend(&omlx(
+            Some("qwen2.5-coder"),
+            Some("http://localhost:8000/v1/"),
+        ))
+        .unwrap();
         assert_eq!(n.base_url.as_deref(), Some("http://localhost:8000/v1"));
 
         // A bare-root URL strips its slash too.
-        let n2 =
-            validate_mini_coder_backend(&omlx(Some("qwen2.5-coder"), Some("http://localhost:8000/")))
-                .unwrap();
+        let n2 = validate_mini_coder_backend(&omlx(
+            Some("qwen2.5-coder"),
+            Some("http://localhost:8000/"),
+        ))
+        .unwrap();
         assert_eq!(n2.base_url.as_deref(), Some("http://localhost:8000"));
 
         // No trailing slash -> unchanged.
-        let n3 =
-            validate_mini_coder_backend(&omlx(Some("qwen2.5-coder"), Some("http://localhost:8000/v1")))
-                .unwrap();
+        let n3 = validate_mini_coder_backend(&omlx(
+            Some("qwen2.5-coder"),
+            Some("http://localhost:8000/v1"),
+        ))
+        .unwrap();
         assert_eq!(n3.base_url.as_deref(), Some("http://localhost:8000/v1"));
     }
 
     #[test]
     fn omlx_rejects_overlong_base_url() {
-        let long = format!("http://localhost:8000/{}", "a".repeat(MINI_BASE_URL_MAX_LEN));
+        let long = format!(
+            "http://localhost:8000/{}",
+            "a".repeat(MINI_BASE_URL_MAX_LEN)
+        );
         assert!(
             validate_mini_coder_backend(&omlx(Some("qwen2.5-coder"), Some(&long))).is_err(),
             "overlong base url must be rejected"
@@ -4700,239 +3552,13 @@ mod tests {
     #[test]
     fn omlx_rejects_bad_model_tag() {
         assert!(
-            validate_mini_coder_backend(&omlx(Some("qwen coder"), Some("http://localhost:8000/v1")))
-                .is_err(),
+            validate_mini_coder_backend(&omlx(
+                Some("qwen coder"),
+                Some("http://localhost:8000/v1")
+            ))
+            .is_err(),
             "model with whitespace must be rejected"
         );
-    }
-
-    // -- P6: retry / escalation transitions + propagation -------------------
-
-    #[test]
-    fn awaiting_retry_only_from_running() {
-        let mut running = directive("d1", MiniCoderStatus::Running, "t0");
-        running.agent_id = Some("mini-c-d1".into());
-        let next = apply_awaiting_retry(&running, "d1-r1").unwrap();
-        assert_eq!(next.status, MiniCoderStatus::AwaitingRetry);
-        assert_eq!(next.retry_directive_id.as_deref(), Some("d1-r1"));
-        assert!(next.result.is_none(), "awaiting_retry is limbo: no terminal result yet");
-        // Not from pending / not from a terminal state.
-        let pending = directive("d2", MiniCoderStatus::Pending, "t0");
-        assert!(apply_awaiting_retry(&pending, "x").is_err());
-        let done = directive("d3", MiniCoderStatus::Done, "t0");
-        assert!(apply_awaiting_retry(&done, "x").is_err());
-    }
-
-    #[test]
-    fn awaiting_retry_is_neither_active_nor_terminal_nor_evictable() {
-        assert!(!MiniCoderStatus::AwaitingRetry.is_active());
-        assert!(!MiniCoderStatus::AwaitingRetry.is_terminal());
-        // cap never evicts a non-terminal: an AwaitingRetry predecessor survives.
-        let mut directives = vec![
-            directive("old-await", MiniCoderStatus::AwaitingRetry, "t0"),
-            directive("new-done", MiniCoderStatus::Done, "t1"),
-        ];
-        cap_directives(&mut directives, 1);
-        assert!(
-            directives.iter().any(|d| d.id == "old-await"),
-            "AwaitingRetry must never be evicted even under cap pressure"
-        );
-    }
-
-    #[test]
-    fn escalated_is_terminal_and_carries_payload() {
-        assert!(MiniCoderStatus::Escalated.is_terminal());
-        assert!(!MiniCoderStatus::Escalated.is_active());
-        let mut running = directive("d1", MiniCoderStatus::Running, "t0");
-        running.attempt = 2;
-        let info = EscalationInfo {
-            attempts: 3,
-            findings: vec![EscalationFinding {
-                file: "src/a.rs".into(),
-                severity: "high".into(),
-                source: "clippy".into(),
-                title: "unwrap on None".into(),
-                line: Some(42),
-            }],
-        };
-        let next = apply_escalated(&running, vec!["src/a.rs".into()], info.clone(), false, None).unwrap();
-        assert_eq!(next.status, MiniCoderStatus::Escalated);
-        let out = next.result.unwrap();
-        assert_eq!(out.escalation.as_ref().unwrap().attempts, 3);
-        assert_eq!(out.files_touched, vec!["src/a.rs".to_string()]);
-        // escalated only from an active directive.
-        let pending = directive("d2", MiniCoderStatus::Pending, "t0");
-        assert!(apply_escalated(&pending, vec![], info, false, None).is_err());
-    }
-
-    // ── FIX 2: escalated outcome must propagate net_blocked ──────────────────
-
-    /// When the last attempt had net_blocked=true and retries are exhausted, the
-    /// Escalated outcome must carry net_blocked=true so finalize_finished_mini
-    /// emits the consent-request event on the escalation path.
-    #[test]
-    fn escalated_outcome_propagates_net_blocked_true() {
-        let info = EscalationInfo {
-            attempts: 2,
-            findings: vec![],
-        };
-        // net_blocked=true must survive into the escalated outcome.
-        let o = MiniCoderOutcome::escalated(vec!["src/a.rs".into()], info, true, None);
-        assert!(
-            o.net_blocked,
-            "escalated outcome must carry net_blocked=true from the last attempt"
-        );
-    }
-
-    #[test]
-    fn escalated_outcome_net_blocked_false_by_default() {
-        let info = EscalationInfo {
-            attempts: 1,
-            findings: vec![],
-        };
-        let o = MiniCoderOutcome::escalated(vec![], info, false, None);
-        assert!(!o.net_blocked, "escalated outcome with net_blocked=false");
-    }
-
-    /// verdict_gate_decision on the Escalate branch must carry net_blocked from
-    /// the incoming outcome (the last attempt's result).
-    #[test]
-    fn verdict_gate_decision_escalate_carries_net_blocked() {
-        let mut d = directive("d1", MiniCoderStatus::Running, "t0");
-        d.write = true;
-        d.attempt = 99; // force escalate path
-        let outcome = MiniCoderOutcome {
-            status: MiniCoderStatus::Done,
-            net_blocked: true,
-            files_touched: vec!["src/a.rs".into()],
-            ..MiniCoderOutcome::default()
-        };
-        let finding = EscalationFinding {
-            file: "src/a.rs".into(),
-            severity: "high".into(),
-            source: "clippy".into(),
-            title: "unwrap".into(),
-            line: None,
-        };
-        let decision = verdict_gate_decision(
-            &d,
-            &outcome,
-            true, // trusted
-            WriteMode::EmitEdits,
-            false, // covered
-            vec![finding],
-            "d1-r1",
-            "result.json",
-            "t1",
-        );
-        match decision {
-            GateDecision::Escalate(escalated_outcome) => {
-                assert!(
-                    escalated_outcome.net_blocked,
-                    "GateDecision::Escalate must carry net_blocked=true from the last attempt"
-                );
-            }
-            other => panic!("expected Escalate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_retry_directive_bumps_attempt_unions_files_and_keeps_root() {
-        let mut root = directive("root", MiniCoderStatus::Running, "t0");
-        root.files = vec!["src/a.rs".into()];
-        root.backend = Some("ollama".into());
-        root.allow_oracle = true;
-        let retry = build_retry_directive(
-            &root,
-            &["src/a.rs".into(), "src/b.rs".into()],
-            "fix the High finding on line 42",
-            "root-r1",
-            "mini/root-r1.json",
-            "t1",
-        );
-        assert_eq!(retry.status, MiniCoderStatus::Pending);
-        assert_eq!(retry.attempt, 1);
-        // root id propagated (root itself has no parent → its own id is the root).
-        assert_eq!(retry.parent_directive_id.as_deref(), Some("root"));
-        // files unioned + de-duped, order preserved.
-        assert_eq!(retry.files, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
-        // inherited config.
-        assert_eq!(retry.backend.as_deref(), Some("ollama"));
-        assert!(retry.allow_oracle);
-        assert_eq!(retry.parent_agent_id, "coder-1");
-        // feedback appended.
-        assert!(retry.task.contains("CENSOR FEEDBACK (attempt 1)"));
-        assert!(retry.task.contains("fix the High finding on line 42"));
-        // A SECOND retry built off the first keeps the SAME root.
-        let mut r1 = retry.clone();
-        r1.status = MiniCoderStatus::Running;
-        let retry2 = build_retry_directive(&r1, &[], "still dirty", "root-r2", "mini/root-r2.json", "t2");
-        assert_eq!(retry2.attempt, 2);
-        assert_eq!(retry2.parent_directive_id.as_deref(), Some("root"));
-    }
-
-    #[test]
-    fn chain_root_id_resolves_root_vs_retry() {
-        let root = directive("root", MiniCoderStatus::AwaitingRetry, "t0");
-        assert_eq!(chain_root_id(&root), "root");
-        let mut retry = directive("r1", MiniCoderStatus::Running, "t1");
-        retry.parent_directive_id = Some("root".into());
-        assert_eq!(chain_root_id(&retry), "root");
-    }
-
-    #[test]
-    fn awaiting_retry_ancestors_finds_whole_lineage_excludes_leaf_and_other_chains() {
-        // Lineage: root(AwaitingRetry) -> r1(AwaitingRetry) -> r2(Running, the leaf).
-        let mut root = directive("root", MiniCoderStatus::AwaitingRetry, "t0");
-        root.retry_directive_id = Some("r1".into());
-        let mut r1 = directive("r1", MiniCoderStatus::AwaitingRetry, "t1");
-        r1.parent_directive_id = Some("root".into());
-        r1.retry_directive_id = Some("r2".into());
-        let mut leaf = directive("r2", MiniCoderStatus::Running, "t2");
-        leaf.parent_directive_id = Some("root".into());
-        // An UNRELATED chain that must NOT be touched.
-        let mut other = directive("other", MiniCoderStatus::AwaitingRetry, "t0");
-        other.retry_directive_id = Some("other-r1".into());
-
-        let snapshot = vec![root.clone(), r1.clone(), leaf.clone(), other.clone()];
-        let mut ancestors = awaiting_retry_ancestors(&snapshot, &leaf);
-        ancestors.sort();
-        assert_eq!(ancestors, vec!["r1".to_string(), "root".to_string()]);
-        assert!(!ancestors.contains(&"r2".to_string()), "leaf excluded");
-        assert!(!ancestors.contains(&"other".to_string()), "other chain untouched");
-    }
-
-    #[test]
-    fn awaiting_retry_ancestors_handles_root_as_leaf() {
-        // First-attempt escalation: the ROOT itself is the leaf (no retries spawned
-        // because MAX_MINI_RETRIES could be 0, or the root escalates directly). No
-        // ancestors to stamp.
-        let root = directive("root", MiniCoderStatus::Running, "t0");
-        let snapshot = vec![root.clone()];
-        assert!(awaiting_retry_ancestors(&snapshot, &root).is_empty());
-    }
-
-    #[test]
-    fn retry_directive_serde_round_trip_and_no_churn_when_zero() {
-        // attempt 0 + None lineage → NO-CHURN (keys omitted).
-        let root = directive("root", MiniCoderStatus::Pending, "t0");
-        let j = serde_json::to_string(&root).unwrap();
-        assert!(!j.contains("attempt"), "attempt 0 must not serialize: {j}");
-        assert!(!j.contains("parentDirectiveId"), "None lineage omitted: {j}");
-        assert!(!j.contains("retryDirectiveId"), "None lineage omitted: {j}");
-        // A retry round-trips its lineage.
-        let retry = build_retry_directive(&root, &[], "fb", "root-r1", "mini/x.json", "t1");
-        let jr = serde_json::to_string(&retry).unwrap();
-        assert!(jr.contains("\"attempt\":1"), "{jr}");
-        assert!(jr.contains("\"parentDirectiveId\":\"root\""), "{jr}");
-        let back: MiniCoderDirective = serde_json::from_str(&jr).unwrap();
-        assert_eq!(retry, back);
-        // Backward compat: an old directive without the new keys still parses.
-        let old: MiniCoderDirective =
-            serde_json::from_str(r#"{"id":"d","status":"pending"}"#).unwrap();
-        assert_eq!(old.attempt, 0);
-        assert!(old.parent_directive_id.is_none());
-        assert!(old.retry_directive_id.is_none());
     }
 
     // ── FIX 4: is_false helper — NO-CHURN round-trip for net_blocked ─────────

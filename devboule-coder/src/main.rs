@@ -139,10 +139,19 @@ fn paused_note(reason: &str) -> String {
     )
 }
 
-/// Char budget for the cumulative session conversation (reviewer F3). The
-/// conversation is the non-evictable `human` message of every burst, so it must
-/// stay well under the model's context window across a long planning session.
-const MAX_CONVERSATION_CHARS: usize = 48_000;
+/// Dynamic budget for the cumulative session conversation. Uses 30% of the
+/// model's context window (in tokens→chars) with a hard floor of 48_000 chars
+/// (back-compat with the old fixed value); the remaining 70% is for the
+/// within-burst transcript + system prompt + model output.
+fn conversation_budget_chars() -> usize {
+    const ENV_CONTEXT_WINDOW: &str = "DEVBOULE_CONTEXT_WINDOW";
+    let window = std::env::var(ENV_CONTEXT_WINDOW)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&w| w >= 1024)
+        .unwrap_or(12_000); // 48K chars / 4 = 12K tokens (old default)
+    (window * 30 / 100 * 4).max(48_000)
+}
 
 /// Bound the running conversation to `max` CHARS (marker included), keeping the head
 /// (original goal + early framing) and the recent tail with a trim marker between.
@@ -216,7 +225,7 @@ async fn run_session(goal: String) -> std::io::Result<()> {
         // message of every burst, so it must be bounded or a long planning session
         // overflows the model context. Keep the head (the original goal + early
         // framing) and the recent tail.
-        conversation = trim_conversation(conversation, MAX_CONVERSATION_CHARS);
+        conversation = trim_conversation(conversation, conversation_budget_chars());
         let outcome = run_one_burst(&runtime, conversation.clone()).await?;
         let prior = match outcome {
             // The reply was already emitted as a chat bubble by the burst — do NOT

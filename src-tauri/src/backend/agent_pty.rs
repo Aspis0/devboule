@@ -438,7 +438,7 @@ pub fn agent_pty_write(
 /// (1) strip trailing newlines, (2) replace every INTERNAL '\r'/'\n' with a single space so the
 /// whole message is one line, then (3) append exactly one '\r' (the single Enter that submits it).
 pub(crate) fn frame_agent_message(message: &str) -> String {
-    let trimmed = message.trim_end_matches(|c| c == '\r' || c == '\n');
+    let trimmed = message.trim_end_matches(['\r', '\n']);
     let replaced: String = trimmed
         .chars()
         .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })

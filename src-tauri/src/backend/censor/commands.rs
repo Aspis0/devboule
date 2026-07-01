@@ -23,12 +23,13 @@
 use super::gemma;
 use super::ledger;
 use super::orchestrator::{self, GemmaCtx};
-use super::schema::{CensorShard, Disposition, Finding};
+use super::schema::{CensorShard, Disposition, Finding, Severity};
 use super::watch::{self, CensorWatchHandle};
 use crate::backend::state::BackendState;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
 
 /// BLOCKER B: the error returned by the tool-running commands when the project is
@@ -867,9 +868,133 @@ pub fn kill_all_on_exit(app: &AppHandle) {
     }
 }
 
+/// Rank a severity for sorting: High=0, Medium=1, Low=2.
+fn severity_rank(s: Severity) -> u8 {
+    match s {
+        Severity::High => 0,
+        Severity::Medium => 1,
+        Severity::Low => 2,
+    }
+}
+
+/// Format Censor findings as human-readable text for agent context.
+/// Token budget: max 10 findings, max 4096 bytes, sorted by severity.
+/// Skips findings that would push output past 4096 bytes (never includes partial findings).
+/// Bodies are capped at 2000 chars to bound allocation.
+#[allow(dead_code)] // called in Step 5 (inject into mini output)
+pub fn format_findings_text(findings: &[Finding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&Finding> = findings.iter().collect();
+    sorted.sort_by_key(|f| severity_rank(f.severity));
+    let mut out = String::new();
+    for (i, f) in sorted.iter().enumerate() {
+        if i >= 10 {
+            break;
+        }
+        let icon = match f.severity {
+            Severity::High => "🔴",
+            Severity::Medium => "🟡",
+            Severity::Low => "🟢",
+        };
+        let sev_str = match f.severity {
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
+        };
+        let cat_str = f.category.id_token();
+        let line = f.line.map(|n| format!(":{n}")).unwrap_or_default();
+        // Pre-truncate body to bound allocation
+        let body: String = f.body.chars().take(2000).collect();
+        let entry = format!(
+            "{icon} [{sev_str}] {}\n  File: {}{}\n  Source: {} ({cat_str})\n  {}\n\n",
+            f.title, f.file, line, f.source, body,
+        );
+        // Skip finding if it would push output past 4096 bytes
+        // (never include a partial finding)
+        if out.len() + entry.len() > 4096 {
+            break;
+        }
+        out.push_str(&entry);
+    }
+    out
+}
+
+/// Wait up to `timeout` for Censor findings on the given files.
+/// Polls the shard directory every 200ms until findings appear or timeout expires.
+/// Capped at 50 findings across all files to bound state size.
+#[allow(dead_code)] // called in Step 4 (finalize_finished_mini)
+pub fn wait_for_censor_findings(root: &Path, files: &[String], timeout: Duration) -> Vec<Finding> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all: Vec<Finding> = Vec::new();
+        for file in files {
+            if let Ok(Some(shard)) = ledger::read_shard(root, file) {
+                for f in shard.findings {
+                    if f.disposition == Disposition::Open {
+                        all.push(f);
+                        if all.len() >= 50 {
+                            return all; // cap at 50 to bound state/event size
+                        }
+                    }
+                }
+            }
+        }
+        if !all.is_empty() || Instant::now() >= deadline {
+            return all;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Drain all pending Censor queue batches. Reads `<root>/.aspis/censor_queue/pending/*.json`,
+/// deletes each file after reading, returns deduplicated findings sorted by severity (High first).
+pub fn drain_censor_queue(root: &Path) -> Vec<crate::backend::censor::schema::Finding> {
+    let queue_dir = root.join(".aspis").join("censor_queue").join("pending");
+    if !queue_dir.exists() {
+        return vec![];
+    }
+    let mut batches: Vec<crate::backend::censor::schema::FindingBatch> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&queue_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    match serde_json::from_str::<
+                        crate::backend::censor::schema::FindingBatch,
+                    >(&content) {
+                        Ok(batch) => batches.push(batch),
+                        Err(e) => {
+                            eprintln!("censor queue: skipping corrupt batch {}: {e}", path.display());
+                            // Rename instead of delete so corrupt file is inspectable
+                            let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+                            continue; // skip delete below
+                        }
+                    }
+                }
+                let _ = std::fs::remove_file(&path); // exactly-once delivery
+            }
+        }
+    }
+    batches.sort_by_key(|b| b.timestamp.clone());
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for batch in batches {
+        for f in batch.findings {
+            if seen.insert(f.id.clone()) {
+                out.push(f);
+            }
+        }
+    }
+    out.sort_by_key(|f| severity_rank(f.severity));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::censor::schema::Category;
     use std::sync::atomic::AtomicU8;
 
     #[test]
@@ -886,6 +1011,158 @@ mod tests {
     fn censor_state_take_handle_empty_is_none() {
         let st = CensorState::new();
         assert!(st.take_handle().is_none());
+    }
+
+    // ---- wait_for_censor_findings tests ----
+
+    #[test]
+    fn wait_for_censor_findings_returns_empty_when_no_shards() {
+        let root = std::env::temp_dir().join(format!("aspis-censor-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let got = wait_for_censor_findings(&root, &["src/a.rs".into()], Duration::from_secs(1));
+        assert!(got.is_empty(), "no shards → empty");
+    }
+
+    #[test]
+    fn wait_for_censor_findings_finds_preexisting_shard() {
+        let root = std::env::temp_dir().join(format!("aspis-censor-shard-{}", std::process::id()));
+        let censor_dir = root.join(".aspis-censor");
+        std::fs::create_dir_all(&censor_dir).unwrap();
+        let shard = CensorShard {
+            file_rel_path: "src/a.rs".into(),
+            content_hash: "h".into(),
+            updated_at: "t".into(),
+            findings: vec![Finding {
+                id: "f1".into(),
+                file: "src/a.rs".into(),
+                severity: Severity::High,
+                category: Category::Correctness,
+                source: "clippy".into(),
+                title: "unused".into(),
+                body: "x is unused".into(),
+                disposition: Disposition::Open,
+                ..Default::default()
+            }],
+        };
+        ledger::write_shard(&root, &shard);
+        let got = wait_for_censor_findings(&root, &["src/a.rs".into()], Duration::from_secs(2));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "unused");
+    }
+
+    #[test]
+    fn wait_for_censor_findings_skips_non_open_disposition() {
+        let root = std::env::temp_dir().join(format!("aspis-censor-skip-{}", std::process::id()));
+        let censor_dir = root.join(".aspis-censor");
+        std::fs::create_dir_all(&censor_dir).unwrap();
+        let shard = CensorShard {
+            file_rel_path: "src/a.rs".into(),
+            content_hash: "h".into(),
+            updated_at: "t".into(),
+            findings: vec![
+                Finding {
+                    id: "f1".into(),
+                    disposition: Disposition::Fixed,
+                    ..Default::default()
+                },
+                Finding {
+                    id: "f2".into(),
+                    disposition: Disposition::Fp,
+                    ..Default::default()
+                },
+                Finding {
+                    id: "f3".into(),
+                    disposition: Disposition::Wontfix,
+                    ..Default::default()
+                },
+            ],
+        };
+        ledger::write_shard(&root, &shard);
+        let got = wait_for_censor_findings(&root, &["src/a.rs".into()], Duration::from_secs(2));
+        assert!(got.is_empty(), "Fixed/Fp/Wontfix must be skipped");
+    }
+
+    #[test]
+    fn wait_for_censor_findings_times_out_when_no_shard_appears() {
+        let root = std::env::temp_dir().join(format!("aspis-censor-poll-{}", std::process::id()));
+        let _censor_dir = root.join(".aspis-censor");
+        std::fs::create_dir_all(&_censor_dir).unwrap();
+        let start = std::time::Instant::now();
+        // No shard for "src/x.rs" — must poll until timeout
+        let got = wait_for_censor_findings(&root, &["src/x.rs".into()], Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert!(got.is_empty(), "no shard → empty");
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "must wait at least ~400ms, got {:?}",
+            elapsed
+        );
+    }
+
+    // ---- format_findings_text tests ----
+
+    #[test]
+    fn format_findings_text_empty_returns_empty() {
+        assert_eq!(format_findings_text(&[]), "");
+    }
+
+    #[test]
+    fn format_findings_text_sorts_high_before_medium_before_low() {
+        let findings = vec![
+            Finding {
+                severity: Severity::Low,
+                title: "low1".into(),
+                ..Default::default()
+            },
+            Finding {
+                severity: Severity::High,
+                title: "high1".into(),
+                ..Default::default()
+            },
+            Finding {
+                severity: Severity::Medium,
+                title: "mid1".into(),
+                ..Default::default()
+            },
+        ];
+        let text = format_findings_text(&findings);
+        let hi = text.find("high1").unwrap();
+        let mi = text.find("mid1").unwrap();
+        let lo = text.find("low1").unwrap();
+        assert!(hi < mi, "High must appear before Medium in output");
+        assert!(mi < lo, "Medium must appear before Low in output");
+    }
+
+    #[test]
+    fn format_findings_text_caps_at_ten_findings() {
+        let findings: Vec<Finding> = (0..15)
+            .map(|i| Finding {
+                title: format!("finding-{i}"),
+                severity: Severity::Medium,
+                source: "clippy".into(),
+                ..Default::default()
+            })
+            .collect();
+        let text = format_findings_text(&findings);
+        let count = text.matches("🟡").count();
+        assert!(count <= 10, "max 10 findings, got {count}");
+    }
+
+    #[test]
+    fn format_findings_text_caps_total_size_at_4096_bytes() {
+        let big_body = "x".repeat(6000);
+        let findings = vec![Finding {
+            body: big_body,
+            severity: Severity::High,
+            source: "clippy".into(),
+            ..Default::default()
+        }];
+        let text = format_findings_text(&findings);
+        assert!(
+            text.len() <= 4096,
+            "must cap at 4096 bytes, got {}",
+            text.len()
+        );
     }
 
     // ---- BLOCKER 2 + WARNING 3: censor root confinement (pure matcher) ----
@@ -1053,7 +1330,10 @@ mod tests {
         rust.insert(ProjectKind::Rust);
         let rust_tools = detect_tools_with(&rust, |_| true);
         let rust_names: Vec<&str> = rust_tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(!rust_names.contains(&"gofmt"), "gofmt leaked into a Rust project");
+        assert!(
+            !rust_names.contains(&"gofmt"),
+            "gofmt leaked into a Rust project"
+        );
     }
 
     #[test]
@@ -1104,7 +1384,10 @@ mod tests {
         ] {
             let tools = detect_tools_with(&kset, |_| true);
             let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-            assert!(names.contains(&"shellcheck"), "missing shellcheck for {kset:?}");
+            assert!(
+                names.contains(&"shellcheck"),
+                "missing shellcheck for {kset:?}"
+            );
             assert!(names.contains(&"yamllint"), "missing yamllint for {kset:?}");
             assert!(names.contains(&"sqlfluff"), "missing sqlfluff for {kset:?}");
         }
@@ -1124,8 +1407,14 @@ mod tests {
             let tools = detect_tools_with(&kset, |_| true);
             let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
             assert!(names.contains(&"hadolint"), "missing hadolint for {kset:?}");
-            assert!(names.contains(&"actionlint"), "missing actionlint for {kset:?}");
-            assert!(names.contains(&"stylelint"), "missing stylelint for {kset:?}");
+            assert!(
+                names.contains(&"actionlint"),
+                "missing actionlint for {kset:?}"
+            );
+            assert!(
+                names.contains(&"stylelint"),
+                "missing stylelint for {kset:?}"
+            );
         }
     }
 
@@ -1373,7 +1662,11 @@ mod tests {
             2,
             "a base change (same provider) re-probes (cache miss on identity mismatch)"
         );
-        assert_eq!(st.gemma_status(), "offline", "status reflects the latest (base B) probe");
+        assert_eq!(
+            st.gemma_status(),
+            "offline",
+            "status reflects the latest (base B) probe"
+        );
     }
 
     #[test]
@@ -1423,7 +1716,11 @@ mod tests {
             2,
             "a provider switch re-probes (cache miss on provider mismatch)"
         );
-        assert_eq!(st.gemma_status(), "offline", "status reflects the latest (omlx) probe");
+        assert_eq!(
+            st.gemma_status(),
+            "offline",
+            "status reflects the latest (omlx) probe"
+        );
 
         // 4) A second omlx call now hits the (re-keyed) cache — NO new probe.
         let omlx2 = ProviderStub {
@@ -1607,5 +1904,89 @@ mod tests {
         // handle (the command then simply skips the stop).
         let st = CensorState::new();
         assert!(st.take_handle_if_project("anyone").is_none());
+    }
+
+    #[test]
+    fn drain_censor_queue_returns_empty_when_no_dir() {
+        let tmp = std::env::temp_dir().join(format!("aspis-dq-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let got = drain_censor_queue(&tmp);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn drain_censor_queue_drains_and_deletes_batches() {
+        use crate::backend::censor::schema::{Category, Finding, FindingBatch, Severity};
+        let tmp = std::env::temp_dir().join(format!("aspis-dq-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let queue_dir = tmp.join(".aspis").join("censor_queue").join("pending");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        let f1 = Finding {
+            id: "id1".into(),
+            severity: Severity::High,
+            title: "bug1".into(),
+            file: "src/a.rs".into(),
+            source: "clippy".into(),
+            category: Category::Correctness,
+            ..Default::default()
+        };
+        let f2 = Finding {
+            id: "id2".into(),
+            severity: Severity::Medium,
+            title: "bug2".into(),
+            file: "src/b.rs".into(),
+            source: "semgrep".into(),
+            category: Category::Security,
+            ..Default::default()
+        };
+        let batch = FindingBatch {
+            batch_id: "t1".into(),
+            timestamp: "2026-06-30T12:00:00Z".into(),
+            pass_type: "coarse".into(),
+            files: vec!["src/a.rs".into()],
+            findings: vec![f1, f2],
+        };
+        std::fs::write(
+            queue_dir.join("t1.json"),
+            serde_json::to_string(&batch).unwrap(),
+        )
+        .unwrap();
+        let got = drain_censor_queue(&tmp);
+        assert_eq!(got.len(), 2);
+        assert!(!queue_dir.join("t1.json").exists());
+    }
+
+    #[test]
+    fn drain_censor_queue_deduplicates_by_id() {
+        use crate::backend::censor::schema::{Category, Finding, FindingBatch, Severity};
+        let tmp = std::env::temp_dir().join(format!("aspis-dq-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let queue_dir = tmp.join(".aspis").join("censor_queue").join("pending");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        let f = Finding {
+            id: "same".into(),
+            severity: Severity::High,
+            title: "dup".into(),
+            file: "src/a.rs".into(),
+            source: "clippy".into(),
+            category: Category::Correctness,
+            ..Default::default()
+        };
+        for ts in ["a", "b"] {
+            let batch = FindingBatch {
+                batch_id: ts.into(),
+                timestamp: format!("{ts}Z"),
+                pass_type: "coarse".into(),
+                files: vec!["src/a.rs".into()],
+                findings: vec![f.clone()],
+            };
+            std::fs::write(
+                queue_dir.join(format!("{ts}.json")),
+                serde_json::to_string(&batch).unwrap(),
+            )
+            .unwrap();
+        }
+        let got = drain_censor_queue(&tmp);
+        assert_eq!(got.len(), 1, "deduplicated");
     }
 }

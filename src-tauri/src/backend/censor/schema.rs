@@ -113,7 +113,7 @@ pub struct ProvenanceEntry {
 /// missing key. `id` is deterministic over (file, line, category, source, title)
 /// so the same issue re-flagged across re-reviews keeps the same id — that
 /// stability is what lets supersede preserve a coder's disposition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     #[serde(default)]
@@ -187,7 +187,7 @@ impl Finding {
 
 /// One per-file shard: the file's current content-hash plus its findings array.
 /// Stored at `<root>/.aspis-censor/<sha256(fileRelPath)>.json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CensorShard {
     #[serde(default)]
@@ -196,6 +196,29 @@ pub struct CensorShard {
     pub content_hash: String,
     #[serde(default)]
     pub updated_at: String,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+}
+
+/// A batch of Censor findings from a single review pass. Written to the
+/// persistent queue directory as a timestamped JSON file. Drained by the
+/// main coder (local: burst loop; cloud: MCP `censor_findings(drain_queue=true)`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingBatch {
+    /// Unique id: `{ISO-timestamp}_{short-hash}` — also the filename.
+    #[serde(default)]
+    pub batch_id: String,
+    /// ISO-8601 with timezone.
+    #[serde(default)]
+    pub timestamp: String,
+    /// Which pass produced this: "fine" | "coarse" | "llm".
+    #[serde(default)]
+    pub pass_type: String,
+    /// Which files triggered this pass.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Findings from this pass (open disposition only).
     #[serde(default)]
     pub findings: Vec<Finding>,
 }
@@ -377,6 +400,22 @@ mod tests {
             Finding::compute_id("src/a.rs", None, Category::Security, "clippy", "t"),
             Finding::compute_id("src/a.rs", Some(0), Category::Security, "clippy", "t")
         );
+    }
+
+    #[test]
+    fn finding_batch_round_trips() {
+        let batch = FindingBatch {
+            batch_id: "2026-06-30T12:00:00_abcd".into(),
+            timestamp: "2026-06-30T12:00:00Z".into(),
+            pass_type: "coarse".into(),
+            files: vec!["src/a.rs".into()],
+            findings: vec![sample_finding()],
+        };
+        let json = serde_json::to_string(&batch).unwrap();
+        let back: FindingBatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.batch_id, batch.batch_id);
+        assert_eq!(back.findings.len(), 1);
+        assert_eq!(back.findings[0].title, "Hardcoded secret");
     }
 
     #[test]

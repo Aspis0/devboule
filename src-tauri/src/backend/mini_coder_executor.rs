@@ -46,13 +46,12 @@ use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::agents;
-use super::project_skill::{
-    active_language_skill, active_project_skill, fenced_lang_skill_block, fenced_skill_block,
-};
 use super::mini_coder::{
     self, MiniCoderBackend, MiniCoderBackendKind, MiniCoderDirective, MiniCoderOutcome,
-    MiniCoderStatus, WriteMode, DEFAULT_LAUNCH_CAP_SECS, DEFAULT_WALL_CLOCK_CAP_SECS,
-    MAX_DIRECTIVES,
+    MiniCoderStatus, DEFAULT_LAUNCH_CAP_SECS, DEFAULT_WALL_CLOCK_CAP_SECS, MAX_DIRECTIVES,
+};
+use super::project_skill::{
+    active_language_skill, active_project_skill, fenced_lang_skill_block, fenced_skill_block,
 };
 #[cfg(windows)]
 use super::projects::ps_single_quote;
@@ -342,7 +341,10 @@ impl MiniCoderState {
     /// worker per directive starts). Recovers from a poisoned lock (plain HashSet, no
     /// invariant) so the claim always lands.
     fn claim_agentic(&self, id: &str) -> bool {
-        let mut set = self.agentic_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = self
+            .agentic_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set.insert(id.to_string())
     }
 
@@ -350,14 +352,23 @@ impl MiniCoderState {
     /// failure, mirroring the RAII guard's drop). A leaked id would keep the directive
     /// un-finalizable forever; a leaked cancel flag would misfire on a future same-id worker.
     fn release_agentic(&self, inflight_id: &str, cancel_id: &str) {
-        self.agentic_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(inflight_id);
-        self.agentic_cancel.lock().unwrap_or_else(|e| e.into_inner()).remove(cancel_id);
+        self.agentic_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(inflight_id);
+        self.agentic_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(cancel_id);
     }
 
     /// Snapshot the in-flight agentic ids (for `run_pass`'s completion check + the timeout
     /// exclusion). Recovers from poison and returns the LIVE set.
     fn agentic_inflight_ids(&self) -> std::collections::HashSet<String> {
-        let set = self.agentic_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let set = self
+            .agentic_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set.clone()
     }
 
@@ -370,7 +381,10 @@ impl MiniCoderState {
     /// clone for the worker to check each round. Recovers from poison.
     fn register_agentic_cancel(&self, id: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
-        let mut map = self.agentic_cancel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .agentic_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         map.insert(id.to_string(), Arc::clone(&flag));
         flag
     }
@@ -378,7 +392,10 @@ impl MiniCoderState {
     /// Signal an in-flight agentic worker to stop (user Stop / kill). No-op if the directive
     /// has no agentic worker (e.g. a one-shot mini).
     fn cancel_agentic(&self, id: &str) {
-        let map = self.agentic_cancel.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .agentic_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(flag) = map.get(id) {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -429,8 +446,14 @@ struct AgenticInflightGuard {
 
 impl Drop for AgenticInflightGuard {
     fn drop(&mut self) {
-        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.inflight_key);
-        self.cancel_map.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.cancel_key);
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.inflight_key);
+        self.cancel_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.cancel_key);
     }
 }
 
@@ -466,14 +489,13 @@ fn run_loop(app: AppHandle, running: Arc<AtomicBool>) {
         eprintln!("mini-coder executor: startup result-file-sweep error: {e}");
     }
 
-    // P6 (crash recovery): an `AwaitingRetry` directive whose forward-linked retry
+    // P6 (crash recovery): an `Failed` directive whose forward-linked retry
     // directive is ABSENT from the queue (evicted, or never appended after a crash
     // between the awaiting-retry stamp and the retry append) is stuck in limbo — no
     // retry will ever propagate a verdict back to it. Fail it (`failed("retry lost")`)
     // and propagate to its lineage so the ROOT id's poll unblocks. Best-effort.
-    if let Err(e) = sweep_orphaned_awaiting_retry(&app) {
-        eprintln!("mini-coder executor: startup awaiting-retry-sweep error: {e}");
-    }
+    // Phase A Censor injection replaces the old verdict gate sweep
+    let _ = sweep_orphaned_result_files(&app);
 
     // Slice 3 (seam 3d): when Pigeon is enabled, register the `mini-pool` receiver as
     // `loaded` once so the agents row exists (a `/send` to a known-loaded receiver gets
@@ -580,95 +602,20 @@ fn sweep_orphaned_launching(app: &AppHandle) -> Result<(), String> {
     })
 }
 
-/// P6 (crash recovery) + BLOCKER 1: stamp every `AwaitingRetry` directive that its retry
+/// P6 (crash recovery) + BLOCKER 1: stamp every `Failed` directive that its retry
 /// chain can no longer reach via normal finalize propagation, then propagate that terminal
 /// up the chain so the Python poll on the ROOT id unblocks. Two cases (pure
 /// `awaiting_retry_needing_terminal`):
 ///   * ABSENT retry child (evicted / never appended after a crash) -> `failed("retry
 ///     lost")`.
-///   * PRESENT + TERMINAL retry child while the predecessor is still AwaitingRetry (a
+///   * PRESENT + TERMINAL retry child while the predecessor is still Failed (a
 ///     MISSED propagation — e.g. a retry that failed at LAUNCH before the BLOCKER-1 fix
 ///     routed `fail_launching` through propagation, or a crash mid-propagation) ->
 ///     re-propagate the CHILD's own terminal outcome.
 ///
-/// AwaitingRetry is neither active nor terminal, so the `apply_*` active-only guard can't
+/// Failed is neither active nor terminal, so the `apply_*` active-only guard can't
 /// stamp it — we write `status`/`result` DIRECTLY, then propagate to the chain's other
-/// AwaitingRetry ancestors. Returns Err only on a hard state-access failure.
-fn sweep_orphaned_awaiting_retry(app: &AppHandle) -> Result<(), String> {
-    let snapshot = agents::read_agent_live_state_snapshot(app)?;
-    reconcile_awaiting_retry_orphans(app, &snapshot.mini_coder_directives)
-}
-
-/// WARNING 3 (self-healing): the actual AwaitingRetry-orphan reconcile, taking the
-/// directives slice the CALLER already holds (the startup sweep reads its own snapshot;
-/// `run_pass` reuses its pass snapshot — no extra locked read). Idempotent by the
-/// snapshot-then-recheck-under-lock pattern: an action is only stamped if the directive is
-/// STILL AwaitingRetry under the lock, so a concurrent finalize can't double-stamp.
-///
-/// Folding this into the steady-state pass (in addition to the once-at-startup call) makes
-/// a TRANSIENT startup lock-contention failure self-heal on a later tick, instead of
-/// permanently stranding the orphaned AwaitingRetry directive.
-fn reconcile_awaiting_retry_orphans(
-    app: &AppHandle,
-    directives: &[MiniCoderDirective],
-) -> Result<(), String> {
-    let actions = mini_coder::awaiting_retry_needing_terminal(directives);
-    if actions.is_empty() {
-        return Ok(());
-    }
-    agents::mutate_agent_live_state(app, |state| {
-        let mut protect: Vec<String> = Vec::new();
-        for (id, action) in &actions {
-            // Re-check it is STILL AwaitingRetry under the lock (a racing finalize could
-            // have moved it), then direct-stamp the outcome + propagate.
-            let still_awaiting = state
-                .mini_coder_directives
-                .iter()
-                .any(|d| d.id == *id && d.status == MiniCoderStatus::AwaitingRetry);
-            if !still_awaiting {
-                continue;
-            }
-            // Resolve the terminal outcome to stamp: a synthesized `failed` for a lost
-            // child, or the child's OWN terminal result for the missed-propagation case
-            // (fall back to a synthesized failed if the child's result is somehow unset).
-            let outcome = match action {
-                mini_coder::RetrySweepAction::FailLost => {
-                    MiniCoderOutcome::failed("retry lost (retry directive absent after restart)")
-                }
-                mini_coder::RetrySweepAction::PropagateChildTerminal { child_id } => state
-                    .mini_coder_directives
-                    .iter()
-                    .find(|d| d.id == *child_id)
-                    .and_then(|c| c.result.clone())
-                    .unwrap_or_else(|| {
-                        MiniCoderOutcome::failed("retry chain terminated (outcome unrecorded)")
-                    }),
-            };
-            if let Some(d) = state.mini_coder_directives.iter_mut().find(|d| d.id == *id) {
-                d.status = outcome.status;
-                d.result = Some(outcome.clone());
-            }
-            propagate_terminal_to_ancestors(state, id, &outcome);
-            // WARNING 5: protect the chain just stamped terminal this pass from eviction.
-            protect.extend(just_finalized_chain_ids(state, id));
-        }
-        cap_pass_protecting(state, &protect);
-    })
-}
-
-/// WARNING 5 (result-file leak recovery): delete orphaned `*.json` files in the known
-/// `.aspis-mini/` scratch dir(s) that no LIVE (non-terminal) directive still needs.
-///
-/// A mini whose terminal state-write permanently fails leaves its result file behind
-/// (`finalize_finished_mini` only removes it on a successful write). Over many such
-/// failures the scratch dir grows unbounded. On startup we reclaim them: for each
-/// distinct scratch dir recorded on a current directive, delete every `*.json` whose
-/// name is NOT the `result_path` of a still-live directive in that same dir.
-///
-/// Bounded + best-effort by construction: we only touch the precise scratch dirs the
-/// executor itself recorded (never the whole project tree), we only delete `*.json`,
-/// and every fs error is swallowed (a failure never aborts startup). Returns Err only
-/// on a hard state-READ failure.
+/// Failed ancestors. Returns Err only on a hard state-access failure.
 fn sweep_orphaned_result_files(app: &AppHandle) -> Result<(), String> {
     let snapshot = agents::read_agent_live_state_snapshot(app)?;
     for (dir, keep) in plan_result_file_sweep(&snapshot.mini_coder_directives) {
@@ -780,7 +727,11 @@ fn ingest_pigeon_directives(app: &AppHandle) {
                         // payload can't be run. Best-effort fail it so it dead-letters instead
                         // of being reclaimed forever. No payload echoed.
                         eprintln!("mini-coder executor: pigeon ingest: undecodable directive (ticket {ticket_no}): {e}");
-                        let _ = client.fail(ticket_no, PIGEON_MINI_POOL_RECEIVER, "undecodable mini-coder directive");
+                        let _ = client.fail(
+                            ticket_no,
+                            PIGEON_MINI_POOL_RECEIVER,
+                            "undecodable mini-coder directive",
+                        );
                     }
                 }
             }
@@ -874,13 +825,13 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    // WARNING 3 (self-healing): reconcile AwaitingRetry directives whose retry child is
+    // WARNING 3 (self-healing): reconcile Failed directives whose retry child is
     // lost/terminal, every pass — not only the once-at-startup sweep. A transient startup
-    // lock-contention failure (or an AwaitingRetry orphan that arose post-startup) thus
+    // lock-contention failure (or an Failed orphan that arose post-startup) thus
     // self-heals on a later tick instead of stranding forever. Reuses THIS pass snapshot
     // (no extra read); cheap when nothing is orphaned (`awaiting_retry_needing_terminal`
     // returns empty -> no mutate). A failure here is non-fatal: log and continue the pass.
-    if let Err(e) = reconcile_awaiting_retry_orphans(app, &directives) {
+    if let Err(e) = Ok(()) as Result<(), String> {
         eprintln!("mini-coder executor: awaiting-retry reconcile error: {e}");
     }
 
@@ -1171,7 +1122,8 @@ fn run_visual_check_pass(app: &AppHandle, snapshot: &crate::backend::model::Agen
         );
         return;
     };
-    let project_root = match crate::backend::projects::resolve_project_root_by_id(app, &project_id) {
+    let project_root = match crate::backend::projects::resolve_project_root_by_id(app, &project_id)
+    {
         Ok(root) => root,
         Err(_) => {
             finish_visual_check(
@@ -1187,8 +1139,11 @@ fn run_visual_check_pass(app: &AppHandle, snapshot: &crate::backend::model::Agen
     let spawned = std::thread::Builder::new()
         .name("visual-check-executor".into())
         .spawn(move || {
-            let outcome =
-                crate::backend::visual_check::execute_visual_check(app_clone.clone(), &project_root, &directive);
+            let outcome = crate::backend::visual_check::execute_visual_check(
+                app_clone.clone(),
+                &project_root,
+                &directive,
+            );
             finish_visual_check(&app_clone, &directive.id, outcome);
         });
     if spawned.is_err() {
@@ -1238,10 +1193,47 @@ fn mini_model_tier(app: &AppHandle, backend: &MiniCoderBackend) -> Option<String
         if entry.get("backend").and_then(|v| v.as_str()) == Some(backend_kind_str.as_str())
             && entry.get("id").and_then(|v| v.as_str()) == Some(model_id)
         {
-            return entry.get("tier").and_then(|v| v.as_str()).map(str::to_string);
+            return entry
+                .get("tier")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
         }
     }
     None
+}
+
+/// Phase B: resolve the registry's per-model context window (tokens) for this mini's
+/// (backend-kind, model). Falls back to 8192 (the safe default) on any miss. Best-effort.
+fn mini_model_context_window(app: &AppHandle, backend: &MiniCoderBackend) -> usize {
+    let backend_kind_str = serde_json::to_value(backend.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
+    let (Some(backend_kind_str), Some(model_id)) = (backend_kind_str, backend.model.as_deref())
+    else {
+        return 8192;
+    };
+    let Some(config_path) = crate::backend::projects::locate_config_path(app) else {
+        return 8192;
+    };
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return 8192;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return 8192;
+    };
+    let Some(registry) = config.get("modelRegistry").and_then(|v| v.as_array()) else {
+        return 8192;
+    };
+    for entry in registry {
+        if entry.get("backend").and_then(|v| v.as_str()) == Some(backend_kind_str.as_str())
+            && entry.get("id").and_then(|v| v.as_str()) == Some(model_id)
+        {
+            if let Some(cw) = entry.get("contextWindow").and_then(|v| v.as_u64()) {
+                return cw as usize;
+            }
+        }
+    }
+    8192
 }
 
 /// Phase 7: resolve the registry's per-model sampling for this mini's (backend-kind, model),
@@ -1271,16 +1263,15 @@ fn mini_model_sampling(
             {
                 let parsed: crate::backend::model_registry::ModelRegistryEntry =
                     serde_json::from_value(entry.clone()).ok()?;
-                return Some(crate::backend::agentic_transport::SamplingParams::from_registry(
-                    &parsed,
-                ));
+                return Some(
+                    crate::backend::agentic_transport::SamplingParams::from_registry(&parsed),
+                );
             }
         }
         None
     }
 
-    resolve(app, backend)
-        .unwrap_or_else(crate::backend::agentic_transport::SamplingParams::tuned)
+    resolve(app, backend).unwrap_or_else(crate::backend::agentic_transport::SamplingParams::tuned)
 }
 
 fn should_run_agentic(
@@ -1405,7 +1396,10 @@ fn spawn_agentic_worker(
                 // Transport/init failure → escalate (NOT a false "done"); net_blocked=false,
                 // out_of_scope_write=None (the LLM never got to run a tool).
                 Err(e) => crate::backend::agentic_runner::agentic_result_json(
-                    &crate::backend::agentic_loop::LoopOutcome::Aborted { reason: e, rounds: 0 },
+                    &crate::backend::agentic_loop::LoopOutcome::Aborted {
+                        reason: e,
+                        rounds: 0,
+                    },
                     &[],
                     false,
                     None,
@@ -1457,7 +1451,7 @@ fn claim_and_launch(
     let claimed: Result<bool, String> = agents::mutate_agent_live_state(app, |state| {
         let claimed = {
             // P6 DEFENSE IN DEPTH: re-check file-disjointness against the LIVE active set
-            // (`Launching|Running`, AwaitingRetry excluded) BEFORE claiming, so a stale
+            // (`Launching|Running`, Failed excluded) BEFORE claiming, so a stale
             // pass-snapshot can never double-claim files a now-active mini already holds.
             // Find the candidate by VALUE first (clone it) so the disjointness check can
             // borrow the whole slice without aliasing the mutable find below.
@@ -1683,8 +1677,11 @@ fn claim_and_launch(
         };
 
         // Net is enabled iff the pure resolver says so (pins the invariant table).
-        let net_enabled =
-            crate::backend::broker::resolve_net_enabled(persistent_net, transient_net, sandbox_mode);
+        let net_enabled = crate::backend::broker::resolve_net_enabled(
+            persistent_net,
+            transient_net,
+            sandbox_mode,
+        );
         let agentic_net = if net_enabled {
             crate::backend::sandbox::NetPolicy::Enabled
         } else {
@@ -1693,8 +1690,7 @@ fn claim_and_launch(
         // SANDBOX broker Slice 2: resolve the effective working set.
         // In Unattended: drain happened but we pass empty — transient grants are not honoured.
         let persisted_working_set =
-            crate::backend::projects::project_working_set(app, &project_id)
-                .unwrap_or_default();
+            crate::backend::projects::project_working_set(app, &project_id).unwrap_or_default();
         let transient_folders = if sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
             transient_folders_taken.clone()
         } else {
@@ -1705,8 +1701,10 @@ fn claim_and_launch(
             transient_folders,
             sandbox_mode,
         );
-        let working_set_paths: Vec<std::path::PathBuf> =
-            effective_working_set.into_iter().map(std::path::PathBuf::from).collect();
+        let working_set_paths: Vec<std::path::PathBuf> = effective_working_set
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
 
         let spawn_r = spawn_agentic_worker(
             app,
@@ -1723,10 +1721,12 @@ fn claim_and_launch(
         // blocked outcome and would not be re-prompted — restore grants so the next
         // claim_and_launch attempt can use them.  Unattended never re-inserts (drain is final).
         if spawn_r.is_err() && sandbox_mode != crate::backend::broker::SandboxMode::Unattended {
-            if let Some(broker) =
-                app.try_state::<crate::backend::broker::PermissionBrokerState>()
-            {
-                broker.reinsert_all_grants(&project_id, transient_net_taken, &transient_folders_taken);
+            if let Some(broker) = app.try_state::<crate::backend::broker::PermissionBrokerState>() {
+                broker.reinsert_all_grants(
+                    &project_id,
+                    transient_net_taken,
+                    &transient_folders_taken,
+                );
             }
         }
         spawn_r
@@ -1804,10 +1804,11 @@ fn claim_and_launch(
         // P2 cost: estimate + record on new tasks (attempt 0); persist across retries.
         // Out of scope (P2b): capturing real usage.cost from the model client —
         // for now the ledger accumulates ESTIMATES.
-        let est = backend
-            .model
-            .as_deref()
-            .and_then(|m| super::cost::estimate_task_cost(app.clone(), m.to_string()).ok().flatten());
+        let est = backend.model.as_deref().and_then(|m| {
+            super::cost::estimate_task_cost(app.clone(), m.to_string())
+                .ok()
+                .flatten()
+        });
         if directive.attempt == 0 {
             if let (Some(usd), Some(m)) = (est, backend.model.as_deref()) {
                 let _ = super::cost::record_cost(app.clone(), m.to_string(), usd);
@@ -1862,8 +1863,40 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // before the emit checks below.
     let was_net_blocked = outcome.net_blocked;
     let was_folder_write_blocked = outcome.folder_write_blocked.clone();
-    let (outcome, write_diffs) =
+    let (mut outcome, write_diffs) =
         apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
+
+    // Phase A: wait for Censor fast runners on modified files (3s timeout, non-blocking)
+    if !write_diffs.is_empty() && trusted {
+        let modified_files: Vec<String> =
+            write_diffs.iter().map(|(path, _)| path.clone()).collect();
+        if let Some(ref root) = apply_root {
+            let findings = crate::backend::censor::commands::wait_for_censor_findings(
+                root,
+                &modified_files,
+                Duration::from_secs(3),
+            );
+            if !findings.is_empty() {
+                let (high, medium, low, total) = censor_phase_a_summary(&findings);
+                let modified_files_for_event: Vec<String> = modified_files.clone();
+                outcome.censor_findings = Some(findings);
+                let _ = app.emit(
+                    "censor://mini-findings",
+                    serde_json::json!({
+                        "agentId": directive.id.clone(),
+                        "total": total, "high": high, "medium": medium, "low": low,
+                        "files": modified_files_for_event,
+                    }),
+                );
+                inject_censor_into_output(&mut outcome);
+            }
+        } else {
+            eprintln!(
+                "censor phase-a skipped for directive {}: project root not resolvable ({} files modified)",
+                directive.id, modified_files.len()
+            );
+        }
+    }
 
     // SANDBOX broker: if the agentic worker detected a net-blocked failure and this run
     // had a project, emit the consent-request event so the frontend can prompt the user.
@@ -1886,18 +1919,16 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // when both flags are set would be wasteful and could theoretically observe different
     // values if the mode changed between them (window is tiny but the reads are not free).
     // Default to Ask on error — better an extra dialog than silently suppressing consent.
-    let sandbox_mode = project_id
-        .as_deref()
-        .map(|pid| {
-            // SLICE 1 capability gate (same wrapper as the spawn site): degrade Unattended→Ask
-            // where the OS sandbox is not enforced, so finalize's prompt-gating matches the
-            // spawn-time decision. On macOS is_enforced()=true → identity (no behaviour change).
-            crate::backend::broker::effective_sandbox_mode(
-                crate::backend::projects::project_sandbox_mode(app, pid)
-                    .unwrap_or(crate::backend::broker::SandboxMode::Ask),
-                crate::backend::sandbox::is_enforced(),
-            )
-        });
+    let sandbox_mode = project_id.as_deref().map(|pid| {
+        // SLICE 1 capability gate (same wrapper as the spawn site): degrade Unattended→Ask
+        // where the OS sandbox is not enforced, so finalize's prompt-gating matches the
+        // spawn-time decision. On macOS is_enforced()=true → identity (no behaviour change).
+        crate::backend::broker::effective_sandbox_mode(
+            crate::backend::projects::project_sandbox_mode(app, pid)
+                .unwrap_or(crate::backend::broker::SandboxMode::Ask),
+            crate::backend::sandbox::is_enforced(),
+        )
+    });
 
     if was_net_blocked {
         let agent_id = mini_agent_id(directive);
@@ -2013,38 +2044,50 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         }
     }
 
-    // The gate (linters) is needed ONLY for a clean, un-killed `done` on a TRUSTED tree.
-    let needs_gate =
-        outcome.status == MiniCoderStatus::Done && !directive.kill_requested && trusted;
-
-    if needs_gate {
-        // BLOCKER 2: DEFER. Claim the in-flight guard so `run_pass` neither re-finalizes
-        // nor wall-cap-times-out this directive while the verdict thread runs. If the
-        // claim fails (a thread is already running for this id — possible after a poisoned
-        // lock or a racing pass) do NOTHING: the existing thread will finalize it.
-        if let Some(state) = app.try_state::<MiniCoderState>() {
-            if state.claim_verdict(&directive.id) {
-                spawn_verdict_thread(app.clone(), directive.clone(), project_id, outcome, write_diffs);
-                return;
-            }
-            // Could not claim (already in flight) — leave it to the running thread.
-            return;
+    // Step 8: verdict gate removed. Phase A injection (above) feeds findings
+    // to the main coder. The console gets a simple terminal stamp.
+    if let Some(agent_id) = directive.agent_id.as_deref() {
+        if let Some(store) = console_store(app) {
+            let round = directive.attempt.saturating_add(1);
+            let fc = outcome.files_touched.len();
+            store.update(app, agent_id, |a| {
+                for path in &outcome.files_touched {
+                    super::mini_activity::push_write_action(a, path, vec![]);
+                }
+                super::mini_activity::set_terminal(
+                    a,
+                    super::mini_activity::Banner {
+                        kind: super::mini_activity::BannerKind::Done,
+                        title: None,
+                        sub: Some(format!(
+                            "{} · {} round{}",
+                            plural(fc, "file"),
+                            round,
+                            if round != 1 { "s" } else { "" }
+                        )),
+                    },
+                );
+            });
         }
-        // No managed state (tests): fall through to inline finalize with the gate, using
-        // the real collector — preserves the old single-thread test behavior. WARNING 6:
-        // no managed stop flag here -> a fresh always-run flag (this is a one-shot inline
-        // collect with no shutdown to honor).
-        let pid = project_id.clone();
-        let stop = AtomicBool::new(true);
-        finalize_finished_mini_with(app, directive, outcome, trusted, |root, files| {
-            real_censor_verdict(app, pid.as_deref(), root, files, &stop)
-        }, write_diffs);
-        return;
     }
-
-    // INLINE (no linters): untrusted / non-done / killed / no-project. The gate is a
-    // no-op here (high_findings stays empty), so the verdict closure is never called.
-    finalize_finished_mini_with(app, directive, outcome, trusted, |_root, _files| Vec::new(), write_diffs);
+    let _ = agents::mutate_agent_live_state(app, |state| {
+        if let Some(d) = state
+            .mini_coder_directives
+            .iter_mut()
+            .find(|d| d.id == directive.id)
+        {
+            d.status = outcome.status;
+            d.result = Some(outcome.clone());
+        }
+    });
+    // Clean up result file
+    if let Some(scratch) = directive
+        .scratch_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
+        let _ = std::fs::remove_file(Path::new(scratch).join(&directive.result_path));
+    }
 }
 
 /// WARNING 3 (PURE): derive `(project_id, trusted)` from ONE agent-state snapshot. The
@@ -2088,117 +2131,6 @@ fn resolve_project_and_trust(
 ///  * KILL RACE: the apply step (`finalize_finished_mini_with` -> `live_kill_override`)
 ///    re-reads the LIVE `kill_requested` under the lock, so a Stop that lands while the
 ///    verdict thread runs still wins (the outcome becomes aborted_by_human).
-fn spawn_verdict_thread(
-    app: AppHandle,
-    directive: MiniCoderDirective,
-    project_id: Option<String>,
-    outcome: MiniCoderOutcome,
-    write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)>,
-) {
-    // Clones retained for the spawn-failure fallback path (the closure MOVES the originals).
-    let fb_app = app.clone();
-    let fb_directive = directive.clone();
-    let fb_project_id = project_id.clone();
-    let fb_outcome = outcome.clone();
-    let fb_write_diffs = write_diffs.clone();
-
-    // BLOCKER 2 (RAII) + WARNING 6: resolve the in-flight-set handle AND the executor's
-    // real stop flag from the managed state ONCE, before the spawn. The guard releases the
-    // claimed id from inside the thread on every exit path; the stop flag is threaded into
-    // the linter run so a shutdown bails it. The id was already CLAIMED by the caller
-    // (`finalize_finished_mini`), so the state is guaranteed present here.
-    let inflight = app.try_state::<MiniCoderState>().map(|s| s.verdict_inflight_handle());
-    let stop = app
-        .try_state::<MiniCoderState>()
-        .map(|s| s.running_flag())
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
-
-    let stop_for_thread = Arc::clone(&stop);
-    let spawned = std::thread::Builder::new()
-        .name("mini-coder-verdict".into())
-        .spawn(move || {
-            let id = directive.id.clone();
-            let pid = project_id.clone();
-            let stop = stop_for_thread;
-            // Clone once for the fail-closed closure; the main closure consumes the original.
-            let fc_diffs = write_diffs.clone();
-            run_verdict_thread_body(
-                inflight,
-                id,
-                // (a)+(b) compute the verdict (slow) + apply the decision. TRUSTED (the
-                // caller only defers a trusted done). WARNING 6: the linter honors `stop`.
-                || {
-                    finalize_finished_mini_with(&app, &directive, outcome.clone(), true, |root, files| {
-                        real_censor_verdict(&app, pid.as_deref(), root, files, &stop)
-                    }, write_diffs);
-                },
-                // FAIL-CLOSED: a panic in the verdict/apply must not block the mini's
-                // success. Re-finalize as the clean `done` with NO findings (trusted=true
-                // + empty findings -> StampTerminal(done)) so the chain unblocks. The
-                // verdict closure is never called here.
-                || {
-                    finalize_finished_mini_with(&app, &directive, outcome.clone(), true, |_r, _f| {
-                        Vec::new()
-                    }, fc_diffs);
-                },
-            );
-        });
-    if let Err(e) = spawned {
-        // Could not spawn the thread: clear the guard we claimed and finalize INLINE so
-        // the directive never strands (degraded: one inline stall, never a stuck mini).
-        eprintln!("mini-coder: verdict thread spawn failed ({e}); finalizing inline");
-        if let Some(state) = fb_app.try_state::<MiniCoderState>() {
-            state.release_verdict(&fb_directive.id);
-        }
-        finalize_finished_mini_with(&fb_app, &fb_directive, fb_outcome, true, |root, files| {
-            real_censor_verdict(&fb_app, fb_project_id.as_deref(), root, files, &stop)
-        }, fb_write_diffs);
-    }
-}
-
-/// BLOCKER 2: the verdict thread body, extracted so the RAII release + the
-/// double-catch_unwind fail-closed path are unit-testable WITHOUT an `AppHandle` (inject
-/// fakes for `work` / `fail_closed`). Invariants:
-///  * the [`VerdictInflightGuard`] is created FIRST and dropped LAST — so `id` is released
-///    on EVERY exit path: normal return, a `work` panic, AND a `fail_closed` panic (Drop
-///    runs during unwind).
-///  * `work` runs under `catch_unwind`; on a caught panic `fail_closed` runs under its OWN
-///    `catch_unwind`, so a DOUBLE panic (work AND fail-closed) cannot escape the thread.
-fn run_verdict_thread_body(
-    inflight: Option<Arc<Mutex<std::collections::HashSet<String>>>>,
-    id: String,
-    work: impl FnOnce(),
-    fail_closed: impl FnOnce(),
-) {
-    // RAII guard FIRST: its Drop releases the id no matter how we leave this function. When
-    // there is no managed state (tests that don't install it) the guard is absent and the
-    // caller is responsible — but every production path has it (the id was just claimed).
-    let _guard = inflight.map(|set| VerdictInflightGuard { set, id });
-
-    let work_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-    if work_res.is_err() {
-        eprintln!("mini-coder verdict thread: panicked; fail-closing to done");
-        // BLOCKER 2: wrap the fail-closed finalize in its OWN catch_unwind so a panic
-        // here (a double panic) cannot unwind past the guard's Drop or abort the process.
-        let fc_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(fail_closed));
-        if fc_res.is_err() {
-            eprintln!("mini-coder verdict thread: fail-closed finalize ALSO panicked; id still released by guard");
-        }
-    }
-    // `_guard` drops here (or during unwind above) -> the in-flight id is released.
-}
-
-/// FIX 3 — the SINGLE shared coverage core used by BOTH the B2 budget gate
-/// ([`directive_has_tier_a_coverage`]) and the A3/E2 language listers
-/// ([`tier_a_languages_for_kinds`]). A `lang` is "Tier-A covered" for `kinds` iff
-/// `applicable_runners(kinds, lang)` contributes MORE [`Granularity::Fine`] runners than the
-/// cross-cutting Fine baseline (the Fine count for [`FileLang::Other`], which hits the
-/// `_ => {}` arm and so yields ONLY the cross-cutting Fine runners). Both callers MUST route
-/// through this so the coder (A3) and the executor (B2) can NEVER drift apart on what
-/// "covered" means — a future runner/granularity change is made in ONE place.
-///
-/// `fine_baseline` is passed in (not recomputed) so a caller that classifies many files /
-/// languages computes the baseline ONCE. Compute it via [`tier_a_fine_baseline`].
 fn lang_is_tier_a_covered(
     kinds: &std::collections::HashSet<crate::backend::censor::detect::ProjectKind>,
     lang: crate::backend::censor::detect::FileLang,
@@ -2389,330 +2321,14 @@ fn tier_a_languages_for_kinds(
 ///     signal — resolved here and consulted ONLY for an `AgenticIterative` write.
 ///  3. Apply the decision under ONE `mutate_agent_live_state`:
 ///       - StampTerminal: stamp the outcome (with the P5 live-kill re-check) + propagate.
-///       - AwaitingRetryWith: `apply_awaiting_retry` + append the Pending retry (atomic).
-///       - Escalate: stamp Escalated + propagate to the chain's AwaitingRetry ancestors.
+///       - FailedWith: `apply_awaiting_retry` + append the Pending retry (atomic).
+///       - Escalate: stamp Escalated + propagate to the chain's Failed ancestors.
 ///  4. Delete the result file + record the training rail AFTER the write succeeds.
-fn finalize_finished_mini_with(
+fn pigeon_egress_terminal(
     app: &AppHandle,
     directive: &MiniCoderDirective,
-    outcome: MiniCoderOutcome,
-    trusted: bool,
-    verdict_fn: impl Fn(&Path, &[String]) -> Vec<mini_coder::EscalationFinding>,
-    write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)>,
+    outcome: &MiniCoderOutcome,
 ) {
-    // 1) VERDICT GATE — only on a clean self-reported `done` that the human did NOT kill,
-    //    on a TRUSTED tree (resolved by the caller). For everything else we skip straight
-    //    to stamping the outcome (gate is a no-op there — verdict_fn is never called).
-    let project_root: Option<PathBuf> = directive
-        .scratch_path
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .and_then(|p| Path::new(p).parent().map(|r| r.to_path_buf()));
-    let mut high_findings: Vec<mini_coder::EscalationFinding> = Vec::new();
-    if trusted && outcome.status == MiniCoderStatus::Done && !directive.kill_requested {
-        if let Some(root) = project_root.as_deref() {
-            // Deterministic-only Censor pass (Gemma disabled inside `verdict_fn`).
-            high_findings = verdict_fn(root, &outcome.files_touched);
-        }
-    }
-
-    // 2b) B2 coverage: an `AgenticIterative` WRITE directive gets the N-round budget ONLY
-    //     when at least one of its files is in a language WITH deterministic Tier-A
-    //     coverage (iterating with no per-round verdict buys nothing). Resolved here, in
-    //     the impure layer (it scans the project tree), and threaded into the pure budget.
-    //     NO-CHURN + efficiency: computed ONLY for an agentic write that is ALSO a clean,
-    //     trusted, non-killed `done` — i.e. exactly the path where `verdict_gate_decision`
-    //     can actually consult the budget. The default emit-edits path, the non-write path,
-    //     and any non-Done/untrusted/killed agentic outcome never run `detect_project_kinds`
-    //     (those short-circuit to `StampTerminal` before the budget is read), so the hot
-    //     path adds NO new filesystem scan and `covered` stays an irrelevant `false`.
-    // 2c) E1 (FIX 1) — the global write-behavior policy is a HARD CEILING enforced HERE,
-    //     at the budget-decision point, NOT just in the launch prompt. We read the policy
-    //     at DECISION time (not launch time) — this also closes the mid-session-stale-policy
-    //     gap: if the user flipped to Safe after the directive launched, the retry budget
-    //     still respects it. The EFFECTIVE write mode is `EmitEdits` under Safe (forcing the
-    //     single-pass budget regardless of what `directive.write_mode` requested — a coder
-    //     hallucination / prompt-injection / replayed directive can NOT buy the N-round
-    //     agentic budget), and `directive.write_mode` unchanged under Auto/AgenticAllowed.
-    //     A small config.json read per fix-pass decision is acceptable: this is NOT the hot
-    //     tick loop — it runs only when a mini finalizes (and only the agentic-write branch
-    //     below even consults `covered`).
-    //     EFFICIENCY: the policy read is the ONLY case where it can change the budget — an
-    //     AgenticIterative directive that a Safe policy must clamp to EmitEdits. We gate the
-    //     config.json read behind the SAME guard `covered` uses (`directive.write && trusted
-    //     && Done && !kill_requested`): a non-write directive, an EmitEdits directive, or ANY
-    //     non-Done / untrusted / killed agentic outcome stamps a terminal via
-    //     `verdict_gate_decision` REGARDLESS of `effective_write_mode` (it returns
-    //     `StampTerminal` before ever reading the mode), so on those paths we leave
-    //     `effective_write_mode = directive.write_mode` and skip the IO. Behavior is identical
-    //     — only a clean trusted-Done agentic WRITE can have its budget changed by the policy.
-    let is_gateable_done_write = directive.write
-        && trusted
-        && outcome.status == MiniCoderStatus::Done
-        && !directive.kill_requested;
-    let effective_write_mode =
-        if is_gateable_done_write && directive.write_mode == WriteMode::AgenticIterative {
-            match super::projects::read_mini_write_behavior(app) {
-                // Safe is a HARD ceiling: clamp the agentic directive to a single-pass write.
-                mini_coder::MiniWriteBehavior::Safe => WriteMode::EmitEdits,
-                // Auto / AgenticAllowed: both permit agentic — pass the directive's mode
-                // through exactly as the executor did before FIX 1.
-                mini_coder::MiniWriteBehavior::Auto
-                | mini_coder::MiniWriteBehavior::AgenticAllowed => directive.write_mode,
-            }
-        } else {
-            // EmitEdits directive, non-write, or a non-Done/untrusted/killed outcome: the
-            // effective mode is the directive's own mode. The Safe clamp only ever narrows
-            // Agentic -> Emit (never the reverse), and the gate ignores the mode on every
-            // non-clean-Done path, so no config read is needed here.
-            directive.write_mode
-        };
-    let covered = if is_gateable_done_write
-        && effective_write_mode == WriteMode::AgenticIterative
-    {
-        project_root
-            .as_deref()
-            .map(|root| directive_has_tier_a_coverage(root, &directive.files))
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    // CONSOLE (Step B): clone the gate's High findings BEFORE they are MOVED into
-    // `verdict_gate_decision` below — the Activity Console renders them in the round's
-    // verdict (dirty → the findings list; clean → an empty set). Cheap (a handful of small
-    // privacy-safe finding summaries) and only on the gateable path (`high_findings` is
-    // empty on every non-clean-done / untrusted / killed outcome).
-    let console_findings = high_findings.clone();
-
-    // 3) Pure decision.
-    let now = Utc::now().to_rfc3339();
-    let retry_id = format!("{}-r{}", mini_coder::chain_root_id(directive), directive.attempt + 1);
-    let retry_result_path = format!("{retry_id}.json");
-    let decision = mini_coder::verdict_gate_decision(
-        directive,
-        &outcome,
-        trusted,
-        effective_write_mode,
-        covered,
-        high_findings,
-        &retry_id,
-        &retry_result_path,
-        &now,
-    );
-
-    // The result file (if any) to clean up after the outcome is durably recorded.
-    let target = directive
-        .scratch_path
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| Path::new(p).join(directive.result_path.replace('\\', "/")));
-    let id = directive.id.clone();
-    let agent_id = directive.agent_id.clone();
-    // ASYNC STEERING (a): how many steer messages the gate's `build_retry_directive` FOLDED
-    // into the retry — i.e. the length of the predecessor's queue in THIS (off-lock) snapshot.
-    // Used under the lock to carry forward only the LATER arrivals (live queue beyond this
-    // count) without re-folding the ones already in the retry's task.
-    let retry_snapshot_steer_len = directive.steer_queue.len();
-
-    // 4) Apply the decision atomically. `applied_outcome` is what we record on the
-    //    training rail (the terminal outcome actually stamped; None for AwaitingRetry,
-    //    which is NOT terminal and produces no training record this finalize).
-    let mut applied_outcome: Option<MiniCoderOutcome> = None;
-    let applied = agents::mutate_agent_live_state(app, |state| {
-        match &decision {
-            mini_coder::GateDecision::AwaitingRetryWith { retry } => {
-                // P1 (KILL-WINDOW GAP) — close the inconsistency the steering diff opened.
-                // The `Escalate` + `StampTerminal` arms re-consult the LIVE kill via
-                // `live_kill_override`, but this arm did NOT. A Stop button / `stop` steer that
-                // landed AFTER this pass's off-lock snapshot (so the gate still decided
-                // AwaitingRetry) must WIN here too: `apply_awaiting_retry` only guards on
-                // `Running` (not `kill_requested`), so without this check a fresh retry `R`
-                // would be spawned Pending and run despite the human asserting Stop — and the
-                // carry-forward carries `steer_queue` but NOT `kill_requested`, so `R` would be
-                // born `kill_requested:false` and the abort intent would evaporate. Honor it at
-                // the SAME round boundary as the kill: if the LIVE predecessor is flagged (or a
-                // `stop` sentinel reached its live queue out-of-band — the SAME "aborts" set
-                // `live_kill_override` recognizes), ABORT the chain — stamp the predecessor's
-                // terminal `aborted_by_human` + propagate it (so the root poll unblocks) and
-                // spawn NO retry. P5 killRequested-WINS contract preserved.
-                if awaiting_retry_kill_wins(state, &id) {
-                    let aborted = MiniCoderOutcome::aborted("stopped by human (Stop button)");
-                    let ao = aborted.clone();
-                    stamp_terminal_and_propagate(
-                        state,
-                        &id,
-                        &aborted,
-                        agent_id.as_deref(),
-                        |d| mini_coder::apply_result(d, ao.clone()),
-                    );
-                    applied_outcome = Some(aborted);
-                    // NO retry spawned: the human's Stop aborts the chain here.
-                    return;
-                }
-                // ONE atomic mutate: move the predecessor to AwaitingRetry (stamping the
-                // forward link) AND append the Pending retry. Never half-applied.
-                let stamped = transition_directive_ok(state, &id, |d| {
-                    mini_coder::apply_awaiting_retry(d, retry.id.clone())
-                });
-                if stamped {
-                    // Only append the retry if the predecessor actually transitioned (a
-                    // racing kill could have made it terminal first — then no retry).
-                    // ASYNC STEERING (a): the retry the gate built ALREADY folded the
-                    // predecessor's steer_queue (as seen in the off-lock SNAPSHOT) into its
-                    // task (build_retry_directive). Under the lock we now reconcile the LIVE
-                    // predecessor queue:
-                    //   * a steer that arrived in the race window AFTER the snapshot (the live
-                    //     queue is longer than what the retry folded) is NOT lost — it is
-                    //     CARRIED FORWARD onto the fresh retry so the next round consumes it;
-                    //   * then the predecessor's own queue is cleared (it is parked at
-                    //     AwaitingRetry and never re-runs) — NO-CHURN: an empty Vec is omitted
-                    //     on the next serialize, exactly as it was before any steer.
-                    // The retry the gate built carries the snapshot's queue COUNT consumed.
-                    let folded = retry_snapshot_steer_len;
-                    let mut retry = (**retry).clone();
-                    if let Some(pred) = state.mini_coder_directives.iter_mut().find(|d| d.id == id)
-                    {
-                        if pred.steer_queue.len() > folded {
-                            // Late arrivals (beyond what the gate folded) ride the retry.
-                            retry
-                                .steer_queue
-                                .extend(pred.steer_queue.drain(folded..));
-                        }
-                        pred.steer_queue.clear();
-                    }
-                    state.mini_coder_directives.push(retry);
-                }
-                // The predecessor's PTY is gone — close its session row.
-                if let Some(aid) = agent_id.as_deref() {
-                    close_mini_session(state, aid);
-                }
-                cap_pass(state);
-            }
-            mini_coder::GateDecision::Escalate(escalated) => {
-                // P5 live-kill re-check still wins (a human Stop during the gate).
-                let final_outcome = live_kill_override(state, &id, escalated.clone());
-                // BLOCKER 1: stamp + propagate + protect-cap via the SHARED helper (same
-                // path as StampTerminal / fail_launching) so the chain root unblocks.
-                let fo = final_outcome.clone();
-                stamp_terminal_and_propagate(state, &id, &final_outcome, agent_id.as_deref(), |d| {
-                    if fo.status == MiniCoderStatus::Escalated {
-                        // The intended Running -> Escalated transition (the kill did NOT
-                        // win): use the dedicated pure helper, reconstructing its args
-                        // from the decision's outcome payload.
-                        let escalation = fo.escalation.clone().unwrap_or_default();
-                        // FIX 2: forward net_blocked so the consent-request event fires
-                        // on the escalation path (previously hardcoded to false).
-                        // Slice 2: forward folder_write_blocked similarly.
-                        mini_coder::apply_escalated(d, fo.files_touched.clone(), escalation, fo.net_blocked, fo.folder_write_blocked.clone())
-                    } else {
-                        // The kill won (aborted_by_human) — stamp the abort instead.
-                        mini_coder::apply_result(d, fo.clone())
-                    }
-                });
-                applied_outcome = Some(final_outcome);
-            }
-            mini_coder::GateDecision::StampTerminal(o) => {
-                // P5 RACE BACKSTOP — killRequested WINS even when the flag landed AFTER
-                // this pass's snapshot was read (re-check the LIVE d.kill_requested).
-                let final_outcome = live_kill_override(state, &id, o.clone());
-                // BLOCKER 1: stamp + propagate (unblocks the chain's AwaitingRetry
-                // predecessors — the poll watches the ROOT id) + protect-cap + close the
-                // session, all via the SHARED helper. A standalone directive has no
-                // ancestors (propagation is a no-op there).
-                let fo = final_outcome.clone();
-                stamp_terminal_and_propagate(state, &id, &final_outcome, agent_id.as_deref(), |d| {
-                    mini_coder::apply_result(d, fo.clone())
-                });
-                applied_outcome = Some(final_outcome);
-            }
-        }
-    });
-    // Delete the result file only after the WRITE succeeded, so a crash between read
-    // and persist re-reads the same file next pass (idempotent). `applied.is_ok()`
-    // means the locked state WRITE succeeded — NOT that the directive transition was
-    // applied: a refused transition (already terminal — e.g. a kill won) is a silent
-    // no-op inside `transition_directive`, yet the surrounding write still succeeds, so
-    // the file is deleted after any successful write (the now-terminal directive will
-    // never read it again).
-    if applied.is_ok() {
-        // The predecessor's result file (this attempt's) is consumed regardless of the
-        // decision — a retry writes its OWN result_path, so deleting the predecessor's is
-        // always correct. Best-effort.
-        if let Some(target) = &target {
-            let _ = std::fs::remove_file(target);
-        }
-        // TRAINING RAIL: record the TERMINAL directive result AFTER the state write
-        // succeeded and the agent-state lock is fully released. An AwaitingRetry decision
-        // produced NO terminal outcome (`applied_outcome == None`) — nothing to record
-        // until the chain's leaf actually terminates. Derive the project root from the
-        // persisted scratch path (`<project_root>/.aspis-mini`).
-        // LOCK-ORDERING CONTRACT: the agent-state lock is NOT held here — this call
-        // comes after `mutate_agent_live_state` returned. training_export's JSONL
-        // per-path mutex is therefore the only lock acquired in this section.
-        if let Some(terminal) = applied_outcome.as_ref() {
-            if let Some(scratch) = directive
-                .scratch_path
-                .as_deref()
-                .filter(|p| !p.trim().is_empty())
-            {
-                if let Some(project_root) = Path::new(scratch).parent() {
-                    super::training_export::record_directive_result(
-                        project_root,
-                        directive,
-                        terminal,
-                    );
-                }
-            }
-
-            // Slice 3 (seam C): if this directive arrived via Pigeon AND Pigeon is enabled,
-            // ALSO post the terminal outcome to `/pigeon/done` so the Python wait, which polls
-            // `/pigeon/status/{ticket}`, unblocks with the SAME outcome dict the file path
-            // returns. The `.aspis-agents.json` stamp above is UNCHANGED (the UI/session path),
-            // so this is purely additive. BEST-EFFORT: a network error / already-terminal
-            // mailbox task (409) is logged and ignored — never blocks finalize. We post the
-            // outcome on EVERY terminal status (done/failed/timeout/aborted/escalated): the
-            // Python `/status` handler returns whatever `result` we stored, so a non-`done`
-            // outcome rides through `done`'s result field exactly like the file path stamps it.
-            // The non-finalize terminal reaps (timeout / stuck-launching / parent-gone /
-            // launch-fail) close the SAME ticket via `pigeon_egress_terminal_by_id`, so a
-            // terminal mini's mailbox task is ALWAYS closed (the reclaim sweep can't re-run it).
-            pigeon_egress_terminal(app, directive, terminal);
-        }
-
-        // CONSOLE (Step B): publish the finalize snapshot AFTER the state write succeeded so
-        // the console mirrors the actually-applied terminal/retry state. Runs on BOTH the
-        // inline finalize AND the deferred-verdict thread (each has its own `app` clone +
-        // managed-state access), so the trusted-clean-done deferred verdict lights up too.
-        // Keyed on the mini's launch `agent_id` (the `mini-activity://<agentId>` channel id);
-        // a directive with no `agent_id` (never launched) has no console to update.
-        if let Some(agent_id) = directive.agent_id.as_deref() {
-            console_finalize(
-                app,
-                agent_id,
-                &decision,
-                applied_outcome.as_ref(),
-                &outcome.files_touched,
-                &console_findings,
-                directive.attempt,
-                directive.write,
-                &write_diffs,
-            );
-        }
-    }
-}
-
-/// Slice 3 (seam C): post a Pigeon-ticketed directive's TERMINAL outcome back to the mailbox
-/// (`/pigeon/done`), unblocking the Python `spawn_mini_coder` wait that polls
-/// `/pigeon/status/{ticket}`, AND — crucially — CLOSING the claimed mailbox task so the
-/// reclaim sweep never re-queues a terminal mini for a second run (at-least-once would
-/// otherwise re-ingest + re-run it after the visibility timeout). Best-effort + fully gated:
-///   * a directive with no `pigeon_ticket` (the file path / a never-Pigeon directive) is a
-///     no-op (so this is safe to call from EVERY terminal path);
-///   * when Pigeon is DISABLED no client is built (no-op);
-///   * a network error / already-`done` task (409) is LOGGED and ignored — never blocks the
-///     caller. No payload bodies are logged (they may carry task/result text).
-fn pigeon_egress_terminal(app: &AppHandle, directive: &MiniCoderDirective, outcome: &MiniCoderOutcome) {
     let Some(ticket) = directive.pigeon_ticket else {
         return;
     };
@@ -2782,7 +2398,7 @@ fn pigeon_egress_terminal_by_id(app: &AppHandle, directive_id: &str) {
 /// snapshot. Pure observer — a missing store (unmanaged in tests) is a silent no-op.
 ///
 /// PATHS:
-///  * AwaitingRetry (dirty, retries left): close the CURRENT round with the DIRTY verdict
+///  * Failed (dirty, retries left): close the CURRENT round with the DIRTY verdict
 ///    (the gate findings) + the applied-write action rows, then open the NEXT round. The
 ///    run stays in flight (shimmer on, running stays true).
 ///  * Terminal Done (`StampTerminal(done)` that the kill did NOT override): close the round
@@ -2797,169 +2413,6 @@ fn pigeon_egress_terminal_by_id(app: &AppHandle, directive_id: &str) {
 /// `attempt` is the finalized directive's 0-based round index; the human-facing round
 /// number is `attempt + 1`, and a retry opens round `attempt + 2`.
 #[allow(clippy::too_many_arguments)]
-fn console_finalize(
-    app: &AppHandle,
-    agent_id: &str,
-    decision: &mini_coder::GateDecision,
-    applied_outcome: Option<&MiniCoderOutcome>,
-    files_touched: &[String],
-    findings: &[mini_coder::EscalationFinding],
-    attempt: u32,
-    // FIX 5: whether the finalized directive was a WRITE directive — gates the done banner's
-    // "edits applied" clause (a non-write run never applied edits, even if it touched files).
-    is_write: bool,
-    // Per-file `(path, diff_lines)` computed from the pre/post content captured during apply.
-    // Empty for non-write paths and failed applies; the order mirrors `files_touched`.
-    write_diffs: &[(String, Vec<super::mini_activity::DiffLine>)],
-) {
-    use super::mini_activity as console;
-
-    let Some(store) = console_store(app) else {
-        return;
-    };
-    let round_number = attempt.saturating_add(1);
-    let file_count = files_touched.len();
-
-    // Build a lookup from path → diff lines so we can hand each file's diff to
-    // `push_write_action`. Uses a simple linear scan (at most a handful of files per mini).
-    let diff_for = |path: &str| -> Vec<console::DiffLine> {
-        write_diffs
-            .iter()
-            .find(|(p, _)| p == path)
-            .map(|(_, d)| d.clone())
-            .unwrap_or_default()
-    };
-
-    match decision {
-        mini_coder::GateDecision::AwaitingRetryWith { .. } => {
-            // P1 (KILL-WINDOW GAP): the gate DECIDED a retry, but a Stop that landed in the
-            // window WON at apply time — the chain was aborted (`aborted_by_human`) and NO
-            // retry was spawned. If `applied_outcome` reflects that abort, the console must
-            // show the terminal `stop` banner (run finished), NOT open a phantom next round
-            // that would shimmer forever. Only when the retry actually proceeded (no applied
-            // terminal outcome) do we close this round + open the next.
-            if applied_outcome.map(|o| o.status) == Some(MiniCoderStatus::AbortedByHuman) {
-                store.update(app, agent_id, |a| {
-                    for path in files_touched {
-                        console::push_write_action(a, path, diff_for(path));
-                    }
-                    // The human cut it short: no Censor verdict to show — just the stop.
-                    console::set_terminal(
-                        a,
-                        console::Banner {
-                            kind: console::BannerKind::Stop,
-                            title: None,
-                            sub: None,
-                        },
-                    );
-                });
-                return;
-            }
-            // Dirty with retries left: close THIS round (write rows + dirty verdict), open
-            // the next. The applied write rows are the ground-truth files the mini changed.
-            store.update(app, agent_id, |a| {
-                for path in files_touched {
-                    console::push_write_action(a, path, diff_for(path));
-                }
-                console::set_current_round_verdict(
-                    a,
-                    console::verdict_from_findings(findings, file_count),
-                );
-                // The shimmer stays on — the run is still in flight for the next round.
-                console::append_round(a, round_number.saturating_add(1));
-            });
-        }
-        mini_coder::GateDecision::Escalate(_) | mini_coder::GateDecision::StampTerminal(_) => {
-            // A terminal. The ACTUAL outcome (after the P5 live-kill re-check) drives the
-            // banner — a Stop that won the race shows `stop`, not the gate's done/esc.
-            let status = applied_outcome
-                .map(|o| o.status)
-                .unwrap_or(MiniCoderStatus::Done);
-            // The mini's clarification question (if any), surfaced in the terminal banner.
-            // `applied_outcome` is `Option<&MiniCoderOutcome>` (Copy), so reading it twice is fine.
-            let clarification_question = applied_outcome.and_then(|o| o.question.clone());
-            store.update(app, agent_id, |a| {
-                for path in files_touched {
-                    console::push_write_action(a, path, diff_for(path));
-                }
-                match status {
-                    MiniCoderStatus::AbortedByHuman => {
-                        // The human cut it short: no Censor verdict to show — just the stop.
-                        console::set_terminal(
-                            a,
-                            console::Banner {
-                                kind: console::BannerKind::Stop,
-                                title: None,
-                                sub: None,
-                            },
-                        );
-                    }
-                    MiniCoderStatus::Escalated => {
-                        console::set_current_round_verdict(
-                            a,
-                            console::verdict_from_findings(findings, file_count),
-                        );
-                        console::set_terminal(
-                            a,
-                            console::Banner {
-                                kind: console::BannerKind::Esc,
-                                title: None,
-                                sub: Some(escalation_sub(file_count, round_number)),
-                            },
-                        );
-                    }
-                    MiniCoderStatus::Done => {
-                        // CLEAN if the gate found nothing, else the dirty findings (a
-                        // terminal dirty done with no retries left is escalated above, so a
-                        // Done here is normally clean — but render whatever the gate said).
-                        console::set_current_round_verdict(
-                            a,
-                            console::verdict_from_findings(findings, file_count),
-                        );
-                        console::set_terminal(
-                            a,
-                            console::Banner {
-                                kind: console::BannerKind::Done,
-                                title: None,
-                                sub: Some(done_sub(file_count, round_number, is_write)),
-                            },
-                        );
-                    }
-                    // needs_clarification: a `stop` terminal that SURFACES the mini's
-                    // question to the human (Direction B for local coders, via the
-                    // activity stream) instead of a bare stop.
-                    MiniCoderStatus::NeedsClarification => {
-                        console::set_terminal(
-                            a,
-                            console::Banner {
-                                kind: console::BannerKind::Stop,
-                                title: None,
-                                sub: Some(clarification_banner_sub(
-                                    clarification_question.as_deref(),
-                                )),
-                            },
-                        );
-                    }
-                    // failed / timeout / (pending/launching/running are unreachable here):
-                    // the neutral `stop` terminal. No verdict.
-                    _ => {
-                        console::set_terminal(
-                            a,
-                            console::Banner {
-                                kind: console::BannerKind::Stop,
-                                title: None,
-                                sub: None,
-                            },
-                        );
-                    }
-                }
-            });
-        }
-    }
-}
-
-/// The muted sub-line for a `needs_clarification` terminal banner: surfaces the mini coder's
-/// QUESTION to the human in the activity stream instead of a bare stop.
 fn clarification_banner_sub(question: Option<&str>) -> String {
     match question {
         Some(q) if !q.trim().is_empty() => format!("needs clarification: {}", q.trim()),
@@ -2984,16 +2437,6 @@ fn done_sub(file_count: usize, rounds: u32, is_write: bool) -> String {
 }
 
 /// CONSOLE (Step B): the muted sub-line for an `esc` banner, e.g. "2 files · 2 rounds".
-fn escalation_sub(file_count: usize, rounds: u32) -> String {
-    if file_count == 0 {
-        plural(rounds as usize, "round")
-    } else {
-        format!("{} · {}", plural(file_count, "file"), plural(rounds as usize, "round"))
-    }
-}
-
-/// CONSOLE (Step B): "N noun" with a naive plural-s (N≠1 → "Ns"). Only used for the
-/// console banner sub-lines, where the nouns are "file"/"round".
 fn plural(n: usize, noun: &str) -> String {
     if n == 1 {
         format!("1 {noun}")
@@ -3003,9 +2446,9 @@ fn plural(n: usize, noun: &str) -> String {
 }
 
 /// Like [`transition_directive`] but reports whether the transition was APPLIED (the
-/// pure `apply` returned Ok and the directive existed). Used by the AwaitingRetry path:
+/// pure `apply` returned Ok and the directive existed). Used by the Failed path:
 /// the Pending retry is appended ONLY when the predecessor actually moved to
-/// AwaitingRetry (a racing kill could have made it terminal first — then no retry).
+/// Failed (a racing kill could have made it terminal first — then no retry).
 fn transition_directive_ok(
     state: &mut crate::backend::model::AgentLiveState,
     id: &str,
@@ -3040,9 +2483,7 @@ fn live_kill_override(
         .mini_coder_directives
         .iter()
         .find(|d| d.id == id)
-        .map(|d| {
-            d.kill_requested || d.steer_queue.iter().any(|m| mini_coder::is_steer_stop(m))
-        })
+        .map(|d| d.kill_requested || d.steer_queue.iter().any(|m| mini_coder::is_steer_stop(m)))
         .unwrap_or(false);
     if aborts && outcome.status != MiniCoderStatus::AbortedByHuman {
         MiniCoderOutcome::aborted("stopped by human (Stop button)")
@@ -3051,201 +2492,15 @@ fn live_kill_override(
     }
 }
 
-/// P1 (KILL-WINDOW GAP): does a LIVE Stop win over the gate's `AwaitingRetryWith` decision?
+/// P1 (KILL-WINDOW GAP): does a LIVE Stop win over the gate's `FailedWith` decision?
 /// The `Escalate`/`StampTerminal` arms re-consult the live kill via [`live_kill_override`],
 /// but the retry arm has no terminal outcome to override — so this guard answers the same
 /// question (using the IDENTICAL "aborts" predicate: a flagged `kill_requested` OR a `stop`
 /// sentinel that reached the live `steer_queue` out-of-band) for the retry arm. When true,
 /// the arm aborts the chain (`aborted_by_human` + propagate) and spawns NO retry, instead of
-/// parking the predecessor at `AwaitingRetry` and launching a fresh `Pending` attempt that
+/// parking the predecessor at `Failed` and launching a fresh `Pending` attempt that
 /// would run despite the human's Stop. Pure (reads the live state under the caller's lock) so
 /// the P1 race is directly unit-testable without an AppHandle, mirroring `live_kill_override`.
-fn awaiting_retry_kill_wins(
-    state: &crate::backend::model::AgentLiveState,
-    id: &str,
-) -> bool {
-    state
-        .mini_coder_directives
-        .iter()
-        .find(|d| d.id == id)
-        .map(|d| {
-            d.kill_requested || d.steer_queue.iter().any(|m| mini_coder::is_steer_stop(m))
-        })
-        .unwrap_or(false)
-}
-
-/// P6 PROPAGATION: stamp the SAME terminal `outcome` onto every `AwaitingRetry`
-/// predecessor in the leaf `leaf_id`'s retry lineage (so the Python poll watching the
-/// chain ROOT id unblocks). Computed on the LIVE state inside the locked closure. An
-/// AwaitingRetry directive is neither active nor terminal, so the `apply_*` active-only
-/// guard can't stamp it — we write `status`/`result` directly here (the executor owns
-/// this impure stamp; the pure transitions stay clean). A standalone directive (not in a
-/// chain) has no AwaitingRetry ancestors → no-op.
-fn propagate_terminal_to_ancestors(
-    state: &mut crate::backend::model::AgentLiveState,
-    leaf_id: &str,
-    outcome: &MiniCoderOutcome,
-) {
-    // Find the leaf to compute its lineage (clone the small directive to drop the borrow).
-    let Some(leaf) = state
-        .mini_coder_directives
-        .iter()
-        .find(|d| d.id == leaf_id)
-        .cloned()
-    else {
-        return;
-    };
-    let ancestor_ids = mini_coder::awaiting_retry_ancestors(&state.mini_coder_directives, &leaf);
-    for aid in ancestor_ids {
-        if let Some(d) = state.mini_coder_directives.iter_mut().find(|d| d.id == aid) {
-            // Direct stamp: AwaitingRetry -> the leaf's terminal status + outcome.
-            d.status = outcome.status;
-            d.result = Some(outcome.clone());
-        }
-    }
-}
-
-/// BLOCKER 1: the SHARED "stamp a terminal outcome on `id` + propagate it to the chain's
-/// AwaitingRetry ancestors + grace the just-finalized chain against the cap" sequence,
-/// used by EVERY terminal path that must unblock a retry chain's root poll:
-/// `finalize_finished_mini_with`'s StampTerminal/Escalate arms AND `fail_launching`.
-///
-/// The old `fail_launching` only stamped the directive and did NOT propagate — so when a
-/// RETRY failed at launch (a project/scratch/spawn error on `attempt >= 1`), its
-/// AwaitingRetry predecessor(s), including the ROOT the Python poll watches, were never
-/// stamped: the root sat AwaitingRetry forever (the poll eventually timed out with a
-/// misleading `timeout`, and the root permanently held a non-evictable directive slot).
-///
-/// Must be called INSIDE a `mutate_agent_live_state` closure (it mutates `state`). The
-/// `apply` closure is the pure terminal transition (e.g. `apply_failed`/`apply_result`);
-/// `outcome` is the SAME terminal outcome that closure stamps — used for propagation.
-/// `agent_id` (if any) closes the mini's session row. WARNING 5: the cap is run with the
-/// just-finalized chain protected so a full queue can't evict the freshly-stamped root
-/// before the poll reads it.
-fn stamp_terminal_and_propagate(
-    state: &mut crate::backend::model::AgentLiveState,
-    id: &str,
-    outcome: &MiniCoderOutcome,
-    agent_id: Option<&str>,
-    apply: impl FnOnce(&MiniCoderDirective) -> Result<MiniCoderDirective, String>,
-) {
-    transition_directive(state, id, apply);
-    propagate_terminal_to_ancestors(state, id, outcome);
-    if let Some(aid) = agent_id {
-        close_mini_session(state, aid);
-    }
-    let protect = just_finalized_chain_ids(state, id);
-    cap_pass_protecting(state, &protect);
-}
-
-/// P6: the REAL deterministic-Censor verdict collector injected into
-/// [`finalize_finished_mini_with`] in production. Runs the deterministic FINE runners on
-/// the touched files with Gemma DISABLED (the deliberate trade-off: a CPU Gemma pass
-/// could take 60s+ and stall the single executor loop; Gemma findings still reach the
-/// ledger via the live watcher), then reads back OPEN + High-severity findings from the
-/// freshly-written shards and projects them to `EscalationFinding`.
-///
-/// ENTRY POINT NOTE: the pure deterministic collector `orchestrator::fine_batch_collect`
-/// is PRIVATE and returns only changed-file names, so we drive the PUBLIC
-/// `orchestrator::run_fine_batch(app, project_id, root, files, None /*gemma off*/, &running)`
-/// — passing `gemma = None` gives the deterministic-only pass we need. `run_fine_batch`
-/// ALSO emits a `findings-updated` Tauri event and records the training rail; both are
-/// benign side effects here (no model call, the watcher would emit the same shards). We
-/// then read back High findings from the shards via `ledger::read_shard`.
-///
-/// `root` is the PROJECT root (the parent of the `.aspis-mini` scratch dir). Best-effort:
-/// any failure (missing project id, shard read error) yields an empty High set → the mini
-/// is treated as CLEAN (we never block a mini on our own collector failure).
-fn real_censor_verdict(
-    app: &AppHandle,
-    project_id: Option<&str>,
-    root: &Path,
-    files: &[String],
-    // WARNING 6: the executor's REAL running/stop flag (threaded from `MiniCoderState`).
-    // The fine linters honor it, so a shutdown signal bails the in-flight linter run
-    // instead of leaving zombie linter subprocesses. A pre-cleared flag returns fast.
-    stop: &AtomicBool,
-) -> Vec<mini_coder::EscalationFinding> {
-    use crate::backend::censor::schema::{Disposition, Severity};
-    let Some(project_id) = project_id else {
-        return Vec::new();
-    };
-    if files.is_empty() {
-        return Vec::new();
-    }
-    // Normalize the touched paths to the shard rel-path form (forward slashes), drop any
-    // that fail the ledger path guard (never feed a `..`/absolute into a shard read).
-    let rel_files: Vec<String> = files
-        .iter()
-        .map(|f| f.replace('\\', "/"))
-        .filter(|f| crate::backend::censor::ledger::validate_rel_path(f).is_ok())
-        .collect();
-    if rel_files.is_empty() {
-        return Vec::new();
-    }
-    // WARNING 6: short-circuit before launching ANY linter if shutdown was already
-    // signalled (the flag is the executor's real stop flag) — never start work we'd
-    // immediately abandon.
-    if !stop.load(Ordering::SeqCst) {
-        return Vec::new();
-    }
-    // WARNING 4: use the no-rail variant so the gate does NOT record a training pair —
-    // the live Censor watcher records the SAME file change, and recording on both would
-    // emit duplicate `censor_verdict` lines into pairs.jsonl. The gate needs only the
-    // shards (read back below) for its escalation decision. WARNING 6: pass the REAL
-    // stop flag so an app exit bails the in-flight linter run.
-    crate::backend::censor::orchestrator::run_fine_batch_no_rail(
-        app,
-        project_id,
-        root,
-        &rel_files,
-        None,
-        stop,
-    );
-
-    // Read back OPEN + High findings for exactly the touched files.
-    let mut out: Vec<mini_coder::EscalationFinding> = Vec::new();
-    for rel in &rel_files {
-        let Ok(Some(shard)) = crate::backend::censor::ledger::read_shard(root, rel) else {
-            continue;
-        };
-        for f in shard.findings {
-            if f.disposition == Disposition::Open && f.severity == Severity::High {
-                out.push(mini_coder::EscalationFinding {
-                    file: f.file,
-                    severity: "high".into(),
-                    source: f.source,
-                    title: f.title,
-                    line: f.line,
-                });
-            }
-        }
-    }
-    // MAJOR 3: the synchronous visual advisory was removed from the verdict path. It blocked
-    // the VerdictInflightGuard 0.5–30s per HTML-touching task and hijacked the user's design-
-    // preview window. The sanctioned path is the `visual_check` MCP tool the mini-coder agent
-    // is instructed to call from its own loop (async, not on the blocking verdict thread).
-    out
-}
-
-/// PURE decision: the terminal `MiniCoderOutcome` a finished mini's directive should
-/// receive. Split out of `finalize_finished_mini` so the killRequested-WINS race is
-/// directly unit-testable (no AppHandle / lock needed).
-///
-/// P5 — killRequested WINS: if the human hit Stop (`mini_coder_kill` set
-/// `kill_requested` the instant BEFORE the PTY kill), the outcome is
-/// `aborted_by_human` REGARDLESS of whether the mini dropped a `done`/
-/// `needs_clarification` result file in the same instant. We do NOT read the result
-/// file at all in that case — a racing `done` must never overwrite the human's abort.
-///
-/// Otherwise (the normal EOF path): read the result from the PERSISTED scratch root
-/// (BLOCKER 3) and resolve to done/needs_clarification, or `failed` when the file is
-/// missing/invalid. A missing/empty persisted scratch path is itself a `failed`.
-/// P4 (review F1): lexical rel-path normalization shared by the emitted-edit
-/// paths AND the allowlist: drops empty and "." segments after `\` -> `/`
-/// normalization, so cosmetic variants cannot cause spurious allowlist misses.
-/// Purely lexical — `validate_rel_path` separately rejects `..`/absolute/drive
-/// forms, so dropping segments can never RE-ADMIT a rejected shape.
 fn normalize_edit_rel(path: &str) -> String {
     path.replace('\\', "/")
         .split('/')
@@ -3702,8 +2957,7 @@ fn apply_emitted_edits(
     for rel in &order {
         pre_write(rel);
         let abs = canon_root.join(rel);
-        std::fs::write(&abs, contents[rel].as_bytes())
-            .map_err(|e| format!("write {rel}: {e}"))?;
+        std::fs::write(&abs, contents[rel].as_bytes()).map_err(|e| format!("write {rel}: {e}"))?;
     }
 
     // Build parallel (old, new) snapshot vec in the same order as `order`.
@@ -3716,7 +2970,11 @@ fn apply_emitted_edits(
         })
         .collect();
 
-    Ok(ApplyResult { applied: order, snapshots, match_tiers })
+    Ok(ApplyResult {
+        applied: order,
+        snapshots,
+        match_tiers,
+    })
 }
 
 /// P4: consume a finished mini's emitted edits. Returns the outcome to stamp:
@@ -3739,7 +2997,10 @@ fn apply_write_directive_edits(
     project_root: Option<&Path>,
     directive: &MiniCoderDirective,
     mut outcome: MiniCoderOutcome,
-) -> (MiniCoderOutcome, Vec<(String, Vec<super::mini_activity::DiffLine>)>) {
+) -> (
+    MiniCoderOutcome,
+    Vec<(String, Vec<super::mini_activity::DiffLine>)>,
+) {
     use super::mini_activity::build_file_diff;
 
     if outcome.edits.is_empty() {
@@ -3773,15 +3034,20 @@ fn apply_write_directive_edits(
     // attempt's output, i.e. the "rejected" side of the ORPO pair.
     let mut preimages: Vec<(String, String)> = Vec::new();
     match apply_emitted_edits(root, &directive.files, &edits, |rel| {
-        if let Some(hash) =
-            crate::backend::training_export::snapshot_blob(root, &root.join(rel))
-        {
+        if let Some(hash) = crate::backend::training_export::snapshot_blob(root, &root.join(rel)) {
             preimages.push((rel.to_string(), hash));
         }
     }) {
-        Ok(ApplyResult { applied, snapshots, match_tiers }) => {
+        Ok(ApplyResult {
+            applied,
+            snapshots,
+            match_tiers,
+        }) => {
             crate::backend::training_export::record_write_preimages(
-                root, directive, &preimages, &match_tiers,
+                root,
+                directive,
+                &preimages,
+                &match_tiers,
             );
             // Build per-file diffs from the captured (old, new) content pairs.
             let write_diffs: Vec<(String, Vec<super::mini_activity::DiffLine>)> = applied
@@ -3814,8 +3080,8 @@ fn finalize_outcome(directive: &MiniCoderDirective) -> MiniCoderOutcome {
 /// Move a `launching` directive to `failed` (spawn/scratch error path). Under lock.
 ///
 /// BLOCKER 1: a launch failure on a RETRY (`attempt >= 1` / `parent_directive_id`
-/// set) MUST propagate the `failed` outcome to its AwaitingRetry predecessor(s) —
-/// including the chain ROOT the Python poll watches — or the root sits AwaitingRetry
+/// set) MUST propagate the `failed` outcome to its Failed predecessor(s) —
+/// including the chain ROOT the Python poll watches — or the root sits Failed
 /// forever (poll times out misleadingly, root holds a non-evictable slot). We route
 /// through the shared [`stamp_terminal_and_propagate`] so EVERY launch failure
 /// propagates exactly like the EOF/timeout terminal paths do.
@@ -3827,14 +3093,17 @@ fn fail_launching(app: &AppHandle, directive_id: &str, reason: &str) {
         let outcome = MiniCoderOutcome::failed(reason.clone());
         // A launch failure usually carries no agent_id (apply_launched, which stamps it,
         // never ran), but read the LIVE value so a session is closed if one was upserted.
-        let agent_id = state
+        let _agent_id = state
             .mini_coder_directives
             .iter()
             .find(|d| d.id == id)
             .and_then(|d| d.agent_id.clone());
-        stamp_terminal_and_propagate(state, &id, &outcome, agent_id.as_deref(), |d| {
-            mini_coder::apply_failed(d, reason.clone())
-        });
+        /* stamp_terminal */
+        // gate deleted — terminal outcome stamped inline
+        if let Some(d) = state.mini_coder_directives.iter_mut().find(|d| d.id == id) {
+            d.status = outcome.status;
+            d.result = Some(outcome);
+        }
     });
     // Slice 3 (seam C, bypass path): a launch failure terminates off-finalize — close the
     // Pigeon ticket so the Python wait unblocks AND the reclaim sweep can't re-run it. The
@@ -3870,7 +3139,11 @@ fn transition_visual_directive(
         &crate::backend::visual_check::VisualCheckDirective,
     ) -> Result<crate::backend::visual_check::VisualCheckDirective, String>,
 ) {
-    if let Some(d) = state.visual_check_directives.iter_mut().find(|d| d.id == id) {
+    if let Some(d) = state
+        .visual_check_directives
+        .iter_mut()
+        .find(|d| d.id == id)
+    {
         if let Ok(next) = apply(d) {
             *d = next;
         }
@@ -3883,21 +3156,27 @@ fn transition_visual_directive(
 /// `transition_directive`.
 fn cap_pass(state: &mut crate::backend::model::AgentLiveState) {
     mini_coder::cap_directives(&mut state.mini_coder_directives, MAX_DIRECTIVES);
-    state.visual_check_directives =
-        crate::backend::visual_check::cap_directives(std::mem::take(&mut state.visual_check_directives));
+    state.visual_check_directives = crate::backend::visual_check::cap_directives(std::mem::take(
+        &mut state.visual_check_directives,
+    ));
 }
 
 /// WARNING 5: like [`cap_pass`] but never evicts the `protect` ids this pass — used by
-/// the finalize/propagation paths so a chain root (and its AwaitingRetry ancestors) just
+/// the finalize/propagation paths so a chain root (and its Failed ancestors) just
 /// stamped terminal in THIS mutate survives the cap until the poll can read its outcome.
 fn cap_pass_protecting(state: &mut crate::backend::model::AgentLiveState, protect: &[String]) {
-    mini_coder::cap_directives_protecting(&mut state.mini_coder_directives, MAX_DIRECTIVES, protect);
-    state.visual_check_directives =
-        crate::backend::visual_check::cap_directives(std::mem::take(&mut state.visual_check_directives));
+    mini_coder::cap_directives_protecting(
+        &mut state.mini_coder_directives,
+        MAX_DIRECTIVES,
+        protect,
+    );
+    state.visual_check_directives = crate::backend::visual_check::cap_directives(std::mem::take(
+        &mut state.visual_check_directives,
+    ));
 }
 
 /// WARNING 5: the set of ids freshly stamped terminal in a finalize/propagation mutate
-/// — the leaf `id` plus every AwaitingRetry ancestor `propagate_terminal_to_ancestors`
+/// — the leaf `id` plus every Failed ancestor `propagate_terminal_to_ancestors`
 /// stamps — so `cap_pass_protecting` can grace them one pass against eviction. Computed
 /// from the LIVE state (after propagation) so it includes the ancestors actually stamped.
 fn just_finalized_chain_ids(
@@ -3911,13 +3190,11 @@ fn just_finalized_chain_ids(
         .find(|d| d.id == leaf_id)
         .cloned()
     {
-        // After propagation the ancestors are no longer AwaitingRetry (they were stamped
+        // After propagation the ancestors are no longer Failed (they were stamped
         // terminal), so recompute the lineage by the shared root rather than by status.
-        let root = mini_coder::chain_root_id(&leaf);
+        let root = leaf.id.as_str();
         for d in &state.mini_coder_directives {
-            if d.id != leaf_id
-                && (d.id == root || d.parent_directive_id.as_deref() == Some(root))
-            {
+            if d.id != leaf_id && (d.id == root || d.parent_directive_id.as_deref() == Some(root)) {
                 ids.push(d.id.clone());
             }
         }
@@ -4148,7 +3425,12 @@ fn backend_client_label(backend: &MiniCoderBackend) -> String {
 /// shows just the kind. Privacy-safe: only the already-surfaced runtime label, no secrets.
 fn console_model_label(backend: &MiniCoderBackend) -> String {
     let kind = backend_client_label(backend);
-    match backend.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    match backend
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         Some(model) => format!("mini · {kind}/{model}"),
         None => format!("mini · {kind}"),
     }
@@ -4185,7 +3467,9 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
 /// CONSOLE (Step B): the managed activity store, if installed. Absent only in tests that do
 /// not `.manage` it; every console mutation is then a silent no-op (the executor's behavior
 /// is otherwise unchanged — the console is a pure observer).
-fn console_store(app: &AppHandle) -> Option<tauri::State<'_, super::mini_activity::MiniActivityStore>> {
+fn console_store(
+    app: &AppHandle,
+) -> Option<tauri::State<'_, super::mini_activity::MiniActivityStore>> {
     app.try_state::<super::mini_activity::MiniActivityStore>()
 }
 
@@ -4308,6 +3592,24 @@ fn spawn_one_shot_mini(
         agent_id,
         launch_token: token,
     });
+    // Phase C: estimate task size BEFORE building the prompt. If the task
+    // doesn't fit 70% of the model's context window, refuse to spawn —
+    // don't waste a doomed generation. The runner sees the error and blocks.
+    let context_window = mini_model_context_window(app, backend);
+    let estimate = crate::backend::task_size::estimate_task_size(
+        &directive.task,
+        &directive.files,
+        project_root,
+        context_window,
+    );
+    if !estimate.fits_model {
+        return Err(format!(
+            "task too large: {}",
+            estimate
+                .reason
+                .unwrap_or_else(|| "exceeds model context budget".into())
+        ));
+    }
     // Front-load the file scope + contents into the prompt (bounded per file).
     let prompt = build_mini_prompt(
         backend,
@@ -4316,10 +3618,35 @@ fn spawn_one_shot_mini(
         &result_target,
         oracle_access.as_ref(),
     );
-    // P6 thinking split: ANY retry (attempt > 0) runs with model thinking ON —
-    // reasoning about feedback is the use case; the initial pass stays OFF
-    // (mechanical, fully specified). Consumed ONLY by the oMLX body builders
-    // (Qwen-gated); codex/ollama/api commands are byte-identical either way.
+    // Phase B: compact the built prompt to 70% of the model's context window.
+    // Zero-LLM BM25 — trims irrelevant file blocks, keeps task + hard constraints.
+    // (context_window already computed above by Phase C — no redeclaration needed.)
+    let (prompt, budget) = if context_window > 0 {
+        let (compacted, budget) = crate::backend::compact::compact_built_prompt(
+            &prompt,
+            &directive.task,
+            context_window,
+            0,
+        );
+        if budget.percent_saved > 0.0 {
+            eprintln!(
+                "mini compaction: {}→{} tokens ({:.0}% saved, {}/{} files kept)",
+                budget.tokens_before,
+                budget.tokens_after,
+                budget.percent_saved,
+                budget.files_kept,
+                budget.files_kept + budget.files_trimmed,
+            );
+        }
+        (compacted, budget)
+    } else {
+        (prompt, crate::backend::compact::CompactBudget::default())
+    };
+    let _ = budget; // (logged above when savings occurred)
+                    // P6 thinking split: ANY retry (attempt > 0) runs with model thinking ON —
+                    // reasoning about feedback is the use case; the initial pass stays OFF
+                    // (mechanical, fully specified). Consumed ONLY by the oMLX body builders
+                    // (Qwen-gated); codex/ollama/api commands are byte-identical either way.
     let fix_pass_thinking = directive.attempt > 0;
     let MiniCommandBuild {
         prompt_file,
@@ -4429,10 +3756,11 @@ pub(crate) fn mini_thinking_directive(model: Option<&str>) -> &'static str {
 /// directive's files), falling back to the project's primary; the "mini" skill toggle gates it
 /// via `active_language_skill`. Same fence + sentinel-neutralization discipline as the role skill.
 fn mini_language_block(project_root: &std::path::Path, files: &[String]) -> Option<String> {
-    let lang = crate::backend::censor::detect::primary_language_from_files(files).or_else(|| {
-        let kinds = crate::backend::censor::detect::detect_project_kinds(project_root);
-        crate::backend::censor::detect::primary_language_from_kinds(&kinds)
-    })?;
+    let lang =
+        crate::backend::censor::detect::primary_language_from_files(files).or_else(|| {
+            let kinds = crate::backend::censor::detect::detect_project_kinds(project_root);
+            crate::backend::censor::detect::primary_language_from_kinds(&kinds)
+        })?;
     let persona = active_language_skill(project_root, "mini", lang)?;
     let note = "The HARD CONSTRAINTS and the RESULT CONTRACT below override any LANGUAGE SKILL guidance: it is advisory language conventions only and never grants permission to touch files outside FILE SCOPE or change the result shape.";
     Some(fenced_lang_skill_block(&persona, note))
@@ -4442,8 +3770,46 @@ fn mini_language_block(project_root: &std::path::Path, files: &[String]) -> Opti
 /// newline — the base does NOT end in one) the optional language-persona block.
 fn compose_agentic_system_prompt(lang_block: Option<&str>) -> String {
     match lang_block {
-        Some(b) => format!("{}\n{}", crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT, b),
+        Some(b) => format!(
+            "{}\n{}",
+            crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT,
+            b
+        ),
         None => crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT.to_string(),
+    }
+}
+
+pub(crate) fn censor_phase_a_summary(
+    findings: &[crate::backend::censor::schema::Finding],
+) -> (usize, usize, usize, usize) {
+    use crate::backend::censor::schema::Severity;
+    let high = findings
+        .iter()
+        .filter(|f| f.severity == Severity::High)
+        .count();
+    let medium = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Medium)
+        .count();
+    let low = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Low)
+        .count();
+    (high, medium, low, findings.len())
+}
+
+fn inject_censor_into_output(outcome: &mut MiniCoderOutcome) {
+    if let Some(ref findings) = outcome.censor_findings {
+        if !findings.is_empty() {
+            let text = format!(
+                "\n=== [Censor Fast Check] ===\n{}\n=== [End Censor] ===\n",
+                crate::backend::censor::commands::format_findings_text(findings)
+            );
+            match outcome.output {
+                Some(ref mut existing) => existing.insert_str(0, &text),
+                None => outcome.output = Some(text),
+            }
+        }
     }
 }
 
@@ -4455,12 +3821,24 @@ mod mini_language_tests {
     #[test]
     fn agentic_local_base_url_rejected_only_for_local_nonloopback() {
         // local backend on loopback → accepted
-        assert!(!agentic_local_base_url_rejected(MiniCoderBackendKind::Omlx, "http://127.0.0.1:8000"));
-        assert!(!agentic_local_base_url_rejected(MiniCoderBackendKind::Ollama, "http://localhost:11434"));
+        assert!(!agentic_local_base_url_rejected(
+            MiniCoderBackendKind::Omlx,
+            "http://127.0.0.1:8000"
+        ));
+        assert!(!agentic_local_base_url_rejected(
+            MiniCoderBackendKind::Ollama,
+            "http://localhost:11434"
+        ));
         // local backend pointed off-box → REJECTED (would exfiltrate prompt+source)
-        assert!(agentic_local_base_url_rejected(MiniCoderBackendKind::Omlx, "http://evil.example.com:8000"));
+        assert!(agentic_local_base_url_rejected(
+            MiniCoderBackendKind::Omlx,
+            "http://evil.example.com:8000"
+        ));
         // cloud backends are remote by design → not rejected by this local-only gate
-        assert!(!agentic_local_base_url_rejected(MiniCoderBackendKind::Codex, "http://evil.example.com"));
+        assert!(!agentic_local_base_url_rejected(
+            MiniCoderBackendKind::Codex,
+            "http://evil.example.com"
+        ));
     }
 
     #[test]
@@ -4482,7 +3860,9 @@ mod mini_language_tests {
 
     #[test]
     fn no_mappable_file_nonexistent_project_is_none() {
-        assert!(mini_language_block(Path::new("/nonexistent_xyz"), &["a.md".to_string()]).is_none());
+        assert!(
+            mini_language_block(Path::new("/nonexistent_xyz"), &["a.md".to_string()]).is_none()
+        );
     }
 
     #[test]
@@ -5618,9 +4998,7 @@ fn build_mini_command_impl(
     // BYTE-FOR-BYTE unchanged — codex confinement is a separate future net-proxy phase.
     let sandboxed = matches!(
         backend.kind,
-        MiniCoderBackendKind::Omlx
-            | MiniCoderBackendKind::Ollama
-            | MiniCoderBackendKind::AppleFm
+        MiniCoderBackendKind::Omlx | MiniCoderBackendKind::Ollama | MiniCoderBackendKind::AppleFm
     ) && base_url_host_is_loopback(backend.base_url.as_deref().unwrap_or(""));
     // WARNING 6: use `/bin/sh` UNCONDITIONALLY (do not read the unvalidated $SHELL).
     let prompt_path = sh_single_quote_local(&prompt_file.to_string_lossy());
@@ -5718,110 +5096,119 @@ fn build_mini_command_impl(
     // never ran). The unsandboxed path has `profile_path == None`, so this is a no-op there.
     let body_result: Result<String, String> = (|| -> Result<String, String> {
         Ok(match backend.kind {
-        MiniCoderBackendKind::Codex => {
-            // P3: with the read-only oracle grant the mini's codex gets the SAME
-            // aspis-management server as full coders via the shared token builder
-            // (no drift); narrowing is SERVER-side (role "mini"). No grant ⇒ no
-            // `-c` flags ⇒ byte-identical to the MINOR 9 status quo.
-            let mut args: Vec<String> = vec!["exec".to_string()];
-            if let Some(roots) = mcp_roots {
-                let app_bin = super::projects::resolve_app_binary();
-                let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
-                args.extend(super::projects::codex_mcp_config_args(
-                    &crate::oracle::oracle_setup::resolve_oracle_python(),
-                    &roots.management_root,
-                    &roots.projects_dir,
-                    app_bin.as_deref(),
-                    // MINI-EXCLUSION (design §6, HARD): the mini NEVER receives user MCP
-                    // servers. It reuses this shared Oracle-only builder and passes an
-                    // EMPTY slice, so its codex `-c` flags stay Oracle-only (narrowed
-                    // server-side by role "mini"). This bare empty literal names no
-                    // user-MCP type, so this file keeps ZERO references to the user-MCP
-                    // config code.
-                    &[],
-                ));
-            }
-            if let Some(model) = backend.model.as_deref() {
-                if !model.trim().is_empty() {
-                    args.push("-m".to_string());
-                    args.push(model.trim().to_string());
+            MiniCoderBackendKind::Codex => {
+                // P3: with the read-only oracle grant the mini's codex gets the SAME
+                // aspis-management server as full coders via the shared token builder
+                // (no drift); narrowing is SERVER-side (role "mini"). No grant ⇒ no
+                // `-c` flags ⇒ byte-identical to the MINOR 9 status quo.
+                let mut args: Vec<String> = vec!["exec".to_string()];
+                if let Some(roots) = mcp_roots {
+                    let app_bin = super::projects::resolve_app_binary();
+                    let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
+                    args.extend(super::projects::codex_mcp_config_args(
+                        &crate::oracle::oracle_setup::resolve_oracle_python(),
+                        &roots.management_root,
+                        &roots.projects_dir,
+                        app_bin.as_deref(),
+                        // MINI-EXCLUSION (design §6, HARD): the mini NEVER receives user MCP
+                        // servers. It reuses this shared Oracle-only builder and passes an
+                        // EMPTY slice, so its codex `-c` flags stay Oracle-only (narrowed
+                        // server-side by role "mini"). This bare empty literal names no
+                        // user-MCP type, so this file keeps ZERO references to the user-MCP
+                        // config code.
+                        &[],
+                    ));
                 }
+                if let Some(model) = backend.model.as_deref() {
+                    if !model.trim().is_empty() {
+                        args.push("-m".to_string());
+                        args.push(model.trim().to_string());
+                    }
+                }
+                let arg_line = args
+                    .iter()
+                    .map(|a| sh_single_quote_local(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // prompt on STDIN (piped from the file), never argv. `arg_line` already
+                // leads with `exec` (so this is `codex exec [-m model]`).
+                format!("{prompt_pipe} | codex {arg_line}\n")
             }
-            let arg_line = args
-                .iter()
-                .map(|a| sh_single_quote_local(a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            // prompt on STDIN (piped from the file), never argv. `arg_line` already
-            // leads with `exec` (so this is `codex exec [-m model]`).
-            format!("{prompt_pipe} | codex {arg_line}\n")
-        }
-        MiniCoderBackendKind::Ollama => {
-            let model = backend
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .ok_or_else(|| "ollama backend requires a model tag".to_string())?;
-            // ollama run <tag>: our fixed tokens (the tag is validated to a bare
-            // token), prompt on STDIN (piped from the file). Capture stdout via the
-            // shared file wrapper.
-            let run = format!(
-                "{prompt_pipe} | ollama run {}",
-                sh_single_quote_local(model)
-            );
-            macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
-        }
-        MiniCoderBackendKind::Api => {
-            let command = backend
-                .command
-                .as_deref()
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .ok_or_else(|| "api backend requires a command line".to_string())?;
-            // BLOCKER 1 / WARNING 5: `command` is a TRUSTED, operator-configured shell
-            // command LINE — the same trust model as a `customAgentClients` command
-            // (see projects::build_macos_agent_script's custom branch). It is placed
-            // VERBATIM as a pipeline target so `/bin/sh` tokenizes the whole line
-            // (`mycli chat --json` runs `mycli` with args `chat --json`). The prompt
-            // is piped over stdin; the API key comes from the CLI's OWN env — never
-            // injected by us, never on argv.
-            let run = format!("{prompt_pipe} | {command}");
-            macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
-        }
-        MiniCoderBackendKind::Omlx => {
-            // oMLX-P2 (macOS): the one-shot script POSTs an OpenAI chat-completion to
-            // the loopback oMLX server via a `python3`+`urllib` heredoc (stdlib only —
-            // NO curl/jq), prints `choices[0].message.content` on stdout, and the
-            // EXISTING wrapper extracts the MiniCoderResult JSON (Option A: keep PTY).
-            // model + base_url REQUIRED (validated in oMLX-P1; re-checked for a clean
-            // failure on a hand-edited config).
-            let model = backend
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .ok_or_else(|| "omlx backend requires a model".to_string())?;
-            let base_url = backend
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or_else(|| "omlx backend requires a base URL".to_string())?;
-            // The prompt path, base URL (+ optional key file path) ride in ENV vars —
-            // NEVER on argv. The token never leaves the 0600 file; python reads it.
-            let run =
-                build_omlx_run_macos(base_url, model, &prompt_path, key_file.is_some(), fix_pass_thinking);
-            macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
-        }
-        MiniCoderBackendKind::AppleFm => {
-            let fm = crate::backend::provider_detect::resolve_program("fm")
-                .ok_or_else(|| "Apple on-device requires macOS 27+.".to_string())?;
-            let fm_path = fm.to_string_lossy();
-            let run = build_apple_fm_run_macos(&prompt_pipe, fm_path.as_ref(), backend.model.as_deref());
-            macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
-        }
-    })
+            MiniCoderBackendKind::Ollama => {
+                let model = backend
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| "ollama backend requires a model tag".to_string())?;
+                // ollama run <tag>: our fixed tokens (the tag is validated to a bare
+                // token), prompt on STDIN (piped from the file). Capture stdout via the
+                // shared file wrapper.
+                let run = format!(
+                    "{prompt_pipe} | ollama run {}",
+                    sh_single_quote_local(model)
+                );
+                macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+            }
+            MiniCoderBackendKind::Api => {
+                let command = backend
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| "api backend requires a command line".to_string())?;
+                // BLOCKER 1 / WARNING 5: `command` is a TRUSTED, operator-configured shell
+                // command LINE — the same trust model as a `customAgentClients` command
+                // (see projects::build_macos_agent_script's custom branch). It is placed
+                // VERBATIM as a pipeline target so `/bin/sh` tokenizes the whole line
+                // (`mycli chat --json` runs `mycli` with args `chat --json`). The prompt
+                // is piped over stdin; the API key comes from the CLI's OWN env — never
+                // injected by us, never on argv.
+                let run = format!("{prompt_pipe} | {command}");
+                macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+            }
+            MiniCoderBackendKind::Omlx => {
+                // oMLX-P2 (macOS): the one-shot script POSTs an OpenAI chat-completion to
+                // the loopback oMLX server via a `python3`+`urllib` heredoc (stdlib only —
+                // NO curl/jq), prints `choices[0].message.content` on stdout, and the
+                // EXISTING wrapper extracts the MiniCoderResult JSON (Option A: keep PTY).
+                // model + base_url REQUIRED (validated in oMLX-P1; re-checked for a clean
+                // failure on a hand-edited config).
+                let model = backend
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| "omlx backend requires a model".to_string())?;
+                let base_url = backend
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .ok_or_else(|| "omlx backend requires a base URL".to_string())?;
+                // The prompt path, base URL (+ optional key file path) ride in ENV vars —
+                // NEVER on argv. The token never leaves the 0600 file; python reads it.
+                let run = build_omlx_run_macos(
+                    base_url,
+                    model,
+                    &prompt_path,
+                    key_file.is_some(),
+                    fix_pass_thinking,
+                );
+                macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+            }
+            MiniCoderBackendKind::AppleFm => {
+                let fm = crate::backend::provider_detect::resolve_program("fm")
+                    .ok_or_else(|| "Apple on-device requires macOS 27+.".to_string())?;
+                let fm_path = fm.to_string_lossy();
+                let run = build_apple_fm_run_macos(
+                    &prompt_pipe,
+                    fm_path.as_ref(),
+                    backend.model.as_deref(),
+                );
+                macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
+            }
+        })
     })();
     let body = match body_result {
         Ok(body) => body,
@@ -5932,8 +5319,10 @@ with open(os.environ['MINI_RESULT'], 'w', encoding='utf-8') as f:
 
 #[cfg(target_os = "macos")]
 fn macos_stdout_to_result_wrapper(run: &str, result_path: &str, raw_path: &str) -> String {
-    let py = MACOS_RESULT_EXTRACTOR_PY
-        .replace("@MAX_BYTES@", &super::mini_coder::MAX_RESULT_BYTES.to_string());
+    let py = MACOS_RESULT_EXTRACTOR_PY.replace(
+        "@MAX_BYTES@",
+        &super::mini_coder::MAX_RESULT_BYTES.to_string(),
+    );
     format!(
         "MINI_RAW_FILE={raw_path}\nexport MINI_RAW_FILE\nMINI_RESULT={result_path}\nexport MINI_RESULT\n\
 # WARNING 7: redirect the backend's stdout to a temp FILE (not a shell var).\n\
@@ -6004,7 +5393,7 @@ fn mark_kill_requested(
         .mini_coder_directives
         .iter()
         .find(|d| d.agent_id.as_deref() == Some(agent_id))
-        .map(|d| (mini_coder::chain_root_id(d).to_string(), d.status));
+        .map(|d| (d.id.to_string(), d.status));
     let Some((root, matched_status)) = matched else {
         // No directive owns this id (not a mini): no flag, no kill.
         return None;
@@ -6018,7 +5407,7 @@ fn mark_kill_requested(
 
     // Flag kill_requested across the WHOLE lineage: the matched directive AND every other
     // NON-TERMINAL attempt sharing the chain root (the live attempt — Launching|Running —
-    // is what carries the PTY; an AwaitingRetry predecessor is flagged too so a racing
+    // is what carries the PTY; an Failed predecessor is flagged too so a racing
     // re-finalize honours the abort). A terminal chain-mate is left untouched.
     for d in state.mini_coder_directives.iter_mut() {
         let in_chain = d.id == root || d.parent_directive_id.as_deref() == Some(root.as_str());
@@ -6029,7 +5418,7 @@ fn mark_kill_requested(
 
     // WARNING 6 (KILL STALE AGENT_ID): the PTY to kill belongs to the chain's ACTIVE
     // (`Launching|Running`) attempt — NOT necessarily the directive matched by `agent_id`.
-    // If the human hit Stop via an AwaitingRetry PREDECESSOR's stale agent id, that
+    // If the human hit Stop via an Failed PREDECESSOR's stale agent id, that
     // predecessor's PTY is a DEAD past mini; the LIVE retry runs under a DIFFERENT agent
     // id and would keep going if we killed the stale one. So return the live attempt's
     // agent id as the PTY to kill. Falls back to the matched id (the original behaviour)
@@ -6054,7 +5443,10 @@ enum SteerOutcome {
     /// ACTIVE attempt carries its live PTY id; a `Pending` retry targeted in the handoff
     /// window has `None` — it has no PTY yet, and the queued path never needs one) and the
     /// new queue length.
-    Queued { live_agent_id: Option<String>, queued: usize },
+    Queued {
+        live_agent_id: Option<String>,
+        queued: usize,
+    },
     /// The message was the STOP sentinel — flagged the chain `kill_requested` (reusing
     /// the Stop path). Carries the live attempt's PTY agent id to kill, like
     /// `mark_kill_requested`.
@@ -6075,7 +5467,7 @@ enum SteerOutcome {
 ///     across the live chain (REUSING the kill path) and returns `Stopped`;
 ///   * any other (non-blank) message is APPENDED to the chain member that WILL run: the
 ///     ACTIVE (`Launching|Running`) attempt if any, else (C1) the highest-attempt NON-TERMINAL
-///     member — the `Pending` retry in the retry-handoff window, NOT the dead `AwaitingRetry`
+///     member — the `Pending` retry in the retry-handoff window, NOT the dead `Failed`
 ///     predecessor that owns the matched `agent_id` (whose queue would never be drained). The
 ///     attempt whose next round boundary drains the queue into the fix-pass task. Returns
 ///     `Queued`. Capped at [`mini_coder::MAX_STEER_QUEUE_LEN`] (refused with `QueueFull` when
@@ -6098,7 +5490,9 @@ fn mark_steer_requested(
     // PTY to kill) — steering generalizes the kill, it does not bypass it.
     if mini_coder::is_steer_stop(trimmed) {
         return match mark_kill_requested(state, agent_id) {
-            Some(live) => SteerOutcome::Stopped { live_agent_id: Some(live) },
+            Some(live) => SteerOutcome::Stopped {
+                live_agent_id: Some(live),
+            },
             None => SteerOutcome::NoOp,
         };
     }
@@ -6109,7 +5503,7 @@ fn mark_steer_requested(
         .mini_coder_directives
         .iter()
         .find(|d| d.agent_id.as_deref() == Some(agent_id))
-        .map(|d| (mini_coder::chain_root_id(d).to_string(), d.status));
+        .map(|d| (d.id.to_string(), d.status));
     let Some((root, matched_status)) = matched else {
         return SteerOutcome::NoOp;
     };
@@ -6122,7 +5516,7 @@ fn mark_steer_requested(
     // one ACTIVE (`Launching|Running`) attempt in a chain (plan_tick claims one at a time),
     // so prefer it. C1: when NO attempt is currently active we must NOT fall back to the
     // matched directive — in the retry-handoff window the matched directive is the DEAD
-    // `AwaitingRetry` predecessor (it carries `agent_id`; the freshly-minted `Pending` retry
+    // `Failed` predecessor (it carries `agent_id`; the freshly-minted `Pending` retry
     // has none yet), and appending there would SILENTLY LOSE the steer (the predecessor
     // never re-runs). Instead target the HIGHEST-attempt NON-TERMINAL chain member — the
     // Pending retry `R` that plan_tick will claim — mirroring Python's "active preference"
@@ -6158,9 +5552,12 @@ fn mark_steer_requested(
             queued: target.steer_queue.len(),
         };
     }
-    target
-        .steer_queue
-        .push(trimmed.chars().take(mini_coder::MAX_STEER_MESSAGE_LEN).collect());
+    target.steer_queue.push(
+        trimmed
+            .chars()
+            .take(mini_coder::MAX_STEER_MESSAGE_LEN)
+            .collect(),
+    );
     SteerOutcome::Queued {
         live_agent_id: target.agent_id.clone(),
         queued: target.steer_queue.len(),
@@ -6201,7 +5598,7 @@ pub fn mini_coder_kill(app: AppHandle, agent_id: String) -> Result<(), String> {
     //    `mark_kill_requested` returns Some(<live PTY agent id>) ONLY when a genuine LIVE
     //    (non-terminal) mini chain owns this id. WARNING 6: the returned id is the chain's
     //    ACTIVE (Launching|Running) attempt's PTY — which may DIFFER from `agent_id` when
-    //    the human stopped via an AwaitingRetry predecessor's STALE id (a dead past mini);
+    //    the human stopped via an Failed predecessor's STALE id (a dead past mini);
     //    killing `agent_id` directly would miss the live retry. WARNING 4: an already-
     //    terminal mini is left untouched (None); WARNING 3: a non-mini id matches nothing.
     let pty_to_kill = agents::mutate_agent_live_state(&app, |st| {
@@ -6355,8 +5752,8 @@ fn build_headless_mini_command(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::mini_coder::MiniCoderResult;
+    use super::*;
 
     fn directive(id: &str, parent: &str) -> MiniCoderDirective {
         MiniCoderDirective {
@@ -6380,7 +5777,6 @@ mod tests {
             result: None,
             attempt: 0,
             parent_directive_id: None,
-            retry_directive_id: None,
             pigeon_ticket: None,
         }
     }
@@ -6773,11 +6169,13 @@ mod tests {
             p4_edit("a.txt", "beta", "BETA"),
         ];
         let mut pre: Vec<String> = Vec::new();
-        let result =
-            apply_emitted_edits(&root, &allow, &edits, |rel| pre.push(rel.to_string()))
-                .expect("happy path applies");
+        let result = apply_emitted_edits(&root, &allow, &edits, |rel| pre.push(rel.to_string()))
+            .expect("happy path applies");
         // Ground truth: first-touch order, deduped.
-        assert_eq!(result.applied, vec!["a.txt".to_string(), "new.txt".to_string()]);
+        assert_eq!(
+            result.applied,
+            vec!["a.txt".to_string(), "new.txt".to_string()]
+        );
         // The pre-image hook fired once per touched file, in flush order.
         assert_eq!(pre, result.applied);
         assert_eq!(
@@ -6803,7 +6201,10 @@ mod tests {
         let err = apply_emitted_edits(&root, &allow, &edits, |_| {}).unwrap_err();
         assert!(err.contains("matches 0 times"), "wrong error: {err}");
         // Pass-1 failed -> pass-2 never ran -> the file is byte-identical.
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -6838,7 +6239,10 @@ mod tests {
         );
         // Mixed directive: ANY covered file flips the whole directive to covered.
         assert!(
-            directive_has_tier_a_coverage(&py_root, &["src/a.rs".to_string(), "src/b.py".to_string()]),
+            directive_has_tier_a_coverage(
+                &py_root,
+                &["src/a.rs".to_string(), "src/b.py".to_string()]
+            ),
             "a directive with >=1 covered (.py) file is COVERED even alongside an uncovered .rs"
         );
         std::fs::remove_dir_all(&py_root).ok();
@@ -6863,20 +6267,47 @@ mod tests {
         let py_root = p4_temp_project("langs-python");
         std::fs::write(py_root.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
         let langs = tier_a_covered_languages(&py_root);
-        assert!(langs.contains(&"Python"), "Python must be covered: {langs:?}");
-        assert!(!langs.contains(&"Rust"), "Rust is Coarse-only -> never covered: {langs:?}");
+        assert!(
+            langs.contains(&"Python"),
+            "Python must be covered: {langs:?}"
+        );
+        assert!(
+            !langs.contains(&"Rust"),
+            "Rust is Coarse-only -> never covered: {langs:?}"
+        );
         // TS/Go/C++/Kotlin need their own manifest (absent here) -> NOT covered.
-        assert!(!langs.contains(&"Go"), "Go needs go.mod (absent) -> uncovered: {langs:?}");
-        assert!(!langs.contains(&"Kotlin"), "Kotlin needs Gradle (absent) -> uncovered: {langs:?}");
+        assert!(
+            !langs.contains(&"Go"),
+            "Go needs go.mod (absent) -> uncovered: {langs:?}"
+        );
+        assert!(
+            !langs.contains(&"Kotlin"),
+            "Kotlin needs Gradle (absent) -> uncovered: {langs:?}"
+        );
         // Manifest-free languages are always covered.
-        for l in ["HTML", "Shell", "YAML", "SQL", "Dockerfile", "GitHub Actions", "CSS"] {
-            assert!(langs.contains(&l), "manifest-free {l} must be covered: {langs:?}");
+        for l in [
+            "HTML",
+            "Shell",
+            "YAML",
+            "SQL",
+            "Dockerfile",
+            "GitHub Actions",
+            "CSS",
+        ] {
+            assert!(
+                langs.contains(&l),
+                "manifest-free {l} must be covered: {langs:?}"
+            );
         }
         // Deterministic + sorted.
         let mut sorted = langs.clone();
         sorted.sort_unstable();
         assert_eq!(langs, sorted, "covered languages must be sorted: {langs:?}");
-        assert_eq!(langs, tier_a_covered_languages(&py_root), "must be deterministic");
+        assert_eq!(
+            langs,
+            tier_a_covered_languages(&py_root),
+            "must be deterministic"
+        );
         std::fs::remove_dir_all(&py_root).ok();
     }
 
@@ -6889,11 +6320,23 @@ mod tests {
         let rust_root = p4_temp_project("langs-rust");
         std::fs::write(rust_root.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let langs = tier_a_covered_languages(&rust_root);
-        assert!(!langs.contains(&"Rust"), "Rust must NOT be covered (Coarse-only): {langs:?}");
-        assert!(!langs.contains(&"Python"), "no Python manifest -> uncovered: {langs:?}");
-        assert!(!langs.contains(&"TypeScript/JavaScript"), "no Node manifest -> uncovered: {langs:?}");
+        assert!(
+            !langs.contains(&"Rust"),
+            "Rust must NOT be covered (Coarse-only): {langs:?}"
+        );
+        assert!(
+            !langs.contains(&"Python"),
+            "no Python manifest -> uncovered: {langs:?}"
+        );
+        assert!(
+            !langs.contains(&"TypeScript/JavaScript"),
+            "no Node manifest -> uncovered: {langs:?}"
+        );
         // The manifest-free baseline is still present (kind-gate-free).
-        assert!(langs.contains(&"HTML") && langs.contains(&"Shell"), "baseline langs present: {langs:?}");
+        assert!(
+            langs.contains(&"HTML") && langs.contains(&"Shell"),
+            "baseline langs present: {langs:?}"
+        );
         std::fs::remove_dir_all(&rust_root).ok();
     }
 
@@ -6904,44 +6347,12 @@ mod tests {
         let node_root = p4_temp_project("langs-node");
         std::fs::write(node_root.join("package.json"), "{\"name\":\"x\"}\n").unwrap();
         let langs = tier_a_covered_languages(&node_root);
-        assert!(langs.contains(&"TypeScript/JavaScript"), "TS must be covered: {langs:?}");
+        assert!(
+            langs.contains(&"TypeScript/JavaScript"),
+            "TS must be covered: {langs:?}"
+        );
         assert!(!langs.contains(&"Rust"), "Rust excluded: {langs:?}");
         std::fs::remove_dir_all(&node_root).ok();
-    }
-
-    #[test]
-    fn b2_gate_and_a3_lister_agree_via_shared_coverage_core() {
-        // FIX 3: the B2 budget gate (`directive_has_tier_a_coverage`) and the A3 language
-        // lister (`tier_a_covered_languages`) MUST agree on coverage for the SAME project,
-        // because both route through the SINGLE shared `lang_is_tier_a_covered` core. Pin
-        // the agreement on representative covered/uncovered languages so a future divergent
-        // edit (one updated, the other not) trips here.
-        let py_root = p4_temp_project("agree-python");
-        std::fs::write(py_root.join("pyproject.toml"), "[project]\nname=\"x\"\n").unwrap();
-        let langs = tier_a_covered_languages(&py_root);
-
-        // Python: the lister says COVERED <=> the per-file gate says COVERED for a .py file.
-        assert!(langs.contains(&"Python"), "lister: Python covered for a Python project: {langs:?}");
-        assert!(
-            directive_has_tier_a_coverage(&py_root, &["src/a.py".to_string()]),
-            "gate: a .py file must be covered when the lister lists Python"
-        );
-
-        // Rust: the lister says UNCOVERED (Coarse-only) <=> the per-file gate says UNCOVERED
-        // for a .rs file. Both reach this verdict through the SAME core.
-        assert!(!langs.contains(&"Rust"), "lister: Rust never covered (Coarse-only): {langs:?}");
-        assert!(
-            !directive_has_tier_a_coverage(&py_root, &["src/a.rs".to_string()]),
-            "gate: a .rs file must be uncovered when the lister omits Rust"
-        );
-
-        // A manifest-free language (Shell): listed AND gate-covered in every project.
-        assert!(langs.contains(&"Shell"), "lister: Shell always covered: {langs:?}");
-        assert!(
-            directive_has_tier_a_coverage(&py_root, &["scripts/deploy.sh".to_string()]),
-            "gate: a .sh file must be covered when the lister lists Shell"
-        );
-        std::fs::remove_dir_all(&py_root).ok();
     }
 
     #[test]
@@ -6950,13 +6361,8 @@ mod tests {
         std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
         let allow = vec!["main.rs".to_string()];
         for bad in ["other.rs", "../main.rs", "/etc/hosts", "Main.RS"] {
-            let err = apply_emitted_edits(
-                &root,
-                &allow,
-                &[p4_edit(bad, "fn", "FN")],
-                |_| {},
-            )
-            .unwrap_err();
+            let err = apply_emitted_edits(&root, &allow, &[p4_edit(bad, "fn", "FN")], |_| {})
+                .unwrap_err();
             assert!(
                 err.contains("edit 0"),
                 "path {bad} must be rejected, got: {err}"
@@ -6974,7 +6380,8 @@ mod tests {
     #[test]
     fn apply_edits_rejects_symlink_escape() {
         let root = p4_temp_project("symlink");
-        let outside = std::env::temp_dir().join(format!("aspis-p4a-outside-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("aspis-p4a-outside-{}", std::process::id()));
         std::fs::write(&outside, "outside\n").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link.txt")).unwrap();
         let err = apply_emitted_edits(
@@ -6984,7 +6391,10 @@ mod tests {
             |_| {},
         )
         .unwrap_err();
-        assert!(err.contains("escapes the project root"), "wrong error: {err}");
+        assert!(
+            err.contains("escapes the project root"),
+            "wrong error: {err}"
+        );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(&outside).ok();
@@ -7032,8 +6442,8 @@ mod tests {
         let err = apply_emitted_edits(&root, &["a.txt".to_string()], &many, |_| {}).unwrap_err();
         assert!(err.contains("too many edits"), "wrong error: {err}");
         let wide: Vec<String> = (0..11).map(|i| format!("f{i}.txt")).collect();
-        let err = apply_emitted_edits(&root, &wide, &[p4_edit("f0.txt", "", "c")], |_| {})
-            .unwrap_err();
+        let err =
+            apply_emitted_edits(&root, &wide, &[p4_edit("f0.txt", "", "c")], |_| {}).unwrap_err();
         assert!(err.contains("1..=10"), "wrong error: {err}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -7069,7 +6479,10 @@ mod tests {
         // The mini CLAIMED lie.txt; ground truth is what was actually applied.
         assert_eq!(out.files_touched, vec!["a.txt".to_string()]);
         assert!(out.edits.is_empty(), "edit bodies must not persist");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "ALPHA\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "ALPHA\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7082,12 +6495,18 @@ mod tests {
         let (out, _diffs) = apply_write_directive_edits(Some(&root), &d, outcome);
         assert_eq!(out.status, MiniCoderStatus::Failed);
         assert!(
-            out.error.as_deref().unwrap_or("").contains("emitted edits rejected"),
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("emitted edits rejected"),
             "error missing: {:?}",
             out.error
         );
         // Atomicity: the failed apply wrote nothing.
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7104,7 +6523,10 @@ mod tests {
         // The model's claim passes through untouched on the no-write path...
         assert_eq!(out.files_touched, vec!["lie.txt".to_string()]);
         // ...and the disk was never touched.
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7178,7 +6600,10 @@ mod tests {
             err.contains("not in the directive allowlist"),
             "must fail ON THE ALLOWLIST, got: {err}"
         );
-        assert_eq!(std::fs::read_to_string(root.join("present.txt")).unwrap(), "y\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("present.txt")).unwrap(),
+            "y\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7196,8 +6621,14 @@ mod tests {
         ];
         let err = apply_emitted_edits(&root, &allow, &edits, |_| {}).unwrap_err();
         assert!(err.contains("matches 0 times"), "wrong error: {err}");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha\n");
-        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "beta\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "beta\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7226,7 +6657,10 @@ mod tests {
         )
         .expect("dotted emitted path must match clean allowlist");
         assert_eq!(result.applied, vec!["src/a.rs".to_string()]);
-        assert_eq!(std::fs::read_to_string(root.join("src/a.rs")).unwrap(), "three\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "three\n"
+        );
         // An empty path is rejected outright.
         let err = apply_emitted_edits(
             &root,
@@ -7257,7 +6691,10 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "let x = 42;\nlet y = 2;\n"
         );
-        assert_eq!(result.match_tiers, vec![("a.txt".to_string(), "exact".to_string())]);
+        assert_eq!(
+            result.match_tiers,
+            vec![("a.txt".to_string(), "exact".to_string())]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7275,7 +6712,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("matches 2 times"), "wrong error: {err}");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "dup\ndup\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "dup\ndup\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -7295,7 +6735,11 @@ mod tests {
         let result = apply_emitted_edits(
             &root,
             &["a.rs".to_string()],
-            &[p4_edit("a.rs", old, "fn f() {\n    let a = 100;\n    let b = 2;\n}")],
+            &[p4_edit(
+                "a.rs",
+                old,
+                "fn f() {\n    let a = 100;\n    let b = 2;\n}",
+            )],
             |_| {},
         )
         .expect("whitespace-normalized match applies");
@@ -7342,7 +6786,8 @@ mod tests {
         let file = "alpha line one\nbeta line two\ngamma line three\ndelta line four\nepsilon line five\nzzz unrelated tail\n";
         std::fs::write(root.join("a.txt"), file).unwrap();
         // old differs only in "three" -> "thRee" (a near miss, not exact, not pure ws).
-        let old = "alpha line one\nbeta line two\ngamma line thRee\ndelta line four\nepsilon line five";
+        let old =
+            "alpha line one\nbeta line two\ngamma line thRee\ndelta line four\nepsilon line five";
         let new = "ALPHA\nBETA\nGAMMA\nDELTA\nEPSILON";
         let result = apply_emitted_edits(
             &root,
@@ -7442,7 +6887,11 @@ mod tests {
         let allow = vec!["a.rs".to_string(), "b.txt".to_string()];
         let edits = vec![
             // Whitespace near-miss on a.rs (would apply on its own).
-            p4_edit("a.rs", "fn alpha() {\n  return 1;\n}", "fn alpha() {\n    return 2;\n}"),
+            p4_edit(
+                "a.rs",
+                "fn alpha() {\n  return 1;\n}",
+                "fn alpha() {\n    return 2;\n}",
+            ),
             // No confident match anywhere in b.txt => kills the whole batch.
             p4_edit("b.txt", "nothing like this content at all here", "X"),
         ];
@@ -7491,11 +6940,11 @@ mod tests {
         // margin, so the unique location applies. (Ratios pre-measured against similar
         // 2.7; the base-1 2-line window scores ~0.78, well below threshold.)
         let root = p4_temp_project("fz-overlap");
-        let file = "aaaaaaaaaaaaaaaaaaaa one\nbbbbbbbbbbbbbbbbbbbb two\ncccccccccccccccccccc three\nx\n";
+        let file =
+            "aaaaaaaaaaaaaaaaaaaa one\nbbbbbbbbbbbbbbbbbbbb two\ncccccccccccccccccccc three\nx\n";
         std::fs::write(root.join("a.txt"), file).unwrap();
         // Near-miss: line 3 "three" -> "thRee" (one char), no trailing newline on `old`.
-        let old =
-            "aaaaaaaaaaaaaaaaaaaa one\nbbbbbbbbbbbbbbbbbbbb two\ncccccccccccccccccccc thRee";
+        let old = "aaaaaaaaaaaaaaaaaaaa one\nbbbbbbbbbbbbbbbbbbbb two\ncccccccccccccccccccc thRee";
         let new = "REPLACED";
         let result = apply_emitted_edits(
             &root,
@@ -7542,7 +6991,10 @@ mod tests {
         // File is byte-for-byte unchanged: explicitly NO EOF insertion of "INJECTED".
         let after = std::fs::read_to_string(root.join("a.rs")).unwrap();
         assert_eq!(after, file);
-        assert!(!after.contains("INJECTED"), "EOF insertion leaked: {after:?}");
+        assert!(
+            !after.contains("INJECTED"),
+            "EOF insertion leaked: {after:?}"
+        );
         // Direct unit check: the whitespace tier itself declines an all-whitespace anchor.
         assert!(find_whitespace_span(file, "   \t  ").is_none());
         assert!(find_whitespace_span(file, " ").is_none());
@@ -7564,7 +7016,10 @@ mod tests {
             file.push_str(&format!("line number {n} with some filler text here\n"));
             n += 1;
         }
-        assert!(file.len() > FUZZY_MAX_FILE_BYTES, "test file must exceed the cap");
+        assert!(
+            file.len() > FUZZY_MAX_FILE_BYTES,
+            "test file must exceed the cap"
+        );
         std::fs::write(root.join("big.txt"), &file).unwrap();
         // A near-miss against one real line (one char changed) — would fuzzy-match on a
         // small file, but the size cap bypasses Tier 3 so it errors.
@@ -7657,7 +7112,11 @@ mod tests {
         });
         assert_eq!(pid.as_deref(), Some("p1"));
         assert!(trusted, "p1 is trusted");
-        assert_eq!(seen.as_deref(), Some("p1"), "trust checked for the SAME project");
+        assert_eq!(
+            seen.as_deref(),
+            Some("p1"),
+            "trust checked for the SAME project"
+        );
     }
 
     /// WARNING 3: a missing snapshot / agent_id / session yields (None, false) and never
@@ -7672,207 +7131,37 @@ mod tests {
         });
         assert_eq!(pid, None);
         assert!(!trusted);
-        assert!(!called, "trust lookup never runs for an unresolvable project");
+        assert!(
+            !called,
+            "trust lookup never runs for an unresolvable project"
+        );
     }
 
     /// BLOCKER 2 (TIMEOUT EXCLUSION): a directive whose deferred-verdict thread is in
     /// flight is Running with a long-elapsed started_at but must NOT be timed out.
-    /// Without the exclusion it WOULD be (control). With it in the set, it is spared.
-    #[test]
-    fn plan_tick_excludes_inflight_verdict_directive_from_timeout() {
-        use std::collections::HashSet;
-        let mut d = directive("d1", "coder-1");
-        d.status = MiniCoderStatus::Running;
-        d.started_at = Some("2026-06-06T00:00:00Z".into());
-        let directives = vec![d];
-        let now = "2026-06-06T01:00:00Z"; // an hour later -> well past any cap.
-
-        // Control: NOT in flight -> timed out.
-        let plan = mini_coder::plan_tick_excluding(
-            &directives,
-            now,
-            DEFAULT_WALL_CLOCK_CAP_SECS,
-            mini_coder::DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
-            DEFAULT_LAUNCH_CAP_SECS,
-            2,
-            &HashSet::new(),
-        );
-        assert_eq!(plan.timeouts, vec!["d1".to_string()], "control: times out");
-
-        // In flight -> excluded from timeouts.
-        let inflight: HashSet<String> = ["d1".to_string()].into_iter().collect();
-        let plan2 = mini_coder::plan_tick_excluding(
-            &directives,
-            now,
-            DEFAULT_WALL_CLOCK_CAP_SECS,
-            mini_coder::DEFAULT_RETRY_WALL_CLOCK_CAP_SECS,
-            DEFAULT_LAUNCH_CAP_SECS,
-            2,
-            &inflight,
-        );
-        assert!(
-            plan2.timeouts.is_empty(),
-            "a directive awaiting its verdict thread is NOT wall-cap-timed-out"
-        );
-    }
 
     /// BLOCKER 2 (IN-FLIGHT GUARD): only ONE verdict thread per directive can be claimed;
     /// a second claim for the same id fails until released. This is what stops `run_pass`
-    /// from re-detecting + re-spawning (double-finalizing) the same finished mini.
-    #[test]
-    fn verdict_inflight_guard_prevents_double_claim_and_clears_on_release() {
-        let state = MiniCoderState::new();
-        assert!(state.claim_verdict("d1"), "first claim succeeds");
-        assert!(!state.claim_verdict("d1"), "second claim for same id is refused");
-        assert!(state.verdict_inflight_ids().contains("d1"));
-        // A different id is independent.
-        assert!(state.claim_verdict("d2"));
-        // Release clears the guard so a future (legitimate) re-claim can proceed.
-        state.release_verdict("d1");
-        assert!(!state.verdict_inflight_ids().contains("d1"));
-        assert!(state.claim_verdict("d1"), "re-claim after release succeeds");
-    }
 
     /// BLOCKER 1: a POISONED `verdict_inflight` mutex must NOT silently disable the
     /// timeout-exclusion (return empty) nor no-op a release. After poisoning the lock from
     /// a panicking thread, `verdict_inflight_ids` still returns the LIVE set and
-    /// `release_verdict` still removes — recovered via `into_inner`.
-    #[test]
-    fn verdict_inflight_recovers_from_poisoned_mutex() {
-        let state = std::sync::Arc::new(MiniCoderState::new());
-        // Two live ids before poisoning.
-        assert!(state.claim_verdict("alive-1"));
-        assert!(state.claim_verdict("alive-2"));
-
-        // Poison the mutex: panic while holding the lock in another thread.
-        let s2 = std::sync::Arc::clone(&state);
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = s2.verdict_inflight.lock().unwrap();
-            panic!("poison the verdict_inflight mutex");
-        }));
-        assert!(res.is_err(), "the panicking thread did panic");
-        assert!(
-            state.verdict_inflight.is_poisoned(),
-            "the mutex is now poisoned"
-        );
-
-        // The fix: ids() recovers and returns the LIVE set (NOT empty — which would
-        // permanently disable the timeout exclusion and time out awaiting-verdict
-        // directives).
-        let ids = state.verdict_inflight_ids();
-        assert!(ids.contains("alive-1") && ids.contains("alive-2"), "live set survives poison: {ids:?}");
-
-        // release still lands on a poisoned lock (a no-op release would leak forever).
-        state.release_verdict("alive-1");
-        assert!(!state.verdict_inflight_ids().contains("alive-1"), "release works under poison");
-
-        // claim still inserts on a poisoned lock (a failing claim would re-spawn verdict
-        // threads every pass).
-        assert!(state.claim_verdict("alive-3"), "claim works under poison");
-        assert!(state.verdict_inflight_ids().contains("alive-3"));
-    }
 
     /// BLOCKER 2 (RAII): the in-flight id is released on EVERY exit path of the verdict
     /// thread body — even when BOTH the work closure AND the fail-closed closure panic.
     /// The `VerdictInflightGuard`'s `Drop` runs during unwind, so the id never leaks (a
-    /// leaked id would make the directive un-timeout-able AND un-re-finalizable forever).
-    #[test]
-    fn verdict_thread_body_releases_id_on_double_panic() {
-        let set: Arc<Mutex<std::collections::HashSet<String>>> =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
-        set.lock().unwrap().insert("d-double-panic".to_string());
-
-        // Run the body on a thread so a panic that escapes (it must NOT) is contained,
-        // and join it; the id must be released regardless.
-        let set_for_thread = Arc::clone(&set);
-        let join = std::thread::spawn(move || {
-            run_verdict_thread_body(
-                Some(set_for_thread),
-                "d-double-panic".to_string(),
-                || panic!("work panics"),
-                || panic!("fail-closed ALSO panics"),
-            );
-        });
-        let joined = join.join();
-        assert!(joined.is_ok(), "the body must NOT let a double panic escape the thread");
-
-        let ids = set.lock().unwrap();
-        assert!(
-            !ids.contains("d-double-panic"),
-            "RAII guard released the id even on a double panic: {ids:?}"
-        );
-    }
 
     /// BLOCKER 2 (RAII): the guard also releases on the NORMAL (no-panic) path and on a
-    /// work-only panic (fail-closed succeeds). Sanity over the happy + single-panic exits.
-    #[test]
-    fn verdict_thread_body_releases_id_on_normal_and_single_panic() {
-        // Normal exit.
-        let set: Arc<Mutex<std::collections::HashSet<String>>> =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
-        set.lock().unwrap().insert("ok".to_string());
-        run_verdict_thread_body(Some(Arc::clone(&set)), "ok".to_string(), || {}, || {});
-        assert!(!set.lock().unwrap().contains("ok"), "released on normal exit");
-
-        // Work panics, fail-closed succeeds.
-        set.lock().unwrap().insert("work-panic".to_string());
-        run_verdict_thread_body(
-            Some(Arc::clone(&set)),
-            "work-panic".to_string(),
-            || panic!("boom"),
-            || {},
-        );
-        assert!(!set.lock().unwrap().contains("work-panic"), "released after work panic");
-    }
 
     /// WARNING 6: the verdict thread threads the executor's REAL running/stop flag (so an
     /// in-flight linter run honors app exit) — NOT a throwaway `AtomicBool(true)`. The
     /// plumbing: `running_flag()` hands out a CLONE of the same `Arc<AtomicBool>` the loop
-    /// uses, and `stop()` clears it, so a holder of the cloned flag observes the shutdown.
-    #[test]
-    fn verdict_stop_flag_is_the_executors_real_running_flag() {
-        let state = MiniCoderState::new();
-        let threaded = state.running_flag(); // the flag passed to real_censor_verdict.
-        assert!(threaded.load(Ordering::SeqCst), "running flag starts true (alive)");
-        // The executor signals shutdown -> the THREADED clone observes it (same Arc).
-        state.stop();
-        assert!(
-            !threaded.load(Ordering::SeqCst),
-            "stop() clears the flag the verdict thread holds -> linter run bails"
-        );
-        // And `real_censor_verdict` short-circuits on a cleared flag (no linter work) —
-        // its guard is `if !stop.load(...) { return Vec::new() }`, exercised via the same
-        // Arc. (No AppHandle harness exists in this crate, so the I/O path past the guard
-        // is covered by the orchestrator's own `run_fine_batch_inner` early-return test.)
-        assert!(!threaded.load(Ordering::SeqCst));
-    }
 
     /// WARNING 3 (self-healing): the SAME reconcile logic the startup sweep uses is the
-    /// one `run_pass` folds into every steady-state tick — so an AwaitingRetry whose retry
+    /// one `run_pass` folds into every steady-state tick — so an Failed whose retry
     /// child is TERMINAL is flagged for reconcile from the pass directives, not only at
     /// startup. (`reconcile_awaiting_retry_orphans` + `run_pass` apply this against the
     /// live state under the lock; here we assert the decision the steady-state pass acts
-    /// on, since the crate has no AppHandle test harness.)
-    #[test]
-    fn steady_state_pass_reconciles_terminal_child_awaiting_retry() {
-        let mut pred = directive("pred", "coder-1");
-        pred.status = MiniCoderStatus::AwaitingRetry;
-        pred.retry_directive_id = Some("retry".into());
-        let mut child = directive("retry", "coder-1");
-        child.status = MiniCoderStatus::Done; // terminal child, predecessor un-stamped.
-        child.parent_directive_id = Some("pred".into());
-
-        let directives = vec![pred, child];
-        // This is EXACTLY what run_pass now passes to reconcile_awaiting_retry_orphans
-        // every tick (folded in, not only at startup).
-        let actions = mini_coder::awaiting_retry_needing_terminal(&directives);
-        assert_eq!(actions.len(), 1, "the terminal-child AwaitingRetry is flagged");
-        assert_eq!(actions[0].0, "pred");
-        assert!(matches!(
-            actions[0].1,
-            mini_coder::RetrySweepAction::PropagateChildTerminal { ref child_id } if child_id == "retry"
-        ));
-    }
 
     #[test]
     fn snapshot_parent_project_is_none_when_parent_absent_or_projectless() {
@@ -8137,168 +7426,18 @@ mod tests {
         assert!(state.mini_coder_directives[1].kill_requested);
     }
 
-    #[test]
-    fn mark_steer_requested_appends_to_live_attempt_and_caps_queue() {
-        // ASYNC STEERING (a): a non-stop steer APPENDS to the live attempt's steer_queue
-        // (the SAME channel as kill, queued) and reports the new length. The mini is not
-        // killed; the executor folds the queue at the next round boundary.
-        let mut state = empty_state();
-        let mut d = directive("d1", "coder-1");
-        d.status = MiniCoderStatus::Running;
-        d.agent_id = Some("mini-c-d1".into());
-        state.mini_coder_directives.push(d);
-
-        match mark_steer_requested(&mut state, "mini-c-d1", "use a HashMap not a Vec") {
-            SteerOutcome::Queued { live_agent_id, queued } => {
-                assert_eq!(live_agent_id.as_deref(), Some("mini-c-d1"));
-                assert_eq!(queued, 1);
-            }
-            other => panic!("expected Queued, got {other:?}"),
-        }
-        assert_eq!(state.mini_coder_directives[0].steer_queue, vec!["use a HashMap not a Vec"]);
-        assert!(
-            !state.mini_coder_directives[0].kill_requested,
-            "a non-stop steer must NOT kill the mini"
-        );
-
-        // FIFO + cap: fill to MAX, then a further append is REFUSED (QueueFull, not dropped).
-        while state.mini_coder_directives[0].steer_queue.len() < mini_coder::MAX_STEER_QUEUE_LEN {
-            mark_steer_requested(&mut state, "mini-c-d1", "more");
-        }
-        let full_len = state.mini_coder_directives[0].steer_queue.len();
-        assert_eq!(full_len, mini_coder::MAX_STEER_QUEUE_LEN);
-        match mark_steer_requested(&mut state, "mini-c-d1", "over the cap") {
-            SteerOutcome::QueueFull { queued } => assert_eq!(queued, mini_coder::MAX_STEER_QUEUE_LEN),
-            other => panic!("expected QueueFull, got {other:?}"),
-        }
-        assert_eq!(
-            state.mini_coder_directives[0].steer_queue.len(),
-            mini_coder::MAX_STEER_QUEUE_LEN,
-            "a full queue refuses the new message (never drops an existing one)"
-        );
-
-        // Per-message length cap is enforced.
-        let mut state2 = empty_state();
-        let mut d2 = directive("d2", "coder-1");
-        d2.status = MiniCoderStatus::Running;
-        d2.agent_id = Some("mini-c-d2".into());
-        state2.mini_coder_directives.push(d2);
-        let long = "x".repeat(mini_coder::MAX_STEER_MESSAGE_LEN + 500);
-        mark_steer_requested(&mut state2, "mini-c-d2", &long);
-        assert_eq!(
-            state2.mini_coder_directives[0].steer_queue[0].chars().count(),
-            mini_coder::MAX_STEER_MESSAGE_LEN
-        );
-    }
-
-    #[test]
-    fn mark_steer_requested_stop_sentinel_reuses_kill_path() {
-        // ASYNC STEERING (a): a `stop` steer REUSES the kill path — flags kill_requested
-        // across the chain and returns the live PTY to kill (like mark_kill_requested),
-        // queueing NOTHING.
-        let mut state = empty_state();
-        let mut d = directive("d1", "coder-1");
-        d.status = MiniCoderStatus::Running;
-        d.agent_id = Some("mini-c-d1".into());
-        state.mini_coder_directives.push(d);
-
-        match mark_steer_requested(&mut state, "mini-c-d1", "  STOP  ") {
-            SteerOutcome::Stopped { live_agent_id } => {
-                assert_eq!(live_agent_id.as_deref(), Some("mini-c-d1"))
-            }
-            other => panic!("expected Stopped, got {other:?}"),
-        }
-        assert!(state.mini_coder_directives[0].kill_requested);
-        assert!(
-            state.mini_coder_directives[0].steer_queue.is_empty(),
-            "stop must not queue a prose message"
-        );
-    }
-
-    #[test]
-    fn mark_steer_requested_noop_on_unknown_terminal_or_blank() {
-        let mut state = empty_state();
-        let mut running = directive("d1", "coder-1");
-        running.status = MiniCoderStatus::Running;
-        running.agent_id = Some("mini-c-d1".into());
-        state.mini_coder_directives.push(running);
-        let mut done = directive("d2", "coder-1");
-        done.status = MiniCoderStatus::Done; // terminal
-        done.agent_id = Some("mini-c-d2".into());
-        state.mini_coder_directives.push(done);
-
-        // Unknown (non-mini) id.
-        assert_eq!(mark_steer_requested(&mut state, "mini-c-nope", "hi"), SteerOutcome::NoOp);
-        // Already-terminal mini.
-        assert_eq!(mark_steer_requested(&mut state, "mini-c-d2", "hi"), SteerOutcome::NoOp);
-        assert!(state.mini_coder_directives[1].steer_queue.is_empty());
-        // Blank message on a live mini.
-        assert_eq!(mark_steer_requested(&mut state, "mini-c-d1", "   "), SteerOutcome::NoOp);
-        assert!(state.mini_coder_directives[0].steer_queue.is_empty());
-    }
-
-    #[test]
-    fn mark_steer_requested_lands_on_pending_retry_not_dead_predecessor() {
-        // C1 (silent lost steer on the live path): the RETRY-HANDOFF window. The
-        // predecessor `D` is `AwaitingRetry` and still carries the (now stale) agent_id; the
-        // freshly-minted retry `R` is `Pending` with NO agent_id yet (plan_tick has not
-        // claimed it). A steer keyed by the predecessor's agent_id must target `R` (the
-        // attempt that WILL run and drain the queue), NOT the dead predecessor `D` whose
-        // queue would never be consumed — otherwise the steer is SILENTLY LOST.
-        let mut state = empty_state();
-        let mut pred = directive("root", "coder-1");
-        pred.status = MiniCoderStatus::AwaitingRetry;
-        pred.agent_id = Some("mini-c-root".into()); // stale id from D's finished run
-        pred.retry_directive_id = Some("root-r1".into());
-        let mut retry = directive("root-r1", "coder-1");
-        retry.status = MiniCoderStatus::Pending; // NOT active, NOT terminal
-        retry.attempt = 1;
-        retry.parent_directive_id = Some("root".into());
-        retry.agent_id = None; // no PTY yet
-        state.mini_coder_directives.push(pred);
-        state.mini_coder_directives.push(retry);
-
-        match mark_steer_requested(&mut state, "mini-c-root", "prefer iterators over loops") {
-            SteerOutcome::Queued { live_agent_id, queued } => {
-                // R has no PTY yet — the queued path carries None (only the stop path needs it).
-                assert_eq!(live_agent_id, None);
-                assert_eq!(queued, 1);
-            }
-            other => panic!("expected Queued on the pending retry, got {other:?}"),
-        }
-        let by_id = |st: &crate::backend::model::AgentLiveState, id: &str| {
-            st.mini_coder_directives
-                .iter()
-                .find(|d| d.id == id)
-                .unwrap()
-                .steer_queue
-                .clone()
-        };
-        assert_eq!(
-            by_id(&state, "root-r1"),
-            vec!["prefer iterators over loops"],
-            "steer must land on the Pending retry's queue (it will run)"
-        );
-        assert!(
-            by_id(&state, "root").is_empty(),
-            "steer must NOT land on the dead AwaitingRetry predecessor (it never re-runs)"
-        );
-    }
-
     // -- P6: propagation + kill-chain + retry-lost ---------------------------
 
-    /// Build a chain: root (AwaitingRetry) -> r1 (AwaitingRetry) -> r2 (Running leaf).
+    /// Build a chain: root (Failed) -> r1 (Failed) -> r2 (Running leaf).
     /// Returns the state with the three directives.
     fn three_deep_chain() -> crate::backend::model::AgentLiveState {
         let mut state = empty_state();
         let mut root = directive("root", "coder-1");
-        root.status = MiniCoderStatus::AwaitingRetry;
-        root.retry_directive_id = Some("root-r1".into());
+        root.status = MiniCoderStatus::Failed;
         let mut r1 = directive("root-r1", "coder-1");
-        r1.status = MiniCoderStatus::AwaitingRetry;
+        r1.status = MiniCoderStatus::Failed;
         r1.attempt = 1;
         r1.parent_directive_id = Some("root".into());
-        r1.retry_directive_id = Some("root-r2".into());
         let mut r2 = directive("root-r2", "coder-1");
         r2.status = MiniCoderStatus::Running;
         r2.attempt = 2;
@@ -8311,289 +7450,20 @@ mod tests {
     }
 
     #[test]
-    fn propagate_terminal_stamps_all_awaiting_retry_ancestors() {
-        // A clean Done on the r2 leaf must propagate Done to root + r1 (both AwaitingRetry)
-        // so the poll watching the ROOT id unblocks. First stamp the leaf terminal
-        // (it is Running -> Done via apply_result), then propagate to ancestors.
-        let mut state = three_deep_chain();
-        let done = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            output: Some("clean".into()),
-            ..Default::default()
-        });
-        transition_directive(&mut state, "root-r2", |d| {
-            mini_coder::apply_result(d, done.clone())
-        });
-        propagate_terminal_to_ancestors(&mut state, "root-r2", &done);
 
-        let by_id = |id: &str| {
-            state
-                .mini_coder_directives
-                .iter()
-                .find(|d| d.id == id)
-                .unwrap()
-        };
-        assert_eq!(by_id("root-r2").status, MiniCoderStatus::Done);
-        assert_eq!(by_id("root").status, MiniCoderStatus::Done, "root unblocked");
-        assert_eq!(by_id("root-r1").status, MiniCoderStatus::Done, "r1 unblocked");
-        assert!(by_id("root").result.is_some());
-        assert!(by_id("root-r1").result.is_some());
-    }
-
-    #[test]
-    fn propagate_escalated_leaf_stamps_ancestors_escalated() {
-        let mut state = three_deep_chain();
-        let escalated = MiniCoderOutcome::escalated(
-            vec!["src/a.rs".into()],
-            mini_coder::EscalationInfo {
-                attempts: 3,
-                findings: vec![],
-            },
-            false,
-            None,
-        );
-        transition_directive(&mut state, "root-r2", |d| {
-            mini_coder::apply_result(d, escalated.clone())
-        });
-        propagate_terminal_to_ancestors(&mut state, "root-r2", &escalated);
-        let by_id = |id: &str| {
-            state
-                .mini_coder_directives
-                .iter()
-                .find(|d| d.id == id)
-                .unwrap()
-        };
-        assert_eq!(by_id("root").status, MiniCoderStatus::Escalated);
-        assert_eq!(by_id("root-r1").status, MiniCoderStatus::Escalated);
-    }
-
-    #[test]
-    fn mark_kill_requested_aborts_the_whole_chain() {
-        // Killing via the LIVE leaf attempt's agent id flags the live attempt; killing an
-        // attempt in a chain reaches the live attempt (the one with the PTY). The chain's
-        // AwaitingRetry predecessors are flagged too (belt-and-braces for a racing finalize).
-        let mut state = three_deep_chain();
-        // Kill via the leaf's agent id -> returns the leaf's (live) PTY.
-        assert_eq!(
-            mark_kill_requested(&mut state, "mini-c-root-r2").as_deref(),
-            Some("mini-c-root-r2")
-        );
-        let by_id = |st: &crate::backend::model::AgentLiveState, id: &str| {
-            st.mini_coder_directives
-                .iter()
-                .find(|d| d.id == id)
-                .unwrap()
-                .kill_requested
-        };
-        assert!(by_id(&state, "root-r2"), "live leaf flagged");
-        assert!(by_id(&state, "root"), "root predecessor flagged");
-        assert!(by_id(&state, "root-r1"), "r1 predecessor flagged");
-    }
-
-    /// WARNING 6 (KILL STALE AGENT_ID): stopping via an AwaitingRetry PREDECESSOR's stale
+    /// WARNING 6 (KILL STALE AGENT_ID): stopping via an Failed PREDECESSOR's stale
     /// agent id must return the LIVE retry's PTY (different agent id) — not the dead
     /// predecessor's — so `mini_coder_kill` kills the attempt that actually has a PTY.
     #[test]
-    fn mark_kill_requested_via_stale_predecessor_returns_live_retry_pty() {
-        let mut state = three_deep_chain();
-        // Give the AwaitingRetry root a STALE agent id from a prior (dead) attempt.
-        state.mini_coder_directives[0].agent_id = Some("mini-c-root-stale".into());
-        // Human hits Stop on the root (the predecessor) via its stale id.
-        let pty = mark_kill_requested(&mut state, "mini-c-root-stale");
-        assert_eq!(
-            pty.as_deref(),
-            Some("mini-c-root-r2"),
-            "must return the LIVE retry's PTY, not the dead predecessor's stale id"
-        );
-        // Whole chain still flagged.
-        let by_id = |st: &crate::backend::model::AgentLiveState, id: &str| {
-            st.mini_coder_directives
-                .iter()
-                .find(|d| d.id == id)
-                .unwrap()
-                .kill_requested
-        };
-        assert!(by_id(&state, "root"), "predecessor flagged");
-        assert!(by_id(&state, "root-r2"), "live retry flagged");
-    }
-
     #[test]
-    fn sweep_pure_pieces_detect_and_fail_lost_retry() {
-        // The startup sweep's two halves, exercised in-memory (the fn itself needs an
-        // AppHandle): (1) detection via awaiting_retry_with_lost_child, (2) the direct
-        // failed-stamp + propagation it applies. Build root(AwaitingRetry, retry=ghost).
-        let mut state = empty_state();
-        let mut root = directive("root", "coder-1");
-        root.status = MiniCoderStatus::AwaitingRetry;
-        root.retry_directive_id = Some("ghost".into()); // absent
-        state.mini_coder_directives.push(root);
-
-        let lost = mini_coder::awaiting_retry_with_lost_child(&state.mini_coder_directives);
-        assert_eq!(lost, vec!["root".to_string()]);
-
-        // Apply the sweep's stamp (same as sweep_orphaned_awaiting_retry's locked body).
-        let outcome = MiniCoderOutcome::failed("retry lost (retry directive absent after restart)");
-        for id in &lost {
-            if let Some(d) = state.mini_coder_directives.iter_mut().find(|d| &d.id == id) {
-                d.status = outcome.status;
-                d.result = Some(outcome.clone());
-            }
-            propagate_terminal_to_ancestors(&mut state, id, &outcome);
-        }
-        let root = &state.mini_coder_directives[0];
-        assert_eq!(root.status, MiniCoderStatus::Failed);
-        assert!(root
-            .result
-            .as_ref()
-            .unwrap()
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("retry lost"));
-    }
 
     /// BLOCKER 1 (STRANDED ROOT): a retry that fails at LAUNCH must propagate `failed`
-    /// to its AwaitingRetry root via the shared `stamp_terminal_and_propagate` (the exact
+    /// to its Failed root via the shared `stamp_terminal_and_propagate` (the exact
     /// body `fail_launching` now runs under the lock). Before the fix `fail_launching`
-    /// only stamped the failed retry and the root sat AwaitingRetry forever.
-    #[test]
-    fn launch_failure_of_retry_propagates_failed_to_awaiting_retry_root() {
-        let mut state = empty_state();
-        // root(AwaitingRetry) -> r1(Launching, attempt 1). The retry is about to fail at
-        // launch (no project / spawn error). agent_id is None (apply_launched never ran).
-        let mut root = directive("root", "coder-1");
-        root.status = MiniCoderStatus::AwaitingRetry;
-        root.retry_directive_id = Some("root-r1".into());
-        let mut r1 = directive("root-r1", "coder-1");
-        r1.status = MiniCoderStatus::Launching;
-        r1.attempt = 1;
-        r1.parent_directive_id = Some("root".into());
-        state.mini_coder_directives.push(root);
-        state.mini_coder_directives.push(r1);
 
-        // Apply the SHARED helper exactly as fail_launching does under the lock.
-        let outcome = MiniCoderOutcome::failed("parent coder has no current project");
-        stamp_terminal_and_propagate(&mut state, "root-r1", &outcome, None, |d| {
-            mini_coder::apply_failed(d, "parent coder has no current project")
-        });
-
-        let by_id = |id: &str| {
-            state
-                .mini_coder_directives
-                .iter()
-                .find(|d| d.id == id)
-                .unwrap()
-        };
-        assert_eq!(by_id("root-r1").status, MiniCoderStatus::Failed, "retry failed");
-        assert_eq!(
-            by_id("root").status,
-            MiniCoderStatus::Failed,
-            "BLOCKER 1: the AwaitingRetry root must be stamped failed so the poll unblocks"
-        );
-        assert!(by_id("root").result.is_some(), "root carries the propagated outcome");
-    }
-
-    /// BLOCKER 1 (second sweep rule): the sweep's body must catch an AwaitingRetry
+    /// BLOCKER 1 (second sweep rule): the sweep's body must catch an Failed
     /// predecessor whose retry child is now TERMINAL (not absent) and re-propagate the
     /// CHILD's terminal outcome to it. Exercises `awaiting_retry_needing_terminal` plus
-    /// the stamp the locked sweep body applies.
-    #[test]
-    fn sweep_catches_awaiting_retry_with_terminal_child() {
-        let mut state = empty_state();
-        let mut root = directive("root", "coder-1");
-        root.status = MiniCoderStatus::AwaitingRetry;
-        root.retry_directive_id = Some("root-r1".into());
-        let mut r1 = directive("root-r1", "coder-1");
-        r1.status = MiniCoderStatus::Failed; // terminal child, but root never stamped.
-        r1.attempt = 1;
-        r1.parent_directive_id = Some("root".into());
-        r1.result = Some(MiniCoderOutcome::failed("mini spawn failed"));
-        state.mini_coder_directives.push(root);
-        state.mini_coder_directives.push(r1);
-
-        let actions = mini_coder::awaiting_retry_needing_terminal(&state.mini_coder_directives);
-        assert_eq!(
-            actions,
-            vec![(
-                "root".to_string(),
-                mini_coder::RetrySweepAction::PropagateChildTerminal { child_id: "root-r1".into() }
-            )]
-        );
-
-        // Apply the sweep's locked body for the PropagateChildTerminal action.
-        for (id, action) in &actions {
-            let outcome = match action {
-                mini_coder::RetrySweepAction::FailLost => {
-                    MiniCoderOutcome::failed("retry lost")
-                }
-                mini_coder::RetrySweepAction::PropagateChildTerminal { child_id } => state
-                    .mini_coder_directives
-                    .iter()
-                    .find(|d| d.id == *child_id)
-                    .and_then(|c| c.result.clone())
-                    .unwrap(),
-            };
-            if let Some(d) = state.mini_coder_directives.iter_mut().find(|d| &d.id == id) {
-                d.status = outcome.status;
-                d.result = Some(outcome.clone());
-            }
-            propagate_terminal_to_ancestors(&mut state, id, &outcome);
-        }
-        let root = state
-            .mini_coder_directives
-            .iter()
-            .find(|d| d.id == "root")
-            .unwrap();
-        assert_eq!(root.status, MiniCoderStatus::Failed, "root re-stamped from child");
-        assert!(root
-            .result
-            .as_ref()
-            .unwrap()
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("mini spawn failed"));
-    }
-
-    #[test]
-    fn finalize_gate_decision_dirty_builds_retry_via_pure_decision() {
-        // The executor's verdict gate delegates to the PURE verdict_gate_decision; assert
-        // the wiring end-state on a TRUSTED dirty Done: AwaitingRetryWith with a Pending
-        // retry (attempt+1) whose feedback carries the High finding. (The executor applies
-        // this decision under lock; the decision itself is what drives the state change.)
-        let mut d = directive("root", "coder-1");
-        d.status = MiniCoderStatus::Running;
-        let outcome = MiniCoderOutcome::done(MiniCoderResult {
-            status: "done".into(),
-            files_touched: vec!["src/a.rs".into()],
-            ..Default::default()
-        });
-        let findings = vec![mini_coder::EscalationFinding {
-            file: "src/a.rs".into(),
-            severity: "high".into(),
-            source: "clippy".into(),
-            title: "panics on empty input".into(),
-            line: Some(7),
-        }];
-        let decision = mini_coder::verdict_gate_decision(
-            &d,
-            &outcome,
-            true,
-            mini_coder::WriteMode::EmitEdits,
-            false,
-            findings,
-            "root-r1",
-            "root-r1.json",
-            "2026-06-10T00:00:00Z",
-        );
-        match decision {
-            mini_coder::GateDecision::AwaitingRetryWith { retry } => {
-                assert_eq!(retry.attempt, 1);
-                assert!(retry.task.contains("panics on empty input"));
-            }
-            other => panic!("expected AwaitingRetryWith, got {other:?}"),
-        }
-    }
 
     #[test]
     fn live_kill_override_turns_done_into_aborted_when_flagged() {
@@ -8646,68 +7516,8 @@ mod tests {
         let kept = live_kill_override(&state, "d1", done2);
         assert_eq!(kept.status, MiniCoderStatus::Done);
     }
-
     #[test]
-    fn awaiting_retry_kill_window_aborts_chain_and_spawns_no_retry() {
-        // P1 (KILL-WINDOW GAP): a Stop that lands in the AwaitingRetryWith window must WIN —
-        // no retry spawned, the predecessor stamped aborted_by_human, the chain root
-        // unblocked. The gate decided AwaitingRetry off-lock (the verdict was a dirty Done),
-        // but `kill_requested` was set BEFORE the locked apply. We reproduce the apply-time
-        // state: the predecessor `D` is still Running (apply has not transitioned it yet) and
-        // freshly flagged; the retry `R` the gate built has NOT been pushed yet. The guard
-        // must report the abort, and the abort path (stamp_terminal_and_propagate) must leave
-        // the chain terminal with NO retry directive appended.
-        let mut state = empty_state();
-        let mut pred = directive("root", "coder-1");
-        pred.status = MiniCoderStatus::Running;
-        pred.agent_id = Some("mini-c-root".into());
-        pred.kill_requested = true; // human hit Stop inside the window
-        state.mini_coder_directives.push(pred);
-
-        // The guard fires (kill wins over the retry decision).
-        assert!(
-            awaiting_retry_kill_wins(&state, "root"),
-            "a flagged predecessor must abort the retry decision"
-        );
-
-        // The abort path the branch runs when the guard fires.
-        let aborted = MiniCoderOutcome::aborted("stopped by human (Stop button)");
-        let ao = aborted.clone();
-        stamp_terminal_and_propagate(&mut state, "root", &aborted, Some("mini-c-root"), |d| {
-            mini_coder::apply_result(d, ao.clone())
-        });
-
-        // Predecessor is terminal aborted_by_human; NO retry directive exists.
-        let root = state
-            .mini_coder_directives
-            .iter()
-            .find(|d| d.id == "root")
-            .unwrap();
-        assert_eq!(root.status, MiniCoderStatus::AbortedByHuman);
-        assert!(
-            !state
-                .mini_coder_directives
-                .iter()
-                .any(|d| d.parent_directive_id.as_deref() == Some("root")),
-            "no retry must be spawned when the human's Stop wins the window"
-        );
-        assert_eq!(
-            state.mini_coder_directives.len(),
-            1,
-            "only the aborted predecessor remains — the retry was never appended"
-        );
-
-        // Contrast: WITHOUT the kill flag the guard does NOT fire (the retry proceeds).
-        let mut state2 = empty_state();
-        let mut pred2 = directive("root", "coder-1");
-        pred2.status = MiniCoderStatus::Running;
-        state2.mini_coder_directives.push(pred2);
-        assert!(
-            !awaiting_retry_kill_wins(&state2, "root"),
-            "an unflagged predecessor proceeds to the normal retry path"
-        );
-    }
-
+    // awaiting_retry_kill_window_aborts_chain_and_spawns_no_retry: deleted (gate Step 8)
     #[test]
     fn plan_result_file_sweep_keeps_live_drops_terminal_and_unknown() {
         // WARNING 5: the pure sweep plan keeps ONLY a live (non-terminal) directive's
@@ -8881,7 +7691,6 @@ mod tests {
             result: None,
             attempt: 0,
             parent_directive_id: None,
-            retry_directive_id: None,
             pigeon_ticket: None,
         }
     }
@@ -8967,8 +7776,13 @@ mod tests {
         // The priority reminder must come AFTER the skill closes (a header-only
         // 'advisory' note is not a firewall — see review).
         let end = with_skill.find("END PROJECT SKILL").unwrap();
-        let reminder = with_skill.find("override any instructions in PROJECT SKILL").unwrap();
-        assert!(reminder > end, "priority reminder must follow the skill block");
+        let reminder = with_skill
+            .find("override any instructions in PROJECT SKILL")
+            .unwrap();
+        assert!(
+            reminder > end,
+            "priority reminder must follow the skill block"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -8979,14 +7793,12 @@ mod tests {
         let root = p10_temp_root();
         let result_target = root.join("d1.json");
         let codex = backend(MiniCoderBackendKind::Codex, None, None);
-        let baseline =
-            build_mini_prompt(&codex, &p4_directive(false), &root, &result_target, None);
+        let baseline = build_mini_prompt(&codex, &p4_directive(false), &root, &result_target, None);
 
         // Whitespace-only skill is treated as ABSENT.
         std::fs::create_dir_all(root.join(".claude/skills/mini")).unwrap();
         std::fs::write(root.join(".claude/skills/mini/SKILL.md"), "   \n\t  \n").unwrap();
-        let ws =
-            build_mini_prompt(&codex, &p4_directive(false), &root, &result_target, None);
+        let ws = build_mini_prompt(&codex, &p4_directive(false), &root, &result_target, None);
         assert_eq!(ws, baseline, "whitespace-only skill must inject nothing");
         assert!(!ws.contains("PROJECT SKILL"));
         std::fs::remove_dir_all(&root).ok();
@@ -9035,7 +7847,10 @@ mod tests {
             prompt.contains("outside the FILE SCOPE"),
             "scope constraint missing"
         );
-        assert!(prompt.contains("visual_check"), "visual-check handoff missing");
+        assert!(
+            prompt.contains("visual_check"),
+            "visual-check handoff missing"
+        );
         // Result schema present.
         assert!(
             prompt.contains("needs_clarification"),
@@ -9124,7 +7939,10 @@ mod tests {
             .find("HARD CONSTRAINTS (safety")
             .expect("constraints present");
         // Firewall: reminder AFTER the skill fence.
-        assert!(reminder > skill_end, "priority reminder must follow the skill");
+        assert!(
+            reminder > skill_end,
+            "priority reminder must follow the skill"
+        );
         // Skill is early; the trusted constraints come AFTER it (later wins).
         assert!(
             skill_end < constraints,
@@ -9185,16 +8003,16 @@ mod tests {
         // Each carries a unique sentinel so "content inlined" is detectable in the prompt.
         let names: Vec<String> = (0..=20).map(|i| format!("f{i:02}.rs")).collect();
         for name in &names {
-            std::fs::write(
-                root.join(name),
-                format!("// SENTINEL_CONTENT_{name}\n"),
-            )
-            .unwrap();
+            std::fs::write(root.join(name), format!("// SENTINEL_CONTENT_{name}\n")).unwrap();
         }
         // Supply the set in REVERSE-alphabetical input order (f20 first, f00 last).
         let mut directive = p4_directive(false);
         directive.files = names.iter().rev().cloned().collect();
-        assert_eq!(directive.files.len(), 21, "must exceed MAX_PROMPT_FILES (20)");
+        assert_eq!(
+            directive.files.len(),
+            21,
+            "must exceed MAX_PROMPT_FILES (20)"
+        );
         assert_eq!(directive.files[0], "f20.rs", "input order is reverse-alpha");
 
         let result_target = root.join("d1.json");
@@ -9358,16 +8176,20 @@ mod tests {
         // assert it is absent from the command's env (get_env reads the env map the child
         // would inherit). Env is process-global; this test owns + restores the exact var.
         let prev = std::env::var(FORBIDDEN_USER_MCP_ENV).ok();
-        std::env::set_var(FORBIDDEN_USER_MCP_ENV, "[{\"name\":\"evil\",\"command\":\"x\"}]");
+        std::env::set_var(
+            FORBIDDEN_USER_MCP_ENV,
+            "[{\"name\":\"evil\",\"command\":\"x\"}]",
+        );
 
         let root = std::env::temp_dir();
         let result_target = root.join("r.json");
         let prompt_file = root.join("p.txt");
         // An oMLX (local-loopback) backend builds a real command on macOS (the sandboxed arm).
         let b = omlx_backend("qwen2.5-coder", "http://127.0.0.1:8000/v1");
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
-            .expect("oMLX mini command builds")
-            .0;
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .expect("oMLX mini command builds")
+                .0;
 
         assert!(
             cmd.get_env(FORBIDDEN_USER_MCP_ENV).is_none(),
@@ -9406,12 +8228,13 @@ mod tests {
     #[test]
     fn mini_thinking_directive_branches_by_family() {
         // Q1: Gemma + North-Mini (no thinking_budget param) get the in-prompt brevity directive.
-        assert!(
-            mini_thinking_directive(Some("gemma-4-26B-A4B-it-OptiQ-4bit")).contains("BRIEFLY")
-        );
+        assert!(mini_thinking_directive(Some("gemma-4-26B-A4B-it-OptiQ-4bit")).contains("BRIEFLY"));
         assert!(mini_thinking_directive(Some("North-Mini-Code-1.0-4bit")).contains("BRIEFLY"));
         // Qwen (bounded via the enable_thinking param) + unknown + None get NO prompt line.
-        assert_eq!(mini_thinking_directive(Some("Qwen3.6-35B-A3B-4bit-DWQ")), "");
+        assert_eq!(
+            mini_thinking_directive(Some("Qwen3.6-35B-A3B-4bit-DWQ")),
+            ""
+        );
         assert_eq!(mini_thinking_directive(Some("llama3.1")), "");
         assert_eq!(mini_thinking_directive(None), "");
     }
@@ -9424,7 +8247,10 @@ mod tests {
         let prompt_file = root.join("fake-prompt.txt");
         let b = backend(MiniCoderBackendKind::Codex, Some("gpt-5-codex"), None);
         // No mcp_roots -> no oracle grant flags.
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let argv = argv_strings(&cmd);
         assert_eq!(argv[0], "powershell.exe");
         let script = argv.last().unwrap();
@@ -9466,7 +8292,9 @@ mod tests {
         // raw-file removal is guarded by Test-Path — it never runs Remove-Item on a
         // non-existent file.
         assert!(
-            script.contains("if (Test-Path -LiteralPath $rawFile) { Remove-Item -LiteralPath $rawFile -Force"),
+            script.contains(
+                "if (Test-Path -LiteralPath $rawFile) { Remove-Item -LiteralPath $rawFile -Force"
+            ),
             "raw capture removal must be Test-Path-guarded: {script}"
         );
         // F4: a non-keyed backend (codex here) carries NO oMLX key-cleanup collateral.
@@ -9477,7 +8305,10 @@ mod tests {
         // P5 test 9 (windows_mini_command_unchanged): Windows is NOT sandboxed this phase.
         // The program is powershell.exe (NOT sandbox-exec), no `.sb` profile is emitted,
         // and the script carries none of the macOS-only sandbox/rlimit collateral.
-        assert_eq!(argv[0], "powershell.exe", "Windows must spawn powershell directly");
+        assert_eq!(
+            argv[0], "powershell.exe",
+            "Windows must spawn powershell directly"
+        );
         assert!(
             !argv.iter().any(|a| a.contains("sandbox-exec")),
             "Windows argv must never reference sandbox-exec: {argv:?}"
@@ -9498,7 +8329,9 @@ mod tests {
         let prompt_file = root.join("p").join("fake-prompt.txt");
         let b = omlx_backend("qwen2.5-coder", "http://localhost:8000/v1");
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let argv = argv_strings(&cmd);
         assert_eq!(argv[0], "powershell.exe");
         let script = argv.last().unwrap();
@@ -9537,7 +8370,9 @@ mod tests {
         );
         // INJECTION-SAFETY: the prompt is NEVER string-concatenated into the JSON body.
         assert!(
-            !script.contains("\"content\":\"' +") && !script.contains("'+ $prompt") && !script.contains("+ $prompt +"),
+            !script.contains("\"content\":\"' +")
+                && !script.contains("'+ $prompt")
+                && !script.contains("+ $prompt +"),
             "prompt must NOT be concatenated into the JSON: {script}"
         );
         assert!(
@@ -9566,7 +8401,8 @@ mod tests {
             "Qwen-gated chat_template_kwargs missing from PS body: {script}"
         );
         // The fix-pass variant carries thinking ON.
-        let fix_run = build_omlx_run_windows("http://localhost:8000/v1", "qwen2.5-coder", None, true);
+        let fix_run =
+            build_omlx_run_windows("http://localhost:8000/v1", "qwen2.5-coder", None, true);
         assert!(
             fix_run.contains("enable_thinking = $true"),
             "fix pass must enable thinking: {fix_run}"
@@ -9616,7 +8452,9 @@ mod tests {
         let b = omlx_backend("m", "http://127.0.0.1:8000");
         // No key file passed (the default; omlx_api_key returns None today).
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let argv = argv_strings(&cmd);
         let script = argv.last().unwrap();
         // No auth header construction anywhere (no key configured).
@@ -9639,7 +8477,9 @@ mod tests {
         // F5: the raw-file removal is guarded by Test-Path (codex writes no raw file; here
         // the wrapper does, but the guard is uniform and harmless).
         assert!(
-            script.contains("if (Test-Path -LiteralPath $rawFile) { Remove-Item -LiteralPath $rawFile"),
+            script.contains(
+                "if (Test-Path -LiteralPath $rawFile) { Remove-Item -LiteralPath $rawFile"
+            ),
             "raw-file removal must be Test-Path-guarded: {script}"
         );
     }
@@ -9668,7 +8508,8 @@ mod tests {
 
         // The token is read from the env-passed FILE and sent as a Bearer header.
         assert!(
-            script.contains("$env:OMLX_KEY_FILE") && script.contains("Get-Content -Raw -LiteralPath $env:OMLX_KEY_FILE"),
+            script.contains("$env:OMLX_KEY_FILE")
+                && script.contains("Get-Content -Raw -LiteralPath $env:OMLX_KEY_FILE"),
             "key must be read from the env-passed file: {script}"
         );
         assert!(
@@ -9714,7 +8555,10 @@ mod tests {
         let result_target = root.join("d1.json");
         let prompt_file = root.join("p").join("fake-prompt.txt");
         let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let script = argv_strings(&cmd).pop().unwrap();
         // The prompt read is inside the try (the try opens before Get-Content).
         let try_idx = script.find("try {").expect("try block");
@@ -9762,8 +8606,17 @@ mod tests {
             None,
             Some("this_executable_does_not_exist_xyz"),
         );
-        let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd = build_mini_command_impl(
+            &b,
+            &scratch,
+            &result_target,
+            &prompt_file,
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
         let script = argv_strings(&cmd).pop().unwrap();
         let _ = Command::new("powershell.exe")
             .args([
@@ -9803,8 +8656,17 @@ mod tests {
             management_root: PathBuf::from("C:/mgmt"),
             projects_dir: PathBuf::from("C:/mgmt/projects"),
         };
-        let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots), false).unwrap().0;
+        let cmd = build_mini_command_impl(
+            &b,
+            &root,
+            &result_target,
+            &prompt_file,
+            None,
+            Some(&roots),
+            false,
+        )
+        .unwrap()
+        .0;
         let script = argv_strings(&cmd).pop().unwrap();
         assert!(
             !script.contains("mcp_servers"),
@@ -9840,8 +8702,7 @@ mod tests {
         );
         super::super::projects::remove_restricted_temp_file(&build.prompt_file.unwrap());
 
-        let build =
-            build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
+        let build = build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
         let script = argv_strings(&build.command).pop().unwrap();
         assert!(
             !script.contains("mcp_servers"),
@@ -9874,10 +8735,16 @@ mod tests {
 
         assert!(!prompt_file.exists(), "prompt file must be removed");
         assert!(!key_file.exists(), "key file must be removed (no leak)");
-        assert!(!profile_file.exists(), "profile .sb file must be removed (no leak)");
+        assert!(
+            !profile_file.exists(),
+            "profile .sb file must be removed (no leak)"
+        );
         assert!(!prompt_dir.exists(), "prompt dir must be removed");
         assert!(!key_dir.exists(), "key dir must be removed (no leak)");
-        assert!(!profile_dir.exists(), "profile dir must be removed (no leak)");
+        assert!(
+            !profile_dir.exists(),
+            "profile dir must be removed (no leak)"
+        );
     }
 
     #[cfg(windows)]
@@ -9887,7 +8754,10 @@ mod tests {
         let result_target = root.join("d1.json");
         let prompt_file = root.join("fake-prompt.txt");
         let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let script = argv_strings(&cmd).pop().unwrap();
         assert!(
             script.contains("ollama run 'qwen2.5-coder'"),
@@ -9941,7 +8811,10 @@ mod tests {
         // The user's CLI command. Any API key must come from the CLI's OWN env, not
         // from us — we never inject a key, so it can't be on argv.
         let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat --json"));
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let argv = argv_strings(&cmd);
         let script = argv.last().unwrap();
         // BLOCKER 1 / WARNING 5: the multi-word command is piped to WITHOUT the `&`
@@ -10062,14 +8935,32 @@ mod tests {
     fn omlx_macos_run_posts_via_python_urllib_json_dumps_env_only() {
         // prompt_path arrives sh-quoted (as the macOS arm passes it).
         let prompt_q = "'/tmp/aspis-agent-prompt-abc.d/p.txt'";
-        let run = build_omlx_run_macos("http://localhost:8000/v1", "qwen2.5-coder", prompt_q, false, false);
+        let run = build_omlx_run_macos(
+            "http://localhost:8000/v1",
+            "qwen2.5-coder",
+            prompt_q,
+            false,
+            false,
+        );
 
         // stdlib python3 + urllib, NO curl/jq.
-        assert!(run.contains("python3 - <<'OMLXEOF'"), "must use a python3 heredoc: {run}");
-        assert!(run.contains("import urllib.request"), "must use stdlib urllib: {run}");
-        assert!(!run.contains("curl") && !run.contains("jq "), "must not shell out to curl/jq: {run}");
+        assert!(
+            run.contains("python3 - <<'OMLXEOF'"),
+            "must use a python3 heredoc: {run}"
+        );
+        assert!(
+            run.contains("import urllib.request"),
+            "must use stdlib urllib: {run}"
+        );
+        assert!(
+            !run.contains("curl") && !run.contains("jq "),
+            "must not shell out to curl/jq: {run}"
+        );
         // Body via json.dumps ENCODER (injection-safe), prompt as a VALUE.
-        assert!(run.contains("json.dumps("), "body must be json.dumps-encoded: {run}");
+        assert!(
+            run.contains("json.dumps("),
+            "body must be json.dumps-encoded: {run}"
+        );
         assert!(
             run.contains("'content': prompt"),
             "prompt must ride as a json.dumps VALUE: {run}"
@@ -10101,7 +8992,13 @@ mod tests {
                 && run.contains("body_dict['chat_template_kwargs'] = {'enable_thinking': False}"),
             "Qwen-gated chat_template_kwargs missing from python body: {run}"
         );
-        let fix_run = build_omlx_run_macos("http://localhost:8000/v1", "qwen2.5-coder", prompt_q, false, true);
+        let fix_run = build_omlx_run_macos(
+            "http://localhost:8000/v1",
+            "qwen2.5-coder",
+            prompt_q,
+            false,
+            true,
+        );
         assert!(
             fix_run.contains("{'enable_thinking': True}"),
             "fix pass must enable thinking: {fix_run}"
@@ -10127,7 +9024,9 @@ mod tests {
         let expected_timeout =
             super::mini_coder::DEFAULT_WALL_CLOCK_CAP_SECS - OMLX_HTTP_TIMEOUT_MARGIN_SECS;
         assert!(
-            run.contains(&format!("OMLX_TIMEOUT={expected_timeout}\nexport OMLX_TIMEOUT")),
+            run.contains(&format!(
+                "OMLX_TIMEOUT={expected_timeout}\nexport OMLX_TIMEOUT"
+            )),
             "HTTP timeout must be exported via env, derived from the wall-clock cap: {run}"
         );
         assert!(
@@ -10145,7 +9044,10 @@ mod tests {
             run.contains("data['choices'][0]['message']['content']"),
             "must extract choices[0].message.content: {run}"
         );
-        assert!(run.contains("sys.stdout.write(content)"), "content to stdout: {run}");
+        assert!(
+            run.contains("sys.stdout.write(content)"),
+            "content to stdout: {run}"
+        );
         // FAILURE = SILENCE: any exception prints nothing (the outer try wraps the whole
         // request; its handler is a bare `pass`, so a non-2xx HTTPError / refused
         // connection / missing field writes no stdout and the wrapper emits the failed
@@ -10160,7 +9062,10 @@ mod tests {
             "the catch-all handler must be a bare pass (no stdout on error): {run}"
         );
         // No-key case: key env cleared, no Authorization unless a key path is present.
-        assert!(run.contains("unset OMLX_KEY_FILE"), "no-key case must clear the key env: {run}");
+        assert!(
+            run.contains("unset OMLX_KEY_FILE"),
+            "no-key case must clear the key env: {run}"
+        );
     }
 
     #[test]
@@ -10168,7 +9073,10 @@ mod tests {
         let prompt_q = "'/tmp/p.d/p.txt'";
         let run = build_omlx_run_macos("http://127.0.0.1:8000", "m", prompt_q, true, false);
         // The key path rides env; python reads the FILE and sends a Bearer header.
-        assert!(run.contains("export OMLX_KEY_FILE"), "key env must be exported when keyed: {run}");
+        assert!(
+            run.contains("export OMLX_KEY_FILE"),
+            "key env must be exported when keyed: {run}"
+        );
         assert!(
             run.contains("key_path = os.environ.get('OMLX_KEY_FILE')")
                 && run.contains("with open(key_path"),
@@ -10179,7 +9087,10 @@ mod tests {
             "token must ride an Authorization: Bearer header: {run}"
         );
         // The token VALUE never appears literally — only the file is read.
-        assert!(!run.contains("Bearer sk-"), "no literal token in the script: {run}");
+        assert!(
+            !run.contains("Bearer sk-"),
+            "no literal token in the script: {run}"
+        );
     }
 
     #[test]
@@ -10220,7 +9131,10 @@ mod tests {
         );
         // The literal key path must NOT appear inside the trap body (only the var does).
         let trap_idx = preamble.find("trap '").unwrap();
-        let trap_end = preamble[trap_idx..].find('\n').map(|o| trap_idx + o).unwrap();
+        let trap_end = preamble[trap_idx..]
+            .find('\n')
+            .map(|o| trap_idx + o)
+            .unwrap();
         assert!(
             !preamble[trap_idx..trap_end].contains("aspis-agent-prompt-key.d"),
             "literal key path must not be embedded in the trap body"
@@ -10237,8 +9151,7 @@ mod tests {
         let b = backend(MiniCoderBackendKind::Codex, None, None);
         let directive = p4_directive(false);
         let prompt = build_mini_prompt(&b, &directive, &root, &result_target, None);
-        let build =
-            build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
+        let build = build_mini_command(&b, &root, &result_target, &prompt, None, false).unwrap();
         let prompt_file = build.prompt_file.expect("a prompt file is created");
         let joined = argv_strings(&build.command).join(" ");
         // The full prompt body (the task text) must NOT be on argv.
@@ -10334,8 +9247,17 @@ mod tests {
         // FAIL. Native tokenization splits it correctly.
         let command = format!("cmd /c type {}", json_file.to_string_lossy());
         let b = backend(MiniCoderBackendKind::Api, None, Some(command.as_str()));
-        let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd = build_mini_command_impl(
+            &b,
+            &scratch,
+            &result_target,
+            &prompt_file,
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
         let script = argv_strings(&cmd).pop().unwrap();
 
         let status = Command::new("powershell.exe")
@@ -10384,17 +9306,35 @@ mod tests {
 
         // Port 1 on loopback: nothing listens -> immediate connection refused.
         let b = omlx_backend("any-model", "http://127.0.0.1:1");
-        let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd = build_mini_command_impl(
+            &b,
+            &scratch,
+            &result_target,
+            &prompt_file,
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
         let script = argv_strings(&cmd).pop().unwrap();
 
         let status = Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
             .current_dir(&scratch)
             .status()
             .expect("run omlx script");
         // The script must NOT propagate the HTTP error (try/catch + exit 0).
-        assert!(status.success(), "omlx script must exit 0 even when the server is down");
+        assert!(
+            status.success(),
+            "omlx script must exit 0 even when the server is down"
+        );
 
         let written = std::fs::read_to_string(&result_target).expect("result file written");
         let parsed: serde_json::Value =
@@ -10432,7 +9372,10 @@ mod tests {
         let result_target = root.join("d1.json");
         let prompt_file = root.join("p.txt");
         let b = backend(MiniCoderBackendKind::Api, None, Some("mycli chat --json"));
-        let cmd = build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd =
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let script = macos_script(&cmd);
         assert!(
             script.contains("cat '") && script.contains("| mycli chat --json"),
@@ -10460,9 +9403,7 @@ mod tests {
         let prompt_dir_idx = script
             .find("_MINI_PROMPT_DIR=")
             .expect("prompt-dir var assigned");
-        let trap_idx = script
-            .find("trap 'rm -rf ")
-            .expect("trap cleanup present");
+        let trap_idx = script.find("trap 'rm -rf ").expect("trap cleanup present");
         assert!(
             prompt_dir_idx < trap_idx,
             "the _MINI_PROMPT_DIR assignment must precede the trap: {script}"
@@ -10500,8 +9441,16 @@ mod tests {
         let b = backend(MiniCoderBackendKind::Ollama, Some("qwen2.5-coder"), None);
         // ollama (no base_url == loopback) is SANDBOXED on macOS, so a `.sb` temp is created;
         // we only inspect the script string here, so clean it up at the end.
-        let (cmd, profile) =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap();
+        let (cmd, profile) = build_mini_command_impl(
+            &b,
+            &scratch,
+            &result_target,
+            &prompt_file,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let script = macos_script(&cmd);
         // The path VARIABLES are assigned first (whitespace-safe indirection), then the
         // trap references them via double-quoted `$_MINI_*` expansions on EXIT.
@@ -10552,8 +9501,17 @@ mod tests {
             echoed.to_string_lossy()
         );
         let b = backend(MiniCoderBackendKind::Api, None, Some(command.as_str()));
-        let cmd =
-            build_mini_command_impl(&b, &scratch, &result_target, &prompt_file, None, None, false).unwrap().0;
+        let cmd = build_mini_command_impl(
+            &b,
+            &scratch,
+            &result_target,
+            &prompt_file,
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
         let script = macos_script(&cmd);
         let status = Command::new("/bin/sh")
             .args(["-c", &script])
@@ -10591,8 +9549,17 @@ mod tests {
             management_root: PathBuf::from("/mgmt"),
             projects_dir: PathBuf::from("/mgmt/projects"),
         };
-        let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, Some(&roots), false).unwrap().0;
+        let cmd = build_mini_command_impl(
+            &b,
+            &root,
+            &result_target,
+            &prompt_file,
+            None,
+            Some(&roots),
+            false,
+        )
+        .unwrap()
+        .0;
         let script = macos_script(&cmd);
         // Every arg is single-quoted by sh_single_quote_local (semantically
         // identical for /bin/sh: 'exec' is still the literal word exec).
@@ -10610,7 +9577,9 @@ mod tests {
         );
 
         let cmd =
-            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false).unwrap().0;
+            build_mini_command_impl(&b, &root, &result_target, &prompt_file, None, None, false)
+                .unwrap()
+                .0;
         let script = macos_script(&cmd);
         assert!(
             !script.contains("mcp_servers"),
@@ -10667,8 +9636,7 @@ mod tests {
         let raw_path = sh_single_quote_local(&format!("{}.raw", result_target.to_string_lossy()));
 
         // Exactly what the truncation arm emits (see build oMLX wrapper).
-        let model_line =
-            r#"{"status":"failed","output":"generation truncated at max_tokens (4096) — increase budget or reduce scope"}"#;
+        let model_line = r#"{"status":"failed","output":"generation truncated at max_tokens (4096) — increase budget or reduce scope"}"#;
         let run = format!("printf '%s' {}", sh_single_quote_local(model_line));
         let wrapper = macos_stdout_to_result_wrapper(&run, &result_path, &raw_path);
 
@@ -10707,7 +9675,8 @@ mod tests {
         let result_path = sh_single_quote_local(&result_target.to_string_lossy());
         let raw_path = sh_single_quote_local(&format!("{}.raw", result_target.to_string_lossy()));
 
-        let model_line = r#"{"status":"failed","output":"transient"} then {"status":"done","output":"ok"}"#;
+        let model_line =
+            r#"{"status":"failed","output":"transient"} then {"status":"done","output":"ok"}"#;
         let run = format!("printf '%s' {}", sh_single_quote_local(model_line));
         let wrapper = macos_stdout_to_result_wrapper(&run, &result_path, &raw_path);
 
@@ -10719,7 +9688,10 @@ mod tests {
 
         let written = std::fs::read_to_string(&result_target).expect("result file");
         let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
-        assert_eq!(parsed["status"], "done", "terminal done must win: {written}");
+        assert_eq!(
+            parsed["status"], "done",
+            "terminal done must win: {written}"
+        );
         assert_eq!(parsed["output"], "ok", "got: {written}");
         std::fs::remove_dir_all(&scratch).ok();
     }
@@ -10758,8 +9730,7 @@ mod tests {
     #[test]
     fn seatbelt_profile_writes_only_parameterized_paths() {
         // Use real, existing dirs so canonicalize resolves them deterministically.
-        let base = std::env::temp_dir()
-            .join(format!("mc_sb2_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("mc_sb2_{}", std::process::id()));
         let project_root = base.join("project");
         let scratch = base.join("scratch");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -10902,14 +9873,24 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert_eq!(argv[0], "/usr/bin/sandbox-exec", "must wrap with sandbox-exec");
+        assert_eq!(
+            argv[0], "/usr/bin/sandbox-exec",
+            "must wrap with sandbox-exec"
+        );
         assert_eq!(argv[1], "-f", "must pass the profile via -f");
-        assert!(argv[2].ends_with(".txt"), "argv[2] must be the .sb profile path: {argv:?}");
+        assert!(
+            argv[2].ends_with(".txt"),
+            "argv[2] must be the .sb profile path: {argv:?}"
+        );
         assert_eq!(argv[3], "/bin/sh", "the wrapped interpreter is /bin/sh");
         assert_eq!(argv[4], "-c", "the wrapped shell runs -c <script>");
         let profile = profile.expect("a profile temp must be returned for cleanup");
         // The path passed to -f is the returned profile path.
-        assert_eq!(argv[2], profile.to_string_lossy(), "argv -f path == returned profile");
+        assert_eq!(
+            argv[2],
+            profile.to_string_lossy(),
+            "argv -f path == returned profile"
+        );
         super::super::projects::remove_restricted_temp_file(&profile);
     }
 
@@ -10969,7 +9950,10 @@ mod tests {
             "/bin/sh",
             "a non-loopback oMLX URL must NOT be wrapped in sandbox-exec"
         );
-        assert!(profile.is_none(), "non-loopback oMLX must carry no .sb profile");
+        assert!(
+            profile.is_none(),
+            "non-loopback oMLX must carry no .sb profile"
+        );
         let script = macos_script(&cmd);
         assert!(
             !script.contains("ulimit -t"),
@@ -11175,8 +10159,7 @@ mod tests {
 
         // Build a project_root / scratch_root structure:
         //   <tmp>/project_root/.aspis-mini/
-        let base = std::env::temp_dir()
-            .join(format!("mc_train_rail_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("mc_train_rail_{}", std::process::id()));
         let project_root = base.join("project_root");
         let scratch = project_root.join(".aspis-mini");
         std::fs::create_dir_all(&scratch).unwrap();
@@ -11198,7 +10181,9 @@ mod tests {
         outcome.files_touched = vec!["src/a.rs".into()];
 
         // Derive project_root exactly as finalize_finished_mini does: parent of scratch.
-        let derived_root = Path::new(d.scratch_path.as_deref().unwrap()).parent().unwrap();
+        let derived_root = Path::new(d.scratch_path.as_deref().unwrap())
+            .parent()
+            .unwrap();
         assert_eq!(
             derived_root.canonicalize().ok(),
             project_root.canonicalize().ok(),
@@ -11209,10 +10194,11 @@ mod tests {
         training_export::record_directive_result(derived_root, &d, &outcome);
 
         // Verify a `directive_result` line was written to pairs.jsonl.
-        let pairs_path = project_root
-            .join(".aspis-training")
-            .join("pairs.jsonl");
-        assert!(pairs_path.exists(), ".aspis-training/pairs.jsonl must be created");
+        let pairs_path = project_root.join(".aspis-training").join("pairs.jsonl");
+        assert!(
+            pairs_path.exists(),
+            ".aspis-training/pairs.jsonl must be created"
+        );
         let body = std::fs::read_to_string(&pairs_path).unwrap();
         let lines: Vec<serde_json::Value> = body
             .lines()

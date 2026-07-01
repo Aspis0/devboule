@@ -532,9 +532,9 @@ fn has_plan_tasks(views: &[TaskView]) -> bool {
 ///   no plan tasks at all; the caller MUST check `has_plan_tasks` to distinguish them).
 /// * exactly 1 → that planId.
 /// * >1 → the group whose tasks have the most-recent `updatedAt` (lexicographic max of the
-///   ISO-8601 timestamps within each group; the freshest-touched plan wins). The
-///   ambiguous-multi-plan case is an edge we document + resolve deterministically; the
-///   caller logs which planId was chosen.
+///   > ISO-8601 timestamps within each group; the freshest-touched plan wins). The
+///   > ambiguous-multi-plan case is an edge we document + resolve deterministically; the
+///   > caller logs which planId was chosen.
 fn select_active_plan(views: &[TaskView]) -> Option<String> {
     // plan_id -> (has_unfinished, max_updated_at)
     let mut groups: HashMap<&str, (bool, &str)> = HashMap::new();

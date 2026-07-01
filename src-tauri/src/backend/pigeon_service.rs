@@ -148,7 +148,7 @@ fn pigeon_package_root(app: &AppHandle) -> Option<PathBuf> {
     }
     #[cfg(debug_assertions)]
     {
-        return std::env::current_dir().ok();
+        std::env::current_dir().ok()
     }
     #[cfg(not(debug_assertions))]
     {

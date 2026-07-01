@@ -1673,7 +1673,7 @@ fn marketplace_preview_impl(url: &str) -> Result<MarketplacePreview, String> {
         MARKETPLACE_FETCH_MAX_BYTES,
         MARKETPLACE_FETCH_TIMEOUT_SECS,
     )?;
-    Ok(preview_from_content(&content, &validated.to_string()))
+    Ok(preview_from_content(&content, validated.as_ref()))
 }
 
 // ---- TDD CONTRACT for F-spec.3: the marketplace preview must surface agentskills.io conformance

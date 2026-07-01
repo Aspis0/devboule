@@ -270,7 +270,17 @@ SCW_OBJECT_ACCESS_KEY_ENVS = ("ASPIS_SCALEWAY_OBJECT_ACCESS_KEY", "SCW_ACCESS_KE
 SCW_OBJECT_SECRET_KEY_ENVS = ("ASPIS_SCALEWAY_OBJECT_SECRET_KEY", "SCW_S3_SECRET_KEY")
 INFOMANIAK_TOKEN_ENVS = ("ASPIS_INFOMANIAK_API_TOKEN", "INFOMANIAK_API_TOKEN")
 MISTRAL_TOKEN_ENVS = ("ASPIS_MISTRAL_API_KEY", "MISTRAL_API_KEY")
-SCW_ZONES = ("fr-par-1", "fr-par-2", "fr-par-3", "nl-ams-1", "nl-ams-2", "nl-ams-3", "pl-waw-1", "pl-waw-2", "pl-waw-3")
+SCW_ZONES = (
+    "fr-par-1",
+    "fr-par-2",
+    "fr-par-3",
+    "nl-ams-1",
+    "nl-ams-2",
+    "nl-ams-3",
+    "pl-waw-1",
+    "pl-waw-2",
+    "pl-waw-3",
+)
 SCW_REGIONS = ("fr-par", "nl-ams", "pl-waw")
 _MCP_ENGINE_CACHE: dict[str, Any] = {}
 _MCP_INDEX_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -294,8 +304,8 @@ ROLE_RULES = [
         # (not in the verbatim-mirrored `contract`) because the mandate differs per
         # role; the Rust copy is English (UI), this one Italian (agents read it).
         "censor": [
-            "A ogni confine di step chiama censor_findings(project_id, file=<file toccati>) per i file che hai modificato.",
-            "Correggi i finding locali reali; chiudi i falsi positivi con censor_dispose(disposition=\"fp\").",
+            "A ogni confine di step chiama censor_findings(project_id, file=<file toccati>, drain_queue=True) per svuotare i finding asincroni accumulati nella coda persistente.",
+            'Correggi i finding locali reali; chiudi i falsi positivi con censor_dispose(disposition="fp").',
             "Raggruppa al confine di step: non e un'interruzione live, e una verifica batch prima di passare al passo successivo.",
         ],
         # Phase 1 plan-approval + reply-box mandate. Dedicated `plan` field (not in
@@ -306,9 +316,9 @@ ROLE_RULES = [
         # stallare nel terminale.
         "plan": [
             "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare l'implementazione prima di status=\"approved\".",
-            "APPENA approvato (status=\"approved\") chiama SUBITO project_create_plan_tasks con la lista strutturata dei task: il Kanban ha ZERO task finche' non lo fai, quindi NON iniziare a scrivere codice prima. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per FASE del piano, ognuna OBBLIGATORIAMENTE con {id, title} piu' opzionali {acceptance, scope:[file], dependsOn}. `id` e' un riferimento interno breve che assegni tu (es. \"P1\", \"P2\"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata (es. [\"P1\"]) — NON i numeri T del Kanban (li alloca il server rimappando i tuoi riferimenti).",
+            'APPENA approvato (status="approved") chiama SUBITO project_create_plan_tasks con la lista strutturata dei task: il Kanban ha ZERO task finche\' non lo fai, quindi NON iniziare a scrivere codice prima. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per FASE del piano, ognuna OBBLIGATORIAMENTE con {id, title} piu\' opzionali {acceptance, scope:[file], dependsOn}. `id` e\' un riferimento interno breve che assegni tu (es. "P1", "P2"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata (es. ["P1"]) — NON i numeri T del Kanban (li alloca il server rimappando i tuoi riferimenti).',
             "Calibra le domande sulla complessita': per un task non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per task semplici/ovvi salta le domande e pianifica direttamente. Non sovra-consultare su lavori banali.",
-            "Se il piano viene rifiutato (status=\"rejected\") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.",
+            'Se il piano viene rifiutato (status="rejected") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.',
             "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
         ],
         # GH-P5 cooperative push mandate (mirrored in Rust default_role_rules
@@ -320,7 +330,7 @@ ROLE_RULES = [
         "push": [
             "Committa liberamente (git add -u / git commit) per salvare il lavoro.",
             "NON fare mai un `git push` grezzo: il tuo ambiente non ha credenziali git e fallira. Per pubblicare chiama il tool MCP `request_git_push`; un umano lo approva.",
-            "Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\"). NON riprovare, NON tentare un push grezzo, NON aggirare il gate.",
+            'Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all\'umano via needs_user (agent_heartbeat status="needs_user"). NON riprovare, NON tentare un push grezzo, NON aggirare il gate.',
         ],
         "allowedTools": [
             "agent_register",
@@ -369,7 +379,7 @@ ROLE_RULES = [
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
             "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
         ],
     },
     {
@@ -386,10 +396,10 @@ ROLE_RULES = [
         # lavoro multi-file l'orchestrator sottomette il piano e ASPETTA
         # l'approvazione umana — "mai full-auto non presidiato".
         "plan": [
-            "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare la delega prima di status=\"approved\".",
-            "APPENA approvato (status=\"approved\") chiama SUBITO project_create_plan_tasks con UNA targhetta per FASE del piano: il Kanban ha ZERO task finche' non lo fai. Crea i task PRIMA di delegare, poi delega in ordine di dipendenza. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per fase, ognuna OBBLIGATORIAMENTE con {id, title} piu' opzionali {acceptance, scope:[file], dependsOn}. `id` e' un riferimento interno breve che assegni tu (es. \"P1\"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata — NON i numeri T del Kanban (li alloca il server).",
+            'Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l\'approvazione umana: non iniziare la delega prima di status="approved".',
+            'APPENA approvato (status="approved") chiama SUBITO project_create_plan_tasks con UNA targhetta per FASE del piano: il Kanban ha ZERO task finche\' non lo fai. Crea i task PRIMA di delegare, poi delega in ordine di dipendenza. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per fase, ognuna OBBLIGATORIAMENTE con {id, title} piu\' opzionali {acceptance, scope:[file], dependsOn}. `id` e\' un riferimento interno breve che assegni tu (es. "P1"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata — NON i numeri T del Kanban (li alloca il server).',
             "Calibra le domande sulla complessita': per un obiettivo non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per richieste semplici/ovvie pianifica direttamente senza sovra-consultare.",
-            "Se il piano viene rifiutato (status=\"rejected\") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.",
+            'Se il piano viene rifiutato (status="rejected") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.',
             "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
         ],
         # Cooperative push mandate (identical to the coder's): commit freely, never
@@ -437,7 +447,7 @@ ROLE_RULES = [
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
             "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
         ],
     },
     {
@@ -481,7 +491,7 @@ ROLE_RULES = [
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
             "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
         ],
     },
     {
@@ -499,15 +509,12 @@ ROLE_RULES = [
         ],
         "contract": [
             "Dichiara il modello (`model`) ad agent_register.",
-            "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context / project_structure.",
+            'Registrati con agent_register (role="mini") prima di chiamare oracle_context / project_structure.',
         ],
     },
 ]
 
-ROLE_ALLOWED_TOOLS = {
-    rule["role"]: set(rule["allowedTools"])
-    for rule in ROLE_RULES
-}
+ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_RULES}
 
 
 TOOLS = [
@@ -951,6 +958,7 @@ TOOLS = [
         "parameters": {
             "project_id": {"type": "string"},
             "file": {"type": "string", "default": ""},
+            "drain_queue": {"type": "boolean", "default": False},
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
@@ -963,7 +971,10 @@ TOOLS = [
             "project_id": {"type": "string"},
             "file": {"type": "string"},
             "id": {"type": "string"},
-            "disposition": {"type": "string", "enum": sorted({"open", "fixed", "fp", "wontfix"})},
+            "disposition": {
+                "type": "string",
+                "enum": sorted({"open", "fixed", "fp", "wontfix"}),
+            },
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
@@ -1305,14 +1316,19 @@ def normalize_project_status(value: str) -> str:
 
 
 def normalize_provider_name(value: str) -> str:
-    return "-".join(part for part in re.split(r"[\s_-]+", str(value or "").strip().lower()) if part)
+    return "-".join(
+        part for part in re.split(r"[\s_-]+", str(value or "").strip().lower()) if part
+    )
 
 
 def validate_management_root(candidate: Path) -> Path:
     root = candidate.expanduser().resolve()
     if root.name == "src-tauri" and root.parent.joinpath("config.json").exists():
         root = root.parent.resolve()
-    if not root.joinpath("config.json").is_file() or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file():
+    if (
+        not root.joinpath("config.json").is_file()
+        or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file()
+    ):
         raise McpError(
             "Aspis MCP management root is invalid. Run from Aspis Management, pass --root, or set ASPIS_MANAGEMENT_ROOT."
         )
@@ -1333,7 +1349,11 @@ def approved_work_root_parents(management_root: Path | None = None) -> list[Path
             parents.append(management_root.expanduser().resolve())
         except OSError:
             pass
-    for env_name in ("ASPIS_WORKSPACE_ROOT", "ASPIS_BIO_WORKSPACE_ROOT", "ASPIS_BIO_ROOT"):
+    for env_name in (
+        "ASPIS_WORKSPACE_ROOT",
+        "ASPIS_BIO_WORKSPACE_ROOT",
+        "ASPIS_BIO_ROOT",
+    ):
         env_value = os.environ.get(env_name)
         if env_value and env_value.strip():
             try:
@@ -1362,7 +1382,9 @@ def path_is_within(child: Path, parent: Path) -> bool:
         return False
 
 
-def validate_project_work_root(candidate: Path, management_root: Path | None = None) -> Path:
+def validate_project_work_root(
+    candidate: Path, management_root: Path | None = None
+) -> Path:
     root = candidate.expanduser().resolve()
     home = Path.home().resolve()
     broad_roots = {home}
@@ -1404,7 +1426,9 @@ def resolve_root(root: str | Path | None = None) -> Path:
     return validate_management_root(Path.cwd())
 
 
-def resolve_projects_dir(root: str | Path | None = None, projects_dir: str | Path | None = None) -> Path:
+def resolve_projects_dir(
+    root: str | Path | None = None, projects_dir: str | Path | None = None
+) -> Path:
     management_root = resolve_root(root)
     os.environ["ASPIS_MANAGEMENT_ROOT"] = str(management_root)
     env_dir = str(projects_dir or os.environ.get("ASPIS_PROJECTS_DIR") or "").strip()
@@ -1466,7 +1490,9 @@ def oracle_index_root_for_args(projects_dir: Path, args: dict[str, Any]) -> Path
     return management_root
 
 
-def ensure_oracle_index_ready(projects_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
+def ensure_oracle_index_ready(
+    projects_dir: Path, args: dict[str, Any]
+) -> dict[str, Any]:
     root = oracle_index_root_for_args(projects_dir, args)
     if not root.is_dir():
         # PRIVACY: basename only — the absolute path would leak the OS username.
@@ -1493,15 +1519,27 @@ def ensure_oracle_index_ready(projects_dir: Path, args: dict[str, Any]) -> dict[
         manifest = load_manifest(manifest_path)
         manifest_files = manifest_files_for_root(manifest, root, create=False)
         sqlite = SQLiteStore(paths["sqlite"])
-        output_paths = {paths["sqlite"].resolve(), paths["chunks"].resolve(), manifest_path.resolve()}
-        files = [path for path in collect_text_files(root) if path.resolve() not in output_paths]
+        output_paths = {
+            paths["sqlite"].resolve(),
+            paths["chunks"].resolve(),
+            manifest_path.resolve(),
+        }
+        files = [
+            path
+            for path in collect_text_files(root)
+            if path.resolve() not in output_paths
+        ]
         expected = {path.relative_to(root).as_posix() for path in files}
         indexed = set(manifest_files)
-        pending = sorted(expected - indexed, key=lambda item: (priority_rank(item), item))
+        pending = sorted(
+            expected - indexed, key=lambda item: (priority_rank(item), item)
+        )
         stale = []
         for path in files:
             file_id = path.relative_to(root).as_posix()
-            if file_id in indexed and file_needs_index(path, root, manifest_files, sqlite):
+            if file_id in indexed and file_needs_index(
+                path, root, manifest_files, sqlite
+            ):
                 stale.append(file_id)
         status = {
             # PRIVACY: store only the basename. This dict is forwarded into the
@@ -1518,12 +1556,9 @@ def ensure_oracle_index_ready(projects_dir: Path, args: dict[str, Any]) -> dict[
         }
         mcp_debug(projects_dir, "oracle_index status ok")
         _MCP_INDEX_STATUS_CACHE[cache_key] = (time.monotonic(), status)
-    if (
-        int(status.get("expected_files") or 0) > 0
-        and (
-            int(status.get("indexed_files") or 0) == 0
-            or int(status.get("sqlite_chunks") or 0) == 0
-        )
+    if int(status.get("expected_files") or 0) > 0 and (
+        int(status.get("indexed_files") or 0) == 0
+        or int(status.get("sqlite_chunks") or 0) == 0
     ):
         # PRIVACY: no absolute paths in the message (the index root may reveal a
         # user home directory). Keep it ACTIONABLE for an agent operator.
@@ -1550,9 +1585,7 @@ def enforce_mini_oracle_project_scope(
         return
     with file_lock(projects_dir / f"{AGENTS_STATE_FILE}.lock"):
         state = read_agents_state(projects_dir)
-    session = next(
-        (s for s in state["sessions"] if s.get("agentId") == agent_id), None
-    )
+    session = next((s for s in state["sessions"] if s.get("agentId") == agent_id), None)
     own = str((session or {}).get("currentProjectId") or "").strip()
     if requested != own:
         raise McpError(
@@ -1561,7 +1594,9 @@ def enforce_mini_oracle_project_scope(
         )
 
 
-def oracle_allowed_file_ids(projects_dir: Path, args: dict[str, Any]) -> set[str] | None:
+def oracle_allowed_file_ids(
+    projects_dir: Path, args: dict[str, Any]
+) -> set[str] | None:
     paths = mcp_oracle_paths(projects_dir)
     manifest_path = paths["root"] / "oracle-data" / "chunk-index-manifest.json"
     from oracle.ingestion.chunk_index import load_manifest, manifest_files_for_root
@@ -1656,10 +1691,14 @@ def validate_launch_token_for_registration(
     role: str,
     launch_token: str | None,
 ) -> dict[str, Any] | None:
-    session = next((item for item in state["sessions"] if item.get("agentId") == agent_id), None)
+    session = next(
+        (item for item in state["sessions"] if item.get("agentId") == agent_id), None
+    )
     if session is None:
         if not unmanaged_privileged_agents_allowed():
-            raise McpError("Agent registration requires an app-issued launch token from Aspis Management.")
+            raise McpError(
+                "Agent registration requires an app-issued launch token from Aspis Management."
+            )
         return None
     # MINOR 2 (defense-in-depth): use the NON-raising `coerce_role` on the STORED
     # role, not the raising `normalize_role`. `normalize_role` is correct for inbound
@@ -1678,15 +1717,24 @@ def validate_launch_token_for_registration(
     if expected_hash:
         token = str(launch_token or "").strip()
         if not token:
-            raise McpError("Agent registration requires the app-issued launch_token from the launch prompt.")
+            raise McpError(
+                "Agent registration requires the app-issued launch_token from the launch prompt."
+            )
         issued_at = parse_iso_timestamp(session.get("launchTokenIssuedAt"))
-        if issued_at is None or datetime.now(timezone.utc) - issued_at > LAUNCH_TOKEN_WINDOW:
-            raise McpError("Agent launch token expired. Relaunch the agent from Aspis Management.")
+        if (
+            issued_at is None
+            or datetime.now(timezone.utc) - issued_at > LAUNCH_TOKEN_WINDOW
+        ):
+            raise McpError(
+                "Agent launch token expired. Relaunch the agent from Aspis Management."
+            )
         if not hmac.compare_digest(hash_launch_token(token), expected_hash):
             raise McpError("Agent launch token is invalid for this agent id and role.")
         return session
     if str(session.get("status") or "").strip().lower() == "launch_pending":
-        raise McpError("Pending agent session is missing a launch token. Relaunch the agent from Aspis Management.")
+        raise McpError(
+            "Pending agent session is missing a launch token. Relaunch the agent from Aspis Management."
+        )
     # SEC#7: a session whose launch token was already CONSUMED cannot be
     # re-registered tokenless — the one-shot launch credential is spent. (A
     # session that never had a hash, i.e. pure unmanaged self-registration, has
@@ -1744,7 +1792,9 @@ def parse_frontmatter(content: str, path: Path) -> tuple[dict[str, Any], int]:
             "title": clean_text(fields.get("title", project_id), "Project title", 500),
             "status": normalize_project_status(fields.get("status", "active")),
             "updatedAt": fields.get("updated_at") or fields.get("updatedAt") or now(),
-            "rootPath": fields.get("root_path") or fields.get("rootPath") or fields.get("root"),
+            "rootPath": fields.get("root_path")
+            or fields.get("rootPath")
+            or fields.get("root"),
             # B7 fix: round-trip the Censor trust flag. The Rust serializer emits
             # `censor_trusted: true` only when the user opted in; if Python parses
             # and rewrites the frontmatter without carrying it, EVERY agent write
@@ -1777,7 +1827,11 @@ def find_state_block(content: str) -> tuple[dict[str, Any], tuple[int, int]]:
         if line.strip() == BLOCK_CLOSE:
             body = content[body_start:line_start].strip()
             try:
-                state = json.loads(body) if body else {"version": 1, "tasks": [], "notes": []}
+                state = (
+                    json.loads(body)
+                    if body
+                    else {"version": 1, "tasks": [], "notes": []}
+                )
             except json.JSONDecodeError as exc:
                 raise McpError(f"Project state JSON is invalid: {exc}") from exc
             state.setdefault("tasks", [])
@@ -1788,7 +1842,11 @@ def find_state_block(content: str) -> tuple[dict[str, Any], tuple[int, int]]:
 
 def replace_frontmatter(content: str, metadata: dict[str, Any]) -> str:
     _, frontmatter_end = parse_frontmatter(content, Path("project.md"))
-    root_line = f"root_path: {yaml_quote(metadata['rootPath'])}\n" if metadata.get("rootPath") else ""
+    root_line = (
+        f"root_path: {yaml_quote(metadata['rootPath'])}\n"
+        if metadata.get("rootPath")
+        else ""
+    )
     # B7 fix: re-emit the Censor trust flag (same line/format/position as the Rust
     # serializer: after root_path, only when true) so a Python write preserves it.
     censor_line = "censor_trusted: true\n" if metadata.get("censorTrusted") else ""
@@ -1886,9 +1944,7 @@ def validate_task_dependency_dag(deps_by_id: dict[str, list[str]]) -> None:
                     f"Task {task_id} dependsOn references unknown task id {dep}."
                 )
             if dep in seen:
-                raise McpError(
-                    f"Task {task_id} has a duplicate dependsOn entry {dep}."
-                )
+                raise McpError(f"Task {task_id} has a duplicate dependsOn entry {dep}.")
             seen.add(dep)
     # Second pass: Kahn's algorithm. in_degree[id] = unresolved prerequisites of id;
     # dependents[dep] = tasks that depend on dep (reverse edges).
@@ -1933,14 +1989,18 @@ def validate_project_state(state: dict[str, Any]) -> None:
         normalize_task_status(task.get("status", ""))
         clean_text(task.get("title"), "Task title", 500)
         clean_text(task.get("updatedAt"), "Task updatedAt", 80)
-        if "linkedResources" in task and not isinstance(task.get("linkedResources"), list):
+        if "linkedResources" in task and not isinstance(
+            task.get("linkedResources"), list
+        ):
             raise McpError("Project task linkedResources must be a list.")
         # Phase 11.5-B (Piece 1a) — new optional fields. Each is OPTIONAL so an old
         # `.md` block written before they existed validates UNCHANGED (mirrors the
         # Rust `#[serde(default)]`). When present, enforce the on-disk wire shape:
         #   dependsOn: list[str]  scope: list[str]  acceptance: str  planId: str|null
         depends_on = task.get("dependsOn", [])
-        if not isinstance(depends_on, list) or not all(isinstance(d, str) for d in depends_on):
+        if not isinstance(depends_on, list) or not all(
+            isinstance(d, str) for d in depends_on
+        ):
             raise McpError("Project task dependsOn must be a list of task ids.")
         if "scope" in task and (
             not isinstance(task.get("scope"), list)
@@ -1992,7 +2052,14 @@ def project_lock_path(projects_dir: Path, project_id: str) -> Path:
 
 
 def task_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {"todo": 0, "wip": 0, "review": 0, "blocked": 0, "done": 0, "total": len(tasks)}
+    counts = {
+        "todo": 0,
+        "wip": 0,
+        "review": 0,
+        "blocked": 0,
+        "done": 0,
+        "total": len(tasks),
+    }
     for task in tasks:
         status = task.get("status")
         if status in counts:
@@ -2034,7 +2101,9 @@ def read_agents_state(projects_dir: Path) -> dict[str, Any]:
         state = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise McpError(f"Agents state is invalid JSON: {exc}") from exc
-    return reconcile_agents_state_with_projects(projects_dir, normalize_agents_state(state))
+    return reconcile_agents_state_with_projects(
+        projects_dir, normalize_agents_state(state)
+    )
 
 
 def write_agents_state(projects_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
@@ -2042,11 +2111,15 @@ def write_agents_state(projects_dir: Path, state: dict[str, Any]) -> dict[str, A
     state["updatedAt"] = now()
     state["events"] = state["events"][-MAX_EVENTS:]
     path = projects_dir / AGENTS_STATE_FILE
-    write_text_crash_safe(path, json.dumps(state, indent=2, ensure_ascii=False), "agent state file")
+    write_text_crash_safe(
+        path, json.dumps(state, indent=2, ensure_ascii=False), "agent state file"
+    )
     return state
 
 
-def public_agents_state(state: dict[str, Any], session_token: str | None = None) -> dict[str, Any]:
+def public_agents_state(
+    state: dict[str, Any], session_token: str | None = None
+) -> dict[str, Any]:
     public = json.loads(json.dumps(state))
     for session in public.get("sessions", []):
         session.pop("launchTokenHash", None)
@@ -2185,7 +2258,9 @@ def cap_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sessions (by lastSeenAt) first, preserving the original list order otherwise."""
     if len(sessions) <= MAX_SESSIONS:
         return sessions
-    closed = [s for s in sessions if str(s.get("status") or "").strip().lower() == "closed"]
+    closed = [
+        s for s in sessions if str(s.get("status") or "").strip().lower() == "closed"
+    ]
     drop_count = len(sessions) - MAX_SESSIONS
     if drop_count <= 0 or not closed:
         return sessions
@@ -2364,13 +2439,17 @@ def cap_plan_approval_requests(requests: list[Any]) -> list[dict[str, Any]]:
     return [r for r in clean if id(r) not in to_drop]
 
 
-def reconcile_agents_state_with_projects(projects_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
+def reconcile_agents_state_with_projects(
+    projects_dir: Path, state: dict[str, Any]
+) -> dict[str, Any]:
     project_cache: dict[str, dict[str, Any] | None] = {}
 
     def project_for(project_id: str) -> dict[str, Any] | None:
         if project_id not in project_cache:
             try:
-                project_cache[project_id] = read_project_file(project_path(projects_dir, project_id))
+                project_cache[project_id] = read_project_file(
+                    project_path(projects_dir, project_id)
+                )
             except Exception:
                 project_cache[project_id] = None
         return project_cache[project_id]
@@ -2384,10 +2463,21 @@ def reconcile_agents_state_with_projects(projects_dir: Path, state: dict[str, An
         if not project:
             claim["status"] = "blocked"
             if not claim.get("evidence"):
-                claim["evidence"] = "Project file missing during agent-state reconciliation."
+                claim["evidence"] = (
+                    "Project file missing during agent-state reconciliation."
+                )
             continue
-        claim["projectTitle"] = project["metadata"].get("title") or claim.get("projectTitle")
-        task = next((item for item in project["state"].get("tasks", []) if item.get("id") == task_id), None)
+        claim["projectTitle"] = project["metadata"].get("title") or claim.get(
+            "projectTitle"
+        )
+        task = next(
+            (
+                item
+                for item in project["state"].get("tasks", [])
+                if item.get("id") == task_id
+            ),
+            None,
+        )
         if not task:
             claim["status"] = "blocked"
             if not claim.get("evidence"):
@@ -2520,9 +2610,15 @@ def upsert_session(
             "message": clean_text(message, "Message", 1000)
             if str(message or "").strip()
             else session.get("message"),
-            "currentProjectId": project_id if project_id is not None else session.get("currentProjectId"),
-            "currentTaskId": task_id if task_id is not None else session.get("currentTaskId"),
-            "client": clean_text(client, "Client", 40) if client else session.get("client"),
+            "currentProjectId": project_id
+            if project_id is not None
+            else session.get("currentProjectId"),
+            "currentTaskId": task_id
+            if task_id is not None
+            else session.get("currentTaskId"),
+            "client": clean_text(client, "Client", 40)
+            if client
+            else session.get("client"),
             "currentFilePath": normalized_file_path
             if normalized_file_path is not None
             else session.get("currentFilePath"),
@@ -2550,7 +2646,11 @@ def upsert_session(
     # the frontend can dedup OS notifications on it — a heartbeat loop must not
     # keep resetting it. The message is refreshed each time (capped/cleaned).
     if clean_status == NEEDS_USER_STATUS:
-        previous = session.get("needsUser") if isinstance(session.get("needsUser"), dict) else None
+        previous = (
+            session.get("needsUser")
+            if isinstance(session.get("needsUser"), dict)
+            else None
+        )
         previous_since = (previous or {}).get("since")
         # Strip-check FIRST: a whitespace-only message ("   ") is truthy under a
         # bare `if message`, but clean_text rejects an all-whitespace value and
@@ -2579,15 +2679,27 @@ def require_session_token(session: dict[str, Any], session_token: str | None) ->
     # the agent: an app-launched agent always presents its session token on each
     # call. Only when no hash exists may the compat flag allow a tokenless call.
     if not expected_hash:
-        if unmanaged_privileged_agents_allowed() and not str(session_token or "").strip():
+        if (
+            unmanaged_privileged_agents_allowed()
+            and not str(session_token or "").strip()
+        ):
             return
-        raise McpError("Agent session is missing a session token. Relaunch the agent from Aspis Management.")
+        raise McpError(
+            "Agent session is missing a session token. Relaunch the agent from Aspis Management."
+        )
     token = str(session_token or "").strip()
     if not token:
-        raise McpError("Tool call requires the session_token returned by agent_register.")
+        raise McpError(
+            "Tool call requires the session_token returned by agent_register."
+        )
     issued_at = parse_iso_timestamp(session.get("sessionTokenIssuedAt"))
-    if issued_at is None or datetime.now(timezone.utc) - issued_at > SESSION_TOKEN_WINDOW:
-        raise McpError("Agent session token expired. Relaunch the agent from Aspis Management.")
+    if (
+        issued_at is None
+        or datetime.now(timezone.utc) - issued_at > SESSION_TOKEN_WINDOW
+    ):
+        raise McpError(
+            "Agent session token expired. Relaunch the agent from Aspis Management."
+        )
     if not hmac.compare_digest(hash_session_token(token), expected_hash):
         raise McpError("Agent session token is invalid for this agent id and role.")
 
@@ -2610,9 +2722,13 @@ def require_registered_role(
         None,
     )
     if session is None:
-        raise McpError("Agent must call agent_register before using project or provider tools.")
+        raise McpError(
+            "Agent must call agent_register before using project or provider tools."
+        )
     if str(session.get("status") or "").strip().lower() == "launch_pending":
-        raise McpError("Agent launch is pending. Call agent_register before using project or provider tools.")
+        raise McpError(
+            "Agent launch is pending. Call agent_register before using project or provider tools."
+        )
     registered_role = normalize_role(session.get("role", ""))
     if registered_role != role:
         raise McpError(
@@ -2671,8 +2787,13 @@ def claim_is_active(claim: dict[str, Any]) -> bool:
         return False
     lease_until = parse_iso_timestamp(claim.get("leaseUntil"))
     if lease_until is None:
-        updated_at = parse_iso_timestamp(claim.get("updatedAt") or claim.get("claimedAt"))
-        return updated_at is not None and datetime.now(timezone.utc) - updated_at <= LEASELESS_CLAIM_WINDOW
+        updated_at = parse_iso_timestamp(
+            claim.get("updatedAt") or claim.get("claimedAt")
+        )
+        return (
+            updated_at is not None
+            and datetime.now(timezone.utc) - updated_at <= LEASELESS_CLAIM_WINDOW
+        )
     return lease_until > datetime.now(timezone.utc)
 
 
@@ -2682,7 +2803,11 @@ def active_claim_for_task(
     task_id: str,
 ) -> dict[str, Any] | None:
     for claim in state.get("claims", []):
-        if claim.get("projectId") == project_id and claim.get("taskId") == task_id and claim_is_active(claim):
+        if (
+            claim.get("projectId") == project_id
+            and claim.get("taskId") == task_id
+            and claim_is_active(claim)
+        ):
             return claim
     return None
 
@@ -2747,7 +2872,9 @@ def require_claim_for_status_update(
 def provider_mutation_approval_enforced() -> bool:
     # Default: ENFORCED. The opt-out exists only for legacy/local single-operator
     # setups and must be set explicitly. Never silently self-attested.
-    return os.getenv("ASPIS_MCP_ALLOW_SELF_ATTESTED_PROVIDER_MUTATION", "").strip() != "1"
+    return (
+        os.getenv("ASPIS_MCP_ALLOW_SELF_ATTESTED_PROVIDER_MUTATION", "").strip() != "1"
+    )
 
 
 def task_provider_mutation_approver(task: dict[str, Any]) -> str:
@@ -2768,11 +2895,22 @@ def require_live_task_for_provider_mutation(
         project_status = project["metadata"].get("status")
         if project_status != "active":
             raise McpError("Provider mutations require an active Management project.")
-        task = next((item for item in project["state"].get("tasks", []) if item.get("id") == task_id), None)
+        task = next(
+            (
+                item
+                for item in project["state"].get("tasks", [])
+                if item.get("id") == task_id
+            ),
+            None,
+        )
         if task is None:
-            raise McpError("Provider mutations require a live task in the Management project.")
+            raise McpError(
+                "Provider mutations require a live task in the Management project."
+            )
         if task.get("status") not in {"wip", "blocked"}:
-            raise McpError("Provider mutations require the live task to be wip or blocked.")
+            raise McpError(
+                "Provider mutations require the live task to be wip or blocked."
+            )
         # SECURITY (H4): a destructive provider mutation (Worker secret rotation,
         # VM terminate) must not be fully self-attested by a single coder. The MCP
         # surface lets a coder self-set wip + write its own claim + supply >=12-char
@@ -2788,7 +2926,10 @@ def require_live_task_for_provider_mutation(
         # (e.g. a verifier-only `project_approve_provider_mutation` tool) so it cannot
         # be forged by a coder with raw filesystem access. Tracked as a product
         # decision; until then the approval field is the minimal safe tightening.
-        if provider_mutation_approval_enforced() and not task_provider_mutation_approver(task):
+        if (
+            provider_mutation_approval_enforced()
+            and not task_provider_mutation_approver(task)
+        ):
             raise McpError(
                 "Provider mutations require a non-coder approval marker (approvedBy) on the "
                 "task. A verifier or human must approve the destructive action before a coder "
@@ -2816,13 +2957,17 @@ def matching_active_claim(
 
 def require_provider_mutation_role(role: str) -> None:
     if normalize_role(role) != "coder":
-        raise McpError("Only coder agents can mutate Cloudflare or Scaleway. Verifiers are read-only.")
+        raise McpError(
+            "Only coder agents can mutate Cloudflare or Scaleway. Verifiers are read-only."
+        )
 
 
 def provider_mutation_project_context(args: dict[str, Any]) -> tuple[str, str, str]:
     project_id = args.get("management_project_id") or args.get("aspis_project_id")
     if not project_id:
-        raise McpError("Provider mutations require management_project_id and task_id so the Kanban can audit the action.")
+        raise McpError(
+            "Provider mutations require management_project_id and task_id so the Kanban can audit the action."
+        )
     task_id = normalize_task_id(args.get("task_id", ""))
     evidence = str(args.get("evidence") or "").strip()
     if len(evidence) < 12:
@@ -2874,7 +3019,16 @@ def reserve_provider_mutation(
             project_id=project_id,
             task_id=task_id,
         )
-        add_event(state, agent_id, role, "provider_action_pending", f"{tool_name} authorized.", project_id, task_id, evidence=evidence)
+        add_event(
+            state,
+            agent_id,
+            role,
+            "provider_action_pending",
+            f"{tool_name} authorized.",
+            project_id,
+            task_id,
+            evidence=evidence,
+        )
         write_agents_state(projects_dir, state)
 
 
@@ -2903,7 +3057,15 @@ def release_provider_mutation_reservation(
             project_id=project_id,
             task_id=task_id,
         )
-        add_event(state, agent_id, role, "provider_action_failed", f"{tool_name} failed: {reason}", project_id, task_id)
+        add_event(
+            state,
+            agent_id,
+            role,
+            "provider_action_failed",
+            f"{tool_name} failed: {reason}",
+            project_id,
+            task_id,
+        )
         write_agents_state(projects_dir, state)
 
 
@@ -2923,7 +3085,9 @@ def record_provider_mutation(
         require_claim_for_status_update(state, agent_id, role, project_id, task_id)
         with file_lock(project_lock_path(projects_dir, project_id)):
             project = read_project_file(project_path(projects_dir, project_id))
-            if not any(item.get("id") == task_id for item in project["state"].get("tasks", [])):
+            if not any(
+                item.get("id") == task_id for item in project["state"].get("tasks", [])
+            ):
                 raise McpError("Task not found.")
             project["state"].setdefault("notes", []).append(
                 {
@@ -2948,7 +3112,16 @@ def record_provider_mutation(
             project_id=project_id,
             task_id=task_id,
         )
-        add_event(state, agent_id, role, event_type, message, project_id, task_id, evidence=evidence)
+        add_event(
+            state,
+            agent_id,
+            role,
+            event_type,
+            message,
+            project_id,
+            task_id,
+            evidence=evidence,
+        )
         write_agents_state(projects_dir, state)
 
 
@@ -2958,7 +3131,13 @@ def require_agent_tool(
     tool_name: str,
 ) -> tuple[str, str]:
     agent_id = normalize_agent_id(args.get("agent_id"))
-    role = require_registered_role(projects_dir, agent_id, args.get("role", ""), tool_name, args.get("session_token"))
+    role = require_registered_role(
+        projects_dir,
+        agent_id,
+        args.get("role", ""),
+        tool_name,
+        args.get("session_token"),
+    )
     return agent_id, role
 
 
@@ -2974,7 +3153,15 @@ def audit_agent_read(
 ) -> None:
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
-        upsert_session(state, agent_id, role, status=event_type, message=message, project_id=project_id, task_id=task_id)
+        upsert_session(
+            state,
+            agent_id,
+            role,
+            status=event_type,
+            message=message,
+            project_id=project_id,
+            task_id=task_id,
+        )
         add_event(state, agent_id, role, event_type, message, project_id, task_id)
         write_agents_state(projects_dir, state)
 
@@ -2983,7 +3170,9 @@ def mcp_debug(projects_dir: Path, message: str) -> None:
     if os.getenv("ASPIS_MCP_DEBUG", "").strip() != "1":
         return
     try:
-        log_dir = management_root_from_projects_dir(projects_dir) / "oracle-data" / "logs"
+        log_dir = (
+            management_root_from_projects_dir(projects_dir) / "oracle-data" / "logs"
+        )
         log_dir.mkdir(parents=True, exist_ok=True)
         with (log_dir / "mcp-debug.log").open("a", encoding="utf-8") as handle:
             handle.write(f"{now()} {message}\n")
@@ -3004,7 +3193,10 @@ def read_windows_credential_password(target_name: str) -> str | None:
     CRED_TYPE_GENERIC = 1
 
     class FILETIME(ctypes.Structure):
-        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
 
     class CREDENTIALW(ctypes.Structure):
         _fields_ = [
@@ -3034,7 +3226,9 @@ def read_windows_credential_password(target_name: str) -> str | None:
     advapi.CredFree.restype = None
 
     credential = ctypes.POINTER(CREDENTIALW)()
-    if not advapi.CredReadW(target_name, CRED_TYPE_GENERIC, 0, ctypes.byref(credential)):
+    if not advapi.CredReadW(
+        target_name, CRED_TYPE_GENERIC, 0, ctypes.byref(credential)
+    ):
         return None
     try:
         blob_size = int(credential.contents.CredentialBlobSize)
@@ -3052,7 +3246,9 @@ def read_macos_keychain_password(service: str, account: str) -> str | None:
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except Exception:
         return None
@@ -3169,7 +3365,9 @@ def read_oracle_llm_settings_from_app_vault() -> dict[str, Any] | None:
     return settings if isinstance(settings, dict) else None
 
 
-def oracle_llm_setting(settings: dict[str, Any], snake: str, camel: str, default: Any = None) -> Any:
+def oracle_llm_setting(
+    settings: dict[str, Any], snake: str, camel: str, default: Any = None
+) -> Any:
     if snake in settings:
         return settings.get(snake)
     if camel in settings:
@@ -3186,16 +3384,30 @@ def bool_setting(value: Any, default: bool = False) -> bool:
 
 
 def oracle_llm_key_scope(settings: dict[str, Any]) -> str:
-    provider = str(oracle_llm_setting(settings, "provider", "provider", "") or "").strip().lower()
-    base_url = str(oracle_llm_setting(settings, "base_url", "baseUrl", "") or "").strip().lower()
+    provider = (
+        str(oracle_llm_setting(settings, "provider", "provider", "") or "")
+        .strip()
+        .lower()
+    )
+    base_url = (
+        str(oracle_llm_setting(settings, "base_url", "baseUrl", "") or "")
+        .strip()
+        .lower()
+    )
     return hashlib.sha256(f"{provider}\n{base_url}".encode("utf-8")).hexdigest()
 
 
 def oracle_llm_api_key_for_settings(settings: dict[str, Any]) -> str | None:
-    scoped = app_vault_account_secret(f"oracle:llm_api_key:{oracle_llm_key_scope(settings)}")
+    scoped = app_vault_account_secret(
+        f"oracle:llm_api_key:{oracle_llm_key_scope(settings)}"
+    )
     if scoped:
         return scoped
-    provider = str(oracle_llm_setting(settings, "provider", "provider", "") or "").strip().lower()
+    provider = (
+        str(oracle_llm_setting(settings, "provider", "provider", "") or "")
+        .strip()
+        .lower()
+    )
     if provider == "scaleway":
         return secret_from_app_vault_or_env(
             "scaleway_ai_token",
@@ -3216,7 +3428,11 @@ def oracle_llm_api_key_for_settings(settings: dict[str, Any]) -> str | None:
 
 
 def oracle_llm_api_key_status_for_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    provider = str(oracle_llm_setting(settings, "provider", "provider", "") or "").strip().lower()
+    provider = (
+        str(oracle_llm_setting(settings, "provider", "provider", "") or "")
+        .strip()
+        .lower()
+    )
     scoped_account = f"oracle:llm_api_key:{oracle_llm_key_scope(settings)}"
     scoped = credential_status_for_account(scoped_account)
     if scoped["configured"]:
@@ -3242,10 +3458,23 @@ def provider_credentials_status() -> dict[str, Any]:
         "settingsTarget": app_vault_target("oracle:llm_settings"),
     }
     if settings:
-        provider = str(oracle_llm_setting(settings, "provider", "provider", "ollama") or "ollama").strip().lower()
-        model = str(oracle_llm_setting(settings, "model", "model", "qwen3.5:4b") or "qwen3.5:4b").strip()
-        remote_enabled = bool_setting(oracle_llm_setting(settings, "remote_enabled", "remoteEnabled"), False)
-        runtime_provider = provider if remote_enabled and provider != "ollama" else "ollama"
+        provider = (
+            str(
+                oracle_llm_setting(settings, "provider", "provider", "ollama")
+                or "ollama"
+            )
+            .strip()
+            .lower()
+        )
+        model = str(
+            oracle_llm_setting(settings, "model", "model", "qwen3.5:4b") or "qwen3.5:4b"
+        ).strip()
+        remote_enabled = bool_setting(
+            oracle_llm_setting(settings, "remote_enabled", "remoteEnabled"), False
+        )
+        runtime_provider = (
+            provider if remote_enabled and provider != "ollama" else "ollama"
+        )
         primary_settings = {
             "provider": provider,
             "base_url": oracle_llm_setting(settings, "base_url", "baseUrl"),
@@ -3257,7 +3486,10 @@ def provider_credentials_status() -> dict[str, Any]:
                 "model": model,
                 "baseUrl": oracle_llm_setting(settings, "base_url", "baseUrl"),
                 "remoteEnabled": remote_enabled,
-                "credential": {"configured": runtime_provider == "ollama", "source": "local" if runtime_provider == "ollama" else "missing"},
+                "credential": {
+                    "configured": runtime_provider == "ollama",
+                    "source": "local" if runtime_provider == "ollama" else "missing",
+                },
             }
         )
         if runtime_provider != "ollama":
@@ -3273,7 +3505,9 @@ def provider_credentials_status() -> dict[str, Any]:
                     *CF_CODER_TOKEN_ENVS,
                     *CF_SECRET_ROTATOR_TOKEN_ENVS,
                 ),
-                "accountId": credential_status_for_key("cloudflare_account_id", *CF_ACCOUNT_ENVS),
+                "accountId": credential_status_for_key(
+                    "cloudflare_account_id", *CF_ACCOUNT_ENVS
+                ),
                 "agentProfiles": {
                     "verifierReadonly": credential_status_for_account(
                         "provider:cloudflare_agent_profile:verifier-readonly",
@@ -3292,7 +3526,9 @@ def provider_credentials_status() -> dict[str, Any]:
             "scaleway": {
                 "targetProjectName": SCW_TARGET_PROJECT_NAME,
                 "token": credential_status_for_key("scaleway_token", *SCW_TOKEN_ENVS),
-                "projectId": credential_status_for_key("scaleway_project_id", *SCW_PROJECT_ENVS),
+                "projectId": credential_status_for_key(
+                    "scaleway_project_id", *SCW_PROJECT_ENVS
+                ),
                 "objectAccessKey": credential_status_for_key(
                     "scaleway_object_access_key",
                     *SCW_OBJECT_ACCESS_KEY_ENVS,
@@ -3317,9 +3553,17 @@ def oracle_llm_config_from_app_vault() -> dict[str, Any] | None:
     settings = read_oracle_llm_settings_from_app_vault()
     if not settings:
         return None
-    provider = str(oracle_llm_setting(settings, "provider", "provider", "ollama") or "ollama").strip().lower()
-    model = str(oracle_llm_setting(settings, "model", "model", "qwen3.5:4b") or "qwen3.5:4b").strip()
-    remote_enabled = bool_setting(oracle_llm_setting(settings, "remote_enabled", "remoteEnabled"), False)
+    provider = (
+        str(oracle_llm_setting(settings, "provider", "provider", "ollama") or "ollama")
+        .strip()
+        .lower()
+    )
+    model = str(
+        oracle_llm_setting(settings, "model", "model", "qwen3.5:4b") or "qwen3.5:4b"
+    ).strip()
+    remote_enabled = bool_setting(
+        oracle_llm_setting(settings, "remote_enabled", "remoteEnabled"), False
+    )
     runtime_provider = provider if remote_enabled and provider != "ollama" else "ollama"
     runtime_settings = {
         "provider": runtime_provider,
@@ -3363,8 +3607,12 @@ def mcp_oracle_ask(
             llm_config=oracle_llm_config_from_app_vault(),
             allowed_file_ids=allowed_file_ids,
         )
-    chunks = mcp_oracle_context(engine, query, max(1, limit), allowed_file_ids=allowed_file_ids)
-    generated = answer_from_context(query, chunks, llm_config=oracle_llm_config_from_app_vault())
+    chunks = mcp_oracle_context(
+        engine, query, max(1, limit), allowed_file_ids=allowed_file_ids
+    )
+    generated = answer_from_context(
+        query, chunks, llm_config=oracle_llm_config_from_app_vault()
+    )
     return {
         "mode": "oracle-mcp-bounded",
         "query": query,
@@ -3460,10 +3708,14 @@ def dispatch_oracle_context(
             )
             return chunks, _http_readiness_placeholder()
         except OracleHttpError as exc:
-            logger.warning("Oracle HTTP context failed, using in-process fallback: %s", exc)
+            logger.warning(
+                "Oracle HTTP context failed, using in-process fallback: %s", exc
+            )
     index_status = ensure_oracle_index_ready(projects_dir, args)
     engine = make_mcp_engine(projects_dir)
-    return mcp_oracle_context(engine, query, limit, allowed_file_ids=allowed_file_ids), index_status
+    return mcp_oracle_context(
+        engine, query, limit, allowed_file_ids=allowed_file_ids
+    ), index_status
 
 
 def dispatch_oracle_ask(
@@ -3492,14 +3744,18 @@ def dispatch_oracle_ask(
             logger.warning("Oracle HTTP ask failed, using in-process fallback: %s", exc)
     index_status = ensure_oracle_index_ready(projects_dir, args)
     engine = make_mcp_engine(projects_dir)
-    return mcp_oracle_ask(engine, query, limit, allowed_file_ids=allowed_file_ids), index_status
+    return mcp_oracle_ask(
+        engine, query, limit, allowed_file_ids=allowed_file_ids
+    ), index_status
 
 
 def mcp_chunk_result(chunk: dict[str, Any]) -> dict[str, Any]:
     file_source = str(chunk.get("file_source") or "")
     return {
         "id": file_source or chunk.get("chunk_id"),
-        "label": Path(file_source).name if file_source else str(chunk.get("chunk_id") or "chunk"),
+        "label": Path(file_source).name
+        if file_source
+        else str(chunk.get("chunk_id") or "chunk"),
         "node_type": "chunk",
         "cluster": 0,
         "score": float(chunk.get("score") or 0.0),
@@ -3531,7 +3787,9 @@ def import_httpx():
     try:
         import httpx
     except Exception as exc:  # pragma: no cover
-        raise McpError("Install oracle/requirements.txt; provider MCP tools need httpx.") from exc
+        raise McpError(
+            "Install oracle/requirements.txt; provider MCP tools need httpx."
+        ) from exc
     return httpx
 
 
@@ -3546,7 +3804,9 @@ def _pigeon_enabled() -> bool:
     at the aspis_mcp spawn, and ONLY when `pigeon.enabled` is true — so requiring both
     present-and-non-empty mirrors that all-or-nothing contract exactly.
     """
-    return bool(optional_env(PIGEON_PORT_ENV)) and bool(optional_env(PIGEON_AUTH_TOKEN_ENV))
+    return bool(optional_env(PIGEON_PORT_ENV)) and bool(
+        optional_env(PIGEON_AUTH_TOKEN_ENV)
+    )
 
 
 def _pigeon_base_url() -> str | None:
@@ -3573,7 +3833,9 @@ def _pigeon_send_directive(
     otherwise never see it). Only reached when `_pigeon_enabled()`.
     """
     base = _pigeon_base_url()
-    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+    if (
+        base is None
+    ):  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
         raise McpError("Pigeon transport requested but PIGEON_PORT is not set.")
     httpx = import_httpx()
     body = {
@@ -3612,7 +3874,9 @@ def _pigeon_send_censor_review(
     `_pigeon_send_directive`, differing only in the receiver and the payload kind.
     """
     base = _pigeon_base_url()
-    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+    if (
+        base is None
+    ):  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
         raise McpError("Pigeon transport requested but PIGEON_PORT is not set.")
     httpx = import_httpx()
     body = {
@@ -3636,9 +3900,13 @@ def _pigeon_send_censor_review(
     try:
         ticket_no = resp.json().get("ticket_no")
     except Exception as exc:
-        raise McpError(f"Pigeon censor-review send returned invalid JSON: {exc}") from exc
+        raise McpError(
+            f"Pigeon censor-review send returned invalid JSON: {exc}"
+        ) from exc
     if not isinstance(ticket_no, int):
-        raise McpError("Pigeon censor-review send response missing an integer ticket_no.")
+        raise McpError(
+            "Pigeon censor-review send response missing an integer ticket_no."
+        )
     return ticket_no
 
 
@@ -3657,7 +3925,11 @@ def _maybe_enqueue_censor_reviews(
             _pigeon_send_censor_review(
                 sender_id=sender_id,
                 project_id=project_id,
-                request={"projectId": project_id, "file": rel_path, "knownFindings": []},
+                request={
+                    "projectId": project_id,
+                    "file": rel_path,
+                    "knownFindings": [],
+                },
             )
         except Exception as exc:  # noqa: BLE001 — best-effort, never fail the mini result
             logging.warning("censor-review enqueue skipped for %s: %s", rel_path, exc)
@@ -3672,7 +3944,9 @@ def _pigeon_status_once(ticket_no: int) -> tuple[str | None, dict[str, Any] | No
     Best-effort: a transient error here is non-fatal — the bounded wait loop retries.
     """
     base = _pigeon_base_url()
-    if base is None:  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
+    if (
+        base is None
+    ):  # pragma: no cover — guarded by `_pigeon_enabled()` at the call site.
         return None, None
     httpx = import_httpx()
     try:
@@ -3691,8 +3965,10 @@ def _pigeon_status_once(ticket_no: int) -> tuple[str | None, dict[str, Any] | No
         return None, None
     status = body.get("status")
     result = body.get("result")
-    return (str(status) if status is not None else None,
-            result if isinstance(result, dict) else None)
+    return (
+        str(status) if status is not None else None,
+        result if isinstance(result, dict) else None,
+    )
 
 
 def _await_mini_directive_pigeon(
@@ -3884,7 +4160,10 @@ class HttpOracleEngine:
         self._timeout = timeout
 
     def _headers(self) -> dict[str, str]:
-        return {"x-oracle-auth-token": self._auth_token, "Content-Type": "application/json"}
+        return {
+            "x-oracle-auth-token": self._auth_token,
+            "Content-Type": "application/json",
+        }
 
     @staticmethod
     def _scope_payload(allowed_file_ids: set[str] | None) -> list[str]:
@@ -3900,7 +4179,9 @@ class HttpOracleEngine:
         status_error = getattr(httpx, "HTTPStatusError", None)
         try:
             with httpx.Client(timeout=self._timeout) as client:
-                response = client.post(self._base_url + path, headers=self._headers(), json=payload)
+                response = client.post(
+                    self._base_url + path, headers=self._headers(), json=payload
+                )
                 response.raise_for_status()
                 if not getattr(response, "content", b""):
                     return {}
@@ -3915,14 +4196,18 @@ class HttpOracleEngine:
             if status_error is not None and isinstance(exc, status_error):
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if isinstance(status, int) and 400 <= status < 500:
-                    logger.warning("Oracle HTTP call returned client error HTTP %s", status)
+                    logger.warning(
+                        "Oracle HTTP call returned client error HTTP %s", status
+                    )
                     raise McpError(
                         f"Oracle HTTP call failed with HTTP {status}. "
                         "Check the agent auth token / request (see server logs)."
                     ) from exc
             # Redact: only the endpoint PATH (not base_url/token/abs paths) is
             # safe to surface. base_url may embed a host; path is generic.
-            raise OracleHttpError(f"Oracle HTTP call to {path} failed: {type(exc).__name__}") from exc
+            raise OracleHttpError(
+                f"Oracle HTTP call to {path} failed: {type(exc).__name__}"
+            ) from exc
         # FIX 3: validate the decoded body BEFORE the caller indexes into it. A
         # non-dict (null/list/str) would otherwise crash `result["index_status"]`
         # at the call site; instead raise OracleHttpError so dispatch falls back.
@@ -3932,7 +4217,9 @@ class HttpOracleEngine:
             )
         return data
 
-    def context(self, query: str, limit: int = 8, allowed_file_ids: set[str] | None = None) -> list[dict]:
+    def context(
+        self, query: str, limit: int = 8, allowed_file_ids: set[str] | None = None
+    ) -> list[dict]:
         scope = self._scope_payload(allowed_file_ids)
         if not scope:
             return []
@@ -3944,7 +4231,9 @@ class HttpOracleEngine:
         # non-list `chunks` is a malformed response -> fall back in-process.
         chunks = data.get("chunks")
         if not isinstance(chunks, list):
-            raise OracleHttpError("Oracle HTTP context response is missing a chunks list.")
+            raise OracleHttpError(
+                "Oracle HTTP context response is missing a chunks list."
+            )
         return list(chunks)
 
     def ask(
@@ -4003,7 +4292,9 @@ def raise_for_provider_status(response: Any, label: str) -> None:
         raise McpError(sanitize_provider_error(f"{prefix}: {url}")) from exc
 
 
-def api_get(url: str, headers: dict[str, str], params: dict[str, Any] | None = None) -> dict[str, Any]:
+def api_get(
+    url: str, headers: dict[str, str], params: dict[str, Any] | None = None
+) -> dict[str, Any]:
     httpx = import_httpx()
     with httpx.Client(timeout=20.0) as client:
         response = client.get(url, headers=headers, params=params)
@@ -4011,7 +4302,9 @@ def api_get(url: str, headers: dict[str, str], params: dict[str, Any] | None = N
         return response.json()
 
 
-def api_post_json(url: str, headers: dict[str, str], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def api_post_json(
+    url: str, headers: dict[str, str], payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
     httpx = import_httpx()
     with httpx.Client(timeout=20.0) as client:
         response = client.post(url, headers=headers, json=payload or {})
@@ -4021,7 +4314,9 @@ def api_post_json(url: str, headers: dict[str, str], payload: dict[str, Any] | N
         return response.json()
 
 
-def api_put_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+def api_put_json(
+    url: str, headers: dict[str, str], payload: dict[str, Any]
+) -> dict[str, Any]:
     httpx = import_httpx()
     with httpx.Client(timeout=20.0) as client:
         response = client.put(url, headers=headers, json=payload)
@@ -4041,7 +4336,9 @@ def cf_result(envelope: dict[str, Any]) -> Any:
     return envelope.get("result")
 
 
-def resolve_cloudflare_account(token: str, requested_account_id: str | None = None) -> dict[str, str]:
+def resolve_cloudflare_account(
+    token: str, requested_account_id: str | None = None
+) -> dict[str, str]:
     headers = cf_headers(token)
     accounts = cf_result(api_get(f"{CF_API}/accounts", headers)) or []
     requested = requested_account_id or secret_from_app_vault_or_env(
@@ -4053,30 +4350,54 @@ def resolve_cloudflare_account(token: str, requested_account_id: str | None = No
             if account.get("id") == requested:
                 name = str(account.get("name") or "")
                 return {"id": account["id"], "name": name}
-        raise McpError("Pinned Cloudflare Aspis Bio account was not visible to this token.")
-    matches = [item for item in accounts if normalize_provider_name(str(item.get("name") or "")) == CF_TARGET_ACCOUNT_NAME]
+        raise McpError(
+            "Pinned Cloudflare Aspis Bio account was not visible to this token."
+        )
+    matches = [
+        item
+        for item in accounts
+        if normalize_provider_name(str(item.get("name") or ""))
+        == CF_TARGET_ACCOUNT_NAME
+    ]
     if len(matches) != 1:
         if len(accounts) == 1:
             account = accounts[0]
             return {"id": account["id"], "name": str(account.get("name") or "")}
-        raise McpError("Cloudflare Aspis Bio account is ambiguous or missing. Set ASPIS_CLOUDFLARE_ACCOUNT_ID.")
-    return {"id": matches[0]["id"], "name": matches[0].get("name") or CF_TARGET_ACCOUNT_NAME}
+        raise McpError(
+            "Cloudflare Aspis Bio account is ambiguous or missing. Set ASPIS_CLOUDFLARE_ACCOUNT_ID."
+        )
+    return {
+        "id": matches[0]["id"],
+        "name": matches[0].get("name") or CF_TARGET_ACCOUNT_NAME,
+    }
 
 
 def cloudflare_worker_in_aspis_bio_scope(name: str, routes: list[Any]) -> bool:
     normalized_name = str(name or "").strip().lower()
-    if normalized_name in CF_ASPIS_BIO_WORKERS or normalized_name.startswith("aspis-bio-"):
+    if normalized_name in CF_ASPIS_BIO_WORKERS or normalized_name.startswith(
+        "aspis-bio-"
+    ):
         return True
     for route in routes:
-        if isinstance(route, dict) and "aspis-bio.com" in str(route.get("pattern") or "").lower():
+        if (
+            isinstance(route, dict)
+            and "aspis-bio.com" in str(route.get("pattern") or "").lower()
+        ):
             return True
     return False
 
 
-def cloudflare_list_workers(token: str, account_id: str | None = None) -> dict[str, Any]:
+def cloudflare_list_workers(
+    token: str, account_id: str | None = None
+) -> dict[str, Any]:
     account = resolve_cloudflare_account(token, account_id)
     headers = cf_headers(token)
-    workers = cf_result(api_get(f"{CF_API}/accounts/{account['id']}/workers/scripts", headers)) or []
+    workers = (
+        cf_result(
+            api_get(f"{CF_API}/accounts/{account['id']}/workers/scripts", headers)
+        )
+        or []
+    )
     safe_workers = []
     hidden_sibling_workers = 0
     for worker in workers:
@@ -4104,7 +4425,11 @@ def cloudflare_list_workers(token: str, account_id: str | None = None) -> dict[s
                 "tags": tags if isinstance(tags, list) else [],
             }
         )
-    return {"account": account, "workers": safe_workers, "hiddenSiblingWorkers": hidden_sibling_workers}
+    return {
+        "account": account,
+        "workers": safe_workers,
+        "hiddenSiblingWorkers": hidden_sibling_workers,
+    }
 
 
 def cloudflare_rotate_secret(
@@ -4129,21 +4454,30 @@ def cloudflare_rotate_secret(
     url = f"{CF_API}/accounts/{account['id']}/workers/scripts/{encoded_worker}/secrets"
     payload = {"name": secret_name, "text": secret_value, "type": "secret_text"}
     cf_result(api_put_json(url, cf_headers(token), payload))
-    return {"account": account, "workerName": worker_name, "secretName": secret_name, "rotatedAt": now()}
+    return {
+        "account": account,
+        "workerName": worker_name,
+        "secretName": secret_name,
+        "rotatedAt": now(),
+    }
 
 
 def scw_headers(token: str) -> dict[str, str]:
     return {"X-Auth-Token": token, "Content-Type": "application/json"}
 
 
-def resolve_scaleway_project(token: str, requested_project_id: str | None = None) -> dict[str, str]:
+def resolve_scaleway_project(
+    token: str, requested_project_id: str | None = None
+) -> dict[str, str]:
     headers = scw_headers(token)
     requested = requested_project_id or secret_from_app_vault_or_env(
         "scaleway_project_id",
         *SCW_PROJECT_ENVS,
     )
     try:
-        projects = api_get(f"{SCW_API}/account/v3/projects", headers).get("projects", [])
+        projects = api_get(f"{SCW_API}/account/v3/projects", headers).get(
+            "projects", []
+        )
     except Exception:
         if requested:
             access_key = secret_from_app_vault_or_env(
@@ -4161,23 +4495,41 @@ def resolve_scaleway_project(token: str, requested_project_id: str | None = None
             if project.get("id") == requested:
                 name = str(project.get("name") or "")
                 if normalize_provider_name(name) != SCW_TARGET_PROJECT_NAME:
-                    raise McpError("Pinned Scaleway project is visible, but it is not aspis-bio.")
+                    raise McpError(
+                        "Pinned Scaleway project is visible, but it is not aspis-bio."
+                    )
                 return {"id": project["id"], "name": name}
-        raise McpError("Pinned Scaleway Aspis Bio project was not visible to this token.")
-    matches = [item for item in projects if normalize_provider_name(str(item.get("name") or "")) == SCW_TARGET_PROJECT_NAME]
+        raise McpError(
+            "Pinned Scaleway Aspis Bio project was not visible to this token."
+        )
+    matches = [
+        item
+        for item in projects
+        if normalize_provider_name(str(item.get("name") or ""))
+        == SCW_TARGET_PROJECT_NAME
+    ]
     if len(matches) != 1:
-        raise McpError("Scaleway Aspis Bio project is ambiguous or missing. Set ASPIS_SCALEWAY_PROJECT_ID.")
-    return {"id": matches[0]["id"], "name": matches[0].get("name") or SCW_TARGET_PROJECT_NAME}
+        raise McpError(
+            "Scaleway Aspis Bio project is ambiguous or missing. Set ASPIS_SCALEWAY_PROJECT_ID."
+        )
+    return {
+        "id": matches[0]["id"],
+        "name": matches[0].get("name") or SCW_TARGET_PROJECT_NAME,
+    }
 
 
-def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[str, Any]:
+def scaleway_list_resources(
+    token: str, project_id: str | None = None
+) -> dict[str, Any]:
     project = resolve_scaleway_project(token, project_id)
     headers = scw_headers(token)
     resources: list[dict[str, Any]] = []
     for zone in SCW_ZONES:
         url = f"{SCW_API}/instance/v1/zones/{zone}/servers"
         try:
-            payload = api_get(url, headers, {"project": project["id"], "page": 1, "per_page": 100})
+            payload = api_get(
+                url, headers, {"project": project["id"], "page": 1, "per_page": 100}
+            )
         except Exception:
             continue
         for server in payload.get("servers", []):
@@ -4190,7 +4542,13 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
                     "state": server.get("state"),
                     "commercialType": server.get("commercial_type"),
                     "projectId": project["id"],
-                    "availableActions": ["start", "stop", "reboot", "delete", "terminate"],
+                    "availableActions": [
+                        "start",
+                        "stop",
+                        "reboot",
+                        "delete",
+                        "terminate",
+                    ],
                 }
             )
     for region in SCW_REGIONS:
@@ -4251,11 +4609,14 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
                     "availableActions": ["deploy"],
                 }
             )
+
     # Each api_get below is independent: a failure (or a non-dict payload from an
     # unstable v1alpha endpoint) yields an empty list and we PROCEED to the sibling
     # call — `continue` here would skip the rest of the zone/region and silently
     # truncate the inventory (e.g. a volumes 5xx must not hide that zone's snapshots).
-    def scw_items(url: str, params: dict[str, Any], envelope: str) -> list[dict[str, Any]]:
+    def scw_items(
+        url: str, params: dict[str, Any], envelope: str
+    ) -> list[dict[str, Any]]:
         try:
             payload = api_get(url, headers, params)
         except Exception:
@@ -4267,7 +4628,9 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
 
     for zone in SCW_ZONES:
         zone_params = {"project_id": project["id"], "page": 1, "per_page": 100}
-        for item in scw_items(f"{SCW_API}/block/v1/zones/{zone}/volumes", zone_params, "volumes"):
+        for item in scw_items(
+            f"{SCW_API}/block/v1/zones/{zone}/volumes", zone_params, "volumes"
+        ):
             resources.append(
                 {
                     "id": item.get("id"),
@@ -4279,7 +4642,9 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
                     "availableActions": [],
                 }
             )
-        for item in scw_items(f"{SCW_API}/block/v1/zones/{zone}/snapshots", zone_params, "snapshots"):
+        for item in scw_items(
+            f"{SCW_API}/block/v1/zones/{zone}/snapshots", zone_params, "snapshots"
+        ):
             resources.append(
                 {
                     "id": item.get("id"),
@@ -4294,7 +4659,9 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
     for region in SCW_REGIONS:
         region_params = {"project_id": project["id"], "page": 1, "page_size": 100}
         for item in scw_items(
-            f"{SCW_API}/file/v1alpha1/regions/{region}/filesystems", region_params, "filesystems"
+            f"{SCW_API}/file/v1alpha1/regions/{region}/filesystems",
+            region_params,
+            "filesystems",
         ):
             resources.append(
                 {
@@ -4308,7 +4675,9 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
                 }
             )
         for item in scw_items(
-            f"{SCW_API}/serverless-sqldb/v1alpha1/regions/{region}/databases", region_params, "databases"
+            f"{SCW_API}/serverless-sqldb/v1alpha1/regions/{region}/databases",
+            region_params,
+            "databases",
         ):
             resources.append(
                 {
@@ -4322,7 +4691,10 @@ def scaleway_list_resources(token: str, project_id: str | None = None) -> dict[s
                     "availableActions": [],
                 }
             )
-    return {"project": project, "resources": [item for item in resources if item.get("id")]}
+    return {
+        "project": project,
+        "resources": [item for item in resources if item.get("id")],
+    }
 
 
 def scaleway_resource_action(
@@ -4335,7 +4707,9 @@ def scaleway_resource_action(
     resource_id = clean_text(resource_id, "Resource id", 160)
     action = clean_text(action, "Action", 40).lower()
     inventory = scaleway_list_resources(token, project_id)
-    resource = next((item for item in inventory["resources"] if item.get("id") == resource_id), None)
+    resource = next(
+        (item for item in inventory["resources"] if item.get("id") == resource_id), None
+    )
     if not resource:
         raise McpError("Scaleway resource is not in the Aspis Bio inventory.")
     action_aliases = {
@@ -4347,8 +4721,12 @@ def scaleway_resource_action(
     }
     if action not in resource.get("availableActions", []):
         raise McpError("Scaleway action is not available for this resource type.")
-    if action in {"delete", "terminate"} and confirm_resource_name != resource.get("name"):
-        raise McpError("Scaleway terminate/delete requires exact resource-name confirmation.")
+    if action in {"delete", "terminate"} and confirm_resource_name != resource.get(
+        "name"
+    ):
+        raise McpError(
+            "Scaleway terminate/delete requires exact resource-name confirmation."
+        )
     headers = scw_headers(token)
     resource_type = resource["resourceType"]
     region = resource["region"]
@@ -4377,19 +4755,25 @@ def scaleway_resource_action(
     }
 
 
-def delete_scaleway_instance_with_volumes(token: str, zone: str, server_id: str) -> None:
+def delete_scaleway_instance_with_volumes(
+    token: str, zone: str, server_id: str
+) -> None:
     httpx = import_httpx()
     headers = scw_headers(token)
     delete_url = f"{SCW_API}/instance/v1/zones/{zone}/servers/{server_id}"
     params = {"with_volumes": "all", "with_ip": "true", "force_shutdown": "true"}
     with httpx.Client(timeout=20.0) as client:
-        volume_ids = scaleway_instance_attached_volume_ids(client, headers, zone, server_id)
+        volume_ids = scaleway_instance_attached_volume_ids(
+            client, headers, zone, server_id
+        )
         response = client.delete(delete_url, headers=headers, params=params)
         if response.is_success or response.status_code == 404:
             delete_scaleway_instance_volumes(client, headers, zone, volume_ids)
             return
         action_url = f"{SCW_API}/instance/v1/zones/{zone}/servers/{server_id}/action"
-        terminate = client.post(action_url, headers=headers, json={"action": "terminate"})
+        terminate = client.post(
+            action_url, headers=headers, json={"action": "terminate"}
+        )
         if terminate.is_success or terminate.status_code == 404:
             delete_scaleway_instance_volumes(client, headers, zone, volume_ids)
             return
@@ -4403,9 +4787,13 @@ def delete_scaleway_instance_with_volumes(token: str, zone: str, server_id: str)
         delete_scaleway_instance_volumes(client, headers, zone, volume_ids)
 
 
-def scaleway_instance_attached_volume_ids(client: Any, headers: dict[str, str], zone: str, server_id: str) -> list[str]:
+def scaleway_instance_attached_volume_ids(
+    client: Any, headers: dict[str, str], zone: str, server_id: str
+) -> list[str]:
     try:
-        response = client.get(f"{SCW_API}/instance/v1/zones/{zone}/servers/{server_id}", headers=headers)
+        response = client.get(
+            f"{SCW_API}/instance/v1/zones/{zone}/servers/{server_id}", headers=headers
+        )
         if not response.is_success:
             return []
         server = response.json().get("server") or {}
@@ -4421,10 +4809,15 @@ def scaleway_instance_attached_volume_ids(client: Any, headers: dict[str, str], 
     return []
 
 
-def delete_scaleway_instance_volumes(client: Any, headers: dict[str, str], zone: str, volume_ids: list[str]) -> None:
+def delete_scaleway_instance_volumes(
+    client: Any, headers: dict[str, str], zone: str, volume_ids: list[str]
+) -> None:
     for volume_id in volume_ids:
         safe_volume_id = clean_text(volume_id, "Volume id", 160)
-        response = client.delete(f"{SCW_API}/instance/v1/zones/{zone}/volumes/{safe_volume_id}", headers=headers)
+        response = client.delete(
+            f"{SCW_API}/instance/v1/zones/{zone}/volumes/{safe_volume_id}",
+            headers=headers,
+        )
         if not response.is_success and response.status_code != 404:
             response.raise_for_status()
 
@@ -4556,7 +4949,9 @@ def _redact_secrets(text: str) -> str:
         has_upper = any(c.isascii() and c.isupper() for c in tok)
         has_lower = any(c.isascii() and c.islower() for c in tok)
         has_symbol = any(c in "+/=_-." for c in tok)
-        mostly_separators = has_symbol and not has_digit and not (has_upper and has_lower)
+        mostly_separators = (
+            has_symbol and not has_digit and not (has_upper and has_lower)
+        )
         if mostly_separators:
             return False
         return (
@@ -4720,7 +5115,9 @@ _STRUCTURE_INFLIGHT: dict[tuple[str, str], threading.Condition] = {}
 # on purpose: a walk is bounded but CPU/IO-heavy, and a build storm (many agents, many
 # projects) must not spawn an unbounded number of children.
 _STRUCTURE_MAX_CONCURRENT_BUILDS = 4
-_STRUCTURE_BUILD_SEMAPHORE = threading.BoundedSemaphore(_STRUCTURE_MAX_CONCURRENT_BUILDS)
+_STRUCTURE_BUILD_SEMAPHORE = threading.BoundedSemaphore(
+    _STRUCTURE_MAX_CONCURRENT_BUILDS
+)
 # How long a caller will block trying to acquire a build slot before returning a clean
 # "busy, try again" error. Bounded well under the subprocess timeout so a caller never
 # stacks both waits; the in-flight dedup means only the FIRST same-key caller ever reaches
@@ -4814,14 +5211,18 @@ def _run_structure_bridge(app_bin: str, root: Path) -> dict[str, Any]:
             "building the graph."
         ) from exc
     except OSError as exc:
-        raise McpError(f"project_structure could not run the structure bridge: {exc}") from exc
+        raise McpError(
+            f"project_structure could not run the structure bridge: {exc}"
+        ) from exc
 
     if proc.returncode != 0:
         # The Rust bridge prints a one-line diagnostic to stderr on failure. Surface a
         # bounded slice of it (never the whole output) so the agent gets a usable reason.
         detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
         detail = detail.splitlines()[0][:200] if detail else "no diagnostic"
-        raise McpError(f"project_structure bridge failed (exit {proc.returncode}): {detail}")
+        raise McpError(
+            f"project_structure bridge failed (exit {proc.returncode}): {detail}"
+        )
 
     raw = proc.stdout or b""
     if len(raw) > PROJECT_STRUCTURE_MAX_OUTPUT_BYTES:
@@ -4867,7 +5268,10 @@ def _structure_cache_get(cache_key: tuple[str, str]) -> dict[str, Any] | None:
     """Return the cached FULL graph for `cache_key` if present AND within TTL, else None.
     MUST be called holding `_STRUCTURE_CACHE_LOCK`."""
     cached = _STRUCTURE_CACHE.get(cache_key)
-    if cached is not None and (time.monotonic() - cached[0]) <= PROJECT_STRUCTURE_CACHE_TTL_S:
+    if (
+        cached is not None
+        and (time.monotonic() - cached[0]) <= PROJECT_STRUCTURE_CACHE_TTL_S
+    ):
         return cached[1]
     return None
 
@@ -4938,7 +5342,9 @@ def build_project_structure(
     # re-acquire the lock only for the quick cache write + waking waiters. `finally` ALWAYS
     # clears the in-flight marker and wakes waiters — so a builder error never leaves
     # same-key callers hung, and never leaks a semaphore slot.
-    acquired = _STRUCTURE_BUILD_SEMAPHORE.acquire(timeout=_STRUCTURE_BUILD_SLOT_TIMEOUT_S)
+    acquired = _STRUCTURE_BUILD_SEMAPHORE.acquire(
+        timeout=_STRUCTURE_BUILD_SLOT_TIMEOUT_S
+    )
     if not acquired:
         # Could not get a build slot in time: drop the in-flight marker and wake any waiters
         # so one of them retries, then return a clean busy error (bounded, not a hang).
@@ -5058,19 +5464,23 @@ def _safe_censor_finding(finding: dict[str, Any]) -> dict[str, Any]:
     for key in CENSOR_SAFE_FINDING_FIELDS:
         if key == "provenance":
             entries = finding.get("provenance")
-            safe["provenance"] = [
-                {
-                    "actor": str(entry.get("actor", "")),
-                    "action": str(entry.get("action", "")),
-                    # `role` is part of the safe allowlist: it is the coder/verifier
-                    # token (no content), and the precedence rule (WARNING 2) needs
-                    # it to survive round-trips. Absent on legacy entries → "".
-                    "role": str(entry.get("role", "")),
-                    "at": str(entry.get("at", "")),
-                }
-                for entry in entries
-                if isinstance(entry, dict)
-            ] if isinstance(entries, list) else []
+            safe["provenance"] = (
+                [
+                    {
+                        "actor": str(entry.get("actor", "")),
+                        "action": str(entry.get("action", "")),
+                        # `role` is part of the safe allowlist: it is the coder/verifier
+                        # token (no content), and the precedence rule (WARNING 2) needs
+                        # it to survive round-trips. Absent on legacy entries → "".
+                        "role": str(entry.get("role", "")),
+                        "at": str(entry.get("at", "")),
+                    }
+                    for entry in entries
+                    if isinstance(entry, dict)
+                ]
+                if isinstance(entries, list)
+                else []
+            )
         elif key in finding:
             value = finding[key]
             # SECOND-LAYER DEFENSE (BLOCKER A): the free-text fields are the only
@@ -5085,7 +5495,9 @@ def _safe_censor_finding(finding: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def read_censor_open_findings(root: Path, file_rel_path: str | None) -> list[dict[str, Any]]:
+def read_censor_open_findings(
+    root: Path, file_rel_path: str | None
+) -> list[dict[str, Any]]:
     """OPEN findings (disposition == "open") across the project's shards, each
     stripped to the safe allowlist. `file_rel_path` filters to one file's shard.
     A missing `.aspis-censor/` dir → empty list (project never reviewed). Each
@@ -5129,6 +5541,50 @@ def read_censor_open_findings(root: Path, file_rel_path: str | None) -> list[dic
             if disposition == "open":
                 open_findings.append(_safe_censor_finding(finding))
     return open_findings
+
+
+def _safe_unlink(path: Path) -> None:
+    """Best-effort file deletion — never propagates errors."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def drain_censor_queue(root: Path) -> list[dict[str, Any]]:
+    """Drain the persistent Censor queue directory. Reads every
+    `<root>/.aspis/censor_queue/pending/*.json`, returns findings, deletes
+    the files. Queue survives main-coder restarts."""
+    queue_dir = root / ".aspis" / "censor_queue" / "pending"
+    if not queue_dir.is_dir():
+        return []
+    findings: list[dict[str, Any]] = []
+    try:
+        entries = sorted(queue_dir.iterdir())
+    except (FileNotFoundError, OSError):
+        return []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.suffix != ".json" or not entry.is_file():
+            continue
+        try:
+            data = json.loads(entry.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            _safe_unlink(entry)
+            continue
+        batch_findings = data.get("findings")
+        if isinstance(batch_findings, list):
+            for f in batch_findings:
+                if (
+                    isinstance(f, dict)
+                    and str(f.get("disposition", "open")).lower() == "open"
+                ):
+                    fid = str(f.get("id", ""))
+                    if fid and fid not in seen:
+                        seen.add(fid)
+                        findings.append(_safe_censor_finding(f))
+        _safe_unlink(entry)
+    return findings
 
 
 def _last_provenance_role(provenance: list[Any]) -> str | None:
@@ -5396,7 +5852,9 @@ def _await_mini_directive(
     on `directive_id` itself.
     """
     seen = False
-    ever_ran = False  # FIX 3: observed in running/launching at least once (was claimed).
+    ever_ran = (
+        False  # FIX 3: observed in running/launching at least once (was claimed).
+    )
     while True:
         present, status, result = _mini_directive_result(
             projects_dir, state_lock, directive_id
@@ -5539,9 +5997,13 @@ def dispatch_spawn_mini_coder(
     task = clean_text(args.get("task"), "Mini-coder task", MINI_CODER_MAX_TASK_LEN)
     raw_files = args.get("files")
     if not isinstance(raw_files, list) or not raw_files:
-        raise McpError("spawn_mini_coder requires a non-empty `files` list of project-relative paths.")
+        raise McpError(
+            "spawn_mini_coder requires a non-empty `files` list of project-relative paths."
+        )
     if len(raw_files) > MINI_CODER_MAX_FILES:
-        raise McpError(f"spawn_mini_coder accepts at most {MINI_CODER_MAX_FILES} files.")
+        raise McpError(
+            f"spawn_mini_coder accepts at most {MINI_CODER_MAX_FILES} files."
+        )
     files: list[str] = []
     for entry in raw_files:
         # Reuse the strict rel-path validator (rejects absolute / `..` / `-`-leading
@@ -5549,7 +6011,11 @@ def dispatch_spawn_mini_coder(
         # flag into a downstream backend.
         files.append(validate_censor_rel_path(str(entry)))
     backend = args.get("backend")
-    backend = clean_text(backend, "Mini-coder backend", 40) if str(backend or "").strip() else None
+    backend = (
+        clean_text(backend, "Mini-coder backend", 40)
+        if str(backend or "").strip()
+        else None
+    )
     allow_oracle = bool(args.get("allow_oracle", False))
     # ASYNC (b): `wait` toggles blocking. STRICT bool (like the `write` flag, review F7):
     # a truthy non-bool ("false", 0, "") is NOT a request to skip the wait — only an
@@ -5643,7 +6109,9 @@ def dispatch_spawn_mini_coder(
                 )
             # Pigeon stores the project id for bookkeeping only; use the parent session's
             # project when known, else a stable `"default"`.
-            project_id = str((session or {}).get("currentProjectId") or "").strip() or "default"
+            project_id = (
+                str((session or {}).get("currentProjectId") or "").strip() or "default"
+            )
         # Publish to Pigeon OUTSIDE the lock (HTTP must never run under the state lock). On
         # failure this raises McpError — the directive never entered Pigeon, so the coder
         # gets a clear error rather than a silently-dropped sub-task.
@@ -5787,7 +6255,11 @@ def dispatch_mini_coder_result(
             return {"directiveId": directive_id, "result": _res}
         deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
         return _await_mini_directive(
-            projects_dir, state_lock, directive_id, deadline, caller_tool="mini_coder_result"
+            projects_dir,
+            state_lock,
+            directive_id,
+            deadline,
+            caller_tool="mini_coder_result",
         )
 
     # wait=false: single-read result (we already have _res from the not-found/owner check).
@@ -5873,7 +6345,11 @@ def dispatch_steer_mini_coder(
         if _root_owner != agent_id:
             raise McpError("mini-coder directive is not owned by this agent.")
         active = next(
-            (d for d in in_chain if str(d.get("status") or "") in _MINI_ACTIVE_STATUSES),
+            (
+                d
+                for d in in_chain
+                if str(d.get("status") or "") in _MINI_ACTIVE_STATUSES
+            ),
             None,
         )
         target = active or next(
@@ -5966,7 +6442,9 @@ def _visual_tool_result(directive_id: str, result: dict[str, Any]) -> dict[str, 
     if status == "done":
         critique = clean_text(result.get("critique"), "Visual critique", 4000)
         return {"directiveId": directive_id, "critique": critique}
-    error = clean_text(result.get("error") or "visual_check failed.", "Visual check error", 1000)
+    error = clean_text(
+        result.get("error") or "visual_check failed.", "Visual check error", 1000
+    )
     return {"directiveId": directive_id, "error": error}
 
 
@@ -5982,7 +6460,11 @@ def dispatch_visual_check(
 
     html_path = clean_visual_html_path(args.get("html_path"))
     raw_focus = str(args.get("focus") or "").strip()
-    focus = clean_text(raw_focus, "Visual check focus", VISUAL_CHECK_MAX_FOCUS_CHARS) if raw_focus else None
+    focus = (
+        clean_text(raw_focus, "Visual check focus", VISUAL_CHECK_MAX_FOCUS_CHARS)
+        if raw_focus
+        else None
+    )
 
     directive_id = uuid.uuid4().hex
     created_at = now()
@@ -6005,9 +6487,7 @@ def dispatch_visual_check(
         )
         status = str((session or {}).get("status") or "").strip().lower()
         if session is None or status in ("", "closed", "launch_pending"):
-            raise McpError(
-                "visual_check requires a live registered session."
-            )
+            raise McpError("visual_check requires a live registered session.")
         directives = state.setdefault("visualCheckDirectives", [])
         directives.append(directive)
         state["visualCheckDirectives"] = cap_visual_check_directives(directives)
@@ -6024,7 +6504,9 @@ def dispatch_visual_check(
     seen = False
     ever_ran = False
     while True:
-        present, status, result = _visual_directive_result(projects_dir, state_lock, directive_id)
+        present, status, result = _visual_directive_result(
+            projects_dir, state_lock, directive_id
+        )
         if result is not None:
             return _visual_tool_result(directive_id, result)
         if present:
@@ -6041,9 +6523,15 @@ def dispatch_visual_check(
         time.sleep(VISUAL_CHECK_POLL_INTERVAL_SECS)
 
     synthesized = (
-        {"status": "timeout", "error": "visual_check timed out waiting for the local critique."}
+        {
+            "status": "timeout",
+            "error": "visual_check timed out waiting for the local critique.",
+        }
         if ever_ran
-        else {"status": "failed", "error": "visual-check executor did not start this request within the poll window."}
+        else {
+            "status": "failed",
+            "error": "visual-check executor did not start this request within the poll window.",
+        }
     )
     try:
         with file_lock(state_lock):
@@ -6075,79 +6563,109 @@ def dispatch_visual_check(
 DESIGN_REQUEST_POLL_TIMEOUT_SECS = 300.0
 DESIGN_REQUEST_POLL_INTERVAL_SECS = 2.0
 
+
 def cap_design_request_directives(directives):
     return [d for d in directives if isinstance(d, dict)][-20:]
+
 
 def _design_directive_result(projects_dir, state_lock, directive_id):
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
-        for directive in state.get('designRequestDirectives', []):
-            if not isinstance(directive, dict): continue
-            if str(directive.get('id') or '') == directive_id:
-                status = str(directive.get('status') or '')
-                result = directive.get('result')
-                if isinstance(result, dict) and result: return True, status, result
+        for directive in state.get("designRequestDirectives", []):
+            if not isinstance(directive, dict):
+                continue
+            if str(directive.get("id") or "") == directive_id:
+                status = str(directive.get("status") or "")
+                result = directive.get("result")
+                if isinstance(result, dict) and result:
+                    return True, status, result
                 return True, status, None
-    return False, '', None
+    return False, "", None
+
 
 def _design_tool_result(directive_id, result):
-    status = str(result.get('status') or '').strip().lower()
-    if status == 'done':
+    status = str(result.get("status") or "").strip().lower()
+    if status == "done":
         return {
-            'directiveId': directive_id,
-            'designProjectPath': clean_text(result.get('designProjectPath'), 'Design path', 1000),
-            'registryId': clean_text(result.get('registryId'), 'Registry id', 200)
+            "directiveId": directive_id,
+            "designProjectPath": clean_text(
+                result.get("designProjectPath"), "Design path", 1000
+            ),
+            "registryId": clean_text(result.get("registryId"), "Registry id", 200),
         }
-    error = clean_text(result.get('error') or 'design_request failed.', 'Design error', 1000)
-    return {'directiveId': directive_id, 'error': error}
+    error = clean_text(
+        result.get("error") or "design_request failed.", "Design error", 1000
+    )
+    return {"directiveId": directive_id, "error": error}
+
 
 def dispatch_design_request(projects_dir, state_lock, args):
-    agent_id, role = require_agent_tool(projects_dir, args, 'design_request')
-    if 'design_request' not in ROLE_ALLOWED_TOOLS.get(role, set()):
-        raise McpError(f'{role} agents cannot use design_request.')
-    prompt = clean_text(args.get('prompt'), 'Design prompt', 4000)
+    agent_id, role = require_agent_tool(projects_dir, args, "design_request")
+    if "design_request" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use design_request.")
+    prompt = clean_text(args.get("prompt"), "Design prompt", 4000)
     if not prompt:
-        raise McpError('Design prompt is required.')
-    context = args.get('context')
-    plan_context = clean_text(context, 'Design context', 4000) if context else None
+        raise McpError("Design prompt is required.")
+    context = args.get("context")
+    plan_context = clean_text(context, "Design context", 4000) if context else None
     directive_id = uuid.uuid4().hex
     directive = {
-        'id': directive_id,
-        'parentAgentId': agent_id,
-        'status': 'pending',
-        'prompt': prompt,
-        'resultPath': f'{directive_id}.json',
-        'createdAt': now()
+        "id": directive_id,
+        "parentAgentId": agent_id,
+        "status": "pending",
+        "prompt": prompt,
+        "resultPath": f"{directive_id}.json",
+        "createdAt": now(),
     }
     if plan_context:
-        directive['planContext'] = plan_context
+        directive["planContext"] = plan_context
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
-        session = next((it for it in state['sessions'] if it.get('agentId')==agent_id), None)
-        status = str((session or {}).get('status') or '').strip().lower()
-        if session is None or status in ('','closed','launch_pending'):
-            raise McpError('design_request requires a live registered session.')
-        directives = state.setdefault('designRequestDirectives', [])
+        session = next(
+            (it for it in state["sessions"] if it.get("agentId") == agent_id), None
+        )
+        status = str((session or {}).get("status") or "").strip().lower()
+        if session is None or status in ("", "closed", "launch_pending"):
+            raise McpError("design_request requires a live registered session.")
+        directives = state.setdefault("designRequestDirectives", [])
         directives.append(directive)
-        state['designRequestDirectives'] = cap_design_request_directives(directives)
-        add_event(state, agent_id, role, 'design_request', 'Requested a design from the designer AI.')
+        state["designRequestDirectives"] = cap_design_request_directives(directives)
+        add_event(
+            state,
+            agent_id,
+            role,
+            "design_request",
+            "Requested a design from the designer AI.",
+        )
         write_agents_state(projects_dir, state)
     deadline = time.monotonic() + DESIGN_REQUEST_POLL_TIMEOUT_SECS
-    seen = False; ever_ran = False
+    seen = False
+    ever_ran = False
     while True:
-        present, status, result = _design_directive_result(projects_dir, state_lock, directive_id)
-        if result is not None: return _design_tool_result(directive_id, result)
+        present, status, result = _design_directive_result(
+            projects_dir, state_lock, directive_id
+        )
+        if result is not None:
+            return _design_tool_result(directive_id, result)
         if present:
             seen = True
-            if status == 'running': ever_ran = True
+            if status == "running":
+                ever_ran = True
         elif seen:
-            return {'directiveId': directive_id, 'error': 'directive vanished'}
-        if time.monotonic() >= deadline: break
+            return {"directiveId": directive_id, "error": "directive vanished"}
+        if time.monotonic() >= deadline:
+            break
         time.sleep(DESIGN_REQUEST_POLL_INTERVAL_SECS)
     synthesized = (
-        {"status": "timeout", "error": "design_request timed out waiting for the designer."}
+        {
+            "status": "timeout",
+            "error": "design_request timed out waiting for the designer.",
+        }
         if ever_ran
-        else {"status": "failed", "error": "design-request executor did not start this request within the poll window."}
+        else {
+            "status": "failed",
+            "error": "design-request executor did not start this request within the poll window.",
+        }
     )
     # Write the synthesized terminal result BACK to the directive so the executor never
     # processes a request the orchestrator already gave up on (mirrors visual_check).
@@ -6377,7 +6895,10 @@ def dispatch_request_git_push(
                     state = read_agents_state(projects_dir)
                     cleared = False
                     for s in state["sessions"]:
-                        if s.get("agentId") == agent_id and s.get("needsUser") is not None:
+                        if (
+                            s.get("agentId") == agent_id
+                            and s.get("needsUser") is not None
+                        ):
                             s["needsUser"] = None
                             cleared = True
                             break
@@ -6456,7 +6977,9 @@ def plans_dir(projects_dir: Path) -> Path:
     return projects_dir / ".aspis-plans"
 
 
-def _plan_artifact_paths(projects_dir: Path, project_id: str, plan_id: str) -> tuple[Path, Path]:
+def _plan_artifact_paths(
+    projects_dir: Path, project_id: str, plan_id: str
+) -> tuple[Path, Path]:
     """Resolve the (markdown, sidecar-json) paths for a plan. `project_id` is already
     normalized (lowercase allowlist) and `plan_id` is already validated 32-hex, so the
     join cannot escape the plans dir, but we still confine it via ensure_inside_projects
@@ -6487,7 +7010,9 @@ def _update_plan_sidecar_status(
         data["decidedAt"] = now()
         if note is not None:
             data["note"] = note
-        write_text_crash_safe(sidecar_path, json.dumps(data, ensure_ascii=False, indent=2), "plan sidecar")
+        write_text_crash_safe(
+            sidecar_path, json.dumps(data, ensure_ascii=False, indent=2), "plan sidecar"
+        )
     except (OSError, json.JSONDecodeError, McpError):
         pass
 
@@ -6581,7 +7106,9 @@ def dispatch_plan_submit(
     #    is single-line cleaned + capped; the markdown is prose (newlines PRESERVED, so
     #    NOT run through clean_text which collapses whitespace) — non-empty + hard cap.
     project_id = normalize_project_id(args.get("project_id", ""))
-    load_project_locked(projects_dir, project_id)  # raises McpError("Project not found.")
+    load_project_locked(
+        projects_dir, project_id
+    )  # raises McpError("Project not found.")
     title = clean_text(args.get("title"), "Plan title", 200)
     plan_markdown = str(args.get("plan_markdown") or "")
     if not strip_invisible_and_bidi(plan_markdown).strip():
@@ -6609,7 +7136,9 @@ def dispatch_plan_submit(
         "createdAt": created_at,
     }
     write_text_crash_safe(md_path, plan_markdown, "plan markdown")
-    write_text_crash_safe(sidecar_path, json.dumps(sidecar, ensure_ascii=False, indent=2), "plan sidecar")
+    write_text_crash_safe(
+        sidecar_path, json.dumps(sidecar, ensure_ascii=False, indent=2), "plan sidecar"
+    )
 
     request = {
         "id": plan_id,
@@ -6704,7 +7233,10 @@ def dispatch_plan_submit(
                     state = read_agents_state(projects_dir)
                     cleared = False
                     for s in state["sessions"]:
-                        if s.get("agentId") == agent_id and s.get("needsUser") is not None:
+                        if (
+                            s.get("agentId") == agent_id
+                            and s.get("needsUser") is not None
+                        ):
                             s["needsUser"] = None
                             cleared = True
                             break
@@ -6739,7 +7271,9 @@ def dispatch_plan_submit(
                     if current in _PLAN_VERDICT_STATUSES:
                         # The human acted in the window; PREFER the real verdict. No-op.
                         final_status = current
-                        final_note = existing_note if isinstance(existing_note, str) else None
+                        final_note = (
+                            existing_note if isinstance(existing_note, str) else None
+                        )
                     elif current == "pending_approval":
                         request["status"] = "timeout"
                         request["decidedAt"] = now()
@@ -6752,7 +7286,9 @@ def dispatch_plan_submit(
                     else:
                         # Already terminal as timeout (or some other state) — leave it.
                         final_status = current or "timeout"
-                        final_note = existing_note if isinstance(existing_note, str) else None
+                        final_note = (
+                            existing_note if isinstance(existing_note, str) else None
+                        )
                     break
             if modified:
                 write_agents_state(projects_dir, state)
@@ -6760,7 +7296,9 @@ def dispatch_plan_submit(
         pass
 
     # Best-effort: keep the durable sidecar in sync with the terminal status we report.
-    _update_plan_sidecar_status(projects_dir, project_id, plan_id, final_status, final_note)
+    _update_plan_sidecar_status(
+        projects_dir, project_id, plan_id, final_status, final_note
+    )
 
     result = {"planId": plan_id, "status": final_status}
     if final_note is not None:
@@ -6804,7 +7342,10 @@ def dispatch_plan_status(
                 continue
             if not isinstance(data, dict):
                 continue
-            result = {"planId": plan_id, "status": str(data.get("status") or "pending_approval")}
+            result = {
+                "planId": plan_id,
+                "status": str(data.get("status") or "pending_approval"),
+            }
             note_value = data.get("note")
             if isinstance(note_value, str):
                 result["note"] = note_value
@@ -6907,9 +7448,16 @@ def dispatch_ask_user(
             )
             if session is None:
                 # The session vanished (closed/capped) — give up cleanly.
-                return {"timeout": True, "note": "session ended before the human replied."}
+                return {
+                    "timeout": True,
+                    "note": "session ended before the human replied.",
+                }
             pending = session.get("pendingQuestion")
-            pending_id = str((pending or {}).get("id") or "") if isinstance(pending, dict) else ""
+            pending_id = (
+                str((pending or {}).get("id") or "")
+                if isinstance(pending, dict)
+                else ""
+            )
             reply = session.get("userReply")
             if isinstance(reply, dict):
                 reply_qid = str(reply.get("questionId") or "")
@@ -6945,7 +7493,10 @@ def dispatch_ask_user(
                 if session.get("agentId") != agent_id:
                     continue
                 pending = session.get("pendingQuestion")
-                if isinstance(pending, dict) and str(pending.get("id") or "") == question_id:
+                if (
+                    isinstance(pending, dict)
+                    and str(pending.get("id") or "") == question_id
+                ):
                     session.pop("pendingQuestion", None)
                     modified = True
                 needs = session.get("needsUser")
@@ -7005,7 +7556,9 @@ def handle_tool_call(
             # is then enforced on every subsequent call. Pure self-registration via
             # the compat kill switch stays tokenless so the per-call enforcement can
             # legitimately allow it; the kill switch covers REGISTRATION only.
-            managed_registration = existing is not None or not unmanaged_privileged_agents_allowed()
+            managed_registration = (
+                existing is not None or not unmanaged_privileged_agents_allowed()
+            )
             session_token = generate_session_token() if managed_registration else ""
             upsert_session(
                 state,
@@ -7016,14 +7569,22 @@ def handle_tool_call(
                 message=args.get("message") or "registered",
                 client=(args.get("client") or "") or None,
             )
-            session = next(item for item in state["sessions"] if item.get("agentId") == agent_id)
+            session = next(
+                item for item in state["sessions"] if item.get("agentId") == agent_id
+            )
             if managed_registration:
                 session["sessionTokenHash"] = hash_session_token(session_token)
                 session["sessionTokenIssuedAt"] = now()
             else:
                 session.pop("sessionTokenHash", None)
                 session.pop("sessionTokenIssuedAt", None)
-            add_event(state, agent_id, role, "register", args.get("message") or "Agent registered.")
+            add_event(
+                state,
+                agent_id,
+                role,
+                "register",
+                args.get("message") or "Agent registered.",
+            )
             # Soft signal: the fleet UI groups agents by model x role, so a blank
             # model leaves a gap. We still register the agent (model is optional),
             # but record a non-fatal event so the omission is visible.
@@ -7044,11 +7605,16 @@ def handle_tool_call(
         agent_id = normalize_agent_id(args.get("agent_id"))
         with file_lock(state_lock):
             state = read_agents_state(projects_dir)
-            session = next((item for item in state["sessions"] if item.get("agentId") == agent_id), None)
+            session = next(
+                (item for item in state["sessions"] if item.get("agentId") == agent_id),
+                None,
+            )
             if session is None:
                 raise McpError("Agent must call agent_register before heartbeat.")
             if str(session.get("status") or "").strip().lower() == "launch_pending":
-                raise McpError("Agent launch is pending. Call agent_register before heartbeat.")
+                raise McpError(
+                    "Agent launch is pending. Call agent_register before heartbeat."
+                )
             role = normalize_role(session.get("role", ""))
             if "agent_heartbeat" not in ROLE_ALLOWED_TOOLS.get(role, set()):
                 raise McpError(f"{role} agents cannot use agent_heartbeat.")
@@ -7114,8 +7680,18 @@ def handle_tool_call(
                     projects.append(summarize_project(read_project_file(path)))
             except Exception as exc:
                 projects.append({"id": path.stem, "path": str(path), "error": str(exc)})
-        projects.sort(key=lambda item: (item.get("updatedAt") or "", item.get("title") or ""), reverse=True)
-        audit_agent_read(projects_dir, state_lock, agent_id, role, "project_read", f"Listed {len(projects)} projects.")
+        projects.sort(
+            key=lambda item: (item.get("updatedAt") or "", item.get("title") or ""),
+            reverse=True,
+        )
+        audit_agent_read(
+            projects_dir,
+            state_lock,
+            agent_id,
+            role,
+            "project_read",
+            f"Listed {len(projects)} projects.",
+        )
         return {"projectsDir": str(projects_dir), "projects": projects}
 
     if name == "project_get":
@@ -7183,7 +7759,13 @@ def handle_tool_call(
 
     if name == "project_claim_task":
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         project_id = normalize_project_id(args.get("project_id", ""))
         task_id = normalize_task_id(args.get("task_id", ""))
         with file_lock(state_lock):
@@ -7196,20 +7778,37 @@ def handle_tool_call(
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
                 if project["metadata"].get("status") in {"paused", "archived", "done"}:
-                    raise McpError("Cannot claim tasks on paused, done or archived projects.")
-                task = next((item for item in project["state"].get("tasks", []) if item.get("id") == task_id), None)
+                    raise McpError(
+                        "Cannot claim tasks on paused, done or archived projects."
+                    )
+                task = next(
+                    (
+                        item
+                        for item in project["state"].get("tasks", [])
+                        if item.get("id") == task_id
+                    ),
+                    None,
+                )
                 if not task:
                     raise McpError("Task not found.")
                 task_status = str(task.get("status") or "")
                 if task_status == "done":
                     raise McpError("Done tasks cannot be claimed.")
                 if role == "verifier" and task_status not in {"review", "blocked"}:
-                    raise McpError("Verifier agents can only claim review or blocked tasks.")
+                    raise McpError(
+                        "Verifier agents can only claim review or blocked tasks."
+                    )
                 # Orchestrator shares the coder's claim semantics (CODER_LIKE_ROLES):
                 # it may claim todo/wip/blocked and auto-advances a todo to wip. It is
                 # NOT a verifier, so it can never claim a review task — tighter-or-equal.
-                if role in CODER_LIKE_ROLES and task_status not in {"todo", "wip", "blocked"}:
-                    raise McpError("Coder agents can only claim todo, wip or blocked tasks.")
+                if role in CODER_LIKE_ROLES and task_status not in {
+                    "todo",
+                    "wip",
+                    "blocked",
+                }:
+                    raise McpError(
+                        "Coder agents can only claim todo, wip or blocked tasks."
+                    )
                 if role in CODER_LIKE_ROLES and task_status == "todo":
                     task["status"] = "wip"
                     task["updatedAt"] = now()
@@ -7224,12 +7823,21 @@ def handle_tool_call(
                         }
                     )
                     project = write_project_file(project)
-            lease_until = (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat()
-            claim_status = "wip" if role in CODER_LIKE_ROLES and task.get("status") == "wip" else "claimed"
+            lease_until = (
+                datetime.now(timezone.utc) + timedelta(minutes=45)
+            ).isoformat()
+            claim_status = (
+                "wip"
+                if role in CODER_LIKE_ROLES and task.get("status") == "wip"
+                else "claimed"
+            )
             state["claims"] = [
                 item
                 for item in state["claims"]
-                if not (item.get("projectId") == project_id and item.get("taskId") == task_id)
+                if not (
+                    item.get("projectId") == project_id
+                    and item.get("taskId") == task_id
+                )
             ]
             state["claims"].append(
                 {
@@ -7245,13 +7853,22 @@ def handle_tool_call(
                     "leaseUntil": lease_until,
                 }
             )
-            upsert_session(state, agent_id, role, status=claim_status, project_id=project_id, task_id=task_id)
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status=claim_status,
+                project_id=project_id,
+                task_id=task_id,
+            )
             add_event(
                 state,
                 agent_id,
                 role,
                 "claim",
-                f"Claimed {task_id}." if claim_status == "claimed" else f"Claimed {task_id} and moved it to wip.",
+                f"Claimed {task_id}."
+                if claim_status == "claimed"
+                else f"Claimed {task_id} and moved it to wip.",
                 project_id,
                 task_id,
                 task.get("status"),
@@ -7260,7 +7877,13 @@ def handle_tool_call(
 
     if name == "project_update_status":
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         project_id = normalize_project_id(args.get("project_id", ""))
         task_id = normalize_task_id(args.get("task_id", ""))
         status = normalize_task_status(args.get("status", ""))
@@ -7269,16 +7892,29 @@ def handle_tool_call(
 
         with file_lock(state_lock):
             state = read_agents_state(projects_dir)
-            require_claim_for_status_update(state, agent_id, role, project_id, task_id, target_status=status)
+            require_claim_for_status_update(
+                state, agent_id, role, project_id, task_id, target_status=status
+            )
 
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
                 if project["metadata"].get("status") in {"paused", "archived"}:
-                    raise McpError("Cannot update tasks on paused or archived projects.")
-                task = next((item for item in project["state"].get("tasks", []) if item.get("id") == task_id), None)
+                    raise McpError(
+                        "Cannot update tasks on paused or archived projects."
+                    )
+                task = next(
+                    (
+                        item
+                        for item in project["state"].get("tasks", [])
+                        if item.get("id") == task_id
+                    ),
+                    None,
+                )
                 if not task:
                     raise McpError("Task not found.")
-                validate_transition(role, status, evidence, confidence, task.get("status"))
+                validate_transition(
+                    role, status, evidence, confidence, task.get("status")
+                )
                 task["status"] = status
                 task["updatedAt"] = now()
                 note_text = f"{agent_id} ({role}) set {task_id} to {status}."
@@ -7292,14 +7928,25 @@ def handle_tool_call(
                         "createdAt": now(),
                     }
                 )
-                if all(item.get("status") == "done" for item in project["state"].get("tasks", [])):
+                if all(
+                    item.get("status") == "done"
+                    for item in project["state"].get("tasks", [])
+                ):
                     project["metadata"]["status"] = "done"
                 elif project["metadata"].get("status") == "done" and status != "done":
                     project["metadata"]["status"] = "active"
                 project["metadata"]["updatedAt"] = now()
                 saved = write_project_file(project)
 
-            upsert_session(state, agent_id, role, status=status, message=evidence or f"{task_id} -> {status}", project_id=project_id, task_id=task_id)
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status=status,
+                message=evidence or f"{task_id} -> {status}",
+                project_id=project_id,
+                task_id=task_id,
+            )
             for claim in state["claims"]:
                 if (
                     claim.get("projectId") == project_id
@@ -7310,14 +7957,30 @@ def handle_tool_call(
                     claim["status"] = status
                     claim["updatedAt"] = now()
                     claim["evidence"] = evidence or claim.get("evidence")
-            add_event(state, agent_id, role, "status", f"{task_id} -> {status}", project_id, task_id, status, evidence)
+            add_event(
+                state,
+                agent_id,
+                role,
+                "status",
+                f"{task_id} -> {status}",
+                project_id,
+                task_id,
+                status,
+                evidence,
+            )
             write_agents_state(projects_dir, state)
 
         return public_project(saved)
 
     if name == "project_append_note":
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         project_id = normalize_project_id(args.get("project_id", ""))
         text = clean_text(args.get("text"), "Note", 4000)
         with file_lock(state_lock):
@@ -7334,7 +7997,14 @@ def handle_tool_call(
                 )
                 project["metadata"]["updatedAt"] = now()
                 saved = write_project_file(project)
-            upsert_session(state, agent_id, role, status="noted", message=text, project_id=project_id)
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status="noted",
+                message=text,
+                project_id=project_id,
+            )
             add_event(state, agent_id, role, "note", text, project_id)
             write_agents_state(projects_dir, state)
         return public_project(saved)
@@ -7344,7 +8014,13 @@ def handle_tool_call(
         # Same locked read-modify-write as project_append_note; touches only the
         # metadata title (+ updatedAt) so it is durable on disk immediately.
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         project_id = normalize_project_id(args.get("project_id", ""))
         title = clean_text(args.get("title"), "Project title", 200)
         with file_lock(state_lock):
@@ -7354,14 +8030,27 @@ def handle_tool_call(
                 project["metadata"]["title"] = title
                 project["metadata"]["updatedAt"] = now()
                 saved = write_project_file(project)
-            upsert_session(state, agent_id, role, status="renamed", message=title, project_id=project_id)
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status="renamed",
+                message=title,
+                project_id=project_id,
+            )
             add_event(state, agent_id, role, "rename", title, project_id)
             write_agents_state(projects_dir, state)
         return public_project(saved)
 
     if name == "project_create_followup":
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         project_id = normalize_project_id(args.get("project_id", ""))
         title = clean_text(args.get("title"), "Task title", 500)
         reason = clean_text(args.get("reason"), "Reason", 2000)
@@ -7381,7 +8070,9 @@ def handle_tool_call(
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
                 if project["metadata"].get("status") in {"paused", "archived", "done"}:
-                    raise McpError("Cannot create follow-up tasks on paused, done or archived projects.")
+                    raise McpError(
+                        "Cannot create follow-up tasks on paused, done or archived projects."
+                    )
                 tasks = project["state"].setdefault("tasks", [])
                 task = {
                     "id": next_task_id(tasks),
@@ -7414,8 +8105,25 @@ def handle_tool_call(
                 project["metadata"]["status"] = "active"
                 project["metadata"]["updatedAt"] = now()
                 saved = write_project_file(project)
-            upsert_session(state, agent_id, role, status="followup", message=title, project_id=project_id, task_id=task["id"])
-            add_event(state, agent_id, role, "followup", reason, project_id, task["id"], "todo")
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status="followup",
+                message=title,
+                project_id=project_id,
+                task_id=task["id"],
+            )
+            add_event(
+                state,
+                agent_id,
+                role,
+                "followup",
+                reason,
+                project_id,
+                task["id"],
+                "todo",
+            )
             write_agents_state(projects_dir, state)
         return {"project": public_project(saved), "task": task}
 
@@ -7426,7 +8134,13 @@ def handle_tool_call(
         # ROLE_ALLOWED_TOOLS. The planner sends its OWN internal ids in id/dependsOn;
         # we allocate FRESH T<n> ids (no collision with manual tasks) and remap deps.
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         project_id = normalize_project_id(args.get("project_id", ""))
         # B4/W6: the plan_id is a SECURITY-CRITICAL identifier here — only an APPROVED
         # plan may have its tasks bulk-created (the runner auto-executes them). Validate
@@ -7436,12 +8150,16 @@ def handle_tool_call(
         # state we read there.
         plan_id = str(args.get("plan_id") or "").strip().lower()
         if not _PLAN_ID_RE.fullmatch(plan_id):
-            raise McpError("plan_id must be exactly 32 lowercase hexadecimal characters.")
+            raise McpError(
+                "plan_id must be exactly 32 lowercase hexadecimal characters."
+            )
         incoming = args.get("tasks")
         if not isinstance(incoming, list) or not incoming:
             raise McpError("project_create_plan_tasks requires a non-empty tasks list.")
         if len(incoming) > MAX_PLAN_TASKS:
-            raise McpError(f"Too many plan tasks: {len(incoming)} (max {MAX_PLAN_TASKS}).")
+            raise McpError(
+                f"Too many plan tasks: {len(incoming)} (max {MAX_PLAN_TASKS})."
+            )
 
         # --- Pre-lock validation of the INCOMING (planner-internal) shape. The plan
         # must be SELF-CONTAINED: every dependsOn references an id that is also in
@@ -7462,9 +8180,13 @@ def handle_tool_call(
             # we cannot use clean_text which rejects empties): strip invisible/BiDi control
             # chars so a U+202E-obfuscated acceptance can't survive into the field piece 1b
             # will EXECUTE + the human reads in the project markdown.
-            acceptance = strip_invisible_and_bidi(str(entry.get("acceptance") or "")).strip()[:4000]
+            acceptance = strip_invisible_and_bidi(
+                str(entry.get("acceptance") or "")
+            ).strip()[:4000]
             raw_scope = entry.get("scope", [])
-            if not isinstance(raw_scope, list) or not all(isinstance(s, str) for s in raw_scope):
+            if not isinstance(raw_scope, list) or not all(
+                isinstance(s, str) for s in raw_scope
+            ):
                 raise McpError("Plan task scope must be a list of file paths.")
             if len(raw_scope) > MAX_PLAN_TASK_SCOPE:
                 raise McpError(
@@ -7472,7 +8194,9 @@ def handle_tool_call(
                 )
             scope = [validate_plan_scope_path(s) for s in raw_scope]
             raw_deps = entry.get("dependsOn", [])
-            if not isinstance(raw_deps, list) or not all(isinstance(d, str) for d in raw_deps):
+            if not isinstance(raw_deps, list) or not all(
+                isinstance(d, str) for d in raw_deps
+            ):
                 raise McpError("Plan task dependsOn must be a list of task ids.")
             deps = [normalize_task_id(d) for d in raw_deps]
             parsed.append(
@@ -7515,7 +8239,9 @@ def handle_tool_call(
             with file_lock(project_lock_path(projects_dir, project_id)):
                 project = read_project_file(project_path(projects_dir, project_id))
                 if project["metadata"].get("status") in {"paused", "archived", "done"}:
-                    raise McpError("Cannot create plan tasks on paused, done or archived projects.")
+                    raise McpError(
+                        "Cannot create plan tasks on paused, done or archived projects."
+                    )
                 tasks = project["state"].setdefault("tasks", [])
                 # Allocate a FRESH T<n> per incoming task. next_task_id derives the
                 # next free id from the CURRENT tasks; append each allocated task to a
@@ -7623,7 +8349,13 @@ def handle_tool_call(
 
     if name == "cloudflare_list_workers":
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         token = cloudflare_token_from_sources(
             *CF_TOKEN_ENVS,
             *CF_READONLY_TOKEN_ENVS,
@@ -7632,17 +8364,31 @@ def handle_tool_call(
         result = cloudflare_list_workers(token, args.get("account_id") or None)
         with file_lock(state_lock):
             state = read_agents_state(projects_dir)
-            upsert_session(state, agent_id, role, status="cloudflare-read", message="Read Cloudflare Workers inventory.")
-            add_event(state, agent_id, role, "cloudflare_read", f"Read {len(result['workers'])} Cloudflare Workers.")
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status="cloudflare-read",
+                message="Read Cloudflare Workers inventory.",
+            )
+            add_event(
+                state,
+                agent_id,
+                role,
+                "cloudflare_read",
+                f"Read {len(result['workers'])} Cloudflare Workers.",
+            )
             write_agents_state(projects_dir, state)
         return result
 
     if name == "cloudflare_rotate_worker_secret":
-        agent_id, role, management_project_id, task_id, evidence = require_provider_mutation_context(
-            projects_dir,
-            state_lock,
-            args,
-            name,
+        agent_id, role, management_project_id, task_id, evidence = (
+            require_provider_mutation_context(
+                projects_dir,
+                state_lock,
+                args,
+                name,
+            )
         )
         token = cloudflare_token_from_sources(
             *CF_SECRET_ROTATOR_TOKEN_ENVS,
@@ -7679,7 +8425,9 @@ def handle_tool_call(
                 str(exc)[:240],
             )
             raise
-        message = f"Rotated Worker secret {result['secretName']} on {result['workerName']}."
+        message = (
+            f"Rotated Worker secret {result['secretName']} on {result['workerName']}."
+        )
         record_provider_mutation(
             projects_dir,
             state_lock,
@@ -7696,7 +8444,13 @@ def handle_tool_call(
 
     if name == "scaleway_list_resources":
         agent_id = normalize_agent_id(args.get("agent_id"))
-        role = require_registered_role(projects_dir, agent_id, args.get("role", ""), name, args.get("session_token"))
+        role = require_registered_role(
+            projects_dir,
+            agent_id,
+            args.get("role", ""),
+            name,
+            args.get("session_token"),
+        )
         token = provider_token_from_sources(
             "scaleway_token",
             *SCW_TOKEN_ENVS,
@@ -7704,17 +8458,31 @@ def handle_tool_call(
         result = scaleway_list_resources(token, args.get("project_id") or None)
         with file_lock(state_lock):
             state = read_agents_state(projects_dir)
-            upsert_session(state, agent_id, role, status="scaleway-read", message="Read Scaleway Aspis Bio inventory.")
-            add_event(state, agent_id, role, "scaleway_read", f"Read {len(result['resources'])} Scaleway resources.")
+            upsert_session(
+                state,
+                agent_id,
+                role,
+                status="scaleway-read",
+                message="Read Scaleway Aspis Bio inventory.",
+            )
+            add_event(
+                state,
+                agent_id,
+                role,
+                "scaleway_read",
+                f"Read {len(result['resources'])} Scaleway resources.",
+            )
             write_agents_state(projects_dir, state)
         return result
 
     if name == "scaleway_resource_action":
-        agent_id, role, management_project_id, task_id, evidence = require_provider_mutation_context(
-            projects_dir,
-            state_lock,
-            args,
-            name,
+        agent_id, role, management_project_id, task_id, evidence = (
+            require_provider_mutation_context(
+                projects_dir,
+                state_lock,
+                args,
+                name,
+            )
         )
         token = provider_token_from_sources(
             "scaleway_token",
@@ -7736,7 +8504,10 @@ def handle_tool_call(
                 resource_id=args.get("resource_id", ""),
                 action=args.get("action", ""),
                 confirm_resource_name=args.get("confirm_resource_name") or None,
-                project_id=args.get("scaleway_project_id") or args.get("provider_project_id") or args.get("project_id") or None,
+                project_id=args.get("scaleway_project_id")
+                or args.get("provider_project_id")
+                or args.get("project_id")
+                or None,
             )
         except Exception as exc:
             release_provider_mutation_reservation(
@@ -7750,7 +8521,9 @@ def handle_tool_call(
                 str(exc)[:240],
             )
             raise
-        message = f"{result['action']} {result['resourceName'] or result['resourceId']}."
+        message = (
+            f"{result['action']} {result['resourceName'] or result['resourceId']}."
+        )
         record_provider_mutation(
             projects_dir,
             state_lock,
@@ -7784,7 +8557,15 @@ def handle_tool_call(
             "pendingFiles": index_status.get("pending_files"),
             "staleFiles": index_status.get("stale_files"),
         }
-        audit_agent_read(projects_dir, state_lock, agent_id, role, "oracle_ask", clean_text(args.get("query"), "Query", 2000), args.get("project_id") or None)
+        audit_agent_read(
+            projects_dir,
+            state_lock,
+            agent_id,
+            role,
+            "oracle_ask",
+            clean_text(args.get("query"), "Query", 2000),
+            args.get("project_id") or None,
+        )
         return result
 
     if name == "oracle_context":
@@ -7800,7 +8581,15 @@ def handle_tool_call(
         enforce_mini_oracle_project_scope(projects_dir, agent_id, role, args)
         query = clean_text(args.get("query"), "Query", 2000)
         mcp_debug(projects_dir, "oracle_context index begin")
-        audit_agent_read(projects_dir, state_lock, agent_id, role, "oracle_context", query, args.get("project_id") or None)
+        audit_agent_read(
+            projects_dir,
+            state_lock,
+            agent_id,
+            role,
+            "oracle_context",
+            query,
+            args.get("project_id") or None,
+        )
         mcp_debug(projects_dir, "oracle_context audit ok")
         # FIX 4: dispatch owns readiness (HTTP path trusts the resident server;
         # only the in-process / fallback path runs the LOCAL fail-closed gate).
@@ -7837,6 +8626,19 @@ def handle_tool_call(
             validate_censor_rel_path(file_arg)
         work_root = resolve_project_work_root(projects_path, project_id)
         findings = read_censor_open_findings(work_root, file_arg)
+        drain_queue = str(args.get("drain_queue") or "").strip().lower() in (
+            "true",
+            "1",
+        )
+
+        if drain_queue:
+            queue_findings = drain_censor_queue(work_root)
+            existing_ids = {f.get("id") for f in findings}
+            for qf in queue_findings:
+                if qf.get("id") not in existing_ids:
+                    findings.append(qf)
+                    existing_ids.add(qf.get("id"))
+
         # Audit the read (identity only — never shard contents, which is why we log
         # just the count, mirroring the privacy posture of the other read tools).
         audit_agent_read(
@@ -7846,10 +8648,16 @@ def handle_tool_call(
             role,
             "censor_findings",
             f"Read {len(findings)} open Censor finding(s)"
-            + (f" for {file_arg}" if file_arg else ""),
+            + (f" for {file_arg}" if file_arg else "")
+            + (" (queue drained)" if drain_queue else ""),
             project_id,
         )
-        return {"projectId": project_id, "file": file_arg, "findings": findings}
+        return {
+            "projectId": project_id,
+            "file": file_arg,
+            "findings": findings,
+            "drainedQueue": drain_queue,
+        }
 
     if name == "censor_dispose":
         agent_id, role = require_agent_tool(projects_path, args, name)
@@ -7895,11 +8703,15 @@ def handle_tool_call(
     raise McpError(f"Unknown Aspis MCP tool: {name}")
 
 
-def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path | None = None):
+def create_mcp_server(
+    root: str | Path | None = None, projects_dir: str | Path | None = None
+):
     try:
         from mcp.server.fastmcp import FastMCP
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("Install oracle/requirements.txt to run the Aspis MCP server.") from exc
+        raise RuntimeError(
+            "Install oracle/requirements.txt to run the Aspis MCP server."
+        ) from exc
 
     server = FastMCP("aspis-management")
 
@@ -7914,10 +8726,20 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
     @server.tool()
     def agent_state(agent_id: str, role: str, session_token: str = "") -> dict:
         """Live state of agent sessions, claims and recent events."""
-        return call("agent_state", {"agent_id": agent_id, "role": role, "session_token": session_token})
+        return call(
+            "agent_state",
+            {"agent_id": agent_id, "role": role, "session_token": session_token},
+        )
 
     @server.tool()
-    def agent_register(agent_id: str, role: str, model: str = "", client: str = "", message: str = "", launch_token: str = "") -> dict:
+    def agent_register(
+        agent_id: str,
+        role: str,
+        model: str = "",
+        client: str = "",
+        message: str = "",
+        launch_token: str = "",
+    ) -> dict:
         """Register a CLI agent in the live dashboard."""
         return call(
             "agent_register",
@@ -8164,7 +8986,9 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
-    def plan_status(agent_id: str, role: str, plan_id: str, session_token: str = "") -> dict:
+    def plan_status(
+        agent_id: str, role: str, plan_id: str, session_token: str = ""
+    ) -> dict:
         """Coder or verifier: read the current status of a previously submitted plan.
 
         Returns `{planId, status, note?}` where status is one of pending_approval /
@@ -8173,11 +8997,18 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         """
         return call(
             "plan_status",
-            {"agent_id": agent_id, "role": role, "plan_id": plan_id, "session_token": session_token},
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "plan_id": plan_id,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
-    def ask_user(agent_id: str, role: str, question: str, session_token: str = "") -> dict:
+    def ask_user(
+        agent_id: str, role: str, question: str, session_token: str = ""
+    ) -> dict:
         """Coder or verifier: ask the HUMAN a blocking question and wait for the reply.
 
         Use this instead of stalling in the terminal when you genuinely need a decision
@@ -8186,30 +9017,66 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         """
         return call(
             "ask_user",
-            {"agent_id": agent_id, "role": role, "question": question, "session_token": session_token},
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "question": question,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
     def project_list(agent_id: str, role: str, session_token: str = "") -> dict:
         """List local Markdown projects."""
-        return call("project_list", {"agent_id": agent_id, "role": role, "session_token": session_token})
+        return call(
+            "project_list",
+            {"agent_id": agent_id, "role": role, "session_token": session_token},
+        )
 
     @server.tool()
-    def project_get(project_id: str, agent_id: str, role: str, session_token: str = "") -> dict:
+    def project_get(
+        project_id: str, agent_id: str, role: str, session_token: str = ""
+    ) -> dict:
         """Read a project with its tasks, notes, revision and path."""
-        return call("project_get", {"project_id": project_id, "agent_id": agent_id, "role": role, "session_token": session_token})
+        return call(
+            "project_get",
+            {
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
+        )
 
     @server.tool()
-    def project_next_task(project_id: str, agent_id: str, role: str = "coder", session_token: str = "") -> dict:
+    def project_next_task(
+        project_id: str, agent_id: str, role: str = "coder", session_token: str = ""
+    ) -> dict:
         """Suggest the next incomplete task for a role."""
-        return call("project_next_task", {"project_id": project_id, "agent_id": agent_id, "role": role, "session_token": session_token})
+        return call(
+            "project_next_task",
+            {
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
+        )
 
     @server.tool()
-    def project_claim_task(project_id: str, task_id: str, agent_id: str, role: str, session_token: str = "") -> dict:
+    def project_claim_task(
+        project_id: str, task_id: str, agent_id: str, role: str, session_token: str = ""
+    ) -> dict:
         """Create a lease claim on the task."""
         return call(
             "project_claim_task",
-            {"project_id": project_id, "task_id": task_id, "agent_id": agent_id, "role": role, "session_token": session_token},
+            {
+                "project_id": project_id,
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
@@ -8239,19 +9106,45 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
-    def project_append_note(project_id: str, text: str, agent_id: str, role: str, session_token: str = "") -> dict:
+    def project_append_note(
+        project_id: str, text: str, agent_id: str, role: str, session_token: str = ""
+    ) -> dict:
         """Append a structured note to the project."""
         return call(
             "project_append_note",
-            {"project_id": project_id, "text": text, "agent_id": agent_id, "role": role, "session_token": session_token},
+            {
+                "project_id": project_id,
+                "text": text,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
-    def project_create_followup(project_id: str, title: str, reason: str, agent_id: str, role: str, category: str = "other", description: str = "", session_token: str = "") -> dict:
+    def project_create_followup(
+        project_id: str,
+        title: str,
+        reason: str,
+        agent_id: str,
+        role: str,
+        category: str = "other",
+        description: str = "",
+        session_token: str = "",
+    ) -> dict:
         """Create a follow-up TODO task. category: feature|hardening|bug|other (default other). description: optional free-form context (used by Oracle suspect localization)."""
         return call(
             "project_create_followup",
-            {"project_id": project_id, "title": title, "reason": reason, "category": category, "description": description, "agent_id": agent_id, "role": role, "session_token": session_token},
+            {
+                "project_id": project_id,
+                "title": title,
+                "reason": reason,
+                "category": category,
+                "description": description,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
@@ -8282,7 +9175,9 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
-    def provider_credentials_status(agent_id: str, role: str, session_token: str = "") -> dict:
+    def provider_credentials_status(
+        agent_id: str, role: str, session_token: str = ""
+    ) -> dict:
         """Read-only: diagnose provider/Oracle credentials without exposing secrets."""
         return call(
             "provider_credentials_status",
@@ -8290,11 +9185,18 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
-    def cloudflare_list_workers(agent_id: str, role: str, account_id: str = "", session_token: str = "") -> dict:
+    def cloudflare_list_workers(
+        agent_id: str, role: str, account_id: str = "", session_token: str = ""
+    ) -> dict:
         """Read-only: list Workers in the Aspis Bio Cloudflare account."""
         return call(
             "cloudflare_list_workers",
-            {"agent_id": agent_id, "role": role, "account_id": account_id, "session_token": session_token},
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "account_id": account_id,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
@@ -8328,11 +9230,18 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
-    def scaleway_list_resources(agent_id: str, role: str, project_id: str = "", session_token: str = "") -> dict:
+    def scaleway_list_resources(
+        agent_id: str, role: str, project_id: str = "", session_token: str = ""
+    ) -> dict:
         """Read-only: list VMs and serverless resources in the Aspis Bio Scaleway project."""
         return call(
             "scaleway_list_resources",
-            {"agent_id": agent_id, "role": role, "project_id": project_id, "session_token": session_token},
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "project_id": project_id,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
@@ -8368,7 +9277,14 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         )
 
     @server.tool()
-    def oracle_ask(query: str, agent_id: str, role: str, limit: int = 5, project_id: str = "", session_token: str = "") -> dict:
+    def oracle_ask(
+        query: str,
+        agent_id: str,
+        role: str,
+        limit: int = 5,
+        project_id: str = "",
+        session_token: str = "",
+    ) -> dict:
         """Ask the Oracle about the project's architecture/codebase.
 
         TIP: ask PRECISE, single-subsystem questions. Retrieval is similarity-based:
@@ -8378,11 +9294,25 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         spawning", then "CPU VM spawning for RNA-seq")."""
         return call(
             "oracle_ask",
-            {"query": query, "limit": limit, "agent_id": agent_id, "role": role, "project_id": project_id, "session_token": session_token},
+            {
+                "query": query,
+                "limit": limit,
+                "agent_id": agent_id,
+                "role": role,
+                "project_id": project_id,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
-    def oracle_context(query: str, agent_id: str, role: str, limit: int = 8, project_id: str = "", session_token: str = "") -> dict:
+    def oracle_context(
+        query: str,
+        agent_id: str,
+        role: str,
+        limit: int = 8,
+        project_id: str = "",
+        session_token: str = "",
+    ) -> dict:
         """Return semantically relevant text chunks for agents.
 
         TIP: precise, single-topic queries return better chunks. A broad query
@@ -8391,11 +9321,24 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         query for each."""
         return call(
             "oracle_context",
-            {"query": query, "limit": limit, "agent_id": agent_id, "role": role, "project_id": project_id, "session_token": session_token},
+            {
+                "query": query,
+                "limit": limit,
+                "agent_id": agent_id,
+                "role": role,
+                "project_id": project_id,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
-    def project_structure(project_id: str, agent_id: str, role: str, full: bool = False, session_token: str = "") -> dict:
+    def project_structure(
+        project_id: str,
+        agent_id: str,
+        role: str,
+        full: bool = False,
+        session_token: str = "",
+    ) -> dict:
         """Return the project's architecturally-central 'spine' files + summary counts,
         computed DETERMINISTICALLY (no-LLM, tree-sitter cross-file graph) from the project
         root. Use this FIRST to orient — the spine is the handful of files the rest of the
@@ -8405,11 +9348,23 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         big repos; usually unnecessary)."""
         return call(
             "project_structure",
-            {"project_id": project_id, "full": full, "agent_id": agent_id, "role": role, "session_token": session_token},
+            {
+                "project_id": project_id,
+                "full": full,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
-    def censor_findings(project_id: str, agent_id: str, role: str, file: str = "", session_token: str = "") -> dict:
+    def censor_findings(
+        project_id: str,
+        agent_id: str,
+        role: str,
+        file: str = "",
+        session_token: str = "",
+    ) -> dict:
         """Read OPEN Censor code-review findings for a project (local linters + the
         optional Gemma tier). Pass `file` (a project-relative path) to scope to the
         files you just touched. CODER: call this at each step boundary for your
@@ -8419,18 +9374,40 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
         raw tool output)."""
         return call(
             "censor_findings",
-            {"project_id": project_id, "file": file, "agent_id": agent_id, "role": role, "session_token": session_token},
+            {
+                "project_id": project_id,
+                "file": file,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     @server.tool()
-    def censor_dispose(project_id: str, file: str, id: str, disposition: str, agent_id: str, role: str, session_token: str = "") -> dict:
+    def censor_dispose(
+        project_id: str,
+        file: str,
+        id: str,
+        disposition: str,
+        agent_id: str,
+        role: str,
+        session_token: str = "",
+    ) -> dict:
         """Set a Censor finding's disposition and append an audit entry.
         disposition: open|fixed|fp|wontfix. `file` is the project-relative path the
         finding belongs to (from censor_findings). Use `fp` for a false positive,
         `wontfix` for an accepted-but-unfixed finding, `fixed` once resolved."""
         return call(
             "censor_dispose",
-            {"project_id": project_id, "file": file, "id": id, "disposition": disposition, "agent_id": agent_id, "role": role, "session_token": session_token},
+            {
+                "project_id": project_id,
+                "file": file,
+                "id": id,
+                "disposition": disposition,
+                "agent_id": agent_id,
+                "role": role,
+                "session_token": session_token,
+            },
         )
 
     return server
@@ -8439,7 +9416,9 @@ def create_mcp_server(root: str | Path | None = None, projects_dir: str | Path |
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aspis Management MCP server")
     parser.add_argument("--root", default=None, help="Aspis Management root folder")
-    parser.add_argument("--projects-dir", default=None, help="Shared Aspis Management projects folder")
+    parser.add_argument(
+        "--projects-dir", default=None, help="Shared Aspis Management projects folder"
+    )
     args = parser.parse_args()
     create_mcp_server(root=args.root, projects_dir=args.projects_dir).run()
 
