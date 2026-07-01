@@ -110,32 +110,36 @@ pub fn compact_built_prompt(
     let task_block = &prompt[task_start..];
 
     // Extract individual file blocks from the files_section: each is "- <path>\n```\n<content>\n```\n"
-    // We split on "\n- " after the "FILE SCOPE" header line.
     let mut file_blocks: Vec<(String, String)> = Vec::new();
     let header_end = files_section
         .find('\n')
         .map(|i| i + 1)
         .unwrap_or(files_section.len());
     let body = &files_section[header_end..];
-    for chunk in body.split("\n- ") {
-        let chunk = chunk.trim_start_matches("\n- ");
-        if chunk.is_empty() {
-            continue;
-        }
-        // First line is the path; rest (in ``` fences) is content.
-        let nl = chunk.find('\n').unwrap_or(chunk.len());
-        let path: String = chunk[..nl].trim().to_string();
-        let content = if let Some(start) = chunk.find("```\n") {
-            let after = &chunk[start + 4..];
-            if let Some(end) = after.find("\n```") {
-                after[..end].to_string()
-            } else {
-                chunk.to_string()
-            }
-        } else {
-            String::new()
+    // Parse fence-aware (blocker 4): a "- " line INSIDE a file's fenced content
+    // (markdown bullets, YAML lists) must NOT start a new block, so we always advance
+    // PAST the closing fence before scanning for the next path line.
+    let mut rest = body;
+    while let Some(dash) = rest.find("- ") {
+        let after = &rest[dash + 2..]; // past "- "
+        let nl = match after.find('\n') {
+            Some(n) => n,
+            None => break,
+        };
+        let path = after[..nl].trim().to_string();
+        let after_path = &after[nl + 1..]; // line following the path line
+        // Content lives in the next ```\n … \n``` fence.
+        let open = match after_path.find("```\n") {
+            Some(o) => o,
+            None => break, // malformed: no fence for this path — stop.
+        };
+        let content_area = &after_path[open + 4..]; // past "```\n"
+        let (content, advance) = match content_area.find("\n```") {
+            Some(close) => (content_area[..close].to_string(), close + 4), // past "\n```"
+            None => (content_area.to_string(), content_area.len()),
         };
         file_blocks.push((path, content));
+        rest = &content_area[advance.min(content_area.len())..];
     }
 
     // BM25 score each file vs the task description.
@@ -455,5 +459,21 @@ mod tests {
         // Task + hard constraints still survive.
         assert!(out.contains("TASK (do EXACTLY"), "task must survive");
         assert!(out.contains("HARD CONSTRAINTS"), "constraints must survive");
+    }
+
+    #[test]
+    fn compact_preserves_file_with_bullet_lines_in_content() {
+        // A file whose CONTENT contains markdown bullet lines must parse as ONE
+        // block, not split at each "- " (blocker 4: the old `"\n- "` split leaked
+        // bullet lines into bogus extra file blocks).
+        let content = "fn x() {}\n- not a new file\n- still same file";
+        let prompt = format!(
+            "sys\n\nFILE SCOPE (operate on ONLY these files):\n- src/a.rs\n```\n{content}\n```\n\nHARD CONSTRAINTS (safety):\n- obey\n\nTASK (do EXACTLY this):\nfix\n"
+        );
+        // Large window → nothing trimmed, the file is kept whole.
+        let (out, budget) = compact_built_prompt(&prompt, "fix", 200_000, 0);
+        assert_eq!(budget.files_kept, 1, "must parse exactly one file block, not split on bullets");
+        assert!(out.contains("- not a new file"), "bullet content line must survive");
+        assert!(out.contains("- still same file"), "bullet content line must survive");
     }
 }
