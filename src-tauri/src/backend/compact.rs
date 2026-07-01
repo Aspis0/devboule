@@ -99,9 +99,15 @@ pub fn compact_built_prompt(
     let preamble = &prompt[..preamble_end];
 
     let files_section_start = preamble_end;
-    // Search for HARD CONSTRAINTS only within the file section (not the whole prompt).
+    // Search for HARD CONSTRAINTS within the file section. Use rFIND (LAST occurrence),
+    // not find: this is a self-hosted tool that routinely edits its OWN source, and files
+    // like compact.rs / mini_coder_executor.rs contain the literal "HARD CONSTRAINTS
+    // (safety" as string constants. Such a file's content sits in the file section BEFORE
+    // the real header, so `find` (first) would match inside the embedded content and
+    // corrupt the split. The REAL header is the last occurrence — the hard-body/task
+    // sections after it don't repeat the header prefix.
     let hard_start = prompt[files_section_start..]
-        .find("HARD CONSTRAINTS (safety")
+        .rfind("HARD CONSTRAINTS (safety")
         .map(|i| i + files_section_start)
         .unwrap_or(prompt.len());
     let files_section = &prompt[files_section_start..hard_start];
@@ -506,5 +512,21 @@ mod tests {
         assert!(out.contains("src/z.rs"), "z path survives (the bug dropped it)");
         assert!(out.contains("fn a() {}"), "a content survives");
         assert!(out.contains("fn z() {}"), "z content survives");
+    }
+
+    #[test]
+    fn compact_handles_file_content_containing_hard_constraints_marker() {
+        // Self-edit collision (review BLOCKER): a file whose CONTENT contains the literal
+        // "HARD CONSTRAINTS (safety" marker (e.g. a mini editing compact.rs itself) must
+        // NOT corrupt the section split — the REAL header is the LAST occurrence (rfind).
+        let file_content = "let x = \"HARD CONSTRAINTS (safety\"; // a literal in the source";
+        let prompt = format!(
+            "sys\n\nFILE SCOPE (operate on ONLY these files):\n- src/x.rs\n```\n{file_content}\n```\n\nHARD CONSTRAINTS (safety — you MUST obey):\n- obey the rules\n\nTASK (do EXACTLY this):\nfix\n"
+        );
+        let (out, budget) = compact_built_prompt(&prompt, "fix", 200_000, 0);
+        assert_eq!(budget.files_kept, 1, "the file with an in-content marker must parse cleanly");
+        assert!(out.contains("- obey the rules"), "real hard-constraints body must survive");
+        assert!(out.contains("TASK (do EXACTLY this"), "task must survive");
+        assert!(out.contains("a literal in the source"), "file content must survive intact");
     }
 }
