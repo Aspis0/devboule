@@ -1863,33 +1863,37 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
     // before the emit checks below.
     let was_net_blocked = outcome.net_blocked;
     let was_folder_write_blocked = outcome.folder_write_blocked.clone();
-    let (mut outcome, write_diffs) =
+    let (outcome, write_diffs) =
         apply_write_directive_edits(apply_root.as_deref(), directive, outcome);
 
-    // Phase A: wait for Censor fast runners on modified files (3s timeout, non-blocking)
+    // Phase A: async Censor fast runners on modified files (3s timeout, non-blocking).
+    // Findings now reach the UI via the "censor://mini-findings" event and remain
+    // available via the persistent Censor queue — the scheduler is never blocked.
     if !write_diffs.is_empty() && trusted {
         let modified_files: Vec<String> =
             write_diffs.iter().map(|(path, _)| path.clone()).collect();
         if let Some(ref root) = apply_root {
-            let findings = crate::backend::censor::commands::wait_for_censor_findings(
-                root,
-                &modified_files,
-                Duration::from_secs(3),
-            );
-            if !findings.is_empty() {
-                let (high, medium, low, total) = censor_phase_a_summary(&findings);
-                let modified_files_for_event: Vec<String> = modified_files.clone();
-                outcome.censor_findings = Some(findings);
-                let _ = app.emit(
-                    "censor://mini-findings",
-                    serde_json::json!({
-                        "agentId": directive.id.clone(),
-                        "total": total, "high": high, "medium": medium, "low": low,
-                        "files": modified_files_for_event,
-                    }),
+            let app = app.clone();
+            let root = root.clone();
+            let agent_id = directive.id.clone();
+            std::thread::spawn(move || {
+                let findings = crate::backend::censor::commands::wait_for_censor_findings(
+                    &root,
+                    &modified_files,
+                    Duration::from_secs(3),
                 );
-                inject_censor_into_output(&mut outcome);
-            }
+                if !findings.is_empty() {
+                    let (high, medium, low, total) = censor_phase_a_summary(&findings);
+                    let _ = app.emit(
+                        "censor://mini-findings",
+                        serde_json::json!({
+                            "agentId": agent_id,
+                            "total": total, "high": high, "medium": medium, "low": low,
+                            "files": modified_files,
+                        }),
+                    );
+                }
+            });
         } else {
             eprintln!(
                 "censor phase-a skipped for directive {}: project root not resolvable ({} files modified)",
