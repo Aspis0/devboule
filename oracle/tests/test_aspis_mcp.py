@@ -3582,11 +3582,13 @@ class RoleMergeTests(unittest.TestCase):
 
 
 class OrchestratorRoleTests(unittest.TestCase):
-    """DEVBOULE: the first-class `orchestrator` role (the devboule-coder main
-    planner/delegator). Pins its allowlist (PRIMARY oracle + delegation + the
-    coder-equivalent Kanban tools + the human gate), and pins that it is
-    tighter-or-equal to coder: NO direct write/mutation tool, NO Censor dispose,
-    NO verifier-only transition, NO provider/secret tool."""
+    """DEVBOULE: the first-class `orchestrator` role — the frontier planning tier.
+    Pins its allowlist (PRIMARY oracle + delegation + the coder-equivalent Kanban
+    tools + the human gate + the FULL provider surface, owner decision role-untangle
+    2026-07: it plans the infra so it sees and manages it, mutations stay
+    claimed-task+evidence audited). Still pinned tighter-or-equal to coder: NO
+    direct file-write tool, NO Censor tools, NO visual_check, NO verifier-only
+    transition."""
 
     def setUp(self):
         # Tokenless self-registration so the role-gate (not the launch-token gate)
@@ -3614,7 +3616,8 @@ class OrchestratorRoleTests(unittest.TestCase):
         orch = ROLE_ALLOWED_TOOLS["orchestrator"]
         coder = ROLE_ALLOWED_TOOLS["coder"]
         self.assertTrue(orch <= coder, f"orchestrator gained non-coder tools: {sorted(orch - coder)}")
-        # And it is genuinely tighter (drops the provider/censor/visual tools).
+        # And it is genuinely tighter (drops the censor/visual tools; the provider
+        # surface is SHARED with the coder — owner decision, role untangle 2026-07).
         self.assertTrue(orch < coder)
 
     def test_orchestrator_allowlist_exact_contents(self):
@@ -3633,6 +3636,14 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_set_title",
                 "project_create_followup",
                 "project_create_plan_tasks",
+                # Owner decision (role untangle 2026-07): the orchestrator holds
+                # the full provider surface — it plans the infra, so it sees and
+                # manages it.
+                "provider_credentials_status",
+                "cloudflare_list_workers",
+                "cloudflare_rotate_worker_secret",
+                "scaleway_list_resources",
+                "scaleway_resource_action",
                 "oracle_ask",
                 "oracle_context",
                 "project_structure",
@@ -3647,22 +3658,25 @@ class OrchestratorRoleTests(unittest.TestCase):
             },
         )
 
-    def test_orchestrator_has_no_write_mutation_or_secret_tool(self):
-        # It delegates ALL writes to spawn_mini_coder, so it must NOT itself hold a
-        # direct file-write/mutation tool, a Censor dispose, or any provider/secret
-        # tool. These would each be a privilege escalation over its mandate.
+    def test_orchestrator_has_no_write_or_censor_tool_but_full_provider_surface(self):
+        # It delegates ALL file writes to spawn_mini_coder and never adjudicates
+        # Censor findings — but it DOES hold the provider tools (owner decision:
+        # the planning tier manages the infra; mutations stay task-audited).
         orch = ROLE_ALLOWED_TOOLS["orchestrator"]
         for forbidden in (
             "censor_findings",
             "censor_dispose",
             "visual_check",
+        ):
+            self.assertNotIn(forbidden, orch)
+        for allowed in (
             "provider_credentials_status",
             "cloudflare_list_workers",
             "cloudflare_rotate_worker_secret",
             "scaleway_list_resources",
             "scaleway_resource_action",
         ):
-            self.assertNotIn(forbidden, orch)
+            self.assertIn(allowed, orch)
 
     def test_role_gate_allows_orchestrator_for_its_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3687,6 +3701,12 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "project_create_followup",
                 "plan_submit",
                 "plan_status",
+                # Owner decision (role untangle 2026-07): full provider surface.
+                "provider_credentials_status",
+                "cloudflare_list_workers",
+                "cloudflare_rotate_worker_secret",
+                "scaleway_list_resources",
+                "scaleway_resource_action",
             ):
                 self.assertEqual(
                     require_registered_role(projects, "orch", "orchestrator", tool),
@@ -3705,9 +3725,6 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "censor_dispose",
                 "censor_findings",
                 "visual_check",
-                "provider_credentials_status",
-                "cloudflare_rotate_worker_secret",
-                "scaleway_resource_action",
             ):
                 with self.assertRaises(McpError, msg=tool):
                     require_registered_role(projects, "orch", "orchestrator", tool)
@@ -4695,23 +4712,16 @@ class AllowedToolsCrossLanguageMirrorTests(unittest.TestCase):
             result[match.group("role")] = tools
         return result
 
-    # SERVER-ONLY role: "orchestrator" (devboule-coder) is enforced by THIS MCP
-    # server's ROLE_ALLOWED_TOOLS gate. The Rust `default_role_rules()` in agents.rs
-    # is the desktop-app fleet-UI copy and is owned separately; the new Rust
-    # `devboule-coder` binary is a thin client that REGISTERS as "orchestrator", it
-    # does not re-declare the role's allowlist. So orchestrator is intentionally NOT
-    # in the agents.rs mirror — exclude it from the cross-language parity comparison
-    # rather than weaken the server-side allowlist that actually gates the role.
-    PYTHON_ONLY_ROLES = {"orchestrator"}
+    # ROLE UNTANGLE (2026-07): the parity check now covers ALL FOUR roles —
+    # coder, orchestrator, verifier, mini. The former PYTHON_ONLY_ROLES carve-out
+    # (orchestrator excluded because agents.rs had no mirror row) is gone: the Rust
+    # `default_role_rules()` carries the orchestrator fleet-UI row too, and this
+    # test is the anti-drift gate keeping both sides' allowlists identical.
 
     def test_allowed_tools_match_rust_default_role_rules(self):
         rust = self._parse_rust_allowed_tools()
         self.assertTrue(rust, "failed to parse allowed_tools from agents.rs")
-        python = {
-            rule["role"]: list(rule["allowedTools"])
-            for rule in ROLE_RULES
-            if rule["role"] not in self.PYTHON_ONLY_ROLES
-        }
+        python = {rule["role"]: list(rule["allowedTools"]) for rule in ROLE_RULES}
         self.assertEqual(set(python), set(rust))
         for role in python:
             self.assertEqual(

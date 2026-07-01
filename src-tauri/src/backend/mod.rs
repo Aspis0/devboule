@@ -1,4 +1,5 @@
 pub mod agent_pty;
+pub mod agent_role;
 pub mod api_fuzz;
 pub mod agents;
 pub mod broker;

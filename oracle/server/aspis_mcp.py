@@ -383,15 +383,17 @@ ROLE_RULES = [
         ],
     },
     {
-        # ORCHESTRATOR (devboule-coder): the MAIN coder that PLANS + DELEGATES. The
-        # new Rust `devboule-coder` binary self-registers under this role. It owns
-        # the same Kanban/transition powers as the coder (CODER_LIKE_ROLES) but
-        # holds NO direct file-write/mutation tool of its own: EVERY write is
-        # delegated to spawn_mini_coder. Its allowlist is a STRICT SUBSET of the
-        # coder's (tighter-or-equal, never broader) — no Censor dispose, no
-        # provider/cloudflare/scaleway tool, no verifier-only transition.
+        # ORCHESTRATOR: the FRONTIER planning tier that PLANS + DELEGATES (locally
+        # the devboule binary; the role is backend-agnostic). It owns the same
+        # Kanban/transition powers as the coder (CODER_LIKE_ROLES) and — owner
+        # decision, role untangle 2026-07 — the FULL provider surface (Cloudflare/
+        # Scaleway read + mutation): to plan seriously it must see and manage the
+        # project's infra. What it NEVER holds is a file-write tool: EVERY code
+        # change is delegated to spawn_mini_coder. Its allowlist stays a subset of
+        # the coder's (no Censor tools, no visual_check, no verifier-only
+        # transition).
         "role": "orchestrator",
-        "summary": "Coder principale che PIANIFICA e DELEGA: capisce il progetto via oracle_ask/oracle_context, delega OGNI scrittura a spawn_mini_coder, gestisce il Kanban come un coder (claim, wip/review/blocked, riapri a todo) ma il done resta verifier; pubblica via request_git_push col gate umano.",
+        "summary": "Il tier di PIANIFICAZIONE di punta: capisce progetto e infrastruttura via oracle_ask/oracle_context e i tool provider (Cloudflare/Scaleway, lettura e mutazione con task+evidenza), delega OGNI scrittura di codice a spawn_mini_coder, gestisce il Kanban come un coder (claim, wip/review/blocked, riapri a todo) ma il done resta verifier; pubblica via request_git_push col gate umano.",
         # Plan-approval + reply-box mandate (same shape as the coder's). Prima di
         # lavoro multi-file l'orchestrator sottomette il piano e ASPETTA
         # l'approvazione umana — "mai full-auto non presidiato".
@@ -422,6 +424,16 @@ ROLE_RULES = [
             "project_set_title",
             "project_create_followup",
             "project_create_plan_tasks",
+            # ROLE UNTANGLE (2026-07, owner decision): the orchestrator is the
+            # FRONTIER planning tier — it must SEE and MANAGE the project's infra
+            # (providers, credentials) to plan seriously, so it holds the full
+            # provider surface the coder has (read + mutation; mutations still
+            # require a claimed task + evidence like every coder-like caller).
+            "provider_credentials_status",
+            "cloudflare_list_workers",
+            "cloudflare_rotate_worker_secret",
+            "scaleway_list_resources",
+            "scaleway_resource_action",
             "oracle_ask",
             "oracle_context",
             "project_structure",
@@ -2956,9 +2968,12 @@ def matching_active_claim(
 
 
 def require_provider_mutation_role(role: str) -> None:
-    if normalize_role(role) != "coder":
+    # ROLE UNTANGLE (2026-07, owner decision): the orchestrator — the frontier
+    # planning tier — mutates providers exactly like a coder (same claimed-task +
+    # evidence context, enforced by require_provider_mutation_context callers).
+    if normalize_role(role) not in CODER_LIKE_ROLES:
         raise McpError(
-            "Only coder agents can mutate Cloudflare or Scaleway. Verifiers are read-only."
+            "Only coder or orchestrator agents can mutate Cloudflare or Scaleway. Verifiers are read-only."
         )
 
 

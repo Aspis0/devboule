@@ -855,11 +855,12 @@ fn write_agent_live_state(path: &Path, state: &AgentLiveState) -> Result<(), Str
 // three Italian mandate lines for every role). If you change one, change both —
 // agents read those via MCP, so they cannot drift.
 //
-// PHASE B MERGE: spawn-time roles collapse to {coder, verifier}. The coder PLANS
-// and CODES (absorbing the former orchestrator's planning/coordination mandate +
-// its project_create_followup allowance); "orchestrator" is no longer a rule —
-// it survives only as an inbound alias (→ coder) and a DERIVED UI badge. The
-// Python ROLE_RULES list mirrors this exact two-role shape.
+// ROLE UNTANGLE (2026-07): FOUR first-class roles — coder ("Main coder": plans AND
+// codes), orchestrator (plans and DELEGATES, never writes), verifier, mini —
+// mirroring the Python ROLE_RULES exactly (VALID_ROLES/CODER_LIKE_ROLES in
+// aspis_mcp.py). This reverts the former "Phase B merge" that folded the
+// orchestrator into the coder; the fold survives only for the legacy
+// architect/code aliases (see backend/agent_role.rs, the ONE classification fold).
 //
 // INTENTIONAL BILINGUAL SPLIT (not drift): only `contract` is mirrored. The
 // `summary` and `forbidden` strings here are English ON PURPOSE because they feed
@@ -991,6 +992,101 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "If the plan is rejected, READ the note and REVISE the plan per it, then resubmit — do NOT start coding against a rejected plan.",
                 "If the plan request times out, STOP and escalate via needs_user (agent_heartbeat status=\"needs_user\"); do NOT proceed unapproved.",
                 "When you are BLOCKED on a decision only the human can make, ask via the `ask_user` MCP tool and wait for the reply — do NOT guess or work around the question.",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        },
+        AgentRoleRule {
+            // ROLE UNTANGLE (2026-07): the ORCHESTRATOR is a first-class role again —
+            // the planning main tier that DELEGATES every write to spawn_mini_coder
+            // and never writes itself. This row mirrors the Python ROLE_RULES
+            // "orchestrator" entry (aspis_mcp.py) — allowlist VERBATIM in the same
+            // order (pinned by test_allowed_tools_match_rust_default_role_rules, no
+            // more PYTHON_ONLY_ROLES carve-out); summary/forbidden are the English
+            // fleet-UI voice of the same mandate (bilingual split by design).
+            role: "orchestrator".into(),
+            summary: "The frontier PLANNING tier: understands project AND infrastructure (Oracle + Cloudflare/Scaleway provider tools, read and task-audited mutation), delegates EVERY code write to spawn_mini_coder, manages the Kanban like a coder (claim, wip/review/blocked, reopen to todo) but never done; publishes only via the human-gated request_git_push.".into(),
+            allowed_tools: vec![
+                "agent_register",
+                "agent_heartbeat",
+                "agent_state",
+                "project_list",
+                "project_get",
+                "project_next_task",
+                "project_claim_task",
+                "project_update_status",
+                "project_append_note",
+                "project_set_title",
+                "project_create_followup",
+                "project_create_plan_tasks",
+                // ROLE UNTANGLE (owner decision): the orchestrator holds the FULL
+                // provider surface — it plans the infra, so it must see and manage
+                // it. Mutations still require a claimed task + evidence, like any
+                // coder-like caller (enforced server-side).
+                "provider_credentials_status",
+                "cloudflare_list_workers",
+                "cloudflare_rotate_worker_secret",
+                "scaleway_list_resources",
+                "scaleway_resource_action",
+                "oracle_ask",
+                "oracle_context",
+                "project_structure",
+                "spawn_mini_coder",
+                "steer_mini_coder",
+                "mini_coder_result",
+                "request_git_push",
+                "plan_submit",
+                "plan_status",
+                "ask_user",
+                "design_request",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            forbidden: vec![
+                "NEVER writes files directly: it has NO filesystem write/mutation tool; EVERY code change goes through spawn_mini_coder (the orchestrator plans and front-loads context; the mini writes).",
+                "To SUPERVISE a delegated mini call spawn_mini_coder with wait=false for its directiveId, watch its activity, steer with steer_mini_coder(directiveId, message) (or \"stop\"), then mini_coder_result(directiveId) for the outcome; the default blocking spawn is fine for simple fire-and-forget delegation.",
+                "For project or codebase questions use oracle_ask / oracle_context FIRST (grounded understanding) — never guess or hand-read the filesystem.",
+                "No done status: done is verifier-only with evidence. Claim and wip/review/blocked (and reopen to todo) exactly like a coder.",
+                "Every change goes through Censor + the Kanban + the human gate: never unattended full-auto. When a sub-task is ready, set review with a note and leave the final verdict to the verifier.",
+                "If spawn_mini_coder returns status='aborted_by_human', STOP that line of work, do NOT silently retry the mini, and escalate to the human via ask_user.",
+                "If spawn_mini_coder returns status='escalated' (retry chain exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file.",
+                "No provider action outside verified Aspis Bio scopes.",
+                "No token printing or token logging.",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            // ANTI-DRIFT: verbatim-identical to the Python orchestrator `contract`
+            // (its second line names "(mini-coder)", unlike the shared contract).
+            contract: vec![
+                "Dichiara il modello (`model`) ad agent_register.",
+                "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
+                "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            // The orchestrator has NO censor tools (Censor runs on the minis it
+            // delegates to) — mirrors the Python entry, which carries no censor key.
+            censor: Vec::new(),
+            // Cooperative push mandate — English mirror of the Python orchestrator.push.
+            push: vec![
+                "Commit freely (git add -u / git commit) to save your work.",
+                "NEVER run a raw `git push` — your environment has no git credentials and it will fail. To publish, call the `request_git_push` MCP tool; a human approves it.",
+                "If the push request is denied or times out, STOP and escalate to the human via ask_user. Do NOT retry, do NOT attempt a raw push, do NOT work around the gate.",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            // Plan-approval mandate — English mirror of the Python orchestrator.plan.
+            plan: vec![
+                "Before any multi-file work, submit the plan with plan_submit(project_id, title, plan_markdown) and WAIT for the human approval: do not start delegating before status=\"approved\".",
+                "As soon as it is approved (status=\"approved\"), IMMEDIATELY call project_create_plan_tasks with ONE task per plan PHASE: the Kanban has ZERO tasks until you do. Create the tasks BEFORE delegating, then delegate in dependency order.",
+                "Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user BEFORE planning a non-trivial or ambiguous goal (zero is fine when it is clear); plan simple/obvious requests directly.",
+                "If the plan is rejected (status=\"rejected\"), revise it per the reviewer's `note` and RESUBMIT with plan_submit; do not proceed on a rejected plan.",
+                "When you have a blocking question for the human use ask_user(question) and wait for the reply, instead of stalling or guessing in the terminal.",
             ]
             .into_iter()
             .map(String::from)
@@ -2010,16 +2106,19 @@ mod tests {
     #[test]
     fn default_rules_keep_cloud_actions_out_of_mcp() {
         let rules = default_role_rules();
-        // Phase B merge: spawn roles collapse to {coder, verifier}; the
-        // standalone orchestrator rule is GONE (its planning/coordination mandate
-        // folds into coder, which now PLANS and CODES). P3 later added the
-        // one-shot read-only "mini" leaf (oracle_context only).
-        assert_eq!(rules.len(), 3);
+        // ROLE UNTANGLE (2026-07): FOUR first-class roles, mirroring the Python
+        // ROLE_RULES exactly — coder (Main coder), orchestrator (plans+delegates,
+        // never writes), verifier, mini.
+        assert_eq!(rules.len(), 4);
         let role_set: std::collections::BTreeSet<&str> =
             rules.iter().map(|rule| rule.role.as_str()).collect();
-        assert_eq!(role_set, ["coder", "mini", "verifier"].into_iter().collect());
-        assert!(!rules.iter().any(|rule| rule.role == "orchestrator"));
-        // The coder absorbed the orchestrator's planning mandate.
+        assert_eq!(
+            role_set,
+            ["coder", "mini", "orchestrator", "verifier"]
+                .into_iter()
+                .collect()
+        );
+        // The coder keeps its planning mandate.
         let coder = rules
             .iter()
             .find(|rule| rule.role == "coder")
@@ -2029,6 +2128,41 @@ mod tests {
             .allowed_tools
             .iter()
             .any(|tool| tool == "project_create_followup"));
+        // The orchestrator is the frontier PLANNING tier: full provider surface
+        // (owner decision — it plans the infra, so it manages it), delegation
+        // tools, but it NEVER writes files and holds NO censor tools (Censor runs
+        // on the minis it delegates to).
+        let orchestrator = rules
+            .iter()
+            .find(|rule| rule.role == "orchestrator")
+            .expect("orchestrator rule present");
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .any(|tool| tool == "cloudflare_rotate_worker_secret"));
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .any(|tool| tool == "scaleway_resource_action"));
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .all(|tool| !tool.starts_with("censor_")));
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .any(|tool| tool == "spawn_mini_coder"));
+        assert!(orchestrator
+            .forbidden
+            .iter()
+            .any(|item| item.to_ascii_lowercase().contains("never writes")));
+        // Every orchestrator tool exists in the coder's list too (it differs from
+        // the coder only by LACKING censor_/visual_check — no file-write tool exists
+        // on either side; writes never flow through MCP).
+        assert!(orchestrator
+            .allowed_tools
+            .iter()
+            .all(|tool| coder.allowed_tools.contains(tool)));
         assert!(rules
             .iter()
             .flat_map(|rule| rule.forbidden.iter())
@@ -2741,8 +2875,9 @@ mod tests {
     #[test]
     fn default_role_rules_carry_contract_for_all_roles() {
         let rules = default_role_rules();
-        // Phase B merge collapsed to coder + verifier; P3 added the read-only mini.
-        assert_eq!(rules.len(), 3);
+        // ROLE UNTANGLE (2026-07): four first-class roles — coder, orchestrator,
+        // verifier, mini.
+        assert_eq!(rules.len(), 4);
         for rule in &rules {
             assert!(
                 !rule.contract.is_empty(),
@@ -2774,9 +2909,19 @@ mod tests {
             "Dichiara il modello (`model`) ad agent_register.",
             "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
         ];
+        // ROLE UNTANGLE: the orchestrator's second contract line names
+        // "(mini-coder)" — byte-identical to the Python orchestrator entry, which
+        // differs from the shared line by exactly that parenthetical.
+        let expected_orchestrator = [
+            "Dichiara il modello (`model`) ad agent_register.",
+            "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
+            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+        ];
         for rule in default_role_rules() {
             let want: &[&str] = if rule.role == "mini" {
                 &expected_mini
+            } else if rule.role == "orchestrator" {
+                &expected_orchestrator
             } else {
                 &expected
             };

@@ -598,30 +598,32 @@ pub fn delete_device_signing_private_key() -> Result<(), String> {
     }
 }
 
-/// Phase B merge: collapse spawn-role aliases to the two canonical roles so the
-/// vault selection is defensive even if a caller forgets to normalize. Mirrors
-/// normalize_agent_role in projects.rs and ROLE_ALIASES in aspis_mcp.py: the
-/// former "orchestrator" (and "architect"/"code") is now a coder. By design the
-/// merged former-orchestrator is a WRITER (it plans AND codes), so it receives the
-/// coder write profile — this is intentional, not a privilege regression.
+/// ROLE UNTANGLE (2026-07): collapse spawn-role aliases to the canonical roles so
+/// the vault selection is defensive even if a caller forgets to normalize. Mirrors
+/// `agent_role::canonicalize_launch_role` and ROLE_ALIASES in aspis_mcp.py.
+/// "orchestrator" is FIRST-CLASS (it no longer folds to coder as an alias; it is
+/// its own arm) — for TOKEN selection it deliberately holds the same write profile
+/// as the coder (owner decision: the orchestrator is the frontier planning tier
+/// that sees AND manages the project's providers; mutations stay task-audited
+/// server-side). What it never holds is a file-write path — that's the mini/coder
+/// executor's job, not a token concern.
 fn canonical_agent_role(role: &str) -> &'static str {
     match role.trim().to_ascii_lowercase().as_str() {
         "verifier" => "verifier",
-        // coder + all writer aliases (orchestrator/architect/code) -> coder.
-        "coder" | "orchestrator" | "architect" | "code" => "coder",
+        "orchestrator" => "orchestrator",
+        // coder + its legacy writer aliases (architect/code) -> coder.
+        "coder" | "architect" | "code" => "coder",
         _ => "",
     }
 }
 
 pub fn cloudflare_agent_token_profile_id_for_role(role: &str) -> Option<&'static str> {
-    // Canonical roles only: coder -> write profile, verifier -> read-only. The
-    // launch path already normalizes "orchestrator" -> "coder" BEFORE this call, so
-    // there is no separate orchestrator arm; canonical_agent_role folds any stray
-    // alias defensively. The coder WRITE profile for a former orchestrator is BY
-    // DESIGN (the merged coder plans + writes), not a missing read-only downgrade.
+    // coder AND orchestrator -> the scoped write profile (the orchestrator manages
+    // the infra it plans — owner decision, role untangle 2026-07); verifier ->
+    // read-only. Explicit per-role arms, no alias fold hiding the decision.
     match canonical_agent_role(role) {
         "verifier" => Some("verifier-readonly"),
-        "coder" => Some("coder-worker-write"),
+        "coder" | "orchestrator" => Some("coder-worker-write"),
         _ => None,
     }
 }
@@ -724,7 +726,9 @@ pub fn all_cloudflare_agent_token_profile_statuses(
 pub fn cloudflare_agent_token_profile_ids_for_role(role: &str) -> &'static [&'static str] {
     match canonical_agent_role(role) {
         "verifier" => &["verifier-readonly"],
-        "coder" => &["coder-worker-write"],
+        // Orchestrator holds the same write profile as the coder (owner decision,
+        // role untangle 2026-07 — it plans AND manages the infra).
+        "coder" | "orchestrator" => &["coder-worker-write"],
         _ => &[],
     }
 }
@@ -1543,17 +1547,11 @@ mod tests {
 
     #[test]
     fn cloudflare_agent_profile_ids_are_role_least_privilege() {
-        // FIX 1 decoupling: "orchestrator" is now a FIRST-CLASS STORED session/
-        // registration role (the launch persists it so the devboule-coder binary's
-        // `agent_register(role="orchestrator")` matches — see projects.rs
-        // `pending_session_role`, mirrors aspis_mcp.py VALID_ROLES). For TOKEN/
-        // PERMISSION selection, however, `canonical_agent_role` still folds it to
-        // "coder", so it receives the coder WRITE profile BY DESIGN (the merged coder
-        // plans AND writes). The registration identity and the permission role are
-        // INTENTIONALLY decoupled: storing "orchestrator" never widens privileges.
-        // (NOTE: the launch path additionally OMITS the Cloudflare provider_env for the
-        // orchestrator client entirely — FIX 3 — since its binary has no Cloudflare
-        // tool; this function still reports the profile a coder-canonical role MAY hold.)
+        // ROLE UNTANGLE (2026-07, owner decision): the orchestrator is FIRST-CLASS
+        // and holds the SAME scoped write profile as the coder — it is the frontier
+        // planning tier that sees and manages the project's providers (mutations
+        // stay claimed-task + evidence audited server-side). Explicit arm, not an
+        // alias fold.
         assert_eq!(
             cloudflare_agent_token_profile_ids_for_role("orchestrator"),
             &["coder-worker-write"]

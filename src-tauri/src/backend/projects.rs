@@ -1468,16 +1468,18 @@ fn prepare_or_launch_project_agent(
 ) -> Result<ProjectAgentLaunchResult, String> {
     state.ensure_unlocked()?;
     let project = read_project_by_id(&app, &input.project_id)?;
-    let role = normalize_agent_role(&input.role)?;
     // Built-in (codex/claude/powershell) or a configured custom client id. For a
     // custom client, `custom_command` is the configured command line the script
     // execs after the universal prompt delivery; for a built-in it is None.
     let (client, custom_command) = resolve_launch_client(&app, &input.client)?;
-    // FIX 1 (L2 BLOCKER) — the SESSION role we PERSIST in the pending launch. For the
-    // orchestrator client this is the first-class "orchestrator" (so the stored role
-    // matches what the devboule-coder binary registers as); for every other client it
-    // is the canonical spawn `role`. See `pending_session_role` for the full rationale.
-    let stored_role: &str = pending_session_role(&client, role.as_str());
+    // ROLE UNTANGLE (2026-07): ONE effective role, derived from the launch intent.
+    // Selecting the Devboule binary (`client == "orchestrator"`) IS an orchestrator
+    // launch, whatever the legacy role field said; every other client keeps its
+    // canonical role. This single value now drives the prompt, the Kanban launch
+    // gate, the vault/provider env (orchestrator ⇒ none) AND the persisted session
+    // role — replacing the former stored_role/canonical-role split, so the stored
+    // role always equals what the binary registers as (`agent_register`, config.rs).
+    let role = super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
     // "app" -> hosted PTY inside Aspis Management; anything else (incl. None and
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
@@ -1495,10 +1497,9 @@ fn prepare_or_launch_project_agent(
     // PROMPT text (workflow_addendum below). The external codex/claude coder CLIs
     // read that prompt; the local Devboule orchestrator binary is AUTONOMOUS and
     // IGNORES the prompt entirely, so a workflow_run on an orchestrator would be
-    // SILENTLY dropped. Reject it explicitly. The `role != "coder"` clause still
-    // rejects verifier launches as before (a verifier never normalizes to "coder").
-    // Note: an orchestrator launch has `role == "coder"` (vault role), so we must
-    // gate on the CLIENT here, not the role, to catch it.
+    // SILENTLY dropped. Reject it explicitly with a client-specific message (the
+    // role gate below would also catch it now that an orchestrator launch carries
+    // `role == "orchestrator"`, but this message tells the user WHY).
     if input.workflow_run.is_some() && client == "orchestrator" {
         return Err(
             "The local Devboule orchestrator runs autonomously and cannot run a saved workflow (its instructions are prompt-delivered, which the orchestrator ignores). Launch the workflow as a codex/claude coder.".into(),
@@ -1527,13 +1528,11 @@ fn prepare_or_launch_project_agent(
     // configured mini backend the launch already relies on (no hardcoded model id) and
     // THIS project's gate-covered languages; `None` backend ⇒ `None` block ⇒ the coder
     // prompt is byte-identical to today (graceful degradation).
-    // FIX 1 — also skip this for the local Devboule orchestrator: it builds the prompt
-    // under `stored_role = "orchestrator"` (so `project_agent_prompt`'s coder-only
-    // `mini_coder_addendum` arm never consumes the block) AND the orchestrator binary
-    // IGNORES the prompt entirely. Computing it here was pure wasted work (the
-    // `read_mini_coder_backend` loopback probe + `tier_a_covered_languages` tree scan
-    // the review flagged); gate on the canonical role AND a non-orchestrator client.
-    let mini_delegation_addendum: Option<String> = if role == "coder" && client != "orchestrator" {
+    // ROLE UNTANGLE: an orchestrator launch now carries `role == "orchestrator"`, so
+    // the plain role check skips the wasted work here (the former extra
+    // `client != "orchestrator"` clause is redundant and gone) — the orchestrator gets
+    // its OWN role rule in `project_agent_prompt`, not the coder's A3 block.
+    let mini_delegation_addendum: Option<String> = if role == "coder" {
         let backend = read_mini_coder_backend(&app);
         let covered = super::mini_coder_executor::tier_a_covered_languages(&root_path);
         // E1: the user's persisted write-behavior policy bounds the injected guidance
@@ -1547,17 +1546,14 @@ fn prepare_or_launch_project_agent(
     };
     let mut prompt = project_agent_prompt(
         &project,
-        // FIX 1 — build the prompt under the STORED role. For codex/claude this is
-        // the canonical spawn role (unchanged). For the orchestrator client it is
+        // ROLE UNTANGLE — the ONE effective role. For codex/claude this is the
+        // canonical spawn role (unchanged). For the orchestrator client it is
         // "orchestrator", so the interpolated `agent_register(role="orchestrator")`
-        // in the prompt MATCHES what the binary registers as — a hand-"Copy prompt"
-        // is now correct instead of telling a human to register as "coder" (which
-        // the server would reject against the stored "orchestrator" session). The
-        // orchestrator binary itself ignores the prompt; this only fixes the manual
-        // copy path. The coder-only addenda inside the builder are positive
-        // allowlists keyed on "coder", so the orchestrator falls into the coder
-        // role-rule (plan+code) but gets none of the CLI-only mini/push blocks.
-        stored_role,
+        // in the prompt MATCHES what the binary registers as, and the builder's
+        // dedicated orchestrator role-rule (plan + delegate, NEVER write) applies —
+        // the coder-only addenda are positive allowlists keyed on "coder", so the
+        // orchestrator gets none of the CLI-only mini/push blocks.
+        &role,
         &agent_id,
         task_id.as_deref(),
         &root_path,
@@ -1597,34 +1593,30 @@ fn prepare_or_launch_project_agent(
     // no language ⇒ byte-identical to before.
     if client != "orchestrator" {
         if let Some(block) =
-            language_persona_block(&root_path, stored_role, input.language_override.as_deref())
+            language_persona_block(&root_path, &role, input.language_override.as_deref())
         {
             prompt.push_str(&block);
         }
     }
     let projects_path = ensure_projects_dir(&app)?;
     let management_root = management_root_for_mcp(&app, &projects_path);
-    // FIX 3 (hardening) — omit the role-scoped Cloudflare provider_env for the local
-    // Devboule orchestrator (it has no Cloudflare tool, so the coder WRITE token would
-    // be an unused long-lived secret in a web-content-ingesting binary's env). Every
-    // other client still gets its role-scoped token. See `launch_injects_cloudflare_env`.
-    // The orchestrator keeps only the secrets it actually uses (the launch token + the
-    // Exa key), appended below.
-    let mut provider_env = if launch_injects_cloudflare_env(&client) {
-        cloudflare_agent_provider_env_for_role(&role)?
-    } else {
-        Vec::new()
-    };
+    // ROLE UNTANGLE — the provider env is ROLE-scoped, one call, no client special
+    // case (the former `launch_injects_cloudflare_env` client strip-hack is gone).
+    // Owner decision: the orchestrator receives the SAME provider env as a coder —
+    // it holds the full Cloudflare/Scaleway tool surface, so it carries the scoped
+    // write token like any coder-like role. The local binary's own secrets (launch
+    // token + Exa key) are appended below.
+    let mut provider_env = cloudflare_agent_provider_env_for_role(&role)?;
     record_launch_pending(
         &app,
         &project.metadata.id,
         &project.metadata.title,
         &agent_id,
-        // FIX 1 — persist the STORED role: "orchestrator" for that client, else the
-        // canonical role. This is the load-bearing change: the session role must
-        // equal what the binary registers as, or the server rejects registration and
-        // the orchestrator silently degrades to the StubExecutor.
-        stored_role,
+        // Persist the effective role. For an orchestrator launch this is
+        // "orchestrator" — the session role must equal what the binary registers as,
+        // or the server rejects registration and the orchestrator silently degrades
+        // to the StubExecutor.
+        &role,
         task_id.as_deref(),
         Some(client.as_str()),
         &launch_token_hash,
@@ -2038,10 +2030,9 @@ fn prepare_or_launch_project_agent(
     }
     Ok(ProjectAgentLaunchResult {
         project_id: project.metadata.id,
-        // FIX 1 — surface the STORED role to the UI so it matches the persisted
-        // session (and the fleet badge) the orchestrator will register as. For every
-        // other client `stored_role == role`, so this is byte-identical there.
-        role: stored_role.to_string(),
+        // Surface the effective role to the UI — it equals the persisted session
+        // role (and the fleet badge) the agent will register as.
+        role,
         client,
         agent_id,
         root_path: root_path.to_string_lossy().into_owned(),
@@ -3253,65 +3244,17 @@ pub fn resolve_project_root_by_id(
     resolve_project_agent_root(&project)
 }
 
+/// ROLE UNTANGLE (2026-07): normalize the inbound `role` FIELD to a CANONICAL
+/// launch role — {coder, verifier, orchestrator}. Delegates to the single
+/// classification fold in `agent_role.rs`; "orchestrator" is FIRST-CLASS (it is in
+/// the Python server's VALID_ROLES, not ROLE_ALIASES) and no longer folds to coder.
+/// The canonical role now drives EVERYTHING for a launch — vault token selection
+/// (orchestrator ⇒ no Cloudflare profile), Kanban transition rules (coder-like, per
+/// Python CODER_LIKE_ROLES) and the persisted session role — replacing the former
+/// normalize-fold + `pending_session_role` + `launch_injects_cloudflare_env` trio
+/// that fought each other over the same string.
 fn normalize_agent_role(value: &str) -> Result<String, String> {
-    let role = value.trim().to_ascii_lowercase();
-    // This normalizes the inbound `role` FIELD to a CANONICAL spawn role used for
-    // vault token selection + Kanban transition rules: {coder, verifier}. The
-    // "architect"/"code" strings are legacy role-field aliases that fold to coder so
-    // old launchers/sessions keep working.
-    //
-    // FIX 1 — "orchestrator" is NO LONGER a mere "derived UI badge". The local
-    // Devboule orchestrator is now a FIRST-CLASS STORED session role: when launched
-    // via `client == "orchestrator"`, `prepare_or_launch_project_agent` PERSISTS the
-    // session role as "orchestrator" (its `stored_role`), because the devboule-coder
-    // binary hardcodes `agent_register(role="orchestrator")` and the server matches
-    // the stored role against it (orchestrator is in VALID_ROLES, NOT ROLE_ALIASES —
-    // see aspis_mcp.py). This function still folds the orchestrator ROLE-STRING alias
-    // to "coder" so the CANONICAL role drives the coder write profile + coder-like
-    // task powers (the orchestrator plans AND writes) — the canonical fold and the
-    // first-class stored role are complementary, not contradictory: one selects
-    // tokens/permissions, the other is the registration identity.
-    match role.as_str() {
-        "coder" | "verifier" => Ok(role),
-        "orchestrator" | "architect" | "code" => Ok("coder".into()),
-        _ => Err("Agent role must be coder or verifier.".into()),
-    }
-}
-
-/// FIX 1 (L2 BLOCKER) — the SESSION role to PERSIST for a launch, given the resolved
-/// `client` and the CANONICAL spawn `role` (`normalize_agent_role`'s output). For the
-/// local Devboule orchestrator client this is the first-class "orchestrator" role,
-/// because the devboule-coder binary hardcodes `agent_register(role="orchestrator")`
-/// and the MCP server matches the STORED session role against that incoming role
-/// (orchestrator is in VALID_ROLES, not a ROLE_ALIASES fold — see aspis_mcp.py). If we
-/// stored the canonical "coder" instead, registration would raise "already registered
-/// as coder", `RmcpBackend::connect` would fail, and the orchestrator would silently
-/// degrade to the StubExecutor (fabricated output). For every other client the stored
-/// role IS the canonical role, so codex/claude/coder/verifier are unchanged.
-///
-/// SECURITY/SCOPE NOTE: this is the REGISTRATION IDENTITY only. Token/permission
-/// selection still uses the CANONICAL `role` (the orchestrator gets the coder write
-/// profile + coder-like Kanban powers), so persisting "orchestrator" never widens the
-/// agent's privileges — it only makes the stored role match what the binary registers.
-fn pending_session_role<'a>(client: &str, canonical_role: &'a str) -> &'a str {
-    if client == "orchestrator" {
-        // The `'static` literal coerces to `&'a str` (any `'static` ref outlives 'a).
-        "orchestrator"
-    } else {
-        canonical_role
-    }
-}
-
-/// FIX 3 (hardening) — whether a launch for `client` should receive the role-scoped
-/// Cloudflare provider_env (the coder WRITE token etc.). The local Devboule
-/// orchestrator binary has NO Cloudflare tool (not in its MCP allowlist; config.rs
-/// never reads a Cloudflare token), yet `vault::canonical_agent_role("orchestrator")`
-/// folds to "coder" and would otherwise hand it the long-lived write token. A
-/// local-model binary that ingests web content must not carry an unused write secret
-/// in its env, so omit the entire Cloudflare provider_env for it. Every other client
-/// keeps its role-scoped token.
-fn launch_injects_cloudflare_env(client: &str) -> bool {
-    client != "orchestrator"
+    super::agent_role::canonicalize_launch_role(value)
 }
 
 fn normalize_agent_client(value: &str) -> Result<String, String> {
@@ -3653,12 +3596,20 @@ fn validate_agent_task_launch(
         .iter()
         .find(|item| item.id == task_id.trim())
         .ok_or_else(|| "Task not found.".to_string())?;
-    // Phase B merge: role is normalized to {coder, verifier} upstream, so the
-    // coder arm covers the former orchestrator's launchable statuses too.
+    // ROLE UNTANGLE: the orchestrator shares the coder's launchable statuses
+    // (mirrors Python CODER_LIKE_ROLES — claim/work todo|wip|blocked, never the
+    // verifier-only review/done surface). `agent_role::is_coder_like` is the single
+    // definition of that set.
     match role {
-        "coder" if matches!(task.status.as_str(), "todo" | "wip" | "blocked") => Ok(()),
+        r if super::agent_role::is_coder_like(r)
+            && matches!(task.status.as_str(), "todo" | "wip" | "blocked") =>
+        {
+            Ok(())
+        }
         "verifier" if matches!(task.status.as_str(), "review" | "blocked") => Ok(()),
-        "coder" => Err("Coder agents can only launch on todo, wip or blocked tasks.".into()),
+        r if super::agent_role::is_coder_like(r) => {
+            Err("Coder agents can only launch on todo, wip or blocked tasks.".into())
+        }
         "verifier" => Err("Verifier agents can only launch on review or blocked tasks.".into()),
         _ => Err("Done tasks cannot be launched as active agent work.".into()),
     }
@@ -3925,12 +3876,16 @@ fn project_agent_prompt(
     // like before, so a non-panel role still never injects.
     skill_role: Option<&str>,
 ) -> String {
-    // Phase B merge: the coder PLANS and CODES — it absorbs the former
-    // orchestrator's plan/coordinate mandate (claim tasks, create follow-ups,
-    // reopen/move tasks) on top of implementation. `verifier` is unchanged. The
-    // role string is already normalized to {coder, verifier} by
-    // normalize_agent_role, so the catch-all just falls back to the coder rule.
+    // ROLE UNTANGLE (2026-07): three distinct role rules. The coder (Main coder)
+    // PLANS and CODES; the orchestrator PLANS and DELEGATES but NEVER writes (every
+    // code change goes through spawn_mini_coder — English mirror of the Python
+    // ROLE_RULES orchestrator mandate); the verifier reviews. The role string is
+    // normalized to {coder, verifier, orchestrator} by normalize_agent_role; the
+    // catch-all falls back to the coder rule.
     let role_rule = match role {
+        "orchestrator" => {
+            "Plan and DELEGATE — you NEVER write or edit files yourself: you have no file-write or mutation tool, and EVERY code change goes through spawn_mini_coder (you plan and front-load context; the mini writes). For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start delegating before this call. Pass plan_id = the `planId` field returned by plan_submit, and tasks = one entry per plan PHASE, each REQUIRING {id, title} plus optional {acceptance, scope:[files], dependsOn}. To SUPERVISE a delegated mini call spawn_mini_coder with wait=false to get its directiveId immediately, watch its activity, steer it with steer_mini_coder(directiveId, message) (or \"stop\" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation. If spawn_mini_coder returns status='aborted_by_human', STOP that line of work and escalate via ask_user; if it returns status='escalated' (retries exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file. For project or codebase questions use oracle_ask / oracle_context FIRST — do not guess. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when a sub-task is ready for the verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent."
+        }
         "verifier" => {
             "Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence. When you have FINISHED reviewing (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent."
         }
@@ -3949,6 +3904,10 @@ fn project_agent_prompt(
     //   review" launch (`censor_review`). Without the flag the verifier prompt is
     //   byte-for-byte unchanged (back-compat).
     let censor_addendum = match role {
+        // ROLE UNTANGLE: the orchestrator has NO censor tools in its MCP allowlist
+        // (aspis_mcp.py ROLE_RULES — Censor runs on the minis it delegates to), so
+        // it gets no censor addendum at all.
+        "orchestrator" => "",
         "verifier" => {
             if censor_review {
                 "Final review: call censor_findings(project_id) for the residual ledger, ignore findings already resolved, focus on cross-file / architectural / multi-file-security issues the small model cannot see, and censor_dispose to confirm or reject each.\n"
@@ -3979,6 +3938,10 @@ fn project_agent_prompt(
     // F4: POSITIVE allowlist (coder-only), not a `_ => addendum` denylist. A future
     // role string would otherwise silently inherit the coder's mini-coder addendum;
     // only the coder gets it, every other role (verifier or anything new) gets "".
+    // ROLE UNTANGLE: deliberately NOT extended to the orchestrator — its dedicated
+    // role_rule above already embeds its own delegation/supervision mandate, and the
+    // coder text here ("delegate only cheap mechanical sub-tasks, do the thinking
+    // yourself") would CONTRADICT the orchestrator's delegate-everything mandate.
     // A3 appends the MINI-CODER DELEGATION write_mode block (pre-built by the caller)
     // right AFTER the routing addendum, CODER-ONLY and only when a mini backend is
     // configured (the caller passes `None` otherwise / for a verifier). Owned `String`
@@ -4013,11 +3976,14 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
     // agent under our neutralized env, but kept as best-effort wording — it is NOT a
     // hard sandbox (a determined agent can re-add a helper). The real gate is
     // request_git_push + human approval.
-    let git_push_addendum = match role {
-        "coder" => {
-            "Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status=\"needs_user\"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.\n"
-        }
-        _ => "",
+    // ROLE UNTANGLE: coder-LIKE (coder + orchestrator), not coder-only — the
+    // orchestrator holds request_git_push too, and a prompt-consuming orchestrator
+    // (a future cloud-CLI planner; the local binary ignores the prompt) must carry
+    // the "never raw push" guardrail, not just the MCP-side ROLE_RULES copy.
+    let git_push_addendum = if super::agent_role::is_coder_like(role) {
+        "Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status=\"needs_user\"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.\n"
+    } else {
+        ""
     };
     // Phase D — design "Save & hand off" addendum (coder only). FIXED wording: the ONLY
     // variable is the bundle's path RELATIVE to the working root (computed from two
@@ -6335,6 +6301,12 @@ fn mcp_client_config_json(
 }
 
 fn cloudflare_agent_provider_env_for_role(role: &str) -> Result<Vec<AgentLaunchEnv>, String> {
+    // ROLE UNTANGLE (2026-07, owner decision): the env is ROLE-scoped with no client
+    // special case. The orchestrator — the frontier planning tier — receives the
+    // SAME provider env as a coder (it holds the full Cloudflare/Scaleway tool
+    // surface and manages the infra it plans); the verifier gets its read-only
+    // profile. This replaced the former `launch_injects_cloudflare_env` client
+    // strip-hack from the era when the orchestrator had no provider tools.
     let mut envs = Vec::new();
     // D1: only inject the token profile env vars this role is allowed to hold
     // (no rotator/coder-write leaking into orchestrator/verifier, no verifier
@@ -12480,12 +12452,12 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn agent_roles_map_to_cloudflare_profile_tokens() {
-        // Phase B merge: the launch path normalizes "orchestrator" -> "coder" BEFORE
-        // vault selection (see normalize_agent_role + cloudflare_agent_provider_env_for_role),
-        // and the vault fn folds any stray alias defensively. So a former orchestrator
-        // resolves to the coder WRITE profile BY DESIGN — the merged coder plans AND
-        // codes, so it is a writer, not a read-only planner. This is intentional, not
-        // a privilege regression.
+        // ROLE UNTANGLE (2026-07, owner decision): the orchestrator is FIRST-CLASS
+        // and — as the frontier planning tier that manages the infra it plans —
+        // holds the SAME scoped write profile as the coder, via its own explicit
+        // arm (no alias fold, no launch-time strip-hack). Provider MUTATIONS remain
+        // claimed-task + evidence audited server-side (aspis_mcp.py
+        // require_provider_mutation_role accepts CODER_LIKE_ROLES).
         assert_eq!(
             vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
             Some("coder-worker-write")
@@ -12495,7 +12467,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             vault::cloudflare_agent_token_profile_id_for_role("verifier"),
             Some("verifier-readonly")
         );
-        // Coder gets its scoped write profile.
+        // Coder (Main coder) gets its scoped write profile.
         assert_eq!(
             vault::cloudflare_agent_token_profile_id_for_role("coder"),
             Some("coder-worker-write")
@@ -12507,131 +12479,99 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         );
     }
 
-    // FIX 1 (L2 BLOCKER) — the PERSISTED session role must equal what the binary
-    // registers as. The devboule-coder binary hardcodes
-    // `agent_register(role="orchestrator")` (config.rs), so a launch with
-    // `client == "orchestrator"` MUST store "orchestrator", not the canonical "coder"
-    // that `normalize_agent_role` produces. Every other client stores its canonical
-    // role unchanged. This is the load-bearing assertion: a mismatch makes the server
-    // reject registration and the orchestrator silently degrade to the StubExecutor.
+    // ROLE UNTANGLE — the PERSISTED session role equals the EFFECTIVE launch role,
+    // which is first-class "orchestrator" for a Devboule-binary launch (the binary
+    // hardcodes `agent_register(role="orchestrator")`, config.rs, and the server
+    // matches the stored role against it — a mismatch silently degrades the
+    // orchestrator to the StubExecutor). Legacy frontend payloads that still send
+    // role:"coder" with client:"orchestrator" keep working via the intent fold.
     #[test]
-    fn orchestrator_launch_persists_orchestrator_session_role() {
-        // The orchestrator client's CANONICAL role is "coder" (normalize_agent_role
-        // folds the orchestrator role-string alias), but the STORED session role is
-        // first-class "orchestrator" so agent_register matches.
-        assert_eq!(normalize_agent_role("orchestrator").unwrap(), "coder");
+    fn orchestrator_launch_role_is_first_class() {
+        // The role string canonicalizes to ITSELF now (no more fold to coder)...
         assert_eq!(
-            pending_session_role("orchestrator", "coder"),
+            normalize_agent_role("orchestrator").unwrap(),
             "orchestrator"
         );
-        // Every other client persists the canonical role verbatim (byte-identical to
-        // pre-FIX behavior).
-        assert_eq!(pending_session_role("codex", "coder"), "coder");
-        assert_eq!(pending_session_role("claude", "coder"), "coder");
-        assert_eq!(pending_session_role("powershell", "coder"), "coder");
-        assert_eq!(pending_session_role("codex", "verifier"), "verifier");
-        assert_eq!(pending_session_role("custom-cli", "coder"), "coder");
+        // ...and the launch INTENT decides: Devboule client ⇒ orchestrator role,
+        // even from a legacy "coder" role field.
+        assert_eq!(
+            super::super::agent_role::effective_launch_role("orchestrator", "coder"),
+            "orchestrator"
+        );
+        // Every other client persists the canonical role verbatim.
+        assert_eq!(
+            super::super::agent_role::effective_launch_role("codex", "coder"),
+            "coder"
+        );
+        assert_eq!(
+            super::super::agent_role::effective_launch_role("claude", "verifier"),
+            "verifier"
+        );
+        assert_eq!(
+            super::super::agent_role::effective_launch_role("custom-cli", "coder"),
+            "coder"
+        );
     }
 
-    // FIX 1 cross-check against the server contract: the stored "orchestrator" role
-    // and the binary's registration role must collapse to the SAME canonical role on
-    // the Python side, where `coerce_role` keeps "orchestrator" first-class (it is in
-    // VALID_ROLES, not ROLE_ALIASES). The Rust vault's `canonical_agent_role` folds it
-    // to the coder write profile for TOKEN selection — proving the registration
-    // identity and the permission role are decoupled (storing "orchestrator" does not
-    // widen privileges).
+    // ROLE UNTANGLE (owner decision) — the orchestrator selects the SAME provider
+    // env surface as a coder: same write profile in the vault, same role-scoped
+    // assembly path (no client strip-hack, no special case). The verifier stays
+    // read-only and unknown roles stay empty.
     #[test]
-    fn orchestrator_stored_role_keeps_coder_permissions() {
-        // Registration identity stored = "orchestrator".
-        assert_eq!(
-            pending_session_role("orchestrator", "coder"),
-            "orchestrator"
-        );
-        // ...but the Cloudflare/token PERMISSION role still resolves to the coder write
-        // profile (the orchestrator plans AND writes), so no privilege regression.
+    fn orchestrator_role_selects_coder_provider_profile() {
         assert_eq!(
             vault::cloudflare_agent_token_profile_id_for_role("orchestrator"),
-            Some("coder-worker-write")
+            vault::cloudflare_agent_token_profile_id_for_role("coder"),
         );
+        assert_eq!(
+            vault::cloudflare_agent_token_profile_ids_for_role("orchestrator"),
+            vault::cloudflare_agent_token_profile_ids_for_role("coder"),
+        );
+        assert_eq!(
+            vault::cloudflare_agent_token_profile_id_for_role("verifier"),
+            Some("verifier-readonly")
+        );
+        assert!(vault::cloudflare_agent_token_profile_ids_for_role("unknown").is_empty());
     }
 
-    // FIX 3 (hardening) — the orchestrator launch must NOT receive the role-scoped
-    // Cloudflare provider_env (it has no Cloudflare tool); every other client must.
-    // This gates the `cloudflare_agent_provider_env_for_role` call in the launch path.
+    // ROLE UNTANGLE — the orchestrator launches on the SAME task statuses as a coder
+    // (Python CODER_LIKE_ROLES mirror): todo/wip/blocked OK, review/done rejected.
     #[test]
-    fn orchestrator_launch_omits_cloudflare_env_others_keep_it() {
-        assert!(!launch_injects_cloudflare_env("orchestrator"));
-        assert!(launch_injects_cloudflare_env("codex"));
-        assert!(launch_injects_cloudflare_env("claude"));
-        assert!(launch_injects_cloudflare_env("powershell"));
-        assert!(launch_injects_cloudflare_env("custom-cli"));
+    fn orchestrator_task_launch_gate_is_coder_like() {
+        let mut project = censor_prompt_test_project();
+        project.state.tasks = vec![
+            ProjectTask {
+                id: "T1".into(),
+                ..task("todo")
+            },
+            ProjectTask {
+                id: "T2".into(),
+                ..task("review")
+            },
+            ProjectTask {
+                id: "T3".into(),
+                ..task("done")
+            },
+        ];
+        assert!(validate_agent_task_launch(&project, "orchestrator", Some("T1")).is_ok());
+        assert!(validate_agent_task_launch(&project, "orchestrator", Some("T2")).is_err());
+        assert!(validate_agent_task_launch(&project, "orchestrator", Some("T3")).is_err());
+        // Coder behavior unchanged.
+        assert!(validate_agent_task_launch(&project, "coder", Some("T1")).is_ok());
+        assert!(validate_agent_task_launch(&project, "verifier", Some("T2")).is_ok());
     }
 
-    // FIX 3 — model the launch's provider_env assembly to prove an orchestrator's env
-    // carries the launch token (+ Exa key when set) but NO Cloudflare token, while a
-    // coder's env DOES carry its Cloudflare token. Uses the SAME predicate the launch
-    // uses to decide the Cloudflare block; the Cloudflare entries are stand-ins (the
-    // real ones come from the keyring, unavailable in unit tests).
-    #[test]
-    fn provider_env_assembly_gates_cloudflare_per_client() {
-        fn assemble(client: &str, exa_key: Option<&str>) -> Vec<AgentLaunchEnv> {
-            // Mirror prepare_or_launch_project_agent's assembly order.
-            let mut env: Vec<AgentLaunchEnv> = if launch_injects_cloudflare_env(client) {
-                vec![AgentLaunchEnv {
-                    name: "ASPIS_CLOUDFLARE_API_TOKEN".into(),
-                    value: "cf-token".into(),
-                }]
-            } else {
-                Vec::new()
-            };
-            if client == "orchestrator" {
-                env.push(AgentLaunchEnv {
-                    name: "DEVBOULE_MCP_LAUNCH_TOKEN".into(),
-                    value: "launch-tok".into(),
-                });
-                if let Some(key) = exa_key {
-                    env.push(AgentLaunchEnv {
-                        name: "EXA_API_KEY".into(),
-                        value: key.into(),
-                    });
-                }
-            }
-            env
-        }
-        let has = |env: &[AgentLaunchEnv], name: &str| env.iter().any(|e| e.name == name);
-
-        // Orchestrator WITH an Exa key: launch token + Exa, NO Cloudflare token.
-        let orch = assemble("orchestrator", Some("exa-key"));
-        assert!(has(&orch, "DEVBOULE_MCP_LAUNCH_TOKEN"));
-        assert!(has(&orch, "EXA_API_KEY"));
-        assert!(!has(&orch, "ASPIS_CLOUDFLARE_API_TOKEN"));
-
-        // Orchestrator WITHOUT an Exa key: launch token only, still no Cloudflare token.
-        let orch_no_exa = assemble("orchestrator", None);
-        assert!(has(&orch_no_exa, "DEVBOULE_MCP_LAUNCH_TOKEN"));
-        assert!(!has(&orch_no_exa, "EXA_API_KEY"));
-        assert!(!has(&orch_no_exa, "ASPIS_CLOUDFLARE_API_TOKEN"));
-
-        // A coder launch (codex client) still gets its Cloudflare token, no orch secrets.
-        let coder = assemble("codex", None);
-        assert!(has(&coder, "ASPIS_CLOUDFLARE_API_TOKEN"));
-        assert!(!has(&coder, "DEVBOULE_MCP_LAUNCH_TOKEN"));
-        assert!(!has(&coder, "EXA_API_KEY"));
-    }
-
-    // FIX 1 — a workflow_run on an orchestrator client must be REJECTED (its
-    // instructions are prompt-delivered, which the autonomous binary ignores). The
-    // guard keys on the client, not the role (the orchestrator's role is "coder").
+    // ROLE UNTANGLE — a workflow_run is rejected for an orchestrator launch by BOTH
+    // guards now: the client-specific message AND the role gate (the effective role
+    // is "orchestrator", which is != "coder").
     #[test]
     fn workflow_run_rejected_for_orchestrator_client() {
-        // The guard condition the launch evaluates: workflow present AND orchestrator.
         let client = "orchestrator";
-        let role = normalize_agent_role("orchestrator").unwrap(); // "coder"
-                                                                  // Pre-FIX, `role != "coder"` was FALSE for an orchestrator (role == "coder"),
-                                                                  // so the old guard would have WRONGLY ALLOWED it. The new client-keyed guard
-                                                                  // catches it.
-        assert_eq!(role, "coder");
+        let role =
+            super::super::agent_role::effective_launch_role(client, &normalize_agent_role("coder").unwrap());
+        assert_eq!(role, "orchestrator");
         assert!(client == "orchestrator", "client-keyed guard rejects this");
+        assert!(role != "coder", "role-keyed guard rejects it too");
     }
 
     #[test]
