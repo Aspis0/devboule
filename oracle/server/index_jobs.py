@@ -9,7 +9,6 @@ from typing import Any
 
 from oracle.config import (
     CHUNK_BATCH_CHARS,
-    CHUNK_BATCH_CHUNKS,
     CHUNK_BATCH_FILES,
     CHUNK_DB_PATH,
     CHUNK_GPU_MIN_FREE_GB,
@@ -217,7 +216,10 @@ class OracleIndexJobManager:
                     CHUNK_DB_PATH,
                     manifest_path=CHUNK_MANIFEST_PATH,
                     batch_files=CHUNK_BATCH_FILES,
-                    batch_chunks=CHUNK_BATCH_CHUNKS,
+                    # None = "nothing chosen": effective_chunk_batch_size derives
+                    # the value from the hardware-sized encode batch (env
+                    # ORACLE_CHUNK_BATCH_CHUNKS still wins inside).
+                    batch_chunks=None,
                     batch_chars=CHUNK_BATCH_CHARS,
                     min_free_gb=min_free_gb,
                     max_gpu_temp_c=CHUNK_MAX_GPU_TEMP_C,

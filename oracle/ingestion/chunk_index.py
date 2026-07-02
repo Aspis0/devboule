@@ -36,7 +36,11 @@ from oracle.config import (
     LANCE_DB_PATH,
     SQLITE_PATH,
 )
-from oracle.ingestion.embedder import embed_texts, release_embedding_memory
+from oracle.ingestion.embedder import (
+    effective_embed_batch_size,
+    embed_texts,
+    release_embedding_memory,
+)
 from oracle.ingestion.parser import is_sensitive_relative_path, utc_mtime
 from oracle.ingestion.retrieval_text import (
     SEMANTIC_PREFIX_PROFILE_VERSION,
@@ -745,6 +749,34 @@ def wait_for_gpu_cooldown(max_gpu_temp_c: int, progress: bool = False) -> int | 
     return temp_c
 
 
+def effective_chunk_batch_size(batch_chunks: int | None) -> int:
+    """Chunks handed to ONE embed_texts() call.
+
+    Tri-state, so an explicit operator value is never second-guessed (an
+    operator pinning ``--batch-chunks 8`` must get literally 8 even though 8
+    is also the config default):
+      * ``batch_chunks`` is an int  -> explicit caller/CLI choice, used as-is;
+      * env ORACLE_CHUNK_BATCH_CHUNKS -> operator override via config;
+      * ``None`` (nothing chosen)   -> derive from the hardware-sized encode
+        batch (embedder.choose_embed_batch_size: up to 64 on CUDA / 32 on
+        MPS): 4 encode-batches per call amortizes per-call overhead. The old
+        flat default (8) couldn't even fill one encode batch.
+
+    Memory bound honesty: chunk_char_budget caps the AGGREGATE chars of one
+    embed_texts() call, NOT the peak forward pass — sentence-transformers
+    slices the call into groups of the encode batch size, so the peak pass is
+    bounded by encode_batch x largest-chunk-chars (32 x ~2500 chars ≈ 20k
+    tokens of Qwen3-0.6B activations on MPS — small next to the tiers'
+    free-RAM floors, and the OOM->CPU fallback + between-batch RAM/thermal
+    guards in the index loop still own scaling DOWN under pressure).
+    """
+    if batch_chunks is not None:
+        return max(1, batch_chunks)
+    if os.getenv("ORACLE_CHUNK_BATCH_CHUNKS", "").strip():
+        return max(1, CHUNK_BATCH_CHUNKS)
+    return max(CHUNK_BATCH_CHUNKS, 4 * effective_embed_batch_size())
+
+
 def adaptive_batch_files(
     base: int, current: int, free_gb: float, min_free_gb: float
 ) -> int:
@@ -806,7 +838,7 @@ def index_file_chunks(
     chunk_vector_path: Path | str = CHUNK_DB_PATH,
     manifest_path: Path | str = CHUNK_MANIFEST_PATH,
     batch_files: int = CHUNK_BATCH_FILES,
-    batch_chunks: int = CHUNK_BATCH_CHUNKS,
+    batch_chunks: int | None = None,
     batch_chars: int = CHUNK_BATCH_CHARS,
     min_free_gb: float = CHUNK_MIN_FREE_GB,
     max_gpu_temp_c: int | None = CHUNK_MAX_GPU_TEMP_C,
@@ -874,7 +906,7 @@ def index_file_chunks(
     # sized in base units even while the adaptive controller grows/shrinks the
     # actual per-iteration slice).
     max_files_per_run = max_batches * base_file_batch_size if max_batches is not None else None
-    chunk_batch_size = max(1, batch_chunks)
+    chunk_batch_size = effective_chunk_batch_size(batch_chunks)
     chunk_char_budget = max(1, batch_chars)
 
     pending_index = 0
