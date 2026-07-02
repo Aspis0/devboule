@@ -8644,9 +8644,13 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// Bare name of the local Devboule main-coder binary (no extension; the `.exe`
-/// suffix is appended per-OS in the resolver below).
-const ORCHESTRATOR_BINARY_STEM: &str = "devboule-coder";
+// ROLE UNTANGLE Phase 6: the built binary is `devboule-orchestrator` (it IS the
+// orchestrator — it never writes files). The crate DIRECTORY is still
+// `devboule-coder`. `OLD_ORCHESTRATOR_BINARY_STEM` is the pre-rename output name,
+// tried as a dual-stem fallback so an already-built artifact still resolves.
+const ORCHESTRATOR_BINARY_STEM: &str = "devboule-orchestrator";
+const OLD_ORCHESTRATOR_BINARY_STEM: &str = "devboule-coder";
+const ORCHESTRATOR_CRATE_DIR: &str = "devboule-coder";
 
 /// Resolve the `devboule-coder` orchestrator binary the launch runs, mirroring
 /// `resolve_oracle_python`'s resolution discipline (try the known real locations
@@ -8665,27 +8669,40 @@ const ORCHESTRATOR_BINARY_STEM: &str = "devboule-coder";
 /// command name — unlike the Python resolver there is no safe system fallback for
 /// our own binary.
 fn resolve_orchestrator_binary() -> Result<PathBuf, String> {
-    let exe_name = if cfg!(windows) {
-        format!("{ORCHESTRATOR_BINARY_STEM}.exe")
+    // Dual-stem: prefer the new `devboule-orchestrator` output name, fall back to
+    // the pre-rename `devboule-coder` so an already-built artifact still resolves.
+    let exe_names: Vec<String> = if cfg!(windows) {
+        vec![
+            format!("{ORCHESTRATOR_BINARY_STEM}.exe"),
+            format!("{OLD_ORCHESTRATOR_BINARY_STEM}.exe"),
+        ]
     } else {
-        ORCHESTRATOR_BINARY_STEM.to_string()
+        vec![
+            ORCHESTRATOR_BINARY_STEM.to_string(),
+            OLD_ORCHESTRATOR_BINARY_STEM.to_string(),
+        ]
     };
 
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // 1. DEV cargo target: <repo>/devboule-coder/target/{release,debug}/<exe>.
+    // The crate DIRECTORY is ORCHESTRATOR_CRATE_DIR (unchanged by the rename);
     // CARGO_MANIFEST_DIR is <repo>/src-tauri; its parent is the repo root.
     if let Some(repo_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        let target_root = repo_root.join(ORCHESTRATOR_BINARY_STEM).join("target");
+        let target_root = repo_root.join(ORCHESTRATOR_CRATE_DIR).join("target");
         for profile in ["release", "debug"] {
-            candidates.push(target_root.join(profile).join(&exe_name));
+            for exe_name in &exe_names {
+                candidates.push(target_root.join(profile).join(exe_name));
+            }
         }
     }
 
     // 2. BUNDLED: alongside the running app binary (the Tauri sidecar location).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(&exe_name));
+            for exe_name in &exe_names {
+                candidates.push(dir.join(exe_name));
+            }
         }
     }
 
@@ -8697,7 +8714,7 @@ fn resolve_orchestrator_binary() -> Result<PathBuf, String> {
     }
 
     Err(format!(
-        "Devboule main-coder binary '{exe_name}' not found. Build it (cargo build in devboule-coder/) or bundle it next to the app. Looked in: {}",
+        "Devboule main-coder binary '{ORCHESTRATOR_BINARY_STEM}' not found. Build it (cargo build in devboule-coder/) or bundle it next to the app. Looked in: {}",
         candidates
             .iter()
             .map(|p| p.display().to_string())
