@@ -12840,48 +12840,62 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
 
     #[test]
     fn mini_launch_path_never_wires_user_mcp_servers() {
-        // MINI-EXCLUSION (design §6): the mini coder is a separate launch path
-        // (mini_coder_executor.rs) that must never WIRE user MCP servers IN. This test
-        // asserts the invariant at the source-text level: the mini module never references
-        // any Phase B wiring symbol (the backend, the action, the merge/serialize helpers).
-        let mini_src = include_str!("mini_coder_executor.rs");
-        for forbidden in [
-            "MultiMcpBackend",
-            "McpTool",
-            "merged_servers",
-            "orchestrator_env_json",
-        ] {
+        // MINI-EXCLUSION (design §6): the mini coder is a separate launch path that
+        // must never WIRE user MCP servers IN. This test asserts the invariant at
+        // the source-text level across the WHOLE mini launch surface — the executor
+        // AND the modules extracted from it in the role-untangle Phase 2 pure move
+        // (mini_command_build owns the command assembly + env scrub now): none may
+        // reference a Phase B wiring symbol (backend, action, merge/serialize).
+        let mini_sources = [
+            ("mini_coder_executor.rs", include_str!("mini_coder_executor.rs")),
+            ("mini_command_build.rs", include_str!("mini_command_build.rs")),
+            ("mini_edit_apply.rs", include_str!("mini_edit_apply.rs")),
+            ("mini_prompt.rs", include_str!("mini_prompt.rs")),
+            ("agentic_worker.rs", include_str!("agentic_worker.rs")),
+        ];
+        for (name, src) in mini_sources {
+            for forbidden in [
+                "MultiMcpBackend",
+                "McpTool",
+                "merged_servers",
+                "orchestrator_env_json",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name} must not reference `{forbidden}` (mini-exclusion §6)"
+                );
+            }
+            // FIX 6: the var name MAY appear, but ONLY as the DEFENSIVE SCRUB
+            // (`env_remove`) that strips an inherited host-env value OUT of the mini
+            // command — never to SET it. Every line mentioning the var must be the
+            // const definition (pub(crate) since the Phase 2 split) or a comment;
+            // the scrub itself must reference the const, not the literal.
+            let var = "DEVBOULE_USER_MCP_SERVERS";
+            for line in src.lines().filter(|l| l.contains(var)) {
+                let t = line.trim();
+                let is_const_def = t.starts_with("const FORBIDDEN_USER_MCP_ENV")
+                    || t.starts_with("pub(crate) const FORBIDDEN_USER_MCP_ENV");
+                let is_doc = t.starts_with("//") || t.starts_with("///");
+                assert!(
+                    is_const_def || is_doc,
+                    "{name}: the only literal `{var}` lines may be the const def or a \
+                     comment; the scrub itself must reference the const, not the \
+                     literal: {line}"
+                );
+            }
+            // No mini source may SET the user-MCP var (`.env(` is the setter,
+            // distinct from `.get_env(` / `.env_remove(`).
             assert!(
-                !mini_src.contains(forbidden),
-                "mini_coder_executor.rs must not reference `{forbidden}` (mini-exclusion §6)"
+                !src.contains(".env(FORBIDDEN_USER_MCP_ENV"),
+                "{name} must NEVER set the user-MCP var (mini-exclusion §6)"
             );
         }
-        // FIX 6: the var name MAY appear, but ONLY as the DEFENSIVE SCRUB (`env_remove`) that
-        // strips an inherited host-env value OUT of the mini command — never to SET it.
-        // Every line mentioning the var must be either the const definition or an
-        // `env_remove(...)` call; none may pass it to `.env(` (which would WIRE it in).
-        let var = "DEVBOULE_USER_MCP_SERVERS";
-        for line in mini_src.lines().filter(|l| l.contains(var)) {
-            let t = line.trim();
-            let is_const_def = t.starts_with("const FORBIDDEN_USER_MCP_ENV");
-            let is_doc = t.starts_with("//") || t.starts_with("///");
-            assert!(
-                is_const_def || is_doc,
-                "the only literal `{var}` lines may be the const def or a comment; the \
-                 scrub itself must reference the const, not the literal: {line}"
-            );
-        }
-        // The defensive scrub IS present (the runtime enforcement), and the var is removed,
-        // never set, on the mini command.
+        // The defensive scrub IS present (the runtime enforcement) where the mini
+        // command is assembled — mini_command_build.rs since the Phase 2 move.
+        let command_src = include_str!("mini_command_build.rs");
         assert!(
-            mini_src.contains("env_remove(FORBIDDEN_USER_MCP_ENV)"),
+            command_src.contains("env_remove(FORBIDDEN_USER_MCP_ENV)"),
             "the mini command must defensively env_remove the user-MCP var (FIX 6)"
-        );
-        // `.env(` (with the leading dot, distinct from `.get_env(` / `.env_remove(`) is the
-        // SETTER. The mini must never SET the user-MCP var — only env_remove it.
-        assert!(
-            !mini_src.contains(".env(FORBIDDEN_USER_MCP_ENV"),
-            "the mini command must NEVER set the user-MCP var (mini-exclusion §6)"
         );
     }
 
