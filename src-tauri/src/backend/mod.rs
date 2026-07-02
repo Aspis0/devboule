@@ -52,6 +52,7 @@ pub mod pigeon_service;
 pub mod plan_approval;
 pub mod project_skill;
 pub mod projects;
+pub mod roles_config;
 pub mod provider_detect;
 pub mod providers;
 pub mod roles;

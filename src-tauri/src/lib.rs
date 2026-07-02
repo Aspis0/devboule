@@ -466,6 +466,8 @@ pub fn run() {
             backend::cloud_duplex::project_cloud_compact,
             backend::agent_pty::agent_pty_list,
             backend::main_coder::spawn_main_coder_directive,
+            backend::roles_config::get_roles_config_cmd,
+            backend::roles_config::set_roles_config_cmd,
             backend::mini_coder_executor::mini_coder_kill,
             backend::mini_coder_executor::mini_coder_steer,
             backend::mini_activity::mini_activity_snapshot,
