@@ -633,6 +633,7 @@ pub fn run() {
             backend::censor::commands::set_censor_trusted,
             backend::projects::set_project_net_enabled_cmd,
             backend::projects::set_project_sandbox_mode_cmd,
+            backend::projects::set_project_main_coder_override_cmd,
             backend::projects::set_project_agent_controls_cmd,
             backend::projects::grant_net_consent,
             backend::projects::project_working_set_cmd,

@@ -169,6 +169,15 @@ pub struct ProjectMetadata {
     /// byte-stable.
     #[serde(default, skip_serializing_if = "AgentControls::is_default")]
     pub agent_controls: AgentControls,
+    /// P6b (role untangle): per-project OVERRIDE of the Main-coder engine. The global
+    /// default lives in `RolesConfig.mainCoder` (config.json); this per-project field lets
+    /// project A run `codex` while project B runs `claude` or a local backend. The value is
+    /// an opaque engine/client id (the same shape as the old hand-off `coderId`), validated
+    /// at the launch/consumption layer. Resolution at launch = this override, else the global
+    /// RolesConfig default. `None` = use the global default. NO-CHURN: omitted from the
+    /// on-disk frontmatter when None so pre-existing project files stay byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_coder: Option<String>,
 }
 
 /// Slice 5c: per-project (or per-launch) capability/cost controls for the cloud coding CLIs.

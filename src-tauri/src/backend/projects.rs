@@ -193,6 +193,9 @@ pub fn create_project(
         sandbox_mode: crate::backend::broker::SandboxMode::default(),
         working_set: Vec::new(),
         agent_controls: Default::default(),
+        // A brand-new project has no Main-coder override; it inherits the global RolesConfig
+        // default until the user picks a per-project engine in the hand-off dropdown.
+        main_coder: None,
     };
     let state_block = ProjectStateBlock {
         version: 1,
@@ -2371,6 +2374,58 @@ pub fn set_project_sandbox_mode_cmd(
     set_project_sandbox_mode(&app, &project_id, mode)
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// main_coder — per-project Main-coder engine override (P6b, role untangle)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// P6b: read this project's Main-coder engine override. `None` = fall back to the global
+/// `RolesConfig.mainCoder` default at launch. Mirrors [`project_sandbox_mode`].
+pub fn project_main_coder_override(
+    app: &tauri::AppHandle,
+    project_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(read_project_by_id(app, project_id)?.metadata.main_coder)
+}
+
+/// P6b: persist (or clear) this project's Main-coder engine override via the same locked
+/// read-modify-write path as [`set_project_sandbox_mode`]. An empty/whitespace value CLEARS
+/// the override (stored as `None` ⇒ NO-CHURN omits the frontmatter key). Mirrors
+/// [`set_project_sandbox_mode`].
+pub fn set_project_main_coder_override(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    engine: Option<String>,
+) -> Result<(), String> {
+    // Normalize "" / whitespace-only → None so the hand-off "Default" choice clears the key.
+    let engine = engine
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    // SECURITY: the id is written VERBATIM onto a single frontmatter line — validate at this
+    // trust boundary (fail closed) before it can reach disk.
+    if let Some(value) = engine.as_ref() {
+        validate_main_coder_engine_id(value)?;
+    }
+    let path = project_path_by_id(app, project_id)?;
+    mutate_project_file_latest(&path, |project| {
+        project.metadata.main_coder = engine.clone();
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Tauri command: persist (or clear) the per-project Main-coder engine override.
+/// Mirrors [`set_project_sandbox_mode_cmd`]: same signature shape, same `ensure_unlocked` guard.
+#[tauri::command]
+pub fn set_project_main_coder_override_cmd(
+    project_id: String,
+    engine: Option<String>,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<(), String> {
+    backend_state.ensure_unlocked()?;
+    set_project_main_coder_override(&app, &project_id, engine)
+}
+
 /// Slice 5c: persist the per-project agent capability/cost controls (effort / system-prompt /
 /// turn+budget caps) via the same locked read-modify-write path (NO-CHURN omits the object when
 /// every field is unset). Permission mode is NOT here — that stays `sandbox_mode`.
@@ -2894,6 +2949,16 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                 .or_else(|| fields.get("agentControls"))
                 .and_then(|value| serde_json::from_str(value.trim()).ok())
                 .unwrap_or_default();
+            // P6b: read the per-project Main-coder engine override. Missing key → None (NO-CHURN:
+            // a project written before this feature has no key and must load with no override).
+            // A key present but blank after trim → None (a blank value carries no engine, same
+            // tolerant posture as sandbox_mode's blank → default). Stored as a plain unquoted
+            // engine id (no colons), so a first-colon split yields the value verbatim.
+            let main_coder: Option<String> = fields
+                .get("main_coder")
+                .or_else(|| fields.get("mainCoder"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
             return Ok((
                 ProjectMetadata {
                     id,
@@ -2906,6 +2971,7 @@ fn parse_frontmatter(content: &str, path: &Path) -> Result<(ProjectMetadata, usi
                     sandbox_mode,
                     working_set,
                     agent_controls,
+                    main_coder,
                 },
                 offset,
             ));
@@ -3039,7 +3105,7 @@ fn write_project_file(project: &ParsedProject) -> Result<(), String> {
 fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<String, String> {
     let (_, end) = parse_frontmatter(content, Path::new("project.md"))?;
     let frontmatter = format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}{}---\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}{}{}---\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -3054,6 +3120,7 @@ fn replace_frontmatter(content: &str, metadata: &ProjectMetadata) -> Result<Stri
         sandbox_mode_frontmatter_line(metadata.sandbox_mode),
         working_set_frontmatter_line(&metadata.working_set),
         agent_controls_frontmatter_line(&metadata.agent_controls),
+        main_coder_frontmatter_line(&metadata.main_coder),
     );
     Ok(format!("{frontmatter}{}", &content[end..]))
 }
@@ -3120,12 +3187,37 @@ fn agent_controls_frontmatter_line(controls: &crate::backend::model::AgentContro
     format!("agent_controls: {json}\n")
 }
 
+/// P6b trust-boundary check for a per-project Main-coder engine id before it is written
+/// VERBATIM onto a single frontmatter line (`main_coder: <value>`). A control character —
+/// above all a newline/CR — would break the single-line invariant and could inject a
+/// premature `---`, corrupting the project file or smuggling frontmatter keys. The id comes
+/// from a known engine set, but the setter command is a trust boundary, so we reject rather
+/// than silently sanitize. A colon is allowed (the parser splits on the FIRST colon only).
+fn validate_main_coder_engine_id(value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err("Invalid Main-coder engine id: control characters are not allowed.".into());
+    }
+    Ok(())
+}
+
+/// P6b NO-CHURN: emit `main_coder: <engine-id>` ONLY when a per-project override is set.
+/// `None` (the default for every pre-existing project) emits nothing, so serializing a
+/// project without an override never injects the key — the on-disk bytes stay identical.
+/// The value is a plain unquoted engine/client id (no colons or newlines by construction —
+/// it comes from the configured Main-coder engine set), read back verbatim by the parser.
+fn main_coder_frontmatter_line(main_coder: &Option<String>) -> String {
+    match main_coder.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => format!("main_coder: {value}\n"),
+        None => String::new(),
+    }
+}
+
 fn initial_project_markdown(
     metadata: &ProjectMetadata,
     state: &ProjectStateBlock,
 ) -> Result<String, String> {
     Ok(format!(
-        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
+        "---\nid: {}\ntitle: {}\nstatus: {}\nupdated_at: {}\n{}{}{}{}{}{}{}---\n\n# Obiettivi\n- Definisci qui gli obiettivi operativi del progetto.\n\n{BLOCK_MARKER}\n{}\n{BLOCK_CLOSE}\n\n# Note libere\n",
         metadata.id,
         metadata.title,
         metadata.status,
@@ -3140,6 +3232,7 @@ fn initial_project_markdown(
         sandbox_mode_frontmatter_line(metadata.sandbox_mode),
         working_set_frontmatter_line(&metadata.working_set),
         agent_controls_frontmatter_line(&metadata.agent_controls),
+        main_coder_frontmatter_line(&metadata.main_coder),
         serde_json::to_string_pretty(state)
             .map_err(|e| format!("Project state could not be serialized: {e}"))?
     ))
@@ -9801,6 +9894,7 @@ mod tests {
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let serialized = replace_frontmatter(old, &trusted).unwrap();
         assert!(serialized.contains("censor_trusted: true"));
@@ -9836,6 +9930,7 @@ mod tests {
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let serialized = replace_frontmatter(old, &enabled).unwrap();
         assert!(serialized.contains("net_enabled: true"));
@@ -9882,6 +9977,7 @@ mod tests {
             sandbox_mode: SandboxMode::Ask,
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let serialized_ask = replace_frontmatter(old, &ask_meta).unwrap();
         assert!(
@@ -9976,6 +10072,95 @@ mod tests {
         );
     }
 
+    /// P6b: the per-project Main-coder engine override round-trips, an old file with no key
+    /// parses as `None`, and serializing `None` is byte-identical (NO-CHURN).
+    #[test]
+    fn main_coder_override_roundtrips_and_old_files_have_no_override() {
+        // An old file with NO main_coder line must parse as None (back-compat / NO-CHURN).
+        let old = "---\nid: proj-mc\ntitle: P\nstatus: active\nupdated_at: t\n---\n";
+        let (meta, _) = parse_frontmatter(old, Path::new("proj-mc.md")).unwrap();
+        assert_eq!(meta.main_coder, None, "missing key must default to None");
+
+        // Serializing a project with None (default) must NOT inject the key AND must be
+        // byte-identical to the original frontmatter (the strongest NO-CHURN guarantee).
+        let none_meta = ProjectMetadata {
+            id: "proj-mc".into(),
+            title: "P".into(),
+            status: "active".into(),
+            updated_at: "t".into(),
+            root_path: None,
+            censor_trusted: false,
+            net_enabled: false,
+            sandbox_mode: crate::backend::broker::SandboxMode::default(),
+            working_set: Vec::new(),
+            agent_controls: Default::default(),
+            main_coder: None,
+        };
+        let serialized_none = replace_frontmatter(old, &none_meta).unwrap();
+        assert!(
+            !serialized_none.contains("main_coder"),
+            "None must not write the main_coder key (NO-CHURN)"
+        );
+        assert_eq!(
+            serialized_none, old,
+            "a None override must serialize byte-identical to the original"
+        );
+
+        // Serializing Some("codex") emits the key; re-parsing reads it back verbatim.
+        let codex_meta = ProjectMetadata {
+            main_coder: Some("codex".into()),
+            ..none_meta
+        };
+        let serialized_codex = replace_frontmatter(old, &codex_meta).unwrap();
+        assert!(
+            serialized_codex.contains("main_coder: codex"),
+            "an override must write the main_coder key"
+        );
+        let (reparsed, _) =
+            parse_frontmatter(&serialized_codex, Path::new("proj-mc.md")).unwrap();
+        assert_eq!(
+            reparsed.main_coder.as_deref(),
+            Some("codex"),
+            "the override must round-trip"
+        );
+
+        // A key present but blank after trim → None (tolerant, like sandbox_mode blank → default).
+        let blank =
+            "---\nid: proj-mc\ntitle: P\nstatus: active\nupdated_at: t\nmain_coder:  \n---\n";
+        let (meta_blank, _) = parse_frontmatter(blank, Path::new("proj-mc.md")).unwrap();
+        assert_eq!(
+            meta_blank.main_coder, None,
+            "a blank main_coder value must parse as None"
+        );
+    }
+
+    /// P6b SECURITY: the engine-id validator must reject any control character (the frontmatter
+    /// injection vector) while accepting ordinary engine/client ids.
+    #[test]
+    fn main_coder_engine_id_rejects_control_characters() {
+        // Legit ids pass.
+        for ok in ["codex", "claude", "omlx", "my-custom_client.v2"] {
+            assert!(
+                validate_main_coder_engine_id(ok).is_ok(),
+                "{ok:?} must be accepted"
+            );
+        }
+        // A newline could inject a premature `---`/frontmatter key — must be rejected.
+        assert!(
+            validate_main_coder_engine_id("codex\n---\nstatus: pwned").is_err(),
+            "a newline-bearing id must be rejected (frontmatter injection)"
+        );
+        assert!(
+            validate_main_coder_engine_id("a\rb").is_err(),
+            "a carriage return must be rejected"
+        );
+        // Belt-and-suspenders: even if a control-char value reached the serializer, the emitted
+        // line must never contain a raw newline that breaks the single-line invariant.
+        let line = main_coder_frontmatter_line(&Some("codex".into()));
+        assert_eq!(line, "main_coder: codex\n");
+        assert_eq!(line.matches('\n').count(), 1, "exactly one trailing newline");
+    }
+
     #[test]
     fn project_markdown_roundtrip_preserves_state_block() {
         let metadata = ProjectMetadata {
@@ -9989,6 +10174,7 @@ mod tests {
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -10087,6 +10273,7 @@ updated_at: 2026-05-28T00:00:00Z
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -11187,6 +11374,7 @@ updated_at: 2026-05-28T00:00:00Z
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
                 working_set: Vec::new(),
                 agent_controls: Default::default(),
+                main_coder: None,
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -11856,6 +12044,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
                 working_set: Vec::new(),
                 agent_controls: Default::default(),
+                main_coder: None,
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -14418,6 +14607,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 sandbox_mode: crate::backend::broker::SandboxMode::default(),
                 working_set: Vec::new(),
                 agent_controls: Default::default(),
+                main_coder: None,
             },
             state: ProjectStateBlock {
                 version: 1,
@@ -14778,6 +14968,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -14969,6 +15160,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let state = ProjectStateBlock {
             version: 1,
@@ -15470,6 +15662,7 @@ mod broker_gate_projects {
             sandbox_mode: crate::backend::broker::SandboxMode::default(),
             working_set: Vec::new(),
             agent_controls: Default::default(),
+            main_coder: None,
         };
         let state = ProjectStateBlock {
             version: 1,
