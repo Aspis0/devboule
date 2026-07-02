@@ -468,6 +468,8 @@ pub fn run() {
             backend::main_coder::spawn_main_coder_directive,
             backend::roles_config::get_roles_config_cmd,
             backend::roles_config::set_roles_config_cmd,
+            backend::roles_config::set_main_coder_backend_cmd,
+            backend::roles_config::set_verifier_backend_cmd,
             backend::mini_coder_executor::mini_coder_kill,
             backend::mini_coder_executor::mini_coder_steer,
             backend::mini_activity::mini_activity_snapshot,

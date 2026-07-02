@@ -390,24 +390,159 @@ pub(crate) fn read_main_coder_backend(
         Ok(v) => v,
         Err(_) => return None,
     };
-    // Try the main coder's own backend first (Phase 3 left the Main engine on the
-    // mini's model; this getter is the seam that gives it its own row).
-    // Review fix: BOTH invalid sub-cases (structurally malformed → deserialize err,
-    // AND semantically invalid → validate err) fall through to the mini fallback,
-    // matching the doc's "missing/invalid → fall back". Only a PRESENT + VALID
-    // mainCoderBackend short-circuits.
-    if let Some(entry) = value.get("mainCoderBackend") {
-        if let Ok(parsed) =
-            serde_json::from_value::<super::mini_coder::MiniCoderBackend>(entry.clone())
-        {
-            if let Ok(valid) = super::mini_coder::validate_mini_coder_backend(&parsed) {
-                return Some(valid);
-            }
-        }
+    // Try the main coder's own backend first (Phase 3 left the Main engine on the mini's
+    // model; this getter is the seam that gives it its own row). `parse_role_backend` returns
+    // Some ONLY for a PRESENT + structurally-deserializable + semantically-VALID entry; every
+    // invalid sub-case falls through to the mini fallback, matching "missing/invalid → fall back".
+    if let Some(backend) = parse_role_backend(&value, "mainCoderBackend") {
+        return Some(backend);
     }
     // Fallback: Phase 3 left the Main engine on the mini's model. Call the
     // existing public reader in projects.rs.
     super::projects::read_mini_coder_backend(app)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Per-role LOCAL backend model (P6b path B) — Main coder + Verifier each get their own
+// `MiniCoderBackend`-shaped local model row, reusing the existing type + validator wholesale.
+//   - Main coder: config key `mainCoderBackend` (reader above already prefers it, falling
+//     back to the mini's model).
+//   - Verifier:   config key `verifierBackend`, INHERITING the Main coder's model when unset
+//     (mirrors the client-axis "verifier defaults to Main coder" affordance on the model axis).
+// PURE core (parse/apply) split from the impure IO wrapper so the write NO-CHURN + read
+// fallback semantics are unit-testable without a Tauri runtime — same shape as
+// resolve_roles_config / apply_mini_write_behavior_to_config in projects.rs.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// PURE: parse a `MiniCoderBackend` stored under `key` in a config JSON value. Returns
+/// `Some` ONLY when the key is present, structurally deserializable AND semantically valid
+/// (`validate_mini_coder_backend`); every other case (missing / malformed / invalid) → `None`,
+/// so callers fall through to their inheritance chain. Tolerant: never panics on bad input.
+fn parse_role_backend(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<super::mini_coder::MiniCoderBackend> {
+    let entry = value.get(key)?;
+    let parsed =
+        serde_json::from_value::<super::mini_coder::MiniCoderBackend>(entry.clone()).ok()?;
+    super::mini_coder::validate_mini_coder_backend(&parsed).ok()
+}
+
+/// PURE + total: merge (or clear) a role backend under `key` into a config `value` object.
+/// `Some` writes the serialized backend; `None` REMOVES the key entirely (NO-CHURN — a config
+/// that never set this role, or cleared it, stays byte-identical). Touches ONLY `key`, so a
+/// save can never clobber a sibling role's backend. Returns Err if `value` is not an object.
+fn apply_role_backend_to_config(
+    value: &mut serde_json::Value,
+    key: &str,
+    backend: Option<&super::mini_coder::MiniCoderBackend>,
+) -> Result<(), String> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "config.json is not a JSON object.".to_string())?;
+    match backend {
+        Some(b) => {
+            let serialized = serde_json::to_value(b)
+                .map_err(|e| format!("Could not serialize {key} backend: {e}"))?;
+            obj.insert(key.to_string(), serialized);
+        }
+        None => {
+            // Clearing: drop the key entirely (no `null` churn).
+            obj.remove(key);
+        }
+    }
+    Ok(())
+}
+
+/// IMPURE: persist (or clear) a `MiniCoderBackend`-shaped role backend under `key`. Mirrors
+/// `projects.rs::set_local_coder_backend` EXACTLY: validate+normalize, take the SHARED config
+/// write lock across the whole read-modify-write (a concurrent Settings save on another key
+/// can't last-writer-wins clobber this), atomic temp+rename so a crash never leaves config.json
+/// partial. `None` clears the key. Returns the normalized persisted backend.
+fn set_role_backend_key(
+    app: &tauri::AppHandle,
+    key: &str,
+    backend: Option<super::mini_coder::MiniCoderBackend>,
+) -> Result<Option<super::mini_coder::MiniCoderBackend>, String> {
+    let normalized = match &backend {
+        Some(b) => Some(super::mini_coder::validate_mini_coder_backend(b)?),
+        None => None,
+    };
+    let path = locate_config_path(app)
+        .ok_or_else(|| format!("config.json could not be located to save the {key} backend."))?;
+    // Serialize the read-modify-write against the other config.json savers (mini / local /
+    // design / rolesConfig) so two concurrent Settings saves can't drop each other's key.
+    let _config_guard = super::projects::config_write_lock()
+        .lock()
+        .map_err(|_| "Config write lock is poisoned.".to_string())?;
+    let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config.json: {e}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("config.json is not valid JSON: {e}"))?;
+    apply_role_backend_to_config(&mut value, key, normalized.as_ref())?;
+    let pretty = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("Could not serialize config.json: {e}"))?;
+    // Atomic temp+rename (same as set_local_coder_backend).
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let temp_path = path.with_extension(format!("json.{suffix}.tmp"));
+    let backup_path = path.with_extension(format!("json.{suffix}.bak"));
+    fs::write(&temp_path, format!("{pretty}\n")).map_err(|e| {
+        format!(
+            "Could not write config.json at {}: {e}. In a packaged build this file is read-only.",
+            path.to_string_lossy()
+        )
+    })?;
+    super::fs_replace::replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")
+        .map_err(|e| format!("{e}. In a packaged build this file is read-only."))?;
+    Ok(normalized)
+}
+
+/// IMPURE: read the Verifier ENGINE's local model. `verifierBackend` when present + valid;
+/// otherwise INHERIT the Main coder's backend (`read_main_coder_backend` → `mainCoderBackend`
+/// else the mini's). Not yet wired to a launch path — the verifier launch reads this in the
+/// launch-consumption slice; kept `allow(dead_code)` until then.
+#[allow(dead_code)]
+pub(crate) fn read_verifier_backend(
+    app: &tauri::AppHandle,
+) -> Option<super::mini_coder::MiniCoderBackend> {
+    if let Some(path) = locate_config_path(app) {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(backend) = parse_role_backend(&value, "verifierBackend") {
+                    return Some(backend);
+                }
+            }
+        }
+    }
+    // Unset/invalid → inherit the Main coder's model (which itself falls back to the mini).
+    read_main_coder_backend(app)
+}
+
+/// Tauri command: persist (or clear) the Main coder's dedicated local model backend.
+/// Mirrors `set_local_coder_backend`: same signature shape + `ensure_unlocked` guard.
+#[tauri::command]
+pub fn set_main_coder_backend_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    backend: Option<super::mini_coder::MiniCoderBackend>,
+) -> Result<Option<super::mini_coder::MiniCoderBackend>, String> {
+    state.ensure_unlocked()?;
+    set_role_backend_key(&app, "mainCoderBackend", backend)
+}
+
+/// Tauri command: persist (or clear) the Verifier's dedicated local model backend.
+/// Mirrors `set_local_coder_backend`: same signature shape + `ensure_unlocked` guard.
+#[tauri::command]
+pub fn set_verifier_backend_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    backend: Option<super::mini_coder::MiniCoderBackend>,
+) -> Result<Option<super::mini_coder::MiniCoderBackend>, String> {
+    state.ensure_unlocked()?;
+    set_role_backend_key(&app, "verifierBackend", backend)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -608,5 +743,80 @@ mod tests {
         assert_eq!(config.orchestrator_client, None);
         assert_eq!(config.coder_client, Some("claude".to_string()));
         assert_eq!(config.verifier_client, None);
+    }
+
+    // -- per-role backend model (P6b path B) ----------------------------------
+
+    use super::super::mini_coder::{MiniCoderBackend, MiniCoderBackendKind};
+
+    fn codex_backend() -> MiniCoderBackend {
+        serde_json::from_value(serde_json::json!({ "kind": "codex" })).unwrap()
+    }
+
+    #[test]
+    fn parse_role_backend_present_valid_returns_some() {
+        let config = serde_json::json!({ "mainCoderBackend": { "kind": "codex" } });
+        let parsed = parse_role_backend(&config, "mainCoderBackend");
+        assert!(parsed.is_some(), "a present + valid backend must parse");
+        assert_eq!(parsed.unwrap().kind, MiniCoderBackendKind::Codex);
+    }
+
+    #[test]
+    fn parse_role_backend_missing_malformed_or_invalid_returns_none() {
+        // Missing key.
+        assert!(parse_role_backend(&serde_json::json!({}), "mainCoderBackend").is_none());
+        // Structurally malformed (unknown kind → deserialize error).
+        let malformed = serde_json::json!({ "mainCoderBackend": { "kind": "nope" } });
+        assert!(parse_role_backend(&malformed, "mainCoderBackend").is_none());
+        // Structurally malformed (missing required `kind`).
+        let no_kind = serde_json::json!({ "mainCoderBackend": { "model": "x" } });
+        assert!(parse_role_backend(&no_kind, "mainCoderBackend").is_none());
+        // Deserializable but semantically INVALID (ollama requires a model tag).
+        let invalid = serde_json::json!({ "mainCoderBackend": { "kind": "ollama" } });
+        assert!(
+            parse_role_backend(&invalid, "mainCoderBackend").is_none(),
+            "a present-but-invalid backend must fall through to None"
+        );
+    }
+
+    #[test]
+    fn apply_role_backend_inserts_clears_and_leaves_siblings_untouched() {
+        // Start with a config that already carries a SIBLING role's backend.
+        let mut config = serde_json::json!({
+            "miniCoderBackend": { "kind": "ollama", "model": "qwen2.5-coder" },
+        });
+
+        // Insert mainCoderBackend.
+        apply_role_backend_to_config(&mut config, "mainCoderBackend", Some(&codex_backend()))
+            .unwrap();
+        assert_eq!(
+            config["mainCoderBackend"]["kind"], "codex",
+            "Some must write the role's key"
+        );
+        assert_eq!(
+            config["miniCoderBackend"]["model"], "qwen2.5-coder",
+            "a sibling backend key must be left untouched"
+        );
+
+        // Clear it → the key is REMOVED entirely (NO-CHURN, no `null`).
+        apply_role_backend_to_config(&mut config, "mainCoderBackend", None).unwrap();
+        assert!(
+            config.get("mainCoderBackend").is_none(),
+            "None must drop the key entirely (no null churn)"
+        );
+        assert!(
+            config.get("miniCoderBackend").is_some(),
+            "clearing one role must not touch the sibling"
+        );
+    }
+
+    #[test]
+    fn apply_role_backend_rejects_non_object() {
+        let mut not_obj = serde_json::json!("i am a string");
+        assert!(
+            apply_role_backend_to_config(&mut not_obj, "mainCoderBackend", Some(&codex_backend()))
+                .is_err(),
+            "a non-object config must be rejected, not panic"
+        );
     }
 }
