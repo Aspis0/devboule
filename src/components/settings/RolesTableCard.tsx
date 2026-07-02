@@ -88,7 +88,10 @@ const KIND_LABELS: Record<MiniCoderBackendKind, string> = {
   ollama: "Ollama (local model)",
   omlx: "oMLX (local MLX server)",
   appleFm: "Apple on-device (macOS)",
-  codex: "Codex (subscription)",
+  // "Codex" everywhere (it always means your Codex subscription — no API key). The
+  // "rides your subscription" nuance lives in the row caption, not the label, so the
+  // name is consistent with the cloud-client dropdown + the hand-off dropdown.
+  codex: "Codex",
   api: "API CLI (your command)",
 };
 
@@ -530,7 +533,7 @@ export function RolesTableCard() {
               onChange={(e) => setRoleClient(role, e.target.value)}
               className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
             >
-              <option value="claude">Claude Code</option>
+              <option value="claude">Claude</option>
               <option value="codex">Codex</option>
             </select>
           </label>

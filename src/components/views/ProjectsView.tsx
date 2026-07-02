@@ -242,6 +242,9 @@ export function ProjectsView() {
   // hand-off dropdown labels its "Default" with this and falls back to it when a project
   // has no per-project override. Loaded once from the resolved rolesConfig.
   const [mainCoderDefault, setMainCoderDefault] = useState<string>("codex");
+  // Role untangle (P6b): the Verifier's OWN client (Settings → Roles), independent of the
+  // Main coder's — the untangle's point (it used to silently reuse mainCoderClient).
+  const [verifierClientDefault, setVerifierClientDefault] = useState<string>("codex");
   // Which backend runs as the ORCHESTRATOR (who you talk to). "orchestrator" = local Devboule
   // (our Stage/TUI); "claude"/"codex" run their own CLI (we show their terminal). Default local.
   const [plannerOrchestratorClient, setPlannerOrchestratorClient] =
@@ -503,6 +506,7 @@ export function ProjectsView() {
           "get_roles_config_cmd",
         );
         if (alive && roles?.coderClient) setMainCoderDefault(roles.coderClient);
+        if (alive && roles?.verifierClient) setVerifierClientDefault(roles.verifierClient);
       } catch {
         // Keep the conservative "codex" default.
       }
@@ -1752,8 +1756,12 @@ export function ProjectsView() {
       invokeBackendCommand("launch_project_agent_terminal", {
         input: {
           projectId: pid,
+          // Role untangle (P6b): the verifier runs on its OWN client (Settings → Roles),
+          // no longer silently reusing the Main coder's. NOTE: a "local" verifier (the
+          // in-process agentic engine) launches via a different path; the CLI terminal
+          // spawn here covers the cloud clients (claude/codex/custom).
           role: "verifier",
-          client: mainCoderClient,
+          client: verifierClientDefault,
           agentId: `verifier-${taskId ?? "recall"}-${Date.now()}-${idx}`,
           taskId,
           host: "app",
@@ -3280,6 +3288,9 @@ export function ProjectsView() {
             onOrchestratorChange={setPlannerOrchestratorClient}
             cloudTerminalAgentId={null}
             coders={[
+              // Role untangle (P6b): the Main coder can run LOCAL — the sandboxed agentic
+              // engine on mainCoderBackend (Settings → Roles) — as well as a cloud CLI.
+              { id: "local", label: "Local (Devboule)" },
               { id: "claude", label: "Claude" },
               { id: "codex", label: "Codex" },
               ...(config.customAgentClients ?? []).map((c) => ({
