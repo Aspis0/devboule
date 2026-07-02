@@ -339,8 +339,11 @@ integration) **not re-audited this pass** — design is `aspis-bio-polis-map.md`
   PolisRenderer, terrain, roadGraph, TradeRouteLayer, possession, props, renderProfile, rng +
   `cityStore.ts` + `types/city.ts`): the isometric living-city map.
 - **Settings** (`SettingsView.tsx`): 4 tabs — `Account` · `Providers & Models` · `Workspace & Index`
-  · `Security`. Per-model sampling + vendor-seeded defaults; "recommended for your machine";
-  main-coder CLI select claude/codex; orchestrator model read-only in SpawnPanel.
+  · `Security`. Per-model sampling + vendor-seeded defaults; "recommended for your machine".
+  **Who-runs-each-role now lives in ONE "Roles" table** (`RolesTableCard`, role-untangle
+  2026-07-02): Orchestrator/Main coder/Mini/Verifier × Local-or-Cloud; Censor + Design LLM sit
+  below under "Gates & helpers" (not roles). The old per-selector cards (main-coder CLI, mini
+  backend) are retired. See `agent-roles-architecture-2026-06.md` v2.
 
 ---
 
@@ -432,6 +435,18 @@ today; the training loop itself is P13. (Vocab pruning, formerly P12, is no long
 - **Write-mode is capability-driven, not a raw toggle.** Registry tier drives the `Auto` default; an
   explicit user override still wins (Simplify = smart default + keep the manual override).
 - **Minis never get user MCP servers**; only main coders do.
+- ⭐ **Writes never flow through MCP** (role-untangle 2026-07-02). No role — not even the coder —
+  writes via an MCP tool. The write/sandbox boundary is the **edit-apply + run-tool** layer:
+  external CLIs use their native tools, minis emit edits the host applies (`apply_emitted_edits`),
+  the agentic engine writes via the Seatbelt run-tool. This is why the orchestrator can hold the
+  full provider (Cloudflare/Scaleway) surface — read+mutation under claimed-task+evidence audit —
+  yet holds NO file-write tool.
+- ⭐ **Role ≠ client; role follows LAUNCH INTENT** (role-untangle). Four first-class roles
+  `{orchestrator, coder="Main coder", verifier, mini}` (aligned to the Python taxonomy — Rust no
+  longer folds `orchestrator→coder`). ONE classification fold (`backend/agent_role.rs`). Config is
+  ONE Settings "Roles" table (`rolesConfig` client triple + per-role model backends), lossless-
+  migrated from the legacy selectors. Per-project Main-coder engine override =
+  `ProjectMetadata.main_coder`. `"local"` is a reserved placement marker, not a client.
 - **Censor privacy fail-safe:** all LLM-censor base-URLs are loopback-clamped; file content never
   leaves the device.
 - **Sandbox boundary = writes + network, not reads.** Loopback-only this phase; cloud (Claude/Codex)
