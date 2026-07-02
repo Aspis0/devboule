@@ -1492,6 +1492,12 @@ fn build_oracle_server_command_with_package_root(
         // a dead port). The supervisor restarts it if it dies. The Python config
         // reads this exact key (oracle/config.py: ORACLE_DISABLE_IDLE_EXIT).
         .env(ORACLE_DISABLE_IDLE_EXIT_ENV, "1")
+        // Parent-death watchdog (orphan-server fix): the server self-exits when
+        // this app pid is gone. Covers every teardown `on_app_exit` cannot reach —
+        // SIGKILL, crash, `tauri dev` rebuild — on macOS AND Windows. The Python
+        // side (oracle/server/main.py: _start_parent_watchdog) is a no-op when
+        // this env var is absent, so CLI/test runs are unaffected.
+        .env("ORACLE_PARENT_PID", std::process::id().to_string())
         .env("PYTHONPATH", &package_root);
     Ok(command)
 }
@@ -2750,6 +2756,20 @@ mod tests {
             command.get_current_dir(),
             Some(root.as_path()),
             "server cwd must be the index/workspace root"
+        );
+
+        // (d) ORACLE_PARENT_PID == this app's pid, so the server's parent-death
+        // watchdog can self-exit when the app dies without a clean shutdown
+        // (SIGKILL / crash / dev rebuild) — the orphan-server fix.
+        let parent_pid = command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("ORACLE_PARENT_PID"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_owned());
+        assert_eq!(
+            parent_pid.as_deref(),
+            Some(std::ffi::OsString::from(std::process::id().to_string()).as_os_str()),
+            "ORACLE_PARENT_PID must be the supervising app's pid"
         );
     }
 

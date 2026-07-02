@@ -19,6 +19,87 @@ from oracle.config import DISABLE_IDLE_EXIT, ORACLE_PORT, QUERY_IDLE_TIMEOUT
 
 _last_request_at = time.monotonic()
 
+# How often the parent-death watchdog polls. Module-level so tests can shrink it.
+_PARENT_POLL_SECONDS = 5.0
+
+
+def _parse_parent_pid(raw):
+    """Parse ORACLE_PARENT_PID; None on missing/garbage/non-positive values so a
+    bad env var degrades to "no watchdog" instead of crashing the server."""
+    try:
+        pid = int((raw or "").strip())
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _parent_alive(parent_pid: int) -> bool:
+    """True while the supervising app process is still our parent.
+
+    POSIX: strict ppid comparison — when the app dies (SIGKILL, crash, `tauri dev`
+    rebuild) we are re-parented to init/launchd, so any mismatch means it is gone.
+    Windows: there is no re-parenting signal, so probe the pid's liveness via
+    OpenProcess/GetExitCodeProcess (os.kill(pid, 0) on Windows would TERMINATE it).
+
+    Known, accepted Windows edges (both degrade safely):
+    * GetExitCodeProcess reports STILL_ACTIVE (259) for a process that really
+      exited WITH code 259 — the watchdog would then never fire for that one
+      exit path (same behavior as before this fix existed, nothing lost).
+    * OpenProcess failure (access denied, e.g. an elevated parent) reads as
+      "dead" and self-exits — the supervisor simply respawns the server.
+    """
+    if os.name != "nt":
+        return os.getppid() == parent_pid
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, parent_pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _start_parent_watchdog() -> None:
+    """Self-exit when the supervising app dies without a graceful shutdown.
+
+    The Rust supervisor kills this server on CLEAN app exit (`on_app_exit`), but a
+    SIGKILL / crash / dev-rebuild never runs that path and used to leave an orphan
+    server per session (macOS AND Windows). Enabled only when the supervisor passes
+    ORACLE_PARENT_PID at spawn, so tests and manual CLI runs are unaffected.
+
+    Deliberately NO indexing-in-progress guard (unlike the idle-reaper): waiting
+    for a running index job would keep the orphan alive for the job's whole
+    duration — the exact bug this fixes. Hard-exit mid-batch is safe by write
+    ordering (chunk_index.py): per batch the manifest is saved LAST, after the
+    LanceDB and sqlite replace-by-id writes, so an interrupted batch is simply
+    re-embedded on the next run; interrupted jobs are a designed-for, resumable
+    state (see index_jobs.status "resume" message).
+    """
+    parent_pid = _parse_parent_pid(os.environ.get("ORACLE_PARENT_PID"))
+    if parent_pid is None:
+        return
+
+    def watch():
+        while True:
+            time.sleep(_PARENT_POLL_SECONDS)
+            if not _parent_alive(parent_pid):
+                sys.stderr.write(
+                    f"oracle-server: supervising app (pid {parent_pid}) is gone; exiting\n"
+                )
+                sys.stderr.flush()
+                os._exit(0)
+
+    threading.Thread(target=watch, daemon=True, name="oracle-parent-watchdog").start()
+
+
 # Cached lazily-built FastAPI app (built by `build_app()` on first use). Kept module-
 # level so repeated `build_app()` / `app` accesses return the same instance.
 _app = None
@@ -134,6 +215,10 @@ if __name__ == "__main__":
     # Bind the fixed session port FIRST, before any heavy import / app construction,
     # so a duplicate process collides on the bind and `os._exit(1)`s in milliseconds.
     listen_socket = _bind_listen_socket("127.0.0.1", ORACLE_PORT)
+
+    # Die with the supervising app even when it never runs its clean-exit kill
+    # (SIGKILL, crash, `tauri dev` rebuild). No-op unless ORACLE_PARENT_PID is set.
+    _start_parent_watchdog()
 
     # Only after we own the port do we pay the heavy FastAPI/routes import cost.
     import uvicorn
