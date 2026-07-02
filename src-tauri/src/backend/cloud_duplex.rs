@@ -174,13 +174,19 @@ pub fn encode_turn_interrupt(id: u64, thread_id: &str) -> String {
 /// frontend's optimistic user copies sort BELOW the reply (the "answer above
 /// my message" flip), the last row always looks like the user's turn, and the
 /// thinking pill + silence watchdog misfire forever.
-fn append_user_echo(activity_file: &std::path::Path, text: &str) {
+/// `msg_id` (D3, planner-chat demolition): the client-generated send id, echoed back
+/// on the wire as `msgId` so the frontend drains its optimistic pending copy BY
+/// IDENTITY instead of counting user rows. Blank/absent ⇒ the key is omitted (wire
+/// compat with old readers and with the local binary's id-less echoes).
+fn append_user_echo(activity_file: &std::path::Path, text: &str, msg_id: Option<&str>) {
     if activity_file.as_os_str().is_empty() {
         return;
     }
-    let line =
-        serde_json::json!({"kind": "chat", "role": "user", "text": text}).to_string();
-    append_bridge_line(activity_file, &line);
+    let mut obj = serde_json::json!({"kind": "chat", "role": "user", "text": text});
+    if let Some(id) = msg_id.map(str::trim).filter(|id| !id.is_empty()) {
+        obj["msgId"] = serde_json::Value::String(id.to_string());
+    }
+    append_bridge_line(activity_file, &obj.to_string());
 }
 
 fn append_bridge_line(path: &std::path::Path, line: &str) {
@@ -222,6 +228,16 @@ pub fn spawn_cloud_duplex(
     cwd: &std::path::Path,
     activity_file: PathBuf,
     initial_goal: Option<&str>,
+    // D3: the frontend's send id for the INITIAL GOAL turn, echoed into the bridge
+    // (`msgId`) exactly like a live send's — the optimistic goal copy then drains by
+    // identity too. Optional + lenient (absent ⇒ id-less echo, byte-identical).
+    initial_goal_msg_id: Option<&str>,
+    // D-resume: the formatted tail of the project's durable transcript
+    // (`format_chat_resume_block`). When present it is PREPENDED to the delivered
+    // first turn so a relaunched/switched orchestrator resumes the conversation —
+    // but the bridge ECHO stays the bare goal (the transcript must not swallow its
+    // own history back, and the visible bubble must be what the user typed).
+    resume_context: Option<&str>,
     project_id: &str,
     model: Option<&str>,
     codex_policy: Option<crate::backend::broker::CodexThreadPolicy>,
@@ -263,14 +279,21 @@ pub fn spawn_cloud_duplex(
     };
 
     match provider {
-        // Claude: send the opening goal as the first user turn inline (byte-identical to before).
+        // Claude: send the opening goal as the first user turn inline (byte-identical to before
+        // when there is no resume context).
         Provider::Claude => {
             if let Some(goal) = initial_goal.filter(|g| !g.trim().is_empty()) {
+                // D-resume: deliver history + goal; echo the GOAL alone (see the
+                // `resume_context` param doc).
+                let delivered = match resume_context {
+                    Some(ctx) => format!("{ctx}\n\n{goal}"),
+                    None => goal.to_string(),
+                };
                 if let Ok(mut w) = stdin.lock() {
-                    let _ = w.write_all(encode_user_turn(provider, goal).as_bytes());
+                    let _ = w.write_all(encode_user_turn(provider, &delivered).as_bytes());
                     let _ = w.flush();
                 }
-                append_user_echo(&activity_file, goal);
+                append_user_echo(&activity_file, goal, initial_goal_msg_id);
             }
         }
         // Codex: the app-server requires an `initialize` → `thread/start` handshake BEFORE any
@@ -297,6 +320,9 @@ pub fn spawn_cloud_duplex(
             let initial_goal_owned: Option<String> = initial_goal
                 .filter(|g| !g.trim().is_empty())
                 .map(str::to_string);
+            let initial_goal_msg_id_owned: Option<String> =
+                initial_goal_msg_id.map(str::to_string);
+            let resume_context_owned: Option<String> = resume_context.map(str::to_string);
 
             let _ = std::thread::Builder::new()
                 .name(format!("cloud-duplex-codex-handshake-{agent_id}"))
@@ -309,6 +335,8 @@ pub fn spawn_cloud_duplex(
                         model_owned,
                         policy_owned,
                         initial_goal_owned,
+                        initial_goal_msg_id_owned,
+                        resume_context_owned,
                     );
                 });
         }
@@ -503,6 +531,7 @@ pub fn cloud_duplex_send(
     sessions: &CloudDuplexSessions,
     agent_id: &str,
     message: &str,
+    msg_id: Option<&str>,
 ) -> Result<(), String> {
     // Clone the stdin handle + provider + Codex correlator under the map lock, then DROP the lock
     // BEFORE the (blocking) pipe write so it can never deadlock against `kill_cloud_duplex`.
@@ -543,7 +572,7 @@ pub fn cloud_duplex_send(
     // Echo the delivered user turn into the bridge — the transcript's source of
     // truth. Only AFTER a successful write, so a failed send never fabricates a
     // user row the child never received.
-    append_user_echo(&activity_file, message);
+    append_user_echo(&activity_file, message, msg_id);
     Ok(())
 }
 
@@ -662,9 +691,13 @@ pub fn project_cloud_orchestrator_send(
     app: tauri::AppHandle,
     agent_id: String,
     message: String,
+    // D3: the frontend's send id, echoed into the bridge (`msgId`) so the optimistic
+    // pending copy drains by identity. Optional + lenient: an absent/blank id keeps
+    // the echo line byte-identical to before.
+    msg_id: Option<String>,
 ) -> Result<(), String> {
     let sessions = app.state::<CloudDuplexSessions>();
-    let result = cloud_duplex_send(&sessions, &agent_id, &message);
+    let result = cloud_duplex_send(&sessions, &agent_id, &message, msg_id.as_deref());
     // SELF-HEAL: "no live session" here means the ledger/state row is a GHOST —
     // typically a duplex child that died with a previous app process (app
     // restart/crash), whose session row survived as "active" with a fresh-enough
@@ -762,6 +795,10 @@ fn codex_handshake_driver(
     model: Option<String>,
     policy: crate::backend::broker::CodexThreadPolicy,
     initial_goal: Option<String>,
+    // D3: the frontend send id for the opening-goal echo (see `append_user_echo`).
+    initial_goal_msg_id: Option<String>,
+    // D-resume: history prepended to the DELIVERED goal turn; the echo stays the goal.
+    resume_context: Option<String>,
 ) {
     // 1. initialize
     let id1 = codex.alloc_id();
@@ -815,8 +852,13 @@ fn codex_handshake_driver(
     //    its streamed notifications drive the Stage like any other turn).
     if let Some(goal) = initial_goal.filter(|g| !g.trim().is_empty()) {
         let id3 = codex.alloc_id();
-        write_codex_line(&stdin, &encode_turn_start(id3, &tid, &goal));
-        append_user_echo(&activity_file, &goal);
+        // D-resume: deliver history + goal; echo the GOAL alone (mirrors the Claude path).
+        let delivered = match resume_context.as_deref() {
+            Some(ctx) => format!("{ctx}\n\n{goal}"),
+            None => goal.clone(),
+        };
+        write_codex_line(&stdin, &encode_turn_start(id3, &tid, &delivered));
+        append_user_echo(&activity_file, &goal, initial_goal_msg_id.as_deref());
     }
 }
 
@@ -1278,6 +1320,31 @@ impl Default for CodexClient {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn user_echo_carries_the_msg_id_and_omits_it_when_absent() {
+        // D3: the echo line is what the frontend's identity drain matches against —
+        // `msgId` must round-trip exactly, and an absent/blank id must not add the key
+        // (wire compat with the local binary's id-less echoes).
+        let dir = std::env::temp_dir().join(format!("aspis-echo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("echo.jsonl");
+        append_user_echo(&path, "hello", Some("m-7"));
+        append_user_echo(&path, "plain", None);
+        append_user_echo(&path, "blankid", Some("   "));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["msgId"], Value::String("m-7".into()));
+        assert_eq!(lines[0]["kind"], "chat");
+        assert_eq!(lines[0]["role"], "user");
+        assert!(lines[1].get("msgId").is_none(), "no id ⇒ no key");
+        assert!(lines[2].get("msgId").is_none(), "blank id ⇒ no key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn claude_user_turn_is_a_stream_json_user_message() {

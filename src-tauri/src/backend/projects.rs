@@ -251,6 +251,21 @@ pub fn delete_project(
     state.ensure_unlocked()?;
     let path = project_path_by_id(&app, &project_id)?;
     delete_project_file(&path)?;
+    // D1 (planner-chat demolition): the orchestrator agent id — and therefore its
+    // bridge/steer file — is now STABLE per project id. Project ids are title slugs,
+    // so a deleted project's id can be REUSED by a later unrelated project; without
+    // this purge the new project's planner would hydrate the dead project's whole
+    // conversation (cross-project transcript leak). STOP the project's orchestrator
+    // first (full stop: row close is right — its project is gone): a still-live
+    // writer would re-create/keep writing the purged file (and on Windows an open
+    // handle makes remove_file fail with a sharing violation — max-recall finding).
+    // Best-effort throughout: a missing session/file is the normal case, and a
+    // purge failure must not block the delete.
+    let orch_id = stable_orchestrator_agent_id(&project_id);
+    let _ = crate::backend::agents::stop_agent_core(&app, &orch_id);
+    if let Ok(projects_dir) = ensure_projects_dir(&app) {
+        crate::backend::mini_activity::purge_agent_bridge_files(&projects_dir, &orch_id);
+    }
     Ok(())
 }
 
@@ -1542,9 +1557,17 @@ fn prepare_or_launch_project_agent(
         ),
         None => None,
     };
-    let agent_id = clean_optional(input.agent_id.as_deref())
-        .unwrap_or_else(|| format!("{}-{}", role, Utc::now().timestamp_millis()));
+    // D1 (planner-chat demolition): orchestrator ⇒ the project's STABLE id (the
+    // conversation belongs to the project, not the process); other roles ⇒ fresh
+    // per-launch id, unchanged. See `launch_agent_id`/`stable_orchestrator_agent_id`.
+    let agent_id = launch_agent_id(input.agent_id.as_deref(), &role, &project.metadata.id);
     let task_id = clean_optional(input.task_id.as_deref());
+    // D1 FENCE: defined further down (it needs `projects_path` for the steer purge);
+    // called at the three spawn points, deliberately NOT here at the top — every step
+    // between here and the spawn can still abort the launch with `?` (task gate,
+    // binary resolution, oMLX preflight, duplex build), and killing a live, healthy
+    // predecessor for a launch that then FAILS would leave the user with no
+    // orchestrator at all (hostile-review BLOCKER).
     validate_agent_task_launch(&project, &role, task_id.as_deref())?;
     let launch_token = generate_launch_token()?;
     let launch_token_hash = hash_launch_token(&launch_token);
@@ -1625,6 +1648,39 @@ fn prepare_or_launch_project_agent(
         }
     }
     let projects_path = ensure_projects_dir(&app)?;
+    // D1 FENCE (called at the three spawn points below, once the launch is committed):
+    // the stable orchestrator id means a relaunch REUSES the bridge file and steer
+    // inbox — there must be AT MOST ONE live writer generation per project.
+    let fence_stale_orchestrator = |app: &tauri::AppHandle| {
+        if role != "orchestrator" {
+            return;
+        }
+        // PROCESS-ONLY stop of whatever predecessor still holds this id (app PTY,
+        // cloud duplex child, external window, stale ledger entry). Deliberately NOT
+        // the full stop (max-recall BLOCKER): `record_launch_pending` already wrote
+        // the NEW generation's launch_pending row under this same stable id, so a
+        // row-close here would stamp the fresh launch closed at birth; and the
+        // registry teardown would defeat the new tail's `had_predecessor` detection.
+        // Errors swallowed: a missing/dead predecessor is the normal case, and the
+        // fence must never block a launch.
+        let _ = crate::backend::agents::stop_agent_process_only(app, &agent_id);
+        // Truncate the steer inbox ONLY NOW, after the predecessor is dead — the
+        // path is deterministic per (stable) agent_id, so truncating it earlier
+        // (as the old config-build site did) would wipe messages a still-LIVE
+        // predecessor had queued but not yet drained. Local orchestrator only:
+        // cloud CLIs take stdin, not a steer file.
+        if client == "orchestrator" {
+            if let Some(steer) =
+                crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
+            {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(&steer);
+            }
+        }
+    };
     let management_root = management_root_for_mcp(&app, &projects_path);
     // ROLE UNTANGLE — the provider env is ROLE-scoped, one call, no client special
     // case (the former `launch_injects_cloudflare_env` client strip-hack is gone).
@@ -1746,16 +1802,10 @@ fn prepare_or_launch_project_agent(
         let steer_file = crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // Truncate it at launch: the path is deterministic per agent_id, so without this a
-        // PRIOR run's leftover messages would replay into this fresh burst (drain starts at
-        // offset 0). Best-effort — a failure just leaves the (rare) stale tail.
-        if !steer_file.is_empty() {
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(&steer_file);
-        }
+        // (Steer-inbox truncation moved into the D1 fence: with the STABLE id this
+        // path now belongs to the predecessor too, so it must only be wiped AFTER
+        // the fence killed that predecessor — never here, where the launch can
+        // still fail and leave a live predecessor robbed of its queued steers.)
         Some(OrchestratorLaunchConfig {
             binary,
             omlx_base_url,
@@ -1914,6 +1964,21 @@ fn prepare_or_launch_project_agent(
         } else {
             None
         };
+        // D-resume: hand the fresh duplex child the TAIL of this project's durable
+        // transcript as first-turn context, so a relaunch/backend switch resumes the
+        // conversation instead of starting amnesiac (the UI history survives via the
+        // stable-id bridge file; this closes the MODEL-memory half). Read BEFORE the
+        // spawn so the goal's own echo (written during spawn) is not swallowed back;
+        // BOUNDED to the hydration window (max-recall: never the whole file on the
+        // launch path). Empty history ⇒ None ⇒ byte-identical first turn.
+        let resume_context = crate::backend::mini_activity::format_chat_resume_block(
+            &crate::backend::mini_activity::recent_chat_turns(&activity_file),
+            24,
+            2000,
+        );
+        // D1 FENCE: launch is committed (every fallible step above passed) — stop the
+        // stable id's predecessor so the bridge file has one writer generation.
+        fence_stale_orchestrator(&app);
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
             &sessions,
@@ -1925,6 +1990,8 @@ fn prepare_or_launch_project_agent(
             &root_path,
             activity_file,
             input.initial_goal.as_deref(),
+            input.initial_goal_msg_id.as_deref(),
+            resume_context.as_deref(),
             &input.project_id,
             input.model.as_deref(),
             codex_policy,
@@ -1951,6 +2018,9 @@ fn prepare_or_launch_project_agent(
         // None. The PTY child deletes its own prompt temp file in-script; the
         // ledger still records the prompt-file path so stop_agent can clean it up
         // if the child died early.
+        // D1 FENCE: committed to spawning — stop the stable orchestrator id's
+        // predecessor first (no-op for every other role).
+        fence_stale_orchestrator(&app);
         let prompt_file_label = spawn_agent_terminal_app(
             &app,
             &agent_id,
@@ -1997,6 +2067,9 @@ fn prepare_or_launch_project_agent(
         // leave a live, token-bearing agent that the app has no usable kill handle
         // for.
         let window_title = agent_window_title(&agent_id);
+        // D1 FENCE: committed to spawning — stop the stable orchestrator id's
+        // predecessor first (no-op for every other role).
+        fence_stale_orchestrator(&app);
         let spawned = spawn_agent_terminal(
             &agent_id,
             &root_path,
@@ -8777,6 +8850,45 @@ fn clean_description(value: Option<&str>) -> Option<String> {
         .map(|value| value.chars().take(4_000).collect::<String>())
 }
 
+/// D1 (planner-chat demolition): the STABLE planner-orchestrator agent id for a
+/// project — `orchestrator-<project id>`. The planner conversation's identity is the
+/// PROJECT, not the process: a stable id ⇒ a stable bridge/steer file ⇒ the transcript
+/// survives relaunches, app restarts, and backend switches (local binary, Claude and
+/// Codex duplex all append to the same file). The project id is reduced to the
+/// bridge-file-safe charset (`[A-Za-z0-9._-]`, the `activity_file_name` rules) and
+/// length-capped, because the id doubles as the activity/steer file basename.
+pub fn stable_orchestrator_agent_id(project_id: &str) -> String {
+    let clean: String = project_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        // `normalize_project_id` allows ids up to 80 chars — take MORE than that so two
+        // distinct legal ids can never collide by truncation ("orchestrator-" + 100 stays
+        // well under `activity_file_name`'s own 128-char basename cap). The cap only
+        // guards against a pathological non-project-id input.
+        .take(100)
+        .collect();
+    format!("orchestrator-{clean}")
+}
+
+/// The agent id a launch runs under: an explicit caller id wins; an orchestrator
+/// launch gets the project's STABLE id (D1 above); every other role keeps the
+/// per-launch timestamp id (each coder/verifier run is its own session).
+fn launch_agent_id(explicit: Option<&str>, role: &str, project_id: &str) -> String {
+    if let Some(id) = clean_optional(explicit) {
+        return id;
+    }
+    if role == "orchestrator" {
+        return stable_orchestrator_agent_id(project_id);
+    }
+    format!("{}-{}", role, Utc::now().timestamp_millis())
+}
+
 fn clean_optional(value: Option<&str>) -> Option<String> {
     value
         .map(|value| {
@@ -8957,6 +9069,48 @@ pub(crate) fn hash_launch_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- D1 (planner-chat demolition): stable orchestrator identity ---------------
+
+    #[test]
+    fn launch_agent_id_orchestrator_is_stable_per_project() {
+        let a = launch_agent_id(None, "orchestrator", "1f2e3d4c-aa-bb");
+        let b = launch_agent_id(None, "orchestrator", "1f2e3d4c-aa-bb");
+        assert_eq!(a, b, "same project ⇒ same id across launches (the whole point)");
+        assert_eq!(a, "orchestrator-1f2e3d4c-aa-bb");
+        let other = launch_agent_id(None, "orchestrator", "other-project");
+        assert_ne!(a, other, "different projects never share a transcript");
+    }
+
+    #[test]
+    fn launch_agent_id_sanitizes_the_project_id_for_the_bridge_filename() {
+        // The id doubles as the activity/steer file basename — it must be
+        // filename-clean by construction, whatever the project id contains.
+        let id = launch_agent_id(None, "orchestrator", "we ird/../id");
+        assert_eq!(id, "orchestrator-we_ird_.._id");
+        // Pathological long input is capped — but ABOVE the 80-char ceiling
+        // `normalize_project_id` allows, so two distinct legal project ids can
+        // never collide by truncation.
+        let long = launch_agent_id(None, "orchestrator", &"x".repeat(500));
+        assert!(long.len() <= "orchestrator-".len() + 100);
+        let a = launch_agent_id(None, "orchestrator", &format!("{}a", "x".repeat(79)));
+        let b = launch_agent_id(None, "orchestrator", &format!("{}b", "x".repeat(79)));
+        assert_ne!(a, b, "80-char ids (the normalize_project_id max) must not collide");
+    }
+
+    #[test]
+    fn launch_agent_id_explicit_id_and_other_roles_are_unchanged() {
+        assert_eq!(
+            launch_agent_id(Some("my-explicit"), "orchestrator", "p1"),
+            "my-explicit",
+            "an explicit caller id always wins"
+        );
+        let coder = launch_agent_id(None, "coder", "p1");
+        assert!(
+            coder.starts_with("coder-") && coder != "coder-p1",
+            "non-orchestrator roles keep the per-launch timestamp id, got {coder}"
+        );
+    }
 
     #[test]
     fn command_exists_resolves_known_and_rejects_bogus() {

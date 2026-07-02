@@ -518,6 +518,20 @@ fn default_agent_live_state() -> AgentLiveState {
     }
 }
 
+/// D1 (planner-chat demolition): whether an EXISTING session row under a launch's
+/// agent id blocks that launch. The ORCHESTRATOR's id is STABLE per project, so an
+/// existing row under it is never an id collision — it is the predecessor generation
+/// (closed history, a ghost, or a live process the launch fence stops right before
+/// spawn) and gets RESET to launch_pending instead (the still-live predecessor's
+/// session_token_hash is deliberately not cleared — its process keeps its token
+/// until the fence kills it). Every other role keeps the fresh-per-launch id, where
+/// a non-pending collision still means a real bug. (Max-recall BLOCKER: without this
+/// carve-out the stable id made EVERY orchestrator relaunch fail forever once the
+/// first session closed.)
+fn launch_id_collision(role: &str, existing_status: &str) -> bool {
+    role != "orchestrator" && existing_status != "launch_pending"
+}
+
 pub fn record_launch_pending(
     app: &tauri::AppHandle,
     project_id: &str,
@@ -552,7 +566,7 @@ pub fn record_launch_pending(
         .find(|session| session.agent_id == agent_id);
     match session {
         Some(session) => {
-            if session.status != "launch_pending" {
+            if launch_id_collision(role, &session.status) {
                 return Err(format!(
                     "Agent id {agent_id} is already registered or active; choose a new agent id."
                 ));
@@ -1816,8 +1830,9 @@ unsafe extern "system" fn enum_window_proc(
 }
 
 /// Outcome of an agent-stop kill attempt, so stop_agent can report a clear
-/// message (especially the "refused: recycled pid" case).
-enum KillOutcome {
+/// message (especially the "refused: recycled pid" case). `pub(crate)` because
+/// [`stop_agent_core`] (reused by the D1 launch fence in projects.rs) returns it.
+pub(crate) enum KillOutcome {
     /// Killed by exact window title (or, on macOS, closed the titled window). The
     /// reboot-/pid-reuse-safe primary path.
     KilledByTitle,
@@ -1911,60 +1926,58 @@ fn kill_agent_process(_title: &str, _pid: Option<u32>, _creation_time: Option<u6
 /// Stop an agent: kill its launched process tree (best-effort), mark its session
 /// closed in `.aspis-agents.json`, append a `stopped` event, drop its ledger
 /// entry, and return the refreshed live state so the UI updates immediately.
-#[tauri::command]
-pub fn stop_agent(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-    agent_id: String,
-) -> Result<AgentLiveState, String> {
-    state.ensure_unlocked()?;
-    let entry = read_agent_ledger_entry(&app, &agent_id)?;
+/// PROCESS-ONLY stop: kill whatever process holds `agent_id` (app PTY, cloud duplex
+/// child, or external window), clean its prompt temp file, and ALWAYS remove the
+/// ledger entry — WITHOUT touching the session row or the activity-tail registry.
+/// This is what the D1 orchestrator launch FENCE needs (max-recall BLOCKER): the
+/// fence runs AFTER `record_launch_pending` wrote the NEW generation's
+/// launch_pending row under the SAME stable id, so a full `mark_agent_session_closed`
+/// here would stamp that fresh row closed (the exact "closed at birth" bug class the
+/// kill_cloud_duplex `had_session` guard already fixed once) AND its `registry.stop`
+/// would empty the tail slot, silently defeating the new tail's `had_predecessor`
+/// grace-sleep. `register()` handles the predecessor tail itself.
+/// Returns `(external kill outcome, host hint for a row close)` — the outcome is
+/// `None` on the app-hosted route, which has no kill-by-title outcome.
+pub(crate) fn stop_agent_process_only(
+    app: &tauri::AppHandle,
+    agent_id: &str,
+) -> Result<(Option<KillOutcome>, Option<&'static str>), String> {
+    let entry = read_agent_ledger_entry(app, agent_id)?;
 
     // ROUTE BY HOST. App-hosted agents (host == "app") run under our in-app PTY,
     // so there is no OS console window/pid to taskkill — we tear down the PTY
     // session (kill + reap the child) instead. Every other host value (including
     // legacy entries with no host, which read back as None) takes the original
     // external kill-by-title path below.
-    if ledger_host_is_app(entry.as_ref()) {
-        super::agent_pty::kill_agent_pty(&app, &agent_id);
+    let (outcome, closed_host) = if ledger_host_is_app(entry.as_ref()) {
+        super::agent_pty::kill_agent_pty(app, agent_id);
         // Phase D: an app-hosted agent may instead be a cloud DUPLEX child (piped, not a PTY).
         // kill_cloud_duplex is idempotent + no-ops when there is no such session, so calling it
         // alongside the PTY kill cleans up whichever kind this agent actually is.
         {
             use tauri::Manager;
             let sessions = app.state::<super::cloud_duplex::CloudDuplexSessions>();
-            super::cloud_duplex::kill_cloud_duplex(&app, &sessions, &agent_id);
+            super::cloud_duplex::kill_cloud_duplex(app, &sessions, agent_id);
         }
-        // Best-effort prompt-file cleanup (same discipline as the external path).
-        // FIX 2: remove the per-launch restricted DIRECTORY too, not just the file.
-        if let Some(prompt_file) = entry.as_ref().and_then(|entry| entry.prompt_file.clone()) {
-            super::projects::remove_restricted_temp_file(std::path::Path::new(&prompt_file));
-        }
-        // FIX 5 (idempotency): mark-closed must NOT short-circuit the ledger
-        // removal. If the live-state write fails, propagating `?` here would strand
-        // the ledger entry forever (a later stop would re-route to a dead PTY). So
-        // capture the close result, ALWAYS remove the ledger entry, then surface the
-        // close error (if any) only after the removal happened.
         // FIX 4: this branch is app-hosted (ledger_host_is_app == true), so persist
         // host="app" on the closed session.
-        let close_result = mark_agent_session_closed(&app, &agent_id, Some(HOST_APP));
-        let _ = remove_agent_ledger_entry(&app, &agent_id);
-        close_result?;
-        return get_agent_live_state(app, state);
-    }
-
-    // Identity primitive: the EXACT unique window title. Kill by title first
-    // (reboot-safe, pid-reuse-safe); only fall back to the stored pid when it is
-    // verified as OUR process. A recycled/stale pid can NEVER cause a wrong-process
-    // kill — the title filter matches nothing and the pid fails verification, so
-    // the worst case is "refuse and report", never "kill the wrong tree".
-    let title = entry
-        .as_ref()
-        .and_then(|entry| entry.window_title.clone())
-        .unwrap_or_else(|| agent_window_title(&agent_id));
-    let pid = entry.as_ref().and_then(|entry| entry.pid);
-    let creation_time = entry.as_ref().and_then(|entry| entry.creation_time);
-    let outcome = kill_agent_process(&title, pid, creation_time);
+        (None, Some(HOST_APP))
+    } else {
+        // Identity primitive: the EXACT unique window title. Kill by title first
+        // (reboot-safe, pid-reuse-safe); only fall back to the stored pid when it is
+        // verified as OUR process. A recycled/stale pid can NEVER cause a wrong-process
+        // kill — the title filter matches nothing and the pid fails verification, so
+        // the worst case is "refuse and report", never "kill the wrong tree".
+        let title = entry
+            .as_ref()
+            .and_then(|entry| entry.window_title.clone())
+            .unwrap_or_else(|| agent_window_title(agent_id));
+        let pid = entry.as_ref().and_then(|entry| entry.pid);
+        let creation_time = entry.as_ref().and_then(|entry| entry.creation_time);
+        // FIX 4: the EXTERNAL stop path — pass None, do NOT rewrite the session's
+        // host to "app".
+        (Some(kill_agent_process(&title, pid, creation_time)), None)
+    };
 
     // Rust-side cleanup of the launch-token-bearing prompt temp file: if the child
     // shell died before its own Remove-Item ran, the token would otherwise linger
@@ -1973,26 +1986,44 @@ pub fn stop_agent(
     if let Some(prompt_file) = entry.as_ref().and_then(|entry| entry.prompt_file.clone()) {
         super::projects::remove_restricted_temp_file(std::path::Path::new(&prompt_file));
     }
+    let _ = remove_agent_ledger_entry(app, agent_id);
+    Ok((outcome, closed_host))
+}
 
-    // FIX 5 (idempotency): mark-closed is best-effort here too — ALWAYS drop the
-    // ledger entry (so a later focus/stop never targets a dead pid), then surface a
-    // close error only after the removal happened.
-    // FIX 4: this is the EXTERNAL stop path (ledger_host_is_app == false), so pass
-    // None — do NOT rewrite the session's host to "app".
-    let close_result = mark_agent_session_closed(&app, &agent_id, None);
-    let _ = remove_agent_ledger_entry(&app, &agent_id);
-    close_result?;
+/// Core of [`stop_agent`] (the user-facing Stop): the process-only teardown PLUS the
+/// durable session-row close. Also used by `delete_project` (a deleted project's
+/// orchestrator must die AND its row must close). Returns the external kill outcome
+/// (`None` on the app-hosted route).
+pub fn stop_agent_core(
+    app: &tauri::AppHandle,
+    agent_id: &str,
+) -> Result<Option<KillOutcome>, String> {
+    let (outcome, closed_host) = stop_agent_process_only(app, agent_id)?;
+    // FIX 5 (idempotency): the ledger entry was already removed above regardless of
+    // this close's result, so a failed live-state write can never strand a dead
+    // kill handle; surface the close error after the teardown happened.
+    mark_agent_session_closed(app, agent_id, closed_host)?;
+    Ok(outcome)
+}
+
+#[tauri::command]
+pub fn stop_agent(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    agent_id: String,
+) -> Result<AgentLiveState, String> {
+    state.ensure_unlocked()?;
+    let outcome = stop_agent_core(&app, &agent_id)?;
 
     let live_state = get_agent_live_state(app, state)?;
 
     // Surface the rare "refused to kill a recycled pid" case so the operator knows
     // the agent's original process is gone and a stranger now holds that pid.
-    if matches!(outcome, KillOutcome::RefusedUnverifiedPid) {
+    if matches!(outcome, Some(KillOutcome::RefusedUnverifiedPid)) {
         return Err(format!(
             "Agent {agent_id} has no live window with its title and its recorded pid now belongs to a different process (pid reuse). Refused to force-kill it; the agent session was marked closed."
         ));
     }
-    let _ = outcome;
 
     Ok(live_state)
 }
@@ -2141,6 +2172,20 @@ fn apply_agent_session_close(
 mod tests {
     use super::*;
     use crate::backend::model::{AgentNeedsUser, AgentSubagent};
+
+    #[test]
+    fn launch_id_collision_lets_the_stable_orchestrator_id_relaunch() {
+        // D1 regression (max-recall BLOCKER): the orchestrator's stable per-project id
+        // MUST be reusable across generations — a closed/active predecessor row is
+        // history to reset, never a collision.
+        assert!(!launch_id_collision("orchestrator", "closed"));
+        assert!(!launch_id_collision("orchestrator", "active"));
+        assert!(!launch_id_collision("orchestrator", "launch_pending"));
+        // Every other role keeps the strict guard (fresh ids ⇒ collision = bug).
+        assert!(launch_id_collision("coder", "closed"));
+        assert!(launch_id_collision("verifier", "active"));
+        assert!(!launch_id_collision("coder", "launch_pending"));
+    }
 
     #[test]
     fn default_rules_keep_cloud_actions_out_of_mcp() {

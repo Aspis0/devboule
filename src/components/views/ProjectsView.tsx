@@ -23,13 +23,16 @@ import {
   derivePlanCards,
   latestWeb,
   pickProjectDesign,
-  chatMessages,
   chatMessagesWithMilestones,
+  mergePendingSends,
+  drainPendingSends,
+  stableOrchestratorAgentId,
+  newMsgId,
   openQuestions,
 } from "../projects/planner/plannerModel";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import { useDesignRequestWatcher } from "../projects/planner/useDesignRequestWatcher";
-import type { PlannerMessage } from "../projects/planner/plannerModel";
+import type { PendingSend } from "../projects/planner/plannerModel";
 import type { DesignProjectEntry } from "../../types/design";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
@@ -191,12 +194,6 @@ function readPersistedRootDraft(): string {
   }
 }
 
-// B15b: remember the orchestrator agentId per project, so the planner chat can keep
-// reading the durable transcript after the orchestrator session ends (the in-memory
-// activity store still has it) — and, via read_activity_chat, across an app restart.
-// Without this the chat was bound to the LIVE session id; when it went null the whole
-// conversation vanished (the reported "steer kills the orchestrator + chat resets" bug).
-const orchAgentKey = (projectId: string) => `devboule.orch.${projectId}`;
 // localStorage key for the planner's orchestrator-backend choice (Local/Claude/Codex).
 const PLANNER_CLIENT_KEY = "devboule.planner.orchestratorClient";
 // localStorage key for the last selected project (owner decision 2026-07-02:
@@ -204,15 +201,9 @@ const PLANNER_CLIENT_KEY = "devboule.planner.orchestratorClient";
 // volatile selection made a restarted app look like the same conversation
 // while the composer was actually unbound, swallowing messages).
 const SELECTED_PROJECT_KEY = "devboule.projects.selectedId";
-
-function readPersistedOrchestratorId(projectId: string | null | undefined): string | null {
-  if (!projectId) return null;
-  try {
-    return localStorage.getItem(orchAgentKey(projectId));
-  } catch {
-    return null;
-  }
-}
+// (The former `devboule.orch.<projectId>` persisted-orchestrator-id key is GONE —
+// D1 made the orchestrator id a pure function of the project id, so nothing needs
+// remembering. Old keys are dead-but-harmless.)
 
 export function ProjectsView() {
   const { pendingTab, config, requestView } = useAppContext();
@@ -289,9 +280,12 @@ export function ProjectsView() {
   // defaulted to the non-eager behavior the owner wants.
   const [plannerAutoCreate, setPlannerAutoCreate] = useState<boolean>(false);
   const [plannerWebMode, setPlannerWebMode] = useState<"auto" | "manual">("auto");
-  // The chat transcript + active goal echo shown in the planner panel. P0 seeds them
-  // optimistically on send; P2 replaces them with the orchestrator's live transcript.
-  const [plannerMessages, setPlannerMessages] = useState<PlannerMessage[]>([]);
+  // D3 (planner-chat demolition): the optimistic user sends awaiting their bridge
+  // echo, each with a client-generated msgId. The bridge is the ONE source of truth;
+  // this list only bridges the echo latency and drains BY IDENTITY in
+  // `mergePendingSends` (the old plannerMessages buffer + echoedUserCount watermark
+  // + GENERATION RESET are gone).
+  const [plannerPending, setPlannerPending] = useState<PendingSend[]>([]);
   // Which cloud CLIs are installed (claude/codex). null until the backend scan
   // answers; both options stay ENABLED while unknown (never lock the user out
   // on a slow/failed probe — worst case they get the launch-time error).
@@ -299,13 +293,11 @@ export function ProjectsView() {
     claude?: boolean;
     codex?: boolean;
   }>({});
-  // Delivery-failure notices for the planner composer. A SEPARATE channel from
-  // plannerMessages on purpose: once the bridge conversation is authoritative,
-  // plannerConvo drops non-user frontend entries (the "bubble above my message"
-  // fix), which silently swallowed failure feedback appended there — the send
-  // died in a toast and the orchestrator just looked mute. These are unioned at
-  // the very END of the convo unconditionally, and cleared on the next send.
-  const [plannerNotices, setPlannerNotices] = useState<PlannerMessage[]>([]);
+  // D4: planner chrome — delivery failures, launch guidance ("pick a folder"),
+  // and the silence watchdog live HERE, as a banner/pill NEXT TO the composer.
+  // They are UI state, never fake assistant messages spliced into the transcript
+  // (that trick also flipped `plannerAwaitingReply` and polluted the convo).
+  const [plannerBanner, setPlannerBanner] = useState<string | null>(null);
   const [plannerGoal, setPlannerGoal] = useState<string | null>(null);
   // True from the moment a Planner launch starts until its session registers (the agent
   // poll lags the launch by up to ~5s). Guards the composer so a second send in that window
@@ -376,6 +368,11 @@ export function ProjectsView() {
   // gap between the note mutation finishing and the launch acquiring it, where a fast second click
   // could double-fire (two notes + two orchestrators); this ref spans the entire sequence.
   const orchestratorPlanRef = useRef(false);
+  // Max-recall F2: the project id the landing composer's in-flight goal belongs to
+  // (set by startNewProject once create_project succeeds). Lets the project-switch
+  // effect keep the pending goal ONLY when the landing transitions to that very
+  // project — selecting a different existing project must not inherit it.
+  const landingGoalProjectRef = useRef<string | null>(null);
   // Reentrancy guard for the Work-mode git actions (commit/push). A fast
   // double-click or Commit-then-Push must not fire two concurrent git ops on the
   // same repo (double commit / non-fast-forward push). Mirrors busyRef: set in a
@@ -781,26 +778,32 @@ export function ProjectsView() {
     const prev = prevProjectIdRef.current;
     const next = currentProject?.metadata.id ?? null;
     prevProjectIdRef.current = next;
-    // null→new (creation) or no real change: keep the freshly-populated chat.
-    if (prev === null || prev === next) return;
+    // No real change: keep everything.
+    if (prev === next) return;
+    // null→project: EITHER the landing composer's own creation (keep its in-flight
+    // goal pending — the launch echo will drain it) OR the user selected an existing
+    // project from the landing (max-recall F2: any leftover landing pendings must
+    // NOT bleed into that unrelated project's conversation).
+    if (prev === null) {
+      if (next !== landingGoalProjectRef.current) {
+        setPlannerPending([]);
+        setPlannerBanner(null);
+      }
+      return;
+    }
     setTaskDraft("");
     setTaskCategory(null);
     setTaskBugDescription("");
     setNoteDraft("");
     setLaunchMessage(null);
-    // Reset the planner chat/goal/web-mode so a different project never shows the previous
-    // project's conversation (and a steer can't fire with stale context). The design +
-    // websearch feeds are already per-project (their own effect / the agent console).
-    setPlannerMessages([]);
-    // Delivery-failure notices are per-conversation too — a stale "didn't reach
-    // the orchestrator" from project A must not bleed into project B's chat.
-    setPlannerNotices([]);
+    // Reset the planner pending sends + chrome so a different project never shows
+    // the previous project's optimistic copies or stale delivery/stall feedback.
+    // The conversation itself needs NO reset: it derives from the per-project
+    // console binding (stable orchestrator id), which switches with the project.
+    setPlannerPending([]);
+    setPlannerBanner(null);
     setPlannerGoal(null);
     setPlannerWebMode("auto");
-    // B15b (reviewer F1): clear the durable transcript SYNCHRONOUSLY on switch, so
-    // the new project never briefly renders the previous project's conversation
-    // while its own read_activity_chat round-trips.
-    setDurableChat([]);
     // Phase B twinning (reviewer F1): the work-selection store is a global singleton, so a
     // stale agent/task selection from the project we're leaving would otherwise highlight a
     // card / focus an agent in the new project. Wipe it on a real project switch.
@@ -1095,12 +1098,22 @@ export function ProjectsView() {
   // here meant the landing never bound to it and the live conversation only showed up in the
   // single-project work view (recognized as a coder). currentProjectSessions is already scoped
   // to this project + recent (active) sessions, so client==="orchestrator" is the right one.
-  const orchestratorAgentId = useMemo(
-    () =>
-      currentProjectSessions.find((s) => s.client === "orchestrator")?.agentId ??
-      null,
-    [currentProjectSessions],
-  );
+  const orchestratorAgentId = useMemo(() => {
+    // D1 ID-STRICT: only the STABLE per-project id counts. A still-live LEGACY
+    // session (pre-cutover timestamp id) writes a DIFFERENT bridge file than the
+    // one the planner console tails — binding the composer to it would deliver
+    // sends into a transcript the UI never shows ("the orchestrator ignores me").
+    // Ignoring legacy rows self-heals: the next send takes the launch path, whose
+    // fence stops any predecessor and relaunches under the stable id.
+    const stableId = currentProject
+      ? stableOrchestratorAgentId(currentProject.metadata.id)
+      : null;
+    return (
+      currentProjectSessions.find(
+        (s) => s.client === "orchestrator" && s.agentId === stableId,
+      )?.agentId ?? null
+    );
+  }, [currentProjectSessions, currentProject]);
   // When the chosen orchestrator is a CLOUD CLI (claude/codex), the running session for this
   // project — its terminal is shown in the planner instead of the local Stage. null when the
   // orchestrator is local, or when no cloud session is running yet (pre-launch).
@@ -1134,20 +1147,38 @@ export function ProjectsView() {
     // so every send failed and the orchestrator looked mute. Pre-untangle
     // role:"coder" orchestrator sessions are dead ledger entries by now;
     // losing their binding is correct, not a regression.
+    // D1 ID-STRICT (hostile-review): only the STABLE per-project id counts — a
+    // still-live legacy session (pre-cutover timestamp id) writes a different
+    // bridge file than the console tails, so a send to it would vanish from the
+    // UI. Dropping it here routes the next send to the launch path (fence +
+    // fresh stable-id orchestrator): the cutover self-heals.
+    const stableId = currentProject
+      ? stableOrchestratorAgentId(currentProject.metadata.id)
+      : null;
     return newestBy(
       currentProjectSessions.filter(
         (s) =>
           s.role === "orchestrator" &&
-          s.client === plannerOrchestratorClient,
+          s.client === plannerOrchestratorClient &&
+          s.agentId === stableId,
       ),
     );
-  }, [plannerOrchestratorClient, currentProjectSessions]);
-  // Phase D: the agent whose activity bridge feeds the planner Stage — the LOCAL orchestrator, or
-  // (when the orchestrator is a CLOUD CLI in duplex mode) the cloud agent, whose reader thread
-  // writes the SAME bridge file. So cloud + local drive the identical Stage (chat/websearch).
+  }, [plannerOrchestratorClient, currentProjectSessions, currentProject]);
+  // D1 (planner-chat demolition): the planner Stage binds to the project's STABLE
+  // orchestrator id — a pure function of the project id, mirroring the backend's
+  // `stable_orchestrator_agent_id`. No session row needed: the console subscribes the
+  // moment a project opens, and the backend's snapshot hydrate-on-miss replays the
+  // durable transcript even when no orchestrator is live. Local binary, Claude and
+  // Codex duplex all launch under this same id and append to this same bridge file,
+  // so the conversation survives relaunches, app restarts, and backend switches.
+  // (orchestratorAgentId / cloudOrchestratorAgentId above remain as LIVENESS signals
+  // for launch gating; post-cutover their value equals this stable id.)
   const plannerActivityAgentId = useMemo(
-    () => orchestratorAgentId ?? cloudOrchestratorAgentId,
-    [orchestratorAgentId, cloudOrchestratorAgentId],
+    () =>
+      currentProject
+        ? stableOrchestratorAgentId(currentProject.metadata.id)
+        : null,
+    [currentProject],
   );
   // Mark a Planner launch in flight (plannerLaunching) until its session registers — guards
   // the composer against a duplicate launch during the agent-poll lag. A safety timeout
@@ -1177,33 +1208,6 @@ export function ProjectsView() {
     },
     [],
   );
-  // B15b: persist the live orchestrator id per project whenever one is bound — local OR cloud
-  // duplex (both write the same durable activity .jsonl), so the chat survives an app restart for
-  // either backend.
-  useEffect(() => {
-    const pid = currentProject?.metadata.id;
-    if (!pid || !plannerActivityAgentId) return;
-    try {
-      localStorage.setItem(orchAgentKey(pid), plannerActivityAgentId);
-    } catch {
-      /* storage unavailable — non-fatal */
-    }
-  }, [plannerActivityAgentId, currentProject?.metadata.id]);
-
-  // The id the chat reads from: the LIVE session when present, else the last known
-  // orchestrator for this project. The in-memory activity store keeps that agent's
-  // transcript after its process ends, so the conversation survives a session death
-  // within the app; read_activity_chat (below) covers an app restart.
-  // Used ONLY for the durable chat READ (read_activity_chat below) — NOT for the live
-  // console. Binding the live console to a persisted (possibly dead / previous-session)
-  // id would feed plannerWeb (websearch) + the "real" plannerConvo from a stale agent
-  // and surface another project's activity (reviewer max-recall finding). The live
-  // console stays on orchestratorAgentId; the disk transcript covers a dead session.
-  const effectiveOrchestratorId = useMemo(() => {
-    if (plannerActivityAgentId) return plannerActivityAgentId;
-    return readPersistedOrchestratorId(currentProject?.metadata.id);
-  }, [plannerActivityAgentId, currentProject?.metadata.id]);
-
   const orchestratorConsole = useAgentConsole(plannerActivityAgentId);
   const plannerWeb = useMemo(
     () => latestWeb(orchestratorConsole.entries),
@@ -1216,81 +1220,22 @@ export function ProjectsView() {
     [orchestratorConsole.entries],
   );
 
-  // B15b durable fallback: when the in-memory console has NO chat (e.g. after an app
-  // restart, the store is empty) but we know this project's orchestrator, read the
-  // transcript straight from the on-disk .jsonl so the conversation is reconstructed.
-  const [durableChat, setDurableChat] = useState<PlannerMessage[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    const live = chatMessages(orchestratorConsole.entries);
-    if (!effectiveOrchestratorId || live.length > 0) {
-      setDurableChat([]);
-      return;
-    }
-    void invokeBackendCommand<{ role: string; text: string }[]>(
-      "read_activity_chat",
-      { agentId: effectiveOrchestratorId },
-    )
-      .then((turns) => {
-        if (cancelled) return;
-        setDurableChat(
-          (turns ?? []).map((t) => ({
-            role: t.role === "assistant" ? "assistant" : "user",
-            text: t.text,
-          })),
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setDurableChat([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [effectiveOrchestratorId, orchestratorConsole.entries]);
-
-  // GENERATION RESET: the optimistic buffer belongs to ONE bound orchestrator.
-  // When the binding changes (fresh launch, relaunch after a ghost), stale
-  // optimistic user copies from the previous generation would out-count the new
-  // bridge's echoes and get re-appended AFTER the reply — duplicated messages,
-  // a trailing "user" row, and a thinking pill that never clears. The bridge
-  // echo (append_user_echo) is the durable copy, so dropping the buffer here
-  // loses nothing.
-  useEffect(() => {
-    setPlannerMessages([]);
-    setPlannerNotices([]);
-  }, [plannerActivityAgentId]);
-
-  // The planner chat = the REAL conversation from the bridge (the orchestrator's
-  // assistant turns + its echoed user steers) PLUS any just-sent user message not yet
-  // echoed back (optimistic, deduped by text once the bridge catches up).
-  const plannerConvo = useMemo(() => {
-    // Milestones ride along as tiny system rows (tool-use visibility): a cloud
-    // orchestrator running Bash/reads no longer looks hung between replies.
-    const real = chatMessagesWithMilestones(orchestratorConsole.entries);
-    // Before the orchestrator's session binds, the bridge has nothing. B15b: if a
-    // DURABLE transcript was reconstructed from disk (session ended / app restarted),
-    // show it (+ any just-typed optimistic user messages after it); otherwise show the
-    // optimistic echo + frontend notices (pick-a-folder / starting…) in send order.
-    if (real.length === 0) {
-      return durableChat.length > 0
-        ? [...durableChat, ...plannerMessages, ...plannerNotices]
-        : [...plannerMessages, ...plannerNotices];
-    }
-    // Once the bridge has the conversation it is AUTHORITATIVE and chronological (user turns
-    // + assistant replies in order). Append ONLY the user messages sent but not yet echoed
-    // back — a position watermark on USER turns, so repeated "yes"/"continue" are never
-    // dropped, and frontend-only notices can't slip in and push a reply ABOVE the message it
-    // answers (that was the "the bubble is above my message" bug). Stale notices are dropped
-    // here on purpose: the real conversation supersedes them.
-    const echoedUserCount = real.filter((m) => m.role === "user").length;
-    const pendingUsers = plannerMessages
-      .filter((m) => m.role === "user")
-      .slice(echoedUserCount);
-    // plannerNotices ride along even when the bridge is authoritative: they are
-    // delivery-failure feedback generated AFTER the last user send, so last
-    // position is chronologically right and they can't displace a reply.
-    return [...real, ...pendingUsers, ...plannerNotices];
-  }, [orchestratorConsole.entries, plannerMessages, durableChat, plannerNotices]);
+  // D2+D3 (planner-chat demolition): the planner chat is the bridge's REAL
+  // conversation (one source of truth — the console store, hydrated from the durable
+  // .jsonl by the backend itself) plus the optimistic pending sends, drained BY
+  // IDENTITY (msgId, with a text fallback for the local binary's id-less echoes).
+  // The old three-source merge (optimistic buffer / live console / read_activity_chat
+  // durable fallback) and its echoedUserCount watermark are gone. Milestones ride
+  // along as tiny system rows (tool-use visibility): a cloud orchestrator running
+  // Bash/reads no longer looks hung between replies.
+  const plannerConvo = useMemo(
+    () =>
+      mergePendingSends(
+        chatMessagesWithMilestones(orchestratorConsole.entries),
+        plannerPending,
+      ),
+    [orchestratorConsole.entries, plannerPending],
+  );
 
   // B14b: append the live, in-progress assistant reply (token streaming) as the LAST bubble —
   // a SEPARATE slot from the finalized timeline, so it grows token-by-token and is replaced by
@@ -1318,24 +1263,58 @@ export function ProjectsView() {
     plannerConvo.length > 0 &&
     plannerConvo[plannerConvo.length - 1].role === "assistant";
 
-  // "Thinking…" watchdog: the pill had NO timeout, so a backend that accepts the
-  // request but never answers (e.g. oMLX cold-loading a big model, or a wedged
-  // child) left the user staring at it forever. Any convo change (deltas
-  // included) resets the timer, so it only fires after 90s of TOTAL silence —
-  // and the notice replaces the pill with something actionable.
+  // D3 GC: once the bridge echoes a pending send (by msgId, or an id-less text match
+  // from the local binary), remove it from state — mergePendingSends already hides it
+  // in the render, but the state array must not grow unbounded over a long session.
   useEffect(() => {
-    const last = plannerConvoLive[plannerConvoLive.length - 1];
-    if (!plannerActivityAgentId || last?.role !== "user") return;
+    setPlannerPending((prev) => {
+      if (prev.length === 0) return prev;
+      const still = drainPendingSends(
+        chatMessagesWithMilestones(orchestratorConsole.entries),
+        prev,
+      );
+      return still.length === prev.length ? prev : still;
+    });
+  }, [orchestratorConsole.entries]);
+
+  // D4 "Thinking…" watchdog: a backend that accepts the request but never answers
+  // (oMLX cold-loading a big model, a wedged child) must not leave the user staring
+  // at the pill forever. Armed on the last CHAT row — MILESTONES are ignored
+  // (max-recall: a single tool-call row after the user's turn used to disarm the
+  // watchdog entirely, so an orchestrator that tool-called once and then hung gave
+  // zero feedback forever). Any convo change (milestones and deltas included) still
+  // resets the timer, so it fires only after 90s of TOTAL silence — and it raises
+  // the composer BANNER (chrome), never a fake assistant message in the transcript.
+  useEffect(() => {
+    let lastChat: (typeof plannerConvoLive)[number] | undefined;
+    for (let i = plannerConvoLive.length - 1; i >= 0; i--) {
+      if (plannerConvoLive[i].role !== "milestone") {
+        lastChat = plannerConvoLive[i];
+        break;
+      }
+    }
+    if (!plannerActivityAgentId || lastChat?.role !== "user") return;
     const timer = setTimeout(() => {
-      setPlannerNotices([
-        {
-          role: "assistant",
-          text: "No reply from the orchestrator in 90s. If it runs on a local model, the model may still be loading — check the oMLX/Ollama window. Otherwise relaunch the orchestrator or switch backend.",
-        },
-      ]);
+      setPlannerBanner(
+        "No reply from the orchestrator in 90s. If it runs on a local model, the model may still be loading — check the oMLX/Ollama window. Otherwise relaunch the orchestrator or switch backend.",
+      );
     }, 90_000);
     return () => clearTimeout(timer);
   }, [plannerConvoLive, plannerActivityAgentId]);
+
+  // D4: any assistant activity (a landed reply or a streaming tail) clears the
+  // banner — the orchestrator is demonstrably alive, so stall/delivery feedback is
+  // stale the moment it speaks. Milestones are skipped symmetrically with the
+  // watchdog below: a tool-call row landing right after the reply (same snapshot)
+  // must not hide the reply from this check.
+  useEffect(() => {
+    for (let i = plannerConvoLive.length - 1; i >= 0; i--) {
+      const role = plannerConvoLive[i].role;
+      if (role === "milestone") continue;
+      if (role === "assistant") setPlannerBanner(null);
+      return;
+    }
+  }, [plannerConvoLive]);
 
   // Phase B L4/L5: fulfill the orchestrator's design_request directives (run the reused
   // design pipeline) and refresh the Stage Design view when one completes.
@@ -1808,12 +1787,6 @@ export function ProjectsView() {
       await invokeBackendCommand<void>("delete_project", {
         projectId: currentProject.metadata.id,
       });
-      // B15b hygiene: drop the remembered orchestrator id for the gone project.
-      try {
-        localStorage.removeItem(orchAgentKey(currentProject.metadata.id));
-      } catch {
-        /* non-fatal */
-      }
       selectedIdRef.current = null;
       setSelectedId(null);
       setProject(null);
@@ -2006,7 +1979,8 @@ export function ProjectsView() {
             projectId: currentProject.metadata.id,
             role,
             client,
-            agentId: `${role}-${Date.now()}`,
+            // D1: the backend owns id generation (orchestrator ⇒ the project's
+            // STABLE id; other roles ⇒ per-launch timestamp, unchanged).
             taskId: taskId ?? null,
             // R4/B19: the task-card quick-launch uses the IN-APP PTY terminal — reliable
             // on macOS AND Windows (the external osascript→Terminal.app path silently
@@ -2302,11 +2276,13 @@ export function ProjectsView() {
     setIsBusy(true);
     setError(null);
     setLaunchMessage(null);
-    // Generate the launched agentId HERE (once) and return it to the caller.
-    // (The former cloud-orchestrator captured-id binding is gone — the Stage now
-    // binds by the stored role:"orchestrator", role untangle 2026-07 — but a
-    // stable, caller-visible id remains useful for any future exact binding.)
-    const launchedAgentId = `${input.role}-${Date.now()}`;
+    // D1 (planner-chat demolition): the BACKEND owns agent-id generation. An
+    // orchestrator launch gets the project's STABLE id (`orchestrator-<projectId>`,
+    // so the planner transcript survives relaunches/restarts/backend switches);
+    // every other role gets the per-launch timestamp id, same as before. Sending a
+    // frontend-generated id here would override that and silently disable the
+    // stable identity (hostile-review BLOCKER). The launched id comes back in
+    // `result.agentId` for callers that need exact binding.
     try {
       const result = await invokeBackendCommand<ProjectAgentLaunchResult>(
         "launch_project_agent_terminal",
@@ -2315,7 +2291,6 @@ export function ProjectsView() {
             projectId: input.projectId,
             role: input.role,
             client: input.client,
-            agentId: launchedAgentId,
             taskId: input.taskId,
             host: input.host,
             model: input.model,
@@ -2334,6 +2309,10 @@ export function ProjectsView() {
             // Orchestrator composer: the typed goal + auto-create toggle (absent for every other
             // launch, so the backend omits DEVBOULE_GOAL/DEVBOULE_AUTO_CREATE — byte-identical).
             initialGoal: input.initialGoal,
+            // D3 (max-recall: this field-by-field payload silently DROPPED it, making
+            // the whole Rust-side goal-echo id plumbing dead on arrival): the goal
+            // echo carries this id back so the pending copy drains by identity.
+            initialGoalMsgId: input.initialGoalMsgId,
             autoCreate: input.autoCreate,
             // Phase D: run a cloud orchestrator as a piped duplex child (Stage, not terminal).
             cloudDuplex: input.cloudDuplex,
@@ -2347,7 +2326,7 @@ export function ProjectsView() {
       );
       await loadAgentState();
       await loadProjects();
-      return launchedAgentId;
+      return result.agentId;
     } catch (e) {
       // Tauri command rejections are plain STRINGS, not Error instances — the
       // old `instanceof Error` fallback swallowed the real reason behind a
@@ -2360,12 +2339,19 @@ export function ProjectsView() {
             : "Agent terminal could not be launched.",
       );
       setError(message);
-      // A failed PLANNER launch must speak in the chat itself (the toast alone
+      // A failed PLANNER launch must speak in the planner itself (the toast alone
       // read as "the planner ignores me") — e.g. the local-model preflight
-      // error ("oMLX not reachable / model not available").
+      // error ("oMLX not reachable / model not available"). D4: it raises the
+      // composer BANNER, never a fake assistant message in the transcript.
       if (input.role === "orchestrator") {
-        setPlannerNotices([{ role: "assistant", text: message }]);
+        setPlannerBanner(message);
         setPlannerLaunching(false);
+        // Max-recall F1: the goal was never delivered — drop its optimistic copy
+        // (no echo can ever drain it; the banner explains what happened).
+        if (input.initialGoalMsgId) {
+          const goalMsgId = input.initialGoalMsgId;
+          setPlannerPending((prev) => prev.filter((p) => p.msgId !== goalMsgId));
+        }
       }
       return null;
     } finally {
@@ -2384,24 +2370,28 @@ export function ProjectsView() {
     goal: string,
     coderId: string,
     autoCreate: boolean,
+    // D3: the send id the composer already showed this goal under — the launch echo
+    // carries it back (`initialGoalMsgId`) so the optimistic copy drains by identity.
+    goalMsgId: string,
   ) => {
     if (busyRef.current || orchestratorPlanRef.current) return;
     const folder = newProjectRootDraft.trim();
     if (!folder) {
-      // The Folder is required (the project depends on a working tree). Say so IN the
-      // conversation — the folder picker is right here in the create bar.
-      setPlannerMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          text: "Pick a folder for this project first (use an existing one, or create a new one), then send your goal again.",
-        },
-      ]);
+      // The Folder is required (the project depends on a working tree). D4: guidance
+      // is composer CHROME (banner), not a fake assistant message in the transcript.
+      setPlannerBanner(
+        "Pick a folder for this project first (use an existing one, or create a new one), then send your goal again.",
+      );
       return;
     }
-    // Clean slate: the conversation starts with exactly this goal (drops any stale notices
-    // like "pick a folder first" from earlier attempts, so the bridge echo lines up cleanly).
-    setPlannerMessages([{ role: "user", text: goal }]);
+    // Clean slate: the conversation starts with exactly this goal (drops stale
+    // pendings from earlier attempts, so the bridge echo lines up cleanly).
+    setPlannerPending([{ text: goal, msgId: goalMsgId }]);
+    setPlannerBanner(null);
+    // Max-recall F2: remember WHICH project this in-flight landing goal belongs to,
+    // so the project-switch effect can tell "landing → the project we just created"
+    // (keep the pending) from "landing → some other existing project" (drop it).
+    landingGoalProjectRef.current = null;
     orchestratorPlanRef.current = true;
     try {
       // The NAME is decided DURING the conversation (this is a vibe-coding app: you talk to
@@ -2415,7 +2405,12 @@ export function ProjectsView() {
           input: { title: "Untitled plan", status: "draft", rootPath: folder },
         }),
       );
-      if (!detail) return;
+      if (!detail) {
+        // The project was never created — the seeded goal has nowhere to go.
+        setPlannerPending((prev) => prev.filter((p) => p.msgId !== goalMsgId));
+        return;
+      }
+      landingGoalProjectRef.current = detail.metadata.id;
       // runMutation already selected the new project; clear the folder draft and launch the
       // Planner ON the freshly-created project (use the returned detail — currentProject
       // updates asynchronously, so we must not read it here).
@@ -2452,6 +2447,8 @@ export function ProjectsView() {
         // the user clicks "Create plan".
         planFirst: plannerOrchestratorClient === "orchestrator" && autoCreate,
         initialGoal: goal,
+        // D3: the goal echo carries the composer's send id back through the bridge.
+        initialGoalMsgId: goalMsgId,
         autoCreate,
         // Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
         cloudDuplex: plannerOrchestratorClient !== "orchestrator",
@@ -2469,14 +2466,26 @@ export function ProjectsView() {
     goal: string,
     coderId: string,
     autoCreate: boolean,
+    // D3: the send id the composer showed this goal under (see startNewProject).
+    goalMsgId: string,
   ) => {
-    if (isArchived) return;
+    // Max-recall F1: callers push the pending BEFORE calling — every early return
+    // here must remove it again, or the undelivered goal stays a permanent ghost
+    // bubble (no echo can ever drain it).
+    const dropPendingGoal = () =>
+      setPlannerPending((prev) => prev.filter((p) => p.msgId !== goalMsgId));
+    if (isArchived) {
+      dropPendingGoal();
+      return;
+    }
     if (
       !currentProject?.metadata.rootPath ||
       busyRef.current ||
       orchestratorPlanRef.current
-    )
+    ) {
+      dropPendingGoal();
       return;
+    }
     orchestratorPlanRef.current = true;
     try {
       const note = `Orchestrator goal: ${goal}\n(hand off to: ${coderId} · auto-create tasks: ${autoCreate ? "on" : "off"})`;
@@ -2490,7 +2499,10 @@ export function ProjectsView() {
           },
         }),
       );
-      if (!detail) return;
+      if (!detail) {
+        dropPendingGoal();
+        return;
+      }
       beginPlannerLaunch();
       // ROLE UNTANGLE: pass the planner's true role — the ledger stores
       // role:"orchestrator" for local and cloud-duplex planners alike.
@@ -2508,6 +2520,8 @@ export function ProjectsView() {
         // The typed goal now reaches the planner directly (DEVBOULE_GOAL — the orchestrator runs it
         // headless, plan-first); the note above is kept only as an audit trail. auto-create rides too.
         initialGoal: goal,
+        // D3: the goal echo carries the composer's send id back through the bridge.
+        initialGoalMsgId: goalMsgId,
         autoCreate,
         // Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
         cloudDuplex: plannerOrchestratorClient !== "orchestrator",
@@ -3194,7 +3208,18 @@ export function ProjectsView() {
               const replanGoal =
                 "Revise the current plan for this project — the user wants to change it. Read the existing tasks and propose the changes.";
               setPlannerGoal(replanGoal);
-              void planWithOrchestrator(replanGoal, plannerCoderId, plannerAutoCreate);
+              // D3: seed the pending copy under the SAME id the goal echo will carry.
+              const replanMsgId = newMsgId();
+              setPlannerPending((prev) => [
+                ...prev,
+                { text: replanGoal, msgId: replanMsgId },
+              ]);
+              void planWithOrchestrator(
+                replanGoal,
+                plannerCoderId,
+                plannerAutoCreate,
+                replanMsgId,
+              );
               exitWorkMode();
             }}
             onLaunch={(input) => void launchFromSpawnPanel(input)}
@@ -3407,6 +3432,7 @@ export function ProjectsView() {
             onOpenInDesign={() => requestView("design")}
             messages={plannerConvoLive}
             awaitingReply={plannerAwaitingReply}
+            banner={plannerBanner}
             onInterrupt={
               cloudOrchestratorAgentId
                 ? () => {
@@ -3428,54 +3454,67 @@ export function ProjectsView() {
             onSend={(text) => {
               const msg = text.trim();
               if (!msg) return;
-              // Always echo the user's message in the chat.
-              setPlannerMessages((prev) => [...prev, { role: "user", text: msg }]);
-              // A fresh attempt clears stale delivery-failure notices.
-              setPlannerNotices([]);
+              // D3: ONE client-generated id per send — it tags the optimistic bubble,
+              // rides the send (steer / cloud stdin / launch goal), and comes back in
+              // the bridge echo so the pending copy drains by identity. The pending is
+              // pushed ONLY on paths that actually DELIVER (max-recall BLOCKER: a
+              // guard short-circuit after an unconditional push left a permanent
+              // ghost bubble no echo could ever drain).
+              const msgId = newMsgId();
+              // A fresh attempt clears stale delivery/stall feedback (D4 chrome).
+              setPlannerBanner(null);
               if (plannerOrchestratorClient === "orchestrator" && orchestratorAgentId) {
+                setPlannerPending((prev) => [...prev, { text: msg, msgId }]);
                 // LIVE: steer the running LOCAL orchestrator (mid-plan course-correction).
                 // It drains DEVBOULE_STEER_FILE between rounds and injects this as a
                 // human turn (P2). Routed by the selected client (not just "any non-null id")
                 // so a stale-but-recent local session can't steal a cloud-mode message.
+                // (The steer wire is a plain text line — no msgId; the binary's echo
+                // drains the pending via the text fallback in mergePendingSends.)
                 invokeBackendCommand("orchestrator_steer", {
                   agentId: orchestratorAgentId,
                   message: msg,
                 }).catch((e) => {
+                  // Max-recall F1: undelivered — drop the optimistic copy too (a
+                  // bubble no echo can drain would contradict the banner forever).
+                  setPlannerPending((prev) =>
+                    prev.filter((p) => p.msgId !== msgId),
+                  );
                   setError(
                     e instanceof Error
                       ? e.message
                       : "Steer failed — message not delivered.",
                   );
-                  setPlannerNotices([
-                    {
-                      role: "assistant",
-                      text: "That message didn't reach the orchestrator — its session is no longer live. Relaunch the orchestrator and send again.",
-                    },
-                  ]);
+                  setPlannerBanner(
+                    "That message didn't reach the orchestrator — its session is no longer live. Relaunch the orchestrator and send again.",
+                  );
                 });
                 return;
               }
               if (cloudOrchestratorAgentId) {
+                setPlannerPending((prev) => [...prev, { text: msg, msgId }]);
                 // Phase D: a CLOUD duplex orchestrator — write the turn straight to its piped
                 // stdin (the cloud counterpart of orchestrator_steer). Its event stream surfaces
                 // the reply in the Stage just like the local path.
                 invokeBackendCommand("project_cloud_orchestrator_send", {
                   agentId: cloudOrchestratorAgentId,
                   message: msg,
+                  msgId,
                 }).catch((e) => {
+                  // Max-recall F1: undelivered — drop the optimistic copy too.
+                  setPlannerPending((prev) =>
+                    prev.filter((p) => p.msgId !== msgId),
+                  );
                   setError(
                     e instanceof Error
                       ? e.message
                       : "Send failed — message not delivered.",
                   );
-                  // Surface the failure IN the chat: a send that dies only in
-                  // the toast reads as "the orchestrator ignores me".
-                  setPlannerNotices([
-                    {
-                      role: "assistant",
-                      text: "That message didn't reach the orchestrator — its session is no longer live. Send again and a fresh orchestrator will launch.",
-                    },
-                  ]);
+                  // D4: surface the failure NEXT TO the composer — a send that dies
+                  // only in the toast reads as "the orchestrator ignores me".
+                  setPlannerBanner(
+                    "That message didn't reach the orchestrator — its session is no longer live. Send again and a fresh orchestrator will launch.",
+                  );
                   // The backend just self-healed the ghost session (marked it
                   // closed). Refresh NOW so the binding memo unbinds and the
                   // very next send launches fresh instead of looping here.
@@ -3484,38 +3523,36 @@ export function ProjectsView() {
                 return;
               }
               // A Planner launch is in flight but its session hasn't registered yet — don't
-              // create a duplicate project or launch a second Planner; it'll pick up from here.
+              // create a duplicate project or launch a second Planner. NO pending is
+              // pushed: this message is NOT delivered anywhere (same as before this
+              // refactor) and a bubble pretending otherwise would be a permanent ghost.
+              // The banner says so honestly.
               if (plannerLaunching) {
-                setPlannerMessages((prev) => [
-                  ...prev,
-                  {
-                    role: "assistant",
-                    text: "The Planner is starting — one moment, then it'll pick up your messages.",
-                  },
-                ]);
+                setPlannerBanner(
+                  "The Planner is still starting — this message was NOT delivered. Wait for its first reply, then send it again.",
+                );
                 return;
               }
               // FRESH landing (no project yet): the first message CREATES the project
               // (with the chosen Folder) and launches the Planner on it.
+              // startNewProject seeds the pending itself AFTER its own guards pass.
               if (!currentProject) {
-                void startNewProject(msg, plannerCoderId, plannerAutoCreate);
+                void startNewProject(msg, plannerCoderId, plannerAutoCreate, msgId);
                 return;
               }
-              // A project is selected but no Planner is running: (re)plan it. Needs a folder.
+              // A project is selected but no Planner is running: (re)plan it. Needs a
+              // folder. No pending: nothing is delivered on this path.
               if (!currentProject.metadata.rootPath) {
-                setPlannerMessages((prev) => [
-                  ...prev,
-                  {
-                    role: "assistant",
-                    text: "This project has no folder yet, so I can't plan or write code in it. Pick a folder, then send your goal again.",
-                  },
-                ]);
+                setPlannerBanner(
+                  "This project has no folder yet, so I can't plan or write code in it. Pick a folder, then send your goal again.",
+                );
                 setError("Select a folder for this project before planning.");
                 return;
               }
               if (busyRef.current || orchestratorPlanRef.current) return;
               setPlannerGoal(msg);
-              void planWithOrchestrator(msg, plannerCoderId, plannerAutoCreate);
+              setPlannerPending((prev) => [...prev, { text: msg, msgId }]);
+              void planWithOrchestrator(msg, plannerCoderId, plannerAutoCreate, msgId);
             }}
             orchestrators={[
               { id: "orchestrator", label: "Local" },
@@ -3527,7 +3564,6 @@ export function ProjectsView() {
             ]}
             orchestratorId={plannerOrchestratorClient}
             onOrchestratorChange={setPlannerOrchestratorClient}
-            cloudTerminalAgentId={null}
             coders={[
               // Role untangle (P6b): the Main coder can run LOCAL — the sandboxed agentic
               // engine on mainCoderBackend (Settings → Roles) — as well as a cloud CLI.
@@ -3565,18 +3601,31 @@ export function ProjectsView() {
                 );
                 return;
               }
-              setPlannerMessages((prev) => [
+              // D3: the visible bubble is EXACTLY the delivered message — showing a
+              // short label while sending a different text made the echo (which is
+              // always the delivered text) silently replace the bubble on cloud and
+              // permanently duplicate it on local (hostile-review BLOCKER). The echo
+              // then drains this pending by msgId (cloud) or by text (local).
+              const planMsgId = newMsgId();
+              setPlannerPending((prev) => [
                 ...prev,
-                { role: "user", text: "Create the plan and the tasks now." },
+                { text: planMessage, msgId: planMsgId },
               ]);
               invokeBackendCommand(target.command, {
                 agentId: target.agentId,
                 message: planMessage,
-              }).catch((e) =>
+                ...(target.command === "project_cloud_orchestrator_send"
+                  ? { msgId: planMsgId }
+                  : {}),
+              }).catch((e) => {
+                // Max-recall F1: undelivered — drop the optimistic copy too.
+                setPlannerPending((prev) =>
+                  prev.filter((p) => p.msgId !== planMsgId),
+                );
                 setError(
                   e instanceof Error ? e.message : "Could not start planning.",
-                ),
-              );
+                );
+              });
             }}
           />
 

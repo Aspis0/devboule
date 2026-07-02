@@ -688,6 +688,13 @@ pub struct ProjectAgentLaunchInput {
     /// lenient: `None`/empty omits the env (byte-identical default launch). camelCase over IPC.
     #[serde(default)]
     pub initial_goal: Option<String>,
+    /// D3 (planner-chat demolition): the frontend's send id for the INITIAL GOAL turn.
+    /// A cloud-duplex launch echoes the goal into the activity bridge as a user chat
+    /// line; carrying the id (`msgId` on the wire) lets the planner's optimistic goal
+    /// copy drain by identity like any live send. Optional + lenient: absent ⇒ the
+    /// echo line is byte-identical to before. camelCase over IPC.
+    #[serde(default)]
+    pub initial_goal_msg_id: Option<String>,
     /// Orchestrator composer auto-create toggle. `Some(false)` sets `DEVBOULE_AUTO_CREATE=0` so the
     /// planner drafts + submits the plan but does NOT create its tasks on approval (you create them).
     /// `None`/`Some(true)` omits the env ⇒ the existing behavior (tasks created on approval). camelCase.
