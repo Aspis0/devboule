@@ -1,0 +1,696 @@
+import {
+  AlertTriangle,
+  Bot,
+  CheckCircle2,
+  Cpu,
+  ShieldCheck,
+  UserCog,
+  Wrench,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  invokeBackendCommand,
+  useAppActions,
+  useAppContext,
+} from "../../context/AppContext";
+import {
+  validateMiniBackend,
+  MINI_MODEL_MAX_LENGTH,
+  MINI_COMMAND_MAX_LENGTH,
+  MINI_BASE_URL_MAX_LENGTH,
+} from "../agents/miniCoderBackend";
+import {
+  buildProviderStatusMap,
+  type ProviderStatusMap,
+} from "../design/designProviderDetection";
+import type {
+  DetectedProvider,
+  EffectiveRolesConfig,
+  MiniCoderBackend,
+  MiniCoderBackendKind,
+  RolesConfig,
+} from "../../types/config";
+
+// ────────────────────────────────────────────────────────────────────────────
+// Role untangle (P6b) — the ONE Settings surface that answers "who runs each
+// agent role, on what". Four rows: Orchestrator / Main coder / Mini / Verifier.
+//
+//   - Orchestrator / Main coder / Verifier carry a Local ⇄ Cloud placement:
+//       Cloud  → a client CLI ("claude" | "codex"), stored in rolesConfig.
+//       Local  → the in-process engine: "orchestrator" (the Devboule binary on
+//                localCoderBackend) or "local" (the sandboxed agentic engine on
+//                the role's own MiniCoderBackend — mainCoderBackend/verifierBackend).
+//   - Mini has NO client toggle: its backend union already spans local (ollama/
+//     omlx/apple) AND cloud (its "codex" kind), so the row is just that picker.
+//   - Verifier defaults to "Same as Main coder" (the untangle's point: it used to
+//     silently reuse the coder's client; now it is independent but conveniently
+//     mirrors it until you say otherwise).
+//
+// The client selectors persist through set_roles_config (which REPLACES the whole
+// rolesConfig triple — so every save sends all three resolved clients, never a
+// partial, or an omitted field silently resets to its legacy default). Per-role
+// local models persist through set_mini_coder_backend / set_main_coder_backend /
+// set_verifier_backend. Retiring the old single-purpose cards happens in a later
+// slice; this card is the new home.
+// ────────────────────────────────────────────────────────────────────────────
+
+// The MiniCoderBackend-shaped draft a row edits before validation.
+interface BackendDraft {
+  kind: MiniCoderBackendKind;
+  model: string;
+  command: string;
+  baseUrl: string;
+}
+
+const EMPTY_DRAFT: BackendDraft = {
+  kind: "ollama",
+  model: "",
+  command: "",
+  baseUrl: "",
+};
+
+// Local = on-device (the prompt never leaves the machine). Cloud = external (a
+// subscription / CLI). Splitting the MiniCoderBackend kinds this way keeps the
+// Local/Cloud toggle honest: the Local editor never offers a cloud kind.
+const LOCAL_KINDS: MiniCoderBackendKind[] = ["ollama", "omlx", "appleFm"];
+// The Mini can also ride an external backend directly (it has no separate client
+// concept): Codex subscription or a custom API CLI.
+const MINI_CLOUD_KINDS: MiniCoderBackendKind[] = ["codex", "api"];
+
+const KIND_LABELS: Record<MiniCoderBackendKind, string> = {
+  ollama: "Ollama (local model)",
+  omlx: "oMLX (local MLX server)",
+  appleFm: "Apple on-device (macOS)",
+  codex: "Codex (subscription)",
+  api: "API CLI (your command)",
+};
+
+function isCloudKind(kind: MiniCoderBackendKind): boolean {
+  return MINI_CLOUD_KINDS.includes(kind);
+}
+
+function draftFromBackend(backend: MiniCoderBackend | null | undefined): BackendDraft {
+  if (!backend) return { ...EMPTY_DRAFT };
+  return {
+    kind: backend.kind,
+    model: backend.model ?? "",
+    command: backend.command ?? "",
+    baseUrl: backend.baseUrl ?? "",
+  };
+}
+
+// The cloud CLIs a role can hand off to. Kept in sync with mainCoderClient's union
+// + the Rust validate_client_id built-ins.
+const CLOUD_CLIENTS = ["claude", "codex"] as const;
+
+// The local placement marker per role (what the client id becomes when a row is
+// switched to "Local"): the orchestrator runs as the Devboule binary; the Main
+// coder and Verifier run the in-process agentic engine.
+function localMarker(role: RoleKey): string {
+  return role === "orchestrator" ? "orchestrator" : "local";
+}
+
+function isLocalClient(role: RoleKey, client: string): boolean {
+  return client === localMarker(role);
+}
+
+type RoleKey = "orchestrator" | "coder" | "mini" | "verifier";
+
+interface RoleMeta {
+  key: RoleKey;
+  label: string;
+  icon: ReactNode;
+  // Honest per-role safety line (the write/sandbox boundary differs per role).
+  safety: string;
+}
+
+const ROLES: RoleMeta[] = [
+  {
+    key: "orchestrator",
+    label: "Orchestrator",
+    icon: <UserCog className="h-4 w-4 text-terracotta" />,
+    safety:
+      "Plans and delegates; never writes files. Holds the provider surface to read + manage infra.",
+  },
+  {
+    key: "coder",
+    label: "Main coder",
+    icon: <Cpu className="h-4 w-4 text-teal" />,
+    safety:
+      "Writes code. Local runs inside the OS sandbox (Seatbelt); cloud CLIs write with their own tools.",
+  },
+  {
+    key: "mini",
+    label: "Mini",
+    icon: <Bot className="h-4 w-4 text-cream-500" />,
+    safety:
+      "Delegated worker. Prompt-only safety constraint, not an OS sandbox — works from front-loaded context.",
+  },
+  {
+    key: "verifier",
+    label: "Verifier",
+    icon: <ShieldCheck className="h-4 w-4 text-emerald-600" />,
+    safety: "Review-only. Sets a task to review, never to done. No file writes.",
+  },
+];
+
+// A compact, controlled MiniCoderBackend field group (kind + the fields that kind
+// needs), reusing the shared validator so the inline errors match the Rust boundary.
+function MiniBackendFields(props: {
+  idPrefix: string;
+  draft: BackendDraft;
+  onChange: (next: BackendDraft) => void;
+  statusMap: ProviderStatusMap;
+  // The kinds this context allows (Local shows on-device kinds; Cloud shows external).
+  kinds: MiniCoderBackendKind[];
+}) {
+  const { idPrefix, draft, onChange, statusMap, kinds } = props;
+  // Guard: if the current draft kind isn't in the allowed set (e.g. right after a
+  // Local⇄Cloud flip), display the first allowed kind so the <select> value always
+  // matches a rendered <option>.
+  const kind = kinds.includes(draft.kind) ? draft.kind : kinds[0];
+  const validation = useMemo(
+    () =>
+      validateMiniBackend({
+        kind,
+        model: draft.model,
+        command: draft.command,
+        baseUrl: draft.baseUrl,
+      }),
+    [kind, draft.model, draft.command, draft.baseUrl],
+  );
+  const detectedModels = useMemo(
+    () => (kind === "ollama" || kind === "omlx" ? statusMap[kind].models : []),
+    [kind, statusMap],
+  );
+  const firstError =
+    validation.errors.model ?? validation.errors.command ?? validation.errors.baseUrl;
+  const listId = `${idPrefix}-models`;
+  const set = (patch: Partial<BackendDraft>) => onChange({ ...draft, ...patch });
+
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+        Backend
+        <select
+          value={kind}
+          onChange={(e) => set({ kind: e.target.value as MiniCoderBackendKind })}
+          className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+        >
+          {kinds.map((k) => (
+            <option key={k} value={k}>
+              {KIND_LABELS[k]}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      {kind === "ollama" || kind === "omlx" || kind === "codex" || kind === "appleFm" ? (
+        <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          Model {kind === "codex" || kind === "appleFm" ? "(optional)" : "tag"}
+          <input
+            value={draft.model}
+            onChange={(e) => set({ model: e.target.value })}
+            placeholder={
+              kind === "appleFm"
+                ? "default"
+                : kind === "codex"
+                  ? "gpt-5-codex"
+                  : "qwen2.5-coder"
+            }
+            maxLength={MINI_MODEL_MAX_LENGTH}
+            list={detectedModels.length ? listId : undefined}
+            className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+          />
+          {detectedModels.length ? (
+            <datalist id={listId}>
+              {detectedModels.map((m) => (
+                <option key={m} value={m} />
+              ))}
+            </datalist>
+          ) : null}
+        </label>
+      ) : (
+        <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          Command line
+          <input
+            value={draft.command}
+            onChange={(e) => set({ command: e.target.value })}
+            placeholder="mycli chat --json"
+            maxLength={MINI_COMMAND_MAX_LENGTH}
+            className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+          />
+        </label>
+      )}
+
+      {kind === "omlx" ? (
+        <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          Base URL
+          <input
+            value={draft.baseUrl}
+            onChange={(e) => set({ baseUrl: e.target.value })}
+            placeholder="http://localhost:8000/v1"
+            maxLength={MINI_BASE_URL_MAX_LENGTH}
+            className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+          />
+        </label>
+      ) : null}
+
+      {firstError ? (
+        <p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
+          {firstError}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+export function RolesTableCard() {
+  const { config } = useAppContext();
+  const { refreshConfig } = useAppActions();
+
+  // The resolved clients (what the launch paths see). Loaded from the backend so the
+  // legacy-key migration is applied; edits are staged here and saved as the full triple.
+  const [clients, setClients] = useState<EffectiveRolesConfig | null>(null);
+  // Per-role local-model drafts, seeded from the current config backends.
+  const [mainDraft, setMainDraft] = useState<BackendDraft>(() =>
+    draftFromBackend(config.mainCoderBackend),
+  );
+  const [miniDraft, setMiniDraft] = useState<BackendDraft>(() =>
+    draftFromBackend(config.miniCoderBackend),
+  );
+  const [verifierDraft, setVerifierDraft] = useState<BackendDraft>(() =>
+    draftFromBackend(config.verifierBackend),
+  );
+  const [verifierSameAsMain, setVerifierSameAsMain] = useState<boolean>(
+    () => !config.verifierBackend,
+  );
+
+  const [detected, setDetected] = useState<DetectedProvider[] | null>(null);
+  const [busyRole, setBusyRole] = useState<RoleKey | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savedRole, setSavedRole] = useState<RoleKey | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const loadClients = useCallback(async () => {
+    try {
+      const result =
+        await invokeBackendCommand<EffectiveRolesConfig>("get_roles_config_cmd");
+      if (mountedRef.current && result) setClients(result);
+    } catch {
+      // Degrade: fall back to a conservative default so the table still renders.
+      if (mountedRef.current)
+        setClients({
+          orchestratorClient: "orchestrator",
+          coderClient: "codex",
+          verifierClient: "codex",
+        });
+    }
+  }, []);
+  useEffect(() => {
+    void loadClients();
+  }, [loadClients]);
+
+  const runDetect = useCallback(async () => {
+    try {
+      const result =
+        await invokeBackendCommand<DetectedProvider[]>("detect_providers");
+      if (mountedRef.current) setDetected(Array.isArray(result) ? result : []);
+    } catch {
+      // Degrade silently to free-text inputs.
+    }
+  }, []);
+  useEffect(() => {
+    void runDetect();
+  }, [runDetect]);
+  const statusMap: ProviderStatusMap = useMemo(
+    () => buildProviderStatusMap(detected),
+    [detected],
+  );
+
+  // Reflect external config changes into the local-model drafts (e.g. after a save).
+  useEffect(() => {
+    setMainDraft(draftFromBackend(config.mainCoderBackend));
+    setMiniDraft(draftFromBackend(config.miniCoderBackend));
+    setVerifierDraft(draftFromBackend(config.verifierBackend));
+    setVerifierSameAsMain(!config.verifierBackend);
+  }, [config.mainCoderBackend, config.miniCoderBackend, config.verifierBackend]);
+
+  const flashSaved = (role: RoleKey) => {
+    setSavedRole(role);
+    window.setTimeout(() => {
+      if (mountedRef.current) setSavedRole((r) => (r === role ? null : r));
+    }, 2000);
+  };
+
+  // Persist the whole rolesConfig triple with ONE role's client overridden. The
+  // command REPLACES rolesConfig, so we always send all three (never a partial).
+  const saveClients = useCallback(
+    async (override: Partial<Record<RoleKey, string>>) => {
+      const base = clients ?? {
+        orchestratorClient: "orchestrator",
+        coderClient: "codex",
+        verifierClient: "codex",
+      };
+      const next: RolesConfig = {
+        orchestratorClient: override.orchestrator ?? base.orchestratorClient,
+        coderClient: override.coder ?? base.coderClient,
+        verifierClient: override.verifier ?? base.verifierClient,
+      };
+      const result = await invokeBackendCommand<EffectiveRolesConfig>(
+        "set_roles_config_cmd",
+        { input: next },
+      );
+      if (mountedRef.current && result) setClients(result);
+    },
+    [clients],
+  );
+
+  const saveMiniBackend = useCallback(
+    async (command: string, draft: BackendDraft) => {
+      const validation = validateMiniBackend({
+        kind: draft.kind,
+        model: draft.model,
+        command: draft.command,
+        baseUrl: draft.baseUrl,
+      });
+      if (!validation.ok || !validation.value) {
+        const firstError =
+          validation.errors.model ??
+          validation.errors.command ??
+          validation.errors.baseUrl;
+        throw new Error(firstError ?? "Invalid backend.");
+      }
+      await invokeBackendCommand(command, { backend: validation.value });
+    },
+    [],
+  );
+
+  // Row save orchestration. Each role wires the client selector and/or its backend.
+  const onSaveRole = useCallback(
+    async (role: RoleKey) => {
+      setBusyRole(role);
+      setError(null);
+      try {
+        if (role === "orchestrator") {
+          const client = clients?.orchestratorClient ?? "orchestrator";
+          await saveClients({ orchestrator: client });
+        } else if (role === "coder") {
+          const client = clients?.coderClient ?? "codex";
+          if (isLocalClient("coder", client)) {
+            await saveMiniBackend("set_main_coder_backend_cmd", mainDraft);
+          }
+          await saveClients({ coder: client });
+        } else if (role === "mini") {
+          await saveMiniBackend("set_mini_coder_backend", miniDraft);
+        } else {
+          // verifier
+          if (verifierSameAsMain) {
+            // Inherit the Main coder: clear the verifier's own backend + mirror its client.
+            await invokeBackendCommand("set_verifier_backend_cmd", { backend: null });
+            await saveClients({ verifier: clients?.coderClient ?? "codex" });
+          } else {
+            const client = clients?.verifierClient ?? "codex";
+            if (isLocalClient("verifier", client)) {
+              await saveMiniBackend("set_verifier_backend_cmd", verifierDraft);
+            }
+            await saveClients({ verifier: client });
+          }
+        }
+        await refreshConfig();
+        if (mountedRef.current) flashSaved(role);
+      } catch (e) {
+        if (mountedRef.current)
+          setError(e instanceof Error ? e.message : "Could not save the role.");
+      } finally {
+        if (mountedRef.current) setBusyRole(null);
+      }
+    },
+    [
+      clients,
+      mainDraft,
+      miniDraft,
+      verifierDraft,
+      verifierSameAsMain,
+      saveClients,
+      saveMiniBackend,
+      refreshConfig,
+    ],
+  );
+
+  const setRoleClient = (role: RoleKey, client: string) => {
+    setClients((prev) => {
+      const base = prev ?? {
+        orchestratorClient: "orchestrator",
+        coderClient: "codex",
+        verifierClient: "codex",
+      };
+      if (role === "orchestrator") return { ...base, orchestratorClient: client };
+      if (role === "coder") return { ...base, coderClient: client };
+      return { ...base, verifierClient: client };
+    });
+  };
+
+  const clientFor = (role: RoleKey): string => {
+    if (!clients) return role === "orchestrator" ? "orchestrator" : "codex";
+    if (role === "orchestrator") return clients.orchestratorClient;
+    if (role === "coder") return clients.coderClient;
+    return clients.verifierClient;
+  };
+
+  // A Local ⇄ Cloud segmented control + the matching editor for a CLI-capable role.
+  const renderPlacement = (role: RoleKey, draft: BackendDraft, setDraft: (d: BackendDraft) => void) => {
+    const client = clientFor(role);
+    const local = isLocalClient(role, client);
+    const setLocal = (wantLocal: boolean) => {
+      if (wantLocal) {
+        setRoleClient(role, localMarker(role));
+        // Entering Local: coerce a cloud draft kind to an on-device one so the
+        // Local editor never opens on codex/api.
+        if (!LOCAL_KINDS.includes(draft.kind)) setDraft({ ...draft, kind: "ollama" });
+      } else {
+        setRoleClient(role, "codex");
+      }
+    };
+    return (
+      <div className="mt-2 space-y-3">
+        <div className="inline-flex overflow-hidden rounded-lg border border-cream-200 text-[11px] font-semibold">
+          <button
+            type="button"
+            onClick={() => setLocal(true)}
+            className={`px-3 py-1.5 ${local ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`}
+          >
+            Local
+          </button>
+          <button
+            type="button"
+            onClick={() => setLocal(false)}
+            className={`px-3 py-1.5 ${!local ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`}
+          >
+            Cloud
+          </button>
+        </div>
+
+        {local ? (
+          role === "orchestrator" ? (
+            <p className="text-[11px] leading-4 text-cream-500">
+              Runs as the local Devboule binary on the{" "}
+              <span className="font-semibold">Local coder backend</span>
+              {config.localCoderBackend
+                ? ` (${config.localCoderBackend.kind}${config.localCoderBackend.model ? ` · ${config.localCoderBackend.model}` : ""}).`
+                : " — configure its model in the Local coder card below."}
+            </p>
+          ) : (
+            <MiniBackendFields
+              idPrefix={`roles-${role}`}
+              draft={draft}
+              onChange={setDraft}
+              statusMap={statusMap}
+              kinds={LOCAL_KINDS}
+            />
+          )
+        ) : (
+          <label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+            Cloud CLI
+            <select
+              value={CLOUD_CLIENTS.includes(client as (typeof CLOUD_CLIENTS)[number]) ? client : "codex"}
+              onChange={(e) => setRoleClient(role, e.target.value)}
+              className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+            >
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
+          </label>
+        )}
+      </div>
+    );
+  };
+
+  // The Mini has no client concept — its Local⇄Cloud toggle just filters its own
+  // backend kinds (on-device vs Codex/API), so it is kind-based, not client-based.
+  const renderMiniPlacement = (draft: BackendDraft, setDraft: (d: BackendDraft) => void) => {
+    const local = !isCloudKind(draft.kind);
+    const setMiniLocal = (wantLocal: boolean) => {
+      if (wantLocal && isCloudKind(draft.kind)) setDraft({ ...draft, kind: "ollama" });
+      else if (!wantLocal && !isCloudKind(draft.kind)) setDraft({ ...draft, kind: "codex" });
+    };
+    return (
+      <div className="mt-2 space-y-3">
+        <p className="text-[11px] leading-4 text-cream-400">
+          The delegated worker a coder spawns. One backend: on-device (Ollama / oMLX /
+          Apple) or an external Codex subscription / custom API CLI.
+        </p>
+        <div className="inline-flex overflow-hidden rounded-lg border border-cream-200 text-[11px] font-semibold">
+          <button
+            type="button"
+            onClick={() => setMiniLocal(true)}
+            className={`px-3 py-1.5 ${local ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`}
+          >
+            Local
+          </button>
+          <button
+            type="button"
+            onClick={() => setMiniLocal(false)}
+            className={`px-3 py-1.5 ${!local ? "bg-teal text-white" : "bg-white text-cream-500 hover:bg-cream-50"}`}
+          >
+            Cloud
+          </button>
+        </div>
+        <MiniBackendFields
+          idPrefix="roles-mini"
+          draft={draft}
+          onChange={setDraft}
+          statusMap={statusMap}
+          kinds={local ? LOCAL_KINDS : MINI_CLOUD_KINDS}
+        />
+      </div>
+    );
+  };
+
+  const summaryFor = (role: RoleKey): string => {
+    if (role === "mini") {
+      const b = config.miniCoderBackend;
+      return b ? `${b.kind}${b.model ? ` · ${b.model}` : ""}` : "not configured";
+    }
+    const client = clientFor(role);
+    if (isLocalClient(role, client)) {
+      if (role === "orchestrator") {
+        const b = config.localCoderBackend;
+        return `Local · ${b ? b.kind : "unset"}`;
+      }
+      const b = role === "coder" ? config.mainCoderBackend : config.verifierBackend;
+      if (role === "verifier" && verifierSameAsMain) return "Same as Main coder";
+      return `Local · ${b ? b.kind : "inherits mini"}`;
+    }
+    return `Cloud · ${client}`;
+  };
+
+  return (
+    <section
+      className="rounded-2xl border border-cream-200 bg-white p-4"
+      data-help-title="One table for who runs each agent role, on what."
+      data-help-lines="Orchestrator plans (never writes); Main coder writes; Mini is the delegated worker; Verifier reviews (sets review, never done).|Each row picks Local (in-process engine) or Cloud (a CLI). Mini's own backend already spans local + cloud.|Verifier defaults to Same as Main coder — independent, but mirrors it until you change it.|Censor and the Design LLM are gates/helpers, configured just below — not agent roles."
+    >
+      <div className="mb-3 flex items-center gap-2">
+        <Wrench className="h-4 w-4 text-teal" />
+        <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+          Roles
+        </h3>
+      </div>
+      <p className="mb-4 max-w-3xl text-[12px] leading-5 text-cream-500">
+        One place for who runs each agent role, and on what. Pick Local or Cloud per
+        role; the Mini is the delegated worker its backend already covers both.
+      </p>
+
+      <div className="divide-y divide-cream-100 rounded-2xl border border-cream-200">
+        {ROLES.map((meta) => {
+          const draft =
+            meta.key === "coder"
+              ? mainDraft
+              : meta.key === "mini"
+                ? miniDraft
+                : verifierDraft;
+          const setDraft =
+            meta.key === "coder"
+              ? setMainDraft
+              : meta.key === "mini"
+                ? setMiniDraft
+                : setVerifierDraft;
+          const busy = busyRole === meta.key;
+          return (
+            <div key={meta.key} className="p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-2">
+                  {meta.icon}
+                  <span className="text-[13px] font-semibold text-cream-800">
+                    {meta.label}
+                  </span>
+                </span>
+                <span className="rounded-lg border border-cream-200 bg-cream-50 px-2 py-0.5 text-[11px] text-cream-600">
+                  {summaryFor(meta.key)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void onSaveRole(meta.key)}
+                  disabled={busy}
+                  className="ml-auto inline-flex items-center gap-1.5 rounded-md bg-teal px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  {savedRole === meta.key ? "Saved" : busy ? "Saving…" : "Save"}
+                </button>
+              </div>
+              <p className="mt-1 flex items-start gap-1.5 text-[11px] leading-4 text-cream-400">
+                {meta.safety}
+              </p>
+
+              {meta.key === "mini" ? (
+                renderMiniPlacement(draft, setDraft)
+              ) : meta.key === "verifier" ? (
+                <div className="mt-2 space-y-3">
+                  <label className="inline-flex items-center gap-2 text-[12px] text-cream-700">
+                    <input
+                      type="checkbox"
+                      checked={verifierSameAsMain}
+                      onChange={(e) => setVerifierSameAsMain(e.target.checked)}
+                    />
+                    Same as Main coder
+                  </label>
+                  {verifierSameAsMain ? (
+                    <p className="text-[11px] leading-4 text-cream-400">
+                      The verifier mirrors the Main coder&apos;s engine. Uncheck to give
+                      it its own.
+                    </p>
+                  ) : (
+                    renderPlacement("verifier", verifierDraft, setVerifierDraft)
+                  )}
+                </div>
+              ) : (
+                renderPlacement(meta.key, draft, setDraft)
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {error && (
+        <p className="mt-3 flex items-start gap-2 rounded-2xl border border-coral/30 bg-coral/[0.05] px-3 py-2 text-[11px] leading-4 text-coral-dark">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{error}</span>
+        </p>
+      )}
+    </section>
+  );
+}

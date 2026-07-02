@@ -272,6 +272,27 @@ export interface DiscoveredModel {
 	contextWindow?: number;
 }
 
+// Role untangle (P6b) — the per-role CLIENT selectors. camelCase mirror of the Rust
+// `RolesConfig`. Every field is optional: an absent field is filled by the read-time
+// migration (legacy keys / defaults), so this PARTIAL is the write shape (what set_roles_config
+// persists), while the resolved triple is EffectiveRolesConfig. A client id is either a cloud
+// CLI ("claude" | "codex" | a custom [a-z0-9-] id) or a LOCAL placement marker ("orchestrator"
+// for the Devboule binary, "local" for the in-process agentic engine on the role's own backend).
+export interface RolesConfig {
+	orchestratorClient?: string;
+	coderClient?: string;
+	verifierClient?: string;
+}
+
+// The RESOLVED per-role clients after read-time migration (every field set). Returned by
+// get_roles_config; mirror of the Rust `EffectiveRolesConfig`. This is the READ shape the
+// Roles table renders from.
+export interface EffectiveRolesConfig {
+	orchestratorClient: string;
+	coderClient: string;
+	verifierClient: string;
+}
+
 export interface AppConfig {
 	project: ProjectConfig;
 	trustAnchor?: TrustAnchor;
@@ -309,7 +330,25 @@ export interface AppConfig {
 	miniWriteBehavior?: MiniWriteBehavior;
 	// S5 — the default EXTERNAL main-coder CLI launched from the task board (Settings →
 	// Providers & Models). Optional; ABSENT means "codex" (today's hardcoded default).
+	// SUPERSEDED by rolesConfig.coderClient (below), which is the unified Roles-table source
+	// of truth; this legacy key is kept for lossless migration (resolve_roles_config reads it).
 	mainCoderClient?: "claude" | "codex";
+	// Role untangle (P6b) — the unified per-role CLIENT selectors, source of truth for the
+	// Roles table. camelCase mirror of the Rust RolesConfig. Each is a client id: a cloud CLI
+	// ("claude" | "codex" | a custom id), OR a LOCAL placement marker — "orchestrator" (the
+	// Devboule binary, for the orchestrator row) / "local" (the in-process agentic engine, for
+	// the Main coder + Verifier rows, which then run on mainCoderBackend / verifierBackend).
+	// Absent fields fall back to the legacy keys via read-time migration; use the resolved
+	// EffectiveRolesConfig from get_roles_config, not this raw partial. See RolesConfig.
+	rolesConfig?: RolesConfig;
+	// Role untangle (P6b path B) — the Main coder's OWN local model (the sandboxed agentic
+	// engine), MiniCoderBackend-shaped. Optional; when absent the local Main coder inherits the
+	// mini's model (read_main_coder_backend). Set via set_main_coder_backend_cmd.
+	mainCoderBackend?: MiniCoderBackend;
+	// Role untangle (P6b path B) — the Verifier's OWN local model, MiniCoderBackend-shaped.
+	// Optional; when absent the Verifier inherits the Main coder's model (which itself falls
+	// back to the mini). Set via set_verifier_backend_cmd. See read_verifier_backend.
+	verifierBackend?: MiniCoderBackend;
 	// The user-curated model registry (Settings → Providers & Models). Optional so an older
 	// config.json without the key still parses; readers default it to []. The coders choose
 	// which local model to run per role from this list. See ModelRegistryEntry.
