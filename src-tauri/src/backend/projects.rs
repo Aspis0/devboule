@@ -3377,7 +3377,10 @@ fn normalize_agent_client(value: &str) -> Result<String, String> {
 const CUSTOM_CLIENT_ID_MAX_LEN: usize = 32;
 const CUSTOM_CLIENT_LABEL_MAX_LEN: usize = 40;
 const CUSTOM_CLIENT_COMMAND_MAX_LEN: usize = 400;
-const RESERVED_CLIENT_IDS: [&str; 4] = ["codex", "claude", "powershell", "orchestrator"];
+// "local" is reserved (P6b): it is the Roles-table / hand-off placement marker for the
+// in-process agentic engine, so a user-registered custom client can never collide with it.
+const RESERVED_CLIENT_IDS: [&str; 5] =
+    ["codex", "claude", "powershell", "orchestrator", "local"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

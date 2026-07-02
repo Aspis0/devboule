@@ -41,9 +41,11 @@ vi.mock("./ModelRegistryCard", () => ({
   ModelRegistryCard: () =>
     createElement("div", { "data-testid": "model-registry-card" }),
 }));
-vi.mock("./MiniCoderBackendCard", () => ({
-  MiniCoderBackendCard: () =>
-    createElement("div", { "data-testid": "mini-coder-card" }),
+// Role untangle (P6b): the unified Roles table is mocked to a marker — its own save flows
+// are tested in its own file; here we only prove it mounts. (It calls useAppContext internally,
+// so mocking it also keeps this tab test free of an AppContext provider.)
+vi.mock("./RolesTableCard", () => ({
+  RolesTableCard: () => createElement("div", { "data-testid": "roles-table-card" }),
 }));
 vi.mock("./MiniWriteBehaviorCard", () => ({
   MiniWriteBehaviorCard: () =>
@@ -159,18 +161,30 @@ describe("ProvidersModelsTab", () => {
 
   it("renders all per-role card sections", async () => {
     await mount();
-    // S1: the default-open groups render their cards immediately.
+    // Default-open surfaces render immediately: the unified Roles table, the Models group
+    // (Model registry), and the Gates & helpers group (Censor + Design LLM).
     expect(
-      container.querySelector('[data-testid="censor-model-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="local-coder-card"]'),
+      container.querySelector('[data-testid="roles-table-card"]'),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="model-registry-card"]'),
     ).not.toBeNull();
     expect(
-      container.querySelector('[data-testid="mini-coder-card"]'),
+      container.querySelector('[data-testid="censor-model-card"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="design-llm-card"]'),
+    ).not.toBeNull();
+
+    // "Coders (advanced)" is collapsed by default (the Roles table supersedes it) — expand it.
+    const codersBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("Coders (advanced)"),
+    );
+    await act(async () => {
+      codersBtn?.click();
+    });
+    expect(
+      container.querySelector('[data-testid="local-coder-card"]'),
     ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="mini-write-behavior-card"]'),
@@ -178,18 +192,16 @@ describe("ProvidersModelsTab", () => {
     expect(
       container.querySelector('[data-testid="exa-search-key-card"]'),
     ).not.toBeNull();
-    // The "Oracle & design" group is collapsed by default — expand it, then assert.
-    const btn = Array.from(container.querySelectorAll("button")).find((b) =>
-      (b.textContent ?? "").includes("Oracle & design"),
+
+    // The "Oracle" group is collapsed by default — expand it, then assert.
+    const oracleBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("Oracle"),
     );
     await act(async () => {
-      btn?.click();
+      oracleBtn?.click();
     });
     expect(
       container.querySelector('[data-testid="oracle-llm-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="design-llm-card"]'),
     ).not.toBeNull();
   });
 

@@ -21,6 +21,9 @@ export const RESERVED_CLIENT_IDS = [
   "claude",
   "powershell",
   "orchestrator",
+  // P6b: the Roles-table / hand-off "Local" placement marker for the in-process agentic
+  // engine — reserved so a custom client can't collide with it.
+  "local",
 ] as const;
 
 const ID_PATTERN = /^[a-z0-9-]{1,32}$/;

@@ -67,6 +67,10 @@ interface BackendDraft {
   model: string;
   command: string;
   baseUrl: string;
+  // Max concurrent mini slots. Carried in the draft so a save PRESERVES it — the backend
+  // set command REPLACES the whole miniCoderBackend, so omitting it would silently reset it
+  // to the default (the bug the review caught). Only the Mini row surfaces an editor for it.
+  maxConcurrent: number;
 }
 
 const EMPTY_DRAFT: BackendDraft = {
@@ -74,6 +78,7 @@ const EMPTY_DRAFT: BackendDraft = {
   model: "",
   command: "",
   baseUrl: "",
+  maxConcurrent: 2,
 };
 
 // Local = on-device (the prompt never leaves the machine). Cloud = external (a
@@ -106,6 +111,7 @@ function draftFromBackend(backend: MiniCoderBackend | null | undefined): Backend
     model: backend.model ?? "",
     command: backend.command ?? "",
     baseUrl: backend.baseUrl ?? "",
+    maxConcurrent: backend.maxConcurrent ?? 2,
   };
 }
 
@@ -173,8 +179,10 @@ function MiniBackendFields(props: {
   statusMap: ProviderStatusMap;
   // The kinds this context allows (Local shows on-device kinds; Cloud shows external).
   kinds: MiniCoderBackendKind[];
+  // Only the Mini row surfaces the concurrency slot editor.
+  showMaxConcurrent?: boolean;
 }) {
-  const { idPrefix, draft, onChange, statusMap, kinds } = props;
+  const { idPrefix, draft, onChange, statusMap, kinds, showMaxConcurrent } = props;
   // Guard: if the current draft kind isn't in the allowed set (e.g. right after a
   // Local⇄Cloud flip), display the first allowed kind so the <select> value always
   // matches a rendered <option>.
@@ -266,6 +274,23 @@ function MiniBackendFields(props: {
         </label>
       ) : null}
 
+      {showMaxConcurrent ? (
+        <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          Max concurrent slots
+          <select
+            value={draft.maxConcurrent}
+            onChange={(e) => set({ maxConcurrent: Number(e.target.value) })}
+            className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+            aria-label="Maximum concurrent mini-coder slots"
+          >
+            <option value={1}>1</option>
+            <option value={2}>2 (default)</option>
+            <option value={3}>3</option>
+            <option value={4}>4</option>
+          </select>
+        </label>
+      ) : null}
+
       {firstError ? (
         <p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
           {firstError}
@@ -292,19 +317,34 @@ export function RolesTableCard() {
   const [verifierDraft, setVerifierDraft] = useState<BackendDraft>(() =>
     draftFromBackend(config.verifierBackend),
   );
-  const [verifierSameAsMain, setVerifierSameAsMain] = useState<boolean>(
-    () => !config.verifierBackend,
-  );
+  // "Same as Main coder" is a user toggle SEEDED from real state (verifier client already
+  // equals the coder's AND no independent verifier backend). Init true (safe); the effect
+  // below corrects it once the resolved clients load / change. The review caught the old
+  // `!config.verifierBackend`-only derivation, which re-checked the box after saving an
+  // independent CLOUD verifier (no backend touched) and then silently clobbered it on re-save.
+  const [verifierSameAsMain, setVerifierSameAsMain] = useState<boolean>(true);
+  // Pending per-role client dropdown edits (Orchestrator/Coder/Verifier), staged separately
+  // from the persisted `clients` so a row's Save sends ONLY that row's change onto the
+  // persisted baseline — not another row's unsaved dropdown edit (review finding #7).
+  const [pendingClients, setPendingClients] = useState<
+    Partial<Record<RoleKey, string>>
+  >({});
 
   const [detected, setDetected] = useState<DetectedProvider[] | null>(null);
   const [busyRole, setBusyRole] = useState<RoleKey | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedRole, setSavedRole] = useState<RoleKey | null>(null);
   const mountedRef = useRef(true);
+  const savedTimerRef = useRef<number | null>(null);
+  // "Same as Main coder" is seeded from persisted equality ONCE on the initial load, then it
+  // is a sticky user toggle — NOT re-derived on every save (that made saving an unrelated row
+  // silently flip it, the adversarial-verify finding).
+  const verifierSeededRef = useRef(false);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current);
     };
   }, []);
 
@@ -349,35 +389,58 @@ export function RolesTableCard() {
     setMainDraft(draftFromBackend(config.mainCoderBackend));
     setMiniDraft(draftFromBackend(config.miniCoderBackend));
     setVerifierDraft(draftFromBackend(config.verifierBackend));
-    setVerifierSameAsMain(!config.verifierBackend);
   }, [config.mainCoderBackend, config.miniCoderBackend, config.verifierBackend]);
+
+  // Seed "Same as Main coder" ONCE from persisted equality (verifier client already equals the
+  // coder's AND no independent verifier backend). After the first resolve it is a sticky user
+  // toggle — re-deriving on every `clients` change made an unrelated Coder/Orchestrator save
+  // silently flip it. When it IS checked, the coder-save path below re-persists the verifier to
+  // follow the coder, so the toggle stays truthful without being re-derived here.
+  useEffect(() => {
+    if (!clients || verifierSeededRef.current) return;
+    verifierSeededRef.current = true;
+    setVerifierSameAsMain(
+      clients.verifierClient === clients.coderClient && !config.verifierBackend,
+    );
+  }, [clients, config.verifierBackend]);
 
   const flashSaved = (role: RoleKey) => {
     setSavedRole(role);
-    window.setTimeout(() => {
+    if (savedTimerRef.current !== null) window.clearTimeout(savedTimerRef.current);
+    savedTimerRef.current = window.setTimeout(() => {
       if (mountedRef.current) setSavedRole((r) => (r === role ? null : r));
     }, 2000);
   };
 
-  // Persist the whole rolesConfig triple with ONE role's client overridden. The
-  // command REPLACES rolesConfig, so we always send all three (never a partial).
+  // Persist ONE role's client. The command REPLACES the whole rolesConfig, so we send the
+  // full triple — but built from the PERSISTED baseline with only THIS role's new value, so
+  // another row's unsaved dropdown edit is never dragged in (review finding #7). On success we
+  // adopt the resolved result and drop this role's pending edit.
   const saveClients = useCallback(
-    async (override: Partial<Record<RoleKey, string>>) => {
+    async (role: RoleKey, value: string) => {
       const base = clients ?? {
         orchestratorClient: "orchestrator",
         coderClient: "codex",
         verifierClient: "codex",
       };
       const next: RolesConfig = {
-        orchestratorClient: override.orchestrator ?? base.orchestratorClient,
-        coderClient: override.coder ?? base.coderClient,
-        verifierClient: override.verifier ?? base.verifierClient,
+        orchestratorClient:
+          role === "orchestrator" ? value : base.orchestratorClient,
+        coderClient: role === "coder" ? value : base.coderClient,
+        verifierClient: role === "verifier" ? value : base.verifierClient,
       };
       const result = await invokeBackendCommand<EffectiveRolesConfig>(
         "set_roles_config_cmd",
         { input: next },
       );
-      if (mountedRef.current && result) setClients(result);
+      if (mountedRef.current && result) {
+        setClients(result);
+        setPendingClients((p) => {
+          const n = { ...p };
+          delete n[role];
+          return n;
+        });
+      }
     },
     [clients],
   );
@@ -397,7 +460,11 @@ export function RolesTableCard() {
           validation.errors.baseUrl;
         throw new Error(firstError ?? "Invalid backend.");
       }
-      await invokeBackendCommand(command, { backend: validation.value });
+      // Merge maxConcurrent (not managed by validateMiniBackend) so a save never resets it.
+      const clamped = Math.max(1, Math.min(4, draft.maxConcurrent));
+      await invokeBackendCommand(command, {
+        backend: { ...validation.value, maxConcurrent: clamped },
+      });
     },
     [],
   );
@@ -409,29 +476,40 @@ export function RolesTableCard() {
       setError(null);
       try {
         if (role === "orchestrator") {
-          const client = clients?.orchestratorClient ?? "orchestrator";
-          await saveClients({ orchestrator: client });
+          const client =
+            pendingClients.orchestrator ??
+            clients?.orchestratorClient ??
+            "orchestrator";
+          await saveClients("orchestrator", client);
         } else if (role === "coder") {
-          const client = clients?.coderClient ?? "codex";
+          const client = pendingClients.coder ?? clients?.coderClient ?? "codex";
           if (isLocalClient("coder", client)) {
             await saveMiniBackend("set_main_coder_backend_cmd", mainDraft);
           }
-          await saveClients({ coder: client });
+          await saveClients("coder", client);
+          // Keep a mirroring verifier following the Main coder (verifier is cloud-only, so a
+          // local Main coder maps to a cloud default). This is what makes "Same as Main coder"
+          // stay truthful when the coder changes — without re-deriving the checkbox.
+          if (verifierSameAsMain) {
+            await invokeBackendCommand("set_verifier_backend_cmd", { backend: null });
+            await saveClients("verifier", client === "local" ? "codex" : client);
+          }
         } else if (role === "mini") {
           await saveMiniBackend("set_mini_coder_backend", miniDraft);
         } else {
-          // verifier
-          if (verifierSameAsMain) {
-            // Inherit the Main coder: clear the verifier's own backend + mirror its client.
-            await invokeBackendCommand("set_verifier_backend_cmd", { backend: null });
-            await saveClients({ verifier: clients?.coderClient ?? "codex" });
-          } else {
-            const client = clients?.verifierClient ?? "codex";
-            if (isLocalClient("verifier", client)) {
-              await saveMiniBackend("set_verifier_backend_cmd", verifierDraft);
-            }
-            await saveClients({ verifier: client });
-          }
+          // verifier — CLOUD-ONLY in the UI: no local verifier engine is wired yet (a "Local"
+          // verifier would silently run cloud, the review's dead-end finding), so the verifier
+          // never sets its own backend. "Same as Main coder" mirrors the coder's client.
+          await invokeBackendCommand("set_verifier_backend_cmd", { backend: null });
+          // Mirror from the PERSISTED coder client (never the coder row's unsaved pending edit
+          // — finding #7), cloud-resolved since the verifier can't run local.
+          const coderClient = clients?.coderClient ?? "codex";
+          const client = verifierSameAsMain
+            ? coderClient === "local"
+              ? "codex"
+              : coderClient
+            : (pendingClients.verifier ?? clients?.verifierClient ?? "codex");
+          await saveClients("verifier", client);
         }
         await refreshConfig();
         if (mountedRef.current) flashSaved(role);
@@ -444,9 +522,9 @@ export function RolesTableCard() {
     },
     [
       clients,
+      pendingClients,
       mainDraft,
       miniDraft,
-      verifierDraft,
       verifierSameAsMain,
       saveClients,
       saveMiniBackend,
@@ -454,20 +532,15 @@ export function RolesTableCard() {
     ],
   );
 
+  // Dropdown edits stage into pendingClients (not the persisted `clients`), so they don't
+  // leak into another row's Save.
   const setRoleClient = (role: RoleKey, client: string) => {
-    setClients((prev) => {
-      const base = prev ?? {
-        orchestratorClient: "orchestrator",
-        coderClient: "codex",
-        verifierClient: "codex",
-      };
-      if (role === "orchestrator") return { ...base, orchestratorClient: client };
-      if (role === "coder") return { ...base, coderClient: client };
-      return { ...base, verifierClient: client };
-    });
+    setPendingClients((p) => ({ ...p, [role]: client }));
   };
 
   const clientFor = (role: RoleKey): string => {
+    const pending = pendingClients[role];
+    if (pending !== undefined) return pending;
     if (!clients) return role === "orchestrator" ? "orchestrator" : "codex";
     if (role === "orchestrator") return clients.orchestratorClient;
     if (role === "coder") return clients.coderClient;
@@ -578,6 +651,7 @@ export function RolesTableCard() {
           onChange={setDraft}
           statusMap={statusMap}
           kinds={local ? LOCAL_KINDS : MINI_CLOUD_KINDS}
+          showMaxConcurrent
         />
       </div>
     );
@@ -588,14 +662,20 @@ export function RolesTableCard() {
       const b = config.miniCoderBackend;
       return b ? `${b.kind}${b.model ? ` · ${b.model}` : ""}` : "not configured";
     }
+    if (role === "verifier") {
+      // Cloud-only in the UI (no local verifier engine wired yet).
+      return verifierSameAsMain
+        ? "Same as Main coder"
+        : `Cloud · ${clientFor("verifier")}`;
+    }
     const client = clientFor(role);
     if (isLocalClient(role, client)) {
       if (role === "orchestrator") {
         const b = config.localCoderBackend;
         return `Local · ${b ? b.kind : "unset"}`;
       }
-      const b = role === "coder" ? config.mainCoderBackend : config.verifierBackend;
-      if (role === "verifier" && verifierSameAsMain) return "Same as Main coder";
+      // coder Local
+      const b = config.mainCoderBackend;
       return `Local · ${b ? b.kind : "inherits mini"}`;
     }
     return `Cloud · ${client}`;
@@ -677,7 +757,27 @@ export function RolesTableCard() {
                       it its own.
                     </p>
                   ) : (
-                    renderPlacement("verifier", verifierDraft, setVerifierDraft)
+                    <label className="block text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+                      Cloud CLI
+                      <select
+                        value={
+                          CLOUD_CLIENTS.includes(
+                            clientFor("verifier") as (typeof CLOUD_CLIENTS)[number],
+                          )
+                            ? clientFor("verifier")
+                            : "codex"
+                        }
+                        onChange={(e) => setRoleClient("verifier", e.target.value)}
+                        className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+                      >
+                        <option value="claude">Claude</option>
+                        <option value="codex">Codex</option>
+                      </select>
+                      <span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
+                        The verifier reviews (never writes). A local verifier engine isn&apos;t
+                        available yet — it runs a cloud CLI.
+                      </span>
+                    </label>
                   )}
                 </div>
               ) : (
