@@ -519,7 +519,15 @@ export function ProjectsView() {
   // The engine the hand-off launches = this project's per-project override, else the global
   // default. Keep plannerCoderId (what startNewProject/planWithOrchestrator hand to the coder)
   // resolved from that whenever the project's override or the default changes.
-  const mainCoderOverride = currentProject?.metadata.mainCoder ?? null;
+  // The hand-off engine override for the selected project. STATE (not a pure derivation) so a
+  // selection reflects in the dropdown IMMEDIATELY (optimistic) — otherwise the controlled
+  // <select> snapped back to the persisted value during the async save/reload, and on a project
+  // with no folder yet (no id to persist to) the choice was silently dropped ("stays Claude").
+  const [mainCoderOverride, setMainCoderOverride] = useState<string | null>(null);
+  // Adopt the selected project's persisted override whenever it (re)loads.
+  useEffect(() => {
+    setMainCoderOverride(currentProject?.metadata.mainCoder ?? null);
+  }, [currentProject?.metadata.mainCoder]);
   useEffect(() => {
     setPlannerCoderId(mainCoderOverride ?? mainCoderDefault);
   }, [mainCoderOverride, mainCoderDefault]);
@@ -546,9 +554,11 @@ export function ProjectsView() {
   const onMainCoderOverrideChange = useCallback(
     async (id: string) => {
       const engine = id === "" ? null : id;
+      // Optimistic: the dropdown + the resolved launch engine update right away.
+      setMainCoderOverride(engine);
       setPlannerCoderId(engine ?? mainCoderDefault);
       const pid = currentProject?.metadata.id;
-      if (!pid) return;
+      if (!pid) return; // No project/folder yet — keep it as a transient choice for this launch.
       try {
         await invokeBackendCommand("set_project_main_coder_override_cmd", {
           projectId: pid,
@@ -559,9 +569,11 @@ export function ProjectsView() {
         setError(
           e instanceof Error ? e.message : "Could not save the Main-coder engine.",
         );
+        // Revert the optimistic value to the persisted truth on failure.
+        setMainCoderOverride(currentProject?.metadata.mainCoder ?? null);
       }
     },
-    [currentProject?.metadata.id, mainCoderDefault, loadProject],
+    [currentProject?.metadata.id, currentProject?.metadata.mainCoder, mainCoderDefault, loadProject],
   );
 
   // Single source of truth for writing agent state into React state: it sets the
