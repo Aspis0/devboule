@@ -42,22 +42,39 @@ impl Drop for AgenticInflightGuard {
     }
 }
 
-pub(crate) fn should_run_agentic(
-    app: &AppHandle,
-    backend: &MiniCoderBackend,
-    directive: &MiniCoderDirective,
+/// PURE decision core for the agentic-vs-one-shot dispatch — every input is a
+/// plain value so the whole decision table (both tiers × policies) is
+/// unit-testable without an AppHandle.
+///
+/// MINI tier (byte-identical to the pre-Phase-3 behavior): a WRITE directive
+/// with `write_mode == AgenticIterative` and a configured base_url, then the S2
+/// policy — Safe never, Auto only for a registry-confirmed agentic-tier model,
+/// AgenticAllowed always.
+///
+/// MAIN tier (ROLE UNTANGLE Phase 3): the Main coder IS the agentic engine —
+/// the multi-turn sandboxed loop is its only write path, independent of
+/// `write_mode` and of the registry tier. Only two ceilings remain: it must be
+/// a WRITE directive with a configured base_url, and the user's explicit
+/// `Safe` policy still wins. When this returns false for a Main directive,
+/// `claim_and_launch` FAILS the directive with a clear reason — it never
+/// silently downgrades to the one-shot mini path.
+pub(crate) fn agentic_decision(
+    tier: mini_coder::DirectiveTier,
+    write: bool,
+    base_url_present: bool,
+    write_mode: mini_coder::WriteMode,
+    behavior: mini_coder::MiniWriteBehavior,
+    model_is_agentic_tier: bool,
 ) -> bool {
-    if !directive.write
-        || directive.write_mode != mini_coder::WriteMode::AgenticIterative
-        || backend.base_url.as_deref().is_none_or(|u| u.is_empty())
-    {
+    if !write || !base_url_present {
         return false;
     }
-
-    // NOTE: the local-backend non-loopback base_url gate lives in the CALLER, BEFORE the
-    // agentic/one-shot branch, so it blocks BOTH paths (declining only agentic here would just
-    // fall through to the one-shot, which makes the same remote request). (review F3/F4)
-
+    if tier == mini_coder::DirectiveTier::Main {
+        return !matches!(behavior, mini_coder::MiniWriteBehavior::Safe);
+    }
+    if write_mode != mini_coder::WriteMode::AgenticIterative {
+        return false;
+    }
     // S2 — the toggle STAYS (always give the user the choice); capability drives only the
     // AUTO default, it never removes a choice:
     //   Safe           => never agentic (force emit-edits).
@@ -66,12 +83,166 @@ pub(crate) fn should_run_agentic(
     //                     stays one-shot — the safe default (never assume an unknown model can
     //                     drive the multi-turn loop).
     //   AgenticAllowed => the user's explicit override wins — agentic even for a small model.
-    match super::projects::read_mini_write_behavior(app) {
+    match behavior {
         mini_coder::MiniWriteBehavior::Safe => false,
-        mini_coder::MiniWriteBehavior::Auto => {
-            mini_model_tier(app, backend).as_deref() == Some("agentic")
-        }
+        mini_coder::MiniWriteBehavior::Auto => model_is_agentic_tier,
         mini_coder::MiniWriteBehavior::AgenticAllowed => true,
+    }
+}
+
+pub(crate) fn should_run_agentic(
+    app: &AppHandle,
+    backend: &MiniCoderBackend,
+    directive: &MiniCoderDirective,
+) -> bool {
+    // NOTE: the local-backend non-loopback base_url gate lives in the CALLER, BEFORE the
+    // agentic/one-shot branch, so it blocks BOTH paths (declining only agentic here would just
+    // fall through to the one-shot, which makes the same remote request). (review F3/F4)
+    let behavior = super::projects::read_mini_write_behavior(app);
+    // Registry lookup preserved LAZY exactly as before: only an Auto-policy MINI
+    // directive consults the model registry (a Main directive never needs it).
+    let model_is_agentic_tier = directive.tier != mini_coder::DirectiveTier::Main
+        && matches!(behavior, mini_coder::MiniWriteBehavior::Auto)
+        && mini_model_tier(app, backend).as_deref() == Some("agentic");
+    agentic_decision(
+        directive.tier,
+        directive.write,
+        backend.base_url.as_deref().is_some_and(|u| !u.is_empty()),
+        directive.write_mode,
+        behavior,
+        model_is_agentic_tier,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agentic_decision;
+    use crate::backend::mini_coder::{DirectiveTier, MiniWriteBehavior, WriteMode};
+
+    #[test]
+    fn mini_tier_decision_table_is_unchanged() {
+        use DirectiveTier::Mini;
+        // Not a write / no base_url → never agentic.
+        for behavior in [
+            MiniWriteBehavior::Safe,
+            MiniWriteBehavior::Auto,
+            MiniWriteBehavior::AgenticAllowed,
+        ] {
+            assert!(!agentic_decision(
+                Mini,
+                false,
+                true,
+                WriteMode::AgenticIterative,
+                behavior,
+                true
+            ));
+            assert!(!agentic_decision(
+                Mini,
+                true,
+                false,
+                WriteMode::AgenticIterative,
+                behavior,
+                true
+            ));
+        }
+        // EmitEdits write_mode → never agentic (whatever the policy).
+        assert!(!agentic_decision(
+            Mini,
+            true,
+            true,
+            WriteMode::EmitEdits,
+            MiniWriteBehavior::AgenticAllowed,
+            true
+        ));
+        // S2 policy rows.
+        assert!(!agentic_decision(
+            Mini,
+            true,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Safe,
+            true
+        ));
+        assert!(agentic_decision(
+            Mini,
+            true,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Auto,
+            true
+        ));
+        assert!(!agentic_decision(
+            Mini,
+            true,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Auto,
+            false
+        ));
+        assert!(agentic_decision(
+            Mini,
+            true,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::AgenticAllowed,
+            false
+        ));
+    }
+
+    #[test]
+    fn main_tier_is_always_agentic_except_safe_policy() {
+        use DirectiveTier::Main;
+        // Main ignores write_mode AND the registry tier — the loop IS its write path.
+        assert!(agentic_decision(
+            Main,
+            true,
+            true,
+            WriteMode::EmitEdits,
+            MiniWriteBehavior::Auto,
+            false
+        ));
+        assert!(agentic_decision(
+            Main,
+            true,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Auto,
+            false
+        ));
+        assert!(agentic_decision(
+            Main,
+            true,
+            true,
+            WriteMode::EmitEdits,
+            MiniWriteBehavior::AgenticAllowed,
+            false
+        ));
+        // The user's explicit Safe policy is the only policy ceiling.
+        assert!(!agentic_decision(
+            Main,
+            true,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Safe,
+            true
+        ));
+        // Still must be a WRITE directive with a configured base_url.
+        assert!(!agentic_decision(
+            Main,
+            false,
+            true,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Auto,
+            true
+        ));
+        assert!(!agentic_decision(
+            Main,
+            true,
+            false,
+            WriteMode::AgenticIterative,
+            MiniWriteBehavior::Auto,
+            true
+        ));
     }
 }
 

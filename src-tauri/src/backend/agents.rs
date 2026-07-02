@@ -366,9 +366,7 @@ pub fn list_pending_design_requests(
     Ok(state
         .design_request_directives
         .into_iter()
-        .filter(|d| {
-            d.status == crate::backend::design_request::DesignRequestStatus::Pending
-        })
+        .filter(|d| d.status == crate::backend::design_request::DesignRequestStatus::Pending)
         .collect())
 }
 
@@ -1009,7 +1007,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
             // more PYTHON_ONLY_ROLES carve-out); summary/forbidden are the English
             // fleet-UI voice of the same mandate (bilingual split by design).
             role: "orchestrator".into(),
-            summary: "The frontier PLANNING tier: understands project AND infrastructure (Oracle + Cloudflare/Scaleway provider tools, read and task-audited mutation), delegates EVERY code write to spawn_mini_coder, manages the Kanban like a coder (claim, wip/review/blocked, reopen to todo) but never done; publishes only via the human-gated request_git_push.".into(),
+            summary: "The frontier PLANNING tier: understands project AND infrastructure (Oracle + Cloudflare/Scaleway provider tools, read and task-audited mutation), delegates EVERY code write — substantial work to spawn_main_coder (the sandboxed agentic Main coder), cheap mechanical sub-tasks to spawn_mini_coder — manages the Kanban like a coder (claim, wip/review/blocked, reopen to todo) but never done; publishes only via the human-gated request_git_push.".into(),
             allowed_tools: vec![
                 "agent_register",
                 "agent_heartbeat",
@@ -1036,6 +1034,9 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
                 "oracle_context",
                 "project_structure",
                 "spawn_mini_coder",
+                // ROLE UNTANGLE Phase 3: substantial work goes to the first-class
+                // MAIN CODER (always-agentic sandboxed engine). Orchestrator-only.
+                "spawn_main_coder",
                 "steer_mini_coder",
                 "mini_coder_result",
                 "request_git_push",
@@ -1048,7 +1049,7 @@ fn default_role_rules() -> Vec<AgentRoleRule> {
             .map(String::from)
             .collect(),
             forbidden: vec![
-                "NEVER writes files directly: it has NO filesystem write/mutation tool; EVERY code change goes through spawn_mini_coder (the orchestrator plans and front-loads context; the mini writes).",
+                "NEVER writes files directly: it has NO filesystem write/mutation tool; EVERY code change goes through delegation — spawn_main_coder for substantial/multi-file work (the sandboxed agentic Main coder), spawn_mini_coder for cheap mechanical sub-tasks (the orchestrator plans and front-loads context; they write).",
                 "To SUPERVISE a delegated mini call spawn_mini_coder with wait=false for its directiveId, watch its activity, steer with steer_mini_coder(directiveId, message) (or \"stop\"), then mini_coder_result(directiveId) for the outcome; the default blocking spawn is fine for simple fire-and-forget delegation.",
                 "For project or codebase questions use oracle_ask / oracle_context FIRST (grounded understanding) — never guess or hand-read the filesystem.",
                 "No done status: done is verifier-only with evidence. Claim and wip/review/blocked (and reopen to todo) exactly like a coder.",
@@ -1189,7 +1190,11 @@ fn mcp_command_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
     // byte-identical launch env). The Python MCP server reads PIGEON_PORT/PIGEON_AUTH_TOKEN
     // to learn that the durable mailbox transport is available (`_pigeon_enabled()`).
     let pigeon = crate::backend::pigeon_service::pigeon_spawn_env(app);
-    mcp_command_hint_for_paths(&root, projects_dir, pigeon.as_ref().map(|(p, t)| (p.as_str(), t.as_str())))
+    mcp_command_hint_for_paths(
+        &root,
+        projects_dir,
+        pigeon.as_ref().map(|(p, t)| (p.as_str(), t.as_str())),
+    )
 }
 
 fn mcp_command_hint_for_paths(
@@ -1200,9 +1205,9 @@ fn mcp_command_hint_for_paths(
     // NO-CHURN: with `pigeon_env` None (the default / Pigeon disabled) this is byte-identical
     // to before this slice. When Some, append the two `$env:` exports next to the existing ones.
     let pigeon_exports = match pigeon_env {
-        Some((port, token)) => format!(
-            " $env:PIGEON_PORT=\"{port}\"; $env:PIGEON_AUTH_TOKEN=\"{token}\";"
-        ),
+        Some((port, token)) => {
+            format!(" $env:PIGEON_PORT=\"{port}\"; $env:PIGEON_AUTH_TOKEN=\"{token}\";")
+        }
         None => String::new(),
     };
     format!(
@@ -1218,7 +1223,11 @@ fn mcp_command_hint_for_paths(
 fn mcp_client_config_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
     let root = management_root_for_mcp(app, projects_dir);
     let pigeon = crate::backend::pigeon_service::pigeon_spawn_env(app);
-    mcp_client_config_hint_for_paths(&root, projects_dir, pigeon.as_ref().map(|(p, t)| (p.as_str(), t.as_str())))
+    mcp_client_config_hint_for_paths(
+        &root,
+        projects_dir,
+        pigeon.as_ref().map(|(p, t)| (p.as_str(), t.as_str())),
+    )
 }
 
 fn mcp_client_config_hint_for_paths(
@@ -2159,13 +2168,26 @@ mod tests {
             .forbidden
             .iter()
             .any(|item| item.to_ascii_lowercase().contains("never writes")));
-        // Every orchestrator tool exists in the coder's list too (it differs from
-        // the coder only by LACKING censor_/visual_check — no file-write tool exists
-        // on either side; writes never flow through MCP).
-        assert!(orchestrator
+        // ROLE UNTANGLE Phase 3: the orchestrator/coder allowlists differ by
+        // EXACTLY two pinned deltas (mirrors the Python test) — the orchestrator
+        // alone holds the Main-coder dispatch; the coder alone holds the
+        // censor/visual adjudication surface. No file-write tool exists on either
+        // side; writes never flow through MCP.
+        let orch_only: Vec<&String> = orchestrator
             .allowed_tools
             .iter()
-            .all(|tool| coder.allowed_tools.contains(tool)));
+            .filter(|tool| !coder.allowed_tools.contains(*tool))
+            .collect();
+        assert_eq!(orch_only, vec!["spawn_main_coder"]);
+        let coder_only: Vec<&String> = coder
+            .allowed_tools
+            .iter()
+            .filter(|tool| !orchestrator.allowed_tools.contains(*tool))
+            .collect();
+        assert_eq!(
+            coder_only,
+            vec!["censor_findings", "censor_dispose", "visual_check"]
+        );
         assert!(rules
             .iter()
             .flat_map(|rule| rule.forbidden.iter())
@@ -2221,9 +2243,13 @@ mod tests {
 
         // When enabled, both hints carry the two Pigeon env vars.
         let command_on = mcp_command_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
-        let config_on = mcp_client_config_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
+        let config_on =
+            mcp_client_config_hint_for_paths(&root, &projects, Some(("28771", "abc123")));
         assert!(command_on.contains("PIGEON_PORT=\"28771\""), "{command_on}");
-        assert!(command_on.contains("PIGEON_AUTH_TOKEN=\"abc123\""), "{command_on}");
+        assert!(
+            command_on.contains("PIGEON_AUTH_TOKEN=\"abc123\""),
+            "{command_on}"
+        );
         assert!(config_on.contains("\"PIGEON_PORT\""), "{config_on}");
         assert!(config_on.contains("abc123"), "{config_on}");
         let _ = fs::remove_dir_all(&root);
@@ -2958,7 +2984,10 @@ mod tests {
         );
         // The verifier does NOT get the coder's pre-review mandate.
         let verifier = rules.iter().find(|r| r.role == "verifier").unwrap();
-        assert!(!verifier.forbidden.join(" ").contains("Sonnet review subagent"));
+        assert!(!verifier
+            .forbidden
+            .join(" ")
+            .contains("Sonnet review subagent"));
     }
 
     #[test]
@@ -3095,7 +3124,10 @@ mod tests {
         let coder = rules.iter().find(|r| r.role == "coder").unwrap();
         let blob = coder.forbidden.join(" ");
         assert!(blob.contains("write_mode"), "coder cites write_mode");
-        assert!(blob.contains("agenticIterative"), "coder cites the agentic mode");
+        assert!(
+            blob.contains("agenticIterative"),
+            "coder cites the agentic mode"
+        );
         assert!(blob.contains("emitEdits"), "coder cites the default mode");
         assert!(
             blob.contains("deterministic-gate coverage"),
@@ -3121,7 +3153,10 @@ mod tests {
             "coder must have request_git_push"
         );
         assert!(
-            !verifier.allowed_tools.iter().any(|t| t == "request_git_push"),
+            !verifier
+                .allowed_tools
+                .iter()
+                .any(|t| t == "request_git_push"),
             "verifier must NOT have request_git_push"
         );
     }
@@ -3137,7 +3172,10 @@ mod tests {
         assert!(!coder.push.is_empty(), "coder must declare a push mandate");
         let blob = coder.push.join(" ");
         // Commit-freely line.
-        assert!(blob.contains("Commit freely"), "coder commits freely: {blob}");
+        assert!(
+            blob.contains("Commit freely"),
+            "coder commits freely: {blob}"
+        );
         // Never-raw-push line that names the request_git_push tool.
         assert!(
             blob.contains("NEVER run a raw `git push`"),
@@ -3148,7 +3186,10 @@ mod tests {
             "coder push mandate cites the request_git_push tool: {blob}"
         );
         // Deny/timeout → STOP + escalate via needs_user, no retry/workaround.
-        assert!(blob.contains("denied or times out"), "deny/timeout branch: {blob}");
+        assert!(
+            blob.contains("denied or times out"),
+            "deny/timeout branch: {blob}"
+        );
         assert!(blob.contains("STOP"), "coder STOPS on deny/timeout: {blob}");
         assert!(
             blob.contains("needs_user"),

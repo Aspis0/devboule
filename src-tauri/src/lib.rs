@@ -124,8 +124,12 @@ fn bootstrap_default_config(dir: &std::path::Path) -> Result<std::path::PathBuf,
     );
     let temp_path = path.with_extension(format!("json.{suffix}.tmp"));
     let backup_path = path.with_extension(format!("json.{suffix}.bak"));
-    fs::write(&temp_path, "{}\n")
-        .map_err(|e| format!("Could not write a default config.json in {}: {e}", dir.display()))?;
+    fs::write(&temp_path, "{}\n").map_err(|e| {
+        format!(
+            "Could not write a default config.json in {}: {e}",
+            dir.display()
+        )
+    })?;
     replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")?;
     Ok(path)
 }
@@ -242,7 +246,10 @@ mod tests {
         // block file creation, so we drive the logic through a missing-dir seam instead).
         let missing = bootstrap_tmp_dir("unwritable").join("does-not-exist");
         let res = bootstrap_default_config(&missing);
-        assert!(res.is_err(), "bootstrap into a missing dir must Err, not panic");
+        assert!(
+            res.is_err(),
+            "bootstrap into a missing dir must Err, not panic"
+        );
         let _ = fs::remove_dir_all(missing.parent().unwrap());
     }
 }
@@ -458,6 +465,7 @@ pub fn run() {
             backend::cloud_duplex::project_cloud_orchestrator_send,
             backend::cloud_duplex::project_cloud_compact,
             backend::agent_pty::agent_pty_list,
+            backend::main_coder::spawn_main_coder_directive,
             backend::mini_coder_executor::mini_coder_kill,
             backend::mini_coder_executor::mini_coder_steer,
             backend::mini_activity::mini_activity_snapshot,

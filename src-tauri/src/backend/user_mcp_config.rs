@@ -56,6 +56,7 @@ const ORACLE_TOOL_NAMES: &[&str] = &[
     "agent_register",
     "agent_heartbeat",
     "spawn_mini_coder",
+    "spawn_main_coder",
     "steer_mini_coder",
     "mini_coder_result",
     "visual_check",
@@ -272,8 +273,7 @@ fn ensure_project_config_dir(project_root: &str) -> Result<PathBuf, String> {
     let dir = path
         .parent()
         .ok_or_else(|| "project MCP config path has no parent".to_string())?;
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("could not create .devboule folder: {e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create .devboule folder: {e}"))?;
     Ok(path)
 }
 
@@ -304,13 +304,19 @@ fn read_config_file(path: &Path) -> UserMcpConfig {
     let mut handle = match std::fs::File::open(path) {
         Ok(f) => f.take(MAX_CONFIG_BYTES + 1),
         Err(e) => {
-            eprintln!("[user-mcp] config unreadable, ignoring: {} ({e})", path.display());
+            eprintln!(
+                "[user-mcp] config unreadable, ignoring: {} ({e})",
+                path.display()
+            );
             return UserMcpConfig::default();
         }
     };
     let mut buf = Vec::new();
     if let Err(e) = handle.read_to_end(&mut buf) {
-        eprintln!("[user-mcp] config read failed, ignoring: {} ({e})", path.display());
+        eprintln!(
+            "[user-mcp] config read failed, ignoring: {} ({e})",
+            path.display()
+        );
         return UserMcpConfig::default();
     }
     if buf.len() as u64 > MAX_CONFIG_BYTES {
@@ -334,8 +340,9 @@ fn read_config_file(path: &Path) -> UserMcpConfig {
     // is the "an individual invalid entry → skip with a warning" fail-open rule. We validate
     // the SAME way an add would (transport + name guard + command), so a hand-edited file
     // cannot smuggle a server past the rules an in-app add would have enforced.
-    config.mcp_servers.retain(|name, record| {
-        match validate_entry(name, record) {
+    config
+        .mcp_servers
+        .retain(|name, record| match validate_entry(name, record) {
             Ok(()) => true,
             Err(reason) => {
                 eprintln!(
@@ -344,8 +351,7 @@ fn read_config_file(path: &Path) -> UserMcpConfig {
                 );
                 false
             }
-        }
-    });
+        });
     config
 }
 
@@ -403,7 +409,10 @@ fn validate_name(name: &str) -> Result<(), String> {
     }
     // Exact Oracle tool names (those not already caught by a reserved prefix, e.g.
     // `spawn_mini_coder`, `plan_submit`, the `project_*`/`censor_*` tools).
-    if ORACLE_TOOL_NAMES.iter().any(|t| t.eq_ignore_ascii_case(name)) {
+    if ORACLE_TOOL_NAMES
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(name))
+    {
         return Err(format!(
             "server name '{name}' collides with a reserved Oracle tool name"
         ));
@@ -1021,7 +1030,11 @@ mod tests {
         add_impl(&global, srv("off", "b", false)).unwrap();
         let merged = merge_files(&global, &project);
         let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["on"], "disabled entries excluded from merged output");
+        assert_eq!(
+            names,
+            vec!["on"],
+            "disabled entries excluded from merged output"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1049,7 +1062,10 @@ mod tests {
         add_impl(&global, srv("dup", "g", true)).unwrap();
         add_impl(&project, srv("dup", "p", false)).unwrap();
         let merged = merge_files(&global, &project);
-        assert!(merged.is_empty(), "project's disabled entry wins and removes the name");
+        assert!(
+            merged.is_empty(),
+            "project's disabled entry wins and removes the name"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1064,7 +1080,9 @@ mod tests {
         assert!(list_impl(&bad).is_empty());
         // Oversized ⇒ empty.
         let big = dir.join("big.json");
-        let mut content = String::from("{\"mcpServers\":{\"x\":{\"transport\":\"stdio\",\"command\":\"c\",\"_pad\":\"");
+        let mut content = String::from(
+            "{\"mcpServers\":{\"x\":{\"transport\":\"stdio\",\"command\":\"c\",\"_pad\":\"",
+        );
         content.push_str(&"z".repeat((MAX_CONFIG_BYTES as usize) + 1024));
         content.push_str("\"}}}");
         std::fs::write(&big, &content).unwrap();
@@ -1097,7 +1115,13 @@ mod tests {
     fn add_rejects_reserved_names() {
         let dir = fresh_dir("reserved");
         let path = dir.join("c.json");
-        for bad in ["oracle", "Oracle", "devboule", "aspis-management", "oracle_ask"] {
+        for bad in [
+            "oracle",
+            "Oracle",
+            "devboule",
+            "aspis-management",
+            "oracle_ask",
+        ] {
             let err = add_validated(&path, srv(bad, "python", true)).unwrap_err();
             assert!(
                 err.contains("reserved") || err.contains("Oracle tool"),
@@ -1105,9 +1129,17 @@ mod tests {
             );
         }
         // An exact Oracle tool name with no reserved prefix is also rejected.
-        for tool in ["spawn_mini_coder", "plan_submit", "project_get", "censor_dispose"] {
+        for tool in [
+            "spawn_mini_coder",
+            "plan_submit",
+            "project_get",
+            "censor_dispose",
+        ] {
             let err = add_validated(&path, srv(tool, "python", true)).unwrap_err();
-            assert!(err.contains("Oracle tool"), "tool name '{tool}' should be rejected, got: {err}");
+            assert!(
+                err.contains("Oracle tool"),
+                "tool name '{tool}' should be rejected, got: {err}"
+            );
         }
         // Nothing was written by any rejected add.
         assert!(list_impl(&path).is_empty());
@@ -1210,7 +1242,10 @@ mod tests {
         add_validated(&path, server).unwrap();
         let listed = list_impl(&path);
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].env.get("MY_KEY").map(String::as_str), Some("value"));
+        assert_eq!(
+            listed[0].env.get("MY_KEY").map(String::as_str),
+            Some("value")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1228,7 +1263,11 @@ mod tests {
         }"#;
         std::fs::write(&path, raw).unwrap();
         let names: Vec<String> = list_impl(&path).into_iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["good".to_string()], "the bad-env entry is skipped on read");
+        assert_eq!(
+            names,
+            vec!["good".to_string()],
+            "the bad-env entry is skipped on read"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1259,7 +1298,9 @@ mod tests {
 
         // \n in a value (newline injection).
         let mut server = srv("test-nl", "python", true);
-        server.env.insert("KEY".to_string(), "val\ninjected".to_string());
+        server
+            .env
+            .insert("KEY".to_string(), "val\ninjected".to_string());
         let err = add_validated(&path, server).unwrap_err();
         assert!(
             err.contains("control characters"),
@@ -1267,15 +1308,23 @@ mod tests {
         );
 
         // Nothing was written by any rejected add.
-        assert!(list_impl(&path).is_empty(), "no entry should have been stored");
+        assert!(
+            list_impl(&path).is_empty(),
+            "no entry should have been stored"
+        );
 
         // A clean value is accepted.
         let mut server = srv("test-ok", "python", true);
-        server.env.insert("KEY".to_string(), "clean-value".to_string());
+        server
+            .env
+            .insert("KEY".to_string(), "clean-value".to_string());
         add_validated(&path, server).unwrap();
         let listed = list_impl(&path);
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].env.get("KEY").map(String::as_str), Some("clean-value"));
+        assert_eq!(
+            listed[0].env.get("KEY").map(String::as_str),
+            Some("clean-value")
+        );
 
         // READ skips a hand-edited entry whose env value contains \r (the bypass path).
         // Write a raw JSON with a \r in the env value alongside a clean server.
@@ -1300,11 +1349,17 @@ mod tests {
         let mut server = srv("argtest", "python", true);
         server.args = vec!["--flag".to_string(), "line1\nline2".to_string()];
         let err = add_validated(&path, server).unwrap_err();
-        assert!(err.contains("control characters"), "newline arg should be rejected, got: {err}");
+        assert!(
+            err.contains("control characters"),
+            "newline arg should be rejected, got: {err}"
+        );
         // And a file carrying such an arg is dropped on read.
         let raw = "{ \"mcpServers\": { \"x\": { \"transport\": \"stdio\", \"command\": \"python\", \"args\": [\"a\\nb\"] } } }";
         std::fs::write(&path, raw).unwrap();
-        assert!(list_impl(&path).is_empty(), "the newline-arg entry is skipped on read");
+        assert!(
+            list_impl(&path).is_empty(),
+            "the newline-arg entry is skipped on read"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1330,10 +1385,16 @@ mod tests {
         assert!(err.contains("control characters"), "\\r in command: {err}");
         server.command = "py\x01thon".to_string();
         let err = add_validated(&path, server).unwrap_err();
-        assert!(err.contains("control characters"), "\\x01 in command: {err}");
+        assert!(
+            err.contains("control characters"),
+            "\\x01 in command: {err}"
+        );
 
         // Nothing was stored by any rejected add.
-        assert!(list_impl(&path).is_empty(), "no entry should have been stored");
+        assert!(
+            list_impl(&path).is_empty(),
+            "no entry should have been stored"
+        );
 
         // A clean command (incl. an absolute path with spaces, which is legitimate) is OK.
         add_validated(&path, srv("cmd-ok", "/usr/bin/python3", true)).unwrap();
@@ -1436,7 +1497,10 @@ mod tests {
             block.push_str(line);
             block.push('\n');
         }
-        assert!(in_block, "could not locate the `TOOLS = [` block in aspis_mcp.py");
+        assert!(
+            in_block,
+            "could not locate the `TOOLS = [` block in aspis_mcp.py"
+        );
         // Match `"name": "<value>"` (the tool key). Tiny hand-roll so the test needs no regex
         // crate: scan for the literal `"name"`, skip a `:` and optional spaces, then read the
         // next double-quoted string.
@@ -1447,14 +1511,20 @@ mod tests {
         while let Some(pos) = block[i..].find("\"name\"") {
             let mut j = i + pos + needle.len();
             // skip spaces, expect a colon, skip spaces.
-            while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+            while j < bytes.len() && bytes[j] == b' ' {
+                j += 1;
+            }
             if j < bytes.len() && bytes[j] == b':' {
                 j += 1;
-                while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+                while j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
                 if j < bytes.len() && bytes[j] == b'"' {
                     j += 1;
                     let start = j;
-                    while j < bytes.len() && bytes[j] != b'"' { j += 1; }
+                    while j < bytes.len() && bytes[j] != b'"' {
+                        j += 1;
+                    }
                     if j <= bytes.len() {
                         names.push(block[start..j].to_string());
                     }
@@ -1486,7 +1556,9 @@ mod tests {
         );
         let mut missing: Vec<String> = Vec::new();
         for tool in &registered {
-            let in_list = ORACLE_TOOL_NAMES.iter().any(|t| t.eq_ignore_ascii_case(tool));
+            let in_list = ORACLE_TOOL_NAMES
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(tool));
             if !in_list && !caught_by_reserved_prefix(tool) {
                 missing.push(tool.clone());
             }
@@ -1522,8 +1594,7 @@ mod allowlist_tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join(format!("user-mcp-test-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("user-mcp-test-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1575,7 +1646,10 @@ mod allowlist_tests {
         let project = dir.join("project.json");
         let allowlist = dir.join("allowlist.json");
 
-        write_test_config(&project, &[("allowed-srv", "python"), ("blocked-srv", "bash")]);
+        write_test_config(
+            &project,
+            &[("allowed-srv", "python"), ("blocked-srv", "bash")],
+        );
         write_test_allowlist(&allowlist, &["python"]);
 
         let allowed = load_allowed_commands_from_path(&allowlist);
@@ -1630,10 +1704,16 @@ mod allowlist_tests {
         std::fs::write(&allowlist, "{ this is not valid json").unwrap();
 
         let allowed = load_allowed_commands_from_path(&allowlist);
-        assert!(allowed.is_empty(), "malformed allowlist must fail-open to empty");
+        assert!(
+            allowed.is_empty(),
+            "malformed allowlist must fail-open to empty"
+        );
 
         let servers = merged_servers_inner(None, Some(&project), &allowed);
-        assert!(servers.is_empty(), "project servers must be rejected when allowlist is empty");
+        assert!(
+            servers.is_empty(),
+            "project servers must be rejected when allowlist is empty"
+        );
     }
 
     #[test]

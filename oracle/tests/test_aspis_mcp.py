@@ -3611,14 +3611,20 @@ class OrchestratorRoleTests(unittest.TestCase):
 
     # --- Allowlist shape (server-side gate is ROLE_ALLOWED_TOOLS) ---------------
 
-    def test_orchestrator_allowlist_is_strict_subset_of_coder(self):
-        # No privilege escalation: every orchestrator tool is also a coder tool.
+    def test_orchestrator_and_coder_allowlists_differ_exactly_as_designed(self):
+        # ROLE UNTANGLE Phase 3: the orchestrator is no longer a strict subset of
+        # the coder — it holds exactly ONE tool the coder lacks (spawn_main_coder,
+        # the Main-coder dispatch: the coder CLIs write with their own tools and
+        # never need it). The coder keeps exactly the censor/visual adjudication
+        # surface the orchestrator must never hold. Pinning BOTH deltas keeps any
+        # future drift loud.
         orch = ROLE_ALLOWED_TOOLS["orchestrator"]
         coder = ROLE_ALLOWED_TOOLS["coder"]
-        self.assertTrue(orch <= coder, f"orchestrator gained non-coder tools: {sorted(orch - coder)}")
-        # And it is genuinely tighter (drops the censor/visual tools; the provider
-        # surface is SHARED with the coder — owner decision, role untangle 2026-07).
-        self.assertTrue(orch < coder)
+        self.assertEqual(sorted(orch - coder), ["spawn_main_coder"])
+        self.assertEqual(
+            sorted(coder - orch),
+            ["censor_dispose", "censor_findings", "visual_check"],
+        )
 
     def test_orchestrator_allowlist_exact_contents(self):
         self.assertEqual(
@@ -3648,6 +3654,8 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "oracle_context",
                 "project_structure",
                 "spawn_mini_coder",
+                # ROLE UNTANGLE Phase 3: the Main-coder dispatch, orchestrator-only.
+                "spawn_main_coder",
                 "steer_mini_coder",
                 "mini_coder_result",
                 "request_git_push",
@@ -3657,6 +3665,18 @@ class OrchestratorRoleTests(unittest.TestCase):
                 "design_request",
             },
         )
+
+    def test_spawn_main_coder_is_orchestrator_only(self):
+        # ROLE UNTANGLE Phase 3: the Main-coder dispatch belongs to the
+        # orchestrator alone — the coder CLIs write with their own tools, the
+        # verifier never writes, the mini never spawns.
+        self.assertIn("spawn_main_coder", ROLE_ALLOWED_TOOLS["orchestrator"])
+        for role in ("coder", "verifier", "mini"):
+            self.assertNotIn(
+                "spawn_main_coder",
+                ROLE_ALLOWED_TOOLS[role],
+                f"{role} must not hold spawn_main_coder",
+            )
 
     def test_orchestrator_has_no_write_or_censor_tool_but_full_provider_surface(self):
         # It delegates ALL file writes to spawn_mini_coder and never adjudicates
@@ -9044,6 +9064,129 @@ class SteerMiniCoderTests(unittest.TestCase):
             set(schema["parameters"]),
             {"agent_id", "role", "directive_id", "message", "session_token"},
         )
+
+
+class SpawnMainCoderTests(unittest.TestCase):
+    """ROLE UNTANGLE Phase 3: spawn_main_coder — the orchestrator-only dispatch of
+    the first-class Main coder. Shares the mini-directive machinery but stamps
+    tier:"main" and FORCES write:true + write_mode:"agenticIterative"."""
+
+    def _project_dir(self, tmp: str) -> Path:
+        root = Path(tmp)
+        projects = root / "projects"
+        projects.mkdir()
+        sample_project(projects)
+        return root
+
+    def _register(self, root: Path, role: str, agent_id: str) -> str:
+        token = "test-launch-token"
+        (root / "projects" / ".aspis-agents.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "updatedAt": "2026-06-06T00:00:00+00:00",
+                    "sessions": [
+                        {
+                            "agentId": agent_id,
+                            "role": role,
+                            "status": "launch_pending",
+                            "lastSeenAt": "2026-06-06T00:00:00+00:00",
+                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
+                        }
+                    ],
+                    "claims": [],
+                    "events": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = handle_tool_call(
+            "agent_register",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "model": "opus",
+                "message": "planning",
+                "launch_token": token,
+            },
+            root=root,
+        )
+        return result["sessionToken"]
+
+    def _read_state(self, root: Path) -> dict:
+        return json.loads(
+            (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
+        )
+
+    def test_spawn_main_coder_stamps_main_tier_and_forces_agentic_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register(root, "orchestrator", "orch")
+            out = handle_tool_call(
+                "spawn_main_coder",
+                {
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "task": "implement the feature end-to-end",
+                    "files": ["src/a.rs", "src/b.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            self.assertIn("directiveId", out)
+            self.assertEqual(out["status"], "running")
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["id"], out["directiveId"])
+            # The Main-coder contract: tier stamped, write + agentic FORCED.
+            self.assertEqual(d["tier"], "main")
+            self.assertIs(d["write"], True)
+            self.assertEqual(d["writeMode"], "agenticIterative")
+            self.assertEqual(d["parentAgentId"], "orch")
+
+    def test_spawn_main_coder_rejected_for_coder_verifier_and_unregistered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register(root, "coder", "codex")
+            with self.assertRaises(McpError):
+                handle_tool_call(
+                    "spawn_main_coder",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "wait": False,
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            # And no directive was written by the rejected call.
+            state = self._read_state(root)
+            self.assertEqual(state.get("miniCoderDirectives", []), [])
+
+    def test_spawn_mini_coder_directive_carries_no_tier_key_no_churn(self):
+        # NO-CHURN: an ordinary mini directive must stay byte-identical — no
+        # `tier` key injected (mirrors the Rust serde skip).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register(root, "coder", "codex")
+            out = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["id"], out["directiveId"])
+            self.assertNotIn("tier", d)
 
 
 class AsyncMiniCoderResultTests(unittest.TestCase):

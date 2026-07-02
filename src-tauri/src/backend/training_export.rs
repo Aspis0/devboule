@@ -921,6 +921,8 @@ mod tests {
             files: vec![],
             write: false,
             write_mode: WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: None,
             backend: None,
             allow_oracle: false,
             kill_requested: false,

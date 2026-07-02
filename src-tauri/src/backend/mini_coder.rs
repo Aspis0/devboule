@@ -388,6 +388,33 @@ fn is_emit_edits(m: &WriteMode) -> bool {
     matches!(m, WriteMode::EmitEdits)
 }
 
+/// ROLE UNTANGLE Phase 3 — which TIER runs a directive. `Mini` (the default) is
+/// the delegated sub-task worker exactly as today. `Main` is the FIRST-CLASS
+/// MAIN CODER: the promoted agentic engine — always the multi-turn sandboxed
+/// tool loop, never the one-shot PTY (the executor FAILS a Main directive that
+/// cannot run agentic rather than silently downgrading it). Wire strings:
+/// `"mini"` / `"main"`; the Python co-writer (`spawn_main_coder` in
+/// aspis_mcp.py) emits `"tier": "main"`. NO-CHURN: paired with [`is_mini_tier`]
+/// so every existing directive (no `tier` key) serializes byte-identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum DirectiveTier {
+    /// The delegated sub-task worker (one-shot emit-edits or agentic by the S2
+    /// capability policy). Wire: `"mini"`.
+    #[default]
+    Mini,
+    /// The first-class Main coder: always agentic + Seatbelt-sandboxed. Wire:
+    /// `"main"`.
+    Main,
+}
+
+/// `skip_serializing_if` for a [`DirectiveTier`] that is `Mini`-by-default
+/// (NO-CHURN co-ownership): a writer that omitted `tier` round-trips through
+/// Rust without gaining a `"tier":"mini"`.
+fn is_mini_tier(t: &DirectiveTier) -> bool {
+    matches!(t, DirectiveTier::Mini)
+}
+
 /// E1 — the USER-FACING write-behavior POLICY (the ceiling the coder's per-task
 /// A3 `write_mode` decision must respect). Persisted in config.json under
 /// `miniWriteBehavior`; absent ⇒ [`MiniWriteBehavior::Auto`] (the current behavior).
@@ -457,6 +484,23 @@ pub struct MiniCoderDirective {
     /// serializes byte-identically to today, exactly like `write`/`allow_oracle`.
     #[serde(default, skip_serializing_if = "is_emit_edits")]
     pub write_mode: WriteMode,
+    /// ROLE UNTANGLE Phase 3: which TIER runs this directive — `Mini` (default,
+    /// the delegated sub-task worker, byte-identical to today) or `Main` (the
+    /// first-class Main coder: always agentic + sandboxed; the executor FAILS a
+    /// Main directive that cannot run agentic instead of downgrading it to the
+    /// one-shot path). NO-CHURN: omitted when `Mini` (see [`is_mini_tier`]); the
+    /// Python co-writer preserves it verbatim like every passthrough field.
+    #[serde(default, skip_serializing_if = "is_mini_tier")]
+    pub tier: DirectiveTier,
+    /// ROLE UNTANGLE Phase 3: EXPLICIT project scope for an APP-AUTHORED directive
+    /// (one whose `parent_agent_id` is the "app-user" sentinel, e.g. the UI's
+    /// `spawn_main_coder_directive` command). MCP-dispatched directives derive
+    /// their project from the live parent session (`snapshot_parent_project`) and
+    /// leave this None; when Some, the executor prefers it and skips the
+    /// parent-liveness auto-kill (the human IS the supervisor of an app-authored
+    /// directive — there is no parent session to die). NO-CHURN: omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Backend override (ollama|api|codex); None -> the global configured backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -1780,6 +1824,8 @@ mod tests {
             status,
             write: false,
             write_mode: WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: None,
             task: "docstring foo()".into(),
             files: vec!["src/a.rs".into()],
             backend: None,
@@ -1810,6 +1856,8 @@ mod tests {
             task: "t".into(),
             write: false,
             write_mode: WriteMode::EmitEdits,
+            tier: Default::default(),
+            project_id: None,
             files: vec!["src/a.rs".into()],
             backend: Some("ollama".into()),
             allow_oracle: true,
@@ -1940,6 +1988,50 @@ mod tests {
             serde_json::from_str(r#"{ "id": "d1", "task": "x", "resultPath": "mini/d1.json" }"#)
                 .unwrap();
         assert_eq!(from_absent.write_mode, WriteMode::EmitEdits);
+    }
+
+    #[test]
+    fn directive_tier_default_mini_omitted_no_churn() {
+        // ROLE UNTANGLE Phase 3 NO-CHURN: a Mini (default) directive serializes
+        // BYTE-IDENTICALLY to today — no `"tier"` key injected — and an absent
+        // key deserializes back to Mini.
+        let d = directive("d1", MiniCoderStatus::Pending, "2026-06-06T00:00:00Z");
+        assert_eq!(d.tier, DirectiveTier::Mini, "default tier is Mini");
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            !json.contains("tier"),
+            "default tier must be omitted (no churn): {json}"
+        );
+        let from_absent: MiniCoderDirective =
+            serde_json::from_str(r#"{ "id": "d1", "task": "x", "resultPath": "mini/d1.json" }"#)
+                .unwrap();
+        assert_eq!(from_absent.tier, DirectiveTier::Mini);
+    }
+
+    #[test]
+    fn directive_tier_main_round_trips_with_wire_string() {
+        // The Python co-writer (spawn_main_coder) emits `"tier": "main"`.
+        let mut d = directive("d1", MiniCoderStatus::Pending, "2026-06-06T00:00:00Z");
+        d.write = true;
+        d.write_mode = WriteMode::AgenticIterative;
+        d.tier = DirectiveTier::Main;
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains("\"tier\":\"main\""),
+            "expected the main wire string: {json}"
+        );
+        let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tier, DirectiveTier::Main);
+        assert_eq!(d, back);
+        // Standalone wire strings — the exact contract the Python co-writer mirrors.
+        assert_eq!(
+            serde_json::to_string(&DirectiveTier::Mini).unwrap(),
+            "\"mini\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DirectiveTier::Main).unwrap(),
+            "\"main\""
+        );
     }
 
     #[test]

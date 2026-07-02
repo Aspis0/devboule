@@ -438,6 +438,10 @@ ROLE_RULES = [
             "oracle_context",
             "project_structure",
             "spawn_mini_coder",
+            # ROLE UNTANGLE Phase 3: the orchestrator dispatches substantial work
+            # to the first-class MAIN CODER (always-agentic sandboxed engine).
+            # Orchestrator-only — the coder CLIs write with their own tools.
+            "spawn_main_coder",
             "steer_mini_coder",
             "mini_coder_result",
             "request_git_push",
@@ -447,7 +451,7 @@ ROLE_RULES = [
             "design_request",
         ],
         "forbidden": [
-            "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per spawn_mini_coder (tu pianifichi e riveli il contesto; il mini scrive).",
+            "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per la delega: spawn_main_coder per il lavoro sostanzioso/multi-file (il Main coder agentico sandboxato), spawn_mini_coder per i sotto-task economici/meccanici (tu pianifichi e riveli il contesto; loro scrivono).",
             "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
             "Per domande su progetto o codebase usa PRIMA oracle_ask / oracle_context (capacita di comprensione grounded): non indovinare ne leggere il filesystem a mano.",
             "Non imposta done: e verifier-only con evidenza. Tu puoi solo claim e wip/review/blocked (e riapertura a todo), esattamente come un coder.",
@@ -620,6 +624,41 @@ TOOLS = [
                     "project AND when the local model is capable enough to iterate "
                     "usefully). Gated by language coverage; falls back to one-shot "
                     "when uncovered. Default to emitEdits when unsure."
+                ),
+            },
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        # ROLE UNTANGLE Phase 3: the FIRST-CLASS MAIN CODER dispatch (orchestrator-
+        # only). Same directive machinery as spawn_mini_coder, but the directive is
+        # stamped tier:"main" and ALWAYS runs the agentic sandboxed tool loop —
+        # write:true + write_mode:"agenticIterative" are FORCED server-side; the
+        # Rust executor FAILS a main directive that cannot run agentic rather than
+        # downgrading it to a one-shot mini.
+        "name": "spawn_main_coder",
+        "description": (
+            "Solo orchestrator: dispaccia un task SOSTANZIOSO al MAIN CODER locale "
+            "(l'engine agentico sandboxato: loop multi-round read/edit/grep/run "
+            "contro il gate deterministico). A differenza di spawn_mini_coder e' "
+            "sempre agentico e pensato per task multi-file/di peso; write e "
+            "write_mode sono forzati lato server. Supervisione identica al mini: "
+            "wait=false + steer_mini_coder + mini_coder_result(directiveId)."
+        ),
+        "parameters": {
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "task": {"type": "string"},
+            "files": {"type": "array", "items": {"type": "string"}},
+            "backend": {"type": "string", "default": ""},
+            "allow_oracle": {"type": "boolean", "default": False},
+            "wait": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Whether to BLOCK until the main coder finishes (default true). "
+                    "Pass false to supervise: watch it, steer with steer_mini_coder, "
+                    "collect with mini_coder_result(directiveId)."
                 ),
             },
             "session_token": {"type": "string"},
@@ -5972,10 +6011,33 @@ def _await_mini_directive(
     return {"directiveId": directive_id, "result": synthesized}
 
 
+def dispatch_spawn_main_coder(
+    projects_dir: Path,
+    state_lock: Path,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """ROLE UNTANGLE Phase 3 — orchestrator-only dispatch of the FIRST-CLASS MAIN
+    CODER. Thin wrapper over the shared mini-directive machinery: it authenticates
+    against the `spawn_main_coder` grant (orchestrator allowlist only), FORCES
+    write:true + write_mode:"agenticIterative" (the Main coder's write path IS the
+    agentic loop), and stamps the directive tier:"main" so the Rust executor runs
+    the sandboxed multi-turn engine — and FAILS the directive (never a silent
+    one-shot downgrade) if it cannot."""
+    # Authn/authz against THIS tool's grant first — only the orchestrator holds it.
+    _agent_id, role = require_agent_tool(projects_dir, args, "spawn_main_coder")
+    if "spawn_main_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use spawn_main_coder.")
+    forced = dict(args)
+    forced["write"] = True
+    forced["write_mode"] = "agenticIterative"
+    return dispatch_spawn_mini_coder(projects_dir, state_lock, forced, tier="main")
+
+
 def dispatch_spawn_mini_coder(
     projects_dir: Path,
     state_lock: Path,
     args: dict[str, Any],
+    tier: str = "mini",
 ) -> dict[str, Any]:
     """Coder-only: delegate a cheap sub-task to a one-shot mini-coder the APP hosts.
 
@@ -6058,6 +6120,10 @@ def dispatch_spawn_mini_coder(
     }
     if backend is not None:
         directive["backend"] = backend
+    # ROLE UNTANGLE Phase 3 NO-CHURN: only emit `tier` when it is the non-default
+    # "main" (matches the Rust serde skip — a mini directive stays byte-identical).
+    if tier == "main":
+        directive["tier"] = "main"
     # NO-CHURN: only emit allowOracle when true (matches the Rust serde skip).
     if allow_oracle:
         directive["allowOracle"] = True
@@ -7658,6 +7724,9 @@ def handle_tool_call(
 
     if name == "spawn_mini_coder":
         return dispatch_spawn_mini_coder(projects_dir, state_lock, args)
+
+    if name == "spawn_main_coder":
+        return dispatch_spawn_main_coder(projects_dir, state_lock, args)
 
     if name == "steer_mini_coder":
         return dispatch_steer_mini_coder(projects_dir, state_lock, args)

@@ -928,12 +928,12 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
         // re-registered (app restart) between the snapshot read and now would be
         // wrongly judged gone. Re-confirm against ONE fresh read (lazily taken once
         // per pass) so only a parent STILL absent/closed at decision time is gone.
-        let parent_gone = parent_is_gone(&snapshot, &directive.parent_agent_id) && {
+        let parent_gone = directive_parent_gone(&snapshot, directive) && {
             // Lazily take the single fresh snapshot on the first re-check this pass.
             let fresh = fresh_recheck
                 .get_or_insert_with(|| agents::read_agent_live_state_snapshot(app).ok());
             match fresh {
-                Some(fresh) => parent_is_gone(fresh, &directive.parent_agent_id),
+                Some(fresh) => directive_parent_gone(fresh, directive),
                 None => false, // fail-safe: unreadable fresh state -> not gone.
             }
         };
@@ -1018,7 +1018,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
     //    lock (claim_and_launch) so a stale snapshot can't double-claim overlapping files.
     for claim_id in &plan.claims {
         if let Some(directive) = directives.iter().find(|d| &d.id == claim_id) {
-            let parent_project = snapshot_parent_project(&snapshot, &directive.parent_agent_id);
+            let parent_project = directive_project(&snapshot, &directive);
             claim_and_launch(app, directive, parent_project);
         }
     }
@@ -1425,6 +1425,7 @@ fn claim_and_launch(
                 &pre_started,
                 &backend_kind_label,
                 Some(hash.as_str()),
+                directive.tier,
             );
         });
     }
@@ -1465,7 +1466,28 @@ fn claim_and_launch(
     let persistent_net =
         crate::backend::projects::project_net_enabled(app, &project_id).unwrap_or(false);
 
-    let spawn_result = if should_run_agentic(app, &backend, directive) {
+    // ROLE UNTANGLE Phase 3: a MAIN-tier directive runs the agentic engine or
+    // FAILS — it must NEVER silently downgrade to the one-shot mini path (its
+    // whole point is the multi-turn sandboxed loop). A Safe write-behavior
+    // policy, a missing/non-loopback backend base_url, or a non-write directive
+    // all surface as a clean failure the dispatcher sees.
+    // Evaluated ONCE and reused for both the guard and the dispatch branch: two
+    // separate calls each re-read config.json, and a concurrent Safe flip between
+    // them could pass the guard yet take the one-shot branch — the exact downgrade
+    // the guard exists to prevent (hostile-review finding).
+    let run_agentic = should_run_agentic(app, &backend, directive);
+    if directive.tier == mini_coder::DirectiveTier::Main && !run_agentic {
+        fail_launching(
+            app,
+            &directive_id,
+            "main-coder directive cannot run the agentic engine (requires write:true, a \
+             configured loopback backend base_url, and a non-Safe mini write behavior) — \
+             refusing to downgrade to a one-shot mini",
+        );
+        return;
+    }
+
+    let spawn_result = if run_agentic {
         // FIX B: resolve the sandbox mode BEFORE consuming the transient grant.
         // When the mode is Unattended, a stale AllowOnce grant (issued before the
         // project was switched to Unattended) must NOT silently enable net — Unattended
@@ -1612,6 +1634,7 @@ fn claim_and_launch(
             &started_at,
             &backend_kind_label,
             oracle_grant.as_ref().map(|(_, hash)| hash.as_str()),
+            directive.tier,
         );
         cap_pass(state);
     });
@@ -2394,7 +2417,6 @@ fn live_kill_override(
 #[allow(unused_imports)]
 pub(crate) use super::mini_edit_apply::*;
 
-
 fn finalize_outcome(directive: &MiniCoderDirective) -> MiniCoderOutcome {
     if directive.kill_requested {
         return MiniCoderOutcome::aborted("stopped by human (Stop button)");
@@ -2421,18 +2443,33 @@ fn fail_launching(app: &AppHandle, directive_id: &str, reason: &str) {
     let _ = agents::mutate_agent_live_state(app, |state| {
         // The terminal outcome we both stamp AND propagate to the chain's ancestors.
         let outcome = MiniCoderOutcome::failed(reason.clone());
-        // A launch failure usually carries no agent_id (apply_launched, which stamps it,
-        // never ran), but read the LIVE value so a session is closed if one was upserted.
-        let _agent_id = state
+        // ROLE UNTANGLE Phase 3 fix (hostile-review finding): a session may have
+        // been PRE-persisted before the launch gates ran (the oracle-grant upsert
+        // in claim_and_launch fires before the base_url/Main-tier guards). A
+        // launch failure must CLOSE it, or a dangling "active" row leaks into the
+        // rail forever. The session id is deterministic (`mini_agent_id`), so
+        // derive it from the stored directive; the directive's own `agent_id`
+        // field (stamped by apply_launched) is also honored when present.
+        let session_ids: Vec<String> = state
             .mini_coder_directives
             .iter()
             .find(|d| d.id == id)
-            .and_then(|d| d.agent_id.clone());
+            .map(|d| {
+                let mut ids = vec![mini_agent_id(d)];
+                if let Some(live) = d.agent_id.clone() {
+                    ids.push(live);
+                }
+                ids
+            })
+            .unwrap_or_default();
         /* stamp_terminal */
         // gate deleted — terminal outcome stamped inline
         if let Some(d) = state.mini_coder_directives.iter_mut().find(|d| d.id == id) {
             d.status = outcome.status;
             d.result = Some(outcome);
+        }
+        for session_id in session_ids {
+            close_mini_session(state, &session_id);
         }
     });
     // Slice 3 (seam C, bypass path): a launch failure terminates off-finalize — close the
@@ -2484,7 +2521,7 @@ fn transition_visual_directive(
 /// every `mutate_agent_live_state` closure that touches directives, so the eviction
 /// (oldest TERMINAL only) runs a single time per persisted write rather than per
 /// `transition_directive`.
-fn cap_pass(state: &mut crate::backend::model::AgentLiveState) {
+pub(crate) fn cap_pass(state: &mut crate::backend::model::AgentLiveState) {
     mini_coder::cap_directives(&mut state.mini_coder_directives, MAX_DIRECTIVES);
     state.visual_check_directives = crate::backend::visual_check::cap_directives(std::mem::take(
         &mut state.visual_check_directives,
@@ -2553,8 +2590,13 @@ fn upsert_mini_session(
     // stored role pins what the mini may register as. None = the status-quo
     // "coder"-labelled, token-less mini session.
     oracle_token_hash: Option<&str>,
+    // ROLE UNTANGLE Phase 3: the directive TIER. A Main-tier session is the
+    // first-class MAIN CODER — stored role "coder" (never "mini") and a
+    // "Main coder running" message, so the rail/ledger tell the tiers apart.
+    tier: mini_coder::DirectiveTier,
 ) {
     let timestamp_now = Utc::now().to_rfc3339();
+    let is_main = tier == mini_coder::DirectiveTier::Main;
     if let Some(session) = state.sessions.iter_mut().find(|s| s.agent_id == agent_id) {
         if session.status == "done" {
             // Max-recall fix: a terminal session is never resurrected — a late
@@ -2564,7 +2606,16 @@ fn upsert_mini_session(
         }
         session.status = "active".into();
         session.parent_agent_id = Some(parent_agent_id.to_string());
-        if let Some(hash) = oracle_token_hash {
+        if is_main {
+            // The Main coder is never a "mini" — even with an oracle grant its
+            // registration role stays "coder".
+            session.role = "coder".into();
+            session.message = Some("Main coder running".into());
+            if let Some(hash) = oracle_token_hash {
+                session.launch_token_hash = Some(hash.to_string());
+                session.launch_token_issued_at = Some(timestamp_now.clone());
+            }
+        } else if let Some(hash) = oracle_token_hash {
             session.role = "mini".into();
             session.launch_token_hash = Some(hash.to_string());
             session.launch_token_issued_at = Some(timestamp_now.clone());
@@ -2582,7 +2633,7 @@ fn upsert_mini_session(
     }
     state.sessions.push(crate::backend::model::AgentSession {
         agent_id: agent_id.to_string(),
-        role: if oracle_token_hash.is_some() {
+        role: if oracle_token_hash.is_some() && !is_main {
             "mini".into()
         } else {
             "coder".into()
@@ -2590,7 +2641,11 @@ fn upsert_mini_session(
         model: None,
         status: "active".into(),
         client: Some(client.to_string()),
-        message: Some("Mini-coder running".into()),
+        message: Some(if is_main {
+            "Main coder running".into()
+        } else {
+            "Mini-coder running".into()
+        }),
         current_project_id,
         current_task_id: None,
         current_file_path: None,
@@ -2666,6 +2721,49 @@ fn snapshot_parent_project(
         .iter()
         .find(|s| s.agent_id == parent_agent_id)
         .and_then(|s| s.current_project_id.clone())
+}
+
+/// ROLE UNTANGLE Phase 3: the sentinel `parent_agent_id` of an APP-AUTHORED
+/// directive (the UI's `spawn_main_coder_directive` command). It is an event-log
+/// identity, never a live session — such directives carry their project scope
+/// EXPLICITLY (`directive.project_id`) and have no parent session to lose.
+pub(crate) const APP_USER_PARENT: &str = "app-user";
+
+/// True when this directive is app-authored: sentinel parent + explicit project.
+/// Both conditions required — a hand-crafted directive with the sentinel but no
+/// project still fails the claim cleanly (no scope), and an MCP directive that
+/// somehow carried a projectId still obeys the parent-liveness sweep.
+fn is_app_authored(directive: &MiniCoderDirective) -> bool {
+    directive.parent_agent_id == APP_USER_PARENT
+        && directive
+            .project_id
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+}
+
+/// Project scope for a directive: an app-authored one carries it explicitly;
+/// everything else derives it from the live parent session (the status quo).
+fn directive_project(
+    snapshot: &crate::backend::model::AgentLiveState,
+    directive: &MiniCoderDirective,
+) -> Option<String> {
+    if is_app_authored(directive) {
+        return directive.project_id.clone();
+    }
+    snapshot_parent_project(snapshot, &directive.parent_agent_id)
+}
+
+/// Parent-liveness for the auto-kill sweep: an app-authored directive has no
+/// parent session to lose — the HUMAN supervises it (Stop button / steer), so it
+/// is never "parent gone". Every MCP-dispatched directive keeps the sweep.
+fn directive_parent_gone(
+    snapshot: &crate::backend::model::AgentLiveState,
+    directive: &MiniCoderDirective,
+) -> bool {
+    if is_app_authored(directive) {
+        return false;
+    }
+    parent_is_gone(snapshot, &directive.parent_agent_id)
 }
 
 /// Resolve `(project_root, scratch_root)` for a mini. `scratch_root` =
@@ -3047,7 +3145,6 @@ fn remove_mini_temp_files(
 // re-import keeps every call site and test unchanged.
 #[allow(unused_imports)]
 pub(crate) use super::mini_prompt::*;
-
 
 #[cfg(test)]
 mod mini_language_tests {
@@ -3532,7 +3629,6 @@ fn build_headless_mini_command(
 #[cfg(test)]
 #[path = "mini_coder_executor_tests.rs"]
 mod tests;
-
 
 // ── Slice 3: unattended_denial_note pure helper ───────────────────────────────
 
