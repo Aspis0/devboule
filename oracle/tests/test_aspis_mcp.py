@@ -4048,6 +4048,50 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             self.assertNotIn("planId", tasks["T1"])  # manual task is plan-free
             self.assertEqual(tasks["T3"]["dependsOn"], ["T2"])
 
+    def test_weight_main_persists_and_mini_stays_no_churn(self):
+        # ROLE UNTANGLE Phase 4: a "main"-weight plan task persists weight:"main"
+        # (the runner routes it to spawn_main_coder); absent or "mini" stores NO
+        # weight key (no churn); an unknown value rejects the whole call.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            result = handle_tool_call(
+                "project_create_plan_tasks",
+                {
+                    "project_id": "scrna-seq",
+                    "plan_id": self.APPROVED_PLAN_ID,
+                    "tasks": [
+                        {"id": "a", "title": "Big refactor", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": [], "weight": "main"},
+                        {"id": "b", "title": "Tiny edit", "scope": ["src/b.ts"], "acceptance": "builds", "dependsOn": [], "weight": "mini"},
+                        {"id": "c", "title": "Plain task", "scope": ["src/c.ts"], "acceptance": "builds", "dependsOn": []},
+                    ],
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                },
+                root=root,
+            )
+            created = {t["title"]: t for t in result["tasks"]}
+            self.assertEqual(created["Big refactor"]["weight"], "main")
+            self.assertNotIn("weight", created["Tiny edit"])  # NO-CHURN
+            self.assertNotIn("weight", created["Plain task"])  # NO-CHURN
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._setup(tmp)
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "project_create_plan_tasks",
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": self.APPROVED_PLAN_ID,
+                        "tasks": [
+                            {"id": "a", "title": "Typo", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": [], "weight": "heavy"},
+                        ],
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                    },
+                    root=root,
+                )
+            self.assertIn("invalid weight", str(ctx.exception))
+
     def test_rejects_cyclic_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._setup(tmp)

@@ -139,6 +139,10 @@ struct TaskView {
     /// from the board. Empty when the task has no evidence yet. Used to feed a task's
     /// completed-dependency context even across a fresh `run_tasks` re-invocation.
     evidence: String,
+    /// ROLE UNTANGLE Phase 4: the task's execution tier — "main" routes the
+    /// dispatch to `spawn_main_coder`; anything else (absent/empty/"mini") stays
+    /// on `spawn_mini_coder`.
+    weight: String,
 }
 
 /// The next thing the linear runner should do given the active plan's current state.
@@ -464,9 +468,12 @@ async fn run_one_task(
         Node::Hollow,
     );
     let params = build_spawn_params(task, dep_summaries);
-    match mcp.call_tool("spawn_mini_coder", params).await {
+    // ROLE UNTANGLE Phase 4: a "main"-weight task goes to the Main coder (the
+    // always-agentic sandboxed engine); everything else keeps the mini path.
+    let tool = if task.weight.trim() == "main" { "spawn_main_coder" } else { "spawn_mini_coder" };
+    match mcp.call_tool(tool, params).await {
         Ok(text) => parse_mini_status(&text),
-        Err(e) => MiniVerdict::Blocked(format!("spawn_mini_coder failed: {}", elide(&e))),
+        Err(e) => MiniVerdict::Blocked(format!("{tool} failed: {}", elide(&e))),
     }
 }
 
@@ -537,6 +544,11 @@ async fn read_plan_views(mcp: &dyn McpBackend, project_id: &str) -> Result<Vec<T
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let weight = t
+            .get("weight")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         views.push(TaskView {
             id,
             title: t
@@ -551,6 +563,7 @@ async fn read_plan_views(mcp: &dyn McpBackend, project_id: &str) -> Result<Vec<T
             evidence,
             plan_id,
             updated_at,
+            weight,
         });
     }
     Ok(views)
@@ -945,6 +958,7 @@ mod tests {
             evidence: String::new(),
             plan_id: "P".into(),
             updated_at: "t".into(),
+            weight: String::new(),
         };
         // With a completed-dependency summary → it is front-loaded.
         let deps = vec![("T1".to_string(), "created the auth module in auth.rs".to_string())];
@@ -1097,7 +1111,7 @@ mod tests {
                     self.set_status(&id, &status);
                     Ok(serde_json::json!({"metadata": {"id": "proj"}}).to_string())
                 }
-                "spawn_mini_coder" => {
+                "spawn_mini_coder" | "spawn_main_coder" => {
                     let mut cursor = self.mini_cursor.lock().unwrap();
                     let idx = *cursor;
                     *cursor += 1;
@@ -1133,7 +1147,7 @@ mod tests {
                 "project_update_status" => {
                     Ok(serde_json::json!({"metadata": {"id": "proj"}}).to_string())
                 }
-                "spawn_mini_coder" => Err("backend offline".to_string()),
+                "spawn_mini_coder" | "spawn_main_coder" => Err("backend offline".to_string()),
                 other => Err(format!("unexpected tool {other}")),
             }
         }
@@ -1168,7 +1182,7 @@ mod tests {
                     Ok(serde_json::json!({"metadata": {"id": "proj"}}).to_string())
                 }
                 // Escalate -> a block verdict that drives the runner into set_blocked.
-                "spawn_mini_coder" => Ok(serde_json::json!(
+                "spawn_mini_coder" | "spawn_main_coder" => Ok(serde_json::json!(
                     {"directiveId": "d", "result": {"status": "escalated"}}
                 )
                 .to_string()),
@@ -1197,6 +1211,28 @@ mod tests {
         })
     }
 
+    /// Build a plan-tagged Kanban task JSON object with a `weight` field.
+    fn ktask_with_weight(
+        id: &str,
+        plan: &str,
+        deps: &[&str],
+        status: &str,
+        updated_at: &str,
+        weight: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "title": format!("title {id}"),
+            "status": status,
+            "planId": plan,
+            "scope": [format!("src/{id}.rs")],
+            "acceptance": "cargo test",
+            "dependsOn": deps,
+            "updatedAt": updated_at,
+            "weight": weight,
+        })
+    }
+
     /// A MANUAL task (no planId) — the runner must ignore it entirely.
     fn manual_task(id: &str, status: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1209,6 +1245,70 @@ mod tests {
 
     fn disabled() -> Activity {
         Activity::disabled()
+    }
+
+    /// ROLE UNTANGLE Phase 4: a task with `weight: "main"` must delegate to
+    /// `spawn_main_coder` (not `spawn_mini_coder`), while a task without weight
+    /// keeps the mini path.
+    #[tokio::test]
+    async fn main_weight_task_delegates_to_spawn_main_coder() {
+        // A plan with one ready task carrying `weight: "main"` — the runner must
+        // call `spawn_main_coder`, NOT `spawn_mini_coder`.
+        let mock = KanbanMock::new(
+            vec![ktask_with_weight(
+                "T001",
+                "p1",
+                &[],
+                STATUS_TODO,
+                "2026-06-17T10:00:00Z",
+                "main",
+            )],
+            &["done"],
+        );
+        let report = run_tasks(&mock, "proj", &disabled()).await.unwrap();
+        assert_eq!(report.blocked, None);
+        assert_eq!((report.completed, report.total), (1, 1));
+        assert_eq!(
+            mock.count("spawn_main_coder"),
+            1,
+            "a main-weight task uses spawn_main_coder"
+        );
+        assert_eq!(
+            mock.count("spawn_mini_coder"),
+            0,
+            "no spawn_mini_coder for a main-weight task"
+        );
+    }
+
+    /// A task without a weight (or with an empty weight) must keep using the
+    /// spawn_mini_coder path — byte-identical to the existing behavior.
+    #[tokio::test]
+    async fn absent_weight_task_keeps_spawn_mini_coder() {
+        // A plan with one ready task with NO weight — must delegate to
+        // `spawn_mini_coder`, as before.
+        let mock = KanbanMock::new(
+            vec![ktask(
+                "T001",
+                "p1",
+                &[],
+                STATUS_TODO,
+                "2026-06-17T10:00:00Z",
+            )],
+            &["done"],
+        );
+        let report = run_tasks(&mock, "proj", &disabled()).await.unwrap();
+        assert_eq!(report.blocked, None);
+        assert_eq!((report.completed, report.total), (1, 1));
+        assert_eq!(
+            mock.count("spawn_mini_coder"),
+            1,
+            "absent weight keeps spawn_mini_coder"
+        );
+        assert_eq!(
+            mock.count("spawn_main_coder"),
+            0,
+            "no spawn_main_coder for absent weight"
+        );
     }
 
     // --- Active-plan detection (0 / 1 / multiple) ----------------------------
@@ -1591,7 +1691,7 @@ mod tests {
                     self.set_status(&id, &status);
                     Ok(serde_json::json!({"metadata": {"id": "proj"}}).to_string())
                 }
-                "spawn_mini_coder" => {
+                "spawn_mini_coder" | "spawn_main_coder" => {
                     // The delegated `task` text leads with the title "title T00X" — match it to
                     // the per-id scripted status (unmatched => done, so an over-run still ends).
                     let text = params["task"].as_str().unwrap_or("");
@@ -1839,7 +1939,7 @@ mod tests {
                         // returns todo, keeping the task perpetually "runnable".
                         Ok(r#"{"metadata":{"id":"proj"}}"#.to_string())
                     }
-                    "spawn_mini_coder" => Ok(
+                    "spawn_mini_coder" | "spawn_main_coder" => Ok(
                         serde_json::json!({"directiveId":"d","result":{"status":"done"}})
                             .to_string(),
                     ),

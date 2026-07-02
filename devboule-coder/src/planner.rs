@@ -168,10 +168,32 @@ pub struct Task {
     /// id; the whole graph must be acyclic.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// ROLE UNTANGLE Phase 4: the execution TIER the runner dispatches this task
+    /// to — "mini" (default; cheap/mechanical work, the one-shot mini) or "main"
+    /// (the first-class Main coder: the always-agentic sandboxed engine, for
+    /// substantial / multi-file / build-and-verify work). Optional in the model's
+    /// JSON; an ABSENT key, an explicit `null`, or `""` all normalize to mini —
+    /// local models routinely null out an unused optional, and that must not burn
+    /// a plan retry (`deny_unknown_fields` on this struct only rejects UNKNOWN
+    /// keys, not a null value on a known one, so the null-tolerant deserializer
+    /// below is what saves it).
+    #[serde(default, deserialize_with = "de_weight_null_as_empty")]
+    pub weight: String,
     /// Kanban status. Always `"pending"` at plan time.
     pub status: String,
     /// Attempt counter. Always `0` at plan time.
     pub attempts: u32,
+}
+
+/// Null-tolerant string deserializer for the optional `weight` field: an explicit
+/// JSON `null` deserializes to `""` (the mini default) instead of the hard
+/// "invalid type: null, expected a string" error a plain `String` would raise.
+/// An absent key never reaches here (`#[serde(default)]` fills `""` first).
+fn de_weight_null_as_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 // --- The EXPLORE note (one fenced JSON block per spine file) -----------------
@@ -585,7 +607,12 @@ fn build_plan_prompt(
     prompt.push_str("- Task `id`s are unique and non-empty (e.g. T001). `dependsOn` lists prerequisite task ids and MUST be acyclic.\n");
     prompt.push_str("- All paths are project-root-relative (no absolute, no `..`).\n");
     prompt.push_str(&format!("- At most {MAX_TASKS} tasks.\n"));
-    prompt.push_str("- Every task starts with \"status\": \"pending\" and \"attempts\": 0.\n\n");
+    prompt.push_str("- Every task starts with \"status\": \"pending\" and \"attempts\": 0.\n");
+    prompt.push_str(
+        "- Optional \"weight\": \"main\" routes the task to the MAIN CODER (the stronger \
+         agentic engine) — use it for substantial, multi-file or build-and-verify work; \
+         omit it (or \"mini\") for cheap mechanical edits.\n\n",
+    );
     prompt.push_str(
         "Emit EXACTLY ONE fenced ```plan``` block — a single JSON object — and nothing else:\n\
          ```plan\n\
@@ -638,6 +665,15 @@ pub(crate) fn validate_plan_structure(plan: &TasksPlan) -> Result<(), String> {
         }
         check_field("title", &task.title)?;
         check_field("acceptance", &task.acceptance)?;
+        // ROLE UNTANGLE Phase 4: weight is optional but, when present, must be a
+        // known tier — a typo like "heavy" must be a retryable parse error, not a
+        // silent mini fallback.
+        if !matches!(task.weight.trim(), "" | "mini" | "main") {
+            return Err(format!(
+                "task {} has invalid weight {:?} (allowed: \"mini\" or \"main\")",
+                task.id, task.weight
+            ));
+        }
 
         if task.scope.is_empty() {
             return Err(format!("task `{}` has an empty `scope`", task.id));
@@ -824,13 +860,21 @@ fn build_plan_tasks_payload(plan: &TasksPlan) -> serde_json::Value {
         .tasks
         .iter()
         .map(|t| {
-            serde_json::json!({
-                "id": t.id,
-                "title": t.title,
-                "scope": t.scope,
-                "acceptance": t.acceptance,
-                "dependsOn": t.depends_on,
-            })
+            {
+                let mut entry = serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "scope": t.scope,
+                    "acceptance": t.acceptance,
+                    "dependsOn": t.depends_on,
+                });
+                // ROLE UNTANGLE Phase 4 NO-CHURN: only a "main"-weight task carries
+                // the field on the wire; mini stays byte-identical to the 1a contract.
+                if t.weight.trim() == "main" {
+                    entry["weight"] = serde_json::json!("main");
+                }
+                entry
+            }
         })
         .collect();
     serde_json::Value::Array(tasks)
@@ -1788,6 +1832,84 @@ mod tests {
         );
     }
 
+    // --- ROLE UNTANGLE Phase 4: task weight ----------------------------------
+
+    fn weighted_task(id: &str, weight: &str) -> Task {
+        Task {
+            id: id.into(),
+            title: "t".into(),
+            scope: vec!["a.rs".into()],
+            context_files: vec![],
+            acceptance: "builds".into(),
+            depends_on: vec![],
+            status: "pending".into(),
+            attempts: 0,
+            weight: weight.into(),
+        }
+    }
+
+    #[test]
+    fn weight_validation_accepts_known_tiers_and_rejects_typos() {
+        for w in ["", "mini", "main"] {
+            let plan = TasksPlan {
+                project_goal: "g".into(),
+                tasks: vec![weighted_task("T001", w)],
+            };
+            assert!(
+                validate_plan_structure(&plan).is_ok(),
+                "weight {w:?} must be accepted"
+            );
+        }
+        let plan = TasksPlan {
+            project_goal: "g".into(),
+            tasks: vec![weighted_task("T001", "heavy")],
+        };
+        let err = validate_plan_structure(&plan).expect_err("unknown weight rejected");
+        assert!(
+            err.contains("invalid weight") && err.contains("T001"),
+            "names the field + task: {err}"
+        );
+    }
+
+    #[test]
+    fn payload_emits_weight_only_for_main_no_churn() {
+        let plan = TasksPlan {
+            project_goal: "g".into(),
+            tasks: vec![
+                weighted_task("T001", "main"),
+                weighted_task("T002", "mini"),
+                weighted_task("T003", ""),
+            ],
+        };
+        let payload = build_plan_tasks_payload(&plan);
+        let arr = payload.as_array().unwrap();
+        assert_eq!(arr[0]["weight"], serde_json::json!("main"));
+        // NO-CHURN: a mini / unweighted task carries no `weight` key at all.
+        assert!(arr[1].get("weight").is_none(), "mini omits weight: {:?}", arr[1]);
+        assert!(arr[2].get("weight").is_none(), "empty omits weight: {:?}", arr[2]);
+    }
+
+    #[test]
+    fn weight_deserializes_null_and_absent_as_empty() {
+        // A local model may omit the key OR emit `"weight": null` — both must
+        // normalize to "" (mini), never a parse error that burns a plan retry.
+        let absent: Task = serde_json::from_str(
+            r#"{"id":"T1","title":"t","scope":["a.rs"],"acceptance":"b","status":"pending","attempts":0}"#,
+        )
+        .expect("absent weight parses");
+        assert_eq!(absent.weight, "");
+        let null: Task = serde_json::from_str(
+            r#"{"id":"T1","title":"t","scope":["a.rs"],"acceptance":"b","status":"pending","attempts":0,"weight":null}"#,
+        )
+        .expect("null weight parses");
+        assert_eq!(null.weight, "");
+        let main: Task = serde_json::from_str(
+            r#"{"id":"T1","title":"t","scope":["a.rs"],"acceptance":"b","status":"pending","attempts":0,"weight":"main"}"#,
+        )
+        .expect("main weight parses");
+        assert_eq!(main.weight, "main");
+    }
+
     #[tokio::test]
     async fn dependson_cycle_is_rejected() {
         let plan = TasksPlan {
@@ -1802,6 +1924,7 @@ mod tests {
                     depends_on: vec!["T002".into()],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
                 Task {
                     id: "T002".into(),
@@ -1812,6 +1935,7 @@ mod tests {
                     depends_on: vec!["T001".into()],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
             ],
         };
@@ -1832,6 +1956,7 @@ mod tests {
                 depends_on: vec!["T999".into()],
                 status: "pending".into(),
                 attempts: 0,
+                weight: String::new(),
             }],
         };
         let err = validate_plan(&plan).expect_err("a dangling dep must be rejected");
@@ -1854,6 +1979,7 @@ mod tests {
                 depends_on: vec![],
                 status: "pending".into(),
                 attempts: 0,
+                weight: String::new(),
             }],
         };
         let err = validate_plan(&plan).expect_err("empty acceptance must be rejected");
@@ -1874,6 +2000,7 @@ mod tests {
                     depends_on: vec![],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
                 Task {
                     id: "T001".into(),
@@ -1884,6 +2011,7 @@ mod tests {
                     depends_on: vec![],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
             ],
         };
@@ -1907,6 +2035,7 @@ mod tests {
                     depends_on: vec![],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
                 Task {
                     id: "T002".into(),
@@ -1917,6 +2046,7 @@ mod tests {
                     depends_on: vec!["T001".into(), "T001".into()],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
             ],
         };
@@ -1942,6 +2072,7 @@ mod tests {
                 depends_on: vec![],
                 status: "pending".into(),
                 attempts: 1,
+                weight: String::new(),
             }],
         };
         let err = validate_plan(&plan).expect_err("attempts != 0 must be rejected");
@@ -1963,6 +2094,7 @@ mod tests {
                 depends_on: vec![],
                 status: "pending".into(),
                 attempts: 0,
+                weight: String::new(),
             }],
         };
         let err = validate_plan(&plan).expect_err("a traversal scope path must be rejected");
@@ -1982,6 +2114,7 @@ mod tests {
                 depends_on: vec!["T001".into()],
                 status: "pending".into(),
                 attempts: 0,
+                weight: String::new(),
             }],
         };
         let err = validate_plan(&plan).expect_err("a self-dep must be rejected");
@@ -2003,6 +2136,7 @@ mod tests {
                     depends_on: vec![],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
                 Task {
                     id: "T002".into(),
@@ -2013,6 +2147,7 @@ mod tests {
                     depends_on: vec!["T001".into()],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
                 Task {
                     id: "T003".into(),
@@ -2023,6 +2158,7 @@ mod tests {
                     depends_on: vec!["T002".into()],
                     status: "pending".into(),
                     attempts: 0,
+                    weight: String::new(),
                 },
             ],
         };

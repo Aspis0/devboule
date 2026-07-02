@@ -8283,15 +8283,58 @@ def handle_tool_call(
             ):
                 raise McpError("Plan task dependsOn must be a list of task ids.")
             deps = [normalize_task_id(d) for d in raw_deps]
-            parsed.append(
-                {
-                    "internal_id": internal_id,
-                    "title": title,
-                    "acceptance": acceptance,
-                    "scope": scope,
-                    "deps": deps,
-                }
-            )
+            # ROLE UNTANGLE Phase 4: validate `weight` per entry. "main" routes
+            # the task to the main coder (spawn_main_coder); absent/None/""/"mini"
+            # → store NOTHING (NO-CHURN: pre-Phase-4 tasks stay byte-identical).
+            # Any other value is rejected (matching how other per-entry validation
+            # errors are raised in this same loop).
+            raw_weight = entry.get("weight")
+            if raw_weight is not None and str(raw_weight).strip():
+                # Cap before processing/echoing: this tool is reachable directly by
+                # any orchestrator (not only via the char-capped local planner), so
+                # an arbitrarily large adversarial value must not be fully processed
+                # or echoed verbatim into the error body.
+                weight = str(raw_weight).strip().lower()[:16]
+                if weight not in ("mini", "main"):
+                    raise McpError(
+                        f"task {internal_id} has invalid weight {weight!r} "
+                        f"(allowed: 'mini' or 'main')"
+                    )
+                # Only "main" is persisted ("mini" is the default — no-CHURN).
+                if weight == "main":
+                    parsed.append(
+                        {
+                            "internal_id": internal_id,
+                            "title": title,
+                            "acceptance": acceptance,
+                            "scope": scope,
+                            "deps": deps,
+                            "weight": "main",
+                        }
+                    )
+                else:
+                    # "mini" → NO-CHURN: store nothing (pre-Phase-4 tasks stay
+                    # byte-identical, no `weight` key in the stored task dict).
+                    parsed.append(
+                        {
+                            "internal_id": internal_id,
+                            "title": title,
+                            "acceptance": acceptance,
+                            "scope": scope,
+                            "deps": deps,
+                        }
+                    )
+            else:
+                # absent / None / "" → NO-CHURN: store nothing.
+                parsed.append(
+                    {
+                        "internal_id": internal_id,
+                        "title": title,
+                        "acceptance": acceptance,
+                        "scope": scope,
+                        "deps": deps,
+                    }
+                )
         # A plan is self-contained: a dependsOn must reference an id PRESENT in this
         # batch (reject before allocating ids — the planner's ids are not yet remapped).
         for entry in parsed:
@@ -8359,6 +8402,13 @@ def handle_tool_call(
                         # mini's write allowlist, the acceptance check, and the DAG.
                         "planId": plan_id,
                     }
+                    # ROLE UNTANGLE Phase 4: route the task to the main coder when
+                    # the planner explicitly specified `weight: "main"` (the stored
+                    # task dict gets the `weight` key; absent/None/"mini" → NO-CHURN,
+                    # the stored dict has NO `weight` key, so pre-Phase-4 tasks stay
+                    # byte-identical).
+                    if entry.get("weight") == "main":
+                        task["weight"] = "main"
                     # OMIT the new fields WHEN EMPTY, mirroring the Rust struct's
                     # `skip_serializing_if` (Vec::is_empty / String::is_empty). Otherwise
                     # Python writes `"scope":[]`/`"acceptance":""`/`"dependsOn":[]` and the

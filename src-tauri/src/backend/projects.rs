@@ -292,6 +292,7 @@ pub fn create_project_task(
                 scope: Vec::new(),
                 acceptance: String::new(),
                 plan_id: None,
+                weight: String::new(),
             });
             Ok(())
         },
@@ -9990,6 +9991,7 @@ mod tests {
                 scope: Vec::new(),
                 acceptance: String::new(),
                 plan_id: None,
+                weight: String::new(),
             }],
             notes: Vec::new(),
             milestones: Vec::new(),
@@ -11187,6 +11189,7 @@ updated_at: 2026-05-28T00:00:00Z
                     scope: Vec::new(),
                     acceptance: String::new(),
                     plan_id: None,
+                    weight: String::new(),
                 }],
                 notes: Vec::new(),
                 milestones: Vec::new(),
@@ -14453,6 +14456,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             scope: Vec::new(),
             acceptance: String::new(),
             plan_id: None,
+            weight: String::new(),
         }
     }
 
@@ -14461,6 +14465,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     fn plan_task(id: &str, status: &str) -> ProjectTask {
         ProjectTask {
             plan_id: Some("plan-alpha".into()),
+            weight: String::new(),
             ..ProjectTask {
                 id: id.into(),
                 ..task(status)
@@ -14541,6 +14546,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     fn plan_control_rejects_blank_plan_id_as_non_plan() {
         let mut t = ProjectTask {
             plan_id: Some("   ".into()),
+            weight: String::new(),
             ..task("blocked")
         };
         let err = apply_plan_task_control(&mut t, "retry").unwrap_err();
@@ -14573,6 +14579,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             scope: Vec::new(),
             acceptance: String::new(),
             plan_id: None,
+            weight: String::new(),
         }
     }
 
@@ -14773,6 +14780,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 scope: Vec::new(),
                 acceptance: String::new(),
                 plan_id: None,
+                weight: String::new(),
             }],
             notes: Vec::new(),
             milestones: Vec::new(),
@@ -15464,6 +15472,7 @@ mod broker_gate_projects {
                 scope: Vec::new(),
                 acceptance: String::new(),
                 plan_id: None,
+                weight: String::new(),
             }],
             notes: Vec::new(),
             milestones: Vec::new(),

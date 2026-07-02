@@ -281,6 +281,15 @@ pub struct ProjectTask {
     /// so a manual task never injects `"planId":null` and churns the content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
+    /// ROLE UNTANGLE Phase 4: the execution TIER the runner dispatches this plan
+    /// task to — `"main"` routes it to the first-class Main coder
+    /// (`spawn_main_coder`, the always-agentic sandboxed engine); empty/absent =
+    /// the mini path (the status quo). Written by `project_create_plan_tasks`
+    /// (Python co-writer, NO-CHURN: only `"main"` is ever stored) and read by the
+    /// devboule-coder runner. Serde-default + no-churn skip so every pre-Phase-4
+    /// task round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub weight: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
