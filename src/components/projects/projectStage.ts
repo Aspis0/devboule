@@ -109,6 +109,14 @@ export function projectStage(
   }
   if (project.status === "paused" || project.status === "archived")
     return "blocked";
+  // The planner/orchestrator session is the create-time CONVERSATION, not
+  // project work — it must never pull the card into Active/Launching (that was
+  // the "plan goes active by itself" bug: chatting with the planner registered
+  // a session and the stage recomputed on the next remount). Only worker-tier
+  // sessions (coder/verifier/mini) drive the stage.
+  const workSessions = sessions.filter(
+    (session) => session.role !== "orchestrator",
+  );
   const working = claims.filter((claim) => isWorkingClaim(claim, now));
   const reviewClaims = claims.filter(
     (claim) => isOpenClaim(claim, now) && claim.status === "review",
@@ -116,16 +124,16 @@ export function projectStage(
   const blockedClaims = claims.filter(
     (claim) => isOpenClaim(claim, now) && claim.status === "blocked",
   );
-  const activeSessions = sessions.filter((session) =>
+  const activeSessions = workSessions.filter((session) =>
     isActiveProjectSession(session, now),
   );
-  const reviewSessions = sessions.filter((session) =>
+  const reviewSessions = workSessions.filter((session) =>
     isReviewProjectSession(session, now),
   );
-  const blockedSessions = sessions.filter((session) =>
+  const blockedSessions = workSessions.filter((session) =>
     isBlockedProjectSession(session, now),
   );
-  const launchingSessions = sessions.filter((session) =>
+  const launchingSessions = workSessions.filter((session) =>
     isLaunchingProjectSession(session, now),
   );
   if (project.taskCounts.wip > 0 || activeSessions.length > 0) return "active";

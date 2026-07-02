@@ -197,13 +197,13 @@ describe("ProjectWorkspace Compact button (MC-P7)", () => {
     );
   });
 
-  it("does NOT render the Compact button for a non-claude agent (codex)", () => {
+  it("renders Compact for a codex agent too (Slice 5a: thread/compact/start)", () => {
+    // Slice 5a extended Compact beyond claude: codex compacts via the app-server
+    // JSON-RPC (`thread/compact/start`) on a live duplex session. This test used
+    // to assert the pre-5a claude-only gate and went stale.
     const sessions = [session({ agentId: "coder-1", client: "codex" })];
     const html = render(sessions, new Set(["coder-1"]));
-    expect(html).not.toContain(">Compact<");
-    expect(html).not.toContain(
-      "Runs /compact in this Claude agent to shrink its context.",
-    );
+    expect(html).toContain(">Compact<");
   });
 
   it("does NOT render Compact for a custom client whose id contains 'claude'", () => {

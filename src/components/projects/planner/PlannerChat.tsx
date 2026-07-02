@@ -10,6 +10,10 @@ interface PlannerChatProps {
   live: boolean;
   awaitingReply: boolean;
   onSend: (text: string) => void;
+  /** Esc while the orchestrator works: interrupt the IN-FLIGHT turn (the agent
+   *  and its context stay alive). Absent = no interrupt surface (e.g. no live
+   *  cloud orchestrator bound). */
+  onInterrupt?: () => void;
 }
 
 export function PlannerChat({
@@ -18,6 +22,7 @@ export function PlannerChat({
   live,
   awaitingReply,
   onSend,
+  onInterrupt,
 }: PlannerChatProps) {
   const [value, setValue] = useState("");
 
@@ -32,6 +37,10 @@ export function PlannerChat({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
+    }
+    if (e.key === "Escape" && onInterrupt && live) {
+      e.preventDefault();
+      onInterrupt();
     }
   };
 

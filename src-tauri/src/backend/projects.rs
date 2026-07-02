@@ -1268,6 +1268,28 @@ pub fn get_main_coder_client(
     Ok(read_main_coder_client(&app))
 }
 
+/// Which cloud CLIs are actually installed on this machine (augmented-PATH scan,
+/// same resolver the launch path uses). The UI disables — never hides — the
+/// orchestrator/coder options whose binary is missing, so a user without codex
+/// can't select a backend that could only fail at launch.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCliAvailability {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+#[tauri::command]
+pub fn get_cloud_cli_availability(
+    state: State<'_, BackendState>,
+) -> Result<CloudCliAvailability, String> {
+    state.ensure_unlocked()?;
+    Ok(CloudCliAvailability {
+        claude: command_exists("claude"),
+        codex: command_exists("codex"),
+    })
+}
+
 /// S5 — persist the default external main-coder CLI (claude|codex) into config.json
 /// (read-modify-write + atomic temp/rename, mirroring `set_mini_write_behavior`).
 #[tauri::command]
@@ -1655,6 +1677,26 @@ fn prepare_or_launch_project_agent(
             Some(backend) => super::local_coder::resolve_omlx_env(backend),
             None => (String::new(), String::new()),
         };
+        // FAIL-FAST PREFLIGHT: a configured loopback backend must be reachable and
+        // actually serve the configured model BEFORE we spawn the binary. Without
+        // this, a dead server / missing model left the planner on "thinking…"
+        // for minutes (3 × 60s silent request timeouts) with zero user feedback.
+        // ~2.5s worst-case cost. GATED on launch_terminal: the prepare-only path
+        // (Copy prompt — clipboard, no process) must never grow a network probe
+        // or a new failure mode (hostile-review BLOCKER).
+        if launch_terminal {
+            if let Some(backend) = &local_backend {
+                if let Err(preflight_err) =
+                    super::local_coder::preflight_local_orchestrator_backend(backend)
+                {
+                    // Close the launch_pending session recorded above — otherwise
+                    // every "oMLX isn't running" failure would strand a pending
+                    // ghost card in the rail.
+                    super::agents::mark_agent_session_closed_public(&app, &agent_id);
+                    return Err(preflight_err);
+                }
+            }
+        }
         // CLOUD (opt-in) env: non-empty ONLY when the configured kind is `cloud`. The base
         // URL + model are NON-secret (they ride inline like the oMLX ones); the API KEY is a
         // SECRET appended to `provider_env` below (off argv, never logged).
@@ -2142,6 +2184,23 @@ fn delete_project_file(path: &Path) -> Result<bool, String> {
        // Best-effort sidecar cleanup, now that no handle holds it open.
     let _ = fs::remove_file(project_lock_path(path));
     Ok(existed)
+}
+
+/// Promote a "draft" project (planner-created, plan not yet approved) to
+/// "active" — the moment its plan is approved or its first task actually lands.
+/// Idempotent + best-effort: a non-draft status is left untouched, and a failure
+/// must never break the approval/task write that triggered it (the promotion is
+/// a board-visibility side effect, not the source of truth).
+pub(crate) fn promote_draft_project_to_active(app: &tauri::AppHandle, project_id: &str) {
+    let Ok(path) = project_path_by_id(app, project_id) else {
+        return;
+    };
+    let _ = mutate_project_file_latest(&path, |project| {
+        if project.metadata.status == "draft" {
+            project.metadata.status = "active".into();
+        }
+        Ok(())
+    });
 }
 
 fn mutate_project_file_latest<F>(
@@ -3680,7 +3739,19 @@ fn validate_agent_task_launch(
     role: &str,
     task_id: Option<&str>,
 ) -> Result<(), String> {
-    if project.metadata.status != "active" {
+    if project.metadata.status == "draft" {
+        // A DRAFT project is exactly the state where the planner conversation
+        // happens: the ORCHESTRATOR must launch there (that's how the plan gets
+        // made and approved). Worker roles stay gated until approval promotes
+        // the project to active.
+        if role != "orchestrator" {
+            return Err(
+                "This project's plan is not approved yet — approve the plan before launching \
+                 coders/verifiers on it."
+                    .into(),
+            );
+        }
+    } else if project.metadata.status != "active" {
         return Err("Cannot launch agents on paused, done or archived projects.".into());
     }
     let Some(task_id) = task_id else {
@@ -6874,8 +6945,11 @@ fn normalize_project_id(value: &str) -> Result<String, String> {
 fn normalize_project_status(value: &str) -> Result<String, String> {
     let status = value.trim().to_ascii_lowercase();
     match status.as_str() {
-        "active" | "paused" | "done" | "archived" => Ok(status),
-        _ => Err("Project status must be active, paused, done or archived.".into()),
+        // "draft": a planner-created project whose plan is NOT approved yet. It
+        // must not appear on the kanban board; plan approval (or the first task
+        // actually landing) promotes it to "active".
+        "active" | "paused" | "done" | "archived" | "draft" => Ok(status),
+        _ => Err("Project status must be draft, active, paused, done or archived.".into()),
     }
 }
 
@@ -11321,6 +11395,13 @@ updated_at: 2026-05-28T00:00:00Z
     fn app_project_status_rejects_direct_done() {
         assert_eq!(normalize_app_project_status("active").unwrap(), "active");
         assert!(normalize_app_project_status("done").is_err());
+    }
+
+    #[test]
+    fn app_project_status_accepts_draft() {
+        // "draft" = planner-created, plan not yet approved (off the kanban).
+        assert_eq!(normalize_app_project_status("draft").unwrap(), "draft");
+        assert_eq!(normalize_project_status("Draft ").unwrap(), "draft");
     }
 
     #[test]

@@ -722,7 +722,9 @@ export interface OracleIndexStatus {
   };
 }
 
-export type ProjectStatus = "active" | "paused" | "done" | "archived";
+// "draft": planner-created, plan not yet approved — kept OFF the kanban board;
+// plan approval (backend) promotes it to "active".
+export type ProjectStatus = "draft" | "active" | "paused" | "done" | "archived";
 export type ProjectTaskStatus = "todo" | "wip" | "review" | "blocked" | "done";
 export type ProjectEditableTaskStatus = Exclude<ProjectTaskStatus, "done">;
 // ROLE UNTANGLE (2026-07): FOUR first-class roles — orchestrator (plans+delegates,

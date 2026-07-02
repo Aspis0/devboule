@@ -498,6 +498,8 @@ pub fn run() {
             backend::projects::get_mini_write_behavior,
             backend::projects::set_mini_write_behavior,
             backend::projects::get_main_coder_client,
+            backend::projects::get_cloud_cli_availability,
+            backend::cloud_duplex::project_cloud_orchestrator_interrupt,
             backend::projects::set_main_coder_client,
             backend::pigeon_service::get_pigeon_enabled,
             backend::pigeon_service::set_pigeon_enabled,
@@ -725,6 +727,10 @@ pub fn run() {
                 // bounded wait/reap, bounded reader join), so it is safe to run on
                 // both ExitRequested and Exit.
                 backend::agent_pty::kill_all_on_exit(app_handle);
+                // Cloud DUPLEX children (claude/codex -p): kill + reap + mark their
+                // sessions closed, or an app restart leaves orphaned CLIs and ghost
+                // "active" session rows the planner then binds to (send dead-end).
+                backend::cloud_duplex::kill_all_on_exit(app_handle);
                 // Reap the active Censor watcher (+ its worker) so quit / dev
                 // Ctrl-C never orphans the watcher thread or an in-flight linter
                 // subprocess. Non-blocking (detached reaper) + idempotent.

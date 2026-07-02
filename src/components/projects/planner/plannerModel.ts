@@ -31,7 +31,8 @@ export interface StageFinding {
 export type ChatRole = 'user' | 'assistant';
 
 export interface PlannerMessage {
-  role: ChatRole;
+  /** 'milestone' = a tiny system ROW (tool use / activity), not a chat bubble. */
+  role: ChatRole | 'milestone';
   text: string;
   /** B14b: this bubble is the live, in-progress reply being streamed token-by-token (render a
    *  caret / "typing" affordance). Absent/false for finalized turns. */
@@ -103,6 +104,23 @@ export function chatMessages(entries: ConsoleEntry[] | undefined): PlannerMessag
   return (entries ?? [])
     .filter((e): e is ChatEntry => e.type === "chat")
     .map((e) => ({ role: e.role, text: e.text }));
+}
+
+/** Like chatMessages, but ALSO interleaves coder milestones (tool use: Bash,
+ *  reads, spawns…) as tiny 'milestone' rows, in timeline order. This is the
+ *  planner chat's visibility into WHAT the orchestrator is doing between
+ *  replies — without it a cloud orchestrator running tools looks identical to
+ *  one that hung ("planner is thinking" forever with work happening underneath). */
+export function chatMessagesWithMilestones(
+  entries: ConsoleEntry[] | undefined,
+): PlannerMessage[] {
+  const out: PlannerMessage[] = [];
+  for (const e of entries ?? []) {
+    if (e.type === "chat") out.push({ role: e.role, text: e.text });
+    else if (e.type === "coder" || e.type === "spawn")
+      out.push({ role: "milestone", text: e.text });
+  }
+  return out;
 }
 
 /** Extract the orchestrator's OPEN Kairion doubts from a console timeline, upserted by

@@ -1997,6 +1997,33 @@ pub fn stop_agent(
     Ok(live_state)
 }
 
+/// Best-effort liveness touch for a session that has NO registration/heartbeat
+/// channel of its own — the cloud DUPLEX orchestrator (claude/codex `-p`): it
+/// never calls agent_register, so without this its `last_seen_at` froze at the
+/// launch stamp and the frontend's 15-minute recency filter silently dropped a
+/// session that was actively chatting (unbinding the planner console mid-
+/// conversation). `status`: `Some("active")` promotes a just-spawned
+/// launch_pending session to active (the duplex spawn IS its registration);
+/// `None` only refreshes `last_seen_at`. Swallows errors — liveness stamping
+/// must never break the reader/spawn path.
+pub fn touch_agent_session(app: &tauri::AppHandle, agent_id: &str, status: Option<&str>) {
+    let agent_id = agent_id.to_string();
+    let status = status.map(String::from);
+    let _ = mutate_agent_live_state(app, move |live_state| {
+        if let Some(session) = live_state
+            .sessions
+            .iter_mut()
+            .find(|session| session.agent_id == agent_id)
+        {
+            session.last_seen_at = Some(Utc::now().to_rfc3339());
+            if let Some(status) = status {
+                session.status = status.clone();
+                session.message = Some("Cloud orchestrator online.".into());
+            }
+        }
+    });
+}
+
 /// Best-effort public wrapper for `mark_agent_session_closed`, used by the
 /// app-hosted PTY subsystem (`backend::agent_pty`) when a session ends (reader
 /// EOF or explicit kill). Swallows the result: the UI already saw the terminal

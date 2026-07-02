@@ -336,6 +336,13 @@ fn decide_plan_request(
     // fail the command — the in-file queue the list command reads is authoritative.
     best_effort_update_sidecar(app, &resolved);
 
+    // Plan approved ⇒ the project graduates from "draft" (planner-only, off the
+    // kanban) to "active" (lands in the board's Planned column). Idempotent +
+    // best-effort; a deny leaves the draft hidden.
+    if approve {
+        super::projects::promote_draft_project_to_active(app, &resolved.project_id);
+    }
+
     Ok(resolved)
 }
 

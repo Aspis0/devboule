@@ -48,7 +48,41 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
         </div>
       ) : (
         <>
-          {messages.map((msg, i) => (
+          {messages.map((msg, i) =>
+            msg.role === "milestone" ? (
+              // Tiny system row: what the orchestrator is DOING (tool use)
+              // between replies — activity visibility, not a chat bubble.
+              <div
+                key={i}
+                className="pp-mono"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  marginTop: 7,
+                  fontSize: 10,
+                  color: "#A89F90",
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+                title={msg.text}
+              >
+                <span
+                  aria-hidden
+                  style={{
+                    width: 5,
+                    height: 5,
+                    borderRadius: "50%",
+                    background: "#CFC6B6",
+                    flexShrink: 0,
+                  }}
+                />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {msg.text}
+                </span>
+              </div>
+            ) : (
             <div
               key={i}
               style={{
@@ -89,7 +123,8 @@ export function ChatThread({ messages, live, awaitingReply, emptyHint }: ChatThr
                 )}
               </div>
             </div>
-          ))}
+            ),
+          )}
           {live &&
             !awaitingReply &&
             messages[messages.length - 1]?.role === "user" && (

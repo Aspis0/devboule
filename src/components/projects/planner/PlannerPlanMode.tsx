@@ -34,10 +34,12 @@ interface PlannerPlanModeProps {
   messages: PlannerMessage[];
   awaitingReply: boolean;
   onSend: (text: string) => void;
+  /** Esc in the chat: interrupt the orchestrator's in-flight turn (cloud duplex). */
+  onInterrupt?: () => void;
   // Orchestrator backend selector — who you TALK TO (the planner). Replaces the redundant
   // status strip (searching/planning/designing duplicated the view tabs). The active one
   // pulses. Local = our Stage/TUI; Claude/Codex run their own CLI (their terminal is shown).
-  orchestrators: { id: string; label: string }[];
+  orchestrators: { id: string; label: string; disabled?: boolean }[];
   orchestratorId: string;
   onOrchestratorChange: (id: string) => void;
   // When a CLOUD orchestrator (Claude/Codex) is running, its agent id — we show ITS terminal
@@ -77,6 +79,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     messages,
     awaitingReply,
     onSend,
+    onInterrupt,
     orchestrators,
     orchestratorId,
     onOrchestratorChange,
@@ -237,12 +240,17 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           </span>
           {orchestrators.map((o) => {
             const isActive = o.id === orchestratorId;
+            const disabled = o.disabled === true;
             return (
               <button
                 type="button"
                 className="pp-mono"
                 key={o.id}
-                onClick={() => onOrchestratorChange(o.id)}
+                onClick={() => {
+                  if (!disabled) onOrchestratorChange(o.id);
+                }}
+                disabled={disabled}
+                title={disabled ? `${o.label} CLI is not installed on this machine` : undefined}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -250,7 +258,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                   fontSize: 10.5,
                   borderRadius: 8,
                   padding: '5px 9px',
-                  cursor: 'pointer',
+                  cursor: disabled ? 'not-allowed' : 'pointer',
+                  opacity: disabled ? 0.45 : 1,
                   fontWeight: isActive ? 600 : 400,
                   color: isActive ? '#9A6A2E' : '#A89F90',
                   background: isActive ? '#F1E4D2' : '#fff',
@@ -431,6 +440,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           live={live}
           awaitingReply={awaitingReply}
           onSend={onSend}
+          onInterrupt={onInterrupt}
         />
           </>
         )}
