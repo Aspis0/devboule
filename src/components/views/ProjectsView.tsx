@@ -524,6 +524,22 @@ export function ProjectsView() {
     setPlannerCoderId(mainCoderOverride ?? mainCoderDefault);
   }, [mainCoderOverride, mainCoderDefault]);
 
+  // Role untangle (P6b consumption): the CLOUD client the board "Launch Coder" button uses,
+  // resolved from the unified config — per-project override, else the Settings → Roles Main
+  // coder client. "local" is NOT a launchable CLI client here (the LOCAL Main coder runs as the
+  // orchestrator's agentic engine on mainCoderBackend, not a terminal), so a "local" selection
+  // falls back to a cloud default for this button. This replaces the legacy mainCoderClient.
+  const effectiveCoderClient = useMemo(() => {
+    const engine = mainCoderOverride ?? mainCoderDefault;
+    if (engine && engine !== "local") return engine;
+    return mainCoderDefault !== "local" ? mainCoderDefault : "codex";
+  }, [mainCoderOverride, mainCoderDefault]);
+  // The Verifier's own client for CLI launches (same "local" → cloud fallback rationale).
+  const effectiveVerifierClient = useMemo(
+    () => (verifierClientDefault !== "local" ? verifierClientDefault : "codex"),
+    [verifierClientDefault],
+  );
+
   // The hand-off dropdown: "" clears the per-project override back to Default; any engine id
   // sets it for THIS project only. Persist it on the selected project (if any) + resolve the
   // launch engine immediately.
@@ -1759,9 +1775,10 @@ export function ProjectsView() {
           // Role untangle (P6b): the verifier runs on its OWN client (Settings → Roles),
           // no longer silently reusing the Main coder's. NOTE: a "local" verifier (the
           // in-process agentic engine) launches via a different path; the CLI terminal
-          // spawn here covers the cloud clients (claude/codex/custom).
+          // spawn here covers the cloud clients (claude/codex/custom) — effectiveVerifierClient
+          // maps a "local" selection to a cloud default.
           role: "verifier",
-          client: verifierClientDefault,
+          client: effectiveVerifierClient,
           agentId: `verifier-${taskId ?? "recall"}-${Date.now()}-${idx}`,
           taskId,
           host: "app",
@@ -1801,12 +1818,14 @@ export function ProjectsView() {
     currentProject?.metadata.agentControls,
     currentProject?.metadata.id,
     isArchived,
-    mainCoderClient,
+    effectiveVerifierClient,
   ]);
 
   const launchAgent = async (
     role: SpawnRole,
-    client: "codex" | "claude",
+    // Widened from the "codex" | "claude" literal to any resolved client id (a custom
+    // agent client, or an effective role client resolved from the unified roles config).
+    client: string,
     taskId?: string,
   ) => {
     if (isArchived) return; // archived project is read-only.
@@ -2930,14 +2949,14 @@ export function ProjectsView() {
                               onLaunchCoder={() =>
                                 void launchAgent(
                                   "coder",
-                                  mainCoderClient,
+                                  effectiveCoderClient,
                                   task.id,
                                 )
                               }
                               onLaunchVerifier={() =>
                                 void launchAgent(
                                   "verifier",
-                                  mainCoderClient,
+                                  effectiveVerifierClient,
                                   task.id,
                                 )
                               }

@@ -1368,7 +1368,18 @@ fn claim_and_launch(
     // refuse to spawn (rather than running a garbage echo): the directive fails
     // cleanly with a clear message the coder's poll surfaces. The headless/test
     // backend is only used by the integration test, never in production.
-    let backend = match super::projects::read_mini_coder_backend(app) {
+    //
+    // Role untangle (P6b consumption): a MAIN-tier directive (the promoted local Main coder)
+    // runs on its OWN model — `read_main_coder_backend` prefers the dedicated `mainCoderBackend`
+    // row and INHERITS the mini's when unset. A Mini-tier directive keeps reading the mini's
+    // backend verbatim (byte-identical to before). This is the seam that makes the Roles table
+    // "Main coder → Local → <model>" actually drive the local Main coder.
+    let resolved_backend = if matches!(directive.tier, super::mini_coder::DirectiveTier::Main) {
+        super::roles_config::read_main_coder_backend(app)
+    } else {
+        super::projects::read_mini_coder_backend(app)
+    };
+    let backend = match resolved_backend {
         Some(b) => b,
         None => {
             fail_launching(app, &directive_id, "no mini-coder backend configured");

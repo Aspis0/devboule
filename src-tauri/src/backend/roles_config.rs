@@ -372,9 +372,8 @@ pub fn set_roles_config_cmd(
 /// When `mainCoderBackend` is missing/invalid, falls back to the mini's backend
 /// by calling `super::projects::read_mini_coder_backend`.
 ///
-/// Not yet wired into a launch path — P5 lands the data model + reader; P6 (the
-/// Roles-table UI + launch consumption) is where the Main-coder launch reads this.
-#[allow(dead_code)]
+/// Wired at the Main-coder spawn (P6b consumption): `mini_coder_executor` calls this for a
+/// `DirectiveTier::Main` directive so the promoted local Main coder runs on its own model.
 pub(crate) fn read_main_coder_backend(
     app: &tauri::AppHandle,
 ) -> Option<super::mini_coder::MiniCoderBackend> {
