@@ -782,6 +782,12 @@ export interface ProjectMetadata {
    * Omitted by the backend when every field is unset (NO-CHURN); treat `undefined` as `{}`.
    */
   agentControls?: AgentControls;
+  /**
+   * Role untangle (P6b): per-project OVERRIDE of the Main-coder engine (the hand-off
+   * dropdown). Absent means "use the global RolesConfig default". An opaque engine/client id
+   * ("claude" | "codex" | a custom id). Set via set_project_main_coder_override_cmd.
+   */
+  mainCoder?: string;
 }
 
 /**

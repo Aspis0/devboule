@@ -1,8 +1,14 @@
 import { Check } from "lucide-react";
 
 interface PlannerControlsProps {
+  // Role untangle (P6b): the hand-off is AGNOSTIC — it always targets the Main coder
+  // ROLE. `coders` is the list of Main-coder-capable engines the per-project override can
+  // pick from; the ENGINE is a per-project choice, not a role pick. `mainCoderOverride` is
+  // the project's override (null = use the global Settings default, whose label is
+  // `defaultCoderLabel`). onCoderChange("") clears the override back to Default.
   coders: { id: string; label: string }[];
-  coderId: string;
+  mainCoderOverride: string | null;
+  defaultCoderLabel: string;
   onCoderChange: (id: string) => void;
   autoCreate: boolean;
   onAutoCreateToggle: () => void;
@@ -16,7 +22,8 @@ interface PlannerControlsProps {
 export function PlannerControls(props: PlannerControlsProps) {
   const {
     coders,
-    coderId,
+    mainCoderOverride,
+    defaultCoderLabel,
     onCoderChange,
     autoCreate,
     onAutoCreateToggle,
@@ -44,67 +51,69 @@ export function PlannerControls(props: PlannerControlsProps) {
         fontWeight: 600,
         cursor: 'help',
       }}
-        data-help-title="The main coder is the agent that builds the plan into code."
-        data-help-lines="After the orchestrator drafts the plan, it hands the tasks off to this coder.|It can be Local (Devboule), Claude, or Codex — the same three backends as the orchestrator.|The coder delegates one-shot edits to mini-coders and moves tasks toward Review.|Pick the backend that fits the job's difficulty and your token budget."
+        data-help-title="After the plan, the orchestrator hands the tasks off to the Main coder."
+        data-help-lines="The Main coder is the ROLE that builds the plan into code — configure its engine in Settings → Roles.|This dropdown is a PER-PROJECT override: one project can build with Codex, another with Claude or a local model.|Default follows the Settings → Roles Main coder; pick an engine here to override it for THIS project only.|The Main coder delegates one-shot edits to minis and moves tasks toward Review."
       >
         HAND OFF TO
       </span>
 
-      {coders.length === 0 ? (
-        <span style={{ fontSize: 11, color: '#B3AB9C' }}>
-          No coders configured — add one in Settings
+      {/* Agnostic target: always the Main coder role. */}
+      <span
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '5px 11px',
+          borderRadius: 8,
+          fontSize: 11.5,
+          fontWeight: 600,
+          border: '1px solid #C0894F',
+          background: '#fff',
+          color: '#2A2621',
+        }}
+      >
+        <span
+          style={{
+            width: 16,
+            height: 16,
+            background: '#F1E4D2',
+            color: '#9A6A2E',
+            borderRadius: 4,
+            fontSize: 9,
+            fontWeight: 700,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          M
         </span>
-      ) : (
-        coders.map((c) => {
-          const isActive = coderId === c.id;
-          return (
-            <button
-              key={c.id}
-              onClick={() => onCoderChange(c.id)}
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '5px 11px',
-                borderRadius: 8,
-                fontSize: 11.5,
-                fontWeight: 600,
-                cursor: 'pointer',
-                ...(isActive
-                  ? {
-                      border: '1px solid #C0894F',
-                      background: '#fff',
-                      color: '#2A2621',
-                      boxShadow: '0 1px 3px rgba(0,0,0,.08)',
-                    }
-                  : {
-                      border: '1px solid #E4DDD0',
-                      background: '#fff',
-                      color: '#7c766b',
-                    }),
-              }}
-            >
-              <span
-                style={{
-                  width: 16,
-                  height: 16,
-                  background: '#F1E4D2',
-                  color: '#9A6A2E',
-                  borderRadius: 4,
-                  fontSize: 9,
-                  fontWeight: 700,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
-              >
-                {c.label[0]?.toUpperCase()}
-              </span>
-              {c.label}
-            </button>
-          );
-        })
-      )}
+        Main coder
+      </span>
+
+      {/* Small per-project engine dropdown (Default = the Settings → Roles Main coder). */}
+      <select
+        value={mainCoderOverride ?? ''}
+        onChange={(e) => onCoderChange(e.target.value)}
+        title="Which engine the Main coder runs for THIS project. Default follows Settings → Roles."
+        style={{
+          padding: '5px 9px',
+          borderRadius: 8,
+          fontSize: 11.5,
+          fontWeight: 600,
+          border: '1px solid #E4DDD0',
+          background: '#fff',
+          color: '#2A2621',
+          cursor: 'pointer',
+        }}
+      >
+        <option value="">Default · {defaultCoderLabel}</option>
+        {coders.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.label}
+          </option>
+        ))}
+      </select>
 
       {onCreatePlan && (
         <button

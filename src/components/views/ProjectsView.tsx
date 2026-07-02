@@ -82,6 +82,7 @@ import type {
   SandboxMode,
   SavedWorkflow,
 } from "../../types/backend";
+import type { EffectiveRolesConfig } from "../../types/config";
 import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
 import { CollapsibleSection } from "../projects/CollapsibleSection";
 import { formatDateTime } from "../projects/projectFormat";
@@ -237,6 +238,10 @@ export function ProjectsView() {
   // Planner panel (Plan Mode) controls — lifted from the old OrchestratorHeroCard so
   // the choices survive (coder hand-off, auto-create, websearch auto/manual).
   const [plannerCoderId, setPlannerCoderId] = useState<string>("claude");
+  // Role untangle (P6b): the global Main-coder engine default (Settings → Roles). The
+  // hand-off dropdown labels its "Default" with this and falls back to it when a project
+  // has no per-project override. Loaded once from the resolved rolesConfig.
+  const [mainCoderDefault, setMainCoderDefault] = useState<string>("codex");
   // Which backend runs as the ORCHESTRATOR (who you talk to). "orchestrator" = local Devboule
   // (our Stage/TUI); "claude"/"codex" run their own CLI (we show their terminal). Default local.
   const [plannerOrchestratorClient, setPlannerOrchestratorClient] =
@@ -487,6 +492,57 @@ export function ProjectsView() {
     }
     void loadSavedWorkflows(currentProject.metadata.id);
   }, [currentProject?.metadata.id, loadSavedWorkflows]);
+
+  // Role untangle (P6b): load the global Main-coder engine default (Settings → Roles) once,
+  // for the hand-off "Default" label + fallback.
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const roles = await invokeBackendCommand<EffectiveRolesConfig>(
+          "get_roles_config_cmd",
+        );
+        if (alive && roles?.coderClient) setMainCoderDefault(roles.coderClient);
+      } catch {
+        // Keep the conservative "codex" default.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // The engine the hand-off launches = this project's per-project override, else the global
+  // default. Keep plannerCoderId (what startNewProject/planWithOrchestrator hand to the coder)
+  // resolved from that whenever the project's override or the default changes.
+  const mainCoderOverride = currentProject?.metadata.mainCoder ?? null;
+  useEffect(() => {
+    setPlannerCoderId(mainCoderOverride ?? mainCoderDefault);
+  }, [mainCoderOverride, mainCoderDefault]);
+
+  // The hand-off dropdown: "" clears the per-project override back to Default; any engine id
+  // sets it for THIS project only. Persist it on the selected project (if any) + resolve the
+  // launch engine immediately.
+  const onMainCoderOverrideChange = useCallback(
+    async (id: string) => {
+      const engine = id === "" ? null : id;
+      setPlannerCoderId(engine ?? mainCoderDefault);
+      const pid = currentProject?.metadata.id;
+      if (!pid) return;
+      try {
+        await invokeBackendCommand("set_project_main_coder_override_cmd", {
+          projectId: pid,
+          engine,
+        });
+        await loadProject(pid);
+      } catch (e) {
+        setError(
+          e instanceof Error ? e.message : "Could not save the Main-coder engine.",
+        );
+      }
+    },
+    [currentProject?.metadata.id, mainCoderDefault, loadProject],
+  );
 
   // Single source of truth for writing agent state into React state: it sets the
   // state AND records the applied signature so the next poll can correctly skip
@@ -3231,8 +3287,9 @@ export function ProjectsView() {
                 label: c.label,
               })),
             ]}
-            coderId={plannerCoderId}
-            onCoderChange={setPlannerCoderId}
+            mainCoderOverride={mainCoderOverride}
+            defaultCoderLabel={mainCoderDefault}
+            onCoderChange={onMainCoderOverrideChange}
             autoCreate={plannerAutoCreate}
             onAutoCreateToggle={() => setPlannerAutoCreate((v) => !v)}
             canCreatePlan={!!orchestratorAgentId || !!cloudOrchestratorAgentId}

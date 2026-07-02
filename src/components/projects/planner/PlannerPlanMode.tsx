@@ -44,8 +44,12 @@ interface PlannerPlanModeProps {
   // instead of the local Stage (the Stage bridges are local-devboule only). null = local/none.
   cloudTerminalAgentId: string | null;
   // Hand-off + auto-create controls (preserved from the old composer — never strip choices).
+  // Role untangle (P6b): the hand-off targets the Main coder ROLE; `coders` are the engines
+  // the PER-PROJECT override can pick, `mainCoderOverride` is this project's override (null =
+  // the Settings → Roles default labelled `defaultCoderLabel`).
   coders: { id: string; label: string }[];
-  coderId: string;
+  mainCoderOverride: string | null;
+  defaultCoderLabel: string;
   onCoderChange: (id: string) => void;
   autoCreate: boolean;
   onAutoCreateToggle: () => void;
@@ -78,7 +82,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     onOrchestratorChange,
     cloudTerminalAgentId,
     coders,
-    coderId,
+    mainCoderOverride,
+    defaultCoderLabel,
     onCoderChange,
     autoCreate,
     onAutoCreateToggle,
@@ -433,7 +438,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
         {/* 5) Hand-off + auto-create controls (preserved choices) */}
         <PlannerControls
           coders={coders}
-          coderId={coderId}
+          mainCoderOverride={mainCoderOverride}
+          defaultCoderLabel={defaultCoderLabel}
           onCoderChange={onCoderChange}
           autoCreate={autoCreate}
           onAutoCreateToggle={onAutoCreateToggle}
