@@ -17,11 +17,9 @@ import {
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
 import { LocalCoderBackendCard } from "./LocalCoderBackendCard";
-import { MainCoderClientCard } from "./MainCoderClientCard";
 import { RolesTableCard } from "./RolesTableCard";
 import { RecommendedConfigCard } from "./RecommendedConfigCard";
 import { ModelRegistryCard } from "./ModelRegistryCard";
-import { MiniCoderBackendCard } from "./MiniCoderBackendCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
 import { ExaSearchKeyCard } from "./ExaSearchKeyCard";
 import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
@@ -305,26 +303,12 @@ export function ProvidersModelsTab() {
 
       <RolesTableCard />
 
-      <CollapsibleGroup title="Coders">
+      <CollapsibleGroup title="Coders (advanced)" defaultOpen={false}>
         <RoleSection
-          title="Default main coder CLI"
-          description="Which external CLI the task-board launches use as the main coder (Codex or Claude). The per-task Launch buttons use this by default."
-        >
-          <MainCoderClientCard />
-        </RoleSection>
-
-        <RoleSection
-          title="Local main coder (Devboule)"
-          description="The model the local Devboule orchestrator — your MAIN coder — runs on. A separate tier from the Mini-coder below (the worker it delegates to)."
+          title="Local orchestrator model"
+          description="The model the local Devboule orchestrator binary runs on (the Orchestrator row's Local placement in the Roles table above points here). Who runs each role now lives in Roles; this is just its model."
         >
           <LocalCoderBackendCard />
-        </RoleSection>
-
-        <RoleSection
-          title="Mini-coder backend"
-          description="The runtime your coders delegate cheap one-shot sub-tasks to."
-        >
-          <MiniCoderBackendCard />
         </RoleSection>
 
         <RoleSection
@@ -342,35 +326,40 @@ export function ProvidersModelsTab() {
         </RoleSection>
       </CollapsibleGroup>
 
-      <CollapsibleGroup title="Models & review">
+      <CollapsibleGroup title="Models">
         <RoleSection
           title="Model registry"
           description="The curated list of local models the coders may choose from per role, each with a tier (agentic / emit-edits) and tuned defaults."
         >
           <ModelRegistryCard />
         </RoleSection>
+      </CollapsibleGroup>
 
+      {/* Role untangle (P6b): Censor and the Design LLM are NOT agent roles — Censor is a
+          review GATE (no Kanban/claim/write), Design is a rendering helper. They configure a
+          backend like the roles, so they live here together, distinct from the Roles table. */}
+      <CollapsibleGroup title="Gates & helpers">
         <RoleSection
           title="Censor model"
-          description="Where Censor's tier-2 local review runs (Ollama, local oMLX, or Apple on-device) and which model it uses."
+          description="A review GATE, not a role: where Censor's tier-2 local review runs (Ollama, local oMLX, or Apple on-device) and which model it uses."
         >
           <CensorLocalAiCard />
         </RoleSection>
+
+        <RoleSection
+          title="Design LLM"
+          description="A rendering helper: the model the generative-design module generates node markup with."
+        >
+          <DesignLlmBackendCard />
+        </RoleSection>
       </CollapsibleGroup>
 
-      <CollapsibleGroup title="Oracle & design" defaultOpen={false}>
+      <CollapsibleGroup title="Oracle" defaultOpen={false}>
         <RoleSection
           title="Oracle LLM"
           description="The remote provider that writes Oracle answers from retrieved context."
         >
           <OracleAnswerSettingsCard />
-        </RoleSection>
-
-        <RoleSection
-          title="Design LLM"
-          description="The model the generative-design module generates node markup with."
-        >
-          <DesignLlmBackendCard />
         </RoleSection>
       </CollapsibleGroup>
 
