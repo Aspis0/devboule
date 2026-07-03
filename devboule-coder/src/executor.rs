@@ -129,6 +129,14 @@ impl FsBackend {
         Ok(Self { root })
     }
 
+    /// The canonical project root this backend is confined to. Exposed for callers
+    /// that need to root their OWN on-disk state under the same project without
+    /// duplicating root discovery — e.g. the planner's `.devboule/preplan.md`
+    /// external memory ([`crate::preplan::Preplan`]).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Resolve a model-supplied RELATIVE path against the root and confirm the
     /// CANONICAL result stays inside the root. Belt-and-suspenders over the
     /// parse-time validation: a path can pass the static `..`/abs check yet still

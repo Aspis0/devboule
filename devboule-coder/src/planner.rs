@@ -34,8 +34,19 @@
 //! discipline of [`crate::action`], and every `scope` / `contextFiles` path is run
 //! through the SAME safe-relative-path validator [`crate::action::check_rel_path`].
 //! The DAG runner / `spawn_mini` execution is Phase 11.3 and OUT OF SCOPE here.
+//!
+//! Worst-case call ceiling (deliberate): if both flat PLAN attempts fail, the
+//! planner escalates into the hierarchical OUTLINE/EXPAND/MERGE path on top of
+//! everything already spent — a single `run_planner` call can therefore reach up
+//! to ~32 SEQUENTIAL model calls ([`MAX_SPINE`] + [`MAX_GOAL_SPINE`] = 12 EXPLORE,
+//! [`FLAT_PLAN_ATTEMPTS`] = 2 flat PLAN, [`MAX_OUTLINE_ATTEMPTS`] = 2 OUTLINE,
+//! [`MAX_MILESTONES`] × [`MAX_EXPAND_ATTEMPTS`] = 16 EXPAND). This is intentional
+//! and there is NO concurrency anywhere in this module — the local model endpoint
+//! has no throttling of its own, so every call (EXPLORE, flat PLAN, OUTLINE, and
+//! EXPAND-per-milestone) is awaited one at a time.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -45,6 +56,7 @@ use crate::activity::{Activity, Node};
 use crate::agent_loop::Transcript;
 use crate::executor::{FsBackend, McpBackend};
 use crate::model::CoderModel;
+use crate::preplan::Preplan;
 
 // --- Bounds ------------------------------------------------------------------
 // The whole point of the staging is that a LOCAL model never holds the codebase.
@@ -76,9 +88,32 @@ pub const MAX_EXPLORE_PROMPT_CHARS: usize = 20_000;
 pub const MAX_NOTE_CHARS: usize = 1_500;
 
 /// Max CHARS of ALL accumulated notes carried into the PLAN call. The PLAN prompt
-/// is goal + notes + summary; this caps the notes contribution so the PLAN call is
-/// also bounded.
-pub const MAX_NOTES_TOTAL_CHARS: usize = 12_000;
+/// is goal + PRE-PLAN NOTES + notes + summary; this caps the notes contribution so
+/// the PLAN call is also bounded.
+///
+/// REDUCED from 12_000 to 7_000 when the PRE-PLAN NOTES section
+/// ([`MAX_PREPLAN_PROMPT_CHARS`], 6_000 chars) was added to the same prompt: the
+/// old 12_000 left no headroom for a second 6_000-char section without leaning on
+/// [`MAX_PLAN_PROMPT_CHARS`]'s final belt-and-suspenders truncate — which would
+/// have silently cut the trailing RULES/schema text the model needs to emit a
+/// valid ```plan``` block. At 7_000, every part at ITS OWN real cap simultaneously
+/// still fits under 24_000 with headroom (see
+/// `plan_prompt_fits_by_construction_with_all_parts_at_their_real_caps`).
+pub const MAX_NOTES_TOTAL_CHARS: usize = 7_000;
+
+/// Max NEW spine entries added from GOAL-driven `oracle_context` grounding (on top
+/// of the purely-structural [`MAX_SPINE`]). A weak local model cannot always
+/// surface which INFRA files matter for THIS goal on its own; grounding the spine
+/// with the goal itself fixes that. Kept SEPARATE and small so goal files never
+/// starve the structural spine — total explored files per run is at most
+/// `MAX_SPINE + MAX_GOAL_SPINE` (do NOT fold this into `MAX_SPINE`'s semantics).
+pub const MAX_GOAL_SPINE: usize = 4;
+
+/// Max CHARS of the rendered PRE-PLAN NOTES section (the on-disk
+/// [`crate::preplan::Preplan`] external memory) fed into the PLAN prompt. Bounded
+/// like every other PLAN-prompt part so a long, crash-resumed planning session
+/// still keeps the single PLAN call small.
+pub const MAX_PREPLAN_PROMPT_CHARS: usize = 6_000;
 
 /// Max CHARS of the structure `summary` (raw Oracle JSON) appended to the PLAN
 /// prompt. The summary is untrusted server output and can be arbitrarily large;
@@ -116,10 +151,37 @@ pub const MAX_TASK_CONTEXT: usize = 12;
 /// the model losing the thread; reject it.
 pub const MAX_TASKS: usize = 40;
 
-/// TOTAL number of PLAN attempts (the `for _ in 0..N` loop includes the FIRST try,
-/// so this is attempts, not retries-after-the-first). Small: a model that cannot
-/// produce a valid plan in a few tries will not on the tenth.
+/// TOTAL number of PLAN-phase attempts across BOTH the flat and hierarchical paths:
+/// [`FLAT_PLAN_ATTEMPTS`] (= `MAX_PLAN_ATTEMPTS - 1`) flat attempts, then — the
+/// ADaPT pattern, decompose ONLY on failure — a single switch to the hierarchical
+/// OUTLINE/EXPAND/MERGE path ([`run_hierarchical_plan`]) in place of what would have
+/// been a third identical flat try. A model that cannot produce a valid FLAT plan in
+/// two tries will not on a tenth flat try either — decomposing the goal is what
+/// changes the odds, not repeating the same ask.
 pub const MAX_PLAN_ATTEMPTS: usize = 3;
+
+/// Number of FLAT PLAN attempts before escalating to the hierarchical path (see
+/// [`MAX_PLAN_ATTEMPTS`]). A SIMPLE goal that succeeds on its first flat attempt
+/// never sees this constant at all — no size-threshold pre-escalation exists; the
+/// hierarchical path is reached ONLY by two flat failures.
+const FLAT_PLAN_ATTEMPTS: usize = MAX_PLAN_ATTEMPTS - 1;
+
+/// Max number of milestones the OUTLINE stage may decompose a goal into. A weak
+/// local model cannot reliably track more than a handful of milestones at once; a
+/// goal that would need more is almost certainly the model losing the thread —
+/// reject it rather than accept an unmanageable decomposition.
+pub const MAX_MILESTONES: usize = 8;
+
+/// TOTAL number of OUTLINE attempts — the hierarchical path's own small analogue of
+/// [`MAX_PLAN_ATTEMPTS`], but for the single OUTLINE call: the first try plus ONE
+/// retry with the precise validation error fed back.
+pub const MAX_OUTLINE_ATTEMPTS: usize = 2;
+
+/// TOTAL number of EXPAND attempts PER MILESTONE: the first try plus ONE retry with
+/// the precise per-fragment validation error fed back. A milestone that still fails
+/// after this budget hard-errors the WHOLE hierarchical plan — no partial, silently
+/// incomplete plans (see [`run_hierarchical_plan`]).
+pub const MAX_EXPAND_ATTEMPTS: usize = 2;
 
 /// Max CHARS of any single free-text field we accept from the model (note role /
 /// watch_out, task title / acceptance, plan goal). Mirrors the action layer's
@@ -367,7 +429,7 @@ fn path_basename(path: &str) -> &str {
 /// upper bound (the local-model context guarantee). When cut, we reserve room for
 /// the marker by keeping `cap - marker_len` chars of the input; if `cap` is smaller
 /// than the marker itself, we emit just the (char-truncated) marker.
-fn truncate_chars(s: &str, cap: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, cap: usize) -> String {
     if s.chars().count() <= cap {
         return s.to_string();
     }
@@ -457,6 +519,117 @@ fn parse_structure(text: &str) -> Result<Structure, String> {
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     Ok(Structure { spine, summary })
+}
+
+// --- oracle_context parsing (grounding, both EXPLORE snippets + GOAL spine) --
+
+/// One retrieved chunk from the Oracle's `oracle_context` tool. Only the two
+/// fields the planner actually uses are kept; NOT `deny_unknown_fields` (unlike
+/// the MODEL-facing [`ExploreNote`] / [`TasksPlan`] structs) — this is SERVER
+/// output whose shape we must tolerate evolving, so an unrecognized field
+/// (`chunk_id`, `score`, ...) is silently ignored rather than a hard parse error.
+#[derive(Debug, Clone, Deserialize)]
+struct OracleChunk {
+    #[serde(default)]
+    file_source: String,
+    #[serde(default)]
+    text: String,
+}
+
+/// The `oracle_context` tool's result shape: `{query, indexStatus, chunks:[...]}`.
+/// Only `chunks` matters here; everything else is ignored for the same
+/// forward-compatibility reason as [`OracleChunk`].
+#[derive(Debug, Clone, Deserialize)]
+struct OracleContextResult {
+    #[serde(default)]
+    chunks: Vec<OracleChunk>,
+}
+
+/// Parse a raw `oracle_context` result into its structured shape. Tolerant: ANY
+/// parse failure (non-JSON, or JSON of an unexpected shape) is `None`, never a
+/// panic — the Oracle server may change shape and every caller here degrades
+/// gracefully rather than breaking.
+fn parse_oracle_context(raw: &str) -> Option<OracleContextResult> {
+    serde_json::from_str(raw).ok()
+}
+
+/// Render a parsed `oracle_context` result as PROSE: each non-empty chunk becomes
+/// `-- {file_source}\n{text}`, joined by a blank line. Before this, the RAW JSON
+/// string (often half-cut by the downstream char-truncate) was fed straight to
+/// the model; this is what makes the EXPLORE grounding actually readable.
+fn render_oracle_chunks(result: &OracleContextResult) -> String {
+    result
+        .chunks
+        .iter()
+        .filter(|c| !c.text.trim().is_empty())
+        .map(|c| format!("-- {}\n{}", c.file_source.trim(), c.text.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Build the (capped) grounding text for one `oracle_context` call: prefer the
+/// structured chunk PROSE (JSON parse succeeds), else fall back to the RAW string
+/// char-truncated (the pre-grounding-fix behavior) — an Oracle server that changes
+/// shape must degrade the EXPLORE call, never sink it.
+fn build_grounding_text(raw: &str, cap: usize) -> String {
+    match parse_oracle_context(raw) {
+        Some(parsed) => truncate_chars(&render_oracle_chunks(&parsed), cap),
+        None => truncate_chars(raw, cap),
+    }
+}
+
+/// From a GOAL-driven `oracle_context` result, extract up to [`MAX_GOAL_SPINE`]
+/// NEW [`SpineEntry`] values: distinct, SAFE (per [`check_rel_path`]) `file_source`
+/// paths not already in `existing` (the structural spine). Order-preserving over
+/// the chunk order; an unsafe or already-known path is silently skipped — the
+/// structural spine still stands on its own even if every goal chunk is unusable.
+/// The entries carry no ranking data of their own (`in_degree: 0`, no symbols) —
+/// unlike the structural spine, they were not scored by centrality, only by
+/// semantic relevance to the goal.
+///
+/// ALSO filters out any path with a dot-leading component (e.g. `.devboule/...`,
+/// `.git/...`) — `check_rel_path` alone does not reject these (only `..`, an
+/// absolute path, or a leading `-` component), so this is an independent guard.
+/// The planner must never EXPLORE a harness/tool scratchpad, least of all its OWN
+/// `.devboule/preplan.md`: self-grounding on a live planning session's own notes
+/// would let them leak back into that SAME session's future EXPLORE prompts as if
+/// they were project source.
+fn goal_spine_entries(result: &OracleContextResult, existing: &HashSet<String>) -> Vec<SpineEntry> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for chunk in &result.chunks {
+        if out.len() >= MAX_GOAL_SPINE {
+            break;
+        }
+        let path = chunk.file_source.trim();
+        if path.is_empty() || existing.contains(path) || seen.contains(path) {
+            continue;
+        }
+        if check_rel_path("goal spine path", path).is_err() {
+            continue;
+        }
+        if has_dot_leading_component(path) {
+            continue;
+        }
+        seen.insert(path.to_string());
+        out.push(SpineEntry {
+            path: path.to_string(),
+            in_degree: 0,
+            top_symbols: Vec::new(),
+        });
+    }
+    out
+}
+
+/// `true` if any path component of `path` (normalizing `\` to `/` first, mirroring
+/// [`check_rel_path`]'s own normalization) starts with `.` — a hidden harness/tool
+/// directory (`.devboule`, `.git`, `.aspis`, ...), never a legitimate EXPLORE
+/// target. `Path::components` folds a bare `.` (current-dir) to [`Component::CurDir`]
+/// rather than [`Component::Normal`], so it is not mistakenly flagged here.
+fn has_dot_leading_component(path: &str) -> bool {
+    Path::new(&path.replace('\\', "/")).components().any(|c| {
+        matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+    })
 }
 
 // --- EXPLORE phase -----------------------------------------------------------
@@ -564,15 +737,49 @@ fn render_note(note: &ExploreNote) -> String {
     truncate_chars(&line, MAX_NOTE_CHARS)
 }
 
+/// The shared RULES block for any prompt that asks the model to emit a `tasks`
+/// array — the flat PLAN prompt ([`build_plan_prompt`]) AND every hierarchical
+/// EXPAND fragment prompt ([`build_expand_prompt`]) — factored into ONE helper so
+/// the two prompts CANNOT drift out of sync (a rule added to one must apply to the
+/// other; the flat and per-milestone task schemas are identical). `max_tasks` is
+/// `Some(N)` for the flat (whole-plan) prompt, which caps the TOTAL task count in
+/// this single call; the per-milestone EXPAND prompt passes `None` — a fragment has
+/// no total-count rule of its own, the global [`MAX_TASKS`] cap is enforced ONCE, on
+/// the fully [`merge_fragments`]-assembled plan.
+fn task_rules_block(max_tasks: Option<usize>) -> String {
+    let mut rules = String::new();
+    rules.push_str(&format!(
+        "- Each task `scope` (files it MODIFIES) has AT MOST {MAX_TASK_SCOPE} entries — split larger work.\n"
+    ));
+    rules.push_str("- One task = one testable, committable unit.\n");
+    rules.push_str("- `acceptance` MUST be a deterministically verifiable check (a test / typecheck / lint command), non-empty.\n");
+    rules.push_str("- Task `id`s are unique and non-empty (e.g. T001). `dependsOn` lists prerequisite task ids and MUST be acyclic.\n");
+    rules.push_str("- All paths are project-root-relative (no absolute, no `..`).\n");
+    if let Some(max_tasks) = max_tasks {
+        rules.push_str(&format!("- At most {max_tasks} tasks.\n"));
+    }
+    rules.push_str("- Every task starts with \"status\": \"pending\" and \"attempts\": 0.\n");
+    rules.push_str(
+        "- Optional \"weight\": \"main\" routes the task to the MAIN CODER (the stronger \
+         agentic engine) — use it for substantial, multi-file or build-and-verify work; \
+         omit it (or \"mini\") for cheap mechanical edits.\n\n",
+    );
+    rules
+}
+
 // --- PLAN phase --------------------------------------------------------------
 
-/// Build the PLAN prompt: goal + accumulated NOTES + the structure summary. It
-/// deliberately carries NO raw file content — only the compact notes — so the
-/// single PLAN call stays small. `prior_error`, when set, is the precise
-/// validation failure from the previous attempt, prepended so the model can
-/// self-correct.
+/// Build the PLAN prompt: goal + PRE-PLAN NOTES (the on-disk external memory) +
+/// accumulated NOTES + the structure summary. It deliberately carries NO raw file
+/// content — only the compact notes — so the single PLAN call stays small.
+/// `prior_error`, when set, is the precise validation failure from the previous
+/// attempt, prepended so the model can self-correct. `preplan_notes` is the
+/// ALREADY-RENDERED (and hence already `MAX_PREPLAN_PROMPT_CHARS`-bounded)
+/// [`crate::preplan::Preplan::render_for_prompt`] output; an empty string omits
+/// the section entirely (a fresh planner with nothing yet remembered).
 fn build_plan_prompt(
     goal: &str,
+    preplan_notes: &str,
     notes_block: &str,
     summary: &serde_json::Value,
     prior_error: Option<&str>,
@@ -593,6 +800,18 @@ fn build_plan_prompt(
     // steps is not, so the joined goal is unbounded without this cap.
     let goal = truncate_chars(goal, MAX_GOAL_CHARS);
     prompt.push_str(&format!("GOAL: {goal}\n\n"));
+    // Defensive re-cap: `preplan_notes` is already bounded by the caller
+    // (`render_for_prompt(MAX_PREPLAN_PROMPT_CHARS)`), but every other part of this
+    // prompt re-caps its own input too — mirror that discipline rather than trust
+    // a single upstream cap.
+    let preplan_notes = truncate_chars(preplan_notes, MAX_PREPLAN_PROMPT_CHARS);
+    if !preplan_notes.trim().is_empty() {
+        prompt.push_str(
+            "PRE-PLAN NOTES (your external memory from this planning session):\n",
+        );
+        prompt.push_str(&preplan_notes);
+        prompt.push_str("\n\n");
+    }
     prompt.push_str("FILE NOTES (from exploring the architectural spine):\n");
     prompt.push_str(notes_block);
     prompt.push_str("\n\nPROJECT SUMMARY: ");
@@ -600,19 +819,7 @@ fn build_plan_prompt(
     // it before appending.
     prompt.push_str(&truncate_chars(&summary.to_string(), MAX_SUMMARY_CHARS));
     prompt.push_str("\n\nRULES:\n");
-    prompt.push_str(&format!(
-        "- Each task `scope` (files it MODIFIES) has AT MOST {MAX_TASK_SCOPE} entries — split larger work.\n"
-    ));
-    prompt.push_str("- `acceptance` MUST be a deterministically verifiable check (a test / typecheck / lint command), non-empty.\n");
-    prompt.push_str("- Task `id`s are unique and non-empty (e.g. T001). `dependsOn` lists prerequisite task ids and MUST be acyclic.\n");
-    prompt.push_str("- All paths are project-root-relative (no absolute, no `..`).\n");
-    prompt.push_str(&format!("- At most {MAX_TASKS} tasks.\n"));
-    prompt.push_str("- Every task starts with \"status\": \"pending\" and \"attempts\": 0.\n");
-    prompt.push_str(
-        "- Optional \"weight\": \"main\" routes the task to the MAIN CODER (the stronger \
-         agentic engine) — use it for substantial, multi-file or build-and-verify work; \
-         omit it (or \"mini\") for cheap mechanical edits.\n\n",
-    );
+    prompt.push_str(&task_rules_block(Some(MAX_TASKS)));
     prompt.push_str(
         "Emit EXACTLY ONE fenced ```plan``` block — a single JSON object — and nothing else:\n\
          ```plan\n\
@@ -891,6 +1098,589 @@ fn parse_created_plan_id(text: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+// --- Hierarchical escalation (ADaPT pattern): OUTLINE + EXPAND + MERGE -------
+//
+// ADaPT ("As-Needed Decomposition and Planning for complex Tasks"): decompose ONLY
+// when the flat plan fails, never pre-emptively. When [`run_planner`]'s flat PLAN
+// loop exhausts [`FLAT_PLAN_ATTEMPTS`], it escalates here instead of a doomed third
+// identical flat try:
+//   1. OUTLINE — one model call decomposes the goal into a small DAG of milestones.
+//   2. EXPAND — one SEQUENTIAL model call PER milestone (no concurrency: the local
+//      model endpoint has no throttling), each producing a small flat [`TasksPlan`]
+//      fragment scoped to JUST that milestone.
+//   3. MERGE ([`merge_fragments`]) — PURE CODE, no model call: namespaces every
+//      fragment's task ids, synthesizes cross-milestone ordering from the milestone
+//      DAG (never asking the weak model to reason about another fragment's tasks),
+//      then re-runs the EXISTING flat-plan validation on the assembled whole.
+
+/// One milestone the OUTLINE stage decomposes the goal into. `files` are ADVISORY
+/// scope hints fed into the EXPAND prompt — NOT an enforced task scope (that
+/// enforcement lives on the per-task `scope` each EXPAND fragment itself emits, via
+/// the SAME [`validate_plan_structure`] the flat path uses). `id`/`dependsOn` wire
+/// the milestone DAG [`merge_fragments`] uses to synthesize cross-fragment task
+/// ordering — the weak local model never has to reason about another milestone's
+/// tasks directly.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Milestone {
+    /// Unique, non-empty id (e.g. `M1`) — the namespace prefix
+    /// [`merge_fragments`] gives every task pulled from this milestone's fragment
+    /// (`"{id}-{taskId}"`, e.g. `M1-T001`).
+    id: String,
+    /// One-line title, fed into the EXPAND prompt as this milestone's framing.
+    title: String,
+    /// Advisory file scope hints (project-root-relative); may be empty. Any entry
+    /// that fails [`check_rel_path`] is silently dropped by [`parse_outline`] — an
+    /// advisory hint, unlike a task `scope` path, is never worth failing the whole
+    /// outline over.
+    #[serde(default)]
+    files: Vec<String>,
+    /// Ids of prerequisite milestones. Must reference EXISTING milestone ids; the
+    /// whole graph must be acyclic — both checked by [`validate_outline`].
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+/// The OUTLINE stage's single model output: the milestone decomposition.
+/// `deny_unknown_fields`: mirrors [`TasksPlan`]'s discipline — a typo'd/extra key is
+/// a hard parse error fed back as a retry message, not silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Outline {
+    milestones: Vec<Milestone>,
+}
+
+/// Reject a cyclic milestone `dependsOn` graph. A small mirror of [`detect_cycle`]'s
+/// Kahn's-algorithm approach over [`Milestone`] instead of [`Task`] — kept as a
+/// SEPARATE copy (not a shared generic) so the flat path's `detect_cycle` stays
+/// completely untouched (byte-stable happy path) while this new, independent stage
+/// gets its own tiny, easy-to-audit cycle check.
+///
+/// PRECONDITION (mirrors [`detect_cycle`]'s own): must run AFTER the dangling-dep
+/// pass in [`validate_outline`], which has already rejected a `dependsOn` entry that
+/// does not reference an existing milestone id.
+fn detect_milestone_cycle(outline: &Outline) -> Result<(), String> {
+    let mut in_degree: HashMap<&str, usize> = HashMap::with_capacity(outline.milestones.len());
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::with_capacity(outline.milestones.len());
+    for m in &outline.milestones {
+        in_degree.insert(m.id.as_str(), m.depends_on.len());
+    }
+    debug_assert!(
+        outline.milestones.iter().all(|m| m
+            .depends_on
+            .iter()
+            .all(|d| in_degree.contains_key(d.as_str()))),
+        "detect_milestone_cycle precondition violated: a dependsOn references an unknown \
+         milestone id (validate_outline must run first)"
+    );
+    for m in &outline.milestones {
+        for dep in &m.depends_on {
+            dependents.entry(dep.as_str()).or_default().push(m.id.as_str());
+        }
+    }
+    let mut queue: Vec<&str> = in_degree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    let mut resolved = 0usize;
+    while let Some(id) = queue.pop() {
+        resolved += 1;
+        if let Some(children) = dependents.get(id) {
+            for &child in children {
+                if let Some(d) = in_degree.get_mut(child) {
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push(child);
+                    }
+                }
+            }
+        }
+    }
+    if resolved != outline.milestones.len() {
+        return Err("the milestone dependsOn graph has a cycle (it must be acyclic)".to_string());
+    }
+    Ok(())
+}
+
+/// Structural validation of an [`Outline`]: non-empty; ≤ [`MAX_MILESTONES`]; unique
+/// non-empty ids; non-empty bounded titles; `dependsOn` references EXISTING
+/// milestone ids only (no self-dep, no dangling, no duplicates) and is acyclic.
+/// Mirrors [`validate_plan_structure`]'s discipline at the milestone-DAG level
+/// rather than the task-DAG level.
+fn validate_outline(outline: &Outline) -> Result<(), String> {
+    if outline.milestones.is_empty() {
+        return Err("outline has no milestones".to_string());
+    }
+    if outline.milestones.len() > MAX_MILESTONES {
+        return Err(format!(
+            "too many milestones: {} (max {MAX_MILESTONES})",
+            outline.milestones.len()
+        ));
+    }
+    let mut ids: HashSet<&str> = HashSet::with_capacity(outline.milestones.len());
+    for m in &outline.milestones {
+        if m.id.trim().is_empty() {
+            return Err("a milestone has an empty `id`".to_string());
+        }
+        if !ids.insert(m.id.as_str()) {
+            return Err(format!("duplicate milestone id `{}`", m.id));
+        }
+        check_field("milestone title", &m.title)?;
+    }
+    for m in &outline.milestones {
+        let mut seen_deps: HashSet<&str> = HashSet::with_capacity(m.depends_on.len());
+        for dep in &m.depends_on {
+            if dep == &m.id {
+                return Err(format!("milestone `{}` depends on itself", m.id));
+            }
+            if !ids.contains(dep.as_str()) {
+                return Err(format!(
+                    "milestone `{}` dependsOn references unknown milestone id `{dep}`",
+                    m.id
+                ));
+            }
+            if !seen_deps.insert(dep.as_str()) {
+                return Err(format!(
+                    "milestone `{}` has a duplicate dependsOn entry `{dep}`",
+                    m.id
+                ));
+            }
+        }
+    }
+    detect_milestone_cycle(outline)?;
+    Ok(())
+}
+
+/// Parse + validate the OUTLINE stage's single fenced ```outline``` block. `files`
+/// entries are advisory scope hints: any that fail [`check_rel_path`] are silently
+/// dropped (never fail the whole outline over an advisory hint) BEFORE structural
+/// validation runs.
+fn parse_outline(raw: &str) -> Result<Outline, String> {
+    let body = extract_one_block(raw, "outline")?;
+    let mut outline: Outline =
+        serde_json::from_str(body).map_err(|e| format!("outline JSON invalid: {e}"))?;
+    for m in outline.milestones.iter_mut() {
+        m.files
+            .retain(|f| check_rel_path("milestone files entry", f).is_ok());
+    }
+    validate_outline(&outline)?;
+    Ok(outline)
+}
+
+/// Build the OUTLINE prompt: goal + PRE-PLAN NOTES + structure summary + the flat
+/// path's two failure reasons (so the model understands WHY it is being asked to
+/// decompose instead of try the same flat ask a third time) + the outline schema.
+/// `prior_error`, when set, is THIS stage's own previous (rejected) outline attempt
+/// — distinct from `flat_failures`, which is always the flat-PLAN failure context.
+/// Hard-capped at [`MAX_PLAN_PROMPT_CHARS`], mirroring [`build_plan_prompt`].
+fn build_outline_prompt(
+    goal: &str,
+    preplan_notes: &str,
+    summary: &serde_json::Value,
+    flat_failures: &str,
+    prior_error: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    if let Some(err) = prior_error {
+        let err = truncate_chars(err, MAX_PRIOR_ERROR_CHARS);
+        prompt.push_str(&format!(
+            "YOUR PREVIOUS OUTLINE WAS REJECTED: {err}\nFix it and emit a corrected outline.\n\n"
+        ));
+    }
+    prompt.push_str(
+        "You are the PLANNER. Produce a milestone OUTLINE — a small DAG of milestones — before \
+         planning each in detail.\n\n",
+    );
+    let flat_failures = truncate_chars(flat_failures, MAX_PRIOR_ERROR_CHARS);
+    prompt.push_str(&format!(
+        "The flat plan failed twice: {flat_failures}; now decompose the goal into milestones.\n\n"
+    ));
+    let goal_capped = truncate_chars(goal, MAX_GOAL_CHARS);
+    prompt.push_str(&format!("GOAL: {goal_capped}\n\n"));
+    let preplan_notes = truncate_chars(preplan_notes, MAX_PREPLAN_PROMPT_CHARS);
+    if !preplan_notes.trim().is_empty() {
+        prompt.push_str("PRE-PLAN NOTES (your external memory from this planning session):\n");
+        prompt.push_str(&preplan_notes);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("PROJECT SUMMARY: ");
+    prompt.push_str(&truncate_chars(&summary.to_string(), MAX_SUMMARY_CHARS));
+    prompt.push_str("\n\nRULES:\n");
+    prompt.push_str(&format!("- At most {MAX_MILESTONES} milestones.\n"));
+    prompt.push_str("- Each milestone `id` is unique and non-empty (e.g. M1).\n");
+    prompt.push_str(
+        "- `dependsOn` lists prerequisite milestone ids (existing ids only) and MUST be acyclic.\n",
+    );
+    prompt.push_str(
+        "- `files` are advisory scope hints (project-root-relative paths); may be empty.\n\n",
+    );
+    prompt.push_str(
+        "Emit EXACTLY ONE fenced ```outline``` block — a single JSON object — and nothing else:\n\
+         ```outline\n\
+         {\"milestones\": [\n\
+         {\"id\": \"M1\", \"title\": \"...\", \"files\": [\"path/a\"], \"dependsOn\": []}\n\
+         ]}\n\
+         ```",
+    );
+    // Final guard, mirroring build_plan_prompt / build_explore_prompt.
+    truncate_chars(&prompt, MAX_PLAN_PROMPT_CHARS)
+}
+
+/// Build the EXPAND prompt for ONE milestone: goal + PRE-PLAN NOTES + this
+/// milestone's title/advisory files + the SAME [`task_rules_block`] the flat PLAN
+/// prompt uses (so the two schemas cannot drift) + the fragment-local-id rule +
+/// the same `plan` schema [`build_plan_prompt`] asks for. Hard-capped at
+/// [`MAX_PLAN_PROMPT_CHARS`]. Deliberately carries NO other milestone's tasks —
+/// each EXPAND call is fresh and small, exactly like an EXPLORE call.
+fn build_expand_prompt(
+    goal: &str,
+    preplan_notes: &str,
+    milestone: &Milestone,
+    prior_error: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    if let Some(err) = prior_error {
+        let err = truncate_chars(err, MAX_PRIOR_ERROR_CHARS);
+        prompt.push_str(&format!(
+            "YOUR PREVIOUS FRAGMENT PLAN WAS REJECTED: {err}\nFix it and emit a corrected plan.\n\n"
+        ));
+    }
+    prompt.push_str(
+        "You are the PLANNER. Produce an ATOMIC implementation plan (a DAG of small tasks) for \
+         ONE MILESTONE only — not the whole goal.\n\n",
+    );
+    let goal_capped = truncate_chars(goal, MAX_GOAL_CHARS);
+    prompt.push_str(&format!("OVERALL GOAL: {goal_capped}\n\n"));
+    let preplan_notes = truncate_chars(preplan_notes, MAX_PREPLAN_PROMPT_CHARS);
+    if !preplan_notes.trim().is_empty() {
+        prompt.push_str("PRE-PLAN NOTES (your external memory from this planning session):\n");
+        prompt.push_str(&preplan_notes);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&format!(
+        "MILESTONE {}: {}\n",
+        milestone.id,
+        milestone.title.trim()
+    ));
+    if milestone.files.is_empty() {
+        prompt.push_str("Advisory file scope hints: (none suggested)\n");
+    } else {
+        prompt.push_str(&format!(
+            "Advisory file scope hints: {}\n",
+            milestone.files.join(", ")
+        ));
+    }
+    prompt.push_str("\nRULES:\n");
+    prompt.push_str(&task_rules_block(None));
+    prompt.push_str(
+        "- Task ids in THIS fragment are LOCAL: `dependsOn` may ONLY reference an id defined in \
+         THIS SAME fragment — never a task id from another milestone.\n\n",
+    );
+    prompt.push_str(
+        "Emit EXACTLY ONE fenced ```plan``` block — a single JSON object — and nothing else:\n\
+         ```plan\n\
+         {\"projectGoal\": \"...\", \"tasks\": [\n\
+         {\"id\": \"T001\", \"title\": \"...\", \"scope\": [\"path/a\"], \"contextFiles\": [], \
+         \"acceptance\": \"cargo test passes\", \"dependsOn\": [], \"status\": \"pending\", \"attempts\": 0}\n\
+         ]}\n\
+         ```",
+    );
+    truncate_chars(&prompt, MAX_PLAN_PROMPT_CHARS)
+}
+
+/// Parse + validate ONE EXPAND fragment for `milestone_id`: reuses the EXACT flat-PLAN
+/// parse (a single fenced ```plan``` block, the SAME [`TasksPlan`] shape) and the EXACT
+/// [`validate_plan_structure`] structural gate the flat path uses — deliberately NOT
+/// [`validate_plan`] (no freshness re-check HERE; [`merge_fragments`]'s Pass 1
+/// unconditionally NORMALIZES every task's `status`/`attempts` back to
+/// `"pending"`/`0` regardless of what this fragment carries, so re-validating
+/// freshness at parse time would be redundant — the invariant holds by
+/// construction downstream, not by rejecting a bad echo here). Because
+/// `validate_plan_structure` only ever considers ids WITHIN `plan.tasks`, it ALREADY
+/// enforces "dependsOn is local to the fragment" for free — a dep naming a task from
+/// another milestone is simply an unknown id from this fragment's point of view.
+fn parse_expand_fragment(raw: &str, milestone_id: &str) -> Result<TasksPlan, String> {
+    let body = extract_one_block(raw, "plan")?;
+    let parsed: TasksPlan =
+        serde_json::from_str(body).map_err(|e| format!("fragment plan JSON invalid: {e}"))?;
+    validate_plan_structure(&parsed)
+        .map_err(|e| format!("milestone {milestone_id} fragment invalid: {e}"))?;
+    Ok(parsed)
+}
+
+/// Task ids (LOCAL, un-namespaced) in `tasks` with an EMPTY `dependsOn` — the entry
+/// points of this fragment's internal DAG. [`merge_fragments`] wires these to the
+/// prerequisite milestone's leaves.
+fn fragment_roots(tasks: &[Task]) -> Vec<&str> {
+    tasks
+        .iter()
+        .filter(|t| t.depends_on.is_empty())
+        .map(|t| t.id.as_str())
+        .collect()
+}
+
+/// Task ids (LOCAL, un-namespaced) in `tasks` that NO OTHER task in the same
+/// fragment depends on — the exit points of this fragment's internal DAG.
+/// [`merge_fragments`] wires these into the dependent milestone's roots.
+fn fragment_leaves(tasks: &[Task]) -> Vec<&str> {
+    let depended_on: HashSet<&str> = tasks
+        .iter()
+        .flat_map(|t| t.depends_on.iter().map(|d| d.as_str()))
+        .collect();
+    tasks
+        .iter()
+        .filter(|t| !depended_on.contains(t.id.as_str()))
+        .map(|t| t.id.as_str())
+        .collect()
+}
+
+/// MERGE: the pure-code heart of the hierarchical escalation path. `fragments` MUST
+/// be in the SAME order as `outline.milestones` (index `i` is milestone `i`'s
+/// EXPAND output) — [`run_hierarchical_plan`] guarantees this (EXPAND runs
+/// sequentially in outline order and pushes each result in turn).
+///
+/// Deterministic rule, in three passes:
+/// 1. NAMESPACE every fragment task id to `"{milestoneId}-{taskId}"` (e.g.
+///    `M1-T001`) and remap its `dependsOn` the same way. A `dependsOn` entry that
+///    does not reference a task id WITHIN THE SAME fragment is a hard error — ids
+///    are local to the fragment; a model that drifted outside it is rejected here
+///    (this is checked independently of any upstream per-fragment validation, so
+///    this function is safe to call, and to unit-test, standalone). This same pass
+///    also NORMALIZES the runtime fields: every namespaced task's `status` is
+///    forced to `"pending"` and `attempts` to `0`, UNCONDITIONALLY overwriting
+///    whatever the EXPAND fragment echoed. The harness owns these two fields, never
+///    the model; an EXPAND call that hallucinated (or echoed from training data) a
+///    `"done"`/`attempts > 0` task must never poison the merged plan with a task
+///    that looks already-finished.
+/// 2. Cross-fragment ORDERING, from the milestone DAG alone (never asking the model
+///    to reason across fragments): for every milestone edge `Ma -> Mb` (`Mb`
+///    `dependsOn` `Ma`), every ROOT task of `Mb`'s fragment gets `dependsOn` +=
+///    ALL LEAF tasks of `Ma`'s fragment ([`fragment_roots`] / [`fragment_leaves`]).
+/// 3. ASSEMBLE: `projectGoal` is the OUTER `goal` (capped like the flat path caps
+///    its own goal in the PLAN prompt — see [`MAX_GOAL_CHARS`]). Every task's
+///    `status`/`attempts` are ALREADY `"pending"`/`0` (Pass 1's normalization
+///    guarantees this unconditionally, for every task, before this pass ever
+///    runs) — so the flat path's freshness check, `validate_plan`, is intentionally
+///    NOT re-run here; only structure/cycles, per the merge contract, because the
+///    freshness invariant it would check is already guaranteed by construction.
+///    Then the EXISTING [`validate_plan_structure`] (which itself runs
+///    [`detect_cycle`]) is run on the WHOLE assembled plan: global id uniqueness
+///    (guaranteed by namespacing, but checked anyway), dangling deps, cycles,
+///    [`MAX_TASKS`], and per-task `scope` caps. A merge that produced more than
+///    [`MAX_TASKS`] tasks gets that validator error WRAPPED with an explicit hint
+///    naming the overflow.
+fn merge_fragments(goal: &str, outline: &Outline, fragments: &[TasksPlan]) -> Result<TasksPlan, String> {
+    if outline.milestones.len() != fragments.len() {
+        return Err(format!(
+            "hierarchical merge: {} milestone(s) but {} fragment(s) (must match 1:1)",
+            outline.milestones.len(),
+            fragments.len()
+        ));
+    }
+
+    // Pass 1: per-milestone namespace remap + local-id (dangling-dep) validation +
+    // runtime-field normalization (status/attempts forced to pending/0 below).
+    // `remapped[i]` holds milestone `i`'s tasks, namespaced, in original order.
+    let mut remapped: Vec<Vec<Task>> = Vec::with_capacity(fragments.len());
+    let mut roots_by_milestone: HashMap<&str, Vec<String>> = HashMap::with_capacity(outline.milestones.len());
+    let mut leaves_by_milestone: HashMap<&str, Vec<String>> = HashMap::with_capacity(outline.milestones.len());
+
+    for (milestone, fragment) in outline.milestones.iter().zip(fragments.iter()) {
+        let mid = milestone.id.as_str();
+        let local_ids: HashSet<&str> = fragment.tasks.iter().map(|t| t.id.as_str()).collect();
+        let root_local: HashSet<&str> = fragment_roots(&fragment.tasks).into_iter().collect();
+        let leaf_local: HashSet<&str> = fragment_leaves(&fragment.tasks).into_iter().collect();
+
+        let mut namespaced_tasks = Vec::with_capacity(fragment.tasks.len());
+        let mut roots = Vec::new();
+        let mut leaves = Vec::new();
+        for task in &fragment.tasks {
+            let namespaced_id = format!("{mid}-{}", task.id);
+            let mut namespaced_deps = Vec::with_capacity(task.depends_on.len());
+            for dep in &task.depends_on {
+                if !local_ids.contains(dep.as_str()) {
+                    return Err(format!(
+                        "milestone {mid}: task `{}` dependsOn `{dep}`, which is not a task in \
+                         this fragment (task ids are local to the fragment)",
+                        task.id
+                    ));
+                }
+                namespaced_deps.push(format!("{mid}-{dep}"));
+            }
+            if root_local.contains(task.id.as_str()) {
+                roots.push(namespaced_id.clone());
+            }
+            if leaf_local.contains(task.id.as_str()) {
+                leaves.push(namespaced_id.clone());
+            }
+            let mut namespaced_task = task.clone();
+            namespaced_task.id = namespaced_id;
+            namespaced_task.depends_on = namespaced_deps;
+            // The harness OWNS runtime fields, never the model: force every
+            // namespaced task back to a fresh draft state regardless of what the
+            // EXPAND fragment echoed. A model that hallucinated (or copy-pasted
+            // from training data) a "done"/`attempts > 0` task must never poison
+            // the merged plan with a task that looks already-finished — this is
+            // the SAME freshness invariant `validate_plan` enforces on the flat
+            // path, applied here at the SOURCE (Pass 1) rather than re-validated
+            // at the end, so it holds unconditionally, not just when re-checked.
+            namespaced_task.status = "pending".to_string();
+            namespaced_task.attempts = 0;
+            namespaced_tasks.push(namespaced_task);
+        }
+        roots_by_milestone.insert(mid, roots);
+        leaves_by_milestone.insert(mid, leaves);
+        remapped.push(namespaced_tasks);
+    }
+
+    // Pass 2: cross-fragment ordering via the milestone DAG.
+    for (i, milestone) in outline.milestones.iter().enumerate() {
+        let mut extra_deps: Vec<String> = Vec::new();
+        for prereq in &milestone.depends_on {
+            if let Some(leaves) = leaves_by_milestone.get(prereq.as_str()) {
+                extra_deps.extend(leaves.iter().cloned());
+            }
+        }
+        if extra_deps.is_empty() {
+            continue;
+        }
+        let roots = roots_by_milestone
+            .get(milestone.id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        for task in remapped[i].iter_mut() {
+            if roots.contains(&task.id) {
+                for dep in &extra_deps {
+                    if !task.depends_on.contains(dep) {
+                        task.depends_on.push(dep.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: assemble + validate the whole.
+    let mut all_tasks: Vec<Task> = Vec::new();
+    for tasks in remapped {
+        all_tasks.extend(tasks);
+    }
+    let merged = TasksPlan {
+        project_goal: truncate_chars(goal, MAX_GOAL_CHARS),
+        tasks: all_tasks,
+    };
+    let task_count = merged.tasks.len();
+    validate_plan_structure(&merged).map_err(|e| {
+        if task_count > MAX_TASKS {
+            format!("hierarchical merge produced {task_count}>{MAX_TASKS} tasks: {e}")
+        } else {
+            e
+        }
+    })?;
+    Ok(merged)
+}
+
+/// Drive the whole hierarchical escalation path: OUTLINE (bounded retries) -> EXPAND
+/// (sequential, one bounded-retry model call PER milestone, NO concurrency — the
+/// local model endpoint has no throttling) -> MERGE (pure code). Called by
+/// [`run_planner`] ONLY after BOTH flat PLAN attempts have failed; `flat_failure_reasons`
+/// is fed into the OUTLINE prompt so the model understands why it is decomposing
+/// instead of repeating the same flat ask. `preplan_notes` is the SAME already-rendered
+/// snapshot [`run_planner`] captured once before its flat retry loop (this stage does
+/// not re-render it — the accepted outline is threaded directly into each EXPAND
+/// prompt via `milestone`, not round-tripped through the preplan file).
+///
+/// Returns `Err` naming whichever stage failed (OUTLINE exhaustion, a specific
+/// milestone's EXPAND exhaustion, or MERGE) — surfaced by [`run_planner`] to the
+/// burst model exactly like today's flat-exhaustion error.
+async fn run_hierarchical_plan(
+    goal: &str,
+    model: &dyn CoderModel,
+    preplan: &Preplan,
+    preplan_notes: &str,
+    summary: &serde_json::Value,
+    flat_failure_reasons: &str,
+    activity: &Activity,
+) -> Result<TasksPlan, String> {
+    // --- OUTLINE (bounded retries) ---
+    activity.milestone("outlining plan (hierarchical)", Node::Hollow);
+    let mut outline_error: Option<String> = None;
+    let mut outline: Option<Outline> = None;
+    for _ in 0..MAX_OUTLINE_ATTEMPTS {
+        let prompt = build_outline_prompt(
+            goal,
+            preplan_notes,
+            summary,
+            flat_failure_reasons,
+            outline_error.as_deref(),
+        );
+        let transcript = Transcript::new(prompt);
+        let raw = model.next_output(&transcript).await;
+        match parse_outline(&raw) {
+            Ok(o) => {
+                outline = Some(o);
+                break;
+            }
+            Err(e) => outline_error = Some(e),
+        }
+    }
+    let outline = outline.ok_or_else(|| {
+        format!(
+            "hierarchical OUTLINE failed after {MAX_OUTLINE_ATTEMPTS} attempt(s): {}",
+            outline_error.unwrap_or_else(|| "unknown error".to_string())
+        )
+    })?;
+
+    // Persist the ACCEPTED outline to the external memory: one line per milestone.
+    for m in &outline.milestones {
+        let deps = if m.depends_on.is_empty() {
+            "none".to_string()
+        } else {
+            m.depends_on.join(", ")
+        };
+        preplan.append(
+            "Draft outline",
+            &format!("- {}: {} (depends on: {deps})", m.id, m.title.trim()),
+        );
+    }
+
+    // --- EXPAND: sequential, one bounded-retry model call PER milestone ---
+    let n = outline.milestones.len();
+    let mut fragments: Vec<TasksPlan> = Vec::with_capacity(n);
+    for (i, milestone) in outline.milestones.iter().enumerate() {
+        activity.milestone(
+            &format!("expanding milestone {} ({}/{n})", milestone.id, i + 1),
+            Node::Hollow,
+        );
+        let mut fragment_error: Option<String> = None;
+        let mut fragment: Option<TasksPlan> = None;
+        for _ in 0..MAX_EXPAND_ATTEMPTS {
+            let prompt =
+                build_expand_prompt(goal, preplan_notes, milestone, fragment_error.as_deref());
+            let transcript = Transcript::new(prompt);
+            let raw = model.next_output(&transcript).await;
+            match parse_expand_fragment(&raw, &milestone.id) {
+                Ok(p) => {
+                    fragment = Some(p);
+                    break;
+                }
+                Err(e) => fragment_error = Some(e),
+            }
+        }
+        let fragment = fragment.ok_or_else(|| {
+            format!(
+                "hierarchical EXPAND for milestone {} failed after {MAX_EXPAND_ATTEMPTS} attempt(s): {}",
+                milestone.id,
+                fragment_error.unwrap_or_else(|| "unknown error".to_string())
+            )
+        })?;
+        fragments.push(fragment);
+    }
+
+    // --- MERGE (pure code, no model call) ---
+    merge_fragments(goal, &outline, &fragments)
+}
+
 // --- The routine -------------------------------------------------------------
 
 /// Run the local planner for `goal`: STRUCTURE -> EXPLORE -> PLAN -> SUBMIT ->
@@ -922,6 +1712,13 @@ pub async fn run_planner(
         return Err("planner needs a project_id (DEVBOULE_PROJECT_ID not set?)".to_string());
     }
 
+    // --- 0) PRE-PLAN NOTES: harness-owned on-disk external memory ---
+    // Rooted at `<fs.root>/.devboule/preplan.md`. Resumes when a prior (possibly
+    // crashed) run's file belongs to this SAME goal — so a planner that dies mid-run
+    // leaves its findings for the next attempt to re-read instead of re-discovering
+    // everything from scratch; a DIFFERENT goal never inherits stale memory.
+    let preplan = Preplan::load_or_init(fs.root(), goal);
+
     // --- 1) STRUCTURE (no LLM) ---
     let structure_text = mcp
         .call_tool(
@@ -937,14 +1734,49 @@ pub async fn run_planner(
         &format!("Planning: {} spine files", structure.spine.len()),
         Node::Dot,
     );
+    preplan.append(
+        "Findings",
+        &format!(
+            "- STRUCTURE spine: {}",
+            structure
+                .spine
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+
+    // --- 1b) GOAL-driven grounding merged into the spine (best-effort) ---
+    // A weak local model cannot reliably guess which INFRA files matter for THIS
+    // goal from the structural spine alone; ground it with whatever the Oracle's
+    // semantic index surfaces for the goal itself, on top of (never instead of)
+    // the purely-structural top-MAX_SPINE files. Any failure here — a tool error,
+    // unparseable JSON, an all-unsafe/all-duplicate chunk set — degrades to the
+    // structural spine alone; it never sinks the plan.
+    activity.milestone("grounding goal via oracle", Node::Hollow);
+    let mut explore_spine: Vec<SpineEntry> = structure.spine.clone();
+    let structural_paths: HashSet<String> =
+        explore_spine.iter().map(|e| e.path.clone()).collect();
+    if let Ok(goal_ctx_raw) = mcp
+        .call_tool(
+            "oracle_context",
+            serde_json::json!({ "query": goal, "limit": 8, "project_id": project_id }),
+        )
+        .await
+    {
+        if let Some(parsed) = parse_oracle_context(&goal_ctx_raw) {
+            explore_spine.extend(goal_spine_entries(&parsed, &structural_paths));
+        }
+    }
 
     // --- 2) EXPLORE (bounded LLM loop, ONE small call per spine file) ---
     // We store the ALREADY-RENDERED note line (not the parsed note) so the budget
     // accounting and the final join use the exact same string — `render_note` is
     // called once per accepted note, never twice.
-    let mut rendered_notes: Vec<String> = Vec::with_capacity(structure.spine.len());
+    let mut rendered_notes: Vec<String> = Vec::with_capacity(explore_spine.len());
     let mut notes_total = 0usize;
-    for entry in &structure.spine {
+    for entry in &explore_spine {
         // Read the file body locally, capped — the FS backend caps to its own read
         // limit; we further cap to MAX_EXPLORE_FILE_CHARS so the per-call context
         // stays small. A read failure (file vanished, binary) is non-fatal: skip
@@ -982,7 +1814,7 @@ pub async fn run_planner(
             )
             .await
             .ok()
-            .map(|g| truncate_chars(&g, MAX_GROUNDING_CHARS));
+            .map(|raw| build_grounding_text(&raw, MAX_GROUNDING_CHARS));
 
         let prompt = build_explore_prompt(goal, entry, &body, grounding.as_deref());
         // Fresh, SMALL context per call: the whole prompt is this one file (+ one
@@ -996,6 +1828,10 @@ pub async fn run_planner(
                 // Render ONCE here; reuse the same string for both the budget check
                 // and the final join.
                 let rendered = render_note(&note);
+                // Persist EVERY accepted note to the external memory, regardless of
+                // whether it also makes THIS run's in-prompt notes budget below —
+                // the on-disk record outlives a single PLAN call's char cap.
+                preplan.append("Findings", &rendered);
                 let rendered_len = rendered.chars().count();
                 // The final `notes_block` is `rendered_notes.join("\n")`, which adds
                 // ONE newline BETWEEN entries. Count that joining newline (only when
@@ -1025,15 +1861,26 @@ pub async fn run_planner(
         truncate_chars(&rendered_notes.join("\n"), MAX_NOTES_TOTAL_CHARS)
     };
 
-    // --- 3) PLAN (a SINGLE LLM call, with bounded validation retries) ---
-    let mut prior_error: Option<String> = None;
+    // --- 3) PLAN: FLAT attempts first, ESCALATE to hierarchical on failure ---
+    // Rendered ONCE, before the retry loop: by this point STRUCTURE + every
+    // accepted EXPLORE note is already on disk, so even attempt #1 carries the
+    // full external-memory context a crash-resumed run needs. Also reused, WITHOUT
+    // re-rendering, by the hierarchical escalation path below (same discipline).
+    let preplan_notes = preplan.render_for_prompt(MAX_PREPLAN_PROMPT_CHARS);
+    // ADaPT pattern (escalation-ONLY, failure-driven): a SIMPLE goal that succeeds on
+    // attempt 1 never touches anything below this loop — no size-threshold
+    // pre-escalation exists. Only when BOTH flat attempts fail does the code below
+    // the loop run the hierarchical OUTLINE/EXPAND/MERGE path in place of what would
+    // have been a third, identical flat try.
+    let mut flat_errors: Vec<String> = Vec::new();
     let mut plan: Option<TasksPlan> = None;
-    for _ in 0..MAX_PLAN_ATTEMPTS {
+    for attempt in 0..FLAT_PLAN_ATTEMPTS {
         let prompt = build_plan_prompt(
             goal,
+            &preplan_notes,
             &notes_block,
             &structure.summary,
-            prior_error.as_deref(),
+            flat_errors.last().map(|s| s.as_str()),
         );
         let transcript = Transcript::new(prompt);
         let raw = model.next_output(&transcript).await;
@@ -1051,16 +1898,40 @@ pub async fn run_planner(
                 plan = Some(valid);
                 break;
             }
-            Err(e) => prior_error = Some(e),
+            Err(e) => {
+                preplan.append(
+                    "Decisions",
+                    &format!("attempt {} rejected: {e}", attempt + 1),
+                );
+                flat_errors.push(e);
+            }
         }
     }
-    let plan = plan.ok_or_else(|| {
-        format!(
-            "planner could not produce a valid plan in {MAX_PLAN_ATTEMPTS} attempts: {}",
-            prior_error.unwrap_or_else(|| "unknown error".to_string())
-        )
-    })?;
-    // PLAN done → how many tasks were drafted (a count label only).
+    let plan = match plan {
+        Some(p) => p,
+        None => {
+            let flat_failure_reasons = flat_errors.join("; ");
+            run_hierarchical_plan(
+                goal,
+                model,
+                &preplan,
+                &preplan_notes,
+                &structure.summary,
+                &flat_failure_reasons,
+                activity,
+            )
+            .await
+            .map_err(|e| format!("planner could not produce a valid plan: {e}"))?
+        }
+    };
+    // PLAN done → how many tasks were drafted (a count label only). Shared by BOTH
+    // the flat and hierarchical paths — everything from here down is IDENTICAL
+    // regardless of which path produced `plan`, INCLUDING the freshness invariant
+    // every downstream consumer relies on: every task's `status` is `"pending"` and
+    // `attempts` is `0`. The flat path gets this from `validate_plan` (above); the
+    // hierarchical path gets it from `merge_fragments`'s Pass 1 normalization
+    // (unconditional, not a re-validation) — so this milestone, and everything
+    // after it, can treat `plan` the same way no matter which path built it.
     activity.milestone(&format!("drafted {} tasks", plan.tasks.len()), Node::Dot);
 
     // --- 4) SUBMIT: plan_submit (human gate). Nothing is persisted locally and
@@ -1142,6 +2013,14 @@ pub async fn run_planner(
         }
         None
     };
+
+    // A TERMINAL human verdict (approved or rejected) ends this planning session —
+    // clear the external memory so it never leaks into a later, unrelated run. A
+    // `Timeout` is NOT terminal (the human simply did not answer in time): leave the
+    // file so a retry with the SAME goal still resumes with everything gathered.
+    if matches!(approval, PlanApproval::Approved | PlanApproval::Rejected) {
+        preplan.clear();
+    }
 
     Ok(PlanOutcome {
         tasks_plan: plan,
@@ -1254,13 +2133,18 @@ mod tests {
     }
 
     // --- A recording mock MCP backend ---------------------------------------
-    // Returns a fixed spine for `project_structure`, a canned snippet for
-    // `oracle_context`, and a configurable status for `plan_submit`; records every
-    // call so tests can assert the tool sequence + the plan_submit payload.
+    // Returns a fixed spine for `project_structure`, the REAL `oracle_context` JSON
+    // shape (`{query, indexStatus, chunks:[...]}`) for EVERY oracle_context call
+    // (configurable chunks; empty by default so the new GOAL-grounding call adds
+    // NOTHING unless a test opts in — existing EXPLORE/PLAN call counts stay
+    // untouched), and a configurable status for `plan_submit`; records every call
+    // so tests can assert the tool sequence + payloads.
 
     struct MockMcp {
         spine_paths: Vec<String>,
         submit_status: String,
+        oracle_chunks: Vec<(String, String)>,
+        oracle_context_fails: bool,
         calls: Mutex<Vec<(String, serde_json::Value)>>,
     }
     impl MockMcp {
@@ -1268,8 +2152,24 @@ mod tests {
             Self {
                 spine_paths: spine_paths.into_iter().map(|s| s.to_string()).collect(),
                 submit_status: submit_status.to_string(),
+                oracle_chunks: Vec::new(),
+                oracle_context_fails: false,
                 calls: Mutex::new(Vec::new()),
             }
+        }
+        /// Every `oracle_context` call (goal-grounding AND per-file EXPLORE
+        /// grounding) returns these `(file_source, text)` pairs as chunks.
+        fn with_oracle_chunks(mut self, chunks: Vec<(&str, &str)>) -> Self {
+            self.oracle_chunks = chunks
+                .into_iter()
+                .map(|(f, t)| (f.to_string(), t.to_string()))
+                .collect();
+            self
+        }
+        /// Every `oracle_context` call fails (tests the best-effort skip path).
+        fn failing_oracle_context(mut self) -> Self {
+            self.oracle_context_fails = true;
+            self
         }
         fn calls(&self) -> Vec<(String, serde_json::Value)> {
             self.calls.lock().unwrap().clone()
@@ -1313,7 +2213,29 @@ mod tests {
                     })
                     .to_string())
                 }
-                "oracle_context" => Ok("[grounding] semantic snippet about the file".to_string()),
+                "oracle_context" => {
+                    if self.oracle_context_fails {
+                        return Err("oracle_context unavailable".to_string());
+                    }
+                    let chunks: Vec<serde_json::Value> = self
+                        .oracle_chunks
+                        .iter()
+                        .map(|(file_source, text)| {
+                            serde_json::json!({
+                                "chunk_id": "c1",
+                                "file_source": file_source,
+                                "text": text,
+                                "score": 0.9,
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::json!({
+                        "query": params.get("query").and_then(|v| v.as_str()).unwrap_or(""),
+                        "indexStatus": {"ready": true},
+                        "chunks": chunks,
+                    })
+                    .to_string())
+                }
                 "plan_submit" => Ok(
                     serde_json::json!({"planId": "p1", "status": self.submit_status}).to_string(),
                 ),
@@ -1588,6 +2510,7 @@ mod tests {
             milestones,
             vec![
                 ("Planning: 2 spine files".to_string(), "dot".to_string()),
+                ("grounding goal via oracle".to_string(), "".to_string()),
                 ("exploring a.rs".to_string(), "".to_string()),
                 ("exploring b.rs".to_string(), "".to_string()),
                 ("drafted 1 tasks".to_string(), "dot".to_string()),
@@ -1754,13 +2677,22 @@ mod tests {
         // PLAN prompt's notes block (rendered_notes.join("\n")) must NEVER exceed
         // MAX_NOTES_TOTAL_CHARS — the join newlines BETWEEN entries are counted, so
         // the running budget can no longer under-count and overflow.
-        const N: usize = MAX_SPINE; // 8 files
-                                    // Each rendered note line is "- <source>: <role>" + truncation; pick a role
-                                    // length that pushes several notes near the cap so the budget actually trips
-                                    // and the join newlines matter.
+        // Each rendered note line is "- <source>: <role>" + truncation; pick a role
+        // length that pushes every note to EXACTLY MAX_NOTE_CHARS after truncation
+        // so the budget math is exact, then pick N so the overflow lands on the
+        // LAST spine file: after k notes the running total is
+        // `k*MAX_NOTE_CHARS + (k-1)` join newlines, so N is the smallest count
+        // whose total exceeds MAX_NOTES_TOTAL_CHARS. This keeps the test scaling
+        // automatically with either budget constant instead of hardcoding N
+        // against a since-reduced MAX_NOTES_TOTAL_CHARS.
         let role_len = MAX_NOTE_CHARS; // render_note truncates the line to MAX_NOTE_CHARS
+        let n = MAX_NOTES_TOTAL_CHARS / (MAX_NOTE_CHARS + 1) + 1;
+        assert!(
+            n <= MAX_SPINE,
+            "test assumption: N must fit within one structural spine (got {n})"
+        );
 
-        let paths: Vec<String> = (0..N).map(|i| format!("src/f{i}.rs")).collect();
+        let paths: Vec<String> = (0..n).map(|i| format!("src/f{i}.rs")).collect();
         let files: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), "fn x() {}\n")).collect();
         let (_dir, fs) = fs_with_files(&files);
         let mcp = MockMcp::new(paths.iter().map(|s| s.as_str()).collect(), "approved");
@@ -1801,6 +2733,327 @@ mod tests {
         // rejected (and skipped), proving the anti-drift guard.
         assert!(parse_explore_note(&note_block("src/OTHER.rs"), "src/a.rs").is_err());
         assert!(parse_explore_note(&note_block("src/a.rs"), "src/a.rs").is_ok());
+    }
+
+    // --- oracle_context grounding: structured PROSE, not raw JSON -----------
+
+    #[test]
+    fn build_grounding_text_parses_real_oracle_json_into_prose() {
+        let raw = serde_json::json!({
+            "query": "role of src/a.rs",
+            "indexStatus": {"ready": true},
+            "chunks": [
+                {"chunk_id": "c1", "file_source": "src/a.rs", "text": "does the a-thing", "score": 0.9},
+                {"chunk_id": "c2", "file_source": "src/b.rs", "text": "does the b-thing", "score": 0.5},
+            ],
+        })
+        .to_string();
+        let grounding = build_grounding_text(&raw, MAX_GROUNDING_CHARS);
+        assert!(
+            grounding.contains("-- src/a.rs\ndoes the a-thing"),
+            "chunk 1 rendered as prose: {grounding}"
+        );
+        assert!(
+            grounding.contains("-- src/b.rs\ndoes the b-thing"),
+            "chunk 2 rendered as prose: {grounding}"
+        );
+        assert!(
+            !grounding.contains("chunk_id") && !grounding.contains("indexStatus"),
+            "no raw JSON scaffolding leaks into the prose: {grounding}"
+        );
+    }
+
+    #[test]
+    fn build_grounding_text_falls_back_to_raw_truncate_on_non_json() {
+        // The Oracle server may change shape; a non-JSON (or wrongly-shaped) result
+        // must degrade to the PRE-fix behavior (raw char-truncate), never panic and
+        // never silently produce empty grounding when there was real content.
+        let raw = "half-truncated garbage that is definitely not JSON {\"chunks\":";
+        let grounding = build_grounding_text(raw, MAX_GROUNDING_CHARS);
+        assert_eq!(
+            grounding, raw,
+            "non-JSON input is passed through (char-truncated) unchanged"
+        );
+    }
+
+    #[test]
+    fn build_grounding_text_respects_the_char_cap() {
+        let raw = serde_json::json!({
+            "chunks": [{"file_source": "src/a.rs", "text": "x".repeat(10_000)}],
+        })
+        .to_string();
+        let grounding = build_grounding_text(&raw, 50);
+        assert!(grounding.chars().count() <= 50, "grounding must respect the cap");
+    }
+
+    // --- GOAL-driven spine grounding (Piece 2) -------------------------------
+
+    #[test]
+    fn goal_spine_entries_extracts_new_safe_paths_capped_and_deduped() {
+        let existing: HashSet<String> = ["src/a.rs".to_string()].into_iter().collect();
+        let result = OracleContextResult {
+            chunks: vec![
+                OracleChunk { file_source: "src/a.rs".to_string(), text: "already in spine".to_string() },
+                OracleChunk { file_source: "src/new1.rs".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "src/new1.rs".to_string(), text: "duplicate chunk".to_string() },
+                OracleChunk { file_source: "../escape.rs".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "/etc/passwd".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "src/new2.rs".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "src/new3.rs".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "src/new4.rs".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "src/new5.rs".to_string(), text: "t".to_string() },
+            ],
+        };
+        let entries = goal_spine_entries(&result, &existing);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/new1.rs", "src/new2.rs", "src/new3.rs", "src/new4.rs"],
+            "dedup (against spine + within itself), unsafe paths filtered, capped at MAX_GOAL_SPINE"
+        );
+        assert_eq!(entries.len(), MAX_GOAL_SPINE);
+        for e in &entries {
+            assert_eq!(e.in_degree, 0);
+            assert!(e.top_symbols.is_empty());
+        }
+    }
+
+    #[test]
+    fn goal_spine_entries_excludes_dot_leading_harness_paths() {
+        // The planner must never EXPLORE its own harness/tool scratchpads — least of
+        // all its OWN preplan file, which would let a planning session's scratch
+        // notes get grounded back into ITS OWN future EXPLORE prompts as if they
+        // were project source. `check_rel_path` alone does not reject a dot-leading
+        // component (only "..", absolute paths, and a leading '-'), so this is an
+        // independent filter.
+        let existing: HashSet<String> = HashSet::new();
+        let result = OracleContextResult {
+            chunks: vec![
+                OracleChunk { file_source: ".devboule/preplan.md".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: ".git/config".to_string(), text: "t".to_string() },
+                OracleChunk { file_source: "src/real.rs".to_string(), text: "t".to_string() },
+            ],
+        };
+        let entries = goal_spine_entries(&result, &existing);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/real.rs"],
+            "dot-leading component paths must be filtered out: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_chunks_add_new_files_to_exploration() {
+        let (_dir, fs) = fs_with_files(&[
+            ("src/a.rs", "fn a() {}\n"),
+            ("src/goalfile.rs", "fn goal() {}\n"),
+        ]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved")
+            .with_oracle_chunks(vec![("src/goalfile.rs", "goal-relevant context")]);
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            note_block("src/goalfile.rs"),
+            plan_block(one_valid_task()),
+        ]);
+        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect("planner succeeds");
+        let prompts = model.prompts();
+        assert_eq!(prompts.len(), 3, "1 structural + 1 goal-added EXPLORE + 1 PLAN call");
+        assert!(
+            prompts[1].contains("src/goalfile.rs") && prompts[1].contains("fn goal()"),
+            "the goal-added file gets its OWN EXPLORE prompt: {}",
+            prompts[1]
+        );
+        assert_eq!(outcome.tasks_plan.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_chunks_dedup_against_the_existing_spine() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved")
+            .with_oracle_chunks(vec![("src/a.rs", "already in spine, adds nothing")]);
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "a goal chunk duplicating the structural spine adds no extra EXPLORE call"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_chunks_are_capped_at_max_goal_spine() {
+        let goal_paths: Vec<String> = (0..6).map(|i| format!("src/goal{i}.rs")).collect();
+        let goal_bodies: Vec<String> = (0..6).map(|i| format!("fn g{i}() {{}}\n")).collect();
+        let mut files: Vec<(&str, &str)> = vec![("src/a.rs", "fn a() {}\n")];
+        for i in 0..6 {
+            files.push((goal_paths[i].as_str(), goal_bodies[i].as_str()));
+        }
+        let (_dir, fs) = fs_with_files(&files);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved")
+            .with_oracle_chunks(goal_paths.iter().map(|p| (p.as_str(), "ctx")).collect());
+
+        let mut outputs = vec![note_block("src/a.rs")];
+        for path in goal_paths.iter().take(MAX_GOAL_SPINE) {
+            outputs.push(note_block(path));
+        }
+        outputs.push(plan_block(one_valid_task()));
+        let model = CapturingModel::new(outputs);
+
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect("planner succeeds");
+        assert_eq!(
+            model.prompts().len(),
+            1 + MAX_GOAL_SPINE + 1,
+            "1 structural + MAX_GOAL_SPINE capped goal files + 1 PLAN call"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_grounding_oracle_failure_is_skipped_not_fatal() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved").failing_oracle_context();
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect("an oracle_context failure must be non-fatal");
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "identical to today: 1 EXPLORE + 1 PLAN when oracle_context is unavailable"
+        );
+        assert_eq!(outcome.tasks_plan.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_chunks_with_unsafe_paths_are_filtered() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved")
+            .with_oracle_chunks(vec![("../escape.rs", "x"), ("/etc/passwd", "y")]);
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "unsafe goal chunk paths must be filtered out, adding nothing to explore"
+        );
+    }
+
+    // --- PRE-PLAN NOTES external memory wiring (Piece 3) ---------------------
+
+    #[tokio::test]
+    async fn preplan_findings_feed_into_the_plan_prompt() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+        let prompts = model.prompts();
+        let plan_prompt = prompts.last().unwrap();
+        assert!(plan_prompt.contains("PRE-PLAN NOTES"), "{plan_prompt}");
+        assert!(
+            plan_prompt.contains("STRUCTURE spine: src/a.rs"),
+            "the STRUCTURE finding is fed back in: {plan_prompt}"
+        );
+        assert!(
+            plan_prompt.contains("central module"),
+            "the EXPLORE note's role text is fed back in via PRE-PLAN NOTES too: {plan_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preexisting_preplan_with_the_same_goal_resumes_into_the_plan_prompt() {
+        // Simulates a CRASHED prior run: a preplan.md already exists for the SAME
+        // goal, with a finding the current run never (re-)discovered on its own.
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let preplan_path = dir.path().join(".devboule").join("preplan.md");
+        std::fs::create_dir_all(preplan_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &preplan_path,
+            "## Goal\ng\n\n## Constraints\n\n## Findings\n- PRIOR RUN: something important already learned\n\n## Decisions\n\n## Open questions\n\n## Draft outline\n",
+        )
+        .unwrap();
+
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+
+        let prompts = model.prompts();
+        let plan_prompt = prompts.last().unwrap();
+        assert!(
+            plan_prompt.contains("PRIOR RUN: something important already learned"),
+            "the crash-resumed finding must appear in the PLAN prompt: {plan_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_retry_rejection_is_recorded_in_preplan_decisions() {
+        // Uses an UNKNOWN submit status ("vanished" -> Timeout, NOT terminal) so the
+        // preplan file survives the run and can be inspected afterward.
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "vanished");
+        let four_scope = serde_json::json!([{
+            "id": "T001", "title": "too big",
+            "scope": ["a.rs", "b.rs", "c.rs", "d.rs"],
+            "acceptance": "x", "dependsOn": [], "status": "pending", "attempts": 0,
+        }]);
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            plan_block(four_scope),       // attempt 1: rejected (scope > 3)
+            plan_block(one_valid_task()), // attempt 2: valid
+        ]);
+        let outcome = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+        assert_eq!(outcome.approval, PlanApproval::Timeout);
+
+        let preplan_path = dir.path().join(".devboule").join("preplan.md");
+        let body = std::fs::read_to_string(&preplan_path)
+            .expect("a non-terminal (Timeout) verdict must NOT clear the preplan file");
+        assert!(
+            body.contains("attempt 1 rejected") && body.contains("scope"),
+            "records the rejection reason under Decisions: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_plan_clears_the_preplan_file() {
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+        let preplan_path = dir.path().join(".devboule").join("preplan.md");
+        assert!(
+            !preplan_path.exists(),
+            "an approved (terminal) plan must clear its preplan memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_plan_clears_the_preplan_file_too() {
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "rejected");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .unwrap();
+        let preplan_path = dir.path().join(".devboule").join("preplan.md");
+        assert!(
+            !preplan_path.exists(),
+            "a rejected (terminal) plan must also clear its preplan memory"
+        );
     }
 
     // --- PLAN validation (reject + retry feeds the error back) ---------------
@@ -2166,9 +3419,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_retries_returns_escalation_error() {
-        // Every PLAN attempt is invalid (4-file scope) -> the planner gives up
-        // after MAX_PLAN_ATTEMPTS with an Escalated-style error, and never submits.
+    async fn flat_exhaustion_always_escalates_and_outline_exhaustion_surfaces() {
+        // Both flat PLAN attempts are invalid (4-file scope). There is no "flat-only
+        // exhaustion" outcome anymore: the planner ALWAYS escalates into the
+        // hierarchical OUTLINE/EXPAND/MERGE path once flat is exhausted. Here the
+        // scripted model has nothing left for OUTLINE to consume either (its next
+        // outputs are also the same invalid flat-shaped block, then the
+        // `CapturingModel` "EXHAUSTED" sentinel), so OUTLINE itself exhausts its own
+        // `MAX_OUTLINE_ATTEMPTS` retries — that OUTLINE-stage failure is what
+        // surfaces, wrapped in the same top-level error, and the planner never
+        // submits.
         let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
         let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
         let bad = serde_json::json!([{
@@ -2185,11 +3445,256 @@ mod tests {
             .await
             .expect_err("exhausted retries is an error");
         assert!(
-            err.contains("could not produce a valid plan"),
-            "escalation msg: {err}"
+            err.contains("could not produce a valid plan") && err.contains("OUTLINE"),
+            "the escalation error must surface the OUTLINE-stage exhaustion, not a \
+             generic flat-only message: {err}"
         );
         // It must NOT have submitted a plan.
         assert!(!mcp.call_names().iter().any(|n| n == "plan_submit"));
+
+        // Prove escalation actually FIRED (not just a loosely-matching error string):
+        // right after the 1 EXPLORE call + the 2 flat PLAN attempts, the NEXT model
+        // call must be an OUTLINE prompt.
+        let prompts = model.prompts();
+        let outline_call_idx = 1 + FLAT_PLAN_ATTEMPTS;
+        assert!(
+            prompts.len() > outline_call_idx,
+            "expected at least one OUTLINE call after 1 explore + {FLAT_PLAN_ATTEMPTS} flat \
+             attempts, got {} prompt(s) total",
+            prompts.len()
+        );
+        assert!(
+            prompts[outline_call_idx].contains("milestone OUTLINE"),
+            "the call right after the 2 flat attempts must be an OUTLINE prompt: {}",
+            prompts[outline_call_idx]
+        );
+    }
+
+    // --- Hierarchical escalation: run_planner integration --------------------
+
+    fn outline_block(milestones: serde_json::Value) -> String {
+        format!("```outline\n{}\n```", serde_json::json!({ "milestones": milestones }))
+    }
+
+    fn bad_scope_task() -> serde_json::Value {
+        serde_json::json!([{
+            "id": "T001", "title": "too big",
+            "scope": ["a.rs", "b.rs", "c.rs", "d.rs"],
+            "acceptance": "x", "dependsOn": [], "status": "pending", "attempts": 0,
+        }])
+    }
+
+    fn fragment_task(id: &str, scope_file: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "id": id, "title": format!("do {id}"), "scope": [scope_file],
+            "acceptance": "cargo test", "dependsOn": [], "status": "pending", "attempts": 0,
+        }])
+    }
+
+    #[tokio::test]
+    async fn a_large_goal_that_succeeds_flat_on_attempt_one_never_escalates() {
+        // No size-threshold pre-escalation: even a goal ~10x a typical one still takes
+        // the flat path when it succeeds immediately — escalation is FAILURE-driven only.
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let model = CapturingModel::new(vec![note_block("src/a.rs"), plan_block(one_valid_task())]);
+        let big_goal = "step ".repeat(2000);
+        let outcome = run_planner(&big_goal, &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect("a large-but-successful goal still takes the flat path");
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "1 explore + 1 flat PLAN call — no outline/expand calls at all"
+        );
+        assert_eq!(outcome.tasks_plan.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn escalation_after_two_flat_failures_runs_outline_expand_merge_and_submits_once() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let outline_raw = outline_block(serde_json::json!([
+            {"id": "M1", "title": "core", "files": [], "dependsOn": []},
+            {"id": "M2", "title": "wiring", "files": [], "dependsOn": ["M1"]},
+        ]));
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),                        // EXPLORE
+            plan_block(bad_scope_task()),                   // flat attempt 1: rejected
+            plan_block(bad_scope_task()),                   // flat attempt 2: rejected
+            outline_raw,                                    // OUTLINE: accepted
+            plan_block(fragment_task("T1", "core.rs")),     // EXPAND M1
+            plan_block(fragment_task("T1", "wire.rs")),     // EXPAND M2
+        ]);
+
+        let outcome = run_planner(
+            "build the thing",
+            &model,
+            &mcp,
+            &fs,
+            "proj",
+            &noop_activity(),
+            true,
+        )
+        .await
+        .expect("hierarchical escalation succeeds");
+
+        assert_eq!(outcome.tasks_plan.tasks.len(), 2, "one task per milestone, merged");
+        let ids: Vec<&str> = outcome.tasks_plan.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            ids.contains(&"M1-T1") && ids.contains(&"M2-T1"),
+            "namespaced ids: {ids:?}"
+        );
+        let m2 = outcome.tasks_plan.tasks.iter().find(|t| t.id == "M2-T1").unwrap();
+        assert_eq!(
+            m2.depends_on,
+            vec!["M1-T1".to_string()],
+            "cross-milestone ordering synthesized by the merge"
+        );
+        assert_eq!(
+            mcp.call_names().iter().filter(|n| *n == "plan_submit").count(),
+            1,
+            "plan_submit fires exactly once"
+        );
+        let submit_pos = mcp.call_names().iter().position(|n| n == "plan_submit").unwrap();
+        let create_pos = mcp
+            .call_names()
+            .iter()
+            .position(|n| n == "project_create_plan_tasks")
+            .unwrap();
+        assert!(submit_pos < create_pos, "submit precedes the board create, as always");
+    }
+
+    #[tokio::test]
+    async fn a_milestone_that_fails_both_expand_attempts_hard_errors_the_whole_plan() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let outline_raw =
+            outline_block(serde_json::json!([{"id": "M1", "title": "core", "files": [], "dependsOn": []}]));
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            plan_block(bad_scope_task()), // flat 1 fails
+            plan_block(bad_scope_task()), // flat 2 fails
+            outline_raw,                  // outline accepted
+            plan_block(bad_scope_task()), // EXPAND M1 attempt 1: also invalid
+            plan_block(bad_scope_task()), // EXPAND M1 attempt 2: also invalid
+        ]);
+        let err = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect_err("a milestone failing both EXPAND attempts must hard-error the whole plan");
+        assert!(err.contains("milestone M1"), "{err}");
+        assert!(
+            !mcp.call_names().iter().any(|n| n == "plan_submit"),
+            "never submits a partial/broken plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn outline_that_fails_twice_hard_errors_before_any_expand_call() {
+        let (_dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            plan_block(bad_scope_task()),
+            plan_block(bad_scope_task()),
+            "not an outline block".to_string(), // OUTLINE attempt 1: invalid
+            "still not an outline".to_string(),  // OUTLINE attempt 2: invalid
+        ]);
+        let err = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect_err("outline exhaustion must hard-error");
+        assert!(err.contains("hierarchical OUTLINE failed"), "{err}");
+        assert_eq!(
+            model.prompts().len(),
+            5,
+            "1 explore + 2 flat + 2 outline attempts, then stop (no EXPAND calls)"
+        );
+        assert!(!mcp.call_names().iter().any(|n| n == "plan_submit"));
+    }
+
+    #[tokio::test]
+    async fn hierarchical_escalation_emits_outlining_and_expanding_milestones_in_order() {
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        let mcp = MockMcp::new(vec!["src/a.rs"], "approved");
+        let outline_raw = outline_block(serde_json::json!([
+            {"id": "M1", "title": "core", "files": [], "dependsOn": []},
+            {"id": "M2", "title": "wiring", "files": [], "dependsOn": ["M1"]},
+        ]));
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            plan_block(bad_scope_task()),
+            plan_block(bad_scope_task()),
+            outline_raw,
+            plan_block(fragment_task("T1", "core.rs")),
+            plan_block(fragment_task("T1", "wire.rs")),
+        ]);
+        let act_file = dir.path().join("activity.jsonl");
+        let activity = Activity::with_path(&act_file);
+
+        run_planner("g", &model, &mcp, &fs, "proj", &activity, true)
+            .await
+            .expect("hierarchical escalation succeeds");
+
+        let milestones = read_milestones(&act_file);
+        let texts: Vec<&str> = milestones.iter().map(|(t, _)| t.as_str()).collect();
+        let outline_idx = texts
+            .iter()
+            .position(|t| *t == "outlining plan (hierarchical)")
+            .expect("outline milestone present");
+        let m1_idx = texts
+            .iter()
+            .position(|t| *t == "expanding milestone M1 (1/2)")
+            .expect("M1 expand milestone present");
+        let m2_idx = texts
+            .iter()
+            .position(|t| *t == "expanding milestone M2 (2/2)")
+            .expect("M2 expand milestone present");
+        assert!(
+            outline_idx < m1_idx && m1_idx < m2_idx,
+            "outline then milestones IN ORDER: {texts:?}"
+        );
+        assert_eq!(milestones[outline_idx].1, "", "Hollow node (in-progress step)");
+        assert_eq!(milestones[m1_idx].1, "");
+        assert_eq!(milestones[m2_idx].1, "");
+        assert!(
+            texts.iter().any(|t| t.contains("drafted 2 tasks")),
+            "the shared 'drafted N tasks' milestone still fires downstream: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_outline_is_appended_to_the_preplan_draft_outline_section() {
+        let (dir, fs) = fs_with_files(&[("src/a.rs", "fn a() {}\n")]);
+        // "vanished" -> Timeout (non-terminal): the preplan file survives so we can
+        // inspect it after the run, mirroring the existing Decisions-recording test.
+        let mcp = MockMcp::new(vec!["src/a.rs"], "vanished");
+        let outline_raw = outline_block(serde_json::json!([
+            {"id": "M1", "title": "core", "files": [], "dependsOn": []},
+            {"id": "M2", "title": "wiring", "files": [], "dependsOn": ["M1"]},
+        ]));
+        let model = CapturingModel::new(vec![
+            note_block("src/a.rs"),
+            plan_block(bad_scope_task()),
+            plan_block(bad_scope_task()),
+            outline_raw,
+            plan_block(fragment_task("T1", "core.rs")),
+            plan_block(fragment_task("T1", "wire.rs")),
+        ]);
+        run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect("hierarchical escalation succeeds even when approval times out");
+
+        let preplan_path = dir.path().join(".devboule").join("preplan.md");
+        let body = std::fs::read_to_string(&preplan_path).expect("Timeout is non-terminal");
+        assert!(body.contains("## Draft outline"));
+        assert!(
+            body.contains("- M1: core (depends on: none)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- M2: wiring (depends on: M1)"),
+            "{body}"
+        );
     }
 
     // --- Structure parsing + small bits -------------------------------------
@@ -2250,14 +3755,16 @@ mod tests {
     #[test]
     fn plan_prompt_is_hard_bounded_for_giant_inputs() {
         // The local-model context guarantee: even a GIANT summary + goal + prior
-        // error can never make the PLAN prompt exceed MAX_PLAN_PROMPT_CHARS, exactly
-        // like the EXPLORE guard.
+        // error + preplan can never make the PLAN prompt exceed
+        // MAX_PLAN_PROMPT_CHARS, exactly like the EXPLORE guard.
         let giant_goal = "step ".repeat(50_000); // ~250k chars
+        let giant_preplan = "p".repeat(100_000);
         let giant_notes = "x".repeat(100_000);
         let giant_summary = serde_json::json!({ "blob": "y".repeat(100_000) });
         let giant_prior = "z".repeat(50_000);
         let prompt = build_plan_prompt(
             &giant_goal,
+            &giant_preplan,
             &giant_notes,
             &giant_summary,
             Some(&giant_prior),
@@ -2267,6 +3774,480 @@ mod tests {
             "PLAN prompt must be hard-bounded: got {} chars (max {MAX_PLAN_PROMPT_CHARS})",
             prompt.chars().count()
         );
+    }
+
+    #[test]
+    fn plan_prompt_fits_by_construction_with_all_parts_at_their_real_caps() {
+        // Unlike the test above (which stress-tests the OUTER belt-and-suspenders
+        // truncate against pathological, UNCAPPED inputs), this proves the
+        // REALISTIC worst case — every part already at ITS OWN legitimate cap, as
+        // `run_planner` always ensures before calling `build_plan_prompt` — fits
+        // WITHOUT ever hitting the final truncate. If it didn't, that truncate
+        // would silently cut the trailing RULES/schema text the model needs to
+        // emit a valid ```plan``` block — exactly the failure mode adding the
+        // PRE-PLAN NOTES section must not reintroduce.
+        let goal = "s".repeat(MAX_GOAL_CHARS);
+        let preplan_notes = "p".repeat(MAX_PREPLAN_PROMPT_CHARS);
+        let notes = "n".repeat(MAX_NOTES_TOTAL_CHARS);
+        // A bare JSON string serializes with 2 wrapping quotes; size the payload so
+        // `summary.to_string()` lands EXACTLY at MAX_SUMMARY_CHARS (not over) — an
+        // object wrapper (`{"blob":"..."}`) would add its OWN overhead and trip
+        // THIS part's own (expected, pre-existing) truncate_chars, which is not
+        // what this test is about (it tests the OUTER assembly, not per-part caps).
+        let summary = serde_json::Value::String("y".repeat(MAX_SUMMARY_CHARS - 2));
+        let prior_error = "e".repeat(MAX_PRIOR_ERROR_CHARS);
+        let prompt = build_plan_prompt(&goal, &preplan_notes, &notes, &summary, Some(&prior_error));
+        assert!(
+            !prompt.contains("[…truncated]"),
+            "the realistic worst case must fit WITHOUT truncation (schema tail preserved); \
+             got {} chars (max {MAX_PLAN_PROMPT_CHARS})",
+            prompt.chars().count()
+        );
+        assert!(
+            prompt.trim_end().ends_with("```"),
+            "the plan schema example must survive intact, got tail: {:?}",
+            &prompt[prompt.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn flat_plan_rules_block_is_byte_stable_plus_one_new_line() {
+        // Touch-up: the RULES block gains ONE new line ("One task = one testable,
+        // committable unit.") right after the scope-cap rule; everything else in the
+        // block — content AND relative order — is byte-stable versus before this
+        // feature, because `task_rules_block` is the SAME helper the flat prompt has
+        // always effectively inlined (factored out, not rewritten).
+        let prompt = build_plan_prompt("g", "", "(no notes)", &serde_json::json!({}), None);
+        let scope_idx = prompt
+            .find(&format!(
+                "- Each task `scope` (files it MODIFIES) has AT MOST {MAX_TASK_SCOPE} entries"
+            ))
+            .expect("scope rule present");
+        let one_task_idx = prompt
+            .find("- One task = one testable, committable unit.\n")
+            .expect("the new rule is present");
+        let acceptance_idx = prompt
+            .find("- `acceptance` MUST be a deterministically verifiable check")
+            .expect("acceptance rule present");
+        let ids_idx = prompt
+            .find("- Task `id`s are unique and non-empty")
+            .expect("id rule present");
+        let paths_idx = prompt
+            .find("- All paths are project-root-relative")
+            .expect("paths rule present");
+        let max_tasks_idx = prompt
+            .find(&format!("- At most {MAX_TASKS} tasks.\n"))
+            .expect("max-tasks rule present (flat only)");
+        let status_idx = prompt
+            .find("- Every task starts with \"status\": \"pending\" and \"attempts\": 0.")
+            .expect("status/attempts rule present");
+        let weight_idx = prompt
+            .find("- Optional \"weight\": \"main\" routes the task")
+            .expect("weight rule present");
+        assert!(
+            scope_idx < one_task_idx
+                && one_task_idx < acceptance_idx
+                && acceptance_idx < ids_idx
+                && ids_idx < paths_idx
+                && paths_idx < max_tasks_idx
+                && max_tasks_idx < status_idx
+                && status_idx < weight_idx,
+            "RULES block must keep the ORIGINAL order with the new line inserted right \
+             after the scope rule: {prompt}"
+        );
+    }
+
+    // --- Hierarchical escalation: OUTLINE validation + MERGE (the merge test matrix) ---
+
+    /// A minimal fragment [`Task`] with `id` and `depends_on` (LOCAL ids), one scope
+    /// file matching `id`, and a valid acceptance — everything else at a passing
+    /// default.
+    fn frag_task(id: &str, deps: &[&str]) -> Task {
+        Task {
+            id: id.into(),
+            title: format!("do {id}"),
+            scope: vec![format!("{id}.rs")],
+            context_files: vec![],
+            acceptance: "cargo test".into(),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            status: "pending".into(),
+            attempts: 0,
+            weight: String::new(),
+        }
+    }
+
+    fn frag(tasks: Vec<Task>) -> TasksPlan {
+        TasksPlan {
+            project_goal: "fragment goal".into(),
+            tasks,
+        }
+    }
+
+    fn mk_milestone(id: &str, deps: &[&str]) -> Milestone {
+        Milestone {
+            id: id.into(),
+            title: format!("milestone {id}"),
+            files: vec![],
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn mk_outline(milestones: Vec<Milestone>) -> Outline {
+        Outline { milestones }
+    }
+
+    #[test]
+    fn merge_single_milestone_namespaces_ids_with_no_extra_deps() {
+        let outline = mk_outline(vec![mk_milestone("M1", &[])]);
+        let merged = merge_fragments("g", &outline, &[frag(vec![frag_task("T001", &[])])])
+            .expect("single milestone merges");
+        assert_eq!(merged.tasks.len(), 1);
+        assert_eq!(merged.tasks[0].id, "M1-T001");
+        assert!(merged.tasks[0].depends_on.is_empty());
+        assert_eq!(merged.project_goal, "g");
+    }
+
+    #[test]
+    fn merge_chain_wires_dependents_root_to_prerequisites_leaf_and_namespaces_duplicate_local_ids() {
+        // M2 dependsOn M1; BOTH fragments locally use the SAME id "T001" — proving
+        // namespacing prevents a collision after merge.
+        let outline = mk_outline(vec![mk_milestone("M1", &[]), mk_milestone("M2", &["M1"])]);
+        let f1 = frag(vec![frag_task("T001", &[])]);
+        let f2 = frag(vec![frag_task("T001", &[])]);
+        let merged = merge_fragments("g", &outline, &[f1, f2]).expect("chain merges");
+        assert_eq!(merged.tasks.len(), 2, "both local T001s survive, namespaced distinctly");
+        let m1 = merged.tasks.iter().find(|t| t.id == "M1-T001").unwrap();
+        assert!(m1.depends_on.is_empty());
+        let m2 = merged.tasks.iter().find(|t| t.id == "M2-T001").unwrap();
+        assert_eq!(
+            m2.depends_on,
+            vec!["M1-T001".to_string()],
+            "M2's root picks up M1's leaf as a dependency"
+        );
+    }
+
+    #[test]
+    fn merge_diamond_unions_leaves_from_multiple_prerequisites() {
+        // M1 <- M2, M1 <- M3, M4 depends on BOTH M2 and M3.
+        let outline = mk_outline(vec![
+            mk_milestone("M1", &[]),
+            mk_milestone("M2", &["M1"]),
+            mk_milestone("M3", &["M1"]),
+            mk_milestone("M4", &["M2", "M3"]),
+        ]);
+        let fragments = vec![
+            frag(vec![frag_task("A", &[])]),
+            frag(vec![frag_task("A", &[])]),
+            frag(vec![frag_task("A", &[])]),
+            frag(vec![frag_task("A", &[])]),
+        ];
+        let merged = merge_fragments("g", &outline, &fragments).expect("diamond merges");
+        let m2 = merged.tasks.iter().find(|t| t.id == "M2-A").unwrap();
+        assert_eq!(m2.depends_on, vec!["M1-A".to_string()]);
+        let m3 = merged.tasks.iter().find(|t| t.id == "M3-A").unwrap();
+        assert_eq!(m3.depends_on, vec!["M1-A".to_string()]);
+        let m4 = merged.tasks.iter().find(|t| t.id == "M4-A").unwrap();
+        let mut deps = m4.depends_on.clone();
+        deps.sort();
+        assert_eq!(
+            deps,
+            vec!["M2-A".to_string(), "M3-A".to_string()],
+            "M4's root unions BOTH prerequisites' leaves"
+        );
+    }
+
+    #[test]
+    fn merge_identifies_roots_and_leaves_of_a_fragments_internal_dag() {
+        // M1 is a linear chain T1 -> T2 -> T3: root=T1 only, leaf=T3 only. M2 (which
+        // depends on M1) must be wired to M1's LEAF (T3), never the middle/root task.
+        let outline = mk_outline(vec![mk_milestone("M1", &[]), mk_milestone("M2", &["M1"])]);
+        let f1 = frag(vec![
+            frag_task("T1", &[]),
+            frag_task("T2", &["T1"]),
+            frag_task("T3", &["T2"]),
+        ]);
+        let f2 = frag(vec![frag_task("X", &[])]);
+        let merged = merge_fragments("g", &outline, &[f1, f2]).expect("merges");
+        let x = merged.tasks.iter().find(|t| t.id == "M2-X").unwrap();
+        assert_eq!(
+            x.depends_on,
+            vec!["M1-T3".to_string()],
+            "only the fragment's LEAF (T3) is wired in, not T1/T2"
+        );
+    }
+
+    #[test]
+    fn fragment_roots_and_leaves_identify_a_linear_chains_ends() {
+        let tasks = vec![
+            frag_task("T1", &[]),
+            frag_task("T2", &["T1"]),
+            frag_task("T3", &["T2"]),
+        ];
+        assert_eq!(fragment_roots(&tasks), vec!["T1"]);
+        assert_eq!(fragment_leaves(&tasks), vec!["T3"]);
+    }
+
+    #[test]
+    fn fragment_roots_and_leaves_handle_a_single_task_fragment() {
+        let tasks = vec![frag_task("T1", &[])];
+        assert_eq!(fragment_roots(&tasks), vec!["T1"]);
+        assert_eq!(fragment_leaves(&tasks), vec!["T1"]);
+    }
+
+    #[test]
+    fn merge_rejects_a_dangling_intra_fragment_dependency() {
+        let outline = mk_outline(vec![mk_milestone("M1", &[])]);
+        let f1 = frag(vec![frag_task("T001", &["T999"])]); // T999 not in this fragment
+        let err = merge_fragments("g", &outline, &[f1]).expect_err("dangling local dep errors");
+        assert!(
+            err.contains("M1") && err.contains("T999") && err.contains("local"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_over_max_tasks_errors_with_hierarchical_hint() {
+        let n_milestones = 5usize;
+        let tasks_per = MAX_TASKS / n_milestones + 2; // total > MAX_TASKS
+        let mut milestones = Vec::new();
+        let mut fragments = Vec::new();
+        for mi in 0..n_milestones {
+            milestones.push(mk_milestone(&format!("M{mi}"), &[]));
+            let tasks: Vec<Task> = (0..tasks_per)
+                .map(|ti| frag_task(&format!("T{ti}"), &[]))
+                .collect();
+            fragments.push(frag(tasks));
+        }
+        let outline = mk_outline(milestones);
+        let total = n_milestones * tasks_per;
+        let err = merge_fragments("g", &outline, &fragments)
+            .expect_err("an over-max merged plan must error");
+        assert!(err.contains("hierarchical merge produced"), "{err}");
+        assert!(err.contains(&total.to_string()), "{err}");
+        assert!(err.contains(&MAX_TASKS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn merge_rejects_mismatched_milestone_and_fragment_counts() {
+        let outline = mk_outline(vec![mk_milestone("M1", &[]), mk_milestone("M2", &["M1"])]);
+        let err = merge_fragments("g", &outline, &[frag(vec![frag_task("T001", &[])])])
+            .expect_err("a count mismatch must error");
+        assert!(err.contains("1:1"), "{err}");
+    }
+
+    #[test]
+    fn merge_normalizes_runtime_fields_a_model_echoing_done_is_forced_back_to_pending() {
+        // The harness OWNS runtime fields (status/attempts), never the model. An
+        // EXPAND fragment task that echoes status:"done"/attempts:3 (e.g. a model
+        // that copy-pasted a completed task from its own training data, or just
+        // hallucinated) must land in the MERGED plan as pending/0 — never poisoning
+        // the freshly-created board with a task that looks already-finished.
+        let outline = mk_outline(vec![mk_milestone("M1", &[])]);
+        let mut task = frag_task("T001", &[]);
+        task.status = "done".into();
+        task.attempts = 3;
+        let merged = merge_fragments("g", &outline, &[frag(vec![task])]).expect("merges");
+        assert_eq!(merged.tasks.len(), 1);
+        assert_eq!(merged.tasks[0].status, "pending");
+        assert_eq!(merged.tasks[0].attempts, 0);
+    }
+
+    #[test]
+    fn merge_preserves_weight_and_context_files_across_namespacing() {
+        // The Phase-11.3 runner routes execution on `weight` ("main" vs "mini") and
+        // reads `contextFiles` for read-only deps — a silent loss of either during
+        // namespacing would break main-coder routing / starve a task of its
+        // declared context, with no validator to catch it (both fields are
+        // orthogonal to the id/dependsOn remap this pass performs).
+        let outline = mk_outline(vec![mk_milestone("M1", &[])]);
+        let mut task = frag_task("T001", &[]);
+        task.weight = "main".into();
+        task.context_files = vec!["src/shared.rs".into()];
+        let merged = merge_fragments("g", &outline, &[frag(vec![task])]).expect("merges");
+        assert_eq!(merged.tasks.len(), 1);
+        assert_eq!(merged.tasks[0].weight, "main");
+        assert_eq!(merged.tasks[0].context_files, vec!["src/shared.rs".to_string()]);
+    }
+
+    #[test]
+    fn validate_outline_rejects_a_milestone_cycle() {
+        let outline = mk_outline(vec![mk_milestone("M1", &["M2"]), mk_milestone("M2", &["M1"])]);
+        let err = validate_outline(&outline).expect_err("a milestone cycle must be rejected");
+        assert!(err.contains("cycle"), "{err}");
+    }
+
+    #[test]
+    fn validate_outline_caps_at_max_milestones() {
+        let outline = mk_outline(
+            (0..(MAX_MILESTONES + 1))
+                .map(|i| mk_milestone(&format!("M{i}"), &[]))
+                .collect(),
+        );
+        let err = validate_outline(&outline).expect_err("too many milestones must be rejected");
+        assert!(err.contains("too many milestones"), "{err}");
+    }
+
+    #[test]
+    fn validate_outline_rejects_duplicate_ids() {
+        let outline = mk_outline(vec![mk_milestone("M1", &[]), mk_milestone("M1", &[])]);
+        let err = validate_outline(&outline).expect_err("duplicate milestone id must be rejected");
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn validate_outline_rejects_dangling_dep() {
+        let outline = mk_outline(vec![mk_milestone("M1", &["M999"])]);
+        let err = validate_outline(&outline).expect_err("dangling milestone dep must be rejected");
+        assert!(err.contains("unknown milestone id"), "{err}");
+    }
+
+    #[test]
+    fn validate_outline_rejects_self_dep() {
+        let outline = mk_outline(vec![mk_milestone("M1", &["M1"])]);
+        let err = validate_outline(&outline).expect_err("a self-dep must be rejected");
+        assert!(err.contains("itself"), "{err}");
+    }
+
+    #[test]
+    fn validate_outline_rejects_empty_milestones() {
+        let outline = mk_outline(vec![]);
+        let err = validate_outline(&outline).expect_err("an empty outline must be rejected");
+        assert!(err.contains("no milestones"), "{err}");
+    }
+
+    #[test]
+    fn parse_outline_extracts_and_filters_unsafe_file_hints() {
+        let raw = format!(
+            "```outline\n{}\n```",
+            serde_json::json!({
+                "milestones": [
+                    {"id": "M1", "title": "do the core work",
+                     "files": ["src/good.rs", "../escape.rs", "/etc/passwd"], "dependsOn": []}
+                ]
+            })
+        );
+        let outline = parse_outline(&raw).expect("a valid outline parses");
+        assert_eq!(
+            outline.milestones[0].files,
+            vec!["src/good.rs".to_string()],
+            "unsafe file hints are dropped, not fatal"
+        );
+    }
+
+    #[test]
+    fn parse_outline_requires_exactly_one_block() {
+        let block = format!(
+            "```outline\n{}\n```",
+            serde_json::json!({"milestones": [{"id": "M1", "title": "t", "files": [], "dependsOn": []}]})
+        );
+        assert!(parse_outline("no block here").is_err());
+        let two = format!("{block}\n{block}");
+        assert!(parse_outline(&two).is_err());
+        assert!(parse_outline(&block).is_ok());
+    }
+
+    #[test]
+    fn build_outline_prompt_carries_goal_failures_and_is_bounded() {
+        let summary = serde_json::json!({"scanned": 3});
+        let prompt = build_outline_prompt(
+            "build the thing",
+            "(no notes)",
+            &summary,
+            "scope has 4 files (max 3)",
+            None,
+        );
+        assert!(prompt.contains("build the thing"), "{prompt}");
+        assert!(
+            prompt.contains("The flat plan failed twice: scope has 4 files (max 3)"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("```outline"), "{prompt}");
+        assert!(prompt.chars().count() <= MAX_PLAN_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn build_outline_prompt_retry_feeds_back_the_precise_error() {
+        let prompt = build_outline_prompt(
+            "g",
+            "",
+            &serde_json::json!({}),
+            "flat failure",
+            Some("duplicate milestone id `M1`"),
+        );
+        assert!(
+            prompt.contains("YOUR PREVIOUS OUTLINE WAS REJECTED")
+                && prompt.contains("duplicate milestone id"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn build_outline_prompt_is_hard_bounded_for_giant_inputs() {
+        let giant_goal = "step ".repeat(50_000);
+        let giant_preplan = "p".repeat(100_000);
+        let giant_summary = serde_json::json!({"blob": "y".repeat(100_000)});
+        let giant_failures = "z".repeat(50_000);
+        let prompt =
+            build_outline_prompt(&giant_goal, &giant_preplan, &giant_summary, &giant_failures, None);
+        assert!(prompt.chars().count() <= MAX_PLAN_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn build_expand_prompt_carries_milestone_framing_and_shares_the_task_rules() {
+        let m = mk_milestone("M1", &[]);
+        let m = Milestone {
+            title: "wire the auth module".into(),
+            files: vec!["src/auth.rs".into()],
+            ..m
+        };
+        let prompt = build_expand_prompt("build the thing", "(notes)", &m, None);
+        assert!(prompt.contains("build the thing"), "{prompt}");
+        assert!(prompt.contains("MILESTONE M1: wire the auth module"), "{prompt}");
+        assert!(prompt.contains("src/auth.rs"), "{prompt}");
+        assert!(
+            prompt.contains("ids in THIS fragment are LOCAL"),
+            "the fragment-local-id rule is present: {prompt}"
+        );
+        // The SAME shared RULES text as the flat prompt (touch-up 6a: proves no drift).
+        assert!(
+            prompt.contains("- One task = one testable, committable unit.\n"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("```plan"), "{prompt}");
+        assert!(prompt.chars().count() <= MAX_PLAN_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn build_expand_prompt_with_no_files_says_so() {
+        let m = mk_milestone("M1", &[]);
+        let prompt = build_expand_prompt("g", "", &m, None);
+        assert!(prompt.contains("(none suggested)"), "{prompt}");
+    }
+
+    #[test]
+    fn parse_expand_fragment_accepts_a_valid_fragment_and_rejects_an_invalid_one() {
+        let good = plan_block(one_valid_task());
+        assert!(parse_expand_fragment(&good, "M1").is_ok());
+        let bad = plan_block(serde_json::json!([{
+            "id": "T001", "title": "too big",
+            "scope": ["a.rs", "b.rs", "c.rs", "d.rs"],
+            "acceptance": "x", "dependsOn": [], "status": "pending", "attempts": 0,
+        }]));
+        let err = parse_expand_fragment(&bad, "M1").expect_err("scope > 3 is rejected");
+        assert!(err.contains("milestone M1") && err.contains("scope"), "{err}");
+    }
+
+    #[test]
+    fn parse_expand_fragment_rejects_a_dep_outside_the_fragment_as_an_unknown_id() {
+        // A fragment task dependsOn an id NOT emitted in this same fragment is caught
+        // by the reused validate_plan_structure (it only knows this fragment's ids),
+        // giving fragment-local-id enforcement "for free".
+        let raw = plan_block(serde_json::json!([{
+            "id": "T001", "title": "t", "scope": ["a.rs"], "acceptance": "x",
+            "dependsOn": ["T999"], "status": "pending", "attempts": 0,
+        }]));
+        let err = parse_expand_fragment(&raw, "M2").expect_err("dangling local dep rejected");
+        assert!(err.contains("milestone M2") && err.contains("unknown task id"), "{err}");
     }
 
     #[test]
