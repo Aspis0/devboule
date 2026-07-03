@@ -2087,7 +2087,7 @@ export function ProjectsView() {
       "1. Check that the terminal cwd is the expected project root.",
       "2. If you still have a session_token, call agent_heartbeat with the current project/task.",
       "3. Call project_get, then oracle_context for context, then update the claim or status.",
-      "4. If the session_token is gone, do not invent one. Relaunch the agent from Aspis Management.",
+      "4. If the session_token is gone, do not invent one. Relaunch the agent from Devboule.",
     ].join("\n");
     try {
       await navigator.clipboard.writeText(recovery);

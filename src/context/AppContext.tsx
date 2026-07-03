@@ -385,7 +385,7 @@ export async function invokeBackendCommand<T>(
 ): Promise<T> {
   if (!isTauriRuntime()) {
     throw new Error(
-      "Aspis Management must be opened as the desktop app to use device authentication.",
+      "Devboule must be opened as the desktop app to use device authentication.",
     );
   }
   const { invoke } = await import("@tauri-apps/api/core");
@@ -2246,7 +2246,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         throw new Error("Open the desktop app to use device authentication.");
       }
       const next = await invokeBackendCommand<AuthState>("request_unlock", {
-        reason: "Unlock Aspis Management",
+        reason: "Unlock Devboule",
       });
       if (!next.locked) {
         authEpochRef.current += 1;
