@@ -40,6 +40,10 @@ pub(crate) fn validate_main_coder_request(
     }
 
     // 2. Files: 1..=10 entries, each must be a project-relative safe path.
+    // CO-WRITER PARITY: `MAIN_CODER_MAX_FILES = 10` in oracle/server/aspis_mcp.py
+    // (dispatch_spawn_main_coder) enforces the same cap on the MCP path — change
+    // BOTH together (Python side pinned by
+    // test_spawn_main_coder_caps_files_at_the_rust_twin_limit).
     if files.is_empty() {
         return Err("files must contain at least 1 entry".into());
     }

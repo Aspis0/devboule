@@ -125,6 +125,13 @@ MAX_VISUAL_CHECK_DIRECTIVES = 50
 # Bounds for the `spawn_mini_coder` tool inputs + its bounded result poll.
 MINI_CODER_MAX_TASK_LEN = 4000
 MINI_CODER_MAX_FILES = 64
+# Main-tier file cap. CO-WRITER PARITY with `validate_main_coder_request` in
+# src-tauri/src/backend/main_coder.rs (files 1..=10) — change BOTH together. The
+# Rust command is the UI twin of the `spawn_main_coder` MCP tool; until the
+# 2026-07 wrapper fix the MCP path was unreachable, so the mismatch (64 via
+# Python vs 10 via Rust) was dead. Tighter-or-equal wins: the MCP path now
+# enforces the same 10 the app's own validator permits.
+MAIN_CODER_MAX_FILES = 10
 # ASYNC STEERING (a): bounds for the `steer_mini_coder` tool. CO-WRITER PARITY with the
 # Rust `MAX_STEER_MESSAGE_LEN` / `MAX_STEER_QUEUE_LEN` in
 # src-tauri/src/backend/mini_coder.rs — change BOTH together. A single mid-flight
@@ -5912,6 +5919,14 @@ def dispatch_spawn_main_coder(
     _agent_id, role = require_agent_tool(projects_dir, args, "spawn_main_coder")
     if "spawn_main_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
         raise McpError(f"{role} agents cannot use spawn_main_coder.")
+    # CO-WRITER PARITY (main_coder.rs validate_main_coder_request): the Main tier
+    # caps files at 10, tighter than the mini's shared MINI_CODER_MAX_FILES=64.
+    # Checked here (not in the shared dispatch) so the mini path is untouched.
+    files = args.get("files") or []
+    if isinstance(files, list) and len(files) > MAIN_CODER_MAX_FILES:
+        raise McpError(
+            f"spawn_main_coder accepts at most {MAIN_CODER_MAX_FILES} files."
+        )
     forced = dict(args)
     forced["write"] = True
     forced["write_mode"] = "agenticIterative"

@@ -3699,6 +3699,51 @@ class OrchestratorRoleTests(unittest.TestCase):
                 f"{role} must not hold spawn_main_coder",
             )
 
+    def test_spawn_main_coder_caps_files_at_the_rust_twin_limit(self):
+        # CO-WRITER PARITY (main_coder.rs validate_main_coder_request caps files
+        # at 10): until the 2026-07 wrapper fix the MCP path was unreachable, so
+        # the Python side silently allowed MINI_CODER_MAX_FILES=64 for the main
+        # tier. Now that the path is live it must enforce the same 10.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "management"
+            projects = Path(tmp) / "shared-projects"
+            root.mkdir()
+            prepare_management_root(root)
+            projects.mkdir()
+            sample_project(projects)
+
+            registered = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "model": "cheap",
+                    "message": "planning",
+                },
+                root=root,
+                projects_dir=projects,
+            )
+            token = ""
+            if isinstance(registered, dict):
+                token = registered.get("session_token") or registered.get(
+                    "sessionToken", ""
+                )
+
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "spawn_main_coder",
+                    {
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                        "task": "do a substantial thing",
+                        "files": [f"src/file_{i}.rs" for i in range(11)],
+                        "session_token": token,
+                    },
+                    root=root,
+                    projects_dir=projects,
+                )
+            self.assertIn("at most 10", str(ctx.exception))
+
     def test_orchestrator_has_no_write_or_censor_tool_but_full_provider_surface(self):
         # It delegates ALL file writes to spawn_mini_coder and never adjudicates
         # Censor findings — but it DOES hold the provider tools (owner decision:
