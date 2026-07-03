@@ -1473,7 +1473,7 @@ function WorkspaceBootstrapPanel({
           <p className="max-w-3xl text-[12px] leading-5 text-cream-500">
             Create one encrypted package for approved devices, then upload the
             file to any cloud. A collaborator can decrypt it only from an
-            approved Aspis Management install.
+            approved Devboule install.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">

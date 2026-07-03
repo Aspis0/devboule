@@ -1910,7 +1910,7 @@ fn package_readme(
 ) -> String {
     let mut out = String::new();
     out.push_str("# Aspis Bio Workspace Bootstrap\n\n");
-    out.push_str("This package contains source files, docs, tests and small configuration files selected by Aspis Management.\n\n");
+    out.push_str("This package contains source files, docs, tests and small configuration files selected by Devboule.\n\n");
     out.push_str("## Security\n\n");
     out.push_str("- Bulk data is encrypted with AES-256-GCM.\n");
     out.push_str(
@@ -1920,7 +1920,7 @@ fn package_readme(
     out.push_str("- A cloud drive may store this file, but only approved devices should be able to decrypt it.\n\n");
     out.push_str("## How to Use\n\n");
     out.push_str("1. Download the `.aspiswspkg` file locally.\n");
-    out.push_str("2. Open Aspis Management on the approved device.\n");
+    out.push_str("2. Open Devboule on the approved device.\n");
     out.push_str(
         "3. Use Workspace Bootstrap / Decrypt package and paste or select the package path.\n",
     );

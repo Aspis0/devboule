@@ -5,7 +5,7 @@ import sys
 
 def main() -> int:
     print(
-        "OpenRouter smoke was retired from Aspis Management. Use model_bakeoff.py with --remote-provider scaleway|infomaniak|mistral.",
+        "OpenRouter smoke was retired from Devboule. Use model_bakeoff.py with --remote-provider scaleway|infomaniak|mistral.",
         file=sys.stderr,
     )
     return 2

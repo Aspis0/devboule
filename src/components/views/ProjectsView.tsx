@@ -2071,7 +2071,7 @@ export function ProjectsView() {
       session.currentProjectId ?? currentProject?.metadata.id ?? "unknown";
     const rootPath =
       currentProject?.metadata.rootPath ??
-      "use the project root shown in Aspis Management";
+      "use the project root shown in Devboule";
     const recovery = [
       "ASPIS AGENT RECOVERY",
       "",

@@ -1462,7 +1462,7 @@ pub fn request_unlock(
     state: State<'_, BackendState>,
     reason: Option<String>,
 ) -> Result<AuthState, String> {
-    let message = reason.unwrap_or_else(|| "Unlock Aspis Management".into());
+    let message = reason.unwrap_or_else(|| "Unlock Devboule".into());
     state.verify_unlock(&message)
 }
 
@@ -4481,7 +4481,7 @@ async fn build_snapshot(
         message: "Dashboard snapshot refreshed.".into(),
         timestamp: now(),
         event_type: "sync".into(),
-        source: "Aspis Management".into(),
+        source: "Devboule".into(),
     });
     append_recent_activity_without_duplicates(state, &mut activity)?;
 

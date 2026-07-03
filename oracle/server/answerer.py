@@ -338,7 +338,7 @@ def generate_with_openai_compatible(prompt: str, config: dict) -> str:
     headers = {
         "Content-Type": "application/json",
         "HTTP-Referer": "https://aspis-bio.com",
-        "X-Title": "Aspis Management Oracle",
+        "X-Title": "Devboule Oracle",
     }
     if config.get("api_key"):
         headers["Authorization"] = f"Bearer {config['api_key']}"
@@ -439,7 +439,7 @@ def validate_remote_llm_config(config: dict) -> None:
             )
         return
     if not config.get("api_key"):
-        raise RuntimeError("Remote Oracle LLM requires an API key saved in Aspis Management.")
+        raise RuntimeError("Remote Oracle LLM requires an API key saved in Devboule.")
     if not config.get("model"):
         raise RuntimeError("Remote Oracle LLM requires a model name.")
     base_url = chat_completions_url(str(config.get("base_url") or ""))

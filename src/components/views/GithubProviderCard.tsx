@@ -166,8 +166,8 @@ export function GithubProviderCard() {
   return (
     <div
       className="px-5 py-4"
-      data-help-title="GitHub credentials let Aspis Management work with your private repositories."
-      data-help-lines="Save a fine-grained GitHub token (or import your GitHub CLI login) so the app can clone, pull, and push inside Aspis Management.|The token is stored in the OS keychain, exactly like the Cloudflare and Scaleway tokens, and is never shown back here.|It is never copied into projects, Oracle, chat, or source files.|If the token expires or leaks, remove it here and rotate it on GitHub."
+      data-help-title="GitHub credentials let Devboule work with your private repositories."
+      data-help-lines="Save a fine-grained GitHub token (or import your GitHub CLI login) so the app can clone, pull, and push inside Devboule.|The token is stored in the OS keychain, exactly like the Cloudflare and Scaleway tokens, and is never shown back here.|It is never copied into projects, Oracle, chat, or source files.|If the token expires or leaks, remove it here and rotate it on GitHub."
     >
       <div className="flex items-start gap-4 min-w-0">
         <div className="w-10 h-10 rounded-xl bg-cream-50 flex items-center justify-center shrink-0">

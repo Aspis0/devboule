@@ -618,7 +618,7 @@ def has_sensitive_credential_field(value: Any) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Real MCP stdio smoke for Aspis Projects Kanban agents.")
-    parser.add_argument("--root", default=".", help="Aspis Management root")
+    parser.add_argument("--root", default=".", help="Devboule root")
     parser.add_argument("--project-root", default=None, help="Root indexed by Oracle for the smoke project")
     parser.add_argument("--keep-project", action="store_true", help="Leave the production-readiness project visible in the app")
     parser.add_argument("--project-id", default="", help="Project id to create/use for a kept production smoke project")
