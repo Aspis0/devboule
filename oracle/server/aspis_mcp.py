@@ -8853,6 +8853,46 @@ def create_mcp_server(
         )
 
     @server.tool()
+    def spawn_main_coder(
+        agent_id: str,
+        role: str,
+        task: str,
+        files: list,
+        backend: str = "",
+        allow_oracle: bool = False,
+        wait: bool = True,
+        session_token: str = "",
+    ) -> dict:
+        """Orchestrator only: dispatch a SUBSTANTIAL task to the local MAIN CODER
+        (the sandboxed agentic engine: multi-round read/edit/grep/run loop against
+        the deterministic gate).
+
+        Unlike spawn_mini_coder it is always agentic and meant for
+        multi-file/heavyweight tasks; write and write_mode are forced server-side
+        (the Rust executor FAILS a main directive that cannot run agentic rather
+        than downgrading it to a one-shot mini). Same supervision contract as the
+        mini: pass wait=false to get {directiveId, status:'running'} immediately,
+        steer with steer_mini_coder(directiveId, message), collect with
+        mini_coder_result(directiveId).
+        """
+        # ROLE UNTANGLE Phase 3 completion: this wrapper was MISSING — the tool
+        # had a TOOLS entry + dispatch + routing but no FastMCP surface, so no
+        # real MCP client could call it (found by the 2026-07 flow audit).
+        return call(
+            "spawn_main_coder",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "task": task,
+                "files": files,
+                "backend": backend,
+                "allow_oracle": allow_oracle,
+                "wait": wait,
+                "session_token": session_token,
+            },
+        )
+
+    @server.tool()
     def steer_mini_coder(
         agent_id: str,
         role: str,

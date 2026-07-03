@@ -2850,6 +2850,26 @@ root_path: "{escaped_work_root}"
                 return tool
         self.fail(f"tool {name!r} is not registered on the FastMCP server")
 
+    def test_spawn_main_coder_is_registered_on_the_live_server(self):
+        # ROLE UNTANGLE Phase 3 gap: spawn_main_coder had a TOOLS entry, a
+        # dispatch function and handle_tool_call routing, but NO @server.tool()
+        # wrapper — FastMCP is the only protocol surface, so no real MCP client
+        # (cloud CLI or devboule binary) could ever call it: the orchestrator's
+        # whole main-coder delegation mandate was dead on the live path.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prepare_management_root(root)
+            server = create_mcp_server(root=root)
+            tool = self._registered_tool(server, "spawn_main_coder")
+
+            params = inspect.signature(tool.fn).parameters
+            for name in ("agent_id", "role", "task", "files", "wait"):
+                self.assertIn(name, params)
+            # write/write_mode are FORCED server-side for the main tier — the
+            # wrapper must NOT advertise them as caller choices.
+            self.assertNotIn("write", params)
+            self.assertNotIn("write_mode", params)
+
     def test_agent_heartbeat_wrapper_advertises_subagents(self):
         # Regression for a whole CLASS of bug: a handler supports a parameter
         # (here `subagents`) but the FastMCP @server.tool() wrapper omits it, so
