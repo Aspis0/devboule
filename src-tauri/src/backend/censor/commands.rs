@@ -480,10 +480,12 @@ pub fn censor_review_now(
     }
     // No live watcher → no concurrent worker to race. Run the one-shot pass on a
     // DETACHED worker thread and return immediately (WARNING 4): the fallback can take
-    // up to probe(5s)+generate(60s)+linter time, which must NEVER block the Tauri
-    // command thread. The frontend learns the results via the `censor://findings-
-    // updated` event (same as the live-watcher path), so a fire-and-forget run is the
-    // correct contract here. Mirrors the watcher's off-thread worker pattern.
+    // up to probe(5s)+generate(60s)+linter time — and on the voted path (n_samples > 1)
+    // the generate cost is n_samples × 60s worst case, since the samples run
+    // SEQUENTIALLY (see `run_gemma`) — which must NEVER block the Tauri command thread.
+    // The frontend learns the results via the `censor://findings-updated` event (same as
+    // the live-watcher path), so a fire-and-forget run is the correct contract here.
+    // Mirrors the watcher's off-thread worker pattern.
     let worker_app = app.clone();
     // WARNING F: hand the detached worker a clone of the shared "keep running" flag
     // so app exit (`kill_all_on_exit`) can flip it and abort the worker between
@@ -535,9 +537,11 @@ fn run_review_now_oneshot(
         (Some(state), Some(client)) => state.ensure_gemma_probed(client),
         _ => false,
     };
+    let gemma_params = local_ai.review_params();
     let gemma_ctx = gemma_client.as_deref().map(|client| GemmaCtx {
         client,
         available: gemma_available,
+        params: gemma_params,
     });
     // WARNING F: pass the SHARED "keep running" flag straight through as the
     // orchestrator's stop-gate. The orchestrator re-reads it between passes/runners
@@ -961,12 +965,15 @@ pub fn drain_censor_queue(root: &Path) -> Vec<crate::backend::censor::schema::Fi
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    match serde_json::from_str::<
-                        crate::backend::censor::schema::FindingBatch,
-                    >(&content) {
+                    match serde_json::from_str::<crate::backend::censor::schema::FindingBatch>(
+                        &content,
+                    ) {
                         Ok(batch) => batches.push(batch),
                         Err(e) => {
-                            eprintln!("censor queue: skipping corrupt batch {}: {e}", path.display());
+                            eprintln!(
+                                "censor queue: skipping corrupt batch {}: {e}",
+                                path.display()
+                            );
                             // Rename instead of delete so corrupt file is inspectable
                             let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
                             continue; // skip delete below

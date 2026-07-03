@@ -1576,9 +1576,7 @@ pub fn delete_scaleway_object_secret_key(
 // (backend-internal `vault::read_exa_key`) and sets `EXA_API_KEY` only when present.
 
 #[tauri::command]
-pub fn get_exa_key_status(
-    state: State<'_, BackendState>,
-) -> Result<AuxCredentialStatus, String> {
+pub fn get_exa_key_status(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::exa_key_status()
 }
@@ -1593,9 +1591,7 @@ pub fn save_exa_key(
 }
 
 #[tauri::command]
-pub fn delete_exa_key(
-    state: State<'_, BackendState>,
-) -> Result<AuxCredentialStatus, String> {
+pub fn delete_exa_key(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::delete_exa_key()
 }
@@ -1654,9 +1650,7 @@ pub fn save_cloud_llm_key(
 }
 
 #[tauri::command]
-pub fn delete_cloud_llm_key(
-    state: State<'_, BackendState>,
-) -> Result<AuxCredentialStatus, String> {
+pub fn delete_cloud_llm_key(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::delete_cloud_llm_key()
 }

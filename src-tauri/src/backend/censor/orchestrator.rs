@@ -54,6 +54,10 @@ const GEMMA_SOURCE: &str = "gemma";
 pub struct GemmaCtx<'a> {
     pub client: &'a dyn GemmaClient,
     pub available: bool,
+    /// Resolved voting/temperature/prompt-style knobs for [`gemma::run_gemma`], computed
+    /// ONCE per watch session from the same `CensorLocalAi` snapshot the client is built
+    /// from (see `watch.rs`). [`GemmaReviewParams::default`] = legacy single-sample review.
+    pub params: gemma::GemmaReviewParams,
 }
 
 /// Tauri event emitted after one or more shards change. Payload:
@@ -711,6 +715,7 @@ fn fine_batch_collect(root: &Path, files: &[String], gemma: Option<GemmaCtx<'_>>
                     &fp.file_rel_path,
                     file_content,
                     &raw_for_file,
+                    &ctx.params,
                 );
                 raw_for_file.append(&mut g);
             }
@@ -1706,6 +1711,7 @@ mod tests {
         let ctx = GemmaCtx {
             client: &stub,
             available: true,
+            params: gemma::GemmaReviewParams::default(),
         };
         let changed = fine_batch_collect(root, &["src/app.ts".to_string()], Some(ctx));
         assert!(
@@ -1756,6 +1762,7 @@ mod tests {
         let ctx = GemmaCtx {
             client: &stub,
             available: false,
+            params: gemma::GemmaReviewParams::default(),
         };
         let _ = fine_batch_collect(root, &["src/app.ts".to_string()], Some(ctx));
         let shard = super::super::ledger::read_shard(root, "src/app.ts")
@@ -1795,6 +1802,7 @@ mod tests {
             Some(GemmaCtx {
                 client: &stub1,
                 available: true,
+                params: gemma::GemmaReviewParams::default(),
             }),
         );
         let mid = super::super::ledger::read_shard(root, "src/app.ts")
@@ -1816,6 +1824,7 @@ mod tests {
             Some(GemmaCtx {
                 client: &stub2,
                 available: true,
+                params: gemma::GemmaReviewParams::default(),
             }),
         );
         let after = super::super::ledger::read_shard(root, "src/app.ts")
@@ -1863,6 +1872,7 @@ mod tests {
             Some(GemmaCtx {
                 client: &stub_online,
                 available: true,
+                params: gemma::GemmaReviewParams::default(),
             }),
         );
         let mid = super::super::ledger::read_shard(root, "src/app.ts")
@@ -1884,6 +1894,7 @@ mod tests {
             Some(GemmaCtx {
                 client: &stub_offline,
                 available: false,
+                params: gemma::GemmaReviewParams::default(),
             }),
         );
         let after = super::super::ledger::read_shard(root, "src/app.ts")

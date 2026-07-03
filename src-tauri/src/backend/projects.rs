@@ -1397,6 +1397,7 @@ fn apply_censor_local_ai_to_config(
             base_url: None,
             model: None,
             ollama_model: None,
+            ..Default::default()
         };
     if is_bare_default {
         obj.remove("censorLocalAi");
@@ -1520,7 +1521,8 @@ fn prepare_or_launch_project_agent(
     // gate, the vault/provider env (orchestrator ⇒ none) AND the persisted session
     // role — replacing the former stored_role/canonical-role split, so the stored
     // role always equals what the binary registers as (`agent_register`, config.rs).
-    let role = super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
+    let role =
+        super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
     // "app" -> hosted PTY inside Aspis Management; anything else (incl. None and
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
@@ -3359,7 +3361,11 @@ fn validate_main_coder_engine_id(value: &str) -> Result<(), String> {
 /// The value is a plain unquoted engine/client id (no colons or newlines by construction —
 /// it comes from the configured Main-coder engine set), read back verbatim by the parser.
 fn main_coder_frontmatter_line(main_coder: &Option<String>) -> String {
-    match main_coder.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    match main_coder
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         Some(value) => format!("main_coder: {value}\n"),
         None => String::new(),
     }
@@ -3532,8 +3538,7 @@ const CUSTOM_CLIENT_LABEL_MAX_LEN: usize = 40;
 const CUSTOM_CLIENT_COMMAND_MAX_LEN: usize = 400;
 // "local" is reserved (P6b): it is the Roles-table / hand-off placement marker for the
 // in-process agentic engine, so a user-registered custom client can never collide with it.
-const RESERVED_CLIENT_IDS: [&str; 5] =
-    ["codex", "claude", "powershell", "orchestrator", "local"];
+const RESERVED_CLIENT_IDS: [&str; 5] = ["codex", "claude", "powershell", "orchestrator", "local"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -9080,7 +9085,10 @@ mod tests {
     fn launch_agent_id_orchestrator_is_stable_per_project() {
         let a = launch_agent_id(None, "orchestrator", "1f2e3d4c-aa-bb");
         let b = launch_agent_id(None, "orchestrator", "1f2e3d4c-aa-bb");
-        assert_eq!(a, b, "same project ⇒ same id across launches (the whole point)");
+        assert_eq!(
+            a, b,
+            "same project ⇒ same id across launches (the whole point)"
+        );
         assert_eq!(a, "orchestrator-1f2e3d4c-aa-bb");
         let other = launch_agent_id(None, "orchestrator", "other-project");
         assert_ne!(a, other, "different projects never share a transcript");
@@ -9099,7 +9107,10 @@ mod tests {
         assert!(long.len() <= "orchestrator-".len() + 100);
         let a = launch_agent_id(None, "orchestrator", &format!("{}a", "x".repeat(79)));
         let b = launch_agent_id(None, "orchestrator", &format!("{}b", "x".repeat(79)));
-        assert_ne!(a, b, "80-char ids (the normalize_project_id max) must not collide");
+        assert_ne!(
+            a, b,
+            "80-char ids (the normalize_project_id max) must not collide"
+        );
     }
 
     #[test]
@@ -10351,8 +10362,7 @@ mod tests {
             serialized_codex.contains("main_coder: codex"),
             "an override must write the main_coder key"
         );
-        let (reparsed, _) =
-            parse_frontmatter(&serialized_codex, Path::new("proj-mc.md")).unwrap();
+        let (reparsed, _) = parse_frontmatter(&serialized_codex, Path::new("proj-mc.md")).unwrap();
         assert_eq!(
             reparsed.main_coder.as_deref(),
             Some("codex"),
@@ -10393,7 +10403,11 @@ mod tests {
         // line must never contain a raw newline that breaks the single-line invariant.
         let line = main_coder_frontmatter_line(&Some("codex".into()));
         assert_eq!(line, "main_coder: codex\n");
-        assert_eq!(line.matches('\n').count(), 1, "exactly one trailing newline");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one trailing newline"
+        );
     }
 
     #[test]
@@ -13010,7 +13024,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             &cloud_base_url,
         )
         .unwrap_err();
-        assert_eq!(err, super::super::local_coder::NO_LOCAL_ORCHESTRATOR_MODEL_MSG);
+        assert_eq!(
+            err,
+            super::super::local_coder::NO_LOCAL_ORCHESTRATOR_MODEL_MSG
+        );
     }
 
     #[test]
@@ -13028,11 +13045,13 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
             None => (String::new(), String::new()),
         };
-        assert!(super::super::local_coder::orchestrator_model_configured_verdict(
-            &omlx_base_url,
-            &cloud_base_url,
-        )
-        .is_ok());
+        assert!(
+            super::super::local_coder::orchestrator_model_configured_verdict(
+                &omlx_base_url,
+                &cloud_base_url,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -13050,11 +13069,13 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
             None => (String::new(), String::new()),
         };
-        assert!(super::super::local_coder::orchestrator_model_configured_verdict(
-            &omlx_base_url,
-            &cloud_base_url,
-        )
-        .is_ok());
+        assert!(
+            super::super::local_coder::orchestrator_model_configured_verdict(
+                &omlx_base_url,
+                &cloud_base_url,
+            )
+            .is_ok()
+        );
     }
 
     // ROLE UNTANGLE — the orchestrator launches on the SAME task statuses as a coder
@@ -13090,8 +13111,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[test]
     fn workflow_run_rejected_for_orchestrator_client() {
         let client = "orchestrator";
-        let role =
-            super::super::agent_role::effective_launch_role(client, &normalize_agent_role("coder").unwrap());
+        let role = super::super::agent_role::effective_launch_role(
+            client,
+            &normalize_agent_role("coder").unwrap(),
+        );
         assert_eq!(role, "orchestrator");
         assert!(client == "orchestrator", "client-keyed guard rejects this");
         assert!(role != "coder", "role-keyed guard rejects it too");
@@ -13370,8 +13393,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // (mini_command_build owns the command assembly + env scrub now): none may
         // reference a Phase B wiring symbol (backend, action, merge/serialize).
         let mini_sources = [
-            ("mini_coder_executor.rs", include_str!("mini_coder_executor.rs")),
-            ("mini_command_build.rs", include_str!("mini_command_build.rs")),
+            (
+                "mini_coder_executor.rs",
+                include_str!("mini_coder_executor.rs"),
+            ),
+            (
+                "mini_command_build.rs",
+                include_str!("mini_command_build.rs"),
+            ),
             ("mini_edit_apply.rs", include_str!("mini_edit_apply.rs")),
             ("mini_prompt.rs", include_str!("mini_prompt.rs")),
             ("agentic_worker.rs", include_str!("agentic_worker.rs")),
@@ -15602,6 +15631,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("ollama default must persist");
@@ -15626,6 +15656,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("reset to default must persist");
@@ -15731,6 +15762,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://localhost:8000/v1/".to_string()),
                 model: Some("mlx-community/gemma".to_string()),
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("valid omlx must persist");
@@ -15747,6 +15779,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://localhost:8000/v1".to_string()),
                 model: Some("mlx-community/gemma".to_string()),
                 ollama_model: None,
+                ..Default::default()
             }),
             "omlx config must read back identically (normalized)"
         );
@@ -15763,6 +15796,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             base_url: Some("http://evil.com/v1".to_string()),
             model: Some("m".to_string()),
             ollama_model: None,
+            ..Default::default()
         })
         .and_then(|normalized| apply_censor_local_ai_to_config(&mut value, &normalized));
         assert!(result.is_err(), "non-loopback omlx base must be rejected");
@@ -15777,6 +15811,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             base_url: Some("http://localhost:8000/v1".to_string()),
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -15792,6 +15827,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://127.0.0.1:11434".to_string()),
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("ollama-with-base must persist");
@@ -15803,6 +15839,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://127.0.0.1:11434".to_string()),
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             })
         );
     }
@@ -15821,6 +15858,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: Some("gemma4:x".to_string()),
+                ..Default::default()
             },
         )
         .expect("ollama-with-override must persist");
@@ -15843,6 +15881,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: Some("gemma4:x".to_string()),
+                ..Default::default()
             }),
             "the override must read back identically (not dropped)"
         );
@@ -15984,8 +16023,18 @@ Git: commit freely (git add -u / git commit) to save your work, but NEVER run a 
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
 "#;
         let coder_baseline = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "test-launch-token", None, false,
-            None, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(
             coder_baseline, CODER_BASELINE_EXPECTED,
@@ -16011,8 +16060,18 @@ Final review: call censor_findings(project_id) for the residual ledger, ignore f
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
 "#;
         let verifier_final_review = project_agent_prompt(
-            &project, "verifier", "verifier-1", None, &root, "test-launch-token", None, true,
-            None, None, None, None,
+            &project,
+            "verifier",
+            "verifier-1",
+            None,
+            &root,
+            "test-launch-token",
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(
             verifier_final_review, VERIFIER_FINAL_REVIEW_EXPECTED,
@@ -16039,8 +16098,18 @@ Git: commit freely (git add -u / git commit) to save your work, but NEVER run a 
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
 "#;
         let orchestrator_baseline = project_agent_prompt(
-            &project, "orchestrator", "orch-1", Some("T1"), &root, "test-launch-token", None, false,
-            None, None, None, None,
+            &project,
+            "orchestrator",
+            "orch-1",
+            Some("T1"),
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(
             orchestrator_baseline, ORCHESTRATOR_BASELINE_EXPECTED,
@@ -16060,13 +16129,33 @@ Never print provider tokens, launch tokens, session tokens or secrets. Provider 
         let mut dh_project = censor_prompt_test_project();
         dh_project.metadata.root_path = Some(dh_root.to_string_lossy().into_owned());
         let coder_with_handoff = project_agent_prompt(
-            &dh_project, "coder", "coder-1", Some("T1"), &dh_root, "tok", None, false,
-            Some(dh_folder.as_path()), None, None, None,
+            &dh_project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &dh_root,
+            "tok",
+            None,
+            false,
+            Some(dh_folder.as_path()),
+            None,
+            None,
+            None,
         );
         assert!(coder_with_handoff.contains("a design bundle has been saved"));
         let coder_without_handoff = project_agent_prompt(
-            &dh_project, "coder", "coder-1", Some("T1"), &dh_root, "tok", None, false,
-            None, None, None, None,
+            &dh_project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &dh_root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(!coder_without_handoff.contains("a design bundle has been saved"));
 
@@ -16079,20 +16168,50 @@ Never print provider tokens, launch tokens, session tokens or secrets. Provider 
         )
         .unwrap();
         let coder_with_mini = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false,
-            None, None, Some(block.as_str()), None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            Some(block.as_str()),
+            None,
         );
         assert!(coder_with_mini.contains("MINI-CODER DELEGATION write_mode"));
         let coder_without_mini = project_agent_prompt(
-            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false,
-            None, None, None, None,
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(!coder_without_mini.contains("MINI-CODER DELEGATION write_mode"));
 
         // verifier: task_id present, censor_review off -> NO censor text at all.
         let verifier_with_task_no_review = project_agent_prompt(
-            &project, "verifier", "verifier-1", Some("T1"), &root, "tok", None, false,
-            None, None, None, None,
+            &project,
+            "verifier",
+            "verifier-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(verifier_with_task_no_review.contains("Preferred task_id: T1"));
         assert!(
@@ -16102,24 +16221,54 @@ Never print provider tokens, launch tokens, session tokens or secrets. Provider 
 
         // verifier: no task_id, censor_review off.
         let verifier_no_task_no_review = project_agent_prompt(
-            &project, "verifier", "verifier-1", None, &root, "tok", None, false,
-            None, None, None, None,
+            &project,
+            "verifier",
+            "verifier-1",
+            None,
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(!verifier_no_task_no_review.contains("Preferred task_id"));
         assert!(!verifier_no_task_no_review.contains("residual ledger"));
 
         // verifier: task_id present, censor_review on.
         let verifier_with_task_review = project_agent_prompt(
-            &project, "verifier", "verifier-1", Some("T1"), &root, "tok", None, true,
-            None, None, None, None,
+            &project,
+            "verifier",
+            "verifier-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(verifier_with_task_review.contains("residual ledger"));
         assert!(verifier_with_task_review.contains("Preferred task_id: T1"));
 
         // orchestrator: no task_id -> project_next_task entrypoint, own role text kept.
         let orch_no_task = project_agent_prompt(
-            &project, "orchestrator", "orch-1", None, &root, "tok", None, false,
-            None, None, None, None,
+            &project,
+            "orchestrator",
+            "orch-1",
+            None,
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(!orch_no_task.contains("Preferred task_id"));
         assert!(orch_no_task.contains("Plan and DELEGATE"));
