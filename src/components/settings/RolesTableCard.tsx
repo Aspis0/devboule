@@ -337,7 +337,9 @@ function MiniBackendFields(props: {
 const LOCAL_KIND_LABELS: Record<LocalCoderBackendKind, string> = {
   ollama: "Ollama (local model)",
   omlx: "oMLX (local MLX server)",
-  cloud: "Cloud (remote API — leaves this machine)",
+  // NOT the Claude/Codex CLI (that is the row's Cloud placement): here the LOCAL
+  // Devboule binary stays the orchestrator and only its MODEL is a remote API.
+  cloud: "Remote model API (Devboule binary + e.g. OpenRouter — leaves this machine)",
 };
 
 // A compact LocalCoderBackend field group for the Orchestrator row — the same shape as
@@ -428,7 +430,9 @@ function LocalBackendFields(props: {
 
       {draft.kind === "cloud" ? (
         <p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
-          Cloud needs an API key — set it in the{" "}
+          This keeps the LOCAL Devboule binary as the agent and only sources its
+          model from a remote API — it is not the Claude/Codex CLI (that is the
+          row&apos;s Cloud placement). It needs an API key — set it in the{" "}
           <span className="font-semibold">Local main coder</span> card below.
         </p>
       ) : null}
