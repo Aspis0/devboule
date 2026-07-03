@@ -4136,20 +4136,21 @@ fn project_agent_prompt(
         _ => super::agents::role_launch_prompt("coder")
             .expect("role_rules.json coder entry must carry a launchPrompt"),
     };
-    // Phase H — Censor launch-prompt addendum (complementary to the ROLE_RULES
-    // contract surfaced by the `agent_rules` MCP tool; this carries the same
-    // mandate into the bootstrap prompt). It is plain instruction text: it names
-    // the `censor_findings`/`censor_dispose` MCP tools and carries NO token or
-    // secret, so the prompt-token-off-argv + restricted-prompt-file guarantees
-    // are untouched.
-    // - coder: an UNCONDITIONAL per-step batch check.
-    // - verifier: the residual-adjudication step, ONLY when this is a "final
-    //   review" launch (`censor_review`). Without the flag the verifier prompt is
-    //   byte-for-byte unchanged (back-compat).
+    // ── Launch-prompt addenda (Phase H / MC-P5 / MC-P7 / GH-P5 / Phase D) ──
+    // Every block below is plain instruction text — it names MCP tools only, never
+    // a token/secret — so the prompt-token-off-argv + restricted-prompt-file
+    // guarantees are untouched. Each is gated with a POSITIVE allowlist keyed on
+    // `role` (F4), NOT a `_ => addendum` catch-all: a future/unknown role string
+    // must never silently inherit a coder-only or verifier-only addendum. They are
+    // assembled, in this fixed order, into `addenda` below.
+
+    // Phase H — Censor addendum, complementary to the ROLE_RULES contract surfaced
+    // by the `agent_rules` MCP tool. coder: UNCONDITIONAL per-step batch check.
+    // verifier: the residual-adjudication step, ONLY on a "final review" launch
+    // (`censor_review`) — byte-for-byte unchanged without the flag (back-compat).
+    // orchestrator: none (ROLE UNTANGLE — its MCP allowlist has no censor tools;
+    // Censor runs on the minis it delegates to).
     let censor_addendum = match role {
-        // ROLE UNTANGLE: the orchestrator has NO censor tools in its MCP allowlist
-        // (aspis_mcp.py ROLE_RULES — Censor runs on the minis it delegates to), so
-        // it gets no censor addendum at all.
         "orchestrator" => "",
         "verifier" => {
             if censor_review {
@@ -4162,34 +4163,16 @@ fn project_agent_prompt(
             "At each step boundary call censor_findings(project_id, file=<files you just touched>); fix the real local findings; mark false positives with censor_dispose. This is a batch at the step boundary, not a live interrupt.\n"
         }
     };
-    // MC-P5 — mini-coder escalation addendum (coder only). Names the terminal
-    // outcomes `spawn_mini_coder` returns and, crucially, the human-kill contract: an
-    // `aborted_by_human` means the human hit the Stop button on the mini's terminal —
-    // STOP that line of work, do NOT silently retry the mini, and escalate to the
-    // human (set status needs_user with what happened). The mini never contacts the
-    // human; the coder is the only human-contact point. Plain instruction text — no
-    // token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
-    // has no spawn_mini_coder access, so it gets no addendum.
-    // MC-P7 — mini-coder ROUTING guidance (coder only), prepended to the MC-P5
-    // outcome-handling text. It tells the coder WHEN/HOW to delegate to save its own
-    // context/limit (the "Claude=thinking, cheap model=I/O" routing pattern):
-    // delegate only cheap/mechanical sub-tasks, front-load the needed context into
-    // the task, and REVIEW the mini's returned output before using it (the mini is a
-    // cheaper model — its output is a draft). Plain instruction text — no
-    // token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
-    // has no spawn_mini_coder access, so it gets no addendum at all.
-    // F4: POSITIVE allowlist (coder-only), not a `_ => addendum` denylist. A future
-    // role string would otherwise silently inherit the coder's mini-coder addendum;
-    // only the coder gets it, every other role (verifier or anything new) gets "".
-    // ROLE UNTANGLE: deliberately NOT extended to the orchestrator — its dedicated
-    // role_rule above already embeds its own delegation/supervision mandate, and the
-    // coder text here ("delegate only cheap mechanical sub-tasks, do the thinking
-    // yourself") would CONTRADICT the orchestrator's delegate-everything mandate.
-    // A3 appends the MINI-CODER DELEGATION write_mode block (pre-built by the caller)
-    // right AFTER the routing addendum, CODER-ONLY and only when a mini backend is
-    // configured (the caller passes `None` otherwise / for a verifier). Owned `String`
-    // so the optional A3 block can be concatenated; an empty/absent block leaves the
-    // base routing text byte-identical to today.
+    // MC-P7 (routing: WHEN/HOW to delegate cheap/mechanical sub-tasks, front-load
+    // context, review the mini's draft output) + MC-P5 (escalation: the terminal
+    // `spawn_mini_coder` outcomes, crucially the `aborted_by_human` human-kill
+    // contract — STOP, do NOT retry, escalate via needs_user). Coder-only —
+    // deliberately NOT extended to the orchestrator: its own role_rule already
+    // carries a delegate-everything mandate that this "do the thinking yourself,
+    // delegate only I/O" text would CONTRADICT; the verifier has no
+    // spawn_mini_coder access either. A3 appends the caller-built MINI-CODER
+    // DELEGATION write_mode block right after the routing text, coder-only and
+    // only when a mini backend is configured (`None` otherwise ⇒ byte-identical).
     let mini_coder_addendum: String = match role {
         "coder" => {
             let base = "For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.\n\
@@ -4203,40 +4186,27 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
         }
         _ => String::new(),
     };
-    // GH-P5 — cooperative git-push addendum (coder only). Mirrors the ROLE_RULES
-    // coder.push mandate surfaced by the agent_rules MCP tool; this carries the
-    // same guidance into the bootstrap prompt: commit freely, but NEVER raw
-    // `git push` — your launch environment's git config has no credential helper
-    // (GIT_CONFIG_GLOBAL resets it; see write_session_gitconfig), so a raw push has
-    // no credential to use and fails. Publish via the request_git_push MCP tool +
-    // human approval, and STOP + escalate via needs_user if a push is denied or
-    // times out. Plain instruction text — no token/secret — so the
-    // prompt-token-off-argv guarantees are untouched.
-    // F4: POSITIVE allowlist (coder-only) — a future role string must NOT silently
-    // inherit the push addendum. The verifier has no request_git_push access
-    // (coder-only, gated in P4); it and any new role get "".
-    // F6: the "no git credentials, a raw push fails" claim is TRUE for a cooperative
-    // agent under our neutralized env, but kept as best-effort wording — it is NOT a
-    // hard sandbox (a determined agent can re-add a helper). The real gate is
-    // request_git_push + human approval.
-    // ROLE UNTANGLE: coder-LIKE (coder + orchestrator), not coder-only — the
-    // orchestrator holds request_git_push too, and a prompt-consuming orchestrator
-    // (a future cloud-CLI planner; the local binary ignores the prompt) must carry
-    // the "never raw push" guardrail, not just the MCP-side ROLE_RULES copy.
+    // GH-P5 — cooperative git-push addendum, mirroring the ROLE_RULES coder.push
+    // mandate: commit freely, but NEVER raw `git push` (the launch env's git config
+    // has no credential helper — GIT_CONFIG_GLOBAL resets it, see
+    // write_session_gitconfig — so a raw push has nothing to authenticate with;
+    // F6: best-effort wording, not a hard sandbox). Publish via request_git_push +
+    // human approval, STOP + needs_user on deny/timeout. Coder-LIKE (coder +
+    // orchestrator), not coder-only (ROLE UNTANGLE) — the orchestrator holds
+    // request_git_push too and a prompt-consuming orchestrator must carry the same
+    // guardrail; the verifier has no request_git_push access (gated in P4).
     let git_push_addendum = if super::agent_role::is_coder_like(role) {
         "Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status=\"needs_user\"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.\n"
     } else {
         ""
     };
-    // Phase D — design "Save & hand off" addendum (coder only). FIXED wording: the ONLY
-    // variable is the bundle's path RELATIVE to the working root (computed from two
-    // already-canonicalized, confinement-checked paths; the validated path is the sole
-    // interpolation, no caller free text). It names the bundle's expected inventory as
-    // "may include" (some files are optional — preview.png only exists after a capture),
-    // tells the coder to IMPLEMENT the design respecting design.md as the design contract,
-    // and leaves mini-coder delegation to the coder's own judgment. Plain instruction text
-    // — no token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
-    // never gets it (it does not implement). `None` => "" keeps the prompt unchanged.
+    // Phase D — design "Save & hand off" addendum, coder-only (verifier never
+    // implements a design). FIXED wording — the only variable is the bundle's path
+    // RELATIVE to the working root (both inputs already canonicalized +
+    // confinement-checked, so no caller free text reaches the prompt). Lists the
+    // inventory as "may include" (e.g. preview.png only exists after a capture) and
+    // leaves mini-coder delegation to the coder's own judgment. `None` ⇒ ""
+    // (byte-identical without a bundle).
     let design_handoff_addendum = match (role, design_handoff_folder) {
         ("coder", Some(folder)) => {
             let rel = design_handoff_relative_label(folder, root_path);
@@ -4266,6 +4236,23 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
                 project_id = project.metadata.id
             )
         });
+    // Every addendum above is already self-terminated (either "" when its guard is
+    // false, or literal text ending in its own "\n"), so the six pluggable blocks
+    // collapse into ONE ordered array, concatenated once — same bytes as the old
+    // per-placeholder interpolation, but the ORDER lives in one place instead of
+    // being implicit in the format! template below. `role_rule` is the one
+    // exception (it has no trailing newline of its own), so its line break is
+    // added here, at the join site, rather than baked into the SSoT string.
+    let role_rule_line = format!("{role_rule}\n");
+    let addenda: [&str; 6] = [
+        &role_rule_line,
+        &censor_addendum,
+        &mini_coder_addendum,
+        git_push_addendum,
+        &design_handoff_addendum,
+        workflow_addendum.unwrap_or(""),
+    ];
+    let addenda_block: String = addenda.concat();
     let mut prompt = format!(
         "You are a Devboule {role} agent.\n\
 Project id: {project_id}\n\
@@ -4282,18 +4269,12 @@ Then call provider_credentials_status(agent_id=\"{agent_id}\", role=\"{role}\", 
 Task entrypoint: {task_action}\n\
 Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.\n\
 Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.\n\
-{role_rule}\n\
-{censor_addendum}\
-{mini_coder_addendum}\
-{git_push_addendum}\
-{design_handoff_addendum}\
-{workflow_addendum}\
+{addenda_block}\
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.\n",
         project_id = project.metadata.id,
         project_title = project.metadata.title,
         root_path = root_path.to_string_lossy(),
         launch_token = launch_token,
-        workflow_addendum = workflow_addendum.unwrap_or(""),
     );
     // P10(b): inject the project's <role> SKILL.md (house conventions) when present,
     // sentinel-fenced AFTER the role rules. Absent ⇒ byte-identical (canonicalize
@@ -15871,6 +15852,184 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // The leading literal survives (minus the stripped \n) so the addendum still
         // points at a meaningful path.
         assert!(label.starts_with("injectme"), "got {label:?}");
+    }
+
+    // ── STEP 0: byte-parity snapshot guard (2026-07 project_agent_prompt
+    // addendum-assembly refactor). Pins the CURRENT output byte-for-byte for 3
+    // representative role combos, plus structural (contains/absent) coverage
+    // across the rest of the {role} x {task_id} x {censor_review} x
+    // {design_handoff} x {mini_delegation} matrix. This test must stay GREEN
+    // through the refactor that collapses the addendum blocks into an ordered
+    // list — that is the proof the collapsed assembly is byte-identical to the
+    // hand-concatenated original.
+    #[test]
+    fn project_agent_prompt_snapshot_matrix() {
+        let project = censor_prompt_test_project();
+        let root = PathBuf::from(project.metadata.root_path.clone().unwrap());
+
+        // ── 1) exact byte-for-byte pins (3 representative combos) ──
+        const CODER_BASELINE_EXPECTED: &str = r#"You are a Devboule coder agent.
+Project id: scrna-seq
+Project title: scRNA-seq UX and Backend
+Agent id: coder-1
+Working root: C:\Users\gualt\Desktop\aspis bio
+Launch token: test-launch-token
+Preferred task_id: T1
+
+Use the MCP server named aspis-management.
+First call agent_register(agent_id="coder-1", role="coder", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
+Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
+Then call provider_credentials_status(agent_id="coder-1", role="coder", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="coder-1", role="coder", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="coder-1", role="coder", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Task entrypoint: project_claim_task(project_id="scrna-seq", task_id="T1", agent_id="coder-1", role="coder", session_token="<sessionToken>")
+Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
+Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
+Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Split the plan into SMALL, self-contained tasks (one testable, committable unit each; a task's scope has AT MOST 3 files — split anything larger; give every task a deterministically verifiable acceptance). Pass plan_id = the `planId` field returned by plan_submit, and tasks = that list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. "P1", "P2"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. ["P1"]) — NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete and the project can advance — do NOT just close the terminal, or you will linger as a stale active agent.
+At each step boundary call censor_findings(project_id, file=<files you just touched>); fix the real local findings; mark false positives with censor_dispose. This is a batch at the step boundary, not a live interrupt.
+For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.
+When you call spawn_mini_coder it BLOCKS and returns a terminal status: done -> verify its output and filesTouched, then use it; needs_clarification -> re-invoke with the answer or do it yourself; aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do NOT silently retry the mini, and escalate to the human (agent_heartbeat status="needs_user" with what happened); failed/timeout -> handle as an error. The mini never contacts the human — you are the only contact point.
+Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
+Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+"#;
+        let coder_baseline = project_agent_prompt(
+            &project, "coder", "coder-1", Some("T1"), &root, "test-launch-token", None, false,
+            None, None, None, None,
+        );
+        assert_eq!(
+            coder_baseline, CODER_BASELINE_EXPECTED,
+            "coder baseline (task_id, no censor_review, no design_handoff, no mini_delegation) drifted"
+        );
+
+        const VERIFIER_FINAL_REVIEW_EXPECTED: &str = r#"You are a Devboule verifier agent.
+Project id: scrna-seq
+Project title: scRNA-seq UX and Backend
+Agent id: verifier-1
+Working root: C:\Users\gualt\Desktop\aspis bio
+Launch token: test-launch-token
+
+Use the MCP server named aspis-management.
+First call agent_register(agent_id="verifier-1", role="verifier", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
+Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
+Then call provider_credentials_status(agent_id="verifier-1", role="verifier", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="verifier-1", role="verifier", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Task entrypoint: project_next_task(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") then claim the returned task_id before working.
+Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
+Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
+Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence. When you have FINISHED reviewing (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent.
+Final review: call censor_findings(project_id) for the residual ledger, ignore findings already resolved, focus on cross-file / architectural / multi-file-security issues the small model cannot see, and censor_dispose to confirm or reject each.
+Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+"#;
+        let verifier_final_review = project_agent_prompt(
+            &project, "verifier", "verifier-1", None, &root, "test-launch-token", None, true,
+            None, None, None, None,
+        );
+        assert_eq!(
+            verifier_final_review, VERIFIER_FINAL_REVIEW_EXPECTED,
+            "verifier final-review (censor_review=true, no task_id) drifted"
+        );
+
+        const ORCHESTRATOR_BASELINE_EXPECTED: &str = r#"You are a Devboule orchestrator agent.
+Project id: scrna-seq
+Project title: scRNA-seq UX and Backend
+Agent id: orch-1
+Working root: C:\Users\gualt\Desktop\aspis bio
+Launch token: test-launch-token
+Preferred task_id: T1
+
+Use the MCP server named aspis-management.
+First call agent_register(agent_id="orch-1", role="orchestrator", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
+Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
+Then call provider_credentials_status(agent_id="orch-1", role="orchestrator", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="orch-1", role="orchestrator", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Task entrypoint: project_claim_task(project_id="scrna-seq", task_id="T1", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>")
+Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
+Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
+Plan and DELEGATE — you NEVER write or edit files yourself: you have no file-write or mutation tool, and EVERY code change goes through delegation (spawn_main_coder for substantial work, spawn_mini_coder for cheap mechanical sub-tasks; you plan and front-load context; they write). For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start delegating before this call. Split the plan into SMALL, self-contained tasks (nanophases) — NOT one per phase: one task = one testable, committable unit; a task's scope (the files it modifies) has AT MOST 3 entries, so split anything larger; give every task a deterministically verifiable acceptance (a test/typecheck/lint command). Pass plan_id = the `planId` field returned by plan_submit, and tasks = the nano-task list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. Route by weight: set weight:"main" for substantial multi-file or build-and-verify tasks; omit it (or "mini") for cheap mechanical edits. The assigned coder may be a small local model that relies SOLELY on your task title, acceptance and scope — make them unambiguous and complete, front-load everything it needs, and preserve exact file paths, function names and error messages. To SUPERVISE a delegated mini call spawn_mini_coder with wait=false to get its directiveId immediately, watch its activity, steer it with steer_mini_coder(directiveId, message) (or "stop" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation. If spawn_mini_coder returns status='aborted_by_human', STOP that line of work and escalate via ask_user; if it returns status='escalated' (retries exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file. For project or codebase questions use oracle_ask / oracle_context FIRST — do not guess. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when a sub-task is ready for the verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent.
+Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
+Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+"#;
+        let orchestrator_baseline = project_agent_prompt(
+            &project, "orchestrator", "orch-1", Some("T1"), &root, "test-launch-token", None, false,
+            None, None, None, None,
+        );
+        assert_eq!(
+            orchestrator_baseline, ORCHESTRATOR_BASELINE_EXPECTED,
+            "orchestrator baseline (task_id) drifted"
+        );
+
+        // ── 2) structural coverage for the rest of the matrix ──
+        // coder: task_id absent -> project_next_task entrypoint, no "Preferred task_id" line.
+        let coder_no_task = project_agent_prompt(
+            &project, "coder", "coder-1", None, &root, "tok", None, false, None, None, None, None,
+        );
+        assert!(!coder_no_task.contains("Preferred task_id"));
+        assert!(coder_no_task.contains("project_next_task(project_id=\"scrna-seq\""));
+
+        // coder: design_handoff_folder present/absent.
+        let (dh_root, dh_folder) = design_handoff_fixture();
+        let mut dh_project = censor_prompt_test_project();
+        dh_project.metadata.root_path = Some(dh_root.to_string_lossy().into_owned());
+        let coder_with_handoff = project_agent_prompt(
+            &dh_project, "coder", "coder-1", Some("T1"), &dh_root, "tok", None, false,
+            Some(dh_folder.as_path()), None, None, None,
+        );
+        assert!(coder_with_handoff.contains("a design bundle has been saved"));
+        let coder_without_handoff = project_agent_prompt(
+            &dh_project, "coder", "coder-1", Some("T1"), &dh_root, "tok", None, false,
+            None, None, None, None,
+        );
+        assert!(!coder_without_handoff.contains("a design bundle has been saved"));
+
+        // coder: mini_delegation_addendum present/absent.
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python"],
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .unwrap();
+        let coder_with_mini = project_agent_prompt(
+            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false,
+            None, None, Some(block.as_str()), None,
+        );
+        assert!(coder_with_mini.contains("MINI-CODER DELEGATION write_mode"));
+        let coder_without_mini = project_agent_prompt(
+            &project, "coder", "coder-1", Some("T1"), &root, "tok", None, false,
+            None, None, None, None,
+        );
+        assert!(!coder_without_mini.contains("MINI-CODER DELEGATION write_mode"));
+
+        // verifier: task_id present, censor_review off -> NO censor text at all.
+        let verifier_with_task_no_review = project_agent_prompt(
+            &project, "verifier", "verifier-1", Some("T1"), &root, "tok", None, false,
+            None, None, None, None,
+        );
+        assert!(verifier_with_task_no_review.contains("Preferred task_id: T1"));
+        assert!(
+            !verifier_with_task_no_review.contains("censor_findings"),
+            "verifier without censor_review contains NO censor text"
+        );
+
+        // verifier: no task_id, censor_review off.
+        let verifier_no_task_no_review = project_agent_prompt(
+            &project, "verifier", "verifier-1", None, &root, "tok", None, false,
+            None, None, None, None,
+        );
+        assert!(!verifier_no_task_no_review.contains("Preferred task_id"));
+        assert!(!verifier_no_task_no_review.contains("residual ledger"));
+
+        // verifier: task_id present, censor_review on.
+        let verifier_with_task_review = project_agent_prompt(
+            &project, "verifier", "verifier-1", Some("T1"), &root, "tok", None, true,
+            None, None, None, None,
+        );
+        assert!(verifier_with_task_review.contains("residual ledger"));
+        assert!(verifier_with_task_review.contains("Preferred task_id: T1"));
+
+        // orchestrator: no task_id -> project_next_task entrypoint, own role text kept.
+        let orch_no_task = project_agent_prompt(
+            &project, "orchestrator", "orch-1", None, &root, "tok", None, false,
+            None, None, None, None,
+        );
+        assert!(!orch_no_task.contains("Preferred task_id"));
+        assert!(orch_no_task.contains("Plan and DELEGATE"));
     }
 }
 
