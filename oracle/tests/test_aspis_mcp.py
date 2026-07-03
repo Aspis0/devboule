@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -4745,137 +4746,61 @@ class CoderReopenFromReviewTests(unittest.TestCase):
 
 
 class AllowedToolsCrossLanguageMirrorTests(unittest.TestCase):
-    """WARNING 5: the Python ROLE_RULES allowedTools per role MUST equal the Rust
-    default_role_rules() allowed_tools per role. Parses agents.rs and compares both
-    directions cannot drift (Rust has a twin verbatim test)."""
+    """role_rules.json is now the single source of truth for allowedTools,
+    consumed directly by Python (this module's ROLE_RULES) and, once rewired
+    by the Rust-side change, by src-tauri/src/backend/agents.rs too — both
+    read the SAME file, so the old "parse agents.rs and diff against Python"
+    drift guard is structurally impossible to trip and has been removed. What
+    remains worth guarding here, on the Python/JSON side alone, is that each
+    role's allowlist is well-formed: non-empty and distinct per role."""
 
-    def _parse_rust_allowed_tools(self) -> dict[str, list[str]]:
-        agents_rs = (
-            Path(__file__).resolve().parents[2]
-            / "src-tauri"
-            / "src"
-            / "backend"
-            / "agents.rs"
-        )
-        text = agents_rs.read_text(encoding="utf-8")
-        # Scope to default_role_rules() so unrelated allowed_tools (e.g. in tests)
-        # are not picked up.
-        start = text.index("fn default_role_rules()")
-        end = text.index("\nfn ", start)
-        body = text[start:end]
-        result: dict[str, list[str]] = {}
-        import re
-
-        # Each rule block: role: "<role>".into(), ... allowed_tools: vec![ "a", ... ]
-        for match in re.finditer(
-            r'role:\s*"(?P<role>[a-z]+)"\.into\(\),.*?allowed_tools:\s*vec!\[(?P<tools>.*?)\]',
-            body,
-            re.DOTALL,
-        ):
-            tools = re.findall(r'"([^"]+)"', match.group("tools"))
-            result[match.group("role")] = tools
-        return result
-
-    # ROLE UNTANGLE (2026-07): the parity check now covers ALL FOUR roles —
-    # coder, orchestrator, verifier, mini. The former PYTHON_ONLY_ROLES carve-out
-    # (orchestrator excluded because agents.rs had no mirror row) is gone: the Rust
-    # `default_role_rules()` carries the orchestrator fleet-UI row too, and this
-    # test is the anti-drift gate keeping both sides' allowlists identical.
-
-    def test_allowed_tools_match_rust_default_role_rules(self):
-        rust = self._parse_rust_allowed_tools()
-        self.assertTrue(rust, "failed to parse allowed_tools from agents.rs")
-        python = {rule["role"]: list(rule["allowedTools"]) for rule in ROLE_RULES}
-        self.assertEqual(set(python), set(rust))
-        for role in python:
-            self.assertEqual(
-                python[role],
-                rust[role],
-                f"allowed_tools for role {role} drifted between Python and Rust",
+    def test_allowed_tools_are_nonempty_and_unique_per_role(self):
+        by_role = {rule["role"]: list(rule["allowedTools"]) for rule in ROLE_RULES}
+        self.assertEqual(set(by_role), {"coder", "orchestrator", "verifier", "mini"})
+        for role, tools in by_role.items():
+            self.assertTrue(tools, f"{role} allowedTools must be non-empty")
+        # No two roles share the exact same allowlist (would indicate a
+        # copy-paste role that lost its distinct tool surface).
+        seen: dict[tuple[str, ...], str] = {}
+        for role, tools in by_role.items():
+            key = tuple(sorted(tools))
+            self.assertNotIn(
+                key,
+                seen,
+                f"{role} and {seen.get(key)} have identical allowedTools sets",
             )
+            seen[key] = role
 
 
 class PushMandateCrossLanguageMirrorTests(unittest.TestCase):
-    """GH-P5 (FIX F5): the cooperative push mandate is intentionally bilingual —
-    English in the Rust default_role_rules coder.push, Italian in the Python
-    ROLE_RULES coder.push — so byte-for-byte parity is impossible. This guards the
-    SEMANTIC contract instead: BOTH sides' coder push mandate must contain
-    (a) the literal tool name `request_git_push`, (b) a "never raw push" prohibition,
-    and (c) a "stop + escalate" instruction. If either side later drops the tool name
-    or the gate instruction, this fails. Mirrors the agents.rs source-parsing approach
-    the allowed_tools parity test already uses."""
+    """GH-P5 (FIX F5): the cooperative push mandate. Both sides now load the
+    SAME role_rules.json SSoT verbatim — Rust via `include_str!` +
+    `parsed_role_rules()` (src-tauri/src/backend/agents.rs), Python via
+    `json.loads` here (this module's ROLE_RULES) — so the historic
+    Italian-vs-English bilingual split, and the old "parse the Rust source
+    text" approach, are both gone: there is no separate Rust literal left to
+    parse. This guards the SEMANTIC contract on the one shared source: the
+    coder's push mandate must contain (a) the literal tool name
+    `request_git_push`, (b) a "never raw push" prohibition, and (c) a
+    "stop + escalate" instruction. If it ever drops the tool name or the gate
+    instruction, this fails — and since both languages read this exact file,
+    neither side can drift from the other."""
 
-    def _parse_rust_coder_push(self) -> list[str]:
-        agents_rs = (
-            Path(__file__).resolve().parents[2]
-            / "src-tauri"
-            / "src"
-            / "backend"
-            / "agents.rs"
-        )
-        text = agents_rs.read_text(encoding="utf-8")
-        import re
-
-        # Scope to the coder rule's `push: vec![ ... ]` inside default_role_rules().
-        start = text.index("fn default_role_rules()")
-        # The coder rule comes first; its push block is the first `push: vec![` after
-        # the coder role declaration.
-        coder_at = text.index('role: "coder".into()', start)
-        push_at = text.index("push: vec![", coder_at)
-        end = text.index("]", push_at)
-        block = text[push_at:end]
-        return re.findall(r'"((?:[^"\\]|\\.)*)"', block)
-
-    def test_rust_coder_push_carries_gate_contract(self):
-        lines = self._parse_rust_coder_push()
-        self.assertTrue(lines, "failed to parse coder.push from agents.rs")
-        blob = " ".join(lines)
+    def test_coder_push_carries_gate_contract(self):
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        self.assertIn("push", coder, "coder must declare a push mandate")
+        blob = " ".join(coder["push"])
         # (a) the tool name, (b) never-raw-push, (c) stop + escalate.
-        self.assertIn("request_git_push", blob, "Rust coder.push must name request_git_push")
+        self.assertIn("request_git_push", blob, "coder.push must name request_git_push")
         self.assertIn(
             "NEVER run a raw `git push`",
             blob,
-            "Rust coder.push must forbid a raw git push",
+            "coder.push must forbid a raw git push",
         )
-        self.assertIn("STOP", blob, "Rust coder.push must instruct to STOP")
+        self.assertIn("STOP", blob, "coder.push must instruct to STOP")
         self.assertIn(
-            "needs_user", blob, "Rust coder.push must instruct to escalate via needs_user"
+            "needs_user", blob, "coder.push must instruct to escalate via needs_user"
         )
-
-    def test_python_coder_push_carries_gate_contract(self):
-        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
-        self.assertIn("push", coder, "Python coder must declare a push mandate")
-        blob = " ".join(coder["push"])
-        # (a) the tool name, (b) never-raw-push (Italian), (c) stop + escalate (Italian).
-        self.assertIn("request_git_push", blob, "Python coder.push must name request_git_push")
-        self.assertIn(
-            "NON fare mai un `git push` grezzo",
-            blob,
-            "Python coder.push must forbid a raw git push",
-        )
-        self.assertIn("FERMATI", blob, "Python coder.push must instruct to STOP (FERMATI)")
-        self.assertIn(
-            "needs_user",
-            blob,
-            "Python coder.push must instruct to escalate via needs_user",
-        )
-
-    def test_both_sides_share_the_semantic_push_contract(self):
-        # Both languages, parsed independently, must each carry all three semantic
-        # elements — so neither side can silently drop the gate.
-        rust_blob = " ".join(self._parse_rust_coder_push())
-        py_coder = next(r for r in ROLE_RULES if r["role"] == "coder")
-        py_blob = " ".join(py_coder["push"])
-        for blob, lang in ((rust_blob, "Rust"), (py_blob, "Python")):
-            self.assertIn("request_git_push", blob, f"{lang} push mandate lost the tool name")
-        # never-raw-push prohibition: English vs Italian phrasing.
-        self.assertIn("NEVER run a raw `git push`", rust_blob)
-        self.assertIn("NON fare mai un `git push` grezzo", py_blob)
-        # stop + escalate: English vs Italian phrasing, both via needs_user.
-        self.assertIn("STOP", rust_blob)
-        self.assertIn("FERMATI", py_blob)
-        self.assertIn("needs_user", rust_blob)
-        self.assertIn("needs_user", py_blob)
 
 
 class AgentModelAndSubagentsTests(unittest.TestCase):
@@ -6071,11 +5996,11 @@ class CensorRoleMandateTests(unittest.TestCase):
         # task to review; the verifier keeps the final verdict (censorReview).
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         blob = " ".join(coder["forbidden"])
-        self.assertIn("subagente Sonnet", blob)
+        self.assertIn("Sonnet review subagent", blob)
         self.assertIn("ready for final reviewer", blob)
         self.assertIn("censorReview", blob)
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
-        self.assertNotIn("subagente Sonnet", " ".join(verifier["forbidden"]))
+        self.assertNotIn("Sonnet review subagent", " ".join(verifier["forbidden"]))
 
     def test_coder_mandate_is_per_step(self):
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
@@ -6089,7 +6014,7 @@ class CensorRoleMandateTests(unittest.TestCase):
         blob = " ".join(verifier["censor"]).lower()
         self.assertIn("censor_findings", blob)
         self.assertIn("censor_dispose", blob)
-        self.assertIn("residuo", blob)
+        self.assertIn("residual", blob)
 
 
 class SpawnMiniCoderTests(unittest.TestCase):
@@ -6321,7 +6246,7 @@ class SpawnMiniCoderTests(unittest.TestCase):
         self.assertIn("write_mode", desc, "tool description must name the param")
         self.assertIn("agenticIterative", desc, "must mention the agentic mode")
         self.assertIn("emitEdits", desc, "must mention the default mode")
-        self.assertIn("copertura", desc, "must mention the gate-coverage gating")
+        self.assertIn("coverage", desc, "must mention the gate-coverage gating")
         # The param schema (A2) still carries its own description + the canonical
         # enum/default, and the rule of thumb is restated there.
         param = tool["parameters"]["write_mode"]
@@ -6967,7 +6892,7 @@ class SpawnMiniCoderTests(unittest.TestCase):
         blob = " ".join(coder["forbidden"])
         self.assertIn("escalated", blob)
         # No blind re-spawn for the same file — the coder fixes it itself.
-        self.assertIn("rifai il file", blob)
+        self.assertIn("REDO that file yourself", blob)
         # The verifier (no spawn_mini_coder) must NOT carry it.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("escalated", " ".join(verifier["forbidden"]))
@@ -6978,8 +6903,8 @@ class SpawnMiniCoderTests(unittest.TestCase):
         # mirroring the Rust default_role_rules coder.forbidden routing line.
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         blob = " ".join(coder["forbidden"])
-        self.assertIn("Delega a spawn_mini_coder solo sub-task economici e meccanici", blob)
-        self.assertIn("RIVEDI l'output del mini come bozza", blob)
+        self.assertIn("Delegate only cheap, mechanical sub-tasks to spawn_mini_coder", blob)
+        self.assertIn("REVIEW the mini's output as a draft", blob)
         # The verifier (no spawn_mini_coder) must NOT carry any routing rule.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("spawn_mini_coder", " ".join(verifier["forbidden"]))
@@ -6987,21 +6912,22 @@ class SpawnMiniCoderTests(unittest.TestCase):
     def test_coder_role_rules_carry_cooperative_push_mandate(self):
         # GH-P5: the coder's `push` mandate must carry the cooperative push contract
         # (commit freely, NEVER raw git push, publish via request_git_push, STOP +
-        # needs_user on deny/timeout), mirrored — bilingual — in the Rust
-        # default_role_rules coder.push (coder_rule_carries_cooperative_push_mandate).
+        # needs_user on deny/timeout), mirrored in the Rust default_role_rules
+        # coder.push (coder_rule_carries_cooperative_push_mandate) — both now source
+        # the same English text from role_rules.json.
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         self.assertIn("push", coder, "coder must declare a push mandate")
         blob = " ".join(coder["push"])
         # Commit-freely line.
-        self.assertIn("Committa liberamente", blob)
+        self.assertIn("Commit freely", blob)
         # Never-raw-push line that names the request_git_push tool.
-        self.assertIn("NON fare mai un `git push` grezzo", blob)
+        self.assertIn("NEVER run a raw `git push`", blob)
         self.assertIn("request_git_push", blob)
         # Deny/timeout -> STOP + escalate via needs_user, no retry/workaround.
-        self.assertIn("negata o va in timeout", blob)
-        self.assertIn("FERMATI", blob)
+        self.assertIn("denied or times out", blob)
+        self.assertIn("STOP", blob)
         self.assertIn("needs_user", blob)
-        self.assertIn("NON riprovare", blob)
+        self.assertIn("Do NOT retry", blob)
         # The verifier (no request_git_push) must NOT carry any push mandate.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("push", verifier, "verifier must have NO push mandate")
@@ -8398,8 +8324,8 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         blob = " ".join(coder.get("plan", []))
         self.assertIn("plan_submit", blob)
         self.assertIn("ask_user", blob)
-        # The mandate is in Italian by convention.
-        self.assertRegex(blob, r"\b(prima|approvazione|attendi|piano)\b")
+        # The mandate is English by convention (role_rules.json SSoT).
+        self.assertRegex(blob, r"\b(before|approval|wait|plan)\b", re.IGNORECASE)
 
     def test_cap_plan_approval_requests_evicts_oldest_terminal_keeps_pending(self):
         requests = [

@@ -285,250 +285,11 @@ SCW_REGIONS = ("fr-par", "nl-ams", "pl-waw")
 _MCP_ENGINE_CACHE: dict[str, Any] = {}
 _MCP_INDEX_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-# ANTI-DRIFT: the `contract` lists below MUST stay verbatim-identical to the
-# contract strings in default_role_rules() in
-# src-tauri/src/backend/agents.rs. If you change one, change both.
-# INTENTIONAL BILINGUAL SPLIT (not drift): only `contract` is mirrored. `summary`
-# and `forbidden` are Italian here because agents read them, while the Rust copies
-# are English on purpose because they feed the fleet UI — do not "align" them.
-ROLE_RULES = [
-    {
-        # Phase B merge: the coder now PLANS and CODES. It absorbs the former
-        # orchestrator's planning/coordination mandate (assign work, open
-        # blockers, reopen tasks to todo, create follow-ups) on top of its own
-        # implementation duties. The final `done` is still verifier-only.
-        "role": "coder",
-        "summary": "Pianifica (/plan), lavora sul codice e usa Oracle; apre blocchi, riapre task a todo e segna wip/review/blocked, ma il done finale e solo verifier.",
-        # PHASE E mandate (mirrored in Rust default_role_rules coder.censor): the
-        # coder is Censor's per-step consumer. Kept as a dedicated `censor` field
-        # (not in the verbatim-mirrored `contract`) because the mandate differs per
-        # role; the Rust copy is English (UI), this one Italian (agents read it).
-        "censor": [
-            "A ogni confine di step chiama censor_findings(project_id, file=<file toccati>, drain_queue=True) per svuotare i finding asincroni accumulati nella coda persistente.",
-            'Correggi i finding locali reali; chiudi i falsi positivi con censor_dispose(disposition="fp").',
-            "Raggruppa al confine di step: non e un'interruzione live, e una verifica batch prima di passare al passo successivo.",
-        ],
-        # Phase 1 plan-approval + reply-box mandate. Dedicated `plan` field (not in
-        # the verbatim-mirrored `contract`) because the mandate differs per role; the
-        # Rust copy is English (UI), this one Italian (agents read it). Prima di lavoro
-        # multi-file il coder sottomette il piano e ASPETTA l'approvazione umana; su
-        # rifiuto rivede e re-invia; usa ask_user per le domande bloccanti invece di
-        # stallare nel terminale.
-        "plan": [
-            "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare l'implementazione prima di status=\"approved\".",
-            'APPENA approvato (status="approved") chiama SUBITO project_create_plan_tasks con la lista strutturata dei task: il Kanban ha ZERO task finche\' non lo fai, quindi NON iniziare a scrivere codice prima. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per FASE del piano, ognuna OBBLIGATORIAMENTE con {id, title} piu\' opzionali {acceptance, scope:[file], dependsOn}. `id` e\' un riferimento interno breve che assegni tu (es. "P1", "P2"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata (es. ["P1"]) — NON i numeri T del Kanban (li alloca il server rimappando i tuoi riferimenti).',
-            "Calibra le domande sulla complessita': per un task non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per task semplici/ovvi salta le domande e pianifica direttamente. Non sovra-consultare su lavori banali.",
-            'Se il piano viene rifiutato (status="rejected") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.',
-            "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
-        ],
-        # GH-P5 cooperative push mandate (mirrored in Rust default_role_rules
-        # coder.push — bilingual by design, Italian here, English there). Gli
-        # agenti committano liberamente ma NON fanno mai un `git push` grezzo:
-        # l'ambiente di lancio dell'agente non ha credenziali git, quindi un push
-        # grezzo fallisce subito; per pubblicare si passa dal tool MCP
-        # request_git_push con approvazione umana.
-        "push": [
-            "Committa liberamente (git add -u / git commit) per salvare il lavoro.",
-            "NON fare mai un `git push` grezzo: il tuo ambiente non ha credenziali git e fallira. Per pubblicare chiama il tool MCP `request_git_push`; un umano lo approva.",
-            'Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all\'umano via needs_user (agent_heartbeat status="needs_user"). NON riprovare, NON tentare un push grezzo, NON aggirare il gate.',
-        ],
-        "allowedTools": [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "project_set_title",
-            "project_create_followup",
-            "project_create_plan_tasks",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources",
-            "scaleway_resource_action",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "censor_findings",
-            "censor_dispose",
-            "visual_check",
-            "design_request",
-            "spawn_mini_coder",
-            "steer_mini_coder",
-            "mini_coder_result",
-            "request_git_push",
-            "plan_submit",
-            "plan_status",
-            "ask_user",
-        ],
-        "forbidden": [
-            "Non imposta done: serve verifier con evidenza.",
-            "Non legge o stampa token. Usa solo token da env e scope Aspis Bio verificato.",
-            "Delega a spawn_mini_coder solo sub-task economici e meccanici (boilerplate, bulk read->summary, edit semplici, docstring, test); pre-carica il contesto necessario; ragiona tu; RIVEDI l'output del mini come bozza prima di usarlo.",
-            "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
-            "Per un task di WRITE scegli `write_mode`: 'agenticIterative' SOLO per file in un linguaggio con copertura del gate deterministico in QUESTO progetto E con un modello mini abbastanza capace di iterare; altrimenti 'emitEdits' (default). Nel dubbio usa 'emitEdits'.",
-            "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\").",
-            "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), rifai il file TU STESSO: il rail di training ha gia' catturato il fallimento, quindi NON rilanciare ciecamente il mini sullo stesso file.",
-            "Prima di mettere un task in review: fai girare UN SOLO pass di review tuo (un subagente Sonnet) sui file che hai toccato, fixa i finding, POI sposta il task a review con una nota 'ready for final reviewer'. Il verdetto FINALE resta del verifier (il pass finale censorReview si lancia dall'app, NON parte da solo quando metti review), mai del tuo pass.",
-            "Quando produci o revisioni un artifact HTML self-contained e serve feedback visuale, chiama visual_check(html_path, focus?) e tratta la critique come evidenza advisory.",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
-        ],
-    },
-    {
-        # ORCHESTRATOR: the FRONTIER planning tier that PLANS + DELEGATES (locally
-        # the devboule binary; the role is backend-agnostic). It owns the same
-        # Kanban/transition powers as the coder (CODER_LIKE_ROLES) and — owner
-        # decision, role untangle 2026-07 — the FULL provider surface (Cloudflare/
-        # Scaleway read + mutation): to plan seriously it must see and manage the
-        # project's infra. What it NEVER holds is a file-write tool: EVERY code
-        # change is delegated to spawn_mini_coder. Its allowlist stays a subset of
-        # the coder's (no Censor tools, no visual_check, no verifier-only
-        # transition).
-        "role": "orchestrator",
-        "summary": "Il tier di PIANIFICAZIONE di punta: capisce progetto e infrastruttura via oracle_ask/oracle_context e i tool provider (Cloudflare/Scaleway, lettura e mutazione con task+evidenza), delega OGNI scrittura di codice a spawn_mini_coder, gestisce il Kanban come un coder (claim, wip/review/blocked, riapri a todo) ma il done resta verifier; pubblica via request_git_push col gate umano.",
-        # Plan-approval + reply-box mandate (same shape as the coder's). Prima di
-        # lavoro multi-file l'orchestrator sottomette il piano e ASPETTA
-        # l'approvazione umana — "mai full-auto non presidiato".
-        "plan": [
-            'Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l\'approvazione umana: non iniziare la delega prima di status="approved".',
-            'APPENA approvato (status="approved") chiama SUBITO project_create_plan_tasks con UNA targhetta per FASE del piano: il Kanban ha ZERO task finche\' non lo fai. Crea i task PRIMA di delegare, poi delega in ordine di dipendenza. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per fase, ognuna OBBLIGATORIAMENTE con {id, title} piu\' opzionali {acceptance, scope:[file], dependsOn}. `id` e\' un riferimento interno breve che assegni tu (es. "P1"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata — NON i numeri T del Kanban (li alloca il server).',
-            "Calibra le domande sulla complessita': per un obiettivo non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per richieste semplici/ovvie pianifica direttamente senza sovra-consultare.",
-            'Se il piano viene rifiutato (status="rejected") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.',
-            "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
-        ],
-        # Cooperative push mandate (identical to the coder's): commit freely, never
-        # raw-push, publish only via the human-approved request_git_push gate.
-        "push": [
-            "Committa liberamente (git add -u / git commit) per salvare il lavoro.",
-            "NON fare mai un `git push` grezzo: il tuo ambiente non ha credenziali git e fallira. Per pubblicare chiama il tool MCP `request_git_push`; un umano lo approva.",
-            "Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all'umano via ask_user. NON riprovare, NON tentare un push grezzo, NON aggirare il gate.",
-        ],
-        "allowedTools": [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "project_set_title",
-            "project_create_followup",
-            "project_create_plan_tasks",
-            # ROLE UNTANGLE (2026-07, owner decision): the orchestrator is the
-            # FRONTIER planning tier — it must SEE and MANAGE the project's infra
-            # (providers, credentials) to plan seriously, so it holds the full
-            # provider surface the coder has (read + mutation; mutations still
-            # require a claimed task + evidence like every coder-like caller).
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources",
-            "scaleway_resource_action",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "spawn_mini_coder",
-            # ROLE UNTANGLE Phase 3: the orchestrator dispatches substantial work
-            # to the first-class MAIN CODER (always-agentic sandboxed engine).
-            # Orchestrator-only — the coder CLIs write with their own tools.
-            "spawn_main_coder",
-            "steer_mini_coder",
-            "mini_coder_result",
-            "request_git_push",
-            "plan_submit",
-            "plan_status",
-            "ask_user",
-            "design_request",
-        ],
-        "forbidden": [
-            "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per la delega: spawn_main_coder per il lavoro sostanzioso/multi-file (il Main coder agentico sandboxato), spawn_mini_coder per i sotto-task economici/meccanici (tu pianifichi e riveli il contesto; loro scrivono).",
-            "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
-            "Per domande su progetto o codebase usa PRIMA oracle_ask / oracle_context (capacita di comprensione grounded): non indovinare ne leggere il filesystem a mano.",
-            "Non imposta done: e verifier-only con evidenza. Tu puoi solo claim e wip/review/blocked (e riapertura a todo), esattamente come un coder.",
-            "Ogni cambiamento passa per Censor + il Kanban + il gate umano: mai full-auto non presidiato. Quando un sotto-task e pronto, mettilo in review con una nota e lascia il verdetto finale al verifier.",
-            "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via ask_user.",
-            "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), FERMATI ed escala all'umano via ask_user invece di rilanciare ciecamente lo stesso file.",
-            "Non legge o stampa token o segreti. Usa solo token da env e scope Aspis Bio verificato; nessun provider OpenAI/Anthropic-API/GCP/AWS sui dati utente (solo Scaleway/Infomaniak EU, ZDR).",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
-        ],
-    },
-    {
-        "role": "verifier",
-        "summary": "Controlla task in review, output, test e rischi. Puo chiudere task o riaprirli come blocked.",
-        # PHASE E mandate (mirrored in Rust default_role_rules verifier.censor): the
-        # verifier is Censor's final authority over the residual ledger.
-        "censor": [
-            "Chiama censor_findings(project_id) per il ledger residuo; ignora i finding gia risolti.",
-            "Concentrati su problemi cross-file, architetturali e di sicurezza multi-file che il modello piccolo non puo vedere.",
-            "Adjudica: conferma i finding reali e chiudi i falsi positivi con censor_dispose (fp/wontfix/fixed).",
-        ],
-        "allowedTools": [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "scaleway_list_resources",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "censor_findings",
-            "censor_dispose",
-            "visual_check",
-            "ask_user",
-            "plan_status",
-        ],
-        "forbidden": [
-            "Non modifica codice.",
-            "Non modifica Cloudflare o Scaleway: solo read-only.",
-            "Non marca done se il task non e in review, o senza evidence e confidence >= 0.70.",
-            "Quando revisioni un artifact HTML self-contained, chiama visual_check(html_path, focus?) se il layout visuale puo influire sul verdetto; tratta la critique come evidenza advisory.",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
-        ],
-    },
-    {
-        "role": "mini",
-        "summary": "Sub-agente one-shot in SOLA LETTURA: usa oracle_context per leggere il codebase e project_structure per la spina dorsale architetturale, nient'altro.",
-        "allowedTools": [
-            "agent_register",
-            "oracle_context",
-            "project_structure",
-        ],
-        "forbidden": [
-            "Non modifica codice, task, Kanban, provider o findings: NESSUN tool di mutazione.",
-            "Non spawna altri agenti, non manda agent_heartbeat (niente subagents, niente needs_user: il contatto umano e' del coder padre) e non chiama censor_*: e' una foglia one-shot.",
-            "Non legge o stampa token o segreti.",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            'Registrati con agent_register (role="mini") prima di chiamare oracle_context / project_structure.',
-        ],
-    },
-]
+# SINGLE SOURCE OF TRUTH: role rules live in oracle/server/role_rules.json
+# (English only, 4 roles). Edit the JSON, not this module — it is loaded
+# verbatim at import time, no hand-synced literal, no silent fallback.
+_ROLE_RULES_PATH = Path(__file__).resolve().parent / "role_rules.json"
+ROLE_RULES = json.loads(_ROLE_RULES_PATH.read_text(encoding="utf-8"))["roles"]
 
 ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_RULES}
 
@@ -536,12 +297,12 @@ ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_R
 TOOLS = [
     {
         "name": "agent_rules",
-        "description": "Restituisce ruoli, responsabilita e divieti pratici per agenti Aspis.",
+        "description": "Returns roles, responsibilities, and practical restrictions for Aspis agents.",
         "parameters": {},
     },
     {
         "name": "agent_state",
-        "description": "Legge stato live di sessioni agenti, claim e ultimi eventi dopo registrazione.",
+        "description": "Reads the live state of agent sessions, claims, and latest events after registration.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -550,7 +311,7 @@ TOOLS = [
     },
     {
         "name": "agent_register",
-        "description": "Registra un agente CLI prima di leggere o aggiornare progetti.",
+        "description": "Registers a CLI agent before reading or updating projects.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -562,7 +323,7 @@ TOOLS = [
     },
     {
         "name": "agent_heartbeat",
-        "description": "Aggiorna presenza live dell'agente nella dashboard.",
+        "description": "Updates the agent's live presence in the dashboard.",
         "parameters": {
             "agent_id": {"type": "string"},
             "status": {"type": "string"},
@@ -583,13 +344,13 @@ TOOLS = [
     {
         "name": "spawn_mini_coder",
         "description": (
-            "Solo coder: delega un sotto-task economico a un mini-coder one-shot "
-            "ospitato dall'app; blocca finche il mini termina e restituisce il "
-            "risultato terminale. Per i task di WRITE scegli `write_mode`: "
-            "'agenticIterative' (il mini corregge su piu round contro il gate "
-            "deterministico) SOLO per file in un linguaggio con copertura del gate "
-            "in questo progetto E con un modello mini abbastanza capace di iterare; "
-            "altrimenti 'emitEdits' (default: una scrittura + una correzione)."
+            "Coder only: delegates a cheap sub-task to a one-shot mini-coder "
+            "hosted by the app; blocks until the mini finishes and returns the "
+            "terminal result. For WRITE tasks choose `write_mode`: "
+            "'agenticIterative' (the mini corrects over multiple rounds against the "
+            "deterministic gate) ONLY for files in a language with gate coverage "
+            "in this project AND with a mini model capable enough to iterate; "
+            "otherwise 'emitEdits' (default: one write + one correction)."
         ),
         "parameters": {
             "agent_id": {"type": "string"},
@@ -638,11 +399,11 @@ TOOLS = [
         # downgrading it to a one-shot mini.
         "name": "spawn_main_coder",
         "description": (
-            "Solo orchestrator: dispaccia un task SOSTANZIOSO al MAIN CODER locale "
-            "(l'engine agentico sandboxato: loop multi-round read/edit/grep/run "
-            "contro il gate deterministico). A differenza di spawn_mini_coder e' "
-            "sempre agentico e pensato per task multi-file/di peso; write e "
-            "write_mode sono forzati lato server. Supervisione identica al mini: "
+            "Orchestrator only: dispatches a SUBSTANTIAL task to the local MAIN "
+            "CODER (the sandboxed agentic engine: multi-round read/edit/grep/run "
+            "loop against the deterministic gate). Unlike spawn_mini_coder it is "
+            "always agentic and meant for multi-file/heavyweight tasks; write and "
+            "write_mode are forced server-side. Same supervision as the mini: "
             "wait=false + steer_mini_coder + mini_coder_result(directiveId)."
         ),
         "parameters": {
@@ -667,7 +428,7 @@ TOOLS = [
     {
         "name": "steer_mini_coder",
         "description": (
-            "Solo coder/orchestrator: steer a RUNNING mini-coder you spawned by appending "
+            "Coder/orchestrator only: steer a RUNNING mini-coder you spawned by appending "
             "a mid-flight correction to its steer queue. The app folds queued corrections "
             "into the mini's NEXT fix-pass round (it takes effect at a round boundary, not "
             "mid-token), reusing the same channel as the Stop button. Send the message "
@@ -692,7 +453,7 @@ TOOLS = [
     {
         "name": "mini_coder_result",
         "description": (
-            "Solo coder/orchestrator: collect the outcome of a mini you delegated with "
+            "Coder/orchestrator only: collect the outcome of a mini you delegated with "
             "spawn_mini_coder(wait=false). Pass the directiveId it returned. With "
             "wait=true (default) BLOCKS until the mini reaches a terminal outcome and "
             "returns {directiveId, result} (same poll/timeout semantics as the blocking "
@@ -739,7 +500,7 @@ TOOLS = [
     },
     {
         "name": "request_git_push",
-        "description": "Solo coder: RICHIEDE l'approvazione umana per un git push (puoi committare liberamente, ma il push lo approva l'umano). Blocca finche l'umano approva (e l'app esegue il push) o nega; su timeout FERMATI, non riprovare, non fare push diretto.",
+        "description": "Coder only: REQUESTS human approval for a git push (you may commit freely, but the human approves the push). Blocks until the human approves (and the app performs the push) or denies; on timeout STOP, do not retry, do not push directly.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -752,7 +513,7 @@ TOOLS = [
     },
     {
         "name": "plan_submit",
-        "description": "Solo coder: invia un piano di implementazione (markdown) per l'approvazione umana prima di lavoro multi-file; blocca finche l'umano approva o rifiuta. Su rifiuto rivedi e re-invia; su timeout fermati e non procedere senza approvazione.",
+        "description": "Coder only: submits an implementation plan (markdown) for human approval before multi-file work; blocks until the human approves or rejects it. On rejection revise and resubmit; on timeout stop and do not proceed without approval.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -764,7 +525,7 @@ TOOLS = [
     },
     {
         "name": "plan_status",
-        "description": "Coder o verifier: legge lo stato corrente di un piano gia inviato (pending_approval/approved/rejected/timeout) dato il suo plan_id.",
+        "description": "Coder or verifier: reads the current status of an already-submitted plan (pending_approval/approved/rejected/timeout) given its plan_id.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -774,7 +535,7 @@ TOOLS = [
     },
     {
         "name": "ask_user",
-        "description": "Coder o verifier: fai una domanda bloccante all'umano e attendi la risposta invece di stallare nel terminale; blocca finche arriva la risposta o scade il timeout.",
+        "description": "Coder or verifier: ask the human a blocking question and wait for the answer instead of stalling in the terminal; blocks until the answer arrives or the timeout expires.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -784,7 +545,7 @@ TOOLS = [
     },
     {
         "name": "project_list",
-        "description": "Lista progetti Markdown locali leggibili dagli agenti.",
+        "description": "Lists local Markdown projects readable by agents.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -793,7 +554,7 @@ TOOLS = [
     },
     {
         "name": "project_get",
-        "description": "Legge un progetto con task, note, revision e path.",
+        "description": "Reads a project with tasks, notes, revision, and path.",
         "parameters": {
             "project_id": {"type": "string"},
             "agent_id": {"type": "string"},
@@ -803,7 +564,7 @@ TOOLS = [
     },
     {
         "name": "project_next_task",
-        "description": "Suggerisce il prossimo task non completato per un ruolo.",
+        "description": "Suggests the next incomplete task for a role.",
         "parameters": {
             "project_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -813,7 +574,7 @@ TOOLS = [
     },
     {
         "name": "project_claim_task",
-        "description": "Crea un claim con lease sul task, visibile nella dashboard agenti.",
+        "description": "Creates a leased claim on the task, visible in the agent dashboard.",
         "parameters": {
             "project_id": {"type": "string"},
             "task_id": {"type": "string"},
@@ -824,7 +585,7 @@ TOOLS = [
     },
     {
         "name": "project_update_status",
-        "description": "Aggiorna status task/progetto con note ed evento auditabile.",
+        "description": "Updates task/project status with notes and an auditable event.",
         "parameters": {
             "project_id": {"type": "string"},
             "task_id": {"type": "string"},
@@ -838,7 +599,7 @@ TOOLS = [
     },
     {
         "name": "project_append_note",
-        "description": "Aggiunge una nota strutturata al progetto.",
+        "description": "Adds a structured note to the project.",
         "parameters": {
             "project_id": {"type": "string"},
             "text": {"type": "string"},
@@ -849,7 +610,7 @@ TOOLS = [
     },
     {
         "name": "project_set_title",
-        "description": "Rinomina il progetto: imposta il titolo deciso durante la conversazione di planning.",
+        "description": "Renames the project: sets the title decided during the planning conversation.",
         "parameters": {
             "project_id": {"type": "string"},
             "title": {"type": "string"},
@@ -860,7 +621,7 @@ TOOLS = [
     },
     {
         "name": "project_create_followup",
-        "description": "Crea un task TODO di follow-up senza chiudere quello corrente.",
+        "description": "Creates a follow-up TODO task without closing the current one.",
         "parameters": {
             "project_id": {"type": "string"},
             "title": {"type": "string"},
@@ -879,10 +640,10 @@ TOOLS = [
     {
         "name": "project_create_plan_tasks",
         "description": (
-            "Bulk-crea i task di un piano approvato sul Kanban del progetto come "
-            "todo, taggati col planId. Alloca id T<n> freschi (nessuna collisione coi "
-            "task manuali) e rimappa dependsOn dagli id interni del piano agli id "
-            "allocati; valida che il DAG sia aciclico. Ritorna gli id allocati."
+            "Bulk-creates the tasks of an approved plan on the project's Kanban as "
+            "todos, tagged with planId. Allocates fresh T<n> ids (no collision with "
+            "manual tasks) and remaps dependsOn from the plan's internal ids to the "
+            "allocated ids; validates that the DAG is acyclic. Returns the allocated ids."
         ),
         "parameters": {
             "project_id": {"type": "string"},
@@ -908,7 +669,7 @@ TOOLS = [
     },
     {
         "name": "provider_credentials_status",
-        "description": "Read-only: diagnostica quali credenziali provider/Oracle sono configurate senza esporre segreti.",
+        "description": "Read-only: diagnoses which provider/Oracle credentials are configured without exposing secrets.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -917,7 +678,7 @@ TOOLS = [
     },
     {
         "name": "cloudflare_list_workers",
-        "description": "Read-only: lista Workers nell'account Aspis Bio Cloudflare.",
+        "description": "Read-only: lists Workers in the Aspis Bio Cloudflare account.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -927,7 +688,7 @@ TOOLS = [
     },
     {
         "name": "cloudflare_rotate_worker_secret",
-        "description": "Coder-only: ruota un secret di un Worker Cloudflare Aspis Bio.",
+        "description": "Coder-only: rotates a secret of an Aspis Bio Cloudflare Worker.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -943,7 +704,7 @@ TOOLS = [
     },
     {
         "name": "scaleway_list_resources",
-        "description": "Read-only: lista VM, funzioni e container nel progetto Scaleway Aspis Bio.",
+        "description": "Read-only: lists VMs, functions, and containers in the Aspis Bio Scaleway project.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -953,7 +714,7 @@ TOOLS = [
     },
     {
         "name": "scaleway_resource_action",
-        "description": "Coder-only: start/stop/reboot/terminate VM o deploy serverless nel progetto Aspis Bio.",
+        "description": "Coder-only: start/stop/reboot/terminate a VM or serverless deploy in the Aspis Bio project.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -970,7 +731,7 @@ TOOLS = [
     },
     {
         "name": "oracle_ask",
-        "description": "Chiedi all'Oracle informazioni sull'architettura del progetto.",
+        "description": "Ask the Oracle for information about the project's architecture.",
         "parameters": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 5},
@@ -982,7 +743,7 @@ TOOLS = [
     },
     {
         "name": "oracle_context",
-        "description": "Restituisce chunk testuali semanticamente rilevanti per agenti.",
+        "description": "Returns semantically relevant text chunks for agents.",
         "parameters": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 8},
@@ -994,7 +755,7 @@ TOOLS = [
     },
     {
         "name": "project_structure",
-        "description": "Read-only: i file architetturalmente centrali (la 'spina dorsale') del progetto + i conteggi riassuntivi, calcolati in modo deterministico (no-LLM, tree-sitter). Usalo PRIMA di oracle_ask per orientarti su quali file toccare.",
+        "description": "Read-only: the architecturally central files (the project's 'backbone') plus summary counts, computed deterministically (no-LLM, tree-sitter). Use it BEFORE oracle_ask to orient yourself on which files to touch.",
         "parameters": {
             "project_id": {"type": "string"},
             "full": {"type": "boolean", "default": False},
@@ -1005,7 +766,7 @@ TOOLS = [
     },
     {
         "name": "censor_findings",
-        "description": "Legge i finding APERTI di Censor (linter locali + Gemma) per un progetto; filtra per file con `file`.",
+        "description": "Reads Censor's OPEN findings (local linters + Gemma) for a project; filter by file with `file`.",
         "parameters": {
             "project_id": {"type": "string"},
             "file": {"type": "string", "default": ""},
@@ -1017,7 +778,7 @@ TOOLS = [
     },
     {
         "name": "censor_dispose",
-        "description": "Imposta la disposition di un finding Censor (open|fixed|fp|wontfix) e aggiunge una voce di provenance.",
+        "description": "Sets the disposition of a Censor finding (open|fixed|fp|wontfix) and adds a provenance entry.",
         "parameters": {
             "project_id": {"type": "string"},
             "file": {"type": "string"},
@@ -3436,7 +3197,7 @@ def provider_token_from_sources(vault_key: str, *env_names: str) -> str:
     if value:
         return value
     raise McpError(
-        "Missing provider token. Save it in Aspis Management > Secrets, or set env var: "
+        "Missing provider token. Save it in Devboule > Secrets, or set env var: "
         + ", ".join(env_names)
     )
 
@@ -9672,10 +9433,10 @@ def create_mcp_server(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aspis Management MCP server")
-    parser.add_argument("--root", default=None, help="Aspis Management root folder")
+    parser = argparse.ArgumentParser(description="Devboule MCP server")
+    parser.add_argument("--root", default=None, help="Devboule root folder")
     parser.add_argument(
-        "--projects-dir", default=None, help="Shared Aspis Management projects folder"
+        "--projects-dir", default=None, help="Shared Devboule projects folder"
     )
     args = parser.parse_args()
     create_mcp_server(root=args.root, projects_dir=args.projects_dir).run()

@@ -4117,22 +4117,24 @@ fn project_agent_prompt(
     // like before, so a non-panel role still never injects.
     skill_role: Option<&str>,
 ) -> String {
-    // ROLE UNTANGLE (2026-07): three distinct role rules. The coder (Main coder)
-    // PLANS and CODES; the orchestrator PLANS and DELEGATES but NEVER writes (every
-    // code change goes through spawn_mini_coder — English mirror of the Python
-    // ROLE_RULES orchestrator mandate); the verifier reviews. The role string is
-    // normalized to {coder, verifier, orchestrator} by normalize_agent_role; the
-    // catch-all falls back to the coder rule.
+    // ROLE UNTANGLE (2026-07) + SSoT follow-up: three distinct role rules, now
+    // looked up from oracle/server/role_rules.json's `launchPrompt` (via
+    // `agents::role_launch_prompt`) instead of hardcoded here — the coder (Main
+    // coder) PLANS and CODES; the orchestrator PLANS and DELEGATES but NEVER
+    // writes (every code change goes through spawn_main_coder/spawn_mini_coder);
+    // the verifier reviews. The role string is normalized to
+    // {coder, verifier, orchestrator} by normalize_agent_role; the catch-all
+    // falls back to the coder's launchPrompt. `expect` is deliberate: coder,
+    // orchestrator and verifier all carry a launchPrompt in the SSoT JSON (only
+    // "mini" — never launched via this bootstrap path — does not), so a miss
+    // here means the JSON lost a required field and must fail loudly.
     let role_rule = match role {
-        "orchestrator" => {
-            "Plan and DELEGATE — you NEVER write or edit files yourself: you have no file-write or mutation tool, and EVERY code change goes through spawn_mini_coder (you plan and front-load context; the mini writes). For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start delegating before this call. Pass plan_id = the `planId` field returned by plan_submit, and tasks = one entry per plan PHASE, each REQUIRING {id, title} plus optional {acceptance, scope:[files], dependsOn}. To SUPERVISE a delegated mini call spawn_mini_coder with wait=false to get its directiveId immediately, watch its activity, steer it with steer_mini_coder(directiveId, message) (or \"stop\" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation. If spawn_mini_coder returns status='aborted_by_human', STOP that line of work and escalate via ask_user; if it returns status='escalated' (retries exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file. For project or codebase questions use oracle_ask / oracle_context FIRST — do not guess. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when a sub-task is ready for the verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent."
-        }
-        "verifier" => {
-            "Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence. When you have FINISHED reviewing (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent."
-        }
-        _ => {
-            "Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Pass plan_id = the `planId` field returned by plan_submit, and tasks = one entry per plan PHASE, each REQUIRING {id, title} plus optional {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. \"P1\", \"P2\"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. [\"P1\"]) — NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete and the project can advance — do NOT just close the terminal, or you will linger as a stale active agent."
-        }
+        "orchestrator" => super::agents::role_launch_prompt("orchestrator")
+            .expect("role_rules.json orchestrator entry must carry a launchPrompt"),
+        "verifier" => super::agents::role_launch_prompt("verifier")
+            .expect("role_rules.json verifier entry must carry a launchPrompt"),
+        _ => super::agents::role_launch_prompt("coder")
+            .expect("role_rules.json coder entry must carry a launchPrompt"),
     };
     // Phase H — Censor launch-prompt addendum (complementary to the ROLE_RULES
     // contract surfaced by the `agent_rules` MCP tool; this carries the same
@@ -4265,7 +4267,7 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
             )
         });
     let mut prompt = format!(
-        "You are an Aspis Management {role} agent.\n\
+        "You are a Devboule {role} agent.\n\
 Project id: {project_id}\n\
 Project title: {project_title}\n\
 Agent id: {agent_id}\n\
