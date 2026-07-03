@@ -810,6 +810,43 @@ pub fn save_oracle_index_preferences(
     read_oracle_index_preferences()
 }
 
+/// TEST SEAM: unit tests must NEVER reach the OS keyring through this read. On a
+/// dev machine the "Aspis Management" keychain item EXISTS but the per-build test
+/// binary is not in the item's ACL, so `get_password()` blocks forever on an
+/// authorization prompt no headless test can answer — two resolver tests
+/// (`http_command_root_resolver_is_the_workspace_resolver`,
+/// `index_root_uses_the_same_shared_resolver_as_the_operator_path`) hung at 0%
+/// CPU because of exactly this (2026-07-03 finding). In `cfg(test)` builds the
+/// read returns the process-shared override (or the defaults), never the vault.
+#[cfg(test)]
+pub(crate) fn set_oracle_index_preferences_override_for_test(
+    preferences: Option<OracleIndexPreferences>,
+) {
+    *test_oracle_index_preferences_override()
+        .lock()
+        .expect("oracle index preferences test override lock poisoned") = preferences;
+}
+
+#[cfg(test)]
+fn test_oracle_index_preferences_override(
+) -> &'static std::sync::Mutex<Option<OracleIndexPreferences>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<OracleIndexPreferences>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// cfg(test) twin of [`read_oracle_index_preferences`]: never touches the
+/// keyring (see the seam doc above) — returns the override or the defaults.
+#[cfg(test)]
+pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String> {
+    Ok(test_oracle_index_preferences_override()
+        .lock()
+        .expect("oracle index preferences test override lock poisoned")
+        .clone()
+        .unwrap_or_else(default_oracle_index_preferences))
+}
+
+#[cfg(not(test))]
 pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String> {
     match oracle_index_preferences_entry()?.get_password() {
         Ok(raw) => {
@@ -1390,6 +1427,27 @@ fn provider_scope_missing_message(provider: ProviderId) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_oracle_index_preferences_in_tests_never_touches_the_keyring() {
+        // The cfg(test) twin returns defaults (or the override) WITHOUT any
+        // keyring call: on a dev machine the real keychain item's ACL does not
+        // include the per-build test binary, and get_password() would block
+        // forever on an authorization prompt (the 2026-07-03 hanging-resolver
+        // finding). If this test ever hangs or prompts, the seam regressed.
+        let defaults = read_oracle_index_preferences().expect("defaults must load");
+        assert_eq!(defaults.auto_watch_on_unlock, true);
+
+        let mut custom = default_oracle_index_preferences();
+        custom.auto_watch_on_unlock = false;
+        set_oracle_index_preferences_override_for_test(Some(custom));
+        let overridden = read_oracle_index_preferences().expect("override must load");
+        assert_eq!(overridden.auto_watch_on_unlock, false);
+
+        set_oracle_index_preferences_override_for_test(None);
+        let restored = read_oracle_index_preferences().expect("defaults again");
+        assert_eq!(restored.auto_watch_on_unlock, true);
+    }
 
     /// RAII guard that snapshots EVERY Oracle LLM credential slot the mutating
     /// `#[ignore]` tests can touch (settings entry, provider-only key slot,
