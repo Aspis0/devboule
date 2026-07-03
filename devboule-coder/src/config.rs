@@ -172,6 +172,11 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
                 // `e` is a validation message (scheme/host/empty-field); it NEVER
                 // contains the key value.
                 eprintln!("devboule: Cloud model disabled ({e}); using MockModel{plan_note}");
+                // BUG B2 (review round 2): this THIRD Mock branch was still silent in
+                // chat. Reachable from the app: cloud base URL configured in the Roles
+                // table but the API key not stored yet (the launch gate passes on a
+                // non-empty cloud URL) — the exact silent-Mock symptom, relocated.
+                emit_mock_fallback_chat(Some(&e));
                 return Arc::new(MockModel::new());
             }
         }
@@ -180,6 +185,18 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
     // 2. LOOPBACK oMLX (the private default) — UNCHANGED.
     let base_url = std::env::var(ENV_OMLX_BASE_URL).ok();
     let Some(base_url) = base_url.filter(|s| !s.trim().is_empty()) else {
+        // BUG B2: NOTHING is configured (neither cloud above nor oMLX here) — the launch-
+        // time gate in `local_coder::orchestrator_model_configured_verdict` (src-tauri) is
+        // meant to reject this launch BEFORE the binary ever starts, but this binary can
+        // also run headless/manually with no app in front of it, so it must never rely on
+        // the app-side gate alone (defense in depth). Before this fix the fallback was
+        // SILENT: no stderr, no chat note — the user chatted with a nonsense "Mock reply
+        // to: …" with zero signal anything was wrong.
+        eprintln!(
+            "devboule: no local orchestrator model configured (DEVBOULE_OMLX_BASE_URL is \
+             empty); using MockModel"
+        );
+        emit_mock_fallback_chat(None);
         return Arc::new(MockModel::new());
     };
     let model_id = std::env::var(ENV_OMLX_MODEL).unwrap_or_default();
@@ -202,6 +219,9 @@ fn build_model(user_mcp_tools: Vec<crate::prompt::UserMcpServerTools>) -> Arc<dy
                 ""
             };
             eprintln!("devboule: oMLX model disabled ({e}); using MockModel{plan_note}");
+            // BUG B2: same anti-mute treatment as the silent branch above — a misconfigured
+            // endpoint must not degrade to the Mock without a persisted, user-visible note.
+            emit_mock_fallback_chat(Some(&e));
             Arc::new(MockModel::new())
         }
     }
@@ -429,6 +449,42 @@ fn emit_backend_offline_chat(reason: &str) {
     let activity = crate::activity::Activity::from_env();
     if activity.is_enabled() {
         activity.chat("assistant", &backend_offline_note(reason));
+    }
+}
+
+/// BUG B2 (anti-mute, model edition): the ONE chat line surfaced in the planner chat when
+/// `build_model` degrades to the safe [`MockModel`] — either because NOTHING is configured
+/// at all (`detail: None`), or because the configured oMLX endpoint failed to construct
+/// (`detail: Some(<raw error>)`). Before this, BOTH cases were silent (stderr only, never
+/// persisted): the planner looked alive and replied with a nonsense "Mock reply to: …" with
+/// zero signal anything was wrong. Pure so it is unit-testable.
+///
+/// Same REDACTION BOUNDARY as [`backend_offline_note`]: `detail` is sanitized here, never
+/// passed through raw, since this string lands on the same persisted/relayable bridge file.
+fn mock_fallback_note(detail: Option<&str>) -> String {
+    match detail {
+        None => "⚠ No local model is configured (DEVBOULE_OMLX_BASE_URL is empty) — replies \
+                  will be MOCK placeholders. Configure the local orchestrator model in \
+                  Settings > Providers & Models, or relaunch with a cloud model."
+            .to_string(),
+        Some(reason) => {
+            let reason = sanitize_offline_reason(reason);
+            format!(
+                "⚠ The local orchestrator model failed to initialize ({reason}) — replies \
+                 will be MOCK placeholders. Configure the local orchestrator model in \
+                 Settings > Providers & Models, or relaunch with a cloud model."
+            )
+        }
+    }
+}
+
+/// Emit [`mock_fallback_note`] to the activity bridge, if one is configured — the SAME
+/// best-effort mechanism as [`emit_backend_offline_chat`] (`Activity::from_env`, never
+/// fails the run): a no-op when no bridge is configured, and stderr remains the signal.
+fn emit_mock_fallback_chat(detail: Option<&str>) {
+    let activity = crate::activity::Activity::from_env();
+    if activity.is_enabled() {
+        activity.chat("assistant", &mock_fallback_note(detail));
     }
 }
 
@@ -696,8 +752,8 @@ mod tests {
     fn resolve_register_model_falls_back_to_cloud_model() {
         // FIX 5: in Cloud mode DEVBOULE_OMLX_MODEL is unset, so the register model must fall
         // back to DEVBOULE_CLOUD_MODEL instead of registering an empty string. Env is
-        // process-global; this test owns BOTH vars and restores them, so it is serialized by
-        // setting/removing the exact keys it asserts on (no shared key with other tests).
+        // process-global AND shared with the build_model note tests — hold the lock.
+        let _env = model_env_lock();
         let prev_omlx = std::env::var(ENV_OMLX_MODEL).ok();
         let prev_cloud = std::env::var(ENV_CLOUD_MODEL).ok();
 
@@ -808,6 +864,216 @@ mod tests {
         let written = std::fs::read_to_string(&file).unwrap();
         assert!(written.contains("\"kind\":\"chat\""));
         assert!(written.contains("test reason"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- BUG B2: MockModel fallback must never be silent -----------------------
+    //
+    // Before this fix, `build_model` picked `MockModel` in two cases (no oMLX/cloud
+    // config at all; a misconfigured oMLX endpoint) with ZERO signal — no stderr, no
+    // chat note — so the user chatted with a nonsense "Mock reply to: …" and had no
+    // idea the orchestrator was never actually talking to a model. These tests pin
+    // the note text (mirrors `backend_offline_note_carries_reason_and_action`) and
+    // the end-to-end emission through `build_model` itself (mirrors
+    // `backend_offline_note_reaches_the_bridge_file` / `resolve_register_model_falls_
+    // back_to_cloud_model`'s own-and-restore env harness).
+
+    #[test]
+    fn mock_fallback_note_silent_case_names_the_env_var() {
+        let note = mock_fallback_note(None);
+        assert!(note.contains("DEVBOULE_OMLX_BASE_URL is empty"), "{note}");
+        assert!(note.contains("MOCK placeholders"), "{note}");
+        assert!(note.contains("Settings > Providers & Models"), "{note}");
+    }
+
+    #[test]
+    fn mock_fallback_note_error_case_names_and_sanitizes_the_error() {
+        // A long digit-bearing run in the error must be masked, exactly like
+        // `backend_offline_note` — this note lands on the same persisted/relayable
+        // bridge, so it must honor the same redaction boundary.
+        let hashy_reason = format!(
+            "oMLX base URL must start with http:// (loopback, http only): {}",
+            "deadbeefcafe1234567890abcdef1234567890"
+        );
+        let note = mock_fallback_note(Some(&hashy_reason));
+        assert!(note.contains("MOCK placeholders"), "{note}");
+        assert!(note.contains("failed to initialize"), "{note}");
+        assert!(note.contains("[redacted]"), "{note}");
+        assert!(!note.contains("deadbeefcafe"), "{note}");
+    }
+
+    /// Env keys are process-global and cargo runs tests in PARALLEL threads:
+    /// own-and-restore alone does not serialize interleavings (one test's
+    /// remove_var can land mid-way through another's build_model call — the
+    /// flaky-CI footgun flagged by the hostile review). Every test that mutates
+    /// the model-selection env MUST hold this lock for its whole body.
+    fn model_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Full path: NO oMLX/cloud config at all ⇒ `build_model` selects `MockModel`
+    /// AND emits EXACTLY ONE chat note to the activity bridge. Env is process-
+    /// global; this test owns every key it touches and restores them (same
+    /// convention as `resolve_register_model_falls_back_to_cloud_model`).
+    #[test]
+    fn build_model_mock_selection_emits_exactly_one_note() {
+        const ENV_ACTIVITY_FILE: &str = "DEVBOULE_ACTIVITY_FILE";
+        let _env = model_env_lock();
+        let prev_omlx_base = std::env::var(ENV_OMLX_BASE_URL).ok();
+        let prev_omlx_model = std::env::var(ENV_OMLX_MODEL).ok();
+        let prev_cloud_base = std::env::var(ENV_CLOUD_BASE_URL).ok();
+        let prev_activity = std::env::var(ENV_ACTIVITY_FILE).ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mock-note-{}-{}",
+            std::process::id(),
+            "silent"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("act.jsonl");
+        std::env::remove_var(ENV_OMLX_BASE_URL);
+        std::env::remove_var(ENV_OMLX_MODEL);
+        std::env::remove_var(ENV_CLOUD_BASE_URL);
+        std::env::set_var(ENV_ACTIVITY_FILE, &file);
+
+        // We don't need to downcast the returned model (CoderModel is not `Any`) — the
+        // property under test is the SIDE EFFECT (the note), which is exactly bug B2's
+        // failure mode: the launch silently proceeds regardless of which model comes back.
+        let _model = build_model(Vec::new());
+        let written = std::fs::read_to_string(&file).unwrap_or_default();
+        let lines: Vec<&str> = written.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one note, got: {written:?}");
+        assert!(written.contains("DEVBOULE_OMLX_BASE_URL is empty"), "{written}");
+
+        // Restore.
+        match prev_omlx_base {
+            Some(v) => std::env::set_var(ENV_OMLX_BASE_URL, v),
+            None => std::env::remove_var(ENV_OMLX_BASE_URL),
+        }
+        match prev_omlx_model {
+            Some(v) => std::env::set_var(ENV_OMLX_MODEL, v),
+            None => std::env::remove_var(ENV_OMLX_MODEL),
+        }
+        match prev_cloud_base {
+            Some(v) => std::env::set_var(ENV_CLOUD_BASE_URL, v),
+            None => std::env::remove_var(ENV_CLOUD_BASE_URL),
+        }
+        match prev_activity {
+            Some(v) => std::env::set_var(ENV_ACTIVITY_FILE, v),
+            None => std::env::remove_var(ENV_ACTIVITY_FILE),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A validly-configured loopback oMLX backend ⇒ `build_model` builds the REAL
+    /// `OmlxModel` (no network call in the constructor) and emits NO note at all.
+    #[test]
+    fn build_model_configured_omlx_emits_no_note() {
+        const ENV_ACTIVITY_FILE: &str = "DEVBOULE_ACTIVITY_FILE";
+        let _env = model_env_lock();
+        let prev_omlx_base = std::env::var(ENV_OMLX_BASE_URL).ok();
+        let prev_omlx_model = std::env::var(ENV_OMLX_MODEL).ok();
+        let prev_cloud_base = std::env::var(ENV_CLOUD_BASE_URL).ok();
+        let prev_activity = std::env::var(ENV_ACTIVITY_FILE).ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mock-note-{}-{}",
+            std::process::id(),
+            "configured"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("act.jsonl");
+        std::env::remove_var(ENV_CLOUD_BASE_URL);
+        std::env::set_var(ENV_OMLX_BASE_URL, "http://127.0.0.1:8000/v1");
+        std::env::set_var(ENV_OMLX_MODEL, "qwen");
+        std::env::set_var(ENV_ACTIVITY_FILE, &file);
+
+        let _model = build_model(Vec::new());
+        let written = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(written.trim().is_empty(), "no note expected, got: {written:?}");
+
+        // Restore.
+        match prev_omlx_base {
+            Some(v) => std::env::set_var(ENV_OMLX_BASE_URL, v),
+            None => std::env::remove_var(ENV_OMLX_BASE_URL),
+        }
+        match prev_omlx_model {
+            Some(v) => std::env::set_var(ENV_OMLX_MODEL, v),
+            None => std::env::remove_var(ENV_OMLX_MODEL),
+        }
+        match prev_cloud_base {
+            Some(v) => std::env::set_var(ENV_CLOUD_BASE_URL, v),
+            None => std::env::remove_var(ENV_CLOUD_BASE_URL),
+        }
+        match prev_activity {
+            Some(v) => std::env::set_var(ENV_ACTIVITY_FILE, v),
+            None => std::env::remove_var(ENV_ACTIVITY_FILE),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG B2, review round 2: the CLOUD failure branch was the third Mock
+    /// fallback and the only one still silent in chat. Reachable from the app:
+    /// cloud base URL configured (so the launch gate passes) but the API key
+    /// not stored yet — CloudModel::new rejects the empty key and the binary
+    /// must emit the same one-line note as the oMLX branches.
+    #[test]
+    fn build_model_cloud_missing_key_emits_the_note() {
+        const ENV_ACTIVITY_FILE: &str = "DEVBOULE_ACTIVITY_FILE";
+        let _env = model_env_lock();
+        let prev_omlx_base = std::env::var(ENV_OMLX_BASE_URL).ok();
+        let prev_omlx_model = std::env::var(ENV_OMLX_MODEL).ok();
+        let prev_cloud_base = std::env::var(ENV_CLOUD_BASE_URL).ok();
+        let prev_cloud_model = std::env::var(ENV_CLOUD_MODEL).ok();
+        let prev_cloud_key = std::env::var(ENV_CLOUD_API_KEY).ok();
+        let prev_activity = std::env::var(ENV_ACTIVITY_FILE).ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "devboule-mock-note-{}-{}",
+            std::process::id(),
+            "cloud-nokey"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("act.jsonl");
+        std::env::remove_var(ENV_OMLX_BASE_URL);
+        std::env::remove_var(ENV_OMLX_MODEL);
+        std::env::set_var(ENV_CLOUD_BASE_URL, "https://api.example.com/v1");
+        std::env::set_var(ENV_CLOUD_MODEL, "some-cloud-model");
+        std::env::remove_var(ENV_CLOUD_API_KEY);
+        std::env::set_var(ENV_ACTIVITY_FILE, &file);
+
+        let _model = build_model(Vec::new());
+        let written = std::fs::read_to_string(&file).unwrap_or_default();
+        let lines: Vec<&str> = written.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one note, got: {written:?}");
+        assert!(written.contains("failed to initialize"), "{written}");
+
+        // Restore.
+        match prev_omlx_base {
+            Some(v) => std::env::set_var(ENV_OMLX_BASE_URL, v),
+            None => std::env::remove_var(ENV_OMLX_BASE_URL),
+        }
+        match prev_omlx_model {
+            Some(v) => std::env::set_var(ENV_OMLX_MODEL, v),
+            None => std::env::remove_var(ENV_OMLX_MODEL),
+        }
+        match prev_cloud_base {
+            Some(v) => std::env::set_var(ENV_CLOUD_BASE_URL, v),
+            None => std::env::remove_var(ENV_CLOUD_BASE_URL),
+        }
+        match prev_cloud_model {
+            Some(v) => std::env::set_var(ENV_CLOUD_MODEL, v),
+            None => std::env::remove_var(ENV_CLOUD_MODEL),
+        }
+        match prev_cloud_key {
+            Some(v) => std::env::set_var(ENV_CLOUD_API_KEY, v),
+            None => std::env::remove_var(ENV_CLOUD_API_KEY),
+        }
+        match prev_activity {
+            Some(v) => std::env::set_var(ENV_ACTIVITY_FILE, v),
+            None => std::env::remove_var(ENV_ACTIVITY_FILE),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

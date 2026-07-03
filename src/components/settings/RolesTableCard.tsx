@@ -27,12 +27,20 @@ import {
   MINI_BASE_URL_MAX_LENGTH,
 } from "../agents/miniCoderBackend";
 import {
+  validateLocalBackend,
+  LOCAL_BACKEND_KINDS,
+  LOCAL_MODEL_MAX_LENGTH,
+  LOCAL_BASE_URL_MAX_LENGTH,
+} from "../agents/localCoderBackend";
+import {
   buildProviderStatusMap,
   type ProviderStatusMap,
 } from "../design/designProviderDetection";
 import type {
   DetectedProvider,
   EffectiveRolesConfig,
+  LocalCoderBackend,
+  LocalCoderBackendKind,
   MiniCoderBackend,
   MiniCoderBackendKind,
   RolesConfig,
@@ -112,6 +120,32 @@ function draftFromBackend(backend: MiniCoderBackend | null | undefined): Backend
     command: backend.command ?? "",
     baseUrl: backend.baseUrl ?? "",
     maxConcurrent: backend.maxConcurrent ?? 2,
+  };
+}
+
+// The LocalCoderBackend-shaped draft the Orchestrator row's inline editor edits — a
+// SEPARATE, smaller shape from BackendDraft (no command/maxConcurrent: the local
+// main-coder tier has neither). Kept minimal so the row stays compact.
+interface LocalBackendRowDraft {
+  kind: LocalCoderBackendKind;
+  model: string;
+  baseUrl: string;
+}
+
+const EMPTY_LOCAL_DRAFT: LocalBackendRowDraft = {
+  kind: "ollama",
+  model: "",
+  baseUrl: "",
+};
+
+function localDraftFromBackend(
+  backend: LocalCoderBackend | null | undefined,
+): LocalBackendRowDraft {
+  if (!backend) return { ...EMPTY_LOCAL_DRAFT };
+  return {
+    kind: backend.kind,
+    model: backend.model ?? "",
+    baseUrl: backend.baseUrl ?? "",
   };
 }
 
@@ -300,6 +334,114 @@ function MiniBackendFields(props: {
   );
 }
 
+const LOCAL_KIND_LABELS: Record<LocalCoderBackendKind, string> = {
+  ollama: "Ollama (local model)",
+  omlx: "oMLX (local MLX server)",
+  cloud: "Cloud (remote API — leaves this machine)",
+};
+
+// A compact LocalCoderBackend field group for the Orchestrator row — the same shape as
+// MiniBackendFields (kind select + model input w/ datalist + validate feedback), but for
+// the LOCAL MAIN-CODER tier (ollama/omlx/cloud), reusing the SAME shared validator
+// (`validateLocalBackend`) the advanced "Local main coder" card (LocalCoderBackendCard)
+// and the Rust `validate_local_coder_backend` boundary use — the two surfaces that edit
+// `localCoderBackend` never disagree on what's valid. The Cloud API key + consent
+// disclosure stay ONLY on the advanced card (out of scope for this compact row); Cloud is
+// still selectable here, with a pointer to where the key lives.
+function LocalBackendFields(props: {
+  idPrefix: string;
+  draft: LocalBackendRowDraft;
+  onChange: (next: LocalBackendRowDraft) => void;
+  statusMap: ProviderStatusMap;
+}) {
+  const { idPrefix, draft, onChange, statusMap } = props;
+  const validation = useMemo(
+    () =>
+      validateLocalBackend({
+        kind: draft.kind,
+        model: draft.model,
+        baseUrl: draft.baseUrl,
+      }),
+    [draft.kind, draft.model, draft.baseUrl],
+  );
+  const detectedModels = useMemo(
+    () =>
+      draft.kind === "ollama" || draft.kind === "omlx" ? statusMap[draft.kind].models : [],
+    [draft.kind, statusMap],
+  );
+  const firstError = validation.errors.model ?? validation.errors.baseUrl;
+  const listId = `${idPrefix}-models`;
+  const set = (patch: Partial<LocalBackendRowDraft>) => onChange({ ...draft, ...patch });
+
+  return (
+    <div className="grid gap-3 md:grid-cols-2" data-testid={`${idPrefix}-fields`}>
+      <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+        Backend
+        <select
+          value={draft.kind}
+          onChange={(e) => set({ kind: e.target.value as LocalCoderBackendKind })}
+          className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+        >
+          {LOCAL_BACKEND_KINDS.map((k) => (
+            <option key={k} value={k}>
+              {LOCAL_KIND_LABELS[k]}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+        Model tag
+        <input
+          value={draft.model}
+          onChange={(e) => set({ model: e.target.value })}
+          placeholder="qwen2.5-coder"
+          maxLength={LOCAL_MODEL_MAX_LENGTH}
+          list={detectedModels.length ? listId : undefined}
+          className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+        />
+        {detectedModels.length ? (
+          <datalist id={listId}>
+            {detectedModels.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+        ) : null}
+      </label>
+
+      {draft.kind === "omlx" || draft.kind === "cloud" ? (
+        <label className="md:col-span-2 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          Base URL
+          <input
+            value={draft.baseUrl}
+            onChange={(e) => set({ baseUrl: e.target.value })}
+            placeholder={
+              draft.kind === "cloud"
+                ? "https://openrouter.ai/api/v1"
+                : "http://localhost:8000/v1"
+            }
+            maxLength={LOCAL_BASE_URL_MAX_LENGTH}
+            className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+          />
+        </label>
+      ) : null}
+
+      {draft.kind === "cloud" ? (
+        <p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
+          Cloud needs an API key — set it in the{" "}
+          <span className="font-semibold">Local main coder</span> card below.
+        </p>
+      ) : null}
+
+      {firstError ? (
+        <p className="md:col-span-2 text-[10px] normal-case tracking-normal text-coral-dark">
+          {firstError}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function RolesTableCard() {
   const { config } = useAppContext();
   const { refreshConfig } = useAppActions();
@@ -316,6 +458,12 @@ export function RolesTableCard() {
   );
   const [verifierDraft, setVerifierDraft] = useState<BackendDraft>(() =>
     draftFromBackend(config.verifierBackend),
+  );
+  // The Orchestrator row's inline local-model draft (localCoderBackend). Seeded from the
+  // same config the advanced "Local main coder" card edits, so the two surfaces never
+  // disagree on the starting point.
+  const [orchestratorDraft, setOrchestratorDraft] = useState<LocalBackendRowDraft>(() =>
+    localDraftFromBackend(config.localCoderBackend),
   );
   // "Same as Main coder" is a user toggle SEEDED from real state (verifier client already
   // equals the coder's AND no independent verifier backend). Init true (safe); the effect
@@ -389,7 +537,13 @@ export function RolesTableCard() {
     setMainDraft(draftFromBackend(config.mainCoderBackend));
     setMiniDraft(draftFromBackend(config.miniCoderBackend));
     setVerifierDraft(draftFromBackend(config.verifierBackend));
-  }, [config.mainCoderBackend, config.miniCoderBackend, config.verifierBackend]);
+    setOrchestratorDraft(localDraftFromBackend(config.localCoderBackend));
+  }, [
+    config.mainCoderBackend,
+    config.miniCoderBackend,
+    config.verifierBackend,
+    config.localCoderBackend,
+  ]);
 
   // Seed "Same as Main coder" ONCE from persisted equality (verifier client already equals the
   // coder's AND no independent verifier backend). After the first resolve it is a sticky user
@@ -469,6 +623,25 @@ export function RolesTableCard() {
     [],
   );
 
+  // Persist the Orchestrator's inline local-model draft. Reuses the SAME shared validator
+  // (`validateLocalBackend`) and the SAME command (`set_local_coder_backend`) as the
+  // advanced LocalCoderBackendCard, so a save from this row never disagrees with a save
+  // from that card.
+  const saveLocalCoderBackend = useCallback(async (draft: LocalBackendRowDraft) => {
+    const validation = validateLocalBackend({
+      kind: draft.kind,
+      model: draft.model,
+      baseUrl: draft.baseUrl,
+    });
+    if (!validation.ok || !validation.value) {
+      const firstError = validation.errors.model ?? validation.errors.baseUrl;
+      throw new Error(firstError ?? "Invalid local coder backend.");
+    }
+    await invokeBackendCommand("set_local_coder_backend", {
+      backend: validation.value,
+    });
+  }, []);
+
   // Row save orchestration. Each role wires the client selector and/or its backend.
   const onSaveRole = useCallback(
     async (role: RoleKey) => {
@@ -480,6 +653,9 @@ export function RolesTableCard() {
             pendingClients.orchestrator ??
             clients?.orchestratorClient ??
             "orchestrator";
+          if (isLocalClient("orchestrator", client)) {
+            await saveLocalCoderBackend(orchestratorDraft);
+          }
           await saveClients("orchestrator", client);
         } else if (role === "coder") {
           const client = pendingClients.coder ?? clients?.coderClient ?? "codex";
@@ -525,9 +701,11 @@ export function RolesTableCard() {
       pendingClients,
       mainDraft,
       miniDraft,
+      orchestratorDraft,
       verifierSameAsMain,
       saveClients,
       saveMiniBackend,
+      saveLocalCoderBackend,
       refreshConfig,
     ],
   );
@@ -555,8 +733,12 @@ export function RolesTableCard() {
       if (wantLocal) {
         setRoleClient(role, localMarker(role));
         // Entering Local: coerce a cloud draft kind to an on-device one so the
-        // Local editor never opens on codex/api.
-        if (!LOCAL_KINDS.includes(draft.kind)) setDraft({ ...draft, kind: "ollama" });
+        // Local editor never opens on codex/api. The Orchestrator's own draft
+        // (LocalCoderBackend-shaped) already only ever holds ollama/omlx/cloud, so it
+        // never needs this coercion.
+        if (role !== "orchestrator" && !LOCAL_KINDS.includes(draft.kind)) {
+          setDraft({ ...draft, kind: "ollama" });
+        }
       } else {
         setRoleClient(role, "codex");
       }
@@ -582,13 +764,12 @@ export function RolesTableCard() {
 
         {local ? (
           role === "orchestrator" ? (
-            <p className="text-[11px] leading-4 text-cream-500">
-              Runs as the local Devboule binary on the{" "}
-              <span className="font-semibold">Local coder backend</span>
-              {config.localCoderBackend
-                ? ` (${config.localCoderBackend.kind}${config.localCoderBackend.model ? ` · ${config.localCoderBackend.model}` : ""}).`
-                : " — configure its model in the Local coder card below."}
-            </p>
+            <LocalBackendFields
+              idPrefix="roles-orchestrator"
+              draft={orchestratorDraft}
+              onChange={setOrchestratorDraft}
+              statusMap={statusMap}
+            />
           ) : (
             <MiniBackendFields
               idPrefix={`roles-${role}`}
@@ -700,6 +881,11 @@ export function RolesTableCard() {
 
       <div className="divide-y divide-cream-100 rounded-2xl border border-cream-200">
         {ROLES.map((meta) => {
+          // Orchestrator has its OWN draft shape (LocalBackendRowDraft, read directly from
+          // closure by renderPlacement/LocalBackendFields) — the BackendDraft picked here for
+          // it is a harmless unused fallback (verifierDraft), never rendered or mutated for
+          // that role (renderPlacement guards every branch that would touch it on `role !==
+          // "orchestrator"`).
           const draft =
             meta.key === "coder"
               ? mainDraft
@@ -714,7 +900,7 @@ export function RolesTableCard() {
                 : setVerifierDraft;
           const busy = busyRole === meta.key;
           return (
-            <div key={meta.key} className="p-3">
+            <div key={meta.key} className="p-3" data-testid={`role-row-${meta.key}`}>
               <div className="flex flex-wrap items-center gap-2">
                 <span className="inline-flex items-center gap-2">
                   {meta.icon}

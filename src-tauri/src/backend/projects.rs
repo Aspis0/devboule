@@ -1733,33 +1733,54 @@ fn prepare_or_launch_project_agent(
             Some(backend) => super::local_coder::resolve_omlx_env(backend),
             None => (String::new(), String::new()),
         };
-        // FAIL-FAST PREFLIGHT: a configured loopback backend must be reachable and
-        // actually serve the configured model BEFORE we spawn the binary. Without
-        // this, a dead server / missing model left the planner on "thinking…"
-        // for minutes (3 × 60s silent request timeouts) with zero user feedback.
-        // ~2.5s worst-case cost. GATED on launch_terminal: the prepare-only path
-        // (Copy prompt — clipboard, no process) must never grow a network probe
-        // or a new failure mode (hostile-review BLOCKER).
-        if launch_terminal {
-            if let Some(backend) = &local_backend {
-                if let Err(preflight_err) =
-                    super::local_coder::preflight_local_orchestrator_backend(backend)
-                {
-                    // Close the launch_pending session recorded above — otherwise
-                    // every "oMLX isn't running" failure would strand a pending
-                    // ghost card in the rail.
-                    super::agents::mark_agent_session_closed_public(&app, &agent_id);
-                    return Err(preflight_err);
-                }
-            }
-        }
         // CLOUD (opt-in) env: non-empty ONLY when the configured kind is `cloud`. The base
         // URL + model are NON-secret (they ride inline like the oMLX ones); the API KEY is a
-        // SECRET appended to `provider_env` below (off argv, never logged).
+        // SECRET appended to `provider_env` below (off argv, never logged). Resolved HERE
+        // (moved up from below the preflight block) so the B2 gate right below can inspect
+        // the ACTUAL cloud env the binary will receive, not re-derive its own copy of the
+        // "is cloud configured" logic — this stays the single source of truth.
         let (cloud_base_url, cloud_model) = match &local_backend {
             Some(backend) => super::local_coder::resolve_cloud_env(backend),
             None => (String::new(), String::new()),
         };
+        // FAIL-FAST PREFLIGHT / B2 FAIL-LOUD GATE: a configured loopback backend must be
+        // reachable and actually serve the configured model BEFORE we spawn the binary
+        // (without this, a dead server / missing model left the planner on "thinking…" for
+        // minutes — 3 × 60s silent request timeouts — with zero user feedback); and an
+        // orchestrator launch with NEITHER a local NOR a cloud model configured must be
+        // rejected outright, rather than spawning a binary whose `build_model` silently
+        // selects the safe MockModel — the user then chats with a nonsense "Mock reply
+        // to: …" with no signal anything is wrong (bug B2). Mirrors the sibling Main-coder
+        // gate (`mini_coder_executor.rs`: a `None` resolved backend refuses to spawn).
+        // ~2.5s worst-case cost for the preflight probe. GATED on launch_terminal: the
+        // prepare-only path (Copy prompt — clipboard, no process) must never grow a
+        // network probe or a new failure mode (hostile-review BLOCKER).
+        if launch_terminal {
+            match &local_backend {
+                Some(backend) => {
+                    if let Err(preflight_err) =
+                        super::local_coder::preflight_local_orchestrator_backend(backend)
+                    {
+                        // Close the launch_pending session recorded above — otherwise
+                        // every "oMLX isn't running" failure would strand a pending
+                        // ghost card in the rail.
+                        super::agents::mark_agent_session_closed_public(&app, &agent_id);
+                        return Err(preflight_err);
+                    }
+                }
+                None => {
+                    if let Err(gate_err) = super::local_coder::orchestrator_model_configured_verdict(
+                        &omlx_base_url,
+                        &cloud_base_url,
+                    ) {
+                        // Same cleanup as the preflight-failure path above: don't strand a
+                        // pending ghost card in the rail for a launch that never spawned.
+                        super::agents::mark_agent_session_closed_public(&app, &agent_id);
+                        return Err(gate_err);
+                    }
+                }
+            }
+        }
         // SECRET 1: the app-issued launch token (the SAME one hashed into the pending
         // session above). The binary's agent_register REQUIRES it for this managed
         // launch. Env only — never argv / never the launch line.
@@ -12962,6 +12983,78 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             Some("verifier-readonly")
         );
         assert!(vault::cloudflare_agent_token_profile_ids_for_role("unknown").is_empty());
+    }
+
+    // BUG B2 — the orchestrator launch site (the `client == "orchestrator"` branch of
+    // `prepare_or_launch_project_agent`) resolves `(omlx_base_url, omlx_model)` /
+    // `(cloud_base_url, cloud_model)` via `match &local_backend { Some(b) => resolve_*(b),
+    // None => ("", "") }`, EXACTLY the same match arms exercised here — so this test pins
+    // the launch site's env resolution to the gate's contract without needing a full
+    // `AppHandle`/Tauri test harness (none exists in this crate). A `None` backend ⇒ BOTH
+    // pairs are empty ⇒ the gate must reject with the shared preflight message (reused
+    // verbatim, no new copy). A `Some` backend (either kind) ⇒ at least one pair is
+    // non-empty ⇒ the gate must pass, leaving the existing preflight/spawn path untouched.
+    #[test]
+    fn orchestrator_no_backend_gate_matches_launch_site_env_resolution() {
+        let local_backend: Option<super::super::local_coder::LocalCoderBackend> = None;
+        let (omlx_base_url, _omlx_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let (cloud_base_url, _cloud_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let err = super::super::local_coder::orchestrator_model_configured_verdict(
+            &omlx_base_url,
+            &cloud_base_url,
+        )
+        .unwrap_err();
+        assert_eq!(err, super::super::local_coder::NO_LOCAL_ORCHESTRATOR_MODEL_MSG);
+    }
+
+    #[test]
+    fn orchestrator_configured_omlx_backend_gate_passes_unaffected() {
+        let local_backend = Some(super::super::local_coder::LocalCoderBackend {
+            kind: super::super::local_coder::LocalCoderBackendKind::Omlx,
+            base_url: Some("http://127.0.0.1:8000/v1".into()),
+            model: Some("qwen".into()),
+        });
+        let (omlx_base_url, _omlx_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let (cloud_base_url, _cloud_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
+            None => (String::new(), String::new()),
+        };
+        assert!(super::super::local_coder::orchestrator_model_configured_verdict(
+            &omlx_base_url,
+            &cloud_base_url,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn orchestrator_configured_cloud_backend_gate_passes_unaffected() {
+        let local_backend = Some(super::super::local_coder::LocalCoderBackend {
+            kind: super::super::local_coder::LocalCoderBackendKind::Cloud,
+            base_url: Some("https://api.example.com/v1".into()),
+            model: Some("big-model".into()),
+        });
+        let (omlx_base_url, _omlx_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let (cloud_base_url, _cloud_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
+            None => (String::new(), String::new()),
+        };
+        assert!(super::super::local_coder::orchestrator_model_configured_verdict(
+            &omlx_base_url,
+            &cloud_base_url,
+        )
+        .is_ok());
     }
 
     // ROLE UNTANGLE — the orchestrator launches on the SAME task statuses as a coder
