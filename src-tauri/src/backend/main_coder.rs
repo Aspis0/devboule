@@ -141,6 +141,7 @@ pub fn spawn_main_coder_directive(
         attempt: 0,
         parent_directive_id: None,
         pigeon_ticket: None,
+        collected: None,
     };
 
     // 5. Append under the ledger lock, then run the shared eviction pass so the

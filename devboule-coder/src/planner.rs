@@ -130,6 +130,15 @@ pub const MAX_GOAL_CHARS: usize = 4_000;
 /// tight so a malformed prior plan cannot inflate the next prompt.
 pub const MAX_PRIOR_ERROR_CHARS: usize = 1_000;
 
+/// Max CHARS of the joined `milestone.files` advisory-hint line in one EXPAND
+/// prompt ([`build_expand_prompt`]) (F-A hardening). [`MAX_MILESTONE_FILES`] caps
+/// the COUNT at outline-validation time, but each hint can independently be up to
+/// `MAX_PATH_LEN` (1024) chars, so the joined line is capped here too — belt and
+/// suspenders so this one part can never, on its own, consume enough of
+/// [`MAX_PLAN_PROMPT_CHARS`] to leave no headroom for the trailing RULES/schema
+/// text the model needs to emit a valid ```plan``` block.
+pub const MAX_EXPAND_FILES_CHARS: usize = 2_000;
+
 /// Hard ceiling on the TOTAL context (chars) of a single PLAN prompt. Belt and
 /// suspenders over the per-part caps (goal / notes / summary / prior_error): even
 /// if a future edit grows a part, no single PLAN call may exceed this — the proof
@@ -171,6 +180,15 @@ const FLAT_PLAN_ATTEMPTS: usize = MAX_PLAN_ATTEMPTS - 1;
 /// goal that would need more is almost certainly the model losing the thread —
 /// reject it rather than accept an unmanageable decomposition.
 pub const MAX_MILESTONES: usize = 8;
+
+/// Max number of advisory `files` scope hints a single milestone may carry (F-A
+/// hardening). These are UNBOUNDED-count hints from the OUTLINE stage's model
+/// output — never an enforced task scope (see [`Milestone::files`]) — but an
+/// unbounded count still lets an adversarial/hallucinating model balloon the
+/// EXPAND prompt via [`build_expand_prompt`]'s joined files line; capping the
+/// COUNT here, at outline-validation time, gives the model a precise, retryable
+/// error instead of relying solely on that prompt's own char truncate.
+pub const MAX_MILESTONE_FILES: usize = 12;
 
 /// TOTAL number of OUTLINE attempts — the hierarchical path's own small analogue of
 /// [`MAX_PLAN_ATTEMPTS`], but for the single OUTLINE call: the first try plus ONE
@@ -411,6 +429,43 @@ fn check_field(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Max chars of a task/milestone `id` (F-D hardening: id contract). Mirrors the
+/// SAME bound the Oracle server enforces AFTER human plan approval, in
+/// `project_create_plan_tasks` (`aspis_mcp.py`):
+/// `re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,39}")`.
+const MAX_ID_CHARS: usize = 40;
+
+/// Validate a task/milestone `id` against the SAME shape the server
+/// independently re-derives (see [`MAX_ID_CHARS`]): non-empty; first char ASCII
+/// alphabetic; every subsequent char ASCII alphanumeric/`_`/`-`; at most
+/// [`MAX_ID_CHARS`] chars total. Catching a mismatched id HERE — at plan/outline
+/// validation time, where a retry can self-correct — is strictly better than
+/// letting it slip through both this validator AND the human approval gate only
+/// to fail the server's OWN `project_create_plan_tasks` check afterward, wasting
+/// the approval.
+fn check_short_id(field: &str, id: &str) -> Result<(), String> {
+    let len = id.chars().count();
+    if len == 0 {
+        return Err(format!("a {field} has an empty `id`"));
+    }
+    if len > MAX_ID_CHARS {
+        return Err(format!("{field} `{id}` id is {len} chars (max {MAX_ID_CHARS})"));
+    }
+    let mut chars = id.chars();
+    let first = chars.next().expect("len checked non-zero above");
+    if !first.is_ascii_alphabetic() {
+        return Err(format!(
+            "{field} `{id}` id must start with a letter (e.g. T001/M1)"
+        ));
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "{field} `{id}` id must contain only letters, digits, `_` or `-` after the first letter (e.g. T001/M1)"
+        ));
+    }
+    Ok(())
+}
+
 /// The trailing path component (basename) of a spine path, for the privacy-safe
 /// EXPLORE milestone label. The spine path is forward-slash relative (Oracle output);
 /// a path with no separator returns itself. An empty/`/`-terminated path falls back to
@@ -462,8 +517,12 @@ struct Structure {
 
 /// Parse the `project_structure` tool's JSON text into the spine + summary, capped
 /// to [`MAX_SPINE`]. The wire shape is `{spine:[{path, inDegree,
-/// topReferencedSymbols}], summary:{...}}` (camelCase). A missing/empty spine is
-/// an error: there is nothing to plan against.
+/// topReferencedSymbols}], summary:{...}}` (camelCase). F-H hardening: a
+/// missing/empty (or all-unsafe-and-therefore-empty) spine is NO LONGER a hard
+/// error here — [`run_planner`] merges this purely-structural spine with the
+/// GOAL-driven grounding spine BEFORE deciding there is nothing to plan against, so
+/// a project whose structural spine is empty (e.g. a brand-new repo with no
+/// central files yet) can still be planned from goal-grounded files alone.
 fn parse_structure(text: &str) -> Result<Structure, String> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| format!("project_structure returned unparseable JSON: {e}"))?;
@@ -506,12 +565,6 @@ fn parse_structure(text: &str) -> Result<Structure, String> {
             in_degree,
             top_symbols,
         });
-    }
-
-    if spine.is_empty() {
-        return Err(
-            "project_structure returned an empty spine; nothing to plan against".to_string(),
-        );
     }
 
     let summary = value
@@ -754,6 +807,9 @@ fn task_rules_block(max_tasks: Option<usize>) -> String {
     rules.push_str("- One task = one testable, committable unit.\n");
     rules.push_str("- `acceptance` MUST be a deterministically verifiable check (a test / typecheck / lint command), non-empty.\n");
     rules.push_str("- Task `id`s are unique and non-empty (e.g. T001). `dependsOn` lists prerequisite task ids and MUST be acyclic.\n");
+    rules.push_str(&format!(
+        "- Task `id`s must be SHORT and letter-first: start with a letter, then only letters/digits/`_`/`-`, at most {MAX_ID_CHARS} chars total (e.g. T001, M1).\n"
+    ));
     rules.push_str("- All paths are project-root-relative (no absolute, no `..`).\n");
     if let Some(max_tasks) = max_tasks {
         rules.push_str(&format!("- At most {max_tasks} tasks.\n"));
@@ -845,7 +901,10 @@ fn build_plan_prompt(
 /// caught at plan time, not at create time.) Enforces: non-empty
 /// goal; ≥1 task; ≤ [`MAX_TASKS`]; per-task non-empty/bounded title + acceptance; `scope`
 /// non-empty, ≤ [`MAX_TASK_SCOPE`], each a safe relative path; `contextFiles` ≤
-/// [`MAX_TASK_CONTEXT`], each a safe relative path; unique non-empty ids; `dependsOn`
+/// [`MAX_TASK_CONTEXT`], each a safe relative path; unique ids matching the shared
+/// id-shape contract ([`check_short_id`] — F-D hardening, mirroring the server's
+/// OWN `project_create_plan_tasks` id gate so a mismatched id fails HERE, where a
+/// retry can self-correct, not after a human already approved the plan); `dependsOn`
 /// references EXISTING ids only (no self-dep, no dangling, no duplicates) and the graph
 /// is ACYCLIC. It deliberately does NOT check the RUNTIME fields (`status`/`attempts`):
 /// the runner mutates those, so only the plan-time wrapper requires `pending`/`0`.
@@ -864,9 +923,7 @@ pub(crate) fn validate_plan_structure(plan: &TasksPlan) -> Result<(), String> {
     // First pass: per-task field validation + collect ids (uniqueness).
     let mut ids: HashSet<&str> = HashSet::with_capacity(plan.tasks.len());
     for task in &plan.tasks {
-        if task.id.trim().is_empty() {
-            return Err("a task has an empty `id`".to_string());
-        }
+        check_short_id("task", &task.id)?;
         if !ids.insert(task.id.as_str()) {
             return Err(format!("duplicate task id `{}`", task.id));
         }
@@ -1204,10 +1261,12 @@ fn detect_milestone_cycle(outline: &Outline) -> Result<(), String> {
 }
 
 /// Structural validation of an [`Outline`]: non-empty; ≤ [`MAX_MILESTONES`]; unique
-/// non-empty ids; non-empty bounded titles; `dependsOn` references EXISTING
-/// milestone ids only (no self-dep, no dangling, no duplicates) and is acyclic.
-/// Mirrors [`validate_plan_structure`]'s discipline at the milestone-DAG level
-/// rather than the task-DAG level.
+/// ids matching the shared id-shape contract ([`check_short_id`]); non-empty
+/// bounded titles; `files` ≤ [`MAX_MILESTONE_FILES`] (F-A hardening: an unbounded
+/// count would let the EXPAND prompt's joined files line balloon); `dependsOn`
+/// references EXISTING milestone ids only (no self-dep, no dangling, no
+/// duplicates) and is acyclic. Mirrors [`validate_plan_structure`]'s discipline at
+/// the milestone-DAG level rather than the task-DAG level.
 fn validate_outline(outline: &Outline) -> Result<(), String> {
     if outline.milestones.is_empty() {
         return Err("outline has no milestones".to_string());
@@ -1220,13 +1279,18 @@ fn validate_outline(outline: &Outline) -> Result<(), String> {
     }
     let mut ids: HashSet<&str> = HashSet::with_capacity(outline.milestones.len());
     for m in &outline.milestones {
-        if m.id.trim().is_empty() {
-            return Err("a milestone has an empty `id`".to_string());
-        }
+        check_short_id("milestone", &m.id)?;
         if !ids.insert(m.id.as_str()) {
             return Err(format!("duplicate milestone id `{}`", m.id));
         }
         check_field("milestone title", &m.title)?;
+        if m.files.len() > MAX_MILESTONE_FILES {
+            return Err(format!(
+                "milestone `{}` has {} files (max {MAX_MILESTONE_FILES})",
+                m.id,
+                m.files.len()
+            ));
+        }
     }
     for m in &outline.milestones {
         let mut seen_deps: HashSet<&str> = HashSet::with_capacity(m.depends_on.len());
@@ -1333,10 +1397,22 @@ fn build_outline_prompt(
 /// the same `plan` schema [`build_plan_prompt`] asks for. Hard-capped at
 /// [`MAX_PLAN_PROMPT_CHARS`]. Deliberately carries NO other milestone's tasks —
 /// each EXPAND call is fresh and small, exactly like an EXPLORE call.
+///
+/// `total_milestones` (F-B hardening) is `outline.milestones.len()`: the flat PLAN
+/// path enforces [`MAX_TASKS`] ONCE, on the whole plan, but the hierarchical path
+/// had NO per-fragment analogue at all — a model could emit an oversized fragment
+/// for EVERY milestone and still pass each per-fragment [`validate_plan_structure`]
+/// check, only to blow the aggregate cap at [`merge_fragments`] time after ALL
+/// milestones were already (wastefully) expanded. Budgeting `MAX_TASKS` evenly
+/// across milestones (`max(1, MAX_TASKS / total_milestones)`) gives EACH EXPAND
+/// call its own "at most N tasks" rule that keeps the total in-budget by
+/// construction, catching an oversized fragment at its own retry instead of only
+/// at the very end.
 fn build_expand_prompt(
     goal: &str,
     preplan_notes: &str,
     milestone: &Milestone,
+    total_milestones: usize,
     prior_error: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
@@ -1366,13 +1442,19 @@ fn build_expand_prompt(
     if milestone.files.is_empty() {
         prompt.push_str("Advisory file scope hints: (none suggested)\n");
     } else {
-        prompt.push_str(&format!(
-            "Advisory file scope hints: {}\n",
-            milestone.files.join(", ")
-        ));
+        // F-A hardening: [`MAX_MILESTONE_FILES`] bounds the COUNT at
+        // outline-validation time, but each hint can independently be up to
+        // `MAX_PATH_LEN` chars — cap the JOINED line too so this part alone can
+        // never eat enough of the prompt to leave no headroom for the trailing
+        // RULES/schema text (see [`MAX_EXPAND_FILES_CHARS`]).
+        let files = truncate_chars(&milestone.files.join(", "), MAX_EXPAND_FILES_CHARS);
+        prompt.push_str(&format!("Advisory file scope hints: {files}\n"));
     }
     prompt.push_str("\nRULES:\n");
-    prompt.push_str(&task_rules_block(None));
+    // F-B hardening: an even per-milestone task budget (see the doc comment above)
+    // instead of the flat path's `None` (no per-fragment count rule at all).
+    let budget = (MAX_TASKS / total_milestones.max(1)).max(1);
+    prompt.push_str(&task_rules_block(Some(budget)));
     prompt.push_str(
         "- Task ids in THIS fragment are LOCAL: `dependsOn` may ONLY reference an id defined in \
          THIS SAME fragment — never a task id from another milestone.\n\n",
@@ -1446,7 +1528,12 @@ fn fragment_leaves(tasks: &[Task]) -> Vec<&str> {
 ///    does not reference a task id WITHIN THE SAME fragment is a hard error — ids
 ///    are local to the fragment; a model that drifted outside it is rejected here
 ///    (this is checked independently of any upstream per-fragment validation, so
-///    this function is safe to call, and to unit-test, standalone). This same pass
+///    this function is safe to call, and to unit-test, standalone). A milestone id
+///    and a task id can EACH independently pass [`check_short_id`]'s own
+///    [`MAX_ID_CHARS`] cap yet still produce a namespaced id over that same cap
+///    once joined (F-D hardening) — this pass rejects that case explicitly, with a
+///    model-facing message naming the offending merged id, rather than silently
+///    emitting an oversized id no downstream consumer expects. This same pass
 ///    also NORMALIZES the runtime fields: every namespaced task's `status` is
 ///    forced to `"pending"` and `attempts` to `0`, UNCONDITIONALLY overwriting
 ///    whatever the EXPAND fragment echoed. The harness owns these two fields, never
@@ -1497,6 +1584,19 @@ fn merge_fragments(goal: &str, outline: &Outline, fragments: &[TasksPlan]) -> Re
         let mut leaves = Vec::new();
         for task in &fragment.tasks {
             let namespaced_id = format!("{mid}-{}", task.id);
+            // F-D hardening: a milestone id and a task id can EACH independently
+            // pass `check_short_id`'s own MAX_ID_CHARS cap yet still overflow it
+            // once namespaced together — catch that HERE, with a message naming
+            // the offending merged id, so the retry can shorten either half.
+            let namespaced_len = namespaced_id.chars().count();
+            if namespaced_len > MAX_ID_CHARS {
+                return Err(format!(
+                    "milestone {mid}: merged id `{namespaced_id}` is {namespaced_len} chars \
+                     (max {MAX_ID_CHARS}); merging namespaces every task id as \
+                     \"{{milestoneId}}-{{taskId}}\" — shorten the milestone id or the task id \
+                     so the merged id fits"
+                ));
+            }
             let mut namespaced_deps = Vec::with_capacity(task.depends_on.len());
             for dep in &task.depends_on {
                 if !local_ids.contains(dep.as_str()) {
@@ -1655,8 +1755,13 @@ async fn run_hierarchical_plan(
         let mut fragment_error: Option<String> = None;
         let mut fragment: Option<TasksPlan> = None;
         for _ in 0..MAX_EXPAND_ATTEMPTS {
-            let prompt =
-                build_expand_prompt(goal, preplan_notes, milestone, fragment_error.as_deref());
+            let prompt = build_expand_prompt(
+                goal,
+                preplan_notes,
+                milestone,
+                n,
+                fragment_error.as_deref(),
+            );
             let transcript = Transcript::new(prompt);
             let raw = model.next_output(&transcript).await;
             match parse_expand_fragment(&raw, &milestone.id) {
@@ -1768,6 +1873,20 @@ pub async fn run_planner(
         if let Some(parsed) = parse_oracle_context(&goal_ctx_raw) {
             explore_spine.extend(goal_spine_entries(&parsed, &structural_paths));
         }
+    }
+
+    // F-H hardening: the "nothing to plan against" hard error moved HERE, from
+    // `parse_structure` itself, to the MERGED spine (structural + goal-grounded).
+    // An empty STRUCTURAL spine alone must NOT abort the run — goal-grounding
+    // above runs regardless and may have surfaced usable files on its own (e.g. a
+    // brand-new repo with no central files yet, but a goal that names real ones);
+    // only when BOTH contribute nothing is there truly nothing to plan against.
+    // The error TEXT is unchanged from before this reordering, so any caller
+    // matching on it keeps working.
+    if explore_spine.is_empty() {
+        return Err(
+            "project_structure returned an empty spine; nothing to plan against".to_string(),
+        );
     }
 
     // --- 2) EXPLORE (bounded LLM loop, ONE small call per spine file) ---
@@ -2946,6 +3065,54 @@ mod tests {
         );
     }
 
+    // --- F-H: an empty STRUCTURAL spine must not make goal-grounding unreachable ---
+
+    #[tokio::test]
+    async fn empty_structural_spine_with_goal_chunks_still_plans() {
+        // No structural spine at all (e.g. a brand-new repo) — but the GOAL itself
+        // grounds a real file. The plan must still proceed exploring it, instead of
+        // hard-erroring before goal-grounding even runs.
+        let (_dir, fs) = fs_with_files(&[("src/goalfile.rs", "fn goal() {}\n")]);
+        let mcp = MockMcp::new(vec![], "approved")
+            .with_oracle_chunks(vec![("src/goalfile.rs", "goal-relevant context")]);
+        let model = CapturingModel::new(vec![
+            note_block("src/goalfile.rs"),
+            plan_block(one_valid_task()),
+        ]);
+        let outcome = run_planner("do the thing", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect("an empty STRUCTURAL spine must not abort when goal-grounding finds files");
+        assert_eq!(
+            model.prompts().len(),
+            2,
+            "1 goal-added EXPLORE + 1 PLAN call, despite zero structural spine files"
+        );
+        assert_eq!(outcome.tasks_plan.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_structural_spine_and_no_goal_chunks_is_the_original_error() {
+        // Neither the structural spine NOR goal-grounding produced anything: this
+        // is the one case that must still hard-error, with the ORIGINAL message.
+        let (_dir, fs) = fs_with_files(&[]);
+        let mcp = MockMcp::new(vec![], "approved"); // no oracle chunks configured -> empty chunks
+        let model = CapturingModel::new(vec![]);
+        let err = run_planner("g", &model, &mcp, &fs, "proj", &noop_activity(), true)
+            .await
+            .expect_err(
+                "an empty structural spine AND no goal-grounded files must still hard-error",
+            );
+        assert!(
+            err.contains("project_structure returned an empty spine; nothing to plan against"),
+            "the original error text is preserved: {err}"
+        );
+        assert_eq!(
+            model.prompts().len(),
+            0,
+            "no model call happens before the hard error"
+        );
+    }
+
     // --- PRE-PLAN NOTES external memory wiring (Piece 3) ---------------------
 
     #[tokio::test]
@@ -3710,9 +3877,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_structure_empty_spine_is_error() {
+    fn parse_structure_empty_spine_is_ok_not_fatal_here() {
+        // F-H: an empty spine is no longer a hard error AT PARSE TIME — the
+        // "nothing to plan against" decision moved to `run_planner`, after it
+        // merges in the GOAL-driven grounding spine (see the
+        // `empty_structural_spine_*` tests below).
         let text = serde_json::json!({"spine": [], "summary": {}}).to_string();
-        assert!(parse_structure(&text).is_err());
+        let s = parse_structure(&text).expect("empty spine is no longer fatal here");
+        assert!(s.spine.is_empty());
     }
 
     #[test]
@@ -3738,18 +3910,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_structure_all_unsafe_spine_is_empty_error() {
-        // If EVERY spine entry is dropped as unsafe, there is nothing to plan
-        // against — the empty-spine error path fires.
+    fn parse_structure_all_unsafe_spine_is_ok_and_empty() {
+        // F-H: if EVERY spine entry is dropped as unsafe, `parse_structure` itself
+        // no longer errors — it returns an empty spine, and it is `run_planner`
+        // (after merging in goal-grounding) that decides whether there is truly
+        // nothing to plan against.
         let spine = serde_json::json!([
             {"path": "../escape.rs", "inDegree": 4, "topReferencedSymbols": []},
             {"path": "/abs.rs", "inDegree": 3, "topReferencedSymbols": []},
         ]);
         let text = serde_json::json!({"spine": spine, "summary": {}}).to_string();
-        assert!(
-            parse_structure(&text).is_err(),
-            "all-unsafe spine is an error"
-        );
+        let s = parse_structure(&text).expect("all-unsafe spine is not fatal here");
+        assert!(s.spine.is_empty(), "every unsafe entry is dropped");
     }
 
     #[test]
@@ -4115,6 +4287,87 @@ mod tests {
         assert!(err.contains("no milestones"), "{err}");
     }
 
+    // --- F-D: shared task/milestone id-shape contract -----------------------
+
+    #[test]
+    fn check_short_id_accepts_documented_examples_and_rejects_bad_shapes() {
+        assert!(check_short_id("task", "T001").is_ok());
+        assert!(check_short_id("milestone", "M1").is_ok());
+        assert!(
+            check_short_id("task", "").is_err(),
+            "empty must be rejected"
+        );
+        assert!(
+            check_short_id("milestone", "9bad").is_err(),
+            "digit-leading must be rejected"
+        );
+        assert!(
+            check_short_id("task", "has space").is_err(),
+            "a space must be rejected"
+        );
+        assert!(
+            check_short_id("task", "bad.id").is_err(),
+            "a dot must be rejected"
+        );
+        let boundary = format!("T{}", "0".repeat(MAX_ID_CHARS - 1)); // exactly 40 chars
+        assert!(
+            check_short_id("task", &boundary).is_ok(),
+            "exactly {MAX_ID_CHARS} chars must be accepted"
+        );
+        let too_long = format!("T{}", "0".repeat(MAX_ID_CHARS)); // 41 chars
+        assert!(
+            check_short_id("task", &too_long).is_err(),
+            "over {MAX_ID_CHARS} chars must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_outline_rejects_a_digit_leading_milestone_id() {
+        let outline = mk_outline(vec![mk_milestone("1bad", &[])]);
+        let err =
+            validate_outline(&outline).expect_err("a digit-leading milestone id must be rejected");
+        assert!(err.contains("1bad") && err.contains("letter"), "{err}");
+    }
+
+    #[test]
+    fn validate_outline_rejects_a_milestone_with_too_many_files() {
+        let mut m = mk_milestone("M1", &[]);
+        m.files = (0..(MAX_MILESTONE_FILES + 1))
+            .map(|i| format!("f{i}.rs"))
+            .collect();
+        let outline = mk_outline(vec![m]);
+        let err = validate_outline(&outline)
+            .expect_err("a milestone with too many advisory files must be rejected");
+        assert!(
+            err.contains("M1")
+                && err.contains("files")
+                && err.contains(&MAX_MILESTONE_FILES.to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_an_oversized_namespaced_id() {
+        // Individually each id is <= MAX_ID_CHARS (and would each pass
+        // `check_short_id` on its own — validate_outline/validate_plan_structure
+        // would accept both in isolation), but the NAMESPACED "{mid}-{tid}" this
+        // produces is 41 chars — merge_fragments must catch what neither per-id
+        // check can see alone.
+        let mid = format!("M{}", "a".repeat(19)); // 20 chars
+        let tid = format!("T{}", "b".repeat(19)); // 20 chars
+        assert!(
+            mid.chars().count() + 1 + tid.chars().count() > MAX_ID_CHARS,
+            "test setup must actually exceed MAX_ID_CHARS"
+        );
+        let outline = mk_outline(vec![mk_milestone(&mid, &[])]);
+        let err = merge_fragments("g", &outline, &[frag(vec![frag_task(&tid, &[])])])
+            .expect_err("an oversized namespaced id must be rejected");
+        assert!(
+            err.contains(&mid) && err.contains(&MAX_ID_CHARS.to_string()),
+            "{err}"
+        );
+    }
+
     #[test]
     fn parse_outline_extracts_and_filters_unsafe_file_hints() {
         let raw = format!(
@@ -4200,7 +4453,7 @@ mod tests {
             files: vec!["src/auth.rs".into()],
             ..m
         };
-        let prompt = build_expand_prompt("build the thing", "(notes)", &m, None);
+        let prompt = build_expand_prompt("build the thing", "(notes)", &m, 1, None);
         assert!(prompt.contains("build the thing"), "{prompt}");
         assert!(prompt.contains("MILESTONE M1: wire the auth module"), "{prompt}");
         assert!(prompt.contains("src/auth.rs"), "{prompt}");
@@ -4220,8 +4473,67 @@ mod tests {
     #[test]
     fn build_expand_prompt_with_no_files_says_so() {
         let m = mk_milestone("M1", &[]);
-        let prompt = build_expand_prompt("g", "", &m, None);
+        let prompt = build_expand_prompt("g", "", &m, 1, None);
         assert!(prompt.contains("(none suggested)"), "{prompt}");
+    }
+
+    #[test]
+    fn build_expand_prompt_budgets_tasks_across_milestones() {
+        // F-B: MAX_TASKS(40) / 8 milestones = 5 — the per-fragment RULES line must
+        // carry this evenly-divided budget, not the flat path's whole-plan cap.
+        let m = mk_milestone("M1", &[]);
+        let prompt = build_expand_prompt("g", "", &m, 8, None);
+        assert!(
+            prompt.contains("At most 5 tasks.\n"),
+            "MAX_TASKS/8 == 5: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_expand_prompt_caps_the_joined_files_line() {
+        // F-A: even a single pathological "file" hint far larger than
+        // MAX_EXPAND_FILES_CHARS must not blow the joined line — the trailing
+        // RULES/schema text the model needs must always survive.
+        let mut m = mk_milestone("M1", &[]);
+        m.files = vec!["a".repeat(MAX_EXPAND_FILES_CHARS + 500)];
+        let prompt = build_expand_prompt("g", "", &m, 1, None);
+        assert!(
+            prompt.trim_end().ends_with("```"),
+            "the plan schema tail must survive: {:?}",
+            &prompt[prompt.len().saturating_sub(80)..]
+        );
+        assert!(prompt.chars().count() <= MAX_PLAN_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn expand_prompt_fits_by_construction_with_all_parts_at_their_real_caps() {
+        // Mirrors `plan_prompt_fits_by_construction_with_all_parts_at_their_real_caps`
+        // for the hierarchical EXPAND prompt: every part at its OWN legitimate cap
+        // (as `run_hierarchical_plan` always ensures — the milestone itself already
+        // passed `validate_outline`, which bounds `id`/title/files) must fit WITHOUT
+        // ever hitting the final truncate, or the trailing RULES/schema text would
+        // be silently cut.
+        let goal = "s".repeat(MAX_GOAL_CHARS);
+        let preplan_notes = "p".repeat(MAX_PREPLAN_PROMPT_CHARS);
+        let prior_error = "e".repeat(MAX_PRIOR_ERROR_CHARS);
+        let milestone = Milestone {
+            id: format!("M{}", "1".repeat(MAX_ID_CHARS - 1)), // exactly MAX_ID_CHARS
+            title: "t".repeat(MAX_FIELD_CHARS),                // validate_outline's own cap
+            files: vec!["f".repeat(MAX_EXPAND_FILES_CHARS)],   // joins to exactly the cap
+            depends_on: vec![],
+        };
+        let prompt = build_expand_prompt(&goal, &preplan_notes, &milestone, 1, Some(&prior_error));
+        assert!(
+            !prompt.contains("[…truncated]"),
+            "the realistic worst case must fit WITHOUT truncation (schema tail preserved); \
+             got {} chars (max {MAX_PLAN_PROMPT_CHARS})",
+            prompt.chars().count()
+        );
+        assert!(
+            prompt.trim_end().ends_with("```"),
+            "the plan schema example must survive intact, got tail: {:?}",
+            &prompt[prompt.len().saturating_sub(80)..]
+        );
     }
 
     #[test]

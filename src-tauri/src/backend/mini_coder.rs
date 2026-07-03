@@ -588,6 +588,20 @@ pub struct MiniCoderDirective {
     /// (passthrough, like `claimedAt`/`scratchPath`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pigeon_ticket: Option<i64>,
+    /// F-E hardening: stamped `Some(true)` by the Python `mini_coder_result` MCP
+    /// tool once it has successfully handed this directive's TERMINAL outcome
+    /// back to its caller (the async `spawn_mini_coder(wait=false)` +
+    /// `mini_coder_result` pattern). `cap_mini_coder_directives` (Python)
+    /// evicts COLLECTED terminal directives before UNCOLLECTED ones. Rust-side
+    /// this is PASSTHROUGH ONLY (nothing here sets or reads it) — but without
+    /// `#[serde(default)]` this struct's `deserialize` would hard-fail on a
+    /// Python-written directive carrying the key, and without the field at all
+    /// the Rust round-trip would SILENTLY DROP it on every re-serialize (the co-
+    /// writer hazard this field exists to close). NO-CHURN: omitted when None,
+    /// like `pigeon_ticket`/`claimed_at`, so a directive that was never
+    /// collected stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collected: Option<bool>,
 }
 
 /// `skip_serializing_if` for a `u32` that is zero-by-default (NO-CHURN co-ownership,
@@ -1842,6 +1856,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
+            collected: None,
         }
     }
 
@@ -1873,6 +1888,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
+            collected: None,
         };
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"claimedAt\""), "json: {json}");
@@ -1892,9 +1908,57 @@ mod tests {
             !json.contains("pigeonTicket"),
             "None ticket must be omitted: {json}"
         );
+        // F-E NO-CHURN: `collected: None` (never stamped by the Python
+        // `mini_coder_result` co-writer) OMITS the field entirely.
+        assert!(
+            !json.contains("collected"),
+            "None collected must be omitted: {json}"
+        );
 
         let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
+    }
+
+    #[test]
+    fn collected_round_trips_as_camel_case_when_present() {
+        // F-E hardening: the Python `mini_coder_result` co-writer stamps
+        // `collected: true` on a directive once its terminal outcome has been
+        // successfully handed back — the Rust struct must round-trip it
+        // verbatim (this is the CO-WRITER hazard: an unknown field silently
+        // dropped by a Rust re-serialize would erase the Python stamp).
+        let mut d = directive("d-collected", MiniCoderStatus::Done, "2026-07-03T00:00:00Z");
+        d.collected = Some(true);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"collected\":true"), "json: {json}");
+        let back: MiniCoderDirective = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.collected, Some(true));
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn python_shaped_directive_with_collected_key_round_trips_without_dropping_it() {
+        // CO-WRITER WARNING guard: deserialize a directive shaped exactly like the
+        // Python `.aspis-agents.json` writer emits it (camelCase, `collected` present)
+        // and confirm a Rust round-trip preserves the key rather than silently
+        // dropping it (the exact hazard `deny_unknown_fields`-free structs create
+        // when a NEW co-writer field has no matching Rust field).
+        let raw = serde_json::json!({
+            "id": "d-py",
+            "parentAgentId": "codex",
+            "status": "done",
+            "task": "x",
+            "files": ["src/a.rs"],
+            "resultPath": "mini/d-py.json",
+            "createdAt": "2026-07-03T00:00:00Z",
+            "collected": true,
+        });
+        let d: MiniCoderDirective = serde_json::from_str(&raw.to_string()).unwrap();
+        assert_eq!(d.collected, Some(true));
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.contains("\"collected\":true"),
+            "the stamp must survive a Rust round-trip: {json}"
+        );
     }
 
     #[test]

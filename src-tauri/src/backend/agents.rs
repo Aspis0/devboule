@@ -914,7 +914,11 @@ struct ParsedRoleRules {
 fn parsed_role_rules() -> &'static ParsedRoleRules {
     static PARSED: OnceLock<ParsedRoleRules> = OnceLock::new();
     PARSED.get_or_init(|| {
-        let raw: RawRoleRulesFile = serde_json::from_str(ROLE_RULES_JSON).unwrap_or_else(|e| {
+        // Strip a leading UTF-8 BOM before parsing: a Windows editor saving the
+        // SSoT with a BOM would otherwise panic here AND kill the Python server
+        // at import (its twin guard is read_text(encoding="utf-8-sig")).
+        let json = ROLE_RULES_JSON.trim_start_matches('\u{feff}');
+        let raw: RawRoleRulesFile = serde_json::from_str(json).unwrap_or_else(|e| {
             panic!(
                 "oracle/server/role_rules.json (role-rules SSoT) failed to parse: {e}. \
                  This file is compiled into the binary via include_str!, so a malformed \

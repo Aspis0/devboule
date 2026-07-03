@@ -36,14 +36,11 @@ use crate::planner::truncate_chars;
 /// The section headers, IN ORDER, every `preplan.md` scaffold carries. A section name
 /// passed to [`Preplan::append`] that is not one of these is silently ignored (best-effort:
 /// this is an internal harness aid, never something a caller's typo should panic on).
-const SECTIONS: [&str; 6] = [
-    "Goal",
-    "Constraints",
-    "Findings",
-    "Decisions",
-    "Open questions",
-    "Draft outline",
-];
+///
+/// F-M hardening: `"Constraints"` and `"Open questions"` were REMOVED — no caller ever
+/// appended to either (dead prompt real estate the model's PRE-PLAN NOTES section paid
+/// for on every render, for nothing).
+const SECTIONS: [&str; 4] = ["Goal", "Findings", "Decisions", "Draft outline"];
 
 /// The planner's on-disk external memory, rooted at `<root>/.devboule/preplan.md`.
 pub struct Preplan {
@@ -294,8 +291,16 @@ mod tests {
         let p = Preplan::load_or_init(dir.path(), "build the thing");
         let body = std::fs::read_to_string(&p.path).unwrap();
         assert!(body.starts_with("## Goal\nbuild the thing\n"));
-        for section in ["## Constraints", "## Findings", "## Decisions", "## Open questions", "## Draft outline"] {
+        for section in ["## Findings", "## Decisions", "## Draft outline"] {
             assert!(body.contains(section), "scaffold missing {section}: {body}");
+        }
+        // F-M: the dead "Constraints"/"Open questions" sections are gone — nothing
+        // ever appended to them, so they were pure prompt real estate for nothing.
+        for section in ["## Constraints", "## Open questions"] {
+            assert!(
+                !body.contains(section),
+                "the dead {section} section must be removed: {body}"
+            );
         }
     }
 
@@ -338,7 +343,7 @@ mod tests {
         p.append("Decisions", "attempt 1 rejected: bad scope");
         let body = std::fs::read_to_string(&p.path).unwrap();
         let decisions_idx = body.find("## Decisions").unwrap();
-        let next_idx = body.find("## Open questions").unwrap();
+        let next_idx = body.find("## Draft outline").unwrap();
         assert!(body[decisions_idx..next_idx].contains("attempt 1 rejected: bad scope"));
         // It must NOT have leaked into a different section.
         let findings_idx = body.find("## Findings").unwrap();

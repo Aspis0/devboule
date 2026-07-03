@@ -53,6 +53,7 @@ from oracle.server.aspis_mcp import (
     dispatch_project_structure,
     dispatch_steer_mini_coder,
     dispatch_mini_coder_result,
+    dispatch_spawn_main_coder,
     dispatch_spawn_mini_coder,
     hash_session_token,
     now,
@@ -7035,6 +7036,43 @@ class SpawnMiniCoderTests(unittest.TestCase):
         self.assertIn("active", ids)
         self.assertNotIn("old", ids)
 
+    def test_cap_mini_coder_directives_prefers_evicting_collected_terminal_first(self):
+        # F-E hardening: a COLLECTED terminal directive is evicted before ANY
+        # uncollected one, even when the collected one is NEWER — the outcome
+        # was already successfully handed back, while the uncollected one's
+        # caller may still be about to poll for it.
+        directives = [
+            {"id": "uncollected-old", "status": "done", "createdAt": "2026-06-06T00:00:01Z"},
+            {
+                "id": "collected-newer",
+                "status": "done",
+                "createdAt": "2026-06-06T00:00:05Z",
+                "collected": True,
+            },
+            {"id": "active", "status": "running", "createdAt": "2026-06-06T00:00:02Z"},
+        ]
+        for i in range(MAX_MINI_CODER_DIRECTIVES - 2):
+            directives.append(
+                {"id": f"t{i}", "status": "failed", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+            )
+        self.assertEqual(len(directives), MAX_MINI_CODER_DIRECTIVES + 1, "test setup: exactly 1 over cap")
+        capped = cap_mini_coder_directives(directives)
+        self.assertEqual(len(capped), MAX_MINI_CODER_DIRECTIVES)
+        ids = {d["id"] for d in capped}
+        self.assertIn("active", ids, "active is never evicted")
+        self.assertNotIn(
+            "collected-newer",
+            ids,
+            "a COLLECTED terminal is evicted before any uncollected one, even though it is newer",
+        )
+        self.assertIn(
+            "uncollected-old",
+            ids,
+            "an uncollected terminal survives while a collected terminal exists to evict instead",
+        )
+        for i in range(MAX_MINI_CODER_DIRECTIVES - 2):
+            self.assertIn(f"t{i}", ids)
+
 
 class VisualCheckTests(unittest.TestCase):
     """The `visual_check` MCP tool: file-only bridge, bounded poll, camelCase shape."""
@@ -9180,6 +9218,66 @@ class SpawnMainCoderTests(unittest.TestCase):
             self.assertEqual(d["writeMode"], "agenticIterative")
             self.assertEqual(d["parentAgentId"], "orch")
 
+    def test_spawn_main_coder_does_not_require_the_callers_role_to_also_hold_spawn_mini_coder(self):
+        # F-F hardening (double-auth coupling): dispatch_spawn_main_coder used to
+        # reuse dispatch_spawn_mini_coder's OWN internal re-authentication, which
+        # ALSO required the caller's role to separately hold "spawn_mini_coder" —
+        # true today only because the orchestrator role happens to hold BOTH
+        # grants. Strip "spawn_mini_coder" from the orchestrator's allowed tools
+        # (keeping only "spawn_main_coder") and prove spawn_main_coder still
+        # succeeds end-to-end — the two grants must be independent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register(root, "orchestrator", "orch")
+            with patch.dict(ROLE_ALLOWED_TOOLS, {"orchestrator": {"spawn_main_coder"}}):
+                out = handle_tool_call(
+                    "spawn_main_coder",
+                    {
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                        "task": "implement the feature end-to-end",
+                        "files": ["src/a.rs"],
+                        "wait": False,
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertIn("directiveId", out)
+            self.assertEqual(out["status"], "running")
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["tier"], "main")
+            self.assertIs(d["write"], True)
+            self.assertEqual(d["parentAgentId"], "orch")
+
+    def test_spawn_mini_coder_preauthorized_skips_its_own_grant_check(self):
+        # Unit-level proof that `_preauthorized` bypasses the internal
+        # `spawn_mini_coder` re-derivation entirely: calling the dispatch
+        # function DIRECTLY (not through `handle_tool_call`/`spawn_main_coder`)
+        # with a role that has NEITHER grant must still succeed when preauthorized.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            self._register(root, "orchestrator", "orch")
+            projects_dir = root / "projects"
+            state_lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+            out = dispatch_spawn_mini_coder(
+                projects_dir,
+                state_lock,
+                {
+                    "agent_id": "orch",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "write": True,
+                    "write_mode": "agenticIterative",
+                },
+                tier="main",
+                _preauthorized=("orch", "some-role-with-neither-grant"),
+            )
+            self.assertIn("directiveId", out)
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["parentAgentId"], "orch")
+            self.assertEqual(d["tier"], "main")
+
     def test_spawn_main_coder_rejected_for_coder_verifier_and_unregistered(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
@@ -9384,6 +9482,71 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             self.assertEqual(out2["directiveId"], did)
             self.assertEqual(out2["result"], done)
             self.assertNotIn("status", out2)
+
+    def test_result_wait_false_stamps_collected_once_terminal_is_handed_back(self):
+        # F-E hardening: once `mini_coder_result` successfully hands back a
+        # TERMINAL outcome, the underlying directive is persisted with
+        # `collected: true` — the signal `cap_mini_coder_directives` uses to
+        # prefer evicting it over a directive whose outcome was never picked up.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            from oracle.server.aspis_mcp import (
+                AGENTS_STATE_FILE,
+                file_lock,
+                read_agents_state,
+                write_agents_state,
+            )
+
+            projects_dir = root / "projects"
+            lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+            done = {"status": "done", "output": "wrote it"}
+            with file_lock(lock):
+                state = read_agents_state(projects_dir)
+                d = next(x for x in state["miniCoderDirectives"] if x["id"] == did)
+                d["status"] = "done"
+                d["result"] = done
+                write_agents_state(projects_dir, state)
+
+            pre = next(
+                x for x in self._read_state(root)["miniCoderDirectives"] if x["id"] == did
+            )
+            self.assertNotIn("collected", pre, "not yet collected before the read")
+
+            out = handle_tool_call(
+                "mini_coder_result",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": did,
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            self.assertEqual(out["result"], done)
+
+            post = next(
+                x for x in self._read_state(root)["miniCoderDirectives"] if x["id"] == did
+            )
+            self.assertIs(
+                post.get("collected"),
+                True,
+                "the directive must be stamped collected after a successful hand-back",
+            )
 
     def test_result_wait_false_unknown_directive_is_not_found(self):
         with tempfile.TemporaryDirectory() as tmp:

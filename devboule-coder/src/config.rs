@@ -379,9 +379,18 @@ fn backend_offline_note(reason: &str) -> String {
 
 /// Mask secret-looking substrings and bound the length of an error reason bound
 /// for the persisted/relayable chat bridge. A "secret-looking" run is ≥24
-/// consecutive `[A-Za-z0-9_-]` chars containing at least one digit — long
-/// enough to spare ordinary words/paths (path SEGMENTS are split by `/`, which
-/// breaks the run) while catching hex hashes, bearer keys and launch tokens.
+/// consecutive `[A-Za-z0-9_+=-]` chars containing at least one digit — long
+/// enough to spare ordinary words/paths while catching hex hashes, bearer keys
+/// and launch tokens.
+///
+/// F-J hardening: `+` and `=` are part of the run charset (standard base64's own
+/// alphabet uses `+`/`/` plus `=` padding) — treating them as separators let a
+/// base64-shaped token split into pieces each individually under the 24-char
+/// threshold, leaking the whole token through unmasked. `/` deliberately stays a
+/// SEPARATOR (NOT added here): it is base64's other alphabet char, but it is also
+/// the path separator, and keeping paths readable in this operator-facing message
+/// is judged worth the (documented) tradeoff of a base64 token that happens to use
+/// `/` splitting across the boundary instead of masking as one run.
 /// Pure + total for unit tests.
 fn sanitize_offline_reason(reason: &str) -> String {
     const MAX_REASON_CHARS: usize = 400;
@@ -396,7 +405,7 @@ fn sanitize_offline_reason(reason: &str) -> String {
         run.clear();
     };
     for c in reason.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '=' {
             run.push(c);
         } else {
             flush(&mut run, &mut out);
@@ -751,6 +760,39 @@ mod tests {
         let capped = sanitize_offline_reason(&huge);
         assert!(capped.chars().count() <= 401);
         assert!(capped.ends_with('…'));
+    }
+
+    /// F-J: `+`/`=` must be part of a secret-looking run, not separators — a
+    /// standard base64 token split at its OWN `+`/`=` chars into pieces each
+    /// individually under the 24-char mask threshold must still be caught (and
+    /// masked) as ONE run.
+    #[test]
+    fn sanitize_offline_reason_treats_plus_and_equals_as_part_of_a_secret_run() {
+        let part_a = "a1".repeat(8); // 16 chars — alone, under the 24-char threshold
+        let part_b = "b2".repeat(8); // 16 chars — alone, under the 24-char threshold
+        let token = format!("{part_a}+{part_b}=="); // 35 chars joined, standard base64 shape
+        let reason = format!("auth failed: token {token} rejected");
+        let cleaned = sanitize_offline_reason(&reason);
+        assert!(
+            cleaned.contains("[redacted]"),
+            "the whole +/= joined token must be masked as one run: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains(&part_a) && !cleaned.contains(&part_b),
+            "neither half of the token may leak through unmasked: {cleaned}"
+        );
+    }
+
+    /// F-J: `/` stays a separator — a normal file path must remain readable
+    /// (the documented tradeoff over masking `/`-joined base64).
+    #[test]
+    fn sanitize_offline_reason_keeps_slash_as_a_separator_for_path_readability() {
+        let path = "/Users/user/Projects/aspis-management-workspace-root/repo";
+        assert_eq!(
+            sanitize_offline_reason(path),
+            path,
+            "a normal path must stay readable"
+        );
     }
 
     /// F3: the note lands on the SAME activity bridge the executor would use —

@@ -296,7 +296,11 @@ _MCP_INDEX_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 # (English only, 4 roles). Edit the JSON, not this module — it is loaded
 # verbatim at import time, no hand-synced literal, no silent fallback.
 _ROLE_RULES_PATH = Path(__file__).resolve().parent / "role_rules.json"
-ROLE_RULES = json.loads(_ROLE_RULES_PATH.read_text(encoding="utf-8"))["roles"]
+# utf-8-sig: identical to utf-8 for a clean file, but strips a leading BOM if a
+# Windows editor ever saves one — json.loads on a BOM-prefixed string would
+# otherwise take the whole MCP server down at import (this file is the SSoT and
+# explicitly invites hand-edits).
+ROLE_RULES = json.loads(_ROLE_RULES_PATH.read_text(encoding="utf-8-sig"))["roles"]
 
 ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_RULES}
 
@@ -2156,7 +2160,20 @@ def cap_mini_coder_directives(directives: list[Any]) -> list[dict[str, Any]]:
     id tie-break); ACTIVE/pending directives are NEVER dropped even past the cap (a
     pending request or a running mini must not be lost). Non-dict entries (hand
     edit / partial write) are filtered out so a stray value cannot brick the read.
-    Original order is otherwise preserved."""
+    Original order is otherwise preserved.
+
+    F-E hardening: within the TERMINAL pool, eviction prefers COLLECTED directives
+    (`collected: true`, stamped by `mini_coder_result` once it has successfully
+    handed a terminal outcome back to its caller) FIRST, oldest-first; an
+    UNCOLLECTED terminal directive — whose outcome a caller may still be about to
+    poll for via the async `spawn_mini_coder(wait=false)` + `mini_coder_result`
+    pattern — is only evicted if the cap is STILL exceeded after every collected
+    directive is gone. A directive with no `collected` key (every directive before
+    this hardening, and every directive collected via the ORIGINAL blocking
+    `spawn_mini_coder`/`mini_coder_result` path, which returns the result inline
+    and never stamps this) is treated as uncollected, so the ordering degrades to
+    the prior oldest-first-only behavior when nothing is stamped.
+    """
     clean = [d for d in directives if isinstance(d, dict)]
     if len(clean) <= MAX_MINI_CODER_DIRECTIVES:
         return clean
@@ -2168,11 +2185,20 @@ def cap_mini_coder_directives(directives: list[Any]) -> list[dict[str, Any]]:
     ]
     if drop_count <= 0 or not terminal:
         return clean
-    terminal_sorted_oldest = sorted(
-        terminal,
-        key=lambda d: (str(d.get("createdAt") or ""), str(d.get("id") or "")),
+
+    def sort_key(d: dict[str, Any]) -> tuple[str, str]:
+        return (str(d.get("createdAt") or ""), str(d.get("id") or ""))
+
+    collected_terminal_oldest = sorted(
+        (d for d in terminal if d.get("collected") is True), key=sort_key
     )
-    to_drop = {id(d) for d in terminal_sorted_oldest[:drop_count]}
+    uncollected_terminal_oldest = sorted(
+        (d for d in terminal if d.get("collected") is not True), key=sort_key
+    )
+    # Collected-first (oldest-first within it), THEN uncollected (oldest-first
+    # within it) only if the cap is still exceeded.
+    eviction_order = collected_terminal_oldest + uncollected_terminal_oldest
+    to_drop = {id(d) for d in eviction_order[:drop_count]}
     return [d for d in clean if id(d) not in to_drop]
 
 
@@ -5916,7 +5942,7 @@ def dispatch_spawn_main_coder(
     the sandboxed multi-turn engine — and FAILS the directive (never a silent
     one-shot downgrade) if it cannot."""
     # Authn/authz against THIS tool's grant first — only the orchestrator holds it.
-    _agent_id, role = require_agent_tool(projects_dir, args, "spawn_main_coder")
+    agent_id, role = require_agent_tool(projects_dir, args, "spawn_main_coder")
     if "spawn_main_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
         raise McpError(f"{role} agents cannot use spawn_main_coder.")
     # CO-WRITER PARITY (main_coder.rs validate_main_coder_request): the Main tier
@@ -5930,7 +5956,21 @@ def dispatch_spawn_main_coder(
     forced = dict(args)
     forced["write"] = True
     forced["write_mode"] = "agenticIterative"
-    return dispatch_spawn_mini_coder(projects_dir, state_lock, forced, tier="main")
+    # F-F hardening (double-auth coupling): pass our ALREADY-VALIDATED identity
+    # through so the shared dispatch below does NOT re-derive it against its OWN
+    # "spawn_mini_coder" grant. Before this, that internal re-derivation made a
+    # successful spawn_main_coder call SECRETLY DEPEND on the caller's role ALSO
+    # holding "spawn_mini_coder" — true only because today's sole
+    # "spawn_main_coder" holder (orchestrator) happens to hold both; a future role
+    # with spawn_main_coder but not spawn_mini_coder would otherwise fail here for
+    # no policy reason.
+    return dispatch_spawn_mini_coder(
+        projects_dir,
+        state_lock,
+        forced,
+        tier="main",
+        _preauthorized=(agent_id, role),
+    )
 
 
 def dispatch_spawn_mini_coder(
@@ -5938,6 +5978,7 @@ def dispatch_spawn_mini_coder(
     state_lock: Path,
     args: dict[str, Any],
     tier: str = "mini",
+    _preauthorized: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Coder-only: delegate a cheap sub-task to a one-shot mini-coder the APP hosts.
 
@@ -5964,11 +6005,26 @@ def dispatch_spawn_mini_coder(
     directive's `parentAgentId`, and it must be a LIVE (active) session — a coder
     that already closed cannot spawn a mini that would outlive its only
     human-contact point.
+
+    `_preauthorized` (F-F hardening): when set, `(agent_id, role)` from an ALREADY
+    -validated caller — used ONLY by `dispatch_spawn_main_coder`, which reuses this
+    function as an implementation detail after authenticating against its OWN
+    "spawn_main_coder" grant. Skips re-deriving identity/role via
+    `require_agent_tool` (and the "spawn_mini_coder"-specific allowlist check)
+    here, so a spawn_main_coder call never depends on the caller's role ALSO
+    separately holding "spawn_mini_coder" — the two grants stay independent.
     """
-    # 1) Authn/authz the CALLER (registered coder + valid session token).
-    agent_id, role = require_agent_tool(projects_dir, args, "spawn_mini_coder")
-    if "spawn_mini_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
-        raise McpError(f"{role} agents cannot use spawn_mini_coder.")
+    # 1) Authn/authz the CALLER (registered coder + valid session token) — UNLESS
+    #    an already-authenticated identity was handed to us (see `_preauthorized`
+    #    above), in which case re-deriving it here would wrongly re-impose the
+    #    "spawn_mini_coder" grant on a caller who was authorized under a DIFFERENT
+    #    (but equally valid) grant.
+    if _preauthorized is not None:
+        agent_id, role = _preauthorized
+    else:
+        agent_id, role = require_agent_tool(projects_dir, args, "spawn_mini_coder")
+        if "spawn_mini_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+            raise McpError(f"{role} agents cannot use spawn_mini_coder.")
 
     # 2) Validate the task + files (the directive payload the executor + mini act on).
     task = clean_text(args.get("task"), "Mini-coder task", MINI_CODER_MAX_TASK_LEN)
@@ -6182,6 +6238,31 @@ def dispatch_spawn_mini_coder(
     return _await_mini_directive(projects_dir, state_lock, directive_id, deadline)
 
 
+def _stamp_mini_directive_collected(
+    projects_dir: Path, state_lock: Path, directive_id: str
+) -> None:
+    """F-E hardening: best-effort mark `directive_id`'s directive `collected: true`
+    once `mini_coder_result` has successfully handed its TERMINAL outcome back to
+    the caller. `cap_mini_coder_directives` evicts COLLECTED terminal directives
+    before UNCOLLECTED ones (oldest-first within each group) — a directive whose
+    outcome was never picked up (the caller may still be about to poll for it via
+    the async pattern) survives longer than one already delivered.
+
+    Best-effort, mirroring the other `try/except McpError: pass` stamps in this
+    module: a failed stamp must never change `mini_coder_result`'s contract — the
+    caller already has the result by the time this is called."""
+    try:
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            for directive in state.get("miniCoderDirectives", []):
+                if isinstance(directive, dict) and str(directive.get("id") or "") == directive_id:
+                    directive["collected"] = True
+                    break
+            write_agents_state(projects_dir, state)
+    except McpError:
+        pass
+
+
 def dispatch_mini_coder_result(
     projects_dir: Path,
     state_lock: Path,
@@ -6233,18 +6314,26 @@ def dispatch_mini_coder_result(
     if wait:
         if _res is not None:
             # Already terminal — return immediately without entering the bounded poll.
+            # F-E: stamp collected — this outcome is now successfully handed back.
+            _stamp_mini_directive_collected(projects_dir, state_lock, directive_id)
             return {"directiveId": directive_id, "result": _res}
         deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
-        return _await_mini_directive(
+        outcome = _await_mini_directive(
             projects_dir,
             state_lock,
             directive_id,
             deadline,
             caller_tool="mini_coder_result",
         )
+        # F-E: the poll always returns a TERMINAL {directiveId, result} shape (real
+        # or synthesized) — stamp collected now that it has been handed back.
+        _stamp_mini_directive_collected(projects_dir, state_lock, directive_id)
+        return outcome
 
     # wait=false: single-read result (we already have _res from the not-found/owner check).
     if _res is not None:
+        # F-E: stamp collected — this outcome is now successfully handed back.
+        _stamp_mini_directive_collected(projects_dir, state_lock, directive_id)
         return {"directiveId": directive_id, "result": _res}
     return {"directiveId": directive_id, "status": "running"}
 
