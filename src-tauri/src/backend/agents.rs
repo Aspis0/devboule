@@ -1312,7 +1312,19 @@ fn normalize_management_root_candidate(candidate: &Path) -> Option<PathBuf> {
     let mut path = candidate.to_path_buf();
     if path.file_name().and_then(|value| value.to_str()) == Some("src-tauri") {
         if let Some(parent) = path.parent() {
-            path = parent.to_path_buf();
+            // LOCK-STEP with `validate_management_root` in oracle/server/aspis_mcp.py:
+            // hop to the parent ONLY when it actually carries the oracle package; a
+            // self-contained directory that merely happens to be named `src-tauri`
+            // otherwise validates on its own merits (the unconditional hop made the
+            // two implementations disagree on that layout — reviewer finding).
+            if parent
+                .join("oracle")
+                .join("server")
+                .join("aspis_mcp.py")
+                .is_file()
+            {
+                path = parent.to_path_buf();
+            }
         }
     }
     if is_valid_management_root(&path) {
@@ -1322,7 +1334,15 @@ fn normalize_management_root_candidate(candidate: &Path) -> Option<PathBuf> {
 }
 
 fn is_valid_management_root(path: &Path) -> bool {
-    path.join("config.json").is_file()
+    // SPLIT LAYOUT (F1, mute-orchestrator fix): the dev app runs with
+    // cwd = src-tauri and writes `config.json` THERE, so the repo root may
+    // carry only `src-tauri/config.json`. Accept either location — requiring
+    // the root copy made every candidate invalid the moment the root copy
+    // disappeared, and the silent `projects_dir.parent()` fallback then pointed
+    // the MCP children at a directory with no `oracle` package.
+    let has_config = path.join("config.json").is_file()
+        || path.join("src-tauri").join("config.json").is_file();
+    has_config
         && path
             .join("oracle")
             .join("server")
@@ -2128,7 +2148,7 @@ fn apply_agent_session_close(
         .find(|session| session.agent_id == agent_id)
     {
         session.status = "closed".into();
-        session.message = Some("Stopped from Aspis Management".into());
+        session.message = Some("Stopped from Devboule".into());
         session.last_seen_at = Some(timestamp.to_string());
         // Persist host="app" ONLY when the caller says this close is app-hosted
         // (the PTY teardown paths pass Some("app")). For an EXTERNAL stop the caller
@@ -2153,7 +2173,7 @@ fn apply_agent_session_close(
             project_id,
             task_id,
             status: Some("closed".into()),
-            message: "Stopped from Aspis Management".into(),
+            message: "Stopped from Devboule".into(),
             evidence: None,
         });
     }
@@ -2284,6 +2304,68 @@ mod tests {
             Some(root.clone())
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// F1 (mute-orchestrator fix): the dev app (cwd = src-tauri) writes
+    /// `config.json` under `src-tauri/`, not the repo root. A root that has the
+    /// oracle package but ONLY `src-tauri/config.json` must still validate —
+    /// before this, NO directory validated, `management_root_for_mcp` silently
+    /// fell back to `projects_dir.parent()` (= src-tauri), and every MCP child
+    /// died on `import oracle` → the whole fleet lost registration.
+    #[test]
+    fn management_root_accepts_split_layout_config_under_src_tauri() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-management-split-root-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        // No config.json anywhere yet ⇒ still invalid.
+        assert!(normalize_management_root_candidate(&root).is_none());
+        // config.json ONLY under src-tauri/ ⇒ valid (split layout).
+        fs::create_dir_all(root.join("src-tauri")).unwrap();
+        fs::write(root.join("src-tauri").join("config.json"), "{}").unwrap();
+        assert_eq!(
+            normalize_management_root_candidate(&root),
+            Some(root.clone())
+        );
+        // And the src-tauri candidate itself still normalizes to the repo root.
+        assert_eq!(
+            normalize_management_root_candidate(&root.join("src-tauri")),
+            Some(root.clone())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Rust/Python parity (reviewer finding): a SELF-CONTAINED directory named
+    /// `src-tauri` (its own config.json + its own oracle package, parent has
+    /// neither) must validate as itself — Python's `validate_management_root`
+    /// already accepts it, and the unconditional parent-hop made Rust reject it.
+    #[test]
+    fn management_root_accepts_self_contained_src_tauri_dir() {
+        let parent = std::env::temp_dir().join(format!(
+            "aspis-management-selfcontained-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        let root = parent.join("src-tauri");
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        assert_eq!(
+            normalize_management_root_candidate(&root),
+            Some(root.clone())
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[test]

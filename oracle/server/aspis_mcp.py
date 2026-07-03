@@ -1374,14 +1374,27 @@ def normalize_provider_name(value: str) -> str:
 
 def validate_management_root(candidate: Path) -> Path:
     root = candidate.expanduser().resolve()
-    if root.name == "src-tauri" and root.parent.joinpath("config.json").exists():
+    # A `src-tauri` candidate (the dev app's cwd) normalizes to the repo root
+    # whenever the parent actually carries the oracle package — the parent IS
+    # the management root regardless of where config.json sits (see below).
+    if root.name == "src-tauri" and root.parent.joinpath(
+        "oracle", "server", "aspis_mcp.py"
+    ).is_file():
         root = root.parent.resolve()
-    if (
-        not root.joinpath("config.json").is_file()
-        or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file()
-    ):
+    # SPLIT LAYOUT (F1, mute-orchestrator fix 2026-07-02): the dev app writes
+    # `config.json` under `src-tauri/`, not the repo root. Accept either
+    # location — requiring the root copy made every candidate invalid the
+    # moment the root copy disappeared, so every spawned MCP child was pointed
+    # at a root with no `oracle` package and died on import (mute fleet).
+    # Mirrors `is_valid_management_root` in src-tauri/src/backend/agents.rs —
+    # keep the two in lock-step.
+    has_config = (
+        root.joinpath("config.json").is_file()
+        or root.joinpath("src-tauri", "config.json").is_file()
+    )
+    if not has_config or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file():
         raise McpError(
-            "Aspis MCP management root is invalid. Run from Aspis Management, pass --root, or set ASPIS_MANAGEMENT_ROOT."
+            "Devboule MCP management root is invalid. Run from Devboule, pass --root, or set ASPIS_MANAGEMENT_ROOT."
         )
     root.joinpath("projects").mkdir(parents=True, exist_ok=True)
     return root
@@ -1748,7 +1761,7 @@ def validate_launch_token_for_registration(
     if session is None:
         if not unmanaged_privileged_agents_allowed():
             raise McpError(
-                "Agent registration requires an app-issued launch token from Aspis Management."
+                "Agent registration requires an app-issued launch token from Devboule."
             )
         return None
     # MINOR 2 (defense-in-depth): use the NON-raising `coerce_role` on the STORED
@@ -1777,14 +1790,14 @@ def validate_launch_token_for_registration(
             or datetime.now(timezone.utc) - issued_at > LAUNCH_TOKEN_WINDOW
         ):
             raise McpError(
-                "Agent launch token expired. Relaunch the agent from Aspis Management."
+                "Agent launch token expired. Relaunch the agent from Devboule."
             )
         if not hmac.compare_digest(hash_launch_token(token), expected_hash):
             raise McpError("Agent launch token is invalid for this agent id and role.")
         return session
     if str(session.get("status") or "").strip().lower() == "launch_pending":
         raise McpError(
-            "Pending agent session is missing a launch token. Relaunch the agent from Aspis Management."
+            "Pending agent session is missing a launch token. Relaunch the agent from Devboule."
         )
     # SEC#7: a session whose launch token was already CONSUMED cannot be
     # re-registered tokenless — the one-shot launch credential is spent. (A
@@ -1792,7 +1805,7 @@ def validate_launch_token_for_registration(
     # no launchConsumedAt and is unaffected.)
     if str(session.get("launchConsumedAt") or "").strip():
         raise McpError(
-            "Agent launch credential already consumed; relaunch the agent from Aspis Management to register again."
+            "Agent launch credential already consumed; relaunch the agent from Devboule to register again."
         )
     return session
 
@@ -2736,7 +2749,7 @@ def require_session_token(session: dict[str, Any], session_token: str | None) ->
         ):
             return
         raise McpError(
-            "Agent session is missing a session token. Relaunch the agent from Aspis Management."
+            "Agent session is missing a session token. Relaunch the agent from Devboule."
         )
     token = str(session_token or "").strip()
     if not token:
@@ -2749,7 +2762,7 @@ def require_session_token(session: dict[str, Any], session_token: str | None) ->
         or datetime.now(timezone.utc) - issued_at > SESSION_TOKEN_WINDOW
     ):
         raise McpError(
-            "Agent session token expired. Relaunch the agent from Aspis Management."
+            "Agent session token expired. Relaunch the agent from Devboule."
         )
     if not hmac.compare_digest(hash_session_token(token), expected_hash):
         raise McpError("Agent session token is invalid for this agent id and role.")
@@ -3302,7 +3315,10 @@ def read_macos_keychain_password(service: str, account: str) -> str | None:
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True,
             text=True,
-            timeout=5,
+            # LATENCY: a headless/stdio child with no keychain session hangs to
+            # this timeout (a real hit answers in tens of ms) — keep it short;
+            # the TTL cache above makes even this cost once-per-window.
+            timeout=2,
         )
     except Exception:
         return None
@@ -3320,19 +3336,41 @@ def app_vault_secret(key: str) -> str | None:
     return app_vault_account_secret(account)
 
 
+# LATENCY (2026-07-02 profiling): the vault lookup shells out to `security`
+# (macOS), which HANGS to its subprocess timeout when the stdio agent child has
+# no keychain session — measured 5.0s burned on EVERY oracle_ask, key present or
+# not. Cache the result (INCLUDING a miss) per account with a TTL so the hang is
+# paid at most once per window. TTL deliberately SHORT (max-recall finding):
+# there is no cross-process invalidation from the app's vault writer, so this
+# bound is also how long a ROTATED key keeps being served / a just-added key
+# keeps reading as missing in a live agent session. 30s caps that skew while
+# still amortizing bursts; a proper mtime/sentinel invalidation hook is the
+# follow-up if 30s ever hurts.
+_APP_VAULT_CACHE: dict[str, tuple[float, str | None]] = {}
+_APP_VAULT_TTL_SECONDS = 30.0
+
+
+def _reset_app_vault_cache() -> None:
+    """Test/seam helper: clear the app-vault TTL cache."""
+    _APP_VAULT_CACHE.clear()
+
+
 def app_vault_account_secret(account: str) -> str | None:
     if os.environ.get("ASPIS_MCP_DISABLE_APP_VAULT") == "1":
         return None
+    cached = _APP_VAULT_CACHE.get(account)
+    if cached is not None and time.monotonic() - cached[0] < _APP_VAULT_TTL_SECONDS:
+        return cached[1]
     try:
         if sys.platform == "darwin":
             value = read_macos_keychain_password(APP_VAULT_SERVICE, account)
         else:
             value = read_windows_credential_password(app_vault_target(account))
     except Exception:
-        return None
-    if value and value.strip():
-        return value.strip()
-    return None
+        value = None
+    result = value.strip() if value and value.strip() else None
+    _APP_VAULT_CACHE[account] = (time.monotonic(), result)
+    return result
 
 
 def secret_from_app_vault_or_env(vault_key: str, *env_names: str) -> str | None:
@@ -4192,7 +4230,63 @@ def _resolve_oracle_http_target_uncached(projects_dir: Path) -> tuple[str, str] 
     if not _is_loopback_http_base(base):
         logger.warning("Oracle discovery baseUrl is not loopback; ignoring.")
         return None
+    # LATENCY (2026-07-02 profiling): a STALE discovery file (server crashed /
+    # app rebuilt) pointed the thin-client at a dead-or-hung target and each
+    # call burned the full HTTP timeout (measured 20.1s) before falling back to
+    # the in-process engine. When the supervisor recorded its pid, gate on its
+    # liveness — a dead pid means the target is gone, skip it immediately.
+    # A missing/garbage pid field keeps the pre-fix behavior (try the target).
+    # `bool` is an `int` subclass — a corrupt `"pid": true` must not probe pid 1.
+    pid = data.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and not _pid_alive(pid):
+        logger.info("Oracle discovery pid %s is not alive; using in-process engine.", pid)
+        return None
     return base, token
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort process-liveness probe (POSIX signal-0 / Windows OpenProcess).
+
+    True when the pid exists (even if owned by another user/integrity level —
+    access-denied still proves liveness on BOTH platforms); False for
+    exited/garbage pids. NEVER raises: a corrupt discovery file (oversized int →
+    OverflowError from os.kill/ctypes, or any other surprise) must degrade to
+    "dead" (skip the HTTP target, use the in-process engine), not crash every
+    oracle_ask until the file is fixed (max-recall finding, reproduced live).
+    """
+    try:
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                # NULL means EITHER "no such process" or "access denied" — the
+                # latter proves the pid is alive (mirrors the POSIX
+                # PermissionError branch; max-recall parity finding).
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+    except Exception as exc:
+        # Diagnosability (adversarial-verify finding): the never-raise contract
+        # must not make a REAL bug here invisible — a silent False would just
+        # look like "server dead" and quietly force the in-process fallback
+        # forever. Debug-level: expected garbage (oversized pid) is normal.
+        logger.debug("pid liveness probe failed for %r: %s", pid, exc)
+        return False
 
 
 class HttpOracleEngine:
@@ -4208,7 +4302,28 @@ class HttpOracleEngine:
     PRIVACY: this client never logs the auth token or absolute paths.
     """
 
-    def __init__(self, base_url: str, auth_token: str, timeout: float = 20.0):
+    def __init__(self, base_url: str, auth_token: str, timeout: float | None = None):
+        # LATENCY: 8s read-bound default (was a flat 20.0) — the resident
+        # bounded endpoints answer in ~1s warm; anything slower is most likely a
+        # hung server and the in-process fallback exists. Max-recall caveat: a
+        # COLD large-corpus read has historically crossed 5s (lance_store.py
+        # readiness-probe note), so the bound is env-overridable rather than
+        # hard-coded — set ASPIS_ORACLE_HTTP_TIMEOUT_SECS on big repos if the
+        # 8s ceiling ever double-works (timeout + in-process redo). Connect is
+        # capped separately at 1s in `_post` (loopback-only contract).
+        if timeout is None:
+            try:
+                timeout = float(
+                    os.environ.get("ASPIS_ORACLE_HTTP_TIMEOUT_SECS") or 8.0
+                )
+            except (TypeError, ValueError):
+                timeout = 8.0
+            # Clamp to a FINITE positive range (adversarial-verify finding):
+            # "inf"/"nan"/negatives parse fine and would silently defeat the
+            # cap this fix exists to enforce. 120s is already absurd for a
+            # loopback bounded endpoint; beyond that, fix the server instead.
+            if not (0.0 < timeout <= 120.0):  # NaN fails every comparison → clamped
+                timeout = 8.0
         self._base_url = base_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = timeout
@@ -4231,8 +4346,17 @@ class HttpOracleEngine:
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         httpx = import_httpx()
         status_error = getattr(httpx, "HTTPStatusError", None)
+        # LATENCY (2026-07-02 profiling): a hung-but-listening target used to
+        # burn the full flat timeout (measured 20.1s) before the in-process
+        # fallback kicked in. The server is LOOPBACK by contract, so connecting
+        # is sub-millisecond when alive — cap connect at 1s and keep
+        # `self._timeout` as the read/write/pool bound for real work.
+        timeout = self._timeout
+        timeout_type = getattr(httpx, "Timeout", None)
+        if timeout_type is not None:
+            timeout = timeout_type(self._timeout, connect=1.0)
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=timeout) as client:
                 response = client.post(
                     self._base_url + path, headers=self._headers(), json=payload
                 )

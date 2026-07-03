@@ -41,7 +41,10 @@ def write_discovery_file(projects_dir: Path, base_url: str, token: str) -> Path:
         "baseUrl": base_url,
         "authToken": token,
         "indexRoot": str(projects_dir.parent),
-        "pid": 1234,
+        # A LIVE pid: the resolver liveness-gates the discovery target (dead
+        # pid ⇒ skip), and these tests assert parsing/validation, not liveness
+        # — the pid-gate cases live in test_oracle_fastpath.py.
+        "pid": os.getpid(),
         "updatedAt": "2026-06-01T00:00:00Z",
     }
     path = projects_dir / ".oracle-server.json"

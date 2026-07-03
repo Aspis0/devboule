@@ -81,16 +81,40 @@ fn resolve_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Str
         if cwd_path.exists() {
             return Ok(cwd_path);
         }
-        // Nothing found anywhere: bootstrap a minimal default at the CWD so a fresh
-        // checkout (config.json is per-machine and untracked) gets a working app with
-        // zero manual setup. NEVER create in the resource dir (read-only in a packaged
-        // build); CWD only. If the CWD is not writable, fall through to the original
-        // not-found error so callers still fail cleanly.
-        if let Ok(path) = bootstrap_default_config(&cwd) {
+        // Nothing found anywhere: bootstrap a minimal default so a fresh checkout
+        // (config.json is per-machine and untracked) gets a working app with zero
+        // manual setup. Bootstrap at the MANAGEMENT ROOT when the parent carries the
+        // oracle package — writing at the bare CWD (src-tauri in dev) is what created
+        // the 2026-07-02 split-layout incident: the readers required
+        // `<root>/config.json`, this writer produced `src-tauri/config.json`, and no
+        // directory validated as a management root any more (mute agent fleet). NEVER
+        // create in the resource dir (read-only in a packaged build). If the chosen
+        // dir is not writable, fall through to the original not-found error so
+        // callers still fail cleanly.
+        if let Ok(path) = bootstrap_default_config(&bootstrap_config_dir(&cwd)) {
             return Ok(path);
         }
     }
     Err("config.json not found in resource dir, parent of CWD, or CWD".into())
+}
+
+/// Where to bootstrap a missing `config.json`: the PARENT of `cwd` when it is
+/// recognizably the management root (it carries the oracle MCP entrypoint),
+/// else `cwd` itself (standalone/unusual layouts keep the old behavior). Pure
+/// (filesystem-read only) so it is unit-testable. Keep the marker in lock-step
+/// with `is_valid_management_root` in backend/agents.rs and
+/// `validate_management_root` in oracle/server/aspis_mcp.py.
+fn bootstrap_config_dir(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.parent()
+        .filter(|parent| {
+            parent
+                .join("oracle")
+                .join("server")
+                .join("aspis_mcp.py")
+                .is_file()
+        })
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Create a minimal default `config.json` (`{}`) in `dir` and return its path.
@@ -180,6 +204,27 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Write-side fix for the 2026-07-02 split-layout incident: from the dev cwd
+    /// (`<root>/src-tauri`) a missing config must be bootstrapped at the
+    /// MANAGEMENT ROOT (the parent carrying the oracle package), not at the cwd.
+    #[test]
+    fn bootstrap_config_dir_prefers_the_management_root_parent() {
+        let root = bootstrap_tmp_dir("root-choice");
+        let src_tauri = root.join("src-tauri");
+        fs::create_dir_all(&src_tauri).unwrap();
+        // Parent without the oracle marker ⇒ old behavior (cwd itself).
+        assert_eq!(bootstrap_config_dir(&src_tauri), src_tauri);
+        // Parent WITH the oracle marker ⇒ bootstrap at the root.
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        assert_eq!(bootstrap_config_dir(&src_tauri), root);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -236,6 +236,9 @@ async fn connect_mcp() -> (
              DEVBOULE_MCP_PROJECTS_DIR not set); oracle/spawn tools will return \
              STUB results — the local coder is NOT connected"
         );
+        emit_backend_offline_chat(
+            "the MCP connection details are missing (DEVBOULE_MCP_ROOT / DEVBOULE_MCP_PROJECTS_DIR not set)",
+        );
         return (None, Vec::new());
     };
 
@@ -268,6 +271,7 @@ async fn connect_mcp() -> (
                 "devboule: MCP backend disabled ({e}); oracle/spawn tools will \
                  return STUB results — the local coder is NOT connected"
             );
+            emit_backend_offline_chat(&format!("the MCP connection failed ({e})"));
             return (None, Vec::new());
         }
     };
@@ -313,6 +317,7 @@ async fn build_executor(
         Ok(fs) => fs,
         Err(e) => {
             eprintln!("devboule: FS backend disabled ({e}); using StubExecutor");
+            emit_backend_offline_chat(&format!("the project filesystem backend failed ({e})"));
             return (Arc::new(StubExecutor), false);
         }
     };
@@ -350,6 +355,72 @@ async fn build_executor(
         .with_orchestrator(is_orchestrator);
     let allow_egress = executor.egress_enabled();
     (Arc::new(executor), allow_egress)
+}
+
+/// F3 (anti-mute): the ONE chat line surfaced in the planner chat when the
+/// binary degrades to the Stub executor. Before this, a failed MCP connect was
+/// reported ONLY on stderr (the in-app PTY scrollback, never persisted), so the
+/// orchestrator looked alive but was completely mute — no echo, no replies, no
+/// reason. Pure so it is unit-testable.
+///
+/// REDACTION BOUNDARY (max-recall finding): unlike stderr, this string lands on
+/// a PERSISTED bridge file that the planner chat renders and a cloud duplex
+/// session may relay off-machine. Today's `{e}` sources are all static,
+/// secret-free messages (verified), but the boundary must not rely on every
+/// future error path remembering that — so the reason is sanitized here: long
+/// token-shaped runs are masked and the whole reason is capped.
+fn backend_offline_note(reason: &str) -> String {
+    let reason = sanitize_offline_reason(reason);
+    format!(
+        "⚠ Local coder backend is OFFLINE — {reason}. Chat replies and tools are \
+         disabled for this session; fix the backend and relaunch me."
+    )
+}
+
+/// Mask secret-looking substrings and bound the length of an error reason bound
+/// for the persisted/relayable chat bridge. A "secret-looking" run is ≥24
+/// consecutive `[A-Za-z0-9_-]` chars containing at least one digit — long
+/// enough to spare ordinary words/paths (path SEGMENTS are split by `/`, which
+/// breaks the run) while catching hex hashes, bearer keys and launch tokens.
+/// Pure + total for unit tests.
+fn sanitize_offline_reason(reason: &str) -> String {
+    const MAX_REASON_CHARS: usize = 400;
+    let mut out = String::with_capacity(reason.len().min(MAX_REASON_CHARS + 16));
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= 24 && run.chars().any(|c| c.is_ascii_digit()) {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in reason.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    if out.chars().count() > MAX_REASON_CHARS {
+        let truncated: String = out.chars().take(MAX_REASON_CHARS).collect();
+        return format!("{truncated}…");
+    }
+    out
+}
+
+/// Emit the offline note to the activity bridge, if one is configured. Uses the
+/// SAME `DEVBOULE_ACTIVITY_FILE` bridge the executor would have used, so the
+/// note lands in the planner chat exactly where the missing conversation would
+/// have been. Best-effort by design (the bridge is pure observability); when no
+/// bridge is configured this is a no-op and stderr remains the only signal.
+fn emit_backend_offline_chat(reason: &str) {
+    let activity = crate::activity::Activity::from_env();
+    if activity.is_enabled() {
+        activity.chat("assistant", &backend_offline_note(reason));
+    }
 }
 
 /// Max user MCP servers the local coder will wire (design defensive bound). The
@@ -644,5 +715,57 @@ mod tests {
             Some(v) => std::env::set_var(ENV_CLOUD_MODEL, v),
             None => std::env::remove_var(ENV_CLOUD_MODEL),
         }
+    }
+
+    /// F3 (anti-mute): the offline note must carry the concrete reason and read
+    /// as a recoverable state (relaunch), never a silent stub degradation.
+    #[test]
+    fn backend_offline_note_carries_reason_and_action() {
+        let note = backend_offline_note("the MCP connection failed (handshake timed out)");
+        assert!(note.contains("OFFLINE"));
+        assert!(note.contains("handshake timed out"));
+        assert!(note.contains("relaunch"));
+    }
+
+    /// Max-recall: the note is a persisted/relayable surface — token-shaped runs
+    /// must be masked and the reason bounded, while ordinary error prose (words,
+    /// path segments, short hex) passes through untouched.
+    #[test]
+    fn sanitize_offline_reason_masks_tokens_and_caps_length() {
+        // A 64-char hex hash (a launch-token hash shape) is masked.
+        let with_hash = format!(
+            "server rejected token {}",
+            "6508af2980e367c44dcb78462e623281c707dfd5cdb1d8f6671a1e96d98f155b"
+        );
+        let cleaned = sanitize_offline_reason(&with_hash);
+        assert!(cleaned.contains("[redacted]"));
+        assert!(!cleaned.contains("6508af29"));
+        // Ordinary prose + a path survive verbatim (segments split the runs).
+        let prose = "MCP initialize handshake failed: /Users/user/Projects/repo not found";
+        assert_eq!(sanitize_offline_reason(prose), prose);
+        // Long digit-free words survive (no false positives on prose).
+        let word = "extraordinarily-long-hyphenated-description";
+        assert_eq!(sanitize_offline_reason(word), word);
+        // Unbounded input is capped with a truncation marker.
+        let huge = "x ".repeat(600);
+        let capped = sanitize_offline_reason(&huge);
+        assert!(capped.chars().count() <= 401);
+        assert!(capped.ends_with('…'));
+    }
+
+    /// F3: the note lands on the SAME activity bridge the executor would use —
+    /// exercised via an explicit temp path (the env-reading wrapper is a thin
+    /// `Activity::from_env()` over this same `chat` call).
+    #[test]
+    fn backend_offline_note_reaches_the_bridge_file() {
+        let dir = std::env::temp_dir().join(format!("devboule-offline-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("act.jsonl");
+        let activity = crate::activity::Activity::with_path(&file);
+        activity.chat("assistant", &backend_offline_note("test reason"));
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(written.contains("\"kind\":\"chat\""));
+        assert!(written.contains("test reason"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -526,6 +526,32 @@ fn oracle_child_spawn() -> &'static Mutex<Option<Instant>> {
     ORACLE_CHILD_SPAWN.get_or_init(|| Mutex::new(None))
 }
 
+/// The OS pid of the currently-tracked resident Python child, if one is alive in
+/// the registry. Max-recall finding (2026-07-02): the discovery file used to
+/// publish `std::process::id()` — the APP's own pid — which made the MCP
+/// children's pid-liveness gate watch the wrong process (a hung/crashed Python
+/// server under a live app was never detected). This accessor exposes the REAL
+/// server pid so `publish_discovery` can record it.
+pub(crate) fn oracle_child_pid() -> Option<u32> {
+    oracle_child()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|child| child.id())
+}
+
+/// Test seam: swap the tracked resident child, returning the previous one so
+/// the test can restore it. Lets `discovery_pid()` (oracle_service.rs) assert
+/// the published pid is the CHILD's, guarding against a regression back to
+/// `std::process::id()` (the bug the accessor above exists to fix).
+#[cfg(test)]
+pub(crate) fn swap_oracle_child_for_test(child: Option<Child>) -> Option<Child> {
+    std::mem::replace(
+        &mut *oracle_child().lock().unwrap_or_else(|e| e.into_inner()),
+        child,
+    )
+}
+
 /// The monotonic age of the currently-tracked resident child, if a spawn stamp is
 /// recorded. `None` when no child is tracked (no stamp) — a missing stamp is treated
 /// by the caller as "do not force-kill" (we cannot prove it is hung).
