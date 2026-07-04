@@ -9,7 +9,17 @@ interface PlannerChatProps {
   modelLabel: string;
   live: boolean;
   awaitingReply: boolean;
+  /** D4 (planner-chat demolition): composer CHROME for delivery failures, launch
+   *  guidance and the 90s silence watchdog — rendered as an amber strip ABOVE the
+   *  composer, never spliced into the transcript as a fake assistant message.
+   *  While set it also supersedes the "thinking…" pill (the strip explains why
+   *  there is no reply; a spinning pill next to it would contradict it). */
+  banner?: string | null;
   onSend: (text: string) => void;
+  /** Esc while the orchestrator works: interrupt the IN-FLIGHT turn (the agent
+   *  and its context stay alive). Absent = no interrupt surface (e.g. no live
+   *  cloud orchestrator bound). */
+  onInterrupt?: () => void;
 }
 
 export function PlannerChat({
@@ -17,7 +27,9 @@ export function PlannerChat({
   modelLabel,
   live,
   awaitingReply,
+  banner,
   onSend,
+  onInterrupt,
 }: PlannerChatProps) {
   const [value, setValue] = useState("");
 
@@ -32,6 +44,10 @@ export function PlannerChat({
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
+    }
+    if (e.key === "Escape" && onInterrupt && live) {
+      e.preventDefault();
+      onInterrupt();
     }
   };
 
@@ -87,7 +103,30 @@ export function PlannerChat({
         </span>
       </div>
 
-      <ChatThread messages={messages} live={live} awaitingReply={awaitingReply} />
+      <ChatThread messages={messages} live={live && !banner} awaitingReply={awaitingReply} />
+
+      {/* D4 BANNER: delivery/stall/launch feedback as chrome above the composer. */}
+      {banner ? (
+        <div
+          data-testid="planner-banner"
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 7,
+            padding: "8px 13px",
+            borderTop: "1px solid #EED9B7",
+            background: "#FBF3E2",
+            color: "#8A6B33",
+            fontSize: 12,
+            lineHeight: 1.45,
+          }}
+        >
+          <span aria-hidden style={{ flex: "none", marginTop: 1 }}>
+            ⚠︎
+          </span>
+          <span>{banner}</span>
+        </div>
+      ) : null}
 
       {/* COMPOSER */}
       <div

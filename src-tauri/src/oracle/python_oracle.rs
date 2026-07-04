@@ -644,6 +644,32 @@ fn oracle_child_spawn() -> &'static Mutex<Option<Instant>> {
     ORACLE_CHILD_SPAWN.get_or_init(|| Mutex::new(None))
 }
 
+/// The OS pid of the currently-tracked resident Python child, if one is alive in
+/// the registry. Max-recall finding (2026-07-02): the discovery file used to
+/// publish `std::process::id()` — the APP's own pid — which made the MCP
+/// children's pid-liveness gate watch the wrong process (a hung/crashed Python
+/// server under a live app was never detected). This accessor exposes the REAL
+/// server pid so `publish_discovery` can record it.
+pub(crate) fn oracle_child_pid() -> Option<u32> {
+    oracle_child()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|child| child.id())
+}
+
+/// Test seam: swap the tracked resident child, returning the previous one so
+/// the test can restore it. Lets `discovery_pid()` (oracle_service.rs) assert
+/// the published pid is the CHILD's, guarding against a regression back to
+/// `std::process::id()` (the bug the accessor above exists to fix).
+#[cfg(test)]
+pub(crate) fn swap_oracle_child_for_test(child: Option<Child>) -> Option<Child> {
+    std::mem::replace(
+        &mut *oracle_child().lock().unwrap_or_else(|e| e.into_inner()),
+        child,
+    )
+}
+
 /// The monotonic age of the currently-tracked resident child, if a spawn stamp is
 /// recorded. `None` when no child is tracked (no stamp) — a missing stamp is treated
 /// by the caller as "do not force-kill" (we cannot prove it is hung).
@@ -1610,6 +1636,12 @@ fn build_oracle_server_command_with_package_root(
         // a dead port). The supervisor restarts it if it dies. The Python config
         // reads this exact key (oracle/config.py: ORACLE_DISABLE_IDLE_EXIT).
         .env(ORACLE_DISABLE_IDLE_EXIT_ENV, "1")
+        // Parent-death watchdog (orphan-server fix): the server self-exits when
+        // this app pid is gone. Covers every teardown `on_app_exit` cannot reach —
+        // SIGKILL, crash, `tauri dev` rebuild — on macOS AND Windows. The Python
+        // side (oracle/server/main.py: _start_parent_watchdog) is a no-op when
+        // this env var is absent, so CLI/test runs are unaffected.
+        .env("ORACLE_PARENT_PID", std::process::id().to_string())
         .env("PYTHONPATH", &package_root);
     // A4 (live wiring) — authoritative embed-device override: force the resident embedder to CPU when
     // the coordinator reports GPU pressure (a local decode active / low free memory) at spawn time, so
@@ -2913,6 +2945,20 @@ mod tests {
             command.get_current_dir(),
             Some(root.as_path()),
             "server cwd must be the index/workspace root"
+        );
+
+        // (d) ORACLE_PARENT_PID == this app's pid, so the server's parent-death
+        // watchdog can self-exit when the app dies without a clean shutdown
+        // (SIGKILL / crash / dev rebuild) — the orphan-server fix.
+        let parent_pid = command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("ORACLE_PARENT_PID"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_owned());
+        assert_eq!(
+            parent_pid.as_deref(),
+            Some(std::ffi::OsString::from(std::process::id().to_string()).as_os_str()),
+            "ORACLE_PARENT_PID must be the supervising app's pid"
         );
     }
 

@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -52,6 +53,7 @@ from oracle.server.aspis_mcp import (
     dispatch_project_structure,
     dispatch_steer_mini_coder,
     dispatch_mini_coder_result,
+    dispatch_spawn_main_coder,
     dispatch_spawn_mini_coder,
     hash_session_token,
     now,
@@ -2855,6 +2857,26 @@ root_path: "{escaped_work_root}"
                 return tool
         self.fail(f"tool {name!r} is not registered on the FastMCP server")
 
+    def test_spawn_main_coder_is_registered_on_the_live_server(self):
+        # ROLE UNTANGLE Phase 3 gap: spawn_main_coder had a TOOLS entry, a
+        # dispatch function and handle_tool_call routing, but NO @server.tool()
+        # wrapper — FastMCP is the only protocol surface, so no real MCP client
+        # (cloud CLI or devboule binary) could ever call it: the orchestrator's
+        # whole main-coder delegation mandate was dead on the live path.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prepare_management_root(root)
+            server = create_mcp_server(root=root)
+            tool = self._registered_tool(server, "spawn_main_coder")
+
+            params = inspect.signature(tool.fn).parameters
+            for name in ("agent_id", "role", "task", "files", "wait"):
+                self.assertIn(name, params)
+            # write/write_mode are FORCED server-side for the main tier — the
+            # wrapper must NOT advertise them as caller choices.
+            self.assertNotIn("write", params)
+            self.assertNotIn("write_mode", params)
+
     def test_agent_heartbeat_wrapper_advertises_subagents(self):
         # Regression for a whole CLASS of bug: a handler supports a parameter
         # (here `subagents`) but the FastMCP @server.tool() wrapper omits it, so
@@ -3685,6 +3707,51 @@ class OrchestratorRoleTests(unittest.TestCase):
                 ROLE_ALLOWED_TOOLS[role],
                 f"{role} must not hold spawn_main_coder",
             )
+
+    def test_spawn_main_coder_caps_files_at_the_rust_twin_limit(self):
+        # CO-WRITER PARITY (main_coder.rs validate_main_coder_request caps files
+        # at 10): until the 2026-07 wrapper fix the MCP path was unreachable, so
+        # the Python side silently allowed MINI_CODER_MAX_FILES=64 for the main
+        # tier. Now that the path is live it must enforce the same 10.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "management"
+            projects = Path(tmp) / "shared-projects"
+            root.mkdir()
+            prepare_management_root(root)
+            projects.mkdir()
+            sample_project(projects)
+
+            registered = handle_tool_call(
+                "agent_register",
+                {
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "model": "cheap",
+                    "message": "planning",
+                },
+                root=root,
+                projects_dir=projects,
+            )
+            token = ""
+            if isinstance(registered, dict):
+                token = registered.get("session_token") or registered.get(
+                    "sessionToken", ""
+                )
+
+            with self.assertRaises(McpError) as ctx:
+                handle_tool_call(
+                    "spawn_main_coder",
+                    {
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                        "task": "do a substantial thing",
+                        "files": [f"src/file_{i}.rs" for i in range(11)],
+                        "session_token": token,
+                    },
+                    root=root,
+                    projects_dir=projects,
+                )
+            self.assertIn("at most 10", str(ctx.exception))
 
     def test_orchestrator_has_no_write_or_censor_tool_but_full_provider_surface(self):
         # It delegates ALL file writes to spawn_mini_coder and never adjudicates
@@ -4753,137 +4820,61 @@ class CoderReopenFromReviewTests(unittest.TestCase):
 
 
 class AllowedToolsCrossLanguageMirrorTests(unittest.TestCase):
-    """WARNING 5: the Python ROLE_RULES allowedTools per role MUST equal the Rust
-    default_role_rules() allowed_tools per role. Parses agents.rs and compares both
-    directions cannot drift (Rust has a twin verbatim test)."""
+    """role_rules.json is now the single source of truth for allowedTools,
+    consumed directly by Python (this module's ROLE_RULES) and, once rewired
+    by the Rust-side change, by src-tauri/src/backend/agents.rs too — both
+    read the SAME file, so the old "parse agents.rs and diff against Python"
+    drift guard is structurally impossible to trip and has been removed. What
+    remains worth guarding here, on the Python/JSON side alone, is that each
+    role's allowlist is well-formed: non-empty and distinct per role."""
 
-    def _parse_rust_allowed_tools(self) -> dict[str, list[str]]:
-        agents_rs = (
-            Path(__file__).resolve().parents[2]
-            / "src-tauri"
-            / "src"
-            / "backend"
-            / "agents.rs"
-        )
-        text = agents_rs.read_text(encoding="utf-8")
-        # Scope to default_role_rules() so unrelated allowed_tools (e.g. in tests)
-        # are not picked up.
-        start = text.index("fn default_role_rules()")
-        end = text.index("\nfn ", start)
-        body = text[start:end]
-        result: dict[str, list[str]] = {}
-        import re
-
-        # Each rule block: role: "<role>".into(), ... allowed_tools: vec![ "a", ... ]
-        for match in re.finditer(
-            r'role:\s*"(?P<role>[a-z]+)"\.into\(\),.*?allowed_tools:\s*vec!\[(?P<tools>.*?)\]',
-            body,
-            re.DOTALL,
-        ):
-            tools = re.findall(r'"([^"]+)"', match.group("tools"))
-            result[match.group("role")] = tools
-        return result
-
-    # ROLE UNTANGLE (2026-07): the parity check now covers ALL FOUR roles —
-    # coder, orchestrator, verifier, mini. The former PYTHON_ONLY_ROLES carve-out
-    # (orchestrator excluded because agents.rs had no mirror row) is gone: the Rust
-    # `default_role_rules()` carries the orchestrator fleet-UI row too, and this
-    # test is the anti-drift gate keeping both sides' allowlists identical.
-
-    def test_allowed_tools_match_rust_default_role_rules(self):
-        rust = self._parse_rust_allowed_tools()
-        self.assertTrue(rust, "failed to parse allowed_tools from agents.rs")
-        python = {rule["role"]: list(rule["allowedTools"]) for rule in ROLE_RULES}
-        self.assertEqual(set(python), set(rust))
-        for role in python:
-            self.assertEqual(
-                python[role],
-                rust[role],
-                f"allowed_tools for role {role} drifted between Python and Rust",
+    def test_allowed_tools_are_nonempty_and_unique_per_role(self):
+        by_role = {rule["role"]: list(rule["allowedTools"]) for rule in ROLE_RULES}
+        self.assertEqual(set(by_role), {"coder", "orchestrator", "verifier", "mini"})
+        for role, tools in by_role.items():
+            self.assertTrue(tools, f"{role} allowedTools must be non-empty")
+        # No two roles share the exact same allowlist (would indicate a
+        # copy-paste role that lost its distinct tool surface).
+        seen: dict[tuple[str, ...], str] = {}
+        for role, tools in by_role.items():
+            key = tuple(sorted(tools))
+            self.assertNotIn(
+                key,
+                seen,
+                f"{role} and {seen.get(key)} have identical allowedTools sets",
             )
+            seen[key] = role
 
 
 class PushMandateCrossLanguageMirrorTests(unittest.TestCase):
-    """GH-P5 (FIX F5): the cooperative push mandate is intentionally bilingual —
-    English in the Rust default_role_rules coder.push, Italian in the Python
-    ROLE_RULES coder.push — so byte-for-byte parity is impossible. This guards the
-    SEMANTIC contract instead: BOTH sides' coder push mandate must contain
-    (a) the literal tool name `request_git_push`, (b) a "never raw push" prohibition,
-    and (c) a "stop + escalate" instruction. If either side later drops the tool name
-    or the gate instruction, this fails. Mirrors the agents.rs source-parsing approach
-    the allowed_tools parity test already uses."""
+    """GH-P5 (FIX F5): the cooperative push mandate. Both sides now load the
+    SAME role_rules.json SSoT verbatim — Rust via `include_str!` +
+    `parsed_role_rules()` (src-tauri/src/backend/agents.rs), Python via
+    `json.loads` here (this module's ROLE_RULES) — so the historic
+    Italian-vs-English bilingual split, and the old "parse the Rust source
+    text" approach, are both gone: there is no separate Rust literal left to
+    parse. This guards the SEMANTIC contract on the one shared source: the
+    coder's push mandate must contain (a) the literal tool name
+    `request_git_push`, (b) a "never raw push" prohibition, and (c) a
+    "stop + escalate" instruction. If it ever drops the tool name or the gate
+    instruction, this fails — and since both languages read this exact file,
+    neither side can drift from the other."""
 
-    def _parse_rust_coder_push(self) -> list[str]:
-        agents_rs = (
-            Path(__file__).resolve().parents[2]
-            / "src-tauri"
-            / "src"
-            / "backend"
-            / "agents.rs"
-        )
-        text = agents_rs.read_text(encoding="utf-8")
-        import re
-
-        # Scope to the coder rule's `push: vec![ ... ]` inside default_role_rules().
-        start = text.index("fn default_role_rules()")
-        # The coder rule comes first; its push block is the first `push: vec![` after
-        # the coder role declaration.
-        coder_at = text.index('role: "coder".into()', start)
-        push_at = text.index("push: vec![", coder_at)
-        end = text.index("]", push_at)
-        block = text[push_at:end]
-        return re.findall(r'"((?:[^"\\]|\\.)*)"', block)
-
-    def test_rust_coder_push_carries_gate_contract(self):
-        lines = self._parse_rust_coder_push()
-        self.assertTrue(lines, "failed to parse coder.push from agents.rs")
-        blob = " ".join(lines)
+    def test_coder_push_carries_gate_contract(self):
+        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
+        self.assertIn("push", coder, "coder must declare a push mandate")
+        blob = " ".join(coder["push"])
         # (a) the tool name, (b) never-raw-push, (c) stop + escalate.
-        self.assertIn("request_git_push", blob, "Rust coder.push must name request_git_push")
+        self.assertIn("request_git_push", blob, "coder.push must name request_git_push")
         self.assertIn(
             "NEVER run a raw `git push`",
             blob,
-            "Rust coder.push must forbid a raw git push",
+            "coder.push must forbid a raw git push",
         )
-        self.assertIn("STOP", blob, "Rust coder.push must instruct to STOP")
+        self.assertIn("STOP", blob, "coder.push must instruct to STOP")
         self.assertIn(
-            "needs_user", blob, "Rust coder.push must instruct to escalate via needs_user"
+            "needs_user", blob, "coder.push must instruct to escalate via needs_user"
         )
-
-    def test_python_coder_push_carries_gate_contract(self):
-        coder = next(r for r in ROLE_RULES if r["role"] == "coder")
-        self.assertIn("push", coder, "Python coder must declare a push mandate")
-        blob = " ".join(coder["push"])
-        # (a) the tool name, (b) never-raw-push (Italian), (c) stop + escalate (Italian).
-        self.assertIn("request_git_push", blob, "Python coder.push must name request_git_push")
-        self.assertIn(
-            "NON fare mai un `git push` grezzo",
-            blob,
-            "Python coder.push must forbid a raw git push",
-        )
-        self.assertIn("FERMATI", blob, "Python coder.push must instruct to STOP (FERMATI)")
-        self.assertIn(
-            "needs_user",
-            blob,
-            "Python coder.push must instruct to escalate via needs_user",
-        )
-
-    def test_both_sides_share_the_semantic_push_contract(self):
-        # Both languages, parsed independently, must each carry all three semantic
-        # elements — so neither side can silently drop the gate.
-        rust_blob = " ".join(self._parse_rust_coder_push())
-        py_coder = next(r for r in ROLE_RULES if r["role"] == "coder")
-        py_blob = " ".join(py_coder["push"])
-        for blob, lang in ((rust_blob, "Rust"), (py_blob, "Python")):
-            self.assertIn("request_git_push", blob, f"{lang} push mandate lost the tool name")
-        # never-raw-push prohibition: English vs Italian phrasing.
-        self.assertIn("NEVER run a raw `git push`", rust_blob)
-        self.assertIn("NON fare mai un `git push` grezzo", py_blob)
-        # stop + escalate: English vs Italian phrasing, both via needs_user.
-        self.assertIn("STOP", rust_blob)
-        self.assertIn("FERMATI", py_blob)
-        self.assertIn("needs_user", rust_blob)
-        self.assertIn("needs_user", py_blob)
 
 
 class AgentModelAndSubagentsTests(unittest.TestCase):
@@ -6079,11 +6070,11 @@ class CensorRoleMandateTests(unittest.TestCase):
         # task to review; the verifier keeps the final verdict (censorReview).
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         blob = " ".join(coder["forbidden"])
-        self.assertIn("subagente Sonnet", blob)
+        self.assertIn("Sonnet review subagent", blob)
         self.assertIn("ready for final reviewer", blob)
         self.assertIn("censorReview", blob)
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
-        self.assertNotIn("subagente Sonnet", " ".join(verifier["forbidden"]))
+        self.assertNotIn("Sonnet review subagent", " ".join(verifier["forbidden"]))
 
     def test_coder_mandate_is_per_step(self):
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
@@ -6097,7 +6088,7 @@ class CensorRoleMandateTests(unittest.TestCase):
         blob = " ".join(verifier["censor"]).lower()
         self.assertIn("censor_findings", blob)
         self.assertIn("censor_dispose", blob)
-        self.assertIn("residuo", blob)
+        self.assertIn("residual", blob)
 
 
 class SpawnMiniCoderTests(unittest.TestCase):
@@ -6329,7 +6320,7 @@ class SpawnMiniCoderTests(unittest.TestCase):
         self.assertIn("write_mode", desc, "tool description must name the param")
         self.assertIn("agenticIterative", desc, "must mention the agentic mode")
         self.assertIn("emitEdits", desc, "must mention the default mode")
-        self.assertIn("copertura", desc, "must mention the gate-coverage gating")
+        self.assertIn("coverage", desc, "must mention the gate-coverage gating")
         # The param schema (A2) still carries its own description + the canonical
         # enum/default, and the rule of thumb is restated there.
         param = tool["parameters"]["write_mode"]
@@ -6975,7 +6966,7 @@ class SpawnMiniCoderTests(unittest.TestCase):
         blob = " ".join(coder["forbidden"])
         self.assertIn("escalated", blob)
         # No blind re-spawn for the same file — the coder fixes it itself.
-        self.assertIn("rifai il file", blob)
+        self.assertIn("REDO that file yourself", blob)
         # The verifier (no spawn_mini_coder) must NOT carry it.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("escalated", " ".join(verifier["forbidden"]))
@@ -6986,8 +6977,8 @@ class SpawnMiniCoderTests(unittest.TestCase):
         # mirroring the Rust default_role_rules coder.forbidden routing line.
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         blob = " ".join(coder["forbidden"])
-        self.assertIn("Delega a spawn_mini_coder solo sub-task economici e meccanici", blob)
-        self.assertIn("RIVEDI l'output del mini come bozza", blob)
+        self.assertIn("Delegate only cheap, mechanical sub-tasks to spawn_mini_coder", blob)
+        self.assertIn("REVIEW the mini's output as a draft", blob)
         # The verifier (no spawn_mini_coder) must NOT carry any routing rule.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("spawn_mini_coder", " ".join(verifier["forbidden"]))
@@ -6995,21 +6986,22 @@ class SpawnMiniCoderTests(unittest.TestCase):
     def test_coder_role_rules_carry_cooperative_push_mandate(self):
         # GH-P5: the coder's `push` mandate must carry the cooperative push contract
         # (commit freely, NEVER raw git push, publish via request_git_push, STOP +
-        # needs_user on deny/timeout), mirrored — bilingual — in the Rust
-        # default_role_rules coder.push (coder_rule_carries_cooperative_push_mandate).
+        # needs_user on deny/timeout), mirrored in the Rust default_role_rules
+        # coder.push (coder_rule_carries_cooperative_push_mandate) — both now source
+        # the same English text from role_rules.json.
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         self.assertIn("push", coder, "coder must declare a push mandate")
         blob = " ".join(coder["push"])
         # Commit-freely line.
-        self.assertIn("Committa liberamente", blob)
+        self.assertIn("Commit freely", blob)
         # Never-raw-push line that names the request_git_push tool.
-        self.assertIn("NON fare mai un `git push` grezzo", blob)
+        self.assertIn("NEVER run a raw `git push`", blob)
         self.assertIn("request_git_push", blob)
         # Deny/timeout -> STOP + escalate via needs_user, no retry/workaround.
-        self.assertIn("negata o va in timeout", blob)
-        self.assertIn("FERMATI", blob)
+        self.assertIn("denied or times out", blob)
+        self.assertIn("STOP", blob)
         self.assertIn("needs_user", blob)
-        self.assertIn("NON riprovare", blob)
+        self.assertIn("Do NOT retry", blob)
         # The verifier (no request_git_push) must NOT carry any push mandate.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
         self.assertNotIn("push", verifier, "verifier must have NO push mandate")
@@ -7051,6 +7043,43 @@ class SpawnMiniCoderTests(unittest.TestCase):
         # The running directive is NEVER evicted; the oldest terminal ("old") is.
         self.assertIn("active", ids)
         self.assertNotIn("old", ids)
+
+    def test_cap_mini_coder_directives_prefers_evicting_collected_terminal_first(self):
+        # F-E hardening: a COLLECTED terminal directive is evicted before ANY
+        # uncollected one, even when the collected one is NEWER — the outcome
+        # was already successfully handed back, while the uncollected one's
+        # caller may still be about to poll for it.
+        directives = [
+            {"id": "uncollected-old", "status": "done", "createdAt": "2026-06-06T00:00:01Z"},
+            {
+                "id": "collected-newer",
+                "status": "done",
+                "createdAt": "2026-06-06T00:00:05Z",
+                "collected": True,
+            },
+            {"id": "active", "status": "running", "createdAt": "2026-06-06T00:00:02Z"},
+        ]
+        for i in range(MAX_MINI_CODER_DIRECTIVES - 2):
+            directives.append(
+                {"id": f"t{i}", "status": "failed", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+            )
+        self.assertEqual(len(directives), MAX_MINI_CODER_DIRECTIVES + 1, "test setup: exactly 1 over cap")
+        capped = cap_mini_coder_directives(directives)
+        self.assertEqual(len(capped), MAX_MINI_CODER_DIRECTIVES)
+        ids = {d["id"] for d in capped}
+        self.assertIn("active", ids, "active is never evicted")
+        self.assertNotIn(
+            "collected-newer",
+            ids,
+            "a COLLECTED terminal is evicted before any uncollected one, even though it is newer",
+        )
+        self.assertIn(
+            "uncollected-old",
+            ids,
+            "an uncollected terminal survives while a collected terminal exists to evict instead",
+        )
+        for i in range(MAX_MINI_CODER_DIRECTIVES - 2):
+            self.assertIn(f"t{i}", ids)
 
 
 class VisualCheckTests(unittest.TestCase):
@@ -8483,8 +8512,8 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         blob = " ".join(coder.get("plan", []))
         self.assertIn("plan_submit", blob)
         self.assertIn("ask_user", blob)
-        # The mandate is in Italian by convention.
-        self.assertRegex(blob, r"\b(prima|approvazione|attendi|piano)\b")
+        # The mandate is English by convention (role_rules.json SSoT).
+        self.assertRegex(blob, r"\b(before|approval|wait|plan)\b", re.IGNORECASE)
 
     def test_cap_plan_approval_requests_evicts_oldest_terminal_keeps_pending(self):
         requests = [
@@ -9274,6 +9303,66 @@ class SpawnMainCoderTests(unittest.TestCase):
             self.assertEqual(d["writeMode"], "agenticIterative")
             self.assertEqual(d["parentAgentId"], "orch")
 
+    def test_spawn_main_coder_does_not_require_the_callers_role_to_also_hold_spawn_mini_coder(self):
+        # F-F hardening (double-auth coupling): dispatch_spawn_main_coder used to
+        # reuse dispatch_spawn_mini_coder's OWN internal re-authentication, which
+        # ALSO required the caller's role to separately hold "spawn_mini_coder" —
+        # true today only because the orchestrator role happens to hold BOTH
+        # grants. Strip "spawn_mini_coder" from the orchestrator's allowed tools
+        # (keeping only "spawn_main_coder") and prove spawn_main_coder still
+        # succeeds end-to-end — the two grants must be independent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register(root, "orchestrator", "orch")
+            with patch.dict(ROLE_ALLOWED_TOOLS, {"orchestrator": {"spawn_main_coder"}}):
+                out = handle_tool_call(
+                    "spawn_main_coder",
+                    {
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                        "task": "implement the feature end-to-end",
+                        "files": ["src/a.rs"],
+                        "wait": False,
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertIn("directiveId", out)
+            self.assertEqual(out["status"], "running")
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["tier"], "main")
+            self.assertIs(d["write"], True)
+            self.assertEqual(d["parentAgentId"], "orch")
+
+    def test_spawn_mini_coder_preauthorized_skips_its_own_grant_check(self):
+        # Unit-level proof that `_preauthorized` bypasses the internal
+        # `spawn_mini_coder` re-derivation entirely: calling the dispatch
+        # function DIRECTLY (not through `handle_tool_call`/`spawn_main_coder`)
+        # with a role that has NEITHER grant must still succeed when preauthorized.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            self._register(root, "orchestrator", "orch")
+            projects_dir = root / "projects"
+            state_lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+            out = dispatch_spawn_mini_coder(
+                projects_dir,
+                state_lock,
+                {
+                    "agent_id": "orch",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "write": True,
+                    "write_mode": "agenticIterative",
+                },
+                tier="main",
+                _preauthorized=("orch", "some-role-with-neither-grant"),
+            )
+            self.assertIn("directiveId", out)
+            d = self._read_state(root)["miniCoderDirectives"][0]
+            self.assertEqual(d["parentAgentId"], "orch")
+            self.assertEqual(d["tier"], "main")
+
     def test_spawn_main_coder_rejected_for_coder_verifier_and_unregistered(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
@@ -9478,6 +9567,71 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             self.assertEqual(out2["directiveId"], did)
             self.assertEqual(out2["result"], done)
             self.assertNotIn("status", out2)
+
+    def test_result_wait_false_stamps_collected_once_terminal_is_handed_back(self):
+        # F-E hardening: once `mini_coder_result` successfully hands back a
+        # TERMINAL outcome, the underlying directive is persisted with
+        # `collected: true` — the signal `cap_mini_coder_directives` uses to
+        # prefer evicting it over a directive whose outcome was never picked up.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            spawn = handle_tool_call(
+                "spawn_mini_coder",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            did = spawn["directiveId"]
+            from oracle.server.aspis_mcp import (
+                AGENTS_STATE_FILE,
+                file_lock,
+                read_agents_state,
+                write_agents_state,
+            )
+
+            projects_dir = root / "projects"
+            lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
+            done = {"status": "done", "output": "wrote it"}
+            with file_lock(lock):
+                state = read_agents_state(projects_dir)
+                d = next(x for x in state["miniCoderDirectives"] if x["id"] == did)
+                d["status"] = "done"
+                d["result"] = done
+                write_agents_state(projects_dir, state)
+
+            pre = next(
+                x for x in self._read_state(root)["miniCoderDirectives"] if x["id"] == did
+            )
+            self.assertNotIn("collected", pre, "not yet collected before the read")
+
+            out = handle_tool_call(
+                "mini_coder_result",
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": did,
+                    "wait": False,
+                    "session_token": token,
+                },
+                root=root,
+            )
+            self.assertEqual(out["result"], done)
+
+            post = next(
+                x for x in self._read_state(root)["miniCoderDirectives"] if x["id"] == did
+            )
+            self.assertIs(
+                post.get("collected"),
+                True,
+                "the directive must be stamped collected after a successful hand-back",
+            )
 
     def test_result_wait_false_unknown_directive_is_not_found(self):
         with tempfile.TemporaryDirectory() as tmp:

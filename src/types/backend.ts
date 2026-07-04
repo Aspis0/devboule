@@ -722,7 +722,9 @@ export interface OracleIndexStatus {
   };
 }
 
-export type ProjectStatus = "active" | "paused" | "done" | "archived";
+// "draft": planner-created, plan not yet approved — kept OFF the kanban board;
+// plan approval (backend) promotes it to "active".
+export type ProjectStatus = "draft" | "active" | "paused" | "done" | "archived";
 export type ProjectTaskStatus = "todo" | "wip" | "review" | "blocked" | "done";
 export type ProjectEditableTaskStatus = Exclude<ProjectTaskStatus, "done">;
 // ROLE UNTANGLE (2026-07): FOUR first-class roles — orchestrator (plans+delegates,
@@ -1222,12 +1224,12 @@ export interface ProjectNoteInput {
 }
 
 export interface AgentRoleRule {
-  // A role RULE is keyed by a SPAWN role: after the Phase B merge the backend only
-  // emits rules for {coder, verifier} (default_role_rules in agents.rs / ROLE_RULES
-  // in aspis_mcp.py). Typed as SpawnRole (not the wider AgentRole) so consumers can
-  // exhaustively switch. Old payloads never carried an "orchestrator" rule, so this
-  // does not break back-compat; the legacy "orchestrator" lives on sessions, not rules.
-  role: SpawnRole;
+  // A role RULE row from the role_rules.json SSoT: since the 2026-07 role
+  // untangle the backend emits FOUR rules — {coder, orchestrator, verifier,
+  // mini} (default_role_rules in agents.rs and ROLE_RULES in aspis_mcp.py both
+  // parse oracle/server/role_rules.json). NOT SpawnRole: the spawn radio stays
+  // narrower, but a consumer switching on rule.role must handle all four.
+  role: AgentRole | "mini";
   summary: string;
   allowedTools: string[];
   forbidden: string[];

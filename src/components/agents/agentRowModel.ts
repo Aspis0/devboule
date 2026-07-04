@@ -319,6 +319,10 @@ export interface SpawnLaunchInput {
   // → DEVBOULE_GOAL, so the orchestrator runs headless on it (plan-first) instead of waiting for TUI
   // input. Absent ⇒ the interactive launch, unchanged.
   initialGoal?: string;
+  // D3 (planner-chat demolition): the client-generated send id for the initial goal.
+  // The cloud-duplex launch echoes the goal into the bridge with this `msgId`, so the
+  // planner's optimistic goal copy drains by identity. Absent ⇒ id-less echo.
+  initialGoalMsgId?: string;
   // Orchestrator composer auto-create toggle. `false` ⇒ DEVBOULE_AUTO_CREATE=0 (the planner submits
   // the plan but doesn't create its tasks on approval). Absent/`true` ⇒ the default (create on approval).
   autoCreate?: boolean;

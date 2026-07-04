@@ -8,6 +8,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use tauri::{Manager, State};
@@ -518,6 +519,20 @@ fn default_agent_live_state() -> AgentLiveState {
     }
 }
 
+/// D1 (planner-chat demolition): whether an EXISTING session row under a launch's
+/// agent id blocks that launch. The ORCHESTRATOR's id is STABLE per project, so an
+/// existing row under it is never an id collision — it is the predecessor generation
+/// (closed history, a ghost, or a live process the launch fence stops right before
+/// spawn) and gets RESET to launch_pending instead (the still-live predecessor's
+/// session_token_hash is deliberately not cleared — its process keeps its token
+/// until the fence kills it). Every other role keeps the fresh-per-launch id, where
+/// a non-pending collision still means a real bug. (Max-recall BLOCKER: without this
+/// carve-out the stable id made EVERY orchestrator relaunch fail forever once the
+/// first session closed.)
+fn launch_id_collision(role: &str, existing_status: &str) -> bool {
+    role != "orchestrator" && existing_status != "launch_pending"
+}
+
 pub fn record_launch_pending(
     app: &tauri::AppHandle,
     project_id: &str,
@@ -552,7 +567,7 @@ pub fn record_launch_pending(
         .find(|session| session.agent_id == agent_id);
     match session {
         Some(session) => {
-            if session.status != "launch_pending" {
+            if launch_id_collision(role, &session.status) {
                 return Err(format!(
                     "Agent id {agent_id} is already registered or active; choose a new agent id."
                 ));
@@ -851,343 +866,104 @@ fn write_agent_live_state(path: &Path, state: &AgentLiveState) -> Result<(), Str
     replace_file_with_backup(&temp_path, path, &backup_path, "agent state file")
 }
 
-// ANTI-DRIFT: the `contract` strings below MUST stay verbatim-identical to the
-// `contract` lists in oracle/server/aspis_mcp.py ROLE_RULES (currently the same
-// three Italian mandate lines for every role). If you change one, change both —
-// agents read those via MCP, so they cannot drift.
-//
-// ROLE UNTANGLE (2026-07): FOUR first-class roles — coder ("Main coder": plans AND
-// codes), orchestrator (plans and DELEGATES, never writes), verifier, mini —
-// mirroring the Python ROLE_RULES exactly (VALID_ROLES/CODER_LIKE_ROLES in
-// aspis_mcp.py). This reverts the former "Phase B merge" that folded the
-// orchestrator into the coder; the fold survives only for the legacy
-// architect/code aliases (see backend/agent_role.rs, the ONE classification fold).
-//
-// INTENTIONAL BILINGUAL SPLIT (not drift): only `contract` is mirrored. The
-// `summary` and `forbidden` strings here are English ON PURPOSE because they feed
-// the fleet UI (house rule: English UI copy), whereas the Python copies are
-// Italian because agents read those. Same data, two audiences — do NOT "fix" the
-// language mismatch on summary/forbidden; it is deliberate.
+// SSoT (2026-07, role-untangle follow-up): agent role rules are authored ONCE
+// in oracle/server/role_rules.json (English-only, four roles in order: coder,
+// orchestrator, verifier, mini) and consumed identically by this Rust backend
+// (compiled in via `include_str!` below, parsed on first use) and the Python
+// MCP server (oracle/server/aspis_mcp.py, `json.load` at import). There is no
+// hand-synced Rust copy left to drift — edit the JSON, both sides update.
+// `launchPrompt` (the cloud-CLI bootstrap prose consumed by
+// `project_agent_prompt` in backend/projects.rs) is looked up separately via
+// `role_launch_prompt` below rather than added to `AgentRoleRule`, so the
+// `.aspis-agents.json` state-file shape (which serializes `rules`) is
+// unchanged by this refactor.
+const ROLE_RULES_JSON: &str = include_str!("../../../oracle/server/role_rules.json");
+
+#[derive(Debug, Deserialize)]
+struct RawRoleRulesFile {
+    roles: Vec<RawRoleRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRoleRule {
+    role: String,
+    summary: String,
+    #[serde(default)]
+    censor: Vec<String>,
+    #[serde(default)]
+    plan: Vec<String>,
+    #[serde(default)]
+    push: Vec<String>,
+    allowed_tools: Vec<String>,
+    forbidden: Vec<String>,
+    contract: Vec<String>,
+    #[serde(default)]
+    launch_prompt: Option<String>,
+}
+
+struct ParsedRoleRules {
+    rules: Vec<AgentRoleRule>,
+    launch_prompts: HashMap<String, String>,
+}
+
+/// Parses the SSoT JSON exactly once (it is `include_str!`-ed at compile
+/// time, so a malformed file is a build-tree defect, not a runtime one — but
+/// we still fail LOUDLY rather than silently degrade to empty role rules, in
+/// case a future refactor turns the include into a runtime read).
+fn parsed_role_rules() -> &'static ParsedRoleRules {
+    static PARSED: OnceLock<ParsedRoleRules> = OnceLock::new();
+    PARSED.get_or_init(|| {
+        // Strip a leading UTF-8 BOM before parsing: a Windows editor saving the
+        // SSoT with a BOM would otherwise panic here AND kill the Python server
+        // at import (its twin guard is read_text(encoding="utf-8-sig")).
+        let json = ROLE_RULES_JSON.trim_start_matches('\u{feff}');
+        let raw: RawRoleRulesFile = serde_json::from_str(json).unwrap_or_else(|e| {
+            panic!(
+                "oracle/server/role_rules.json (role-rules SSoT) failed to parse: {e}. \
+                 This file is compiled into the binary via include_str!, so a malformed \
+                 edit must fail the build/tests loudly — never silently fall back to \
+                 empty role rules."
+            )
+        });
+        let mut rules = Vec::with_capacity(raw.roles.len());
+        let mut launch_prompts = HashMap::new();
+        for r in raw.roles {
+            if let Some(prompt) = r.launch_prompt {
+                launch_prompts.insert(r.role.clone(), prompt);
+            }
+            rules.push(AgentRoleRule {
+                role: r.role,
+                summary: r.summary,
+                allowed_tools: r.allowed_tools,
+                forbidden: r.forbidden,
+                contract: r.contract,
+                censor: r.censor,
+                push: r.push,
+                plan: r.plan,
+            });
+        }
+        ParsedRoleRules {
+            rules,
+            launch_prompts,
+        }
+    })
+}
+
 fn default_role_rules() -> Vec<AgentRoleRule> {
-    // The three contract lines every role shares (model declaration, subagent
-    // reporting, needs_user signalling). Copied verbatim from the Python MCP.
-    let shared_contract = || -> Vec<String> {
-        vec![
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
-    };
-    vec![
-        AgentRoleRule {
-            // Phase B merge: the coder now PLANS and CODES. It absorbs the former
-            // orchestrator's planning/coordination mandate (assign work, open
-            // blockers, reopen tasks, create follow-ups via project_create_followup)
-            // on top of its own implementation duties. Final done stays verifier-only.
-            role: "coder".into(),
-            summary: "Plans (/plan), works on code and uses Oracle context; opens blockers, reopens tasks, and moves work to review or blocked, but never done.".into(),
-            allowed_tools: vec![
-                "agent_register",
-                "agent_heartbeat",
-                "agent_state",
-                "project_list",
-                "project_get",
-                "project_next_task",
-                "project_claim_task",
-                "project_update_status",
-                "project_append_note",
-                "project_set_title",
-                "project_create_followup",
-                "project_create_plan_tasks",
-                "provider_credentials_status",
-                "cloudflare_list_workers",
-                "cloudflare_rotate_worker_secret",
-                "scaleway_list_resources",
-                "scaleway_resource_action",
-                "oracle_ask",
-                "oracle_context",
-                "project_structure",
-                "get_neighborhood",
-                "find_imports",
-                "censor_findings",
-                "censor_dispose",
-                "visual_check",
-                "design_request",
-                "spawn_mini_coder",
-                "steer_mini_coder",
-                "mini_coder_result",
-                "request_git_push",
-                "plan_submit",
-                "plan_status",
-                "ask_user",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            forbidden: vec![
-                "No done status.",
-                "No token printing or token logging.",
-                "No provider action outside verified Aspis Bio scopes.",
-                // MC-P7: mini-coder ROUTING mandate (bilingual by design — English
-                // here, Italian in the Python ROLE_RULES). Delegate only cheap,
-                // mechanical sub-tasks to spawn_mini_coder; front-load context; do
-                // the thinking yourself; REVIEW the cheaper model's output as a draft.
-                "Delegate only cheap, mechanical sub-tasks to spawn_mini_coder (boilerplate, bulk read->summary, simple edits, docstrings, tests); front-load the needed context; do the thinking yourself; REVIEW the mini's output as a draft before using it.",
-                // A3: mini-coder write_mode rule of thumb (bilingual by design — English
-                // here, Italian in the Python ROLE_RULES). agentic-iterative ONLY for files
-                // in a language with deterministic-gate coverage in THIS project AND a model
-                // capable enough to iterate; otherwise emit-edits (the default).
-                "For a WRITE task set spawn_mini_coder's write_mode: use 'agenticIterative' ONLY for files in a language with deterministic-gate coverage in this project AND when the local model is capable enough to iterate usefully; otherwise use 'emitEdits' (the default). When unsure, use 'emitEdits'.",
-                // MC-P5: mirror of the Python coder.forbidden mini-coder escalation
-                // line (bilingual by design — English here, Italian in the Python
-                // ROLE_RULES). If spawn_mini_coder returns aborted_by_human the coder
-                // STOPS, never silently retries, and escalates via needs_user.
-                "If spawn_mini_coder returns status='aborted_by_human', STOP that line of work, do NOT silently retry the mini, and escalate to the human via needs_user (agent_heartbeat status=\"needs_user\").",
-                // MC-P6: mirror of the Python coder.forbidden escalation line (bilingual
-                // by design — English here, Italian in the Python ROLE_RULES). When a mini
-                // chain returns status='escalated' (Censor still dirty after its automatic
-                // retries), the coder REDOES that file itself — the training rail already
-                // captured the failed attempts — and does NOT re-spawn the mini for it.
-                "If spawn_mini_coder returns status='escalated', REDO that file yourself (the mini's automatic retries failed Censor and the training rail captured them); do NOT re-spawn the mini for the same file.",
-                // P8: the coder's OWN review pass gates the Kanban review move
-                // (bilingual by design — English here, Italian in the Python
-                // ROLE_RULES). One pass, not a loop; the verifier keeps the
-                // final verdict via the censorReview handoff.
-                "Before moving a task to review: run ONE review pass of your own (a Sonnet review subagent) over the files you touched, fix the findings, THEN set the task to review with a 'ready for final reviewer' note. The FINAL verdict stays with the verifier (the censorReview final pass, triggered from the app UI — it does NOT fire automatically when you set review) — never your own pass.",
-                "When you produce or review a self-contained HTML artifact and need visual feedback, call visual_check(html_path, focus?) and treat the returned critique as advisory evidence.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            contract: shared_contract(),
-            // PHASE E mandate (mirrored in Python ROLE_RULES coder.censor).
-            censor: vec![
-                "At each step boundary call censor_findings(project_id, file=<files you touched>) for the files you changed.",
-                "Fix the real local findings; dispose false positives with censor_dispose(disposition=\"fp\").",
-                "Batch at the step boundary: this is a per-step check before moving on, not a live interrupt.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            // GH-P5 cooperative push mandate (mirrored in Python ROLE_RULES
-            // coder.push — bilingual by design, English here, Italian there).
-            // Agents commit freely but NEVER raw `git push`: the agent launch env
-            // carries no git credentials, so a raw push fails fast; publishing
-            // goes through the request_git_push MCP tool + human approval.
-            push: vec![
-                "Commit freely (git add -u / git commit) to save your work.",
-                "NEVER run a raw `git push` — your environment has no git credentials and it will fail. To publish, call the `request_git_push` MCP tool; a human approves it.",
-                "If the push request is denied or times out, STOP and escalate to the human via needs_user (agent_heartbeat status=\"needs_user\"). Do NOT retry, do NOT attempt a raw push, do NOT work around the gate.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            // Phase 1 plan mandate (mirrored in Python ROLE_RULES coder.plan —
-            // bilingual by design, English here, Italian there). The coder PLANS
-            // before multi-file work: submit a plan, wait for the human's approval,
-            // revise on reject per the note, and use ask_user for blocking questions
-            // instead of guessing.
-            plan: vec![
-                "Before any multi-file or non-trivial change, submit a plan with the `plan_submit` MCP tool (a short title + the markdown plan) and WAIT for the human's approval.",
-                "If the plan is rejected, READ the note and REVISE the plan per it, then resubmit — do NOT start coding against a rejected plan.",
-                "If the plan request times out, STOP and escalate via needs_user (agent_heartbeat status=\"needs_user\"); do NOT proceed unapproved.",
-                "When you are BLOCKED on a decision only the human can make, ask via the `ask_user` MCP tool and wait for the reply — do NOT guess or work around the question.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        },
-        AgentRoleRule {
-            // ROLE UNTANGLE (2026-07): the ORCHESTRATOR is a first-class role again —
-            // the planning main tier that DELEGATES every write to spawn_mini_coder
-            // and never writes itself. This row mirrors the Python ROLE_RULES
-            // "orchestrator" entry (aspis_mcp.py) — allowlist VERBATIM in the same
-            // order (pinned by test_allowed_tools_match_rust_default_role_rules, no
-            // more PYTHON_ONLY_ROLES carve-out); summary/forbidden are the English
-            // fleet-UI voice of the same mandate (bilingual split by design).
-            role: "orchestrator".into(),
-            summary: "The frontier PLANNING tier: understands project AND infrastructure (Oracle + Cloudflare/Scaleway provider tools, read and task-audited mutation), delegates EVERY code write — substantial work to spawn_main_coder (the sandboxed agentic Main coder), cheap mechanical sub-tasks to spawn_mini_coder — manages the Kanban like a coder (claim, wip/review/blocked, reopen to todo) but never done; publishes only via the human-gated request_git_push.".into(),
-            allowed_tools: vec![
-                "agent_register",
-                "agent_heartbeat",
-                "agent_state",
-                "project_list",
-                "project_get",
-                "project_next_task",
-                "project_claim_task",
-                "project_update_status",
-                "project_append_note",
-                "project_set_title",
-                "project_create_followup",
-                "project_create_plan_tasks",
-                // ROLE UNTANGLE (owner decision): the orchestrator holds the FULL
-                // provider surface — it plans the infra, so it must see and manage
-                // it. Mutations still require a claimed task + evidence, like any
-                // coder-like caller (enforced server-side).
-                "provider_credentials_status",
-                "cloudflare_list_workers",
-                "cloudflare_rotate_worker_secret",
-                "scaleway_list_resources",
-                "scaleway_resource_action",
-                "oracle_ask",
-                "oracle_context",
-                "project_structure",
-                "get_neighborhood",
-                "find_imports",
-                "spawn_mini_coder",
-                // ROLE UNTANGLE Phase 3: substantial work goes to the first-class
-                // MAIN CODER (always-agentic sandboxed engine). Orchestrator-only.
-                "spawn_main_coder",
-                "steer_mini_coder",
-                "mini_coder_result",
-                "request_git_push",
-                "plan_submit",
-                "plan_status",
-                "ask_user",
-                "design_request",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            forbidden: vec![
-                "NEVER writes files directly: it has NO filesystem write/mutation tool; EVERY code change goes through delegation — spawn_main_coder for substantial/multi-file work (the sandboxed agentic Main coder), spawn_mini_coder for cheap mechanical sub-tasks (the orchestrator plans and front-loads context; they write).",
-                "To SUPERVISE a delegated mini call spawn_mini_coder with wait=false for its directiveId, watch its activity, steer with steer_mini_coder(directiveId, message) (or \"stop\"), then mini_coder_result(directiveId) for the outcome; the default blocking spawn is fine for simple fire-and-forget delegation.",
-                "For project or codebase questions use oracle_ask / oracle_context FIRST (grounded understanding) — never guess or hand-read the filesystem.",
-                "No done status: done is verifier-only with evidence. Claim and wip/review/blocked (and reopen to todo) exactly like a coder.",
-                "Every change goes through Censor + the Kanban + the human gate: never unattended full-auto. When a sub-task is ready, set review with a note and leave the final verdict to the verifier.",
-                "If spawn_mini_coder returns status='aborted_by_human', STOP that line of work, do NOT silently retry the mini, and escalate to the human via ask_user.",
-                "If spawn_mini_coder returns status='escalated' (retry chain exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file.",
-                "No provider action outside verified Aspis Bio scopes.",
-                "No token printing or token logging.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            // ANTI-DRIFT: verbatim-identical to the Python orchestrator `contract`
-            // (its second line names "(mini-coder)", unlike the shared contract).
-            contract: vec![
-                "Dichiara il modello (`model`) ad agent_register.",
-                "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-                "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            // The orchestrator has NO censor tools (Censor runs on the minis it
-            // delegates to) — mirrors the Python entry, which carries no censor key.
-            censor: Vec::new(),
-            // Cooperative push mandate — English mirror of the Python orchestrator.push.
-            push: vec![
-                "Commit freely (git add -u / git commit) to save your work.",
-                "NEVER run a raw `git push` — your environment has no git credentials and it will fail. To publish, call the `request_git_push` MCP tool; a human approves it.",
-                "If the push request is denied or times out, STOP and escalate to the human via ask_user. Do NOT retry, do NOT attempt a raw push, do NOT work around the gate.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            // Plan-approval mandate — English mirror of the Python orchestrator.plan.
-            plan: vec![
-                "Before any multi-file work, submit the plan with plan_submit(project_id, title, plan_markdown) and WAIT for the human approval: do not start delegating before status=\"approved\".",
-                "As soon as it is approved (status=\"approved\"), IMMEDIATELY call project_create_plan_tasks with ONE task per plan PHASE: the Kanban has ZERO tasks until you do. Create the tasks BEFORE delegating, then delegate in dependency order.",
-                "Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user BEFORE planning a non-trivial or ambiguous goal (zero is fine when it is clear); plan simple/obvious requests directly.",
-                "If the plan is rejected (status=\"rejected\"), revise it per the reviewer's `note` and RESUBMIT with plan_submit; do not proceed on a rejected plan.",
-                "When you have a blocking question for the human use ask_user(question) and wait for the reply, instead of stalling or guessing in the terminal.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        },
-        AgentRoleRule {
-            role: "verifier".into(),
-            summary: "Checks review tasks, evidence, tests and risk. Can close or block tasks.".into(),
-            allowed_tools: vec![
-                "agent_register",
-                "agent_heartbeat",
-                "agent_state",
-                "project_list",
-                "project_get",
-                "project_next_task",
-                "project_claim_task",
-                "project_update_status",
-                "project_append_note",
-                "provider_credentials_status",
-                "cloudflare_list_workers",
-                "scaleway_list_resources",
-                "oracle_ask",
-                "oracle_context",
-                "project_structure",
-                "get_neighborhood",
-                "find_imports",
-                "censor_findings",
-                "censor_dispose",
-                "visual_check",
-                "ask_user",
-                "plan_status",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            forbidden: vec![
-                "No coding.",
-                "No Cloudflare or Scaleway mutation; read-only provider access.",
-                "No done status unless the task is in review and evidence/confidence are concrete.",
-                "When reviewing a self-contained HTML artifact, call visual_check(html_path, focus?) if visual layout could affect the verdict; treat the critique as advisory evidence.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            contract: shared_contract(),
-            // PHASE E mandate (mirrored in Python ROLE_RULES verifier.censor).
-            censor: vec![
-                "Call censor_findings(project_id) for the residual ledger; ignore findings already resolved.",
-                "Focus on cross-file, architectural and multi-file security issues the small model cannot see.",
-                "Adjudicate: confirm the real findings and dispose false positives with censor_dispose (fp/wontfix/fixed).",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            // GH-P5: the verifier has NO push capability (request_git_push is
-            // coder-only, gated in P4) and therefore gets NO push mandate.
-            push: Vec::new(),
-            // Phase 1: planning is coder-only; the verifier gets NO plan mandate.
-            plan: Vec::new(),
-        },
-        AgentRoleRule {
-            // P3 + Phase 11.2: the mini is a one-shot READ-ONLY leaf — the read-only
-            // retrieval tools (oracle_context + project_structure) only. No
-            // heartbeat/subagents/needs_user (the parent coder owns the human contact)
-            // and no censor/push/plan mandates. Mirrored in the Python ROLE_RULES "mini"
-            // entry; parity (list order included) is pinned by
-            // test_allowed_tools_match_rust_default_role_rules.
-            role: "mini".into(),
-            summary: "One-shot read-only sub-agent: reads the codebase via oracle_context and the architectural spine via project_structure, nothing else.".into(),
-            allowed_tools: vec!["agent_register", "oracle_context", "project_structure", "get_neighborhood", "find_imports"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            forbidden: vec![
-                "No mutation tools: code, tasks, Kanban, providers and findings are off-limits.",
-                "No agent_heartbeat, no subagents, no needs_user escalation: the parent coder owns the human contact.",
-                "Never read or print tokens or secrets.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            contract: vec![
-                "Dichiara il modello (`model`) ad agent_register.",
-                "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            censor: Vec::new(),
-            push: Vec::new(),
-            plan: Vec::new(),
-        },
-    ]
+    parsed_role_rules().rules.clone()
+}
+
+/// The role's `launchPrompt` prose (the cloud CLI bootstrap block injected by
+/// `project_agent_prompt`), looked up from the SSoT JSON rather than added as
+/// a field on `AgentRoleRule` — keeps the `.aspis-agents.json` state-file
+/// shape unchanged. `None` for a role with no launchPrompt (currently "mini",
+/// which never runs the cloud CLI bootstrap).
+pub fn role_launch_prompt(role: &str) -> Option<&'static str> {
+    parsed_role_rules()
+        .launch_prompts
+        .get(role)
+        .map(String::as_str)
 }
 
 fn mcp_command_hint(app: &tauri::AppHandle, projects_dir: &Path) -> String {
@@ -1304,7 +1080,19 @@ fn normalize_management_root_candidate(candidate: &Path) -> Option<PathBuf> {
     let mut path = candidate.to_path_buf();
     if path.file_name().and_then(|value| value.to_str()) == Some("src-tauri") {
         if let Some(parent) = path.parent() {
-            path = parent.to_path_buf();
+            // LOCK-STEP with `validate_management_root` in oracle/server/aspis_mcp.py:
+            // hop to the parent ONLY when it actually carries the oracle package; a
+            // self-contained directory that merely happens to be named `src-tauri`
+            // otherwise validates on its own merits (the unconditional hop made the
+            // two implementations disagree on that layout — reviewer finding).
+            if parent
+                .join("oracle")
+                .join("server")
+                .join("aspis_mcp.py")
+                .is_file()
+            {
+                path = parent.to_path_buf();
+            }
         }
     }
     if is_valid_management_root(&path) {
@@ -1314,7 +1102,15 @@ fn normalize_management_root_candidate(candidate: &Path) -> Option<PathBuf> {
 }
 
 fn is_valid_management_root(path: &Path) -> bool {
-    path.join("config.json").is_file()
+    // SPLIT LAYOUT (F1, mute-orchestrator fix): the dev app runs with
+    // cwd = src-tauri and writes `config.json` THERE, so the repo root may
+    // carry only `src-tauri/config.json`. Accept either location — requiring
+    // the root copy made every candidate invalid the moment the root copy
+    // disappeared, and the silent `projects_dir.parent()` fallback then pointed
+    // the MCP children at a directory with no `oracle` package.
+    let has_config = path.join("config.json").is_file()
+        || path.join("src-tauri").join("config.json").is_file();
+    has_config
         && path
             .join("oracle")
             .join("server")
@@ -1822,8 +1618,9 @@ unsafe extern "system" fn enum_window_proc(
 }
 
 /// Outcome of an agent-stop kill attempt, so stop_agent can report a clear
-/// message (especially the "refused: recycled pid" case).
-enum KillOutcome {
+/// message (especially the "refused: recycled pid" case). `pub(crate)` because
+/// [`stop_agent_core`] (reused by the D1 launch fence in projects.rs) returns it.
+pub(crate) enum KillOutcome {
     /// Killed by exact window title (or, on macOS, closed the titled window). The
     /// reboot-/pid-reuse-safe primary path.
     KilledByTitle,
@@ -1917,60 +1714,58 @@ fn kill_agent_process(_title: &str, _pid: Option<u32>, _creation_time: Option<u6
 /// Stop an agent: kill its launched process tree (best-effort), mark its session
 /// closed in `.aspis-agents.json`, append a `stopped` event, drop its ledger
 /// entry, and return the refreshed live state so the UI updates immediately.
-#[tauri::command]
-pub fn stop_agent(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-    agent_id: String,
-) -> Result<AgentLiveState, String> {
-    state.ensure_unlocked()?;
-    let entry = read_agent_ledger_entry(&app, &agent_id)?;
+/// PROCESS-ONLY stop: kill whatever process holds `agent_id` (app PTY, cloud duplex
+/// child, or external window), clean its prompt temp file, and ALWAYS remove the
+/// ledger entry — WITHOUT touching the session row or the activity-tail registry.
+/// This is what the D1 orchestrator launch FENCE needs (max-recall BLOCKER): the
+/// fence runs AFTER `record_launch_pending` wrote the NEW generation's
+/// launch_pending row under the SAME stable id, so a full `mark_agent_session_closed`
+/// here would stamp that fresh row closed (the exact "closed at birth" bug class the
+/// kill_cloud_duplex `had_session` guard already fixed once) AND its `registry.stop`
+/// would empty the tail slot, silently defeating the new tail's `had_predecessor`
+/// grace-sleep. `register()` handles the predecessor tail itself.
+/// Returns `(external kill outcome, host hint for a row close)` — the outcome is
+/// `None` on the app-hosted route, which has no kill-by-title outcome.
+pub(crate) fn stop_agent_process_only(
+    app: &tauri::AppHandle,
+    agent_id: &str,
+) -> Result<(Option<KillOutcome>, Option<&'static str>), String> {
+    let entry = read_agent_ledger_entry(app, agent_id)?;
 
     // ROUTE BY HOST. App-hosted agents (host == "app") run under our in-app PTY,
     // so there is no OS console window/pid to taskkill — we tear down the PTY
     // session (kill + reap the child) instead. Every other host value (including
     // legacy entries with no host, which read back as None) takes the original
     // external kill-by-title path below.
-    if ledger_host_is_app(entry.as_ref()) {
-        super::agent_pty::kill_agent_pty(&app, &agent_id);
+    let (outcome, closed_host) = if ledger_host_is_app(entry.as_ref()) {
+        super::agent_pty::kill_agent_pty(app, agent_id);
         // Phase D: an app-hosted agent may instead be a cloud DUPLEX child (piped, not a PTY).
         // kill_cloud_duplex is idempotent + no-ops when there is no such session, so calling it
         // alongside the PTY kill cleans up whichever kind this agent actually is.
         {
             use tauri::Manager;
             let sessions = app.state::<super::cloud_duplex::CloudDuplexSessions>();
-            super::cloud_duplex::kill_cloud_duplex(&app, &sessions, &agent_id);
+            super::cloud_duplex::kill_cloud_duplex(app, &sessions, agent_id);
         }
-        // Best-effort prompt-file cleanup (same discipline as the external path).
-        // FIX 2: remove the per-launch restricted DIRECTORY too, not just the file.
-        if let Some(prompt_file) = entry.as_ref().and_then(|entry| entry.prompt_file.clone()) {
-            super::projects::remove_restricted_temp_file(std::path::Path::new(&prompt_file));
-        }
-        // FIX 5 (idempotency): mark-closed must NOT short-circuit the ledger
-        // removal. If the live-state write fails, propagating `?` here would strand
-        // the ledger entry forever (a later stop would re-route to a dead PTY). So
-        // capture the close result, ALWAYS remove the ledger entry, then surface the
-        // close error (if any) only after the removal happened.
         // FIX 4: this branch is app-hosted (ledger_host_is_app == true), so persist
         // host="app" on the closed session.
-        let close_result = mark_agent_session_closed(&app, &agent_id, Some(HOST_APP));
-        let _ = remove_agent_ledger_entry(&app, &agent_id);
-        close_result?;
-        return get_agent_live_state(app, state);
-    }
-
-    // Identity primitive: the EXACT unique window title. Kill by title first
-    // (reboot-safe, pid-reuse-safe); only fall back to the stored pid when it is
-    // verified as OUR process. A recycled/stale pid can NEVER cause a wrong-process
-    // kill — the title filter matches nothing and the pid fails verification, so
-    // the worst case is "refuse and report", never "kill the wrong tree".
-    let title = entry
-        .as_ref()
-        .and_then(|entry| entry.window_title.clone())
-        .unwrap_or_else(|| agent_window_title(&agent_id));
-    let pid = entry.as_ref().and_then(|entry| entry.pid);
-    let creation_time = entry.as_ref().and_then(|entry| entry.creation_time);
-    let outcome = kill_agent_process(&title, pid, creation_time);
+        (None, Some(HOST_APP))
+    } else {
+        // Identity primitive: the EXACT unique window title. Kill by title first
+        // (reboot-safe, pid-reuse-safe); only fall back to the stored pid when it is
+        // verified as OUR process. A recycled/stale pid can NEVER cause a wrong-process
+        // kill — the title filter matches nothing and the pid fails verification, so
+        // the worst case is "refuse and report", never "kill the wrong tree".
+        let title = entry
+            .as_ref()
+            .and_then(|entry| entry.window_title.clone())
+            .unwrap_or_else(|| agent_window_title(agent_id));
+        let pid = entry.as_ref().and_then(|entry| entry.pid);
+        let creation_time = entry.as_ref().and_then(|entry| entry.creation_time);
+        // FIX 4: the EXTERNAL stop path — pass None, do NOT rewrite the session's
+        // host to "app".
+        (Some(kill_agent_process(&title, pid, creation_time)), None)
+    };
 
     // Rust-side cleanup of the launch-token-bearing prompt temp file: if the child
     // shell died before its own Remove-Item ran, the token would otherwise linger
@@ -1979,28 +1774,73 @@ pub fn stop_agent(
     if let Some(prompt_file) = entry.as_ref().and_then(|entry| entry.prompt_file.clone()) {
         super::projects::remove_restricted_temp_file(std::path::Path::new(&prompt_file));
     }
+    let _ = remove_agent_ledger_entry(app, agent_id);
+    Ok((outcome, closed_host))
+}
 
-    // FIX 5 (idempotency): mark-closed is best-effort here too — ALWAYS drop the
-    // ledger entry (so a later focus/stop never targets a dead pid), then surface a
-    // close error only after the removal happened.
-    // FIX 4: this is the EXTERNAL stop path (ledger_host_is_app == false), so pass
-    // None — do NOT rewrite the session's host to "app".
-    let close_result = mark_agent_session_closed(&app, &agent_id, None);
-    let _ = remove_agent_ledger_entry(&app, &agent_id);
-    close_result?;
+/// Core of [`stop_agent`] (the user-facing Stop): the process-only teardown PLUS the
+/// durable session-row close. Also used by `delete_project` (a deleted project's
+/// orchestrator must die AND its row must close). Returns the external kill outcome
+/// (`None` on the app-hosted route).
+pub fn stop_agent_core(
+    app: &tauri::AppHandle,
+    agent_id: &str,
+) -> Result<Option<KillOutcome>, String> {
+    let (outcome, closed_host) = stop_agent_process_only(app, agent_id)?;
+    // FIX 5 (idempotency): the ledger entry was already removed above regardless of
+    // this close's result, so a failed live-state write can never strand a dead
+    // kill handle; surface the close error after the teardown happened.
+    mark_agent_session_closed(app, agent_id, closed_host)?;
+    Ok(outcome)
+}
+
+#[tauri::command]
+pub fn stop_agent(
+    app: tauri::AppHandle,
+    state: State<'_, BackendState>,
+    agent_id: String,
+) -> Result<AgentLiveState, String> {
+    state.ensure_unlocked()?;
+    let outcome = stop_agent_core(&app, &agent_id)?;
 
     let live_state = get_agent_live_state(app, state)?;
 
     // Surface the rare "refused to kill a recycled pid" case so the operator knows
     // the agent's original process is gone and a stranger now holds that pid.
-    if matches!(outcome, KillOutcome::RefusedUnverifiedPid) {
+    if matches!(outcome, Some(KillOutcome::RefusedUnverifiedPid)) {
         return Err(format!(
             "Agent {agent_id} has no live window with its title and its recorded pid now belongs to a different process (pid reuse). Refused to force-kill it; the agent session was marked closed."
         ));
     }
-    let _ = outcome;
 
     Ok(live_state)
+}
+
+/// Best-effort liveness touch for a session that has NO registration/heartbeat
+/// channel of its own — the cloud DUPLEX orchestrator (claude/codex `-p`): it
+/// never calls agent_register, so without this its `last_seen_at` froze at the
+/// launch stamp and the frontend's 15-minute recency filter silently dropped a
+/// session that was actively chatting (unbinding the planner console mid-
+/// conversation). `status`: `Some("active")` promotes a just-spawned
+/// launch_pending session to active (the duplex spawn IS its registration);
+/// `None` only refreshes `last_seen_at`. Swallows errors — liveness stamping
+/// must never break the reader/spawn path.
+pub fn touch_agent_session(app: &tauri::AppHandle, agent_id: &str, status: Option<&str>) {
+    let agent_id = agent_id.to_string();
+    let status = status.map(String::from);
+    let _ = mutate_agent_live_state(app, move |live_state| {
+        if let Some(session) = live_state
+            .sessions
+            .iter_mut()
+            .find(|session| session.agent_id == agent_id)
+        {
+            session.last_seen_at = Some(Utc::now().to_rfc3339());
+            if let Some(status) = status {
+                session.status = status.clone();
+                session.message = Some("Cloud orchestrator online.".into());
+            }
+        }
+    });
 }
 
 /// Best-effort public wrapper for `mark_agent_session_closed`, used by the
@@ -2076,7 +1916,7 @@ fn apply_agent_session_close(
         .find(|session| session.agent_id == agent_id)
     {
         session.status = "closed".into();
-        session.message = Some("Stopped from Aspis Management".into());
+        session.message = Some("Stopped from Devboule".into());
         session.last_seen_at = Some(timestamp.to_string());
         // Persist host="app" ONLY when the caller says this close is app-hosted
         // (the PTY teardown paths pass Some("app")). For an EXTERNAL stop the caller
@@ -2101,7 +1941,7 @@ fn apply_agent_session_close(
             project_id,
             task_id,
             status: Some("closed".into()),
-            message: "Stopped from Aspis Management".into(),
+            message: "Stopped from Devboule".into(),
             evidence: None,
         });
     }
@@ -2120,6 +1960,20 @@ fn apply_agent_session_close(
 mod tests {
     use super::*;
     use crate::backend::model::{AgentNeedsUser, AgentSubagent};
+
+    #[test]
+    fn launch_id_collision_lets_the_stable_orchestrator_id_relaunch() {
+        // D1 regression (max-recall BLOCKER): the orchestrator's stable per-project id
+        // MUST be reusable across generations — a closed/active predecessor row is
+        // history to reset, never a collision.
+        assert!(!launch_id_collision("orchestrator", "closed"));
+        assert!(!launch_id_collision("orchestrator", "active"));
+        assert!(!launch_id_collision("orchestrator", "launch_pending"));
+        // Every other role keeps the strict guard (fresh ids ⇒ collision = bug).
+        assert!(launch_id_collision("coder", "closed"));
+        assert!(launch_id_collision("verifier", "active"));
+        assert!(!launch_id_collision("coder", "launch_pending"));
+    }
 
     #[test]
     fn default_rules_keep_cloud_actions_out_of_mcp() {
@@ -2218,6 +2072,68 @@ mod tests {
             Some(root.clone())
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// F1 (mute-orchestrator fix): the dev app (cwd = src-tauri) writes
+    /// `config.json` under `src-tauri/`, not the repo root. A root that has the
+    /// oracle package but ONLY `src-tauri/config.json` must still validate —
+    /// before this, NO directory validated, `management_root_for_mcp` silently
+    /// fell back to `projects_dir.parent()` (= src-tauri), and every MCP child
+    /// died on `import oracle` → the whole fleet lost registration.
+    #[test]
+    fn management_root_accepts_split_layout_config_under_src_tauri() {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-management-split-root-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        // No config.json anywhere yet ⇒ still invalid.
+        assert!(normalize_management_root_candidate(&root).is_none());
+        // config.json ONLY under src-tauri/ ⇒ valid (split layout).
+        fs::create_dir_all(root.join("src-tauri")).unwrap();
+        fs::write(root.join("src-tauri").join("config.json"), "{}").unwrap();
+        assert_eq!(
+            normalize_management_root_candidate(&root),
+            Some(root.clone())
+        );
+        // And the src-tauri candidate itself still normalizes to the repo root.
+        assert_eq!(
+            normalize_management_root_candidate(&root.join("src-tauri")),
+            Some(root.clone())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Rust/Python parity (reviewer finding): a SELF-CONTAINED directory named
+    /// `src-tauri` (its own config.json + its own oracle package, parent has
+    /// neither) must validate as itself — Python's `validate_management_root`
+    /// already accepts it, and the unconditional parent-hop made Rust reject it.
+    #[test]
+    fn management_root_accepts_self_contained_src_tauri_dir() {
+        let parent = std::env::temp_dir().join(format!(
+            "aspis-management-selfcontained-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        let root = parent.join("src-tauri");
+        fs::create_dir_all(root.join("oracle").join("server")).unwrap();
+        fs::write(
+            root.join("oracle").join("server").join("aspis_mcp.py"),
+            "# test",
+        )
+        .unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        assert_eq!(
+            normalize_management_root_candidate(&root),
+            Some(root.clone())
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[test]
@@ -2923,34 +2839,31 @@ mod tests {
             assert!(rule
                 .contract
                 .iter()
-                .any(|line| line == "Dichiara il modello (`model`) ad agent_register."));
+                .any(|line| line == "Declare your model (`model`) at agent_register."));
         }
     }
 
     #[test]
-    fn shared_contract_matches_python_literals_verbatim() {
-        // ANTI-DRIFT: every role's `contract` must be byte-identical to the
-        // ROLE_RULES[].contract lines in oracle/server/aspis_mcp.py. If this
-        // breaks, the Python and Rust copies have drifted — fix BOTH together.
+    fn role_rules_contract_matches_ssot_json_per_role() {
+        // The SSoT (oracle/server/role_rules.json) is now parsed identically by
+        // Rust and Python, so cross-language drift is structurally impossible —
+        // this just pins the per-role contract shape (shared 3-liner for
+        // coder/verifier, the "(mini-coders)" orchestrator variant, and the
+        // mini's own 2-line contract) so an accidental JSON edit still fails
+        // loudly here.
         let expected = [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+            "Declare your model (`model`) at agent_register.",
+            "Whenever you spawn or close subagents, send agent_heartbeat with an updated `subagents=[{label, model, count, role?}]`.",
+            "When waiting on the human (question, allow/deny permission, blocker) send agent_heartbeat with status=\"needs_user\" and a clear message.",
         ];
-        // P3: the mini is NOT on the shared 3-line contract — it has its own
-        // 2-line contract (model declaration + register-first), also mirrored
-        // byte-identically in the Python ROLE_RULES "mini" entry.
         let expected_mini = [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Registrati con agent_register (role=\"mini\") prima di chiamare oracle_context.",
+            "Declare your model (`model`) at agent_register.",
+            "Register with agent_register (role=\"mini\") before calling oracle_context / project_structure.",
         ];
-        // ROLE UNTANGLE: the orchestrator's second contract line names
-        // "(mini-coder)" — byte-identical to the Python orchestrator entry, which
-        // differs from the shared line by exactly that parenthetical.
         let expected_orchestrator = [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            "Quando aspetti l'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status=\"needs_user\" e un message chiaro.",
+            "Declare your model (`model`) at agent_register.",
+            "Whenever you spawn or close subagents (mini-coders), send agent_heartbeat with an updated `subagents=[{label, model, count, role?}]`.",
+            "When waiting on the human (question, allow/deny permission, blocker) send agent_heartbeat with status=\"needs_user\" and a clear message.",
         ];
         for rule in default_role_rules() {
             let want: &[&str] = if rule.role == "mini" {
@@ -2962,7 +2875,7 @@ mod tests {
             };
             assert_eq!(
                 rule.contract, want,
-                "role {} contract drifted from the Python mirror",
+                "role {} contract drifted from the SSoT JSON",
                 rule.role
             );
         }
@@ -3217,78 +3130,140 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // SSoT schema tests (2026-07 role-rules-JSON follow-up). The former
+    // `allowed_tools_match_python_role_rules_verbatim` cross-language literal
+    // pin is gone: Rust and Python now parse the exact same
+    // oracle/server/role_rules.json, so a permission-surface drift between
+    // the two languages is structurally impossible. What remains worth
+    // pinning is the JSON's own shape/content, so a bad edit to the SSoT
+    // still fails Rust's test suite loudly.
+    // ---------------------------------------------------------------------
+
     #[test]
-    fn allowed_tools_match_python_role_rules_verbatim() {
-        // ANTI-DRIFT (WARNING 5): each role's `allowed_tools` MUST equal the
-        // ROLE_RULES[].allowedTools list in oracle/server/aspis_mcp.py. The Python
-        // side has a twin test (test_allowed_tools_match_rust_default_role_rules)
-        // that parses THIS file and compares the other direction, so the two
-        // implementations cannot drift their permission surface. If this breaks,
-        // fix BOTH languages together — a mismatch is a real privilege divergence.
-        let coder_expected = [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "project_set_title",
-            "project_create_followup",
-            "project_create_plan_tasks",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources",
-            "scaleway_resource_action",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "get_neighborhood",
-            "find_imports",
-            "censor_findings",
-            "censor_dispose",
-            "visual_check",
-            "design_request",
-            "spawn_mini_coder",
-            "steer_mini_coder",
-            "mini_coder_result",
-            "request_git_push",
-            "plan_submit",
-            "plan_status",
-            "ask_user",
-        ];
-        let verifier_expected = [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "scaleway_list_resources",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "get_neighborhood",
-            "find_imports",
-            "censor_findings",
-            "censor_dispose",
-            "visual_check",
-            "ask_user",
-            "plan_status",
-        ];
+    fn role_rules_json_parses() {
+        // The include_str!-ed SSoT must be valid JSON matching RawRoleRulesFile;
+        // parsed_role_rules() panics on failure, so simply calling it is the test.
         let rules = default_role_rules();
-        let coder = rules.iter().find(|r| r.role == "coder").unwrap();
-        let verifier = rules.iter().find(|r| r.role == "verifier").unwrap();
-        assert_eq!(coder.allowed_tools, coder_expected);
-        assert_eq!(verifier.allowed_tools, verifier_expected);
+        assert!(!rules.is_empty(), "role_rules.json must parse to >=1 role");
+    }
+
+    #[test]
+    fn role_rules_json_has_exactly_four_roles_in_order() {
+        let rules = default_role_rules();
+        let names: Vec<&str> = rules.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["coder", "orchestrator", "verifier", "mini"],
+            "role_rules.json roles[] order drifted"
+        );
+    }
+
+    #[test]
+    fn role_rules_json_every_role_has_non_empty_core_fields() {
+        for rule in default_role_rules() {
+            assert!(
+                !rule.summary.is_empty(),
+                "role {} must have a non-empty summary",
+                rule.role
+            );
+            assert!(
+                !rule.forbidden.is_empty(),
+                "role {} must have a non-empty forbidden list",
+                rule.role
+            );
+            assert!(
+                !rule.contract.is_empty(),
+                "role {} must have a non-empty contract",
+                rule.role
+            );
+            assert!(
+                !rule.allowed_tools.is_empty(),
+                "role {} must have a non-empty allowedTools list",
+                rule.role
+            );
+        }
+    }
+
+    #[test]
+    fn role_rules_json_orchestrator_has_spawn_main_coder_and_launch_prompt() {
+        let rules = default_role_rules();
+        let orchestrator = rules.iter().find(|r| r.role == "orchestrator").unwrap();
+        assert!(
+            orchestrator
+                .allowed_tools
+                .iter()
+                .any(|t| t == "spawn_main_coder"),
+            "orchestrator must be allowed spawn_main_coder"
+        );
+        assert!(
+            role_launch_prompt("orchestrator").is_some(),
+            "orchestrator must carry a launchPrompt"
+        );
+    }
+
+    #[test]
+    fn role_rules_json_verifier_and_coder_have_launch_prompt() {
+        assert!(
+            role_launch_prompt("verifier").is_some(),
+            "verifier must carry a launchPrompt"
+        );
+        assert!(
+            role_launch_prompt("coder").is_some(),
+            "coder must carry a launchPrompt"
+        );
+    }
+
+    #[test]
+    fn role_rules_json_mini_allowlist_is_read_only_set() {
+        // The mini is a one-shot READ-ONLY leaf. Its allowlist is exactly the
+        // read-only retrieval surface: agent_register + oracle_context +
+        // project_structure + the two CKG graph queries (get_neighborhood,
+        // find_imports — both pure reads, added with the CKG feature). Any
+        // MUTATION tool here is a privilege leak. Pinned in lockstep with the
+        // Python twin (test_mini_role_is_oracle_context_only in
+        // oracle/tests/test_aspis_mcp.py), which both consume role_rules.json.
+        let rules = default_role_rules();
+        let mini = rules.iter().find(|r| r.role == "mini").unwrap();
+        assert_eq!(
+            mini.allowed_tools,
+            vec![
+                "agent_register",
+                "oracle_context",
+                "project_structure",
+                "get_neighborhood",
+                "find_imports",
+            ],
+            "mini allowlist must be exactly the read-only retrieval set"
+        );
+    }
+
+    #[test]
+    fn role_rules_json_contract_and_summary_have_no_italian() {
+        // Tripwire: the SSoT is English-only now (house rule: agents read the
+        // SAME English prose the fleet UI shows — no more bilingual split).
+        // These three tokens are distinctive Italian words that appeared
+        // verbatim in the old hand-written Italian contract/plan literals; if
+        // any of them resurface, someone pasted Italian back into the JSON.
+        let italian_tripwire = ["Dichiara", "Quando ", "targhetta"];
+        for rule in default_role_rules() {
+            let blob = format!(
+                "{} {} {} {} {} {}",
+                rule.summary,
+                rule.contract.join(" "),
+                rule.forbidden.join(" "),
+                rule.censor.join(" "),
+                rule.push.join(" "),
+                rule.plan.join(" "),
+            );
+            for needle in italian_tripwire {
+                assert!(
+                    !blob.contains(needle),
+                    "role {} contains Italian tripwire {needle:?}: {blob}",
+                    rule.role
+                );
+            }
+        }
     }
 
     #[test]

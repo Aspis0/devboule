@@ -932,6 +932,18 @@ fn run_commit_index_kick(project_root: &Path) {
 /// race). The lock also serializes two briefly-overlapping supervisors writing the
 /// same target/backup. NOTE: publishing is NOT suppressed by a vault lock — the
 /// discovery file is meant to persist across a lock (always-on agent MCP).
+/// The pid to publish in the discovery file. Max-recall finding (2026-07-02):
+/// this must be the PYTHON SERVER's pid, not our own — the MCP children
+/// liveness-gate the field to skip a dead target, and `std::process::id()`
+/// (the app) is alive even when the server child crashed/hung, so the gate
+/// watched the wrong process. Falls back to the app pid only when no child is
+/// tracked (still a truthful "the supervisor lives" signal, and better than
+/// 0/absent for older readers of this file). Extracted so a unit test pins the
+/// child-pid linkage against a regression back to the app pid.
+fn discovery_pid() -> u32 {
+    crate::oracle::python_oracle::oracle_child_pid().unwrap_or_else(std::process::id)
+}
+
 fn publish_discovery(root: &Path) -> Result<(), String> {
     let _guard = discovery_lock().lock().unwrap_or_else(|e| e.into_inner());
     if EXITING.load(Ordering::SeqCst) {
@@ -954,7 +966,7 @@ fn publish_discovery(root: &Path) -> Result<(), String> {
         base_url,
         auth_token: oracle_agent_token().to_string(),
         index_root: root.to_string_lossy().to_string(),
-        pid: std::process::id(),
+        pid: discovery_pid(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     let json = serde_json::to_string_pretty(&payload)
@@ -1206,6 +1218,38 @@ mod tests {
     /// Serializes the tests that mutate the process-wide `EXITING` / `PROJECTS_DIR`
     /// statics so they don't clobber each other under the parallel test runner.
     static GLOBAL_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Max-recall regression pin: the discovery file must publish the tracked
+    /// PYTHON CHILD's pid (the process the MCP liveness gate needs to watch),
+    /// falling back to the app's own pid only when no child is tracked. Guards
+    /// against a regression back to a bare `std::process::id()`.
+    #[test]
+    fn discovery_pid_publishes_the_tracked_child_not_the_app() {
+        // Spawn a real short-lived child to own a genuine OS pid.
+        let child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+                .spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .expect("spawn test child");
+        let child_pid = child.id();
+        assert_ne!(child_pid, std::process::id());
+
+        let previous =
+            crate::oracle::python_oracle::swap_oracle_child_for_test(Some(child));
+        let published = discovery_pid();
+        // Restore the registry BEFORE asserting so a failure cannot leak state,
+        // then reap the test child.
+        let mut test_child =
+            crate::oracle::python_oracle::swap_oracle_child_for_test(previous);
+        if let Some(ref mut c) = test_child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        assert_eq!(published, child_pid);
+    }
 
     #[test]
     fn validate_sid_accepts_real_sids_and_rejects_names_and_garbage() {

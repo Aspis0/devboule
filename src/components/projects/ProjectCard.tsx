@@ -8,6 +8,7 @@ import type {
 import { censorChipAria, censorChipLabel, gitChipModel } from "./censorCounts";
 
 const statusDotTone: Record<ProjectStatus, string> = {
+  draft: "bg-cream-300",
   active: "bg-sage",
   paused: "bg-amber",
   done: "bg-teal",

@@ -129,6 +129,14 @@ impl FsBackend {
         Ok(Self { root })
     }
 
+    /// The canonical project root this backend is confined to. Exposed for callers
+    /// that need to root their OWN on-disk state under the same project without
+    /// duplicating root discovery — e.g. the planner's `.devboule/preplan.md`
+    /// external memory ([`crate::preplan::Preplan`]).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Resolve a model-supplied RELATIVE path against the root and confirm the
     /// CANONICAL result stays inside the root. Belt-and-suspenders over the
     /// parse-time validation: a path can pass the static `..`/abs check yet still
@@ -824,9 +832,21 @@ impl ToolExecutor for RealExecutor {
             // (it owns the token from `agent_register`), so the params here carry
             // ONLY the action-specific arguments.
             AgentAction::OracleAsk { query } => {
+                let label = if query.len() > 80 {
+                    format!("asking Oracle: {}…", &query[..80])
+                } else {
+                    format!("asking Oracle: {query}")
+                };
+                self.activity.milestone(&label, crate::activity::Node::Dot);
                 self.mcp_call("oracle_ask", json!({ "query": query })).await
             }
             AgentAction::OracleContext { query, limit } => {
+                let label = if query.len() > 80 {
+                    format!("searching Oracle: {}…", &query[..80])
+                } else {
+                    format!("searching Oracle: {query}")
+                };
+                self.activity.milestone(&label, crate::activity::Node::Dot);
                 let mut params = json!({ "query": query });
                 if let Some(limit) = limit {
                     params["limit"] = json!(limit);
@@ -882,6 +902,7 @@ impl ToolExecutor for RealExecutor {
             // A `JoinError` (the blocking task panicked / was cancelled) becomes a
             // failed `ToolResult`, never a panic that takes down the burst.
             AgentAction::Read { path } => {
+                self.activity.milestone(&format!("reading {path}"), crate::activity::Node::Dot);
                 let fs = self.fs.clone();
                 let arg = path.clone();
                 match tokio::task::spawn_blocking(move || fs.read(&arg)).await {

@@ -12,7 +12,9 @@ LEGACY_GRAPH_JSON = Path(os.getenv("LEGACY_GRAPH_JSON", "graph.json"))
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBED_DIMS = 1024
 EMBED_MAX_LENGTH = 32768
-EMBED_BATCH_SIZE = int(os.getenv("ORACLE_EMBED_BATCH_SIZE", "4"))
+# Encode batch size is hardware-adaptive, not a config constant: see
+# oracle/ingestion/embedder.py choose_embed_batch_size / effective_embed_batch_size
+# (the ORACLE_EMBED_BATCH_SIZE env override is read there).
 CHUNK_MAX_CHARS = int(os.getenv("ORACLE_CHUNK_MAX_CHARS", "2200"))
 CHUNK_OVERLAP_CHARS = int(os.getenv("ORACLE_CHUNK_OVERLAP_CHARS", "280"))
 CHUNK_DOC_MAX_CHARS = int(os.getenv("ORACLE_CHUNK_DOC_MAX_CHARS", "12000"))

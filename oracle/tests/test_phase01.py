@@ -140,6 +140,25 @@ class OraclePhase01Test(unittest.TestCase):
             self.assertIn("src/live.py", files)
             self.assertNotIn("_baseline/old.py", files)
 
+    def test_collect_text_files_excludes_devboule_scratchpad_and_aspis_dirs(self):
+        # `.devboule/` (the orchestrator's own preplan/session scratchpad, e.g.
+        # `.devboule/preplan.md`) and `.aspis/` must never be self-indexed: they are
+        # harness state, not project source, and self-grounding on them would let a
+        # planner's own scratch notes leak back into its future prompts as if they
+        # were project code.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "src").mkdir()
+            (root / "src" / "live.py").write_text("print('live')\n", encoding="utf-8")
+            (root / ".devboule").mkdir()
+            (root / ".devboule" / "preplan.md").write_text("## Goal\nx\n", encoding="utf-8")
+            (root / ".aspis").mkdir()
+            (root / ".aspis" / "state.json").write_text("{}\n", encoding="utf-8")
+
+            files = {path.relative_to(root).as_posix() for path in collect_text_files(root)}
+
+            self.assertEqual(files, {"src/live.py"})
+
     def test_collect_text_files_respects_workspace_oracleignore(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

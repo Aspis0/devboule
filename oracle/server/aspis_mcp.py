@@ -127,6 +127,13 @@ MAX_VISUAL_CHECK_DIRECTIVES = 50
 # Bounds for the `spawn_mini_coder` tool inputs + its bounded result poll.
 MINI_CODER_MAX_TASK_LEN = 4000
 MINI_CODER_MAX_FILES = 64
+# Main-tier file cap. CO-WRITER PARITY with `validate_main_coder_request` in
+# src-tauri/src/backend/main_coder.rs (files 1..=10) — change BOTH together. The
+# Rust command is the UI twin of the `spawn_main_coder` MCP tool; until the
+# 2026-07 wrapper fix the MCP path was unreachable, so the mismatch (64 via
+# Python vs 10 via Rust) was dead. Tighter-or-equal wins: the MCP path now
+# enforces the same 10 the app's own validator permits.
+MAIN_CODER_MAX_FILES = 10
 # ASYNC STEERING (a): bounds for the `steer_mini_coder` tool. CO-WRITER PARITY with the
 # Rust `MAX_STEER_MESSAGE_LEN` / `MAX_STEER_QUEUE_LEN` in
 # src-tauri/src/backend/mini_coder.rs — change BOTH together. A single mid-flight
@@ -287,258 +294,15 @@ SCW_REGIONS = ("fr-par", "nl-ams", "pl-waw")
 _MCP_ENGINE_CACHE: dict[str, Any] = {}
 _MCP_INDEX_STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-# ANTI-DRIFT: the `contract` lists below MUST stay verbatim-identical to the
-# contract strings in default_role_rules() in
-# src-tauri/src/backend/agents.rs. If you change one, change both.
-# INTENTIONAL BILINGUAL SPLIT (not drift): only `contract` is mirrored. `summary`
-# and `forbidden` are Italian here because agents read them, while the Rust copies
-# are English on purpose because they feed the fleet UI — do not "align" them.
-ROLE_RULES = [
-    {
-        # Phase B merge: the coder now PLANS and CODES. It absorbs the former
-        # orchestrator's planning/coordination mandate (assign work, open
-        # blockers, reopen tasks to todo, create follow-ups) on top of its own
-        # implementation duties. The final `done` is still verifier-only.
-        "role": "coder",
-        "summary": "Pianifica (/plan), lavora sul codice e usa Oracle; apre blocchi, riapre task a todo e segna wip/review/blocked, ma il done finale e solo verifier.",
-        # PHASE E mandate (mirrored in Rust default_role_rules coder.censor): the
-        # coder is Censor's per-step consumer. Kept as a dedicated `censor` field
-        # (not in the verbatim-mirrored `contract`) because the mandate differs per
-        # role; the Rust copy is English (UI), this one Italian (agents read it).
-        "censor": [
-            "A ogni confine di step chiama censor_findings(project_id, file=<file toccati>, drain_queue=True) per svuotare i finding asincroni accumulati nella coda persistente.",
-            'Correggi i finding locali reali; chiudi i falsi positivi con censor_dispose(disposition="fp").',
-            "Raggruppa al confine di step: non e un'interruzione live, e una verifica batch prima di passare al passo successivo.",
-        ],
-        # Phase 1 plan-approval + reply-box mandate. Dedicated `plan` field (not in
-        # the verbatim-mirrored `contract`) because the mandate differs per role; the
-        # Rust copy is English (UI), this one Italian (agents read it). Prima di lavoro
-        # multi-file il coder sottomette il piano e ASPETTA l'approvazione umana; su
-        # rifiuto rivede e re-invia; usa ask_user per le domande bloccanti invece di
-        # stallare nel terminale.
-        "plan": [
-            "Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l'approvazione umana: non iniziare l'implementazione prima di status=\"approved\".",
-            'APPENA approvato (status="approved") chiama SUBITO project_create_plan_tasks con la lista strutturata dei task: il Kanban ha ZERO task finche\' non lo fai, quindi NON iniziare a scrivere codice prima. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per FASE del piano, ognuna OBBLIGATORIAMENTE con {id, title} piu\' opzionali {acceptance, scope:[file], dependsOn}. `id` e\' un riferimento interno breve che assegni tu (es. "P1", "P2"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata (es. ["P1"]) — NON i numeri T del Kanban (li alloca il server rimappando i tuoi riferimenti).',
-            "Calibra le domande sulla complessita': per un task non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per task semplici/ovvi salta le domande e pianifica direttamente. Non sovra-consultare su lavori banali.",
-            'Se il piano viene rifiutato (status="rejected") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.',
-            "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
-        ],
-        # GH-P5 cooperative push mandate (mirrored in Rust default_role_rules
-        # coder.push — bilingual by design, Italian here, English there). Gli
-        # agenti committano liberamente ma NON fanno mai un `git push` grezzo:
-        # l'ambiente di lancio dell'agente non ha credenziali git, quindi un push
-        # grezzo fallisce subito; per pubblicare si passa dal tool MCP
-        # request_git_push con approvazione umana.
-        "push": [
-            "Committa liberamente (git add -u / git commit) per salvare il lavoro.",
-            "NON fare mai un `git push` grezzo: il tuo ambiente non ha credenziali git e fallira. Per pubblicare chiama il tool MCP `request_git_push`; un umano lo approva.",
-            'Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all\'umano via needs_user (agent_heartbeat status="needs_user"). NON riprovare, NON tentare un push grezzo, NON aggirare il gate.',
-        ],
-        "allowedTools": [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "project_set_title",
-            "project_create_followup",
-            "project_create_plan_tasks",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources",
-            "scaleway_resource_action",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "get_neighborhood",
-            "find_imports",
-            "censor_findings",
-            "censor_dispose",
-            "visual_check",
-            "design_request",
-            "spawn_mini_coder",
-            "steer_mini_coder",
-            "mini_coder_result",
-            "request_git_push",
-            "plan_submit",
-            "plan_status",
-            "ask_user",
-        ],
-        "forbidden": [
-            "Non imposta done: serve verifier con evidenza.",
-            "Non legge o stampa token. Usa solo token da env e scope Aspis Bio verificato.",
-            "Delega a spawn_mini_coder solo sub-task economici e meccanici (boilerplate, bulk read->summary, edit semplici, docstring, test); pre-carica il contesto necessario; ragiona tu; RIVEDI l'output del mini come bozza prima di usarlo.",
-            "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
-            "Per un task di WRITE scegli `write_mode`: 'agenticIterative' SOLO per file in un linguaggio con copertura del gate deterministico in QUESTO progetto E con un modello mini abbastanza capace di iterare; altrimenti 'emitEdits' (default). Nel dubbio usa 'emitEdits'.",
-            "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via needs_user (agent_heartbeat status=\"needs_user\").",
-            "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), rifai il file TU STESSO: il rail di training ha gia' catturato il fallimento, quindi NON rilanciare ciecamente il mini sullo stesso file.",
-            "Prima di mettere un task in review: fai girare UN SOLO pass di review tuo (un subagente Sonnet) sui file che hai toccato, fixa i finding, POI sposta il task a review con una nota 'ready for final reviewer'. Il verdetto FINALE resta del verifier (il pass finale censorReview si lancia dall'app, NON parte da solo quando metti review), mai del tuo pass.",
-            "Quando produci o revisioni un artifact HTML self-contained e serve feedback visuale, chiama visual_check(html_path, focus?) e tratta la critique come evidenza advisory.",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
-        ],
-    },
-    {
-        # ORCHESTRATOR: the FRONTIER planning tier that PLANS + DELEGATES (locally
-        # the devboule binary; the role is backend-agnostic). It owns the same
-        # Kanban/transition powers as the coder (CODER_LIKE_ROLES) and — owner
-        # decision, role untangle 2026-07 — the FULL provider surface (Cloudflare/
-        # Scaleway read + mutation): to plan seriously it must see and manage the
-        # project's infra. What it NEVER holds is a file-write tool: EVERY code
-        # change is delegated to spawn_mini_coder. Its allowlist stays a subset of
-        # the coder's (no Censor tools, no visual_check, no verifier-only
-        # transition).
-        "role": "orchestrator",
-        "summary": "Il tier di PIANIFICAZIONE di punta: capisce progetto e infrastruttura via oracle_ask/oracle_context e i tool provider (Cloudflare/Scaleway, lettura e mutazione con task+evidenza), delega OGNI scrittura di codice a spawn_mini_coder, gestisce il Kanban come un coder (claim, wip/review/blocked, riapri a todo) ma il done resta verifier; pubblica via request_git_push col gate umano.",
-        # Plan-approval + reply-box mandate (same shape as the coder's). Prima di
-        # lavoro multi-file l'orchestrator sottomette il piano e ASPETTA
-        # l'approvazione umana — "mai full-auto non presidiato".
-        "plan": [
-            'Prima di lavoro multi-file invia il piano con plan_submit(project_id, title, plan_markdown) e ASPETTA l\'approvazione umana: non iniziare la delega prima di status="approved".',
-            'APPENA approvato (status="approved") chiama SUBITO project_create_plan_tasks con UNA targhetta per FASE del piano: il Kanban ha ZERO task finche\' non lo fai. Crea i task PRIMA di delegare, poi delega in ordine di dipendenza. Passa plan_id = il campo `planId` restituito da plan_submit, e tasks = una entry per fase, ognuna OBBLIGATORIAMENTE con {id, title} piu\' opzionali {acceptance, scope:[file], dependsOn}. `id` e\' un riferimento interno breve che assegni tu (es. "P1"); `dependsOn` elenca gli id di ALTRI task in QUESTA STESSA chiamata — NON i numeri T del Kanban (li alloca il server).',
-            "Calibra le domande sulla complessita': per un obiettivo non banale o ambiguo fai FINO A 3 domande mirate con ask_user PRIMA di pianificare (zero va bene se e' chiaro); per richieste semplici/ovvie pianifica direttamente senza sovra-consultare.",
-            'Se il piano viene rifiutato (status="rejected") rivedilo seguendo la `note` del revisore e RE-INVIA con plan_submit; non procedere col piano bocciato.',
-            "Se hai una domanda bloccante per l'umano usa ask_user(question) e attendi la risposta, invece di stallare o indovinare nel terminale.",
-        ],
-        # Cooperative push mandate (identical to the coder's): commit freely, never
-        # raw-push, publish only via the human-approved request_git_push gate.
-        "push": [
-            "Committa liberamente (git add -u / git commit) per salvare il lavoro.",
-            "NON fare mai un `git push` grezzo: il tuo ambiente non ha credenziali git e fallira. Per pubblicare chiama il tool MCP `request_git_push`; un umano lo approva.",
-            "Se la richiesta di push viene negata o va in timeout, FERMATI ed escala all'umano via ask_user. NON riprovare, NON tentare un push grezzo, NON aggirare il gate.",
-        ],
-        "allowedTools": [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "project_set_title",
-            "project_create_followup",
-            "project_create_plan_tasks",
-            # ROLE UNTANGLE (2026-07, owner decision): the orchestrator is the
-            # FRONTIER planning tier — it must SEE and MANAGE the project's infra
-            # (providers, credentials) to plan seriously, so it holds the full
-            # provider surface the coder has (read + mutation; mutations still
-            # require a claimed task + evidence like every coder-like caller).
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "cloudflare_rotate_worker_secret",
-            "scaleway_list_resources",
-            "scaleway_resource_action",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "get_neighborhood",
-            "find_imports",
-            "spawn_mini_coder",
-            # ROLE UNTANGLE Phase 3: the orchestrator dispatches substantial work
-            # to the first-class MAIN CODER (always-agentic sandboxed engine).
-            # Orchestrator-only — the coder CLIs write with their own tools.
-            "spawn_main_coder",
-            "steer_mini_coder",
-            "mini_coder_result",
-            "request_git_push",
-            "plan_submit",
-            "plan_status",
-            "ask_user",
-            "design_request",
-        ],
-        "forbidden": [
-            "Non scrive MAI file direttamente: NON hai alcun tool di scrittura/mutazione del filesystem. OGNI modifica al codice passa per la delega: spawn_main_coder per il lavoro sostanzioso/multi-file (il Main coder agentico sandboxato), spawn_mini_coder per i sotto-task economici/meccanici (tu pianifichi e riveli il contesto; loro scrivono).",
-            "Per SUPERVISIONARE un mini delegato chiama spawn_mini_coder con wait=false per avere subito il suo directiveId, osserva la sua attivita', manda correzioni con steer_mini_coder(directiveId, message) (o steer_mini_coder(directiveId, \"stop\") per interromperlo), poi mini_coder_result(directiveId) per raccoglierne l'esito. Il default spawn_mini_coder (wait omesso) blocca e restituisce l'esito direttamente, per una delega fire-and-forget semplice.",
-            "Per domande su progetto o codebase usa PRIMA oracle_ask / oracle_context (capacita di comprensione grounded): non indovinare ne leggere il filesystem a mano.",
-            "Non imposta done: e verifier-only con evidenza. Tu puoi solo claim e wip/review/blocked (e riapertura a todo), esattamente come un coder.",
-            "Ogni cambiamento passa per Censor + il Kanban + il gate umano: mai full-auto non presidiato. Quando un sotto-task e pronto, mettilo in review con una nota e lascia il verdetto finale al verifier.",
-            "Se spawn_mini_coder torna status='aborted_by_human' FERMA quel lavoro, NON riprovare il mini in silenzio, ed escala all'umano via ask_user.",
-            "Se spawn_mini_coder torna status='escalated' (la catena di retry e' esaurita e Censor e' ancora sporco), FERMATI ed escala all'umano via ask_user invece di rilanciare ciecamente lo stesso file.",
-            "Non legge o stampa token o segreti. Usa solo token da env e scope Aspis Bio verificato; nessun provider OpenAI/Anthropic-API/GCP/AWS sui dati utente (solo Scaleway/Infomaniak EU, ZDR).",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti (mini-coder) manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
-        ],
-    },
-    {
-        "role": "verifier",
-        "summary": "Controlla task in review, output, test e rischi. Puo chiudere task o riaprirli come blocked.",
-        # PHASE E mandate (mirrored in Rust default_role_rules verifier.censor): the
-        # verifier is Censor's final authority over the residual ledger.
-        "censor": [
-            "Chiama censor_findings(project_id) per il ledger residuo; ignora i finding gia risolti.",
-            "Concentrati su problemi cross-file, architetturali e di sicurezza multi-file che il modello piccolo non puo vedere.",
-            "Adjudica: conferma i finding reali e chiudi i falsi positivi con censor_dispose (fp/wontfix/fixed).",
-        ],
-        "allowedTools": [
-            "agent_register",
-            "agent_heartbeat",
-            "agent_state",
-            "project_list",
-            "project_get",
-            "project_next_task",
-            "project_claim_task",
-            "project_update_status",
-            "project_append_note",
-            "provider_credentials_status",
-            "cloudflare_list_workers",
-            "scaleway_list_resources",
-            "oracle_ask",
-            "oracle_context",
-            "project_structure",
-            "get_neighborhood",
-            "find_imports",
-            "censor_findings",
-            "censor_dispose",
-            "visual_check",
-            "ask_user",
-            "plan_status",
-        ],
-        "forbidden": [
-            "Non modifica codice.",
-            "Non modifica Cloudflare o Scaleway: solo read-only.",
-            "Non marca done se il task non e in review, o senza evidence e confidence >= 0.70.",
-            "Quando revisioni un artifact HTML self-contained, chiama visual_check(html_path, focus?) se il layout visuale puo influire sul verdetto; tratta la critique come evidenza advisory.",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            "Quando spawni o chiudi subagenti manda agent_heartbeat con `subagents=[{label, model, count, role?}]` aggiornato.",
-            'Quando aspetti l\'umano (domanda, permesso allow/deny, blocco) manda agent_heartbeat con status="needs_user" e un message chiaro.',
-        ],
-    },
-    {
-        "role": "mini",
-        "summary": "Sub-agente one-shot in SOLA LETTURA: usa oracle_context per leggere il codebase e project_structure per la spina dorsale architetturale, nient'altro.",
-        "allowedTools": [
-            "agent_register",
-            "oracle_context",
-            "project_structure",
-            "get_neighborhood",
-            "find_imports",
-        ],
-        "forbidden": [
-            "Non modifica codice, task, Kanban, provider o findings: NESSUN tool di mutazione.",
-            "Non spawna altri agenti, non manda agent_heartbeat (niente subagents, niente needs_user: il contatto umano e' del coder padre) e non chiama censor_*: e' una foglia one-shot.",
-            "Non legge o stampa token o segreti.",
-        ],
-        "contract": [
-            "Dichiara il modello (`model`) ad agent_register.",
-            'Registrati con agent_register (role="mini") prima di chiamare oracle_context / project_structure.',
-        ],
-    },
-]
+# SINGLE SOURCE OF TRUTH: role rules live in oracle/server/role_rules.json
+# (English only, 4 roles). Edit the JSON, not this module — it is loaded
+# verbatim at import time, no hand-synced literal, no silent fallback.
+_ROLE_RULES_PATH = Path(__file__).resolve().parent / "role_rules.json"
+# utf-8-sig: identical to utf-8 for a clean file, but strips a leading BOM if a
+# Windows editor ever saves one — json.loads on a BOM-prefixed string would
+# otherwise take the whole MCP server down at import (this file is the SSoT and
+# explicitly invites hand-edits).
+ROLE_RULES = json.loads(_ROLE_RULES_PATH.read_text(encoding="utf-8-sig"))["roles"]
 
 ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_RULES}
 
@@ -546,12 +310,12 @@ ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_R
 TOOLS = [
     {
         "name": "agent_rules",
-        "description": "Restituisce ruoli, responsabilita e divieti pratici per agenti Aspis.",
+        "description": "Returns roles, responsibilities, and practical restrictions for Aspis agents.",
         "parameters": {},
     },
     {
         "name": "agent_state",
-        "description": "Legge stato live di sessioni agenti, claim e ultimi eventi dopo registrazione.",
+        "description": "Reads the live state of agent sessions, claims, and latest events after registration.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -560,7 +324,7 @@ TOOLS = [
     },
     {
         "name": "agent_register",
-        "description": "Registra un agente CLI prima di leggere o aggiornare progetti.",
+        "description": "Registers a CLI agent before reading or updating projects.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -572,7 +336,7 @@ TOOLS = [
     },
     {
         "name": "agent_heartbeat",
-        "description": "Aggiorna presenza live dell'agente nella dashboard.",
+        "description": "Updates the agent's live presence in the dashboard.",
         "parameters": {
             "agent_id": {"type": "string"},
             "status": {"type": "string"},
@@ -593,13 +357,13 @@ TOOLS = [
     {
         "name": "spawn_mini_coder",
         "description": (
-            "Solo coder: delega un sotto-task economico a un mini-coder one-shot "
-            "ospitato dall'app; blocca finche il mini termina e restituisce il "
-            "risultato terminale. Per i task di WRITE scegli `write_mode`: "
-            "'agenticIterative' (il mini corregge su piu round contro il gate "
-            "deterministico) SOLO per file in un linguaggio con copertura del gate "
-            "in questo progetto E con un modello mini abbastanza capace di iterare; "
-            "altrimenti 'emitEdits' (default: una scrittura + una correzione)."
+            "Coder only: delegates a cheap sub-task to a one-shot mini-coder "
+            "hosted by the app; blocks until the mini finishes and returns the "
+            "terminal result. For WRITE tasks choose `write_mode`: "
+            "'agenticIterative' (the mini corrects over multiple rounds against the "
+            "deterministic gate) ONLY for files in a language with gate coverage "
+            "in this project AND with a mini model capable enough to iterate; "
+            "otherwise 'emitEdits' (default: one write + one correction)."
         ),
         "parameters": {
             "agent_id": {"type": "string"},
@@ -648,11 +412,11 @@ TOOLS = [
         # downgrading it to a one-shot mini.
         "name": "spawn_main_coder",
         "description": (
-            "Solo orchestrator: dispaccia un task SOSTANZIOSO al MAIN CODER locale "
-            "(l'engine agentico sandboxato: loop multi-round read/edit/grep/run "
-            "contro il gate deterministico). A differenza di spawn_mini_coder e' "
-            "sempre agentico e pensato per task multi-file/di peso; write e "
-            "write_mode sono forzati lato server. Supervisione identica al mini: "
+            "Orchestrator only: dispatches a SUBSTANTIAL task to the local MAIN "
+            "CODER (the sandboxed agentic engine: multi-round read/edit/grep/run "
+            "loop against the deterministic gate). Unlike spawn_mini_coder it is "
+            "always agentic and meant for multi-file/heavyweight tasks; write and "
+            "write_mode are forced server-side. Same supervision as the mini: "
             "wait=false + steer_mini_coder + mini_coder_result(directiveId)."
         ),
         "parameters": {
@@ -677,7 +441,7 @@ TOOLS = [
     {
         "name": "steer_mini_coder",
         "description": (
-            "Solo coder/orchestrator: steer a RUNNING mini-coder you spawned by appending "
+            "Coder/orchestrator only: steer a RUNNING mini-coder you spawned by appending "
             "a mid-flight correction to its steer queue. The app folds queued corrections "
             "into the mini's NEXT fix-pass round (it takes effect at a round boundary, not "
             "mid-token), reusing the same channel as the Stop button. Send the message "
@@ -702,7 +466,7 @@ TOOLS = [
     {
         "name": "mini_coder_result",
         "description": (
-            "Solo coder/orchestrator: collect the outcome of a mini you delegated with "
+            "Coder/orchestrator only: collect the outcome of a mini you delegated with "
             "spawn_mini_coder(wait=false). Pass the directiveId it returned. With "
             "wait=true (default) BLOCKS until the mini reaches a terminal outcome and "
             "returns {directiveId, result} (same poll/timeout semantics as the blocking "
@@ -784,7 +548,7 @@ TOOLS = [
     },
     {
         "name": "request_git_push",
-        "description": "Solo coder: RICHIEDE l'approvazione umana per un git push (puoi committare liberamente, ma il push lo approva l'umano). Blocca finche l'umano approva (e l'app esegue il push) o nega; su timeout FERMATI, non riprovare, non fare push diretto.",
+        "description": "Coder only: REQUESTS human approval for a git push (you may commit freely, but the human approves the push). Blocks until the human approves (and the app performs the push) or denies; on timeout STOP, do not retry, do not push directly.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -797,7 +561,7 @@ TOOLS = [
     },
     {
         "name": "plan_submit",
-        "description": "Solo coder: invia un piano di implementazione (markdown) per l'approvazione umana prima di lavoro multi-file; blocca finche l'umano approva o rifiuta. Su rifiuto rivedi e re-invia; su timeout fermati e non procedere senza approvazione.",
+        "description": "Coder only: submits an implementation plan (markdown) for human approval before multi-file work; blocks until the human approves or rejects it. On rejection revise and resubmit; on timeout stop and do not proceed without approval.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -809,7 +573,7 @@ TOOLS = [
     },
     {
         "name": "plan_status",
-        "description": "Coder o verifier: legge lo stato corrente di un piano gia inviato (pending_approval/approved/rejected/timeout) dato il suo plan_id.",
+        "description": "Coder or verifier: reads the current status of an already-submitted plan (pending_approval/approved/rejected/timeout) given its plan_id.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -819,7 +583,7 @@ TOOLS = [
     },
     {
         "name": "ask_user",
-        "description": "Coder o verifier: fai una domanda bloccante all'umano e attendi la risposta invece di stallare nel terminale; blocca finche arriva la risposta o scade il timeout.",
+        "description": "Coder or verifier: ask the human a blocking question and wait for the answer instead of stalling in the terminal; blocks until the answer arrives or the timeout expires.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -829,7 +593,7 @@ TOOLS = [
     },
     {
         "name": "project_list",
-        "description": "Lista progetti Markdown locali leggibili dagli agenti.",
+        "description": "Lists local Markdown projects readable by agents.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -838,7 +602,7 @@ TOOLS = [
     },
     {
         "name": "project_get",
-        "description": "Legge un progetto con task, note, revision e path.",
+        "description": "Reads a project with tasks, notes, revision, and path.",
         "parameters": {
             "project_id": {"type": "string"},
             "agent_id": {"type": "string"},
@@ -848,7 +612,7 @@ TOOLS = [
     },
     {
         "name": "project_next_task",
-        "description": "Suggerisce il prossimo task non completato per un ruolo.",
+        "description": "Suggests the next incomplete task for a role.",
         "parameters": {
             "project_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -858,7 +622,7 @@ TOOLS = [
     },
     {
         "name": "project_claim_task",
-        "description": "Crea un claim con lease sul task, visibile nella dashboard agenti.",
+        "description": "Creates a leased claim on the task, visible in the agent dashboard.",
         "parameters": {
             "project_id": {"type": "string"},
             "task_id": {"type": "string"},
@@ -869,7 +633,7 @@ TOOLS = [
     },
     {
         "name": "project_update_status",
-        "description": "Aggiorna status task/progetto con note ed evento auditabile.",
+        "description": "Updates task/project status with notes and an auditable event.",
         "parameters": {
             "project_id": {"type": "string"},
             "task_id": {"type": "string"},
@@ -883,7 +647,7 @@ TOOLS = [
     },
     {
         "name": "project_append_note",
-        "description": "Aggiunge una nota strutturata al progetto.",
+        "description": "Adds a structured note to the project.",
         "parameters": {
             "project_id": {"type": "string"},
             "text": {"type": "string"},
@@ -894,7 +658,7 @@ TOOLS = [
     },
     {
         "name": "project_set_title",
-        "description": "Rinomina il progetto: imposta il titolo deciso durante la conversazione di planning.",
+        "description": "Renames the project: sets the title decided during the planning conversation.",
         "parameters": {
             "project_id": {"type": "string"},
             "title": {"type": "string"},
@@ -905,7 +669,7 @@ TOOLS = [
     },
     {
         "name": "project_create_followup",
-        "description": "Crea un task TODO di follow-up senza chiudere quello corrente.",
+        "description": "Creates a follow-up TODO task without closing the current one.",
         "parameters": {
             "project_id": {"type": "string"},
             "title": {"type": "string"},
@@ -924,10 +688,10 @@ TOOLS = [
     {
         "name": "project_create_plan_tasks",
         "description": (
-            "Bulk-crea i task di un piano approvato sul Kanban del progetto come "
-            "todo, taggati col planId. Alloca id T<n> freschi (nessuna collisione coi "
-            "task manuali) e rimappa dependsOn dagli id interni del piano agli id "
-            "allocati; valida che il DAG sia aciclico. Ritorna gli id allocati."
+            "Bulk-creates the tasks of an approved plan on the project's Kanban as "
+            "todos, tagged with planId. Allocates fresh T<n> ids (no collision with "
+            "manual tasks) and remaps dependsOn from the plan's internal ids to the "
+            "allocated ids; validates that the DAG is acyclic. Returns the allocated ids."
         ),
         "parameters": {
             "project_id": {"type": "string"},
@@ -953,7 +717,7 @@ TOOLS = [
     },
     {
         "name": "provider_credentials_status",
-        "description": "Read-only: diagnostica quali credenziali provider/Oracle sono configurate senza esporre segreti.",
+        "description": "Read-only: diagnoses which provider/Oracle credentials are configured without exposing secrets.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -962,7 +726,7 @@ TOOLS = [
     },
     {
         "name": "cloudflare_list_workers",
-        "description": "Read-only: lista Workers nell'account Aspis Bio Cloudflare.",
+        "description": "Read-only: lists Workers in the Aspis Bio Cloudflare account.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -972,7 +736,7 @@ TOOLS = [
     },
     {
         "name": "cloudflare_rotate_worker_secret",
-        "description": "Coder-only: ruota un secret di un Worker Cloudflare Aspis Bio.",
+        "description": "Coder-only: rotates a secret of an Aspis Bio Cloudflare Worker.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -988,7 +752,7 @@ TOOLS = [
     },
     {
         "name": "scaleway_list_resources",
-        "description": "Read-only: lista VM, funzioni e container nel progetto Scaleway Aspis Bio.",
+        "description": "Read-only: lists VMs, functions, and containers in the Aspis Bio Scaleway project.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -998,7 +762,7 @@ TOOLS = [
     },
     {
         "name": "scaleway_resource_action",
-        "description": "Coder-only: start/stop/reboot/terminate VM o deploy serverless nel progetto Aspis Bio.",
+        "description": "Coder-only: start/stop/reboot/terminate a VM or serverless deploy in the Aspis Bio project.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -1015,7 +779,7 @@ TOOLS = [
     },
     {
         "name": "oracle_ask",
-        "description": "Chiedi all'Oracle informazioni sull'architettura del progetto.",
+        "description": "Ask the Oracle for information about the project's architecture.",
         "parameters": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 5},
@@ -1027,7 +791,7 @@ TOOLS = [
     },
     {
         "name": "oracle_context",
-        "description": "Restituisce chunk testuali semanticamente rilevanti per agenti.",
+        "description": "Returns semantically relevant text chunks for agents.",
         "parameters": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 8},
@@ -1039,7 +803,7 @@ TOOLS = [
     },
     {
         "name": "project_structure",
-        "description": "Read-only: i file architetturalmente centrali (la 'spina dorsale') del progetto + i conteggi riassuntivi, calcolati in modo deterministico (no-LLM, tree-sitter). Usalo PRIMA di oracle_ask per orientarti su quali file toccare.",
+        "description": "Read-only: the architecturally central files (the project's 'backbone') plus summary counts, computed deterministically (no-LLM, tree-sitter). Use it BEFORE oracle_ask to orient yourself on which files to touch.",
         "parameters": {
             "project_id": {"type": "string"},
             "full": {"type": "boolean", "default": False},
@@ -1074,7 +838,7 @@ TOOLS = [
     },
     {
         "name": "censor_findings",
-        "description": "Legge i finding APERTI di Censor (linter locali + Gemma) per un progetto; filtra per file con `file`.",
+        "description": "Reads Censor's OPEN findings (local linters + Gemma) for a project; filter by file with `file`.",
         "parameters": {
             "project_id": {"type": "string"},
             "file": {"type": "string", "default": ""},
@@ -1086,7 +850,7 @@ TOOLS = [
     },
     {
         "name": "censor_dispose",
-        "description": "Imposta la disposition di un finding Censor (open|fixed|fp|wontfix) e aggiunge una voce di provenance.",
+        "description": "Sets the disposition of a Censor finding (open|fixed|fp|wontfix) and adds a provenance entry.",
         "parameters": {
             "project_id": {"type": "string"},
             "file": {"type": "string"},
@@ -1443,14 +1207,27 @@ def normalize_provider_name(value: str) -> str:
 
 def validate_management_root(candidate: Path) -> Path:
     root = candidate.expanduser().resolve()
-    if root.name == "src-tauri" and root.parent.joinpath("config.json").exists():
+    # A `src-tauri` candidate (the dev app's cwd) normalizes to the repo root
+    # whenever the parent actually carries the oracle package — the parent IS
+    # the management root regardless of where config.json sits (see below).
+    if root.name == "src-tauri" and root.parent.joinpath(
+        "oracle", "server", "aspis_mcp.py"
+    ).is_file():
         root = root.parent.resolve()
-    if (
-        not root.joinpath("config.json").is_file()
-        or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file()
-    ):
+    # SPLIT LAYOUT (F1, mute-orchestrator fix 2026-07-02): the dev app writes
+    # `config.json` under `src-tauri/`, not the repo root. Accept either
+    # location — requiring the root copy made every candidate invalid the
+    # moment the root copy disappeared, so every spawned MCP child was pointed
+    # at a root with no `oracle` package and died on import (mute fleet).
+    # Mirrors `is_valid_management_root` in src-tauri/src/backend/agents.rs —
+    # keep the two in lock-step.
+    has_config = (
+        root.joinpath("config.json").is_file()
+        or root.joinpath("src-tauri", "config.json").is_file()
+    )
+    if not has_config or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file():
         raise McpError(
-            "Aspis MCP management root is invalid. Run from Aspis Management, pass --root, or set ASPIS_MANAGEMENT_ROOT."
+            "Devboule MCP management root is invalid. Run from Devboule, pass --root, or set ASPIS_MANAGEMENT_ROOT."
         )
     root.joinpath("projects").mkdir(parents=True, exist_ok=True)
     return root
@@ -1817,7 +1594,7 @@ def validate_launch_token_for_registration(
     if session is None:
         if not unmanaged_privileged_agents_allowed():
             raise McpError(
-                "Agent registration requires an app-issued launch token from Aspis Management."
+                "Agent registration requires an app-issued launch token from Devboule."
             )
         return None
     # MINOR 2 (defense-in-depth): use the NON-raising `coerce_role` on the STORED
@@ -1846,14 +1623,14 @@ def validate_launch_token_for_registration(
             or datetime.now(timezone.utc) - issued_at > LAUNCH_TOKEN_WINDOW
         ):
             raise McpError(
-                "Agent launch token expired. Relaunch the agent from Aspis Management."
+                "Agent launch token expired. Relaunch the agent from Devboule."
             )
         if not hmac.compare_digest(hash_launch_token(token), expected_hash):
             raise McpError("Agent launch token is invalid for this agent id and role.")
         return session
     if str(session.get("status") or "").strip().lower() == "launch_pending":
         raise McpError(
-            "Pending agent session is missing a launch token. Relaunch the agent from Aspis Management."
+            "Pending agent session is missing a launch token. Relaunch the agent from Devboule."
         )
     # SEC#7: a session whose launch token was already CONSUMED cannot be
     # re-registered tokenless — the one-shot launch credential is spent. (A
@@ -1861,7 +1638,7 @@ def validate_launch_token_for_registration(
     # no launchConsumedAt and is unaffected.)
     if str(session.get("launchConsumedAt") or "").strip():
         raise McpError(
-            "Agent launch credential already consumed; relaunch the agent from Aspis Management to register again."
+            "Agent launch credential already consumed; relaunch the agent from Devboule to register again."
         )
     return session
 
@@ -2444,7 +2221,20 @@ def cap_mini_coder_directives(directives: list[Any]) -> list[dict[str, Any]]:
     id tie-break); ACTIVE/pending directives are NEVER dropped even past the cap (a
     pending request or a running mini must not be lost). Non-dict entries (hand
     edit / partial write) are filtered out so a stray value cannot brick the read.
-    Original order is otherwise preserved."""
+    Original order is otherwise preserved.
+
+    F-E hardening: within the TERMINAL pool, eviction prefers COLLECTED directives
+    (`collected: true`, stamped by `mini_coder_result` once it has successfully
+    handed a terminal outcome back to its caller) FIRST, oldest-first; an
+    UNCOLLECTED terminal directive — whose outcome a caller may still be about to
+    poll for via the async `spawn_mini_coder(wait=false)` + `mini_coder_result`
+    pattern — is only evicted if the cap is STILL exceeded after every collected
+    directive is gone. A directive with no `collected` key (every directive before
+    this hardening, and every directive collected via the ORIGINAL blocking
+    `spawn_mini_coder`/`mini_coder_result` path, which returns the result inline
+    and never stamps this) is treated as uncollected, so the ordering degrades to
+    the prior oldest-first-only behavior when nothing is stamped.
+    """
     clean = [d for d in directives if isinstance(d, dict)]
     if len(clean) <= MAX_MINI_CODER_DIRECTIVES:
         return clean
@@ -2456,11 +2246,20 @@ def cap_mini_coder_directives(directives: list[Any]) -> list[dict[str, Any]]:
     ]
     if drop_count <= 0 or not terminal:
         return clean
-    terminal_sorted_oldest = sorted(
-        terminal,
-        key=lambda d: (str(d.get("createdAt") or ""), str(d.get("id") or "")),
+
+    def sort_key(d: dict[str, Any]) -> tuple[str, str]:
+        return (str(d.get("createdAt") or ""), str(d.get("id") or ""))
+
+    collected_terminal_oldest = sorted(
+        (d for d in terminal if d.get("collected") is True), key=sort_key
     )
-    to_drop = {id(d) for d in terminal_sorted_oldest[:drop_count]}
+    uncollected_terminal_oldest = sorted(
+        (d for d in terminal if d.get("collected") is not True), key=sort_key
+    )
+    # Collected-first (oldest-first within it), THEN uncollected (oldest-first
+    # within it) only if the cap is still exceeded.
+    eviction_order = collected_terminal_oldest + uncollected_terminal_oldest
+    to_drop = {id(d) for d in eviction_order[:drop_count]}
     return [d for d in clean if id(d) not in to_drop]
 
 
@@ -2805,7 +2604,7 @@ def require_session_token(session: dict[str, Any], session_token: str | None) ->
         ):
             return
         raise McpError(
-            "Agent session is missing a session token. Relaunch the agent from Aspis Management."
+            "Agent session is missing a session token. Relaunch the agent from Devboule."
         )
     token = str(session_token or "").strip()
     if not token:
@@ -2818,7 +2617,7 @@ def require_session_token(session: dict[str, Any], session_token: str | None) ->
         or datetime.now(timezone.utc) - issued_at > SESSION_TOKEN_WINDOW
     ):
         raise McpError(
-            "Agent session token expired. Relaunch the agent from Aspis Management."
+            "Agent session token expired. Relaunch the agent from Devboule."
         )
     if not hmac.compare_digest(hash_session_token(token), expected_hash):
         raise McpError("Agent session token is invalid for this agent id and role.")
@@ -3371,7 +3170,10 @@ def read_macos_keychain_password(service: str, account: str) -> str | None:
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True,
             text=True,
-            timeout=5,
+            # LATENCY: a headless/stdio child with no keychain session hangs to
+            # this timeout (a real hit answers in tens of ms) — keep it short;
+            # the TTL cache above makes even this cost once-per-window.
+            timeout=2,
         )
     except Exception:
         return None
@@ -3389,19 +3191,41 @@ def app_vault_secret(key: str) -> str | None:
     return app_vault_account_secret(account)
 
 
+# LATENCY (2026-07-02 profiling): the vault lookup shells out to `security`
+# (macOS), which HANGS to its subprocess timeout when the stdio agent child has
+# no keychain session — measured 5.0s burned on EVERY oracle_ask, key present or
+# not. Cache the result (INCLUDING a miss) per account with a TTL so the hang is
+# paid at most once per window. TTL deliberately SHORT (max-recall finding):
+# there is no cross-process invalidation from the app's vault writer, so this
+# bound is also how long a ROTATED key keeps being served / a just-added key
+# keeps reading as missing in a live agent session. 30s caps that skew while
+# still amortizing bursts; a proper mtime/sentinel invalidation hook is the
+# follow-up if 30s ever hurts.
+_APP_VAULT_CACHE: dict[str, tuple[float, str | None]] = {}
+_APP_VAULT_TTL_SECONDS = 30.0
+
+
+def _reset_app_vault_cache() -> None:
+    """Test/seam helper: clear the app-vault TTL cache."""
+    _APP_VAULT_CACHE.clear()
+
+
 def app_vault_account_secret(account: str) -> str | None:
     if os.environ.get("ASPIS_MCP_DISABLE_APP_VAULT") == "1":
         return None
+    cached = _APP_VAULT_CACHE.get(account)
+    if cached is not None and time.monotonic() - cached[0] < _APP_VAULT_TTL_SECONDS:
+        return cached[1]
     try:
         if sys.platform == "darwin":
             value = read_macos_keychain_password(APP_VAULT_SERVICE, account)
         else:
             value = read_windows_credential_password(app_vault_target(account))
     except Exception:
-        return None
-    if value and value.strip():
-        return value.strip()
-    return None
+        value = None
+    result = value.strip() if value and value.strip() else None
+    _APP_VAULT_CACHE[account] = (time.monotonic(), result)
+    return result
 
 
 def secret_from_app_vault_or_env(vault_key: str, *env_names: str) -> str | None:
@@ -3467,7 +3291,7 @@ def provider_token_from_sources(vault_key: str, *env_names: str) -> str:
     if value:
         return value
     raise McpError(
-        "Missing provider token. Save it in Aspis Management > Secrets, or set env var: "
+        "Missing provider token. Save it in Devboule > Secrets, or set env var: "
         + ", ".join(env_names)
     )
 
@@ -4261,7 +4085,63 @@ def _resolve_oracle_http_target_uncached(projects_dir: Path) -> tuple[str, str] 
     if not _is_loopback_http_base(base):
         logger.warning("Oracle discovery baseUrl is not loopback; ignoring.")
         return None
+    # LATENCY (2026-07-02 profiling): a STALE discovery file (server crashed /
+    # app rebuilt) pointed the thin-client at a dead-or-hung target and each
+    # call burned the full HTTP timeout (measured 20.1s) before falling back to
+    # the in-process engine. When the supervisor recorded its pid, gate on its
+    # liveness — a dead pid means the target is gone, skip it immediately.
+    # A missing/garbage pid field keeps the pre-fix behavior (try the target).
+    # `bool` is an `int` subclass — a corrupt `"pid": true` must not probe pid 1.
+    pid = data.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and not _pid_alive(pid):
+        logger.info("Oracle discovery pid %s is not alive; using in-process engine.", pid)
+        return None
     return base, token
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort process-liveness probe (POSIX signal-0 / Windows OpenProcess).
+
+    True when the pid exists (even if owned by another user/integrity level —
+    access-denied still proves liveness on BOTH platforms); False for
+    exited/garbage pids. NEVER raises: a corrupt discovery file (oversized int →
+    OverflowError from os.kill/ctypes, or any other surprise) must degrade to
+    "dead" (skip the HTTP target, use the in-process engine), not crash every
+    oracle_ask until the file is fixed (max-recall finding, reproduced live).
+    """
+    try:
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                # NULL means EITHER "no such process" or "access denied" — the
+                # latter proves the pid is alive (mirrors the POSIX
+                # PermissionError branch; max-recall parity finding).
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+    except Exception as exc:
+        # Diagnosability (adversarial-verify finding): the never-raise contract
+        # must not make a REAL bug here invisible — a silent False would just
+        # look like "server dead" and quietly force the in-process fallback
+        # forever. Debug-level: expected garbage (oversized pid) is normal.
+        logger.debug("pid liveness probe failed for %r: %s", pid, exc)
+        return False
 
 
 class HttpOracleEngine:
@@ -4277,7 +4157,28 @@ class HttpOracleEngine:
     PRIVACY: this client never logs the auth token or absolute paths.
     """
 
-    def __init__(self, base_url: str, auth_token: str, timeout: float = 20.0):
+    def __init__(self, base_url: str, auth_token: str, timeout: float | None = None):
+        # LATENCY: 8s read-bound default (was a flat 20.0) — the resident
+        # bounded endpoints answer in ~1s warm; anything slower is most likely a
+        # hung server and the in-process fallback exists. Max-recall caveat: a
+        # COLD large-corpus read has historically crossed 5s (lance_store.py
+        # readiness-probe note), so the bound is env-overridable rather than
+        # hard-coded — set ASPIS_ORACLE_HTTP_TIMEOUT_SECS on big repos if the
+        # 8s ceiling ever double-works (timeout + in-process redo). Connect is
+        # capped separately at 1s in `_post` (loopback-only contract).
+        if timeout is None:
+            try:
+                timeout = float(
+                    os.environ.get("ASPIS_ORACLE_HTTP_TIMEOUT_SECS") or 8.0
+                )
+            except (TypeError, ValueError):
+                timeout = 8.0
+            # Clamp to a FINITE positive range (adversarial-verify finding):
+            # "inf"/"nan"/negatives parse fine and would silently defeat the
+            # cap this fix exists to enforce. 120s is already absurd for a
+            # loopback bounded endpoint; beyond that, fix the server instead.
+            if not (0.0 < timeout <= 120.0):  # NaN fails every comparison → clamped
+                timeout = 8.0
         self._base_url = base_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = timeout
@@ -4300,8 +4201,17 @@ class HttpOracleEngine:
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         httpx = import_httpx()
         status_error = getattr(httpx, "HTTPStatusError", None)
+        # LATENCY (2026-07-02 profiling): a hung-but-listening target used to
+        # burn the full flat timeout (measured 20.1s) before the in-process
+        # fallback kicked in. The server is LOOPBACK by contract, so connecting
+        # is sub-millisecond when alive — cap connect at 1s and keep
+        # `self._timeout` as the read/write/pool bound for real work.
+        timeout = self._timeout
+        timeout_type = getattr(httpx, "Timeout", None)
+        if timeout_type is not None:
+            timeout = timeout_type(self._timeout, connect=1.0)
         try:
-            with httpx.Client(timeout=self._timeout) as client:
+            with httpx.Client(timeout=timeout) as client:
                 response = client.post(
                     self._base_url + path, headers=self._headers(), json=payload
                 )
@@ -6152,13 +6062,35 @@ def dispatch_spawn_main_coder(
     the sandboxed multi-turn engine — and FAILS the directive (never a silent
     one-shot downgrade) if it cannot."""
     # Authn/authz against THIS tool's grant first — only the orchestrator holds it.
-    _agent_id, role = require_agent_tool(projects_dir, args, "spawn_main_coder")
+    agent_id, role = require_agent_tool(projects_dir, args, "spawn_main_coder")
     if "spawn_main_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
         raise McpError(f"{role} agents cannot use spawn_main_coder.")
+    # CO-WRITER PARITY (main_coder.rs validate_main_coder_request): the Main tier
+    # caps files at 10, tighter than the mini's shared MINI_CODER_MAX_FILES=64.
+    # Checked here (not in the shared dispatch) so the mini path is untouched.
+    files = args.get("files") or []
+    if isinstance(files, list) and len(files) > MAIN_CODER_MAX_FILES:
+        raise McpError(
+            f"spawn_main_coder accepts at most {MAIN_CODER_MAX_FILES} files."
+        )
     forced = dict(args)
     forced["write"] = True
     forced["write_mode"] = "agenticIterative"
-    return dispatch_spawn_mini_coder(projects_dir, state_lock, forced, tier="main")
+    # F-F hardening (double-auth coupling): pass our ALREADY-VALIDATED identity
+    # through so the shared dispatch below does NOT re-derive it against its OWN
+    # "spawn_mini_coder" grant. Before this, that internal re-derivation made a
+    # successful spawn_main_coder call SECRETLY DEPEND on the caller's role ALSO
+    # holding "spawn_mini_coder" — true only because today's sole
+    # "spawn_main_coder" holder (orchestrator) happens to hold both; a future role
+    # with spawn_main_coder but not spawn_mini_coder would otherwise fail here for
+    # no policy reason.
+    return dispatch_spawn_mini_coder(
+        projects_dir,
+        state_lock,
+        forced,
+        tier="main",
+        _preauthorized=(agent_id, role),
+    )
 
 
 def dispatch_spawn_mini_coder(
@@ -6166,6 +6098,7 @@ def dispatch_spawn_mini_coder(
     state_lock: Path,
     args: dict[str, Any],
     tier: str = "mini",
+    _preauthorized: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Coder-only: delegate a cheap sub-task to a one-shot mini-coder the APP hosts.
 
@@ -6192,11 +6125,26 @@ def dispatch_spawn_mini_coder(
     directive's `parentAgentId`, and it must be a LIVE (active) session — a coder
     that already closed cannot spawn a mini that would outlive its only
     human-contact point.
+
+    `_preauthorized` (F-F hardening): when set, `(agent_id, role)` from an ALREADY
+    -validated caller — used ONLY by `dispatch_spawn_main_coder`, which reuses this
+    function as an implementation detail after authenticating against its OWN
+    "spawn_main_coder" grant. Skips re-deriving identity/role via
+    `require_agent_tool` (and the "spawn_mini_coder"-specific allowlist check)
+    here, so a spawn_main_coder call never depends on the caller's role ALSO
+    separately holding "spawn_mini_coder" — the two grants stay independent.
     """
-    # 1) Authn/authz the CALLER (registered coder + valid session token).
-    agent_id, role = require_agent_tool(projects_dir, args, "spawn_mini_coder")
-    if "spawn_mini_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
-        raise McpError(f"{role} agents cannot use spawn_mini_coder.")
+    # 1) Authn/authz the CALLER (registered coder + valid session token) — UNLESS
+    #    an already-authenticated identity was handed to us (see `_preauthorized`
+    #    above), in which case re-deriving it here would wrongly re-impose the
+    #    "spawn_mini_coder" grant on a caller who was authorized under a DIFFERENT
+    #    (but equally valid) grant.
+    if _preauthorized is not None:
+        agent_id, role = _preauthorized
+    else:
+        agent_id, role = require_agent_tool(projects_dir, args, "spawn_mini_coder")
+        if "spawn_mini_coder" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+            raise McpError(f"{role} agents cannot use spawn_mini_coder.")
 
     # 2) Validate the task + files (the directive payload the executor + mini act on).
     task = clean_text(args.get("task"), "Mini-coder task", MINI_CODER_MAX_TASK_LEN)
@@ -6410,6 +6358,31 @@ def dispatch_spawn_mini_coder(
     return _await_mini_directive(projects_dir, state_lock, directive_id, deadline)
 
 
+def _stamp_mini_directive_collected(
+    projects_dir: Path, state_lock: Path, directive_id: str
+) -> None:
+    """F-E hardening: best-effort mark `directive_id`'s directive `collected: true`
+    once `mini_coder_result` has successfully handed its TERMINAL outcome back to
+    the caller. `cap_mini_coder_directives` evicts COLLECTED terminal directives
+    before UNCOLLECTED ones (oldest-first within each group) — a directive whose
+    outcome was never picked up (the caller may still be about to poll for it via
+    the async pattern) survives longer than one already delivered.
+
+    Best-effort, mirroring the other `try/except McpError: pass` stamps in this
+    module: a failed stamp must never change `mini_coder_result`'s contract — the
+    caller already has the result by the time this is called."""
+    try:
+        with file_lock(state_lock):
+            state = read_agents_state(projects_dir)
+            for directive in state.get("miniCoderDirectives", []):
+                if isinstance(directive, dict) and str(directive.get("id") or "") == directive_id:
+                    directive["collected"] = True
+                    break
+            write_agents_state(projects_dir, state)
+    except McpError:
+        pass
+
+
 def dispatch_mini_coder_result(
     projects_dir: Path,
     state_lock: Path,
@@ -6461,18 +6434,26 @@ def dispatch_mini_coder_result(
     if wait:
         if _res is not None:
             # Already terminal — return immediately without entering the bounded poll.
+            # F-E: stamp collected — this outcome is now successfully handed back.
+            _stamp_mini_directive_collected(projects_dir, state_lock, directive_id)
             return {"directiveId": directive_id, "result": _res}
         deadline = time.monotonic() + MINI_CODER_POLL_TIMEOUT_SECS
-        return _await_mini_directive(
+        outcome = _await_mini_directive(
             projects_dir,
             state_lock,
             directive_id,
             deadline,
             caller_tool="mini_coder_result",
         )
+        # F-E: the poll always returns a TERMINAL {directiveId, result} shape (real
+        # or synthesized) — stamp collected now that it has been handed back.
+        _stamp_mini_directive_collected(projects_dir, state_lock, directive_id)
+        return outcome
 
     # wait=false: single-read result (we already have _res from the not-found/owner check).
     if _res is not None:
+        # F-E: stamp collected — this outcome is now successfully handed back.
+        _stamp_mini_directive_collected(projects_dir, state_lock, directive_id)
         return {"directiveId": directive_id, "result": _res}
     return {"directiveId": directive_id, "status": "running"}
 
@@ -6813,30 +6794,30 @@ def dispatch_design_request(projects_dir, state_lock, args):
     if "design_request" not in ROLE_ALLOWED_TOOLS.get(role, set()):
         raise McpError(f"{role} agents cannot use design_request.")
     prompt = clean_text(args.get("prompt"), "Design prompt", 4000)
-	    if not prompt:
-	        raise McpError("Design prompt is required.")
-	    context = args.get("context")
-	    plan_context = clean_text(context, "Design context", 4000) if context else None
-	    # Phase 3: optional mode / frame forwarded to the watcher unchanged.
-	    raw_mode = args.get("mode") or ""
-	    mode = raw_mode if raw_mode in ("static", "interactive") else None
-	    raw_frame = args.get("frame") or ""
-	    frame = raw_frame if raw_frame in ("android", "ios", "web", "component") else None
-	    directive_id = uuid.uuid4().hex
-	    directive = {
-	        "id": directive_id,
-	        "parentAgentId": agent_id,
-	        "status": "pending",
-	        "prompt": prompt,
-	        "resultPath": f"{directive_id}.json",
-	        "createdAt": now(),
-	    }
-	    if plan_context:
-	        directive["planContext"] = plan_context
-	    if mode:
-	        directive["mode"] = mode
-	    if frame:
-	        directive["frame"] = frame
+    if not prompt:
+        raise McpError("Design prompt is required.")
+    context = args.get("context")
+    plan_context = clean_text(context, "Design context", 4000) if context else None
+    # Phase 3: optional mode / frame forwarded to the watcher unchanged.
+    raw_mode = args.get("mode") or ""
+    mode = raw_mode if raw_mode in ("static", "interactive") else None
+    raw_frame = args.get("frame") or ""
+    frame = raw_frame if raw_frame in ("android", "ios", "web", "component") else None
+    directive_id = uuid.uuid4().hex
+    directive = {
+        "id": directive_id,
+        "parentAgentId": agent_id,
+        "status": "pending",
+        "prompt": prompt,
+        "resultPath": f"{directive_id}.json",
+        "createdAt": now(),
+    }
+    if plan_context:
+        directive["planContext"] = plan_context
+    if mode:
+        directive["mode"] = mode
+    if frame:
+        directive["frame"] = frame
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
         session = next(
@@ -9111,6 +9092,46 @@ def create_mcp_server(
         )
 
     @server.tool()
+    def spawn_main_coder(
+        agent_id: str,
+        role: str,
+        task: str,
+        files: list,
+        backend: str = "",
+        allow_oracle: bool = False,
+        wait: bool = True,
+        session_token: str = "",
+    ) -> dict:
+        """Orchestrator only: dispatch a SUBSTANTIAL task to the local MAIN CODER
+        (the sandboxed agentic engine: multi-round read/edit/grep/run loop against
+        the deterministic gate).
+
+        Unlike spawn_mini_coder it is always agentic and meant for
+        multi-file/heavyweight tasks; write and write_mode are forced server-side
+        (the Rust executor FAILS a main directive that cannot run agentic rather
+        than downgrading it to a one-shot mini). Same supervision contract as the
+        mini: pass wait=false to get {directiveId, status:'running'} immediately,
+        steer with steer_mini_coder(directiveId, message), collect with
+        mini_coder_result(directiveId).
+        """
+        # ROLE UNTANGLE Phase 3 completion: this wrapper was MISSING — the tool
+        # had a TOOLS entry + dispatch + routing but no FastMCP surface, so no
+        # real MCP client could call it (found by the 2026-07 flow audit).
+        return call(
+            "spawn_main_coder",
+            {
+                "agent_id": agent_id,
+                "role": role,
+                "task": task,
+                "files": files,
+                "backend": backend,
+                "allow_oracle": allow_oracle,
+                "wait": wait,
+                "session_token": session_token,
+            },
+        )
+
+    @server.tool()
     def steer_mini_coder(
         agent_id: str,
         role: str,
@@ -9691,10 +9712,10 @@ def create_mcp_server(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aspis Management MCP server")
-    parser.add_argument("--root", default=None, help="Aspis Management root folder")
+    parser = argparse.ArgumentParser(description="Devboule MCP server")
+    parser.add_argument("--root", default=None, help="Devboule root folder")
     parser.add_argument(
-        "--projects-dir", default=None, help="Shared Aspis Management projects folder"
+        "--projects-dir", default=None, help="Shared Devboule projects folder"
     )
     args = parser.parse_args()
     create_mcp_server(root=args.root, projects_dir=args.projects_dir).run()

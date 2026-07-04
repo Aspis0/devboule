@@ -63,7 +63,7 @@ export function DynamicCard({
         type="button"
         onClick={() => void openExternal()}
         data-help-title={`${title} opens an external ${variant === "bookmark" ? "bookmark" : "provider"} link.`}
-        data-help-lines="External links leave Aspis Management and open a browser or provider console.|For Aspis Bio, use them to verify provider state, docs, billing, permissions, or repo context directly at the source.|Opening a link does not change cloud resources by itself.|For repeatable provider operations, prefer a guarded action inside the app."
+        data-help-lines="External links leave Devboule and open a browser or provider console.|For Aspis Bio, use them to verify provider state, docs, billing, permissions, or repo context directly at the source.|Opening a link does not change cloud resources by itself.|For repeatable provider operations, prefer a guarded action inside the app."
         className="group block w-full text-left bg-white rounded-3xl border border-cream-200 p-5
                    hover:shadow-soft-md hover:border-cream-300 hover:-translate-y-0.5
                    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-terracotta/40 focus-visible:ring-offset-2

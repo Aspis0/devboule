@@ -83,6 +83,7 @@ function WorkingAgentLine({
 }
 
 const statusDotTone: Record<string, string> = {
+  draft: "bg-cream-300",
   active: "bg-sage",
   paused: "bg-amber",
   done: "bg-teal",
@@ -90,6 +91,7 @@ const statusDotTone: Record<string, string> = {
 };
 
 const statusLabel: Record<string, string> = {
+  draft: "draft — plan not approved",
   active: "active",
   paused: "paused",
   done: "done",
@@ -208,7 +210,10 @@ export function ProjectStatusHeader({
           <PauseCircle className="h-3.5 w-3.5" />
           Pause
         </button>
-      ) : status !== "done" ? (
+      ) : status !== "done" && status !== "draft" ? (
+        // "draft" gets NO Resume: it would write status=active directly and
+        // bypass the plan-approval gate (the ONLY sanctioned draft→active
+        // transition — hostile-review finding). Approve the plan instead.
         <button
           onClick={onResume}
           disabled={isBusy}

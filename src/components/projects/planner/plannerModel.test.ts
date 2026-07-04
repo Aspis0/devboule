@@ -4,7 +4,7 @@ import {
   pageHostname,
   stripLabel,
   pickProjectDesign,
-  chatMessages,
+  chatMessagesWithMilestones,
   openQuestions,
   steerPickOption,
   steerYouDecide,
@@ -123,24 +123,27 @@ describe("doubtTouchesCard (doubt <-> task link)", () => {
   });
 });
 
-describe("chatMessages", () => {
-  it("keeps only chat entries, in order, mapping role+text", () => {
+describe("chatMessagesWithMilestones", () => {
+  it("maps chat entries + coder milestones in timeline order, threading msgId", () => {
     const entries: ConsoleEntry[] = [
       { type: "coder", text: "Planning: 3 files", time: "1" },
-      { type: "chat", role: "user", text: "build OAuth", time: "2" },
+      { type: "chat", role: "user", text: "build OAuth", time: "2", msgId: "m1" },
       { type: "webSearch", query: "oauth", pages: [], time: "3" },
       { type: "chat", role: "assistant", text: "On it — drafting a plan.", time: "4" },
     ];
-    expect(chatMessages(entries)).toEqual([
-      { role: "user", text: "build OAuth" },
+    expect(chatMessagesWithMilestones(entries)).toEqual([
+      { role: "milestone", text: "Planning: 3 files" },
+      { role: "user", text: "build OAuth", msgId: "m1" },
       { role: "assistant", text: "On it — drafting a plan." },
     ]);
   });
 
-  it("returns [] for undefined / no chat entries", () => {
-    expect(chatMessages(undefined)).toEqual([]);
+  it("returns [] for undefined / no mappable entries", () => {
+    expect(chatMessagesWithMilestones(undefined)).toEqual([]);
     expect(
-      chatMessages([{ type: "coder", text: "x", time: "1" }]),
+      chatMessagesWithMilestones([
+        { type: "webSearch", query: "x", pages: [], time: "1" },
+      ]),
     ).toEqual([]);
   });
 });
@@ -272,5 +275,95 @@ describe("stripLabel", () => {
     expect(stripLabel("exa")).toBe("searching");
     expect(stripLabel("plan")).toBe("planning");
     expect(stripLabel("design")).toBe("designing");
+  });
+});
+
+// ---- D3 (planner-chat demolition): identity-based pending reconciliation ------
+
+import { mergePendingSends, stableOrchestratorAgentId, type PendingSend } from "./plannerModel";
+
+describe("mergePendingSends", () => {
+  const pending = (text: string, msgId: string): PendingSend => ({ text, msgId });
+
+  it("appends pendings the bridge has not echoed yet", () => {
+    const real = [{ role: "assistant" as const, text: "hi" }];
+    const out = mergePendingSends(real, [pending("do it", "m1")]);
+    expect(out).toEqual([
+      { role: "assistant", text: "hi" },
+      { role: "user", text: "do it", msgId: "m1" },
+    ]);
+  });
+
+  it("drains a pending BY ID when the echo carries its msgId", () => {
+    const real = [
+      { role: "user" as const, text: "do it", msgId: "m1" },
+      { role: "assistant" as const, text: "done" },
+    ];
+    const out = mergePendingSends(real, [pending("do it", "m1")]);
+    expect(out).toEqual(real);
+  });
+
+  it("repeated identical sends drain one-by-one by their own ids", () => {
+    // The exact case the old count-watermark existed for: "yes" sent twice.
+    const real = [
+      { role: "user" as const, text: "yes", msgId: "m1" },
+      { role: "assistant" as const, text: "ok" },
+    ];
+    const out = mergePendingSends(real, [pending("yes", "m1"), pending("yes", "m2")]);
+    expect(out).toEqual([...real, { role: "user", text: "yes", msgId: "m2" }]);
+  });
+
+  it("falls back to consuming one id-less echo per text match (local binary echoes)", () => {
+    // The local orchestrator binary echoes user steers WITHOUT a msgId. Each id-less
+    // user row consumes exactly ONE text-matching pending (oldest first).
+    const real = [
+      { role: "user" as const, text: "yes" },
+      { role: "assistant" as const, text: "ok" },
+      { role: "user" as const, text: "yes" },
+    ];
+    const out = mergePendingSends(real, [
+      pending("yes", "m1"),
+      pending("yes", "m2"),
+      pending("yes", "m3"),
+    ]);
+    expect(out).toEqual([...real, { role: "user", text: "yes", msgId: "m3" }]);
+  });
+
+  it("an id-less echo never consumes a pending with a DIFFERENT text", () => {
+    const real = [{ role: "user" as const, text: "first message" }];
+    const out = mergePendingSends(real, [pending("second message", "m2")]);
+    expect(out).toEqual([...real, { role: "user", text: "second message", msgId: "m2" }]);
+  });
+
+  it("milestone rows ride through untouched and never match pendings", () => {
+    const real = [
+      { role: "milestone" as const, text: "Bash: ls" },
+      { role: "user" as const, text: "go", msgId: "m1" },
+    ];
+    const out = mergePendingSends(real, [pending("go", "m1"), pending("next", "m2")]);
+    expect(out).toEqual([...real, { role: "user", text: "next", msgId: "m2" }]);
+  });
+
+  it("empty inputs are total", () => {
+    expect(mergePendingSends([], [])).toEqual([]);
+    expect(mergePendingSends([], [pending("a", "m1")])).toEqual([
+      { role: "user", text: "a", msgId: "m1" },
+    ]);
+  });
+});
+
+describe("stableOrchestratorAgentId", () => {
+  it("mirrors the backend id: orchestrator-<sanitized project id>", () => {
+    // MUST stay byte-identical to Rust `stable_orchestrator_agent_id` (projects.rs):
+    // charset [A-Za-z0-9._-] (others -> '_'), capped at 100 chars of project id.
+    expect(stableOrchestratorAgentId("my-project.v2")).toBe(
+      "orchestrator-my-project.v2",
+    );
+    expect(stableOrchestratorAgentId("we ird/../id")).toBe(
+      "orchestrator-we_ird_.._id",
+    );
+    expect(stableOrchestratorAgentId("x".repeat(500))).toBe(
+      `orchestrator-${"x".repeat(100)}`,
+    );
   });
 });

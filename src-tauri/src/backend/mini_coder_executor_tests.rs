@@ -33,6 +33,7 @@ fn directive(id: &str, parent: &str) -> MiniCoderDirective {
         attempt: 0,
         parent_directive_id: None,
         pigeon_ticket: None,
+        collected: None,
     }
 }
 
@@ -1949,6 +1950,7 @@ fn p4_directive(allow_oracle: bool) -> MiniCoderDirective {
         attempt: 0,
         parent_directive_id: None,
         pigeon_ticket: None,
+        collected: None,
     }
 }
 
@@ -4560,6 +4562,7 @@ fn app_authored_directive_carries_its_own_project_and_never_loses_a_parent() {
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
+            collected: None,
         }
     }
     let state = bare_state();

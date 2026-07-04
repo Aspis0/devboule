@@ -121,7 +121,10 @@ pub const RESPONSE_BODY_CAP: usize = 1024 * 1024;
 /// Cap on a single finding's title / body length (chars), to bound what a verbose
 /// or adversarial model can write into a shard.
 const TITLE_CAP: usize = 200;
-const BODY_CAP: usize = 1_000;
+/// `pub(crate)` so the voting layer ([`crate::backend::censor::votes`]) can re-cap a suspect
+/// body AFTER prepending its `[unverified …]` marker, using the SAME bound this module caps
+/// parsed bodies at.
+pub(crate) const BODY_CAP: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Censor local-AI provider config (`config.json` `censorLocalAi`).
@@ -150,7 +153,10 @@ pub enum CensorAiProvider {
 /// VALIDATED loopback origin (see [`validate_censor_local_ai`]) — file content sent to
 /// the model can never leave the device. Fields stay `Option` so the Ollama default
 /// (the common case) carries no base/model and serializes to just `{ provider:"ollama" }`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+// NOTE: `Eq` is intentionally NOT derived — `temperature: Option<f32>` (added for the
+// voting tier) is not `Eq`. `PartialEq` is kept (all comparisons/`assert_eq!` in the
+// config tests use it); no code path needs `Eq`/`Hash` on this type.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CensorLocalAi {
     pub provider: CensorAiProvider,
@@ -167,6 +173,30 @@ pub struct CensorLocalAi {
     /// for the oMLX provider (oMLX uses `model`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ollama_model: Option<String>,
+    /// k-sample self-consistency: how many times the model reviews EACH file. Clamped to
+    /// `1..=9` by [`validate_censor_local_ai`]; `None`/absent = 1 = legacy single pass (no
+    /// voting). NO-CHURN: an absent key parses (serde default) and `None` serializes to
+    /// nothing, so an old config is never rewritten with this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_samples: Option<u8>,
+    /// Votes needed to CONFIRM a smell (block). Clamped to `1..=n_samples` when resolved;
+    /// `None` = `ceil(n_samples/2)` for `n_samples > 1`, else 1 (see
+    /// [`CensorLocalAi::review_params`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_votes_block: Option<u8>,
+    /// Votes needed to SURFACE a smell as an unverified suspect. `None` = 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_votes_verify: Option<u8>,
+    /// Sampling temperature for the review generation. Clamped to `0.0..=1.5`; `None` =
+    /// the legacy `0.1`. A non-zero temperature is what makes the k samples DIFFER (and so
+    /// makes voting meaningful).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Prompt/parse style: `"gemma"` (default — the fixed [`SYSTEM_INSTRUCTION`] + free-form
+    /// JSON) or `"censor_v2"` (the fine-tuned reviewer's system prompt + `<think>`/typed-
+    /// category JSON). Unknown values normalize to `None` (⇒ gemma) in validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_style: Option<String>,
 }
 
 impl Default for CensorLocalAi {
@@ -178,6 +208,11 @@ impl Default for CensorLocalAi {
             base_url: None,
             model: None,
             ollama_model: None,
+            n_samples: None,
+            min_votes_block: None,
+            min_votes_verify: None,
+            temperature: None,
+            prompt_style: None,
         }
     }
 }
@@ -207,6 +242,101 @@ impl CensorLocalAi {
         // oMLX/AppleFm model and is empty when unset, keeping the tier off.
         self.model.clone().unwrap_or_default()
     }
+
+    /// Resolve the voting/temperature/prompt-style knobs into a concrete
+    /// [`GemmaReviewParams`] for [`run_gemma`]. PURE. Applies the semantic defaults +
+    /// cross-field clamps on top of the per-field bounds already applied by
+    /// [`validate_censor_local_ai`]:
+    ///   - `n_samples`   → `1..=9`, default 1;
+    ///   - `min_votes_block`  → `1..=n_samples`, default `ceil(n/2)` for `n>1` else 1;
+    ///   - `min_votes_verify` → `1..=n_samples`, default 1;
+    ///   - `temperature` → `0.0..=1.5`, default [`LEGACY_GEMMA_TEMPERATURE`];
+    ///   - `prompt_style` → `censor_v2` when set (case-insensitive), else `gemma`.
+    ///
+    /// A config that opts into nothing returns exactly [`GemmaReviewParams::default`] — the
+    /// legacy single-sample behavior.
+    pub fn review_params(&self) -> GemmaReviewParams {
+        // AppleFm cannot thread a temperature (the `fm respond` CLI has no such flag), so the
+        // k samples would be identical and voting is meaningless — force a single sample.
+        let n = if self.provider == CensorAiProvider::AppleFm {
+            1
+        } else {
+            self.n_samples.map(|v| v.clamp(1, 9)).unwrap_or(1)
+        };
+        let min_votes_block = self
+            .min_votes_block
+            .map(|v| v.clamp(1, n))
+            .unwrap_or_else(|| if n > 1 { n.div_ceil(2) } else { 1 });
+        // Enforce `verify <= block`: an inverted config (verify > block) would make the
+        // suspect window `[verify, block)` empty, silently discarding the whole tier.
+        let min_votes_verify = self
+            .min_votes_verify
+            .map(|v| v.clamp(1, n))
+            .unwrap_or(1)
+            .min(min_votes_block);
+        let temperature = self
+            .temperature
+            .map(|t| t.clamp(0.0, 1.5))
+            .unwrap_or(LEGACY_GEMMA_TEMPERATURE);
+        let prompt_style = match self.prompt_style.as_deref() {
+            Some(s) if s.trim().eq_ignore_ascii_case("censor_v2") => PromptStyle::CensorV2,
+            _ => PromptStyle::Gemma,
+        };
+        GemmaReviewParams {
+            vote: crate::backend::censor::votes::VoteParams {
+                n_samples: n,
+                min_votes_block,
+                min_votes_verify,
+                line_tolerance: crate::backend::censor::votes::VoteParams::default().line_tolerance,
+            },
+            temperature,
+            prompt_style,
+        }
+    }
+}
+
+/// The legacy review temperature (the value hardcoded before the voting tier). `None`
+/// `temperature` in the config resolves to this, and the single-sample fast path in
+/// [`run_gemma`] uses it so the default config is byte-for-byte the pre-voting behavior.
+pub const LEGACY_GEMMA_TEMPERATURE: f32 = 0.1;
+
+/// Prompt + response-parse style for the review generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStyle {
+    /// The fixed [`SYSTEM_INSTRUCTION`] folded with the file body; response parsed by
+    /// [`parse_gemma`] (free-form `{line,title,body,severity}` JSON).
+    Gemma,
+    /// The fine-tuned reviewer's system prompt ([`CENSOR_V2_SYSTEM`]); response parsed by
+    /// [`parse_censor_v2`] (optional `<think>` block + typed-category JSON with
+    /// `rationale`).
+    CensorV2,
+}
+
+/// The resolved, ready-to-run review knobs (see [`CensorLocalAi::review_params`]). Copy so
+/// it threads cheaply through [`crate::backend::censor::orchestrator::GemmaCtx`]. The
+/// [`Default`] is the LEGACY single-sample behavior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GemmaReviewParams {
+    pub vote: crate::backend::censor::votes::VoteParams,
+    pub temperature: f32,
+    pub prompt_style: PromptStyle,
+}
+
+impl Default for GemmaReviewParams {
+    fn default() -> Self {
+        Self {
+            vote: crate::backend::censor::votes::VoteParams::default(),
+            temperature: LEGACY_GEMMA_TEMPERATURE,
+            prompt_style: PromptStyle::Gemma,
+        }
+    }
+}
+
+/// True when `t` is (within float epsilon) the legacy default temperature. Used to gate
+/// the byte-identical single-sample fast path in [`run_gemma`]. An abs-difference compare
+/// (not `==`) keeps clippy's `float_cmp` lint happy.
+fn is_legacy_temperature(t: f32) -> bool {
+    (t - LEGACY_GEMMA_TEMPERATURE).abs() < 1e-6
 }
 
 /// Validate a parsed `censorLocalAi` config, returning the NORMALIZED config or an error
@@ -221,6 +351,15 @@ impl CensorLocalAi {
 pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, String> {
     let base = cfg.base_url.as_deref().map(str::trim).unwrap_or("");
     let model = cfg.model.as_deref().map(str::trim).unwrap_or("");
+    // Voting/temperature/prompt-style knobs are provider-INDEPENDENT: clamp each into its
+    // valid range so a hand-edited/hostile config can never persist an absurd value, and
+    // normalize an unknown prompt style to `None` (⇒ gemma). The semantic defaulting +
+    // cross-field clamp (block ≤ n, etc.) is layered on in `review_params`.
+    let n_samples = cfg.n_samples.map(|v| v.clamp(1, 9));
+    let min_votes_block = cfg.min_votes_block.map(|v| v.clamp(1, 9));
+    let min_votes_verify = cfg.min_votes_verify.map(|v| v.clamp(1, 9));
+    let temperature = cfg.temperature.map(|t| t.clamp(0.0, 1.5));
+    let prompt_style = normalize_prompt_style(cfg.prompt_style.as_deref());
     match cfg.provider {
         CensorAiProvider::Ollama => {
             // Optional fields; if a base is given it must still be loopback http.
@@ -228,8 +367,9 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                 None
             } else {
                 if !is_loopback_base(base) {
-                    return Err("censorLocalAi.baseUrl must be a loopback http origin for ollama."
-                        .into());
+                    return Err(
+                        "censorLocalAi.baseUrl must be a loopback http origin for ollama.".into(),
+                    );
                 }
                 // Strip a single trailing slash (mirror the oMLX normalization) so
                 // `<base>/api/generate` never double-slashes (`…11434//api/generate`).
@@ -267,6 +407,11 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                 base_url: base_opt,
                 model: model_opt,
                 ollama_model: ollama_model_opt,
+                n_samples,
+                min_votes_block,
+                min_votes_verify,
+                temperature,
+                prompt_style,
             })
         }
         CensorAiProvider::Omlx => {
@@ -300,6 +445,11 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                 // oMLX uses `model`; the Ollama-only override is dropped so an oMLX config
                 // never carries a stray `ollamaModel` (it would never be read).
                 ollama_model: None,
+                n_samples,
+                min_votes_block,
+                min_votes_verify,
+                temperature,
+                prompt_style,
             })
         }
         CensorAiProvider::Cloud => {
@@ -330,6 +480,11 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                 base_url: Some(normalized_base),
                 model: Some(model.to_string()),
                 ollama_model: None,
+                n_samples,
+                min_votes_block,
+                min_votes_verify,
+                temperature,
+                prompt_style,
             })
         }
         CensorAiProvider::AppleFm => {
@@ -355,6 +510,11 @@ pub fn validate_censor_local_ai(cfg: &CensorLocalAi) -> Result<CensorLocalAi, St
                     Some(model.to_string())
                 },
                 ollama_model: None,
+                n_samples,
+                min_votes_block,
+                min_votes_verify,
+                temperature,
+                prompt_style,
             })
         }
     }
@@ -417,7 +577,9 @@ fn validate_cloud_base_for_censor(base: &str) -> Result<String, String> {
         .chars()
         .any(crate::backend::mini_coder::is_forbidden_command_char)
     {
-        return Err("Cloud base URL must not contain control, bidi or invisible characters.".into());
+        return Err(
+            "Cloud base URL must not contain control, bidi or invisible characters.".into(),
+        );
     }
     let Some(rest) = trimmed.strip_prefix("https://") else {
         return Err("Cloud base URL must be an https origin.".into());
@@ -457,8 +619,10 @@ fn validate_cloud_base_for_censor(base: &str) -> Result<String, String> {
     }
     // Bare IPv4 / numeric dotted-quad literals are an SSRF surface (e.g. 169.254.169.254).
     let labels: Vec<&str> = host.split('.').collect();
-    let is_numeric_quad =
-        labels.len() == 4 && labels.iter().all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
+    let is_numeric_quad = labels.len() == 4
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
     if is_numeric_quad {
         return Err("Cloud base URL must be a hostname, not an IP literal.".into());
     }
@@ -492,6 +656,18 @@ fn validate_cloud_base_for_censor(base: &str) -> Result<String, String> {
 /// allowed). Assumes the input is already trimmed (the caller trims first).
 fn is_valid_omlx_model(model: &str) -> bool {
     crate::backend::mini_coder::is_valid_model(model)
+}
+
+/// Normalize a configured `promptStyle` to the canonical stored token, or `None` for an
+/// absent/unknown value (which resolves to the default `gemma` style in
+/// [`CensorLocalAi::review_params`]). Case-insensitive; only `gemma` / `censor_v2` are
+/// accepted so a typo can never silently select an unintended style.
+fn normalize_prompt_style(raw: Option<&str>) -> Option<String> {
+    match raw.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("gemma") => Some("gemma".to_string()),
+        Some(s) if s.eq_ignore_ascii_case("censor_v2") => Some("censor_v2".to_string()),
+        _ => None,
+    }
 }
 
 /// Errors a Gemma client can surface. Deliberately coarse + content-free: the
@@ -532,6 +708,36 @@ pub trait GemmaClient: Send + Sync {
     /// `response` field of the Ollama `/api/generate` reply). The caller parses it
     /// defensively via [`parse_gemma`].
     fn generate(&self, prompt: &str) -> Result<String, GemmaError>;
+
+    /// Run ONE generation with a SEPARATE `system` + `user` message pair at an explicit
+    /// `temperature` (the voting tier uses a non-zero temperature so the k samples differ).
+    ///
+    /// The DEFAULT impl (used by providers with only a single-prompt endpoint, e.g.
+    /// AppleFm's CLI) folds `system` + "\n\n" + `user` into one prompt and delegates to
+    /// [`generate`]; this matches the byte layout [`build_prompt`] produces (its
+    /// [`SYSTEM_INSTRUCTION`] is followed by exactly "\n\n" then the user body), so the
+    /// concatenating providers see an identical prompt. `temperature` is ignored by the
+    /// default because [`generate`]'s endpoint carries no temperature knob for those
+    /// providers. Providers WITH a temperature-capable path override this:
+    ///   - the OpenAI-compatible oMLX/Cloud client sends TWO real messages
+    ///     `[{role:system}, {role:user}]` at the given temperature;
+    ///   - the Ollama client concatenates (single `/api/generate` prompt) but threads the
+    ///     temperature through `options.temperature`.
+    fn generate_chat(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: f32,
+    ) -> Result<String, GemmaError> {
+        // Default: no temperature-capable path — fold into one prompt and reuse `generate`.
+        let _ = temperature;
+        let prompt = if system.is_empty() {
+            user.to_string()
+        } else {
+            format!("{system}\n\n{user}")
+        };
+        self.generate(&prompt)
+    }
 
     /// Run ONE MULTIMODAL generation: `prompt` text PLUS one or more base64-encoded images
     /// (the design visual-critique path passes a single captured PNG). Returns the model's
@@ -673,7 +879,12 @@ impl OllamaClient {
     /// resolver. PRIVACY: a `GET` of public model metadata — no file content leaves here.
     fn fetch_tags(&self) -> Option<Vec<String>> {
         let url = format!("{}/api/tags", self.base);
-        let resp = self.http.get(&url).timeout(self.probe_timeout).send().ok()?;
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(self.probe_timeout)
+            .send()
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -712,6 +923,42 @@ impl OllamaClient {
         }
         resolved
     }
+
+    /// POST `/api/generate` with `prompt` at an explicit `temperature`, returning the
+    /// model's raw text. The SINGLE place the text request is built so `generate` (legacy
+    /// temperature) and `generate_chat` (configured temperature) can never drift on payload
+    /// shape / OOM cap. The model is the resolution-chain result (reused from the probe).
+    fn post_generate(&self, prompt: &str, temperature: f32) -> Result<String, GemmaError> {
+        let model = self.resolved_model();
+        let url = format!("{}/api/generate", self.base);
+        let payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "options": { "temperature": temperature }
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(self.generate_timeout)
+            .json(&payload)
+            .send()
+            .map_err(|e| {
+                if e.is_timeout() {
+                    GemmaError::Timeout
+                } else {
+                    GemmaError::Transport
+                }
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(GemmaError::Status(status.as_u16()));
+        }
+        // OOM defense: read the body with a hard size cap BEFORE deserializing (a runaway
+        // local model with stream:false could otherwise emit hundreds of MiB).
+        let bytes = resp.bytes().map_err(|_| GemmaError::Decode)?;
+        parse_generate_body(&bytes)
+    }
 }
 
 /// The loopback oMLX client — an alternative tier-2 provider that talks to a local
@@ -749,12 +996,7 @@ impl OmlxClient {
     /// `impl Default`, which `OmlxClient` cannot have — it needs base/model args).
     #[cfg(test)]
     pub fn new(base_url: &str, model: &str) -> Self {
-        Self::with_config(
-            base_url,
-            model,
-            GEMMA_GENERATE_TIMEOUT,
-            GEMMA_PROBE_TIMEOUT,
-        )
+        Self::with_config(base_url, model, GEMMA_GENERATE_TIMEOUT, GEMMA_PROBE_TIMEOUT)
     }
 
     /// Construct with explicit config. `pub(crate)` for the SAME reason as
@@ -825,9 +1067,7 @@ impl OmlxClient {
                 }
             }
         } else {
-            eprintln!(
-                "censor gemma: refusing invalid oMLX base; falling back to loopback default"
-            );
+            eprintln!("censor gemma: refusing invalid oMLX base; falling back to loopback default");
             OMLX_DEFAULT_BASE.to_string()
         };
         let http = reqwest::blocking::Client::builder()
@@ -842,6 +1082,47 @@ impl OmlxClient {
             generate_timeout,
             probe_timeout,
         }
+    }
+
+    /// POST `<base>/chat/completions` with the given `messages` array + `temperature`,
+    /// returning the assistant text. The SINGLE place the request is built so `generate`
+    /// (one user message, legacy temperature) and `generate_chat` (system+user, configured
+    /// temperature) can never drift on payload shape / OOM cap / Bearer auth. PRIVACY: the
+    /// Bearer header is sent ONLY for the Cloud provider (`api_key.is_some()`); local oMLX
+    /// sends none. Same hard body-size cap before deserializing as every other call here.
+    fn post_chat(
+        &self,
+        messages: serde_json::Value,
+        temperature: f32,
+    ) -> Result<String, GemmaError> {
+        let url = format!("{}/chat/completions", self.base);
+        let payload = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+            "temperature": temperature
+        });
+        let mut req = self
+            .http
+            .post(&url)
+            .timeout(self.generate_timeout)
+            .json(&payload);
+        if let Some(k) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {k}"));
+        }
+        let resp = req.send().map_err(|e| {
+            if e.is_timeout() {
+                GemmaError::Timeout
+            } else {
+                GemmaError::Transport
+            }
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(GemmaError::Status(status.as_u16()));
+        }
+        let bytes = resp.bytes().map_err(|_| GemmaError::Decode)?;
+        parse_openai_chat_body(&bytes)
     }
 }
 
@@ -922,12 +1203,8 @@ fn run_apple_fm_respond_process(
         }
     };
 
-    let stdin_result = stdin_thread
-        .join()
-        .map_err(|_| GemmaError::Transport)?;
-    let stdout_result = stdout_thread
-        .join()
-        .map_err(|_| GemmaError::Decode)?;
+    let stdin_result = stdin_thread.join().map_err(|_| GemmaError::Transport)?;
+    let stdout_result = stdout_thread.join().map_err(|_| GemmaError::Decode)?;
     let _ = stderr_thread.join();
 
     if !status.success() {
@@ -964,8 +1241,8 @@ impl GemmaClient for AppleFmClient {
     }
 
     fn generate(&self, prompt: &str) -> Result<String, GemmaError> {
-        let program = crate::backend::provider_detect::resolve_program("fm")
-            .ok_or(GemmaError::Transport)?;
+        let program =
+            crate::backend::provider_detect::resolve_program("fm").ok_or(GemmaError::Transport)?;
         run_apple_fm_respond_process(
             &program,
             &apple_fm_respond_args(self.model.as_deref()),
@@ -1023,43 +1300,32 @@ impl GemmaClient for OmlxClient {
     }
 
     fn generate(&self, prompt: &str) -> Result<String, GemmaError> {
-        // POST <base>/chat/completions { model, messages:[{role:user, content:prompt}],
-        // stream:false, temperature:0.1 }. Same low temperature as the Ollama call for
-        // conservative, deterministic-ish output.
-        let url = format!("{}/chat/completions", self.base);
-        let payload = serde_json::json!({
-            "model": self.model,
-            "messages": [ { "role": "user", "content": prompt } ],
-            "stream": false,
-            "temperature": 0.1
-        });
-        let mut req = self
-            .http
-            .post(&url)
-            .timeout(self.generate_timeout)
-            .json(&payload);
-        // Cloud provider only: authenticate the remote endpoint. Local oMLX (api_key None)
-        // sends no header — unchanged loopback behavior.
-        if let Some(k) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {k}"));
-        }
-        let resp = req
-            .send()
-            .map_err(|e| {
-                if e.is_timeout() {
-                    GemmaError::Timeout
-                } else {
-                    GemmaError::Transport
-                }
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(GemmaError::Status(status.as_u16()));
-        }
-        // Same OOM defense as the Ollama path: read the body with a hard size cap BEFORE
-        // deserializing (`resp.json()` would buffer unbounded).
-        let bytes = resp.bytes().map_err(|_| GemmaError::Decode)?;
-        parse_openai_chat_body(&bytes)
+        // LEGACY single-message call: one user message at the legacy temperature (kept
+        // byte-identical to the pre-voting behavior — the folded `build_prompt` string is
+        // sent as a single user turn). `generate_chat` is the voting-tier entry point.
+        self.post_chat(
+            serde_json::json!([{ "role": "user", "content": prompt }]),
+            LEGACY_GEMMA_TEMPERATURE,
+        )
+    }
+
+    fn generate_chat(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: f32,
+    ) -> Result<String, GemmaError> {
+        // oMLX/Cloud is chat-native: send a REAL system message + the user body (a better
+        // shape for an instruct model than folding the system text into the user turn).
+        let messages = if system.is_empty() {
+            serde_json::json!([{ "role": "user", "content": user }])
+        } else {
+            serde_json::json!([
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ])
+        };
+        self.post_chat(messages, temperature)
     }
 
     fn provider_label(&self) -> &'static str {
@@ -1081,7 +1347,11 @@ impl GemmaClient for OmlxClient {
         // cloud-vs-local so a cloud client never collides with a local oMLX one in the probe
         // cache. NEVER logged — opaque in-memory key only; the api_key is deliberately
         // EXCLUDED (it could otherwise leak into a log of this identity).
-        let prefix = if self.api_key.is_some() { "cloud" } else { "omlx" };
+        let prefix = if self.api_key.is_some() {
+            "cloud"
+        } else {
+            "omlx"
+        };
         format!("{}|{}|{}", prefix, self.base, self.model)
     }
 }
@@ -1197,41 +1467,27 @@ impl GemmaClient for OllamaClient {
     }
 
     fn generate(&self, prompt: &str) -> Result<String, GemmaError> {
-        // POST /api/generate { model, prompt, stream:false, options:{temperature} }.
-        // A low temperature keeps the model conservative + deterministic-ish. The model is
-        // the resolution-chain result (reused from the probe's fetch when available).
-        let model = self.resolved_model();
-        let url = format!("{}/api/generate", self.base);
-        let payload = serde_json::json!({
-            "model": model,
-            "prompt": prompt,
-            "stream": false,
-            "options": { "temperature": 0.1 }
-        });
-        let resp = self
-            .http
-            .post(&url)
-            .timeout(self.generate_timeout)
-            .json(&payload)
-            .send()
-            .map_err(|e| {
-                if e.is_timeout() {
-                    GemmaError::Timeout
-                } else {
-                    GemmaError::Transport
-                }
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(GemmaError::Status(status.as_u16()));
-        }
-        // BLOCKER: read the body into memory with a hard size cap BEFORE deserializing.
-        // `resp.json()` would buffer the WHOLE body unbounded — a runaway/looping local
-        // model can emit hundreds of MiB and OOM us. `resp.bytes()` still buffers, but
-        // we reject anything over the cap before parsing (and Ollama with `stream:false`
-        // sends a single small JSON object, so a legitimate body is far under 1 MiB).
-        let bytes = resp.bytes().map_err(|_| GemmaError::Decode)?;
-        parse_generate_body(&bytes)
+        // LEGACY single-prompt call at the legacy temperature — byte-identical to the
+        // pre-voting behavior. `generate_chat` is the voting-tier entry point (it threads
+        // a configured temperature through the SAME `post_generate` path).
+        self.post_generate(prompt, LEGACY_GEMMA_TEMPERATURE)
+    }
+
+    fn generate_chat(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: f32,
+    ) -> Result<String, GemmaError> {
+        // Ollama's `/api/generate` is single-prompt (no chat roles), so fold system + user
+        // into one prompt (identical byte layout to `build_prompt`) but thread the
+        // configured temperature through so the k samples actually differ.
+        let prompt = if system.is_empty() {
+            user.to_string()
+        } else {
+            format!("{system}\n\n{user}")
+        };
+        self.post_generate(&prompt, temperature)
     }
 
     fn generate_with_images(
@@ -1252,7 +1508,7 @@ impl GemmaClient for OllamaClient {
             "prompt": prompt,
             "images": images_b64,
             "stream": false,
-            "options": { "temperature": 0.1 }
+            "options": { "temperature": LEGACY_GEMMA_TEMPERATURE }
         });
         let resp = self
             .http
@@ -1508,6 +1764,15 @@ keys: {\"line\": <integer 1-based>, \"title\": <short string>, \"body\": <one-se
 string>, \"severity\": one of \"high\" | \"medium\" | \"low\"}. If there is nothing to \
 report, output [].";
 
+/// The `censor_v2` system prompt — the EXACT system message the fine-tuned reviewer was
+/// trained on (copied verbatim from the first row's `system` turn in
+/// `review-experts/data_cot/sft_v2fix_7030/train.jsonl`). It asks for a short `<think>`
+/// block then a typed-category JSON array with a `rationale` field; the response is parsed
+/// by [`parse_censor_v2`] (which strips the `<think>` block and maps the typed categories +
+/// `error|warning|info` severities onto our schema). A raw string literal keeps the many
+/// embedded quotes readable; DO NOT reword it — it must match the training distribution.
+const CENSOR_V2_SYSTEM: &str = r#"You are a Rust code reviewer. Think briefly (<=200 tokens) inside <think></think>, then output ONLY a JSON array of findings. Each: {"line":int,"severity":"error|warning|info","category":"<one of: correctness,logic-error,off-by-one,panic-risk,error-handling,security,performance,style,maintainability,naming,api-misuse>","title":"<=200 chars","rationale":"<=200 chars"}. Use severity error for real bugs/correctness/security, warning for likely issues, info for style/nits. If the code is correct, output []. Do not re-report anything in ALREADY-KNOWN."#;
+
 /// Build the full prompt for one file. PURE (no IO). Layers:
 ///   1. the fixed [`SYSTEM_INSTRUCTION`];
 ///   2. the file path + its (capped) content, fenced so the model can locate lines;
@@ -1524,9 +1789,31 @@ pub fn build_prompt(
     file_content: &str,
     deterministic_findings: &[RawFinding],
 ) -> String {
-    let mut p = String::with_capacity(file_content.len().min(MAX_FILE_CHARS) + 2048);
+    // Legacy layout: the fixed system instruction, then EXACTLY "\n\n", then the user body.
+    // `build_user_body` starts with "FILE: ", so this reproduces the original byte layout
+    // (`SYSTEM_INSTRUCTION` + "\n\nFILE: " + …) verbatim — and it also equals what the
+    // concatenating `generate_chat` path builds (`system + "\n\n" + user`).
+    let body = build_user_body(file_rel_path, file_content, deterministic_findings);
+    let mut p = String::with_capacity(SYSTEM_INSTRUCTION.len() + 2 + body.len());
     p.push_str(SYSTEM_INSTRUCTION);
-    p.push_str("\n\nFILE: ");
+    p.push_str("\n\n");
+    p.push_str(&body);
+    p
+}
+
+/// Build the USER body (everything after the system prompt): the file path + capped
+/// content + the ALREADY-KNOWN deterministic list + the final instruction. PURE. Shared by
+/// BOTH prompt styles — the `gemma` style pairs it with [`SYSTEM_INSTRUCTION`], the
+/// `censor_v2` style with [`CENSOR_V2_SYSTEM`] — and by [`build_prompt`] (which folds it
+/// under the system prompt for the legacy single-prompt path). Factored out of the old
+/// `build_prompt` unchanged so the rendered body is byte-identical to before.
+pub fn build_user_body(
+    file_rel_path: &str,
+    file_content: &str,
+    deterministic_findings: &[RawFinding],
+) -> String {
+    let mut p = String::with_capacity(file_content.len().min(MAX_FILE_CHARS) + 2048);
+    p.push_str("FILE: ");
     p.push_str(file_rel_path);
     p.push_str("\n--- BEGIN FILE CONTENT ---\n");
     if file_content.chars().count() > MAX_FILE_CHARS {
@@ -1650,6 +1937,128 @@ fn severity_from_token(token: &str) -> Severity {
     }
 }
 
+/// Parse a `censor_v2` model response into `RawFinding`s. Same defensive contract as
+/// [`parse_gemma`] (never panics; caps at [`MAX_GEMMA_FINDINGS`]; redacts + caps
+/// title/body) but for the fine-tuned reviewer's output shape:
+///   - the model may emit a leading `<think>…</think>` reasoning block — it is STRIPPED
+///     first (via [`strip_think_block`]) so a `[` inside the reasoning can't be mistaken
+///     for the findings array; then the balanced array is extracted the same way;
+///   - each object uses `rationale` (mapped to `body`), a typed `category` string (mapped
+///     best-effort onto our [`Category`] via [`category_from_v2_token`], unknown →
+///     `Correctness`), and an `error|warning|info` `severity` (via
+///     [`severity_from_v2_token`]).
+///
+/// `source` stays `"gemma"` so the orchestrator's gemma-source clobber protection is
+/// unchanged regardless of which prompt style produced the finding.
+pub fn parse_censor_v2(file_rel_path: &str, raw_response: &str) -> Vec<RawFinding> {
+    let cleaned = strip_think_block(raw_response);
+    let Some(array_text) = extract_json_array(&cleaned) else {
+        return Vec::new();
+    };
+    let value: serde_json::Value = match serde_json::from_str(&array_text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<RawFinding> = Vec::new();
+    for item in items {
+        if out.len() >= MAX_GEMMA_FINDINGS {
+            break;
+        }
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let title_raw = obj
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if title_raw.is_empty() {
+            continue;
+        }
+        // v2 carries the explanation in `rationale` (not `body`).
+        let body_raw = obj
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let line = obj.get("line").and_then(|v| v.as_u64()).and_then(|n| {
+            if n >= 1 && n <= u32::MAX as u64 {
+                Some(n as u32)
+            } else {
+                None
+            }
+        });
+        let severity =
+            severity_from_v2_token(obj.get("severity").and_then(|v| v.as_str()).unwrap_or(""));
+        let category =
+            category_from_v2_token(obj.get("category").and_then(|v| v.as_str()).unwrap_or(""));
+
+        let title = cap(&redact_secrets(title_raw), TITLE_CAP);
+        let body = cap(&redact_secrets(body_raw), BODY_CAP);
+
+        out.push(RawFinding {
+            file: file_rel_path.to_string(),
+            line,
+            severity,
+            category,
+            source: "gemma".to_string(),
+            title,
+            body,
+        });
+    }
+    out
+}
+
+/// Strip `<think>…</think>` reasoning blocks from a model response before JSON extraction.
+/// Removes EVERY `<think>` … matching `</think>` span (inclusive) — not just the first — so
+/// a stray second block whose text contains a `[` cannot hijack [`extract_json_array`]. If
+/// an opening tag has no matching close (truncated reasoning), everything from that
+/// `<think>` onward is dropped (no valid findings array lives inside an unterminated think
+/// block). Returns the text unchanged when no `<think>` is present. PURE.
+fn strip_think_block(text: &str) -> String {
+    let mut s = text.to_string();
+    while let Some(start) = s.find("<think>") {
+        if let Some(end_rel) = s[start..].find("</think>") {
+            let end = start + end_rel + "</think>".len();
+            let mut next = String::with_capacity(s.len());
+            next.push_str(&s[..start]);
+            next.push_str(&s[end..]);
+            s = next;
+        } else {
+            s.truncate(start);
+            break;
+        }
+    }
+    s
+}
+
+/// Map a `censor_v2` severity token (`error|warning|info`) onto our `Severity`.
+/// Case-insensitive; `error`→High, `info`→Low, everything else (`warning` + unknown)→Medium.
+fn severity_from_v2_token(token: &str) -> Severity {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "error" => Severity::High,
+        "info" => Severity::Low,
+        _ => Severity::Medium,
+    }
+}
+
+/// Map a `censor_v2` typed category string best-effort onto our coarser [`Category`].
+/// Case-insensitive; anything unrecognized (including the correctness-family buckets
+/// `logic-error`/`off-by-one`/`panic-risk`/`error-handling`/`api-misuse`) → `Correctness`,
+/// the neutral non-security default.
+fn category_from_v2_token(token: &str) -> Category {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "security" => Category::Security,
+        "performance" => Category::Complexity,
+        "style" | "maintainability" | "naming" => Category::Style,
+        _ => Category::Correctness,
+    }
+}
+
 /// Extract the first balanced top-level JSON array (`[` … matching `]`) from `text`,
 /// tolerating surrounding prose / markdown fences. Tracks string + escape state so a
 /// `]` INSIDE a string literal doesn't prematurely close the array. Returns the
@@ -1713,12 +2122,27 @@ pub fn build_context_block(_root: &Path, _file_rel_path: &str) -> Option<String>
 /// orchestrator/state computes it once per watch session, never per file):
 ///   - `available == false` → return empty immediately (the tier is disabled; the
 ///     fine pass behaves exactly like deterministic-only A3);
-///   - otherwise build the prompt, call `client.generate`, and parse the response.
+///   - otherwise generate + parse per `params`.
 ///
-/// On ANY generate error/timeout → empty + log ONCE (model name + the file's
-/// project-relative path ONLY; NEVER the file content or the model output, per the
-/// module privacy header). `_root` is accepted for the future context seam; it is
-/// unused today.
+/// `params` carries the resolved voting/temperature/prompt-style knobs (see
+/// [`CensorLocalAi::review_params`]).
+///
+/// LEGACY FAST PATH: with the default single-sample gemma style at the legacy temperature
+/// (`params == GemmaReviewParams::default()`) this is BYTE-IDENTICAL to the pre-voting
+/// engine — one `client.generate(build_prompt(...))` call parsed by [`parse_gemma`].
+///
+/// VOTED PATH (any of: `n_samples > 1`, a non-`gemma` style, or a non-legacy temperature):
+/// the file is reviewed `n_samples` times via [`GemmaClient::generate_chat`] (a system +
+/// user split at the configured temperature so the samples differ), each response parsed
+/// ([`parse_gemma`] / [`parse_censor_v2`]); a failed generate counts as an EMPTY sample
+/// (never aborts the file). The per-sample findings are clustered + voted
+/// ([`crate::backend::censor::votes`]) and the confirmed + (flagged) suspect findings are
+/// returned.
+///
+/// On ANY generate error/timeout the failure is logged ONCE per sample (provider + the
+/// model actually in use + the file's project-relative path ONLY; NEVER the file content,
+/// prompt, base URL, or model output, per the module privacy header). `_root` is accepted
+/// for the future context seam; it is unused today.
 pub fn run_gemma(
     client: &dyn GemmaClient,
     available: bool,
@@ -1726,26 +2150,80 @@ pub fn run_gemma(
     file_rel_path: &str,
     file_content: &str,
     deterministic: &[RawFinding],
+    params: &GemmaReviewParams,
 ) -> Vec<RawFinding> {
     if !available {
         return Vec::new();
     }
-    let prompt = build_prompt(file_rel_path, file_content, deterministic);
-    match client.generate(&prompt) {
-        Ok(response) => parse_gemma(file_rel_path, &response),
-        Err(e) => {
-            // Identity (provider + the model ACTUALLY in use) + path ONLY — never the
-            // prompt, file content, base URL, or model output. Logging the real provider/
-            // model (not the hardcoded GEMMA_MODEL constant) is what makes an oMLX failure
-            // triageable: with oMLX active the constant would show the wrong model.
-            eprintln!(
-                "censor gemma: {} model {} generate failed for {file_rel_path} ({e})",
-                client.provider_label(),
-                client.model_label()
-            );
-            Vec::new()
+    let n_samples = params.vote.n_samples.max(1);
+
+    // LEGACY byte-identical fast path: default single-sample gemma review at the legacy
+    // temperature. Preserves the exact pre-voting request (one folded prompt as a single
+    // turn) — important for the oMLX path, where `generate_chat` would otherwise split into
+    // two messages.
+    if n_samples <= 1
+        && params.prompt_style == PromptStyle::Gemma
+        && is_legacy_temperature(params.temperature)
+    {
+        let prompt = build_prompt(file_rel_path, file_content, deterministic);
+        return match client.generate(&prompt) {
+            Ok(response) => parse_gemma(file_rel_path, &response),
+            Err(e) => {
+                log_generate_failure(client, file_rel_path, &e);
+                Vec::new()
+            }
+        };
+    }
+
+    // Voted / non-default path: one shared user body, the style-specific system prompt.
+    let user = build_user_body(file_rel_path, file_content, deterministic);
+    let system: &str = match params.prompt_style {
+        PromptStyle::Gemma => SYSTEM_INSTRUCTION,
+        PromptStyle::CensorV2 => CENSOR_V2_SYSTEM,
+    };
+
+    // TODO(concurrency): fan the n samples out concurrently. Sequential is fine for v1 — a
+    // local single-model server serializes the requests anyway, so parallelism would only
+    // add contention without a wall-clock win on the common local setup.
+    let mut samples: Vec<Vec<RawFinding>> = Vec::with_capacity(n_samples as usize);
+    for _ in 0..n_samples {
+        // TODO(cancellation): check the orchestrator stop flag between samples so a mid-file
+        // stop aborts the remaining generations (needs a stop-flag param — out of scope here).
+        match client.generate_chat(system, &user, params.temperature) {
+            Ok(response) => {
+                let parsed = match params.prompt_style {
+                    PromptStyle::Gemma => parse_gemma(file_rel_path, &response),
+                    PromptStyle::CensorV2 => parse_censor_v2(file_rel_path, &response),
+                };
+                samples.push(parsed);
+            }
+            Err(e) => {
+                // A failed sample simply casts no votes — count it as EMPTY, never abort.
+                log_generate_failure(client, file_rel_path, &e);
+                samples.push(Vec::new());
+            }
         }
     }
+
+    let voted = crate::backend::censor::votes::cluster_and_vote(samples, &params.vote);
+    let (mut confirmed, mut suspects) =
+        crate::backend::censor::votes::split_by_threshold(voted, &params.vote);
+    // Suspects carry an `[unverified …]` body marker so the verifier role sees they are
+    // unconfirmed; they follow the confirmed findings in the returned set.
+    confirmed.append(&mut suspects);
+    confirmed
+}
+
+/// Content-free once-per-call failure log for a generate error: provider identity + the
+/// model ACTUALLY in use + the file's project-relative path ONLY. NEVER the prompt, file
+/// content, base URL, or model output (module privacy header). Logging the real provider/
+/// model (not the hardcoded [`GEMMA_MODEL`]) is what makes an oMLX/Cloud failure triageable.
+fn log_generate_failure(client: &dyn GemmaClient, file_rel_path: &str, e: &GemmaError) {
+    eprintln!(
+        "censor gemma: {} model {} generate failed for {file_rel_path} ({e})",
+        client.provider_label(),
+        client.model_label()
+    );
 }
 
 /// Re-export the runners' secret-redaction pass at crate scope so OTHER local-AI
@@ -1822,6 +2300,327 @@ mod tests {
         }
     }
 
+    /// A stub that returns a DIFFERENT canned response per successive `generate` call
+    /// (used to test the voting path where samples disagree). Uses the trait-default
+    /// `generate_chat` (fold system+user → `generate`), so each voted sample pops the next
+    /// response. Runs out → yields an empty JSON array.
+    struct SeqStubClient {
+        responses: std::sync::Mutex<std::collections::VecDeque<Result<String, GemmaError>>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl SeqStubClient {
+        fn new(responses: Vec<Result<String, GemmaError>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into_iter().collect()),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+    impl GemmaClient for SeqStubClient {
+        fn probe(&self) -> bool {
+            true
+        }
+        fn generate(&self, _prompt: &str) -> Result<String, GemmaError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok("[]".to_string()))
+        }
+        fn provider_label(&self) -> &'static str {
+            "stub"
+        }
+        fn model_label(&self) -> String {
+            "stub-model".to_string()
+        }
+    }
+
+    // ---- new prompt/body refactor identity ----
+
+    #[test]
+    fn build_prompt_equals_system_plus_user_body() {
+        // The refactor must be byte-identical: build_prompt == SYSTEM + "\n\n" + user body.
+        let dets = [det(3, "known smell")];
+        let full = build_prompt("src/a.rs", "let x = 1;", &dets);
+        let body = build_user_body("src/a.rs", "let x = 1;", &dets);
+        assert_eq!(full, format!("{SYSTEM_INSTRUCTION}\n\n{body}"));
+        // And the body carries no system header.
+        assert!(!body.contains("You are a careful code reviewer"));
+        assert!(body.starts_with("FILE: src/a.rs"));
+    }
+
+    // ---- review_params resolution ----
+
+    #[test]
+    fn review_params_defaults_to_legacy_single_sample() {
+        let p = CensorLocalAi::default().review_params();
+        assert_eq!(p, GemmaReviewParams::default());
+        assert_eq!(p.vote.n_samples, 1);
+        assert_eq!(p.vote.min_votes_block, 1);
+        assert_eq!(p.vote.min_votes_verify, 1);
+        assert!(is_legacy_temperature(p.temperature));
+        assert_eq!(p.prompt_style, PromptStyle::Gemma);
+    }
+
+    #[test]
+    fn review_params_resolves_votes_temperature_and_clamps() {
+        let cfg = CensorLocalAi {
+            provider: CensorAiProvider::Ollama,
+            n_samples: Some(5),
+            // Over-large block clamps to n_samples; verify defaults to 1.
+            min_votes_block: Some(9),
+            temperature: Some(0.8),
+            prompt_style: Some("censor_v2".to_string()),
+            ..Default::default()
+        };
+        let p = cfg.review_params();
+        assert_eq!(p.vote.n_samples, 5);
+        assert_eq!(p.vote.min_votes_block, 5, "block clamped to n_samples");
+        assert_eq!(p.vote.min_votes_verify, 1);
+        assert!((p.temperature - 0.8).abs() < 1e-6);
+        assert_eq!(p.prompt_style, PromptStyle::CensorV2);
+        // Default block for n>1 with no explicit value is ceil(n/2).
+        let d = CensorLocalAi {
+            provider: CensorAiProvider::Ollama,
+            n_samples: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(d.review_params().vote.min_votes_block, 2);
+    }
+
+    #[test]
+    fn review_params_clamps_verify_to_not_exceed_block() {
+        // Inverted config: verify (3) > block (2). Must clamp verify down to block so the
+        // suspect window `[verify, block)` is never silently empty due to inversion.
+        let cfg = CensorLocalAi {
+            provider: CensorAiProvider::Ollama,
+            n_samples: Some(3),
+            min_votes_block: Some(2),
+            min_votes_verify: Some(3),
+            ..Default::default()
+        };
+        let p = cfg.review_params();
+        assert_eq!(p.vote.min_votes_block, 2);
+        assert_eq!(p.vote.min_votes_verify, 2, "verify clamped down to block");
+        assert!(p.vote.min_votes_verify <= p.vote.min_votes_block);
+    }
+
+    #[test]
+    fn review_params_forces_single_sample_for_apple_fm() {
+        // AppleFm cannot vary temperature → voting is meaningless → force n_samples = 1
+        // regardless of what the config asks for.
+        let cfg = CensorLocalAi {
+            provider: CensorAiProvider::AppleFm,
+            n_samples: Some(7),
+            temperature: Some(1.0),
+            ..Default::default()
+        };
+        let p = cfg.review_params();
+        assert_eq!(p.vote.n_samples, 1, "AppleFm forced to single sample");
+        assert_eq!(p.vote.min_votes_block, 1);
+        assert_eq!(p.vote.min_votes_verify, 1);
+    }
+
+    #[test]
+    fn validate_clamps_out_of_range_voting_fields() {
+        let cfg = CensorLocalAi {
+            provider: CensorAiProvider::Ollama,
+            n_samples: Some(50),
+            temperature: Some(9.0),
+            prompt_style: Some("bogus".to_string()),
+            ..Default::default()
+        };
+        let v = validate_censor_local_ai(&cfg).expect("ollama config is valid");
+        assert_eq!(v.n_samples, Some(9), "n_samples clamped to 9");
+        assert_eq!(v.temperature, Some(1.5), "temperature clamped to 1.5");
+        assert_eq!(v.prompt_style, None, "unknown style normalizes to None");
+    }
+
+    // ---- parse_censor_v2 ----
+
+    #[test]
+    fn parse_censor_v2_maps_fields_severity_category_and_strips_think() {
+        let resp = "<think>reasoning with a [bracket] that must not fool extraction</think>\n\
+            [{\"line\": 3, \"severity\": \"error\", \"category\": \"security\", \
+             \"title\": \"SQL injection\", \"rationale\": \"user input reaches the query\"}]";
+        let out = parse_censor_v2("src/db.rs", resp);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, Some(3));
+        assert_eq!(out[0].severity, Severity::High, "error → High");
+        assert_eq!(out[0].category, Category::Security);
+        assert_eq!(out[0].title, "SQL injection");
+        assert_eq!(
+            out[0].body, "user input reaches the query",
+            "rationale → body"
+        );
+        assert_eq!(
+            out[0].source, "gemma",
+            "source stays gemma for clobber-protection"
+        );
+    }
+
+    #[test]
+    fn parse_censor_v2_severity_and_category_fallbacks() {
+        let resp = "[\
+            {\"line\":1,\"severity\":\"warning\",\"category\":\"performance\",\"title\":\"a\",\"rationale\":\"r\"},\
+            {\"line\":2,\"severity\":\"info\",\"category\":\"naming\",\"title\":\"b\",\"rationale\":\"r\"},\
+            {\"line\":3,\"severity\":\"???\",\"category\":\"logic-error\",\"title\":\"c\",\"rationale\":\"r\"}]";
+        let out = parse_censor_v2("src/a.rs", resp);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].severity, Severity::Medium); // warning
+        assert_eq!(out[0].category, Category::Complexity); // performance
+        assert_eq!(out[1].severity, Severity::Low); // info
+        assert_eq!(out[1].category, Category::Style); // naming
+        assert_eq!(out[2].severity, Severity::Medium); // unknown → Medium
+        assert_eq!(out[2].category, Category::Correctness); // logic-error → Correctness
+    }
+
+    #[test]
+    fn strip_think_block_handles_missing_close() {
+        assert_eq!(strip_think_block("no tags [1]"), "no tags [1]");
+        assert_eq!(strip_think_block("<think>abc</think>[1]"), "[1]");
+        // Unterminated think → everything from the tag is dropped (no array survives).
+        assert_eq!(strip_think_block("prefix <think>abc [1]"), "prefix ");
+    }
+
+    #[test]
+    fn strip_think_block_removes_all_blocks_not_just_first() {
+        // A second <think> block containing a `[` must not survive to hijack extraction.
+        let raw = "<think>first</think> junk <think>trap [999]</think>[{\"line\":1}]";
+        assert_eq!(strip_think_block(raw), " junk [{\"line\":1}]");
+        // And parse_censor_v2 must therefore extract the REAL array, not the decoy.
+        let out = parse_censor_v2(
+            "src/a.rs",
+            "<think>reason</think><think>[{\"line\":42,\"severity\":\"error\",\"title\":\"decoy\",\"rationale\":\"x\"}]</think>\n\
+             [{\"line\":7,\"severity\":\"error\",\"category\":\"security\",\"title\":\"real\",\"rationale\":\"r\"}]",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "real");
+        assert_eq!(out[0].line, Some(7));
+    }
+
+    // ---- run_gemma voted path ----
+
+    #[test]
+    fn run_gemma_voted_confirms_consistent_finding_and_runs_n_samples() {
+        let resp =
+            r#"[{"line": 7, "title": "Inverted guard", "body": "backwards", "severity": "high"}]"#;
+        let c = StubClient::new(true, Ok(resp.into()));
+        let params = GemmaReviewParams {
+            vote: crate::backend::censor::votes::VoteParams {
+                n_samples: 3,
+                min_votes_block: 2,
+                min_votes_verify: 1,
+                line_tolerance: 2,
+            },
+            temperature: 0.5,
+            prompt_style: PromptStyle::Gemma,
+        };
+        let out = run_gemma(
+            &c,
+            true,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &params,
+        );
+        assert_eq!(out.len(), 1, "3 agreeing samples → one confirmed finding");
+        assert_eq!(out[0].title, "Inverted guard");
+        assert!(
+            !out[0].body.starts_with("[unverified"),
+            "confirmed → no marker"
+        );
+        assert_eq!(
+            c.generate_calls.load(Ordering::SeqCst),
+            3,
+            "voted path runs n_samples generations"
+        );
+    }
+
+    #[test]
+    fn run_gemma_voted_marks_single_vote_finding_as_unverified_suspect() {
+        // Only ONE of three samples reports a smell → 1 vote. block=2, verify=1 → suspect.
+        let hit = r#"[{"line": 4, "title": "swallowed error", "body": "empty catch", "severity": "medium"}]"#;
+        let c = SeqStubClient::new(vec![Ok(hit.into()), Ok("[]".into()), Ok("[]".into())]);
+        let params = GemmaReviewParams {
+            vote: crate::backend::censor::votes::VoteParams {
+                n_samples: 3,
+                min_votes_block: 2,
+                min_votes_verify: 1,
+                line_tolerance: 2,
+            },
+            temperature: 0.5,
+            prompt_style: PromptStyle::Gemma,
+        };
+        let out = run_gemma(
+            &c,
+            true,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &params,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].body.starts_with("[unverified 1/3 votes] "),
+            "got: {}",
+            out[0].body
+        );
+    }
+
+    #[test]
+    fn run_gemma_voted_failed_samples_count_as_empty_no_panic() {
+        // All samples error: the file degrades to empty (each failure is an empty sample).
+        let c = StubClient::new(true, Err(GemmaError::Timeout));
+        let params = GemmaReviewParams {
+            vote: crate::backend::censor::votes::VoteParams {
+                n_samples: 3,
+                min_votes_block: 2,
+                min_votes_verify: 1,
+                line_tolerance: 2,
+            },
+            temperature: 0.5,
+            prompt_style: PromptStyle::Gemma,
+        };
+        let out = run_gemma(
+            &c,
+            true,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &params,
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            c.generate_calls.load(Ordering::SeqCst),
+            3,
+            "all 3 attempted"
+        );
+    }
+
+    #[test]
+    fn run_gemma_legacy_single_sample_uses_plain_generate() {
+        // Default params → the legacy fast path: exactly one generate() call, parsed by
+        // parse_gemma (byte-identical to the pre-voting behavior).
+        let resp = r#"[{"line": 1, "title": "t", "body": "b", "severity": "low"}]"#;
+        let c = StubClient::new(true, Ok(resp.into()));
+        let out = run_gemma(
+            &c,
+            true,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &GemmaReviewParams::default(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(c.generate_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn apple_fm_generate_does_not_deadlock_when_child_emits_before_reading_large_prompt() {
         if std::env::var_os(APPLE_FM_DEADLOCK_CANDIDATE_ENV).is_some()
@@ -1854,7 +2653,9 @@ mod tests {
             }
             if start.elapsed() > Duration::from_secs(10) {
                 let _ = child.kill();
-                let output = child.wait_with_output().expect("collect timed-out candidate");
+                let output = child
+                    .wait_with_output()
+                    .expect("collect timed-out candidate");
                 panic!(
                     "appleFm process runner deadlocked on large stdin + early stdout\nstdout:\n{}\nstderr:\n{}",
                     String::from_utf8_lossy(&output.stdout),
@@ -1877,13 +2678,8 @@ mod tests {
             "apple_fm_deadlock_stub_child".to_string(),
             "--nocapture".to_string(),
         ];
-        let output = run_apple_fm_respond_process(
-            &exe,
-            &args,
-            &prompt,
-            Duration::from_secs(5),
-        )
-        .expect("large prompt should not deadlock");
+        let output = run_apple_fm_respond_process(&exe, &args, &prompt, Duration::from_secs(5))
+            .expect("large prompt should not deadlock");
         assert!(
             output.contains("stub saw 163840 bytes"),
             "stub output missing stdin length: {output}"
@@ -2143,7 +2939,10 @@ mod tests {
         assert_eq!(resolve_gemma_model(None, &["gemma4:e4b".to_string()]), "");
         assert_eq!(resolve_gemma_model(None, &[]), "");
         // Whitespace-only configured is treated as absent → empty (tier off).
-        assert_eq!(resolve_gemma_model(Some("   "), &[GEMMA_MODEL.to_string()]), "");
+        assert_eq!(
+            resolve_gemma_model(Some("   "), &[GEMMA_MODEL.to_string()]),
+            ""
+        );
     }
 
     #[test]
@@ -2164,7 +2963,15 @@ mod tests {
             Ok("[{\"line\":1,\"title\":\"x\",\"severity\":\"low\"}]".into()),
         );
         let calls = c.generate_calls.clone();
-        let out = run_gemma(&c, false, Path::new("/root"), "src/a.ts", "code", &[]);
+        let out = run_gemma(
+            &c,
+            false,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &GemmaReviewParams::default(),
+        );
         assert!(out.is_empty());
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -2185,6 +2992,7 @@ mod tests {
             "src/a.ts",
             "code",
             &[det(1, "known")],
+            &GemmaReviewParams::default(),
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].source, "gemma");
@@ -2195,14 +3003,30 @@ mod tests {
     #[test]
     fn run_gemma_generate_error_returns_empty_no_panic() {
         let c = StubClient::new(true, Err(GemmaError::Timeout));
-        let out = run_gemma(&c, true, Path::new("/root"), "src/a.ts", "code", &[]);
+        let out = run_gemma(
+            &c,
+            true,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &GemmaReviewParams::default(),
+        );
         assert!(out.is_empty());
     }
 
     #[test]
     fn run_gemma_garbage_response_returns_empty() {
         let c = StubClient::new(true, Ok("the model rambled with no json".into()));
-        let out = run_gemma(&c, true, Path::new("/root"), "src/a.ts", "code", &[]);
+        let out = run_gemma(
+            &c,
+            true,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &GemmaReviewParams::default(),
+        );
         assert!(out.is_empty());
     }
 
@@ -2396,19 +3220,25 @@ mod tests {
             "http://[::1]", // no port at all is fine
             "http://localhost",
         ] {
-            assert!(is_loopback_omlx_base(ok), "valid-port base {ok:?} must be accepted");
+            assert!(
+                is_loopback_omlx_base(ok),
+                "valid-port base {ok:?} must be accepted"
+            );
         }
         for bad in [
-            "http://[::1]:",         // empty ipv6 port
-            "http://localhost:",     // empty port
+            "http://[::1]:",          // empty ipv6 port
+            "http://localhost:",      // empty port
             "http://localhost:99999", // > 65535
             "http://localhost:65536", // > 65535
-            "http://localhost:abc",  // non-numeric
-            "http://127.0.0.1:",     // empty port
-            "http://[::1]:abc",      // ipv6 non-numeric
-            "http://[::1]:65536",    // ipv6 out of range
+            "http://localhost:abc",   // non-numeric
+            "http://127.0.0.1:",      // empty port
+            "http://[::1]:abc",       // ipv6 non-numeric
+            "http://[::1]:65536",     // ipv6 out of range
         ] {
-            assert!(!is_loopback_omlx_base(bad), "invalid-port base {bad:?} must be rejected");
+            assert!(
+                !is_loopback_omlx_base(bad),
+                "invalid-port base {bad:?} must be rejected"
+            );
         }
     }
 
@@ -2464,13 +3294,12 @@ mod tests {
         // not loopback alone — so the type is safe regardless of how it is called.
 
         // An over-length base (even an otherwise-loopback one) is clamped to the default.
-        let overlong = format!("http://localhost:8000/{}", "a".repeat(OMLX_BASE_URL_MAX_LEN));
-        let c_long = OmlxClient::with_config(
-            &overlong,
-            "m",
-            GEMMA_GENERATE_TIMEOUT,
-            GEMMA_PROBE_TIMEOUT,
+        let overlong = format!(
+            "http://localhost:8000/{}",
+            "a".repeat(OMLX_BASE_URL_MAX_LEN)
         );
+        let c_long =
+            OmlxClient::with_config(&overlong, "m", GEMMA_GENERATE_TIMEOUT, GEMMA_PROBE_TIMEOUT);
         assert_eq!(
             c_long.base, OMLX_DEFAULT_BASE,
             "an over-length oMLX base must be clamped to the default"
@@ -2478,12 +3307,8 @@ mod tests {
 
         // A base carrying a control/bidi/invisible char is clamped too.
         let obfuscated = "http://localhost:8000/\u{202e}v1";
-        let c_bidi = OmlxClient::with_config(
-            obfuscated,
-            "m",
-            GEMMA_GENERATE_TIMEOUT,
-            GEMMA_PROBE_TIMEOUT,
-        );
+        let c_bidi =
+            OmlxClient::with_config(obfuscated, "m", GEMMA_GENERATE_TIMEOUT, GEMMA_PROBE_TIMEOUT);
         assert_eq!(
             c_bidi.base, OMLX_DEFAULT_BASE,
             "a base with a forbidden char must be clamped to the default"
@@ -2581,7 +3406,10 @@ mod tests {
         assert!(!openai_model_present(&body, "mlx-community/other-model"));
         // Missing / empty data → false.
         assert!(!openai_model_present(&serde_json::json!({}), "m"));
-        assert!(!openai_model_present(&serde_json::json!({ "data": [] }), "m"));
+        assert!(!openai_model_present(
+            &serde_json::json!({ "data": [] }),
+            "m"
+        ));
     }
 
     // ---- validate_censor_local_ai: defaults + omlx requirements + privacy ----
@@ -2594,6 +3422,7 @@ mod tests {
             base_url: None,
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v.provider, CensorAiProvider::Ollama);
@@ -2606,6 +3435,7 @@ mod tests {
             base_url: Some("  http://127.0.0.1:11434  ".into()),
             model: Some(" gemma4:e2b ".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v2.base_url.as_deref(), Some("http://127.0.0.1:11434"));
@@ -2619,6 +3449,7 @@ mod tests {
             base_url: Some("http://evil.com:11434".into()),
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2631,6 +3462,7 @@ mod tests {
             base_url: Some("http://localhost:8000/v1".into()),
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
         // Missing base.
@@ -2639,6 +3471,7 @@ mod tests {
             base_url: None,
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
         // Empty (whitespace) base/model.
@@ -2647,6 +3480,7 @@ mod tests {
             base_url: Some("   ".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2658,6 +3492,7 @@ mod tests {
             base_url: Some("http://localhost:8000/v1/".into()),
             model: Some("mlx-community/gemma".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v.provider, CensorAiProvider::Omlx);
@@ -2677,6 +3512,7 @@ mod tests {
             base_url: Some("https://localhost:8000/v1".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2690,6 +3526,7 @@ mod tests {
             base_url: Some("https://openrouter.ai/api/v1/".into()),
             model: Some("openai/gpt-4o-mini".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v.provider, CensorAiProvider::Cloud);
@@ -2707,6 +3544,7 @@ mod tests {
             base_url: Some("http://openrouter.ai/api/v1".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2719,6 +3557,7 @@ mod tests {
             base_url: None,
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
         // Missing model.
@@ -2727,6 +3566,7 @@ mod tests {
             base_url: Some("https://openrouter.ai/api/v1".into()),
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2743,10 +3583,10 @@ mod tests {
             "https://metadata.google.internal/v1",
             "https://api.internal/v1",
             "https://router.local/v1",
-            "https://intranet/v1", // single label, no dot
+            "https://intranet/v1",           // single label, no dot
             "https://user@openrouter.ai/v1", // userinfo
-            "https://[::1]/v1", // IPv6 literal
-            "http://openrouter.ai/v1", // not https
+            "https://[::1]/v1",              // IPv6 literal
+            "http://openrouter.ai/v1",       // not https
         ] {
             assert!(
                 validate_censor_local_ai(&CensorLocalAi {
@@ -2754,6 +3594,7 @@ mod tests {
                     base_url: Some(base.into()),
                     model: Some("m".into()),
                     ollama_model: None,
+                    ..Default::default()
                 })
                 .is_err(),
                 "cloud base {base:?} must be rejected"
@@ -2768,6 +3609,7 @@ mod tests {
             base_url: Some("https://api.openai.com:443/v1".into()),
             model: Some("gpt-4o-mini".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v.base_url.as_deref(), Some("https://api.openai.com:443/v1"));
@@ -2785,7 +3627,9 @@ mod tests {
             GEMMA_PROBE_TIMEOUT,
         );
         // cache_identity folds in the base; it must show the remote host, prefixed "cloud".
-        assert!(c.cache_identity().starts_with("cloud|https://openrouter.ai/api/v1|"));
+        assert!(c
+            .cache_identity()
+            .starts_with("cloud|https://openrouter.ai/api/v1|"));
         assert_eq!(c.provider_label(), "cloud");
         // The key MUST NOT appear anywhere identity-bearing (it could be logged).
         assert!(!c.cache_identity().contains("sk-secret"));
@@ -2817,7 +3661,9 @@ mod tests {
             GEMMA_GENERATE_TIMEOUT,
             GEMMA_PROBE_TIMEOUT,
         );
-        assert!(c.cache_identity().ends_with(&format!("|{OMLX_DEFAULT_BASE}|m")));
+        assert!(c
+            .cache_identity()
+            .ends_with(&format!("|{OMLX_DEFAULT_BASE}|m")));
     }
 
     #[test]
@@ -2827,6 +3673,7 @@ mod tests {
             base_url: Some("https://openrouter.ai/api/v1".into()),
             model: Some("openai/gpt-4o-mini".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         let client = build_gemma_client_with_key(&cfg, Some("sk-secret")).unwrap();
@@ -2849,6 +3696,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:11434/".into()),
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v.base_url.as_deref(), Some("http://127.0.0.1:11434"));
@@ -2863,6 +3711,7 @@ mod tests {
             base_url: Some("http://evil.com:8000/v1".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
         // Userinfo trick refused.
@@ -2871,6 +3720,7 @@ mod tests {
             base_url: Some("http://127.0.0.1@evil.com".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
         // Control / bidi chars refused.
@@ -2879,15 +3729,20 @@ mod tests {
             base_url: Some("http://localhost:8000/\u{202e}v1".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
         // Overlong base refused.
-        let long = format!("http://localhost:8000/{}", "a".repeat(OMLX_BASE_URL_MAX_LEN));
+        let long = format!(
+            "http://localhost:8000/{}",
+            "a".repeat(OMLX_BASE_URL_MAX_LEN)
+        );
         assert!(validate_censor_local_ai(&CensorLocalAi {
             provider: CensorAiProvider::Omlx,
             base_url: Some(long),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2910,8 +3765,12 @@ mod tests {
                 base_url: Some("http://localhost:8000/v1".into()),
                 model: Some(model.into()),
                 ollama_model: None,
+                ..Default::default()
             });
-            assert!(v.is_ok(), "valid oMLX model {model:?} must be accepted: {v:?}");
+            assert!(
+                v.is_ok(),
+                "valid oMLX model {model:?} must be accepted: {v:?}"
+            );
             // The same token must satisfy the mini-coder validator (cross-check parity).
             assert!(
                 crate::backend::mini_coder::is_valid_model(model),
@@ -2920,14 +3779,14 @@ mod tests {
         }
 
         let invalid = [
-            "model name",       // whitespace
-            "model;rm -rf",     // shell metachar
-            "-leading-dash",    // first char not alnum
-            ".dotfirst",        // first char not alnum
+            "model name",        // whitespace
+            "model;rm -rf",      // shell metachar
+            "-leading-dash",     // first char not alnum
+            ".dotfirst",         // first char not alnum
             "model\u{202e}evil", // bidi override
-            "model\ttab",       // control
-            "model@host",       // @ not allowed
-            "model\\path",      // backslash not allowed
+            "model\ttab",        // control
+            "model@host",        // @ not allowed
+            "model\\path",       // backslash not allowed
         ];
         for model in invalid {
             assert!(
@@ -2936,6 +3795,7 @@ mod tests {
                     base_url: Some("http://localhost:8000/v1".into()),
                     model: Some(model.into()),
                     ollama_model: None,
+                    ..Default::default()
                 })
                 .is_err(),
                 "invalid oMLX model {model:?} must be rejected"
@@ -2959,6 +3819,7 @@ mod tests {
             base_url: Some("http://localhost:8000/v1".into()),
             model: Some(at_cap),
             ollama_model: None,
+            ..Default::default()
         })
         .is_ok());
         let over_cap = "a".repeat(CENSOR_OMLX_MODEL_MAX_LEN + 1);
@@ -2967,6 +3828,7 @@ mod tests {
             base_url: Some("http://localhost:8000/v1".into()),
             model: Some(over_cap),
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -2992,22 +3854,31 @@ mod tests {
             base_url: Some("http://localhost:8000/v1".into()),
             model: Some("m".into()),
             ollama_model: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&omlx).unwrap();
-        assert!(j.contains("\"baseUrl\":\"http://localhost:8000/v1\""), "{j}");
+        assert!(
+            j.contains("\"baseUrl\":\"http://localhost:8000/v1\""),
+            "{j}"
+        );
         assert!(!j.contains("base_url"), "snake_case leaked: {j}");
         // NO-CHURN: ollama_model is None → never serialized.
-        assert!(!j.contains("ollamaModel"), "absent ollamaModel must not serialize: {j}");
+        assert!(
+            !j.contains("ollamaModel"),
+            "absent ollamaModel must not serialize: {j}"
+        );
         let back: CensorLocalAi = serde_json::from_str(&j).unwrap();
         assert_eq!(back, omlx);
         // Deserialize from a minimal camelCase object (provider only).
-        let parsed: CensorLocalAi = serde_json::from_str(r#"{"provider":"omlx","baseUrl":"http://localhost:8000","model":"x"}"#).unwrap();
+        let parsed: CensorLocalAi = serde_json::from_str(
+            r#"{"provider":"omlx","baseUrl":"http://localhost:8000","model":"x"}"#,
+        )
+        .unwrap();
         assert_eq!(parsed.provider, CensorAiProvider::Omlx);
         assert_eq!(parsed.base_url.as_deref(), Some("http://localhost:8000"));
 
         // BACKWARD COMPAT: an OLD ollama config (no ollamaModel key) parses with None.
-        let old: CensorLocalAi =
-            serde_json::from_str(r#"{"provider":"ollama"}"#).unwrap();
+        let old: CensorLocalAi = serde_json::from_str(r#"{"provider":"ollama"}"#).unwrap();
         assert!(old.ollama_model.is_none());
         // Round-trip WITH a configured ollamaModel (camelCase over IPC).
         let with_model = CensorLocalAi {
@@ -3015,6 +3886,7 @@ mod tests {
             base_url: None,
             model: None,
             ollama_model: Some("gemma4:e4b".into()),
+            ..Default::default()
         };
         let jm = serde_json::to_string(&with_model).unwrap();
         assert!(jm.contains("\"ollamaModel\":\"gemma4:e4b\""), "{jm}");
@@ -3027,6 +3899,7 @@ mod tests {
             base_url: None,
             model: Some("apple-default".into()),
             ollama_model: None,
+            ..Default::default()
         };
         let aj = serde_json::to_string(&apple).unwrap();
         assert!(aj.contains("\"provider\":\"appleFm\""), "{aj}");
@@ -3042,6 +3915,7 @@ mod tests {
             base_url: Some("http://evil.example".into()),
             model: Some("  apple-model:v1  ".into()),
             ollama_model: Some("gemma4:e4b".into()),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(valid.provider, CensorAiProvider::AppleFm);
@@ -3054,6 +3928,7 @@ mod tests {
             base_url: None,
             model: Some("bad model".into()),
             ollama_model: None,
+            ..Default::default()
         });
         assert!(bad.is_err(), "appleFm model must use bare-token validation");
     }
@@ -3077,6 +3952,7 @@ mod tests {
             base_url: None,
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         let err = match build_gemma_client(&cfg) {
@@ -3094,6 +3970,7 @@ mod tests {
             base_url: None,
             model: None,
             ollama_model: Some("  gemma4:e4b  ".into()),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(v.ollama_model.as_deref(), Some("gemma4:e4b"));
@@ -3103,22 +3980,19 @@ mod tests {
             base_url: None,
             model: None,
             ollama_model: Some("   ".into()),
+            ..Default::default()
         })
         .unwrap();
         assert!(v_empty.ollama_model.is_none());
         // Invalid (space / control / overlong) → REJECTED.
-        for bad in [
-            "model name",
-            "model;rm",
-            "bad\u{202e}tag",
-            "model\ttab",
-        ] {
+        for bad in ["model name", "model;rm", "bad\u{202e}tag", "model\ttab"] {
             assert!(
                 validate_censor_local_ai(&CensorLocalAi {
                     provider: CensorAiProvider::Ollama,
                     base_url: None,
                     model: None,
                     ollama_model: Some(bad.into()),
+                    ..Default::default()
                 })
                 .is_err(),
                 "invalid ollamaModel {bad:?} must be rejected"
@@ -3130,6 +4004,7 @@ mod tests {
             base_url: None,
             model: None,
             ollama_model: Some(overlong),
+            ..Default::default()
         })
         .is_err());
         // oMLX config: a stray ollama_model is dropped (oMLX uses `model`).
@@ -3138,6 +4013,7 @@ mod tests {
             base_url: Some("http://localhost:8000/v1".into()),
             model: Some("mlx-community/gemma".into()),
             ollama_model: Some("gemma4:e4b".into()),
+            ..Default::default()
         })
         .unwrap();
         assert!(omlx.ollama_model.is_none());
@@ -3175,9 +4051,9 @@ mod tests {
         let base = format!("http://127.0.0.1:{}", addr.port());
         let client = OllamaClient::with_config(
             &base,
-            None,                          // NO override -> the IO branch under test
+            None, // NO override -> the IO branch under test
             GEMMA_GENERATE_TIMEOUT,
-            Duration::from_secs(30),       // a fetch would block ~30s if it happened
+            Duration::from_secs(30), // a fetch would block ~30s if it happened
         );
 
         let start = Instant::now();
@@ -3231,6 +4107,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:11434".into()),
             model: None,
             ollama_model: Some("gemma4:e4b".into()),
+            ..Default::default()
         })
         .unwrap();
         let client = build_gemma_client(&cfg).unwrap();
@@ -3269,6 +4146,7 @@ mod tests {
                 base_url: Some("http://127.0.0.1:11434".into()),
                 model: None,
                 ollama_model: Some("llama3:8b".into()),
+                ..Default::default()
             })
             .unwrap(),
         )
@@ -3304,6 +4182,7 @@ mod tests {
             base_url: Some("http://localhost:8000/v1".into()),
             model: Some("mlx-community/gemma".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         let client = build_gemma_client(&cfg).unwrap();
@@ -3324,6 +4203,7 @@ mod tests {
                 base_url: Some("http://localhost:8000/v1".into()),
                 model: Some("mlx-community/gemma".into()),
                 ollama_model: None,
+                ..Default::default()
             })
             .unwrap(),
         ] {
@@ -3346,6 +4226,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:11434".into()),
             model: Some("gemma4:e2b".into()),
             ollama_model: None,
+            ..Default::default()
         })
         .unwrap();
         let client = build_gemma_client(&cfg).unwrap();
@@ -3368,7 +4249,15 @@ mod tests {
         // probe site uses), then passes it to run_gemma — exactly the worker's flow.
         let available = probe_available(&stub);
         assert!(!available, "probe=false must disable the tier");
-        let out = run_gemma(&stub, available, Path::new("/root"), "src/a.ts", "code", &[]);
+        let out = run_gemma(
+            &stub,
+            available,
+            Path::new("/root"),
+            "src/a.ts",
+            "code",
+            &[],
+            &GemmaReviewParams::default(),
+        );
         assert!(out.is_empty(), "unavailable tier yields no findings");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3394,6 +4283,7 @@ mod tests {
             base_url: Some("http://127.0.0.1:8000/v1".into()),
             model: Some("gemma-4-12B-it-qat-4bit".into()),
             ollama_model: None,
+            ..Default::default()
         };
         let client = build_gemma_client(&cfg).expect("omlx client builds");
         let available = probe_available(client.as_ref());
@@ -3401,7 +4291,8 @@ mod tests {
             eprintln!("omlx_gemma_tier_live: no oMLX server on 127.0.0.1:8000 — SKIPPED");
             return;
         }
-        let code = "export function div(a: number, b: number) {\n  return a / b; // no zero check\n}\n";
+        let code =
+            "export function div(a: number, b: number) {\n  return a / b; // no zero check\n}\n";
         let findings = run_gemma(
             client.as_ref(),
             available,
@@ -3409,6 +4300,7 @@ mod tests {
             "src/div.ts",
             code,
             &[],
+            &GemmaReviewParams::default(),
         );
         // Zero findings is a VALID verdict; the assertion is that the live tier
         // ran (availability true) — transport/parse failures inside run_gemma

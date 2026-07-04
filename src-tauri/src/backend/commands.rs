@@ -1462,7 +1462,7 @@ pub fn request_unlock(
     state: State<'_, BackendState>,
     reason: Option<String>,
 ) -> Result<AuthState, String> {
-    let message = reason.unwrap_or_else(|| "Unlock Aspis Management".into());
+    let message = reason.unwrap_or_else(|| "Unlock Devboule".into());
     state.verify_unlock(&message)
 }
 
@@ -1576,9 +1576,7 @@ pub fn delete_scaleway_object_secret_key(
 // (backend-internal `vault::read_exa_key`) and sets `EXA_API_KEY` only when present.
 
 #[tauri::command]
-pub fn get_exa_key_status(
-    state: State<'_, BackendState>,
-) -> Result<AuxCredentialStatus, String> {
+pub fn get_exa_key_status(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::exa_key_status()
 }
@@ -1593,9 +1591,7 @@ pub fn save_exa_key(
 }
 
 #[tauri::command]
-pub fn delete_exa_key(
-    state: State<'_, BackendState>,
-) -> Result<AuxCredentialStatus, String> {
+pub fn delete_exa_key(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::delete_exa_key()
 }
@@ -1654,9 +1650,7 @@ pub fn save_cloud_llm_key(
 }
 
 #[tauri::command]
-pub fn delete_cloud_llm_key(
-    state: State<'_, BackendState>,
-) -> Result<AuxCredentialStatus, String> {
+pub fn delete_cloud_llm_key(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::delete_cloud_llm_key()
 }
@@ -1698,6 +1692,22 @@ pub fn delete_oracle_llm_api_key(
 ) -> Result<OracleLlmSettingsStatus, String> {
     state.ensure_unlocked()?;
     vault::delete_oracle_llm_api_key()
+}
+
+#[tauri::command]
+pub fn disable_oracle_llm(
+    state: State<'_, BackendState>,
+) -> Result<OracleLlmSettingsStatus, String> {
+    state.ensure_unlocked()?;
+    let disabled = OracleLlmSettings {
+        provider: String::new(),
+        model: String::new(),
+        base_url: None,
+        remote_enabled: false,
+    };
+    let status = vault::save_oracle_llm_settings(&disabled, None)?;
+    crate::backend::oracle_service::request_llm_restart();
+    Ok(status)
 }
 
 #[tauri::command]
@@ -4481,7 +4491,7 @@ async fn build_snapshot(
         message: "Dashboard snapshot refreshed.".into(),
         timestamp: now(),
         event_type: "sync".into(),
-        source: "Aspis Management".into(),
+        source: "Devboule".into(),
     });
     append_recent_activity_without_duplicates(state, &mut activity)?;
 

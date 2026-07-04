@@ -327,7 +327,7 @@ fn parse_ollama_tags(body: &str) -> Vec<String> {
 /// PURE: extract the model ids from an OpenAI-compatible `/v1/models` JSON body. Shape:
 /// `{"data":[{"id":"model-name", ...}, ...]}`. Same tolerance as the ollama parser.
 /// Bounded count + per-name length (BLOCKER 2).
-fn parse_omlx_models(body: &str) -> Vec<String> {
+pub(crate) fn parse_omlx_models(body: &str) -> Vec<String> {
     let value: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return Vec::new(),

@@ -801,7 +801,10 @@ fn build_spawn_params(task: &TaskView, dep_summaries: &[(String, String)]) -> se
         // blow the per-spawn char budget and silently drop the tail (the whole text is
         // capped below, which truncates from the END). Keep the first N, name the rest.
         const MAX_DEP_SUMMARIES: usize = 8;
-        text.push_str("\n\nContext from completed dependencies (already done):");
+        text.push_str(
+            "\n\nContext from completed dependencies (already done). Preserve exact file \
+             paths, function names, and error messages.",
+        );
         for (id, summary) in dep_summaries.iter().take(MAX_DEP_SUMMARIES) {
             text.push_str(&format!("\n- {}: {}", id, cap_chars(summary.trim(), 400)));
         }
@@ -972,6 +975,43 @@ mod tests {
         assert!(
             !none["task"].as_str().unwrap().contains("Context from completed dependencies"),
             "no dep section when there are no summaries"
+        );
+    }
+
+    #[test]
+    fn build_spawn_params_dep_summary_instructs_preserving_exact_identifiers() {
+        // The dep-summary handoff is a fixed instruction string wrapping raw evidence
+        // text (not itself model-authored), so the closing rule sentence is appended
+        // as a fixed part of that instruction: a mini reading a summary of what a
+        // dependency did must not paraphrase away the exact names/paths it needs to
+        // wire against.
+        let task = TaskView {
+            id: "T2".into(),
+            title: "wire the login route".into(),
+            status: "todo".into(),
+            depends_on: vec!["T1".into()],
+            scope: vec!["src/auth.rs".into()],
+            acceptance: "cargo test auth".into(),
+            evidence: String::new(),
+            plan_id: "P".into(),
+            updated_at: "t".into(),
+            weight: String::new(),
+        };
+        let deps = vec![("T1".to_string(), "created fn login_user() in src/auth.rs".to_string())];
+        let params = build_spawn_params(&task, &deps);
+        let text = params["task"].as_str().unwrap();
+        assert!(
+            text.contains("Preserve exact file paths, function names, and error messages."),
+            "the closing rule sentence must be present: {text}"
+        );
+        // No dependency summaries → the instruction (and its closing rule) is absent too.
+        let none = build_spawn_params(&task, &[]);
+        assert!(
+            !none["task"]
+                .as_str()
+                .unwrap()
+                .contains("Preserve exact file paths, function names, and error messages."),
+            "no dep section => no closing rule either"
         );
     }
 

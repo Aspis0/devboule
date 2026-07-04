@@ -19,7 +19,11 @@ pub mod orchestrator;
 pub mod runners;
 pub mod schema;
 pub mod severity;
+pub mod votes;
 pub mod watch;
+
+#[cfg(test)]
+mod live_e2e;
 
 /// Per-project directory holding the censor shards. Lives in the watched project
 /// root; A3 adds it to the watcher ignore set (self-trigger guard) and the panel

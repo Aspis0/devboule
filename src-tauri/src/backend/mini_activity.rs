@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager};
 
 // (was: use super::mini_coder::EscalationFinding; — deleted with verdict gate)
 use crate::backend::censor::schema::Finding as CensorFinding;
@@ -269,6 +269,13 @@ pub enum ConsoleEntry {
         role: String,
         text: String,
         time: String,
+        /// D3 (planner-chat demolition): the client-generated send id, echoed back
+        /// through the bridge when the writer knew it (the app's cloud-duplex user
+        /// echo). The frontend drains its optimistic pending list BY this id; absent
+        /// for local-binary echoes and historical lines (those fall back to text
+        /// matching). Omitted from the wire when None (compat with old readers).
+        #[serde(rename = "msgId", default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
     },
     /// KAIRION (orchestrator-only): a clarification question the orchestrator raised, carrying
     /// the text-doubt signal (unrest / candidates / lean / directionConfidence) so the UI can
@@ -500,11 +507,43 @@ impl MiniActivityStore {
 /// config), mirroring `mini_coder_kill`'s deliberate gate-skip. Tauri maps the camelCase
 /// `agentId` arg onto the snake_case `agent_id` param, exactly like `get_agent_token_usage`.
 #[tauri::command]
-pub fn mini_activity_snapshot(
-    agent_id: String,
-    store: State<'_, MiniActivityStore>,
-) -> ConsoleActivity {
-    store.snapshot(&agent_id)
+pub async fn mini_activity_snapshot(app: tauri::AppHandle, agent_id: String) -> ConsoleActivity {
+    let Some(store) = app.try_state::<MiniActivityStore>() else {
+        return ConsoleActivity::empty();
+    };
+    let snap = store.snapshot(&agent_id);
+    if !is_console_blank(&snap) {
+        return snap;
+    }
+    // D2 HYDRATE-ON-MISS: nothing in the render cache (app restart, CAP eviction, or no
+    // session this app-run) but the agent may have a durable bridge file — replay its
+    // tail so the conversation survives WITHOUT a live session and without the frontend
+    // needing a separate durable-read path. Async + spawn_blocking because this is real
+    // disk I/O (up to HYDRATE_WINDOW_BYTES) — a burst of snapshot polls must not stall
+    // IPC dispatch (hostile-review finding). `mark_running=false`: with no live tail
+    // there is no process to spin for; a live tail's own pushes re-assert running within
+    // a tick (and its launch-time reset atomically replaces this state anyway, so the
+    // benign race between this write and a concurrent tail hydration converges). Ids
+    // with no bridge file (minis, coders) fall through untouched — a plain blank snapshot.
+    let Ok(projects_dir) = crate::backend::projects::ensure_projects_dir(&app) else {
+        return snap;
+    };
+    let Some(name) = activity_file_name(&agent_id) else {
+        return snap;
+    };
+    let path = projects_dir.join(ACTIVITY_SUBDIR).join(name);
+    let hydrated = tauri::async_runtime::spawn_blocking(move || {
+        hydrate_from_bridge_file(&path, HYDRATE_WINDOW_BYTES, false)
+    })
+    .await;
+    match hydrated {
+        Ok(Some((activity, _))) if !is_console_blank(&activity) => {
+            let out = activity.clone();
+            store.update(&app, &agent_id, move |a| *a = activity);
+            out
+        }
+        _ => snap,
+    }
 }
 
 /// One durable chat turn read back from an agent's on-disk activity bridge.
@@ -513,6 +552,9 @@ pub fn mini_activity_snapshot(
 pub struct ChatTurn {
     pub role: String,
     pub text: String,
+    /// D3: the echoed client send id, when the bridge line carried one.
+    #[serde(rename = "msgId", skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
 }
 
 /// B15b: read an agent's DURABLE chat transcript directly from its on-disk
@@ -538,8 +580,77 @@ pub fn read_activity_chat(app: tauri::AppHandle, agent_id: String) -> Vec<ChatTu
     content
         .lines()
         .filter_map(parse_chat_line)
-        .map(|(role, text)| ChatTurn { role, text })
+        .map(|chat| ChatTurn {
+            role: chat.role,
+            text: chat.text,
+            msg_id: chat.msg_id,
+        })
         .collect()
+}
+
+/// D-resume: the chat turns inside a bridge file's HYDRATION WINDOW — a bounded tail
+/// read, never the whole file (max-recall: an unbounded read on the launch path means
+/// ever-growing relaunch latency for a months-old project). Empty on a missing file.
+pub fn recent_chat_turns(path: &Path) -> Vec<ChatTurn> {
+    let Some((activity, _)) = hydrate_from_bridge_file(path, HYDRATE_WINDOW_BYTES, false) else {
+        return Vec::new();
+    };
+    activity
+        .entries
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ConsoleEntry::Chat {
+                role,
+                text,
+                msg_id,
+                ..
+            } => Some(ChatTurn { role, text, msg_id }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D-resume (planner-chat demolition follow-on): format the TAIL of a project's durable
+/// chat transcript as a context block for a RELAUNCHED orchestrator's first turn, so a
+/// new process (relaunch, app restart, backend switch) resumes the conversation instead
+/// of starting amnesiac. Deterministic and zero-LLM, reusing the compact.rs primitives:
+/// turns are taken from the END (recency beats lexical relevance for a dialogue — BM25
+/// deliberately NOT used here) until `max_turns` or the `budget_tokens` estimate is
+/// exhausted; each line is truncated to a per-turn ceiling so one giant paste cannot
+/// evict the rest. `None` for an empty history — the caller then sends the goal alone,
+/// byte-identical to a first launch.
+pub fn format_chat_resume_block(
+    turns: &[ChatTurn],
+    max_turns: usize,
+    budget_tokens: usize,
+) -> Option<String> {
+    use crate::backend::compact::{estimate_tokens, truncate_to_token_budget};
+    /// One turn may not eat more than this many tokens of the resume budget.
+    const PER_TURN_TOKEN_CAP: usize = 400;
+    if turns.is_empty() || max_turns == 0 || budget_tokens == 0 {
+        return None;
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut spent = 0usize;
+    for turn in turns.iter().rev().take(max_turns) {
+        let line = format!(
+            "{}: {}",
+            turn.role,
+            truncate_to_token_budget(&turn.text, PER_TURN_TOKEN_CAP)
+        );
+        let cost = estimate_tokens(&line);
+        if !kept.is_empty() && spent + cost > budget_tokens {
+            break;
+        }
+        spent += cost;
+        kept.push(line);
+    }
+    kept.reverse();
+    Some(format!(
+        "<conversation-so-far>\n{}\n</conversation-so-far>\n(You are resuming this project's planning conversation after a relaunch or backend switch. The transcript above is what the user already discussed with the previous orchestrator. Continue from there — do not re-ask answered questions, do not re-introduce yourself.)",
+        kept.join("\n"),
+    ))
 }
 
 // ---- builder / mutator helpers (keep the executor diff tiny) ----------------
@@ -648,7 +759,13 @@ pub fn push_websearch(
 
 /// Append ONE `Chat` timeline entry (a conversational turn). Same FIFO cap + live-state
 /// bookkeeping as [`push_coder_milestone`].
-pub fn push_chat(activity: &mut ConsoleActivity, role: &str, text: &str, time: &str) {
+pub fn push_chat(
+    activity: &mut ConsoleActivity,
+    role: &str,
+    text: &str,
+    time: &str,
+    msg_id: Option<&str>,
+) {
     // B14b: the final assistant turn lands as a real timeline entry — clear the live
     // streaming tail so the in-progress bubble is replaced by the finalized one (no
     // duplicate, no leftover preview). A user turn never clears an in-flight reply.
@@ -660,6 +777,7 @@ pub fn push_chat(activity: &mut ConsoleActivity, role: &str, text: &str, time: &
         role: role.to_string(),
         text: text.to_string(),
         time: time.to_string(),
+        msg_id: msg_id.map(str::to_string),
     });
     if entries.len() > MAX_ENTRIES_PER_AGENT {
         let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
@@ -1157,12 +1275,24 @@ struct ChatEvent {
     role: String,
     #[serde(default)]
     text: String,
+    /// D3: the client-generated send id the writer echoed back (optional).
+    #[serde(rename = "msgId", default)]
+    msg_id: Option<String>,
 }
 
-/// Parse ONE file line into a `(role, text)` chat turn, or `None` to SKIP (blank,
-/// oversized, non-JSON, not `kind == "chat"`, or an unknown role). Pure + total. Role
-/// is normalized to "assistant"/"user" (anything else is dropped); text re-capped.
-fn parse_chat_line(line: &str) -> Option<(String, String)> {
+/// One parsed chat bridge line: normalized role + capped text + the optional echoed
+/// send id (D3). A struct, not a widening tuple, so call sites stay readable.
+pub(crate) struct ParsedChatLine {
+    pub(crate) role: String,
+    pub(crate) text: String,
+    pub(crate) msg_id: Option<String>,
+}
+
+/// Parse ONE file line into a chat turn, or `None` to SKIP (blank, oversized,
+/// non-JSON, not `kind == "chat"`, or an unknown role). Pure + total. Role is
+/// normalized to "assistant"/"user" (anything else is dropped); text re-capped;
+/// the untrusted `msgId` is trimmed, capped, and blank ⇒ absent.
+fn parse_chat_line(line: &str) -> Option<ParsedChatLine> {
     let line = line.trim();
     if line.is_empty() || line.len() > MAX_LINE_BYTES {
         return None;
@@ -1180,7 +1310,15 @@ fn parse_chat_line(line: &str) -> Option<(String, String)> {
     if text.trim().is_empty() {
         return None;
     }
-    Some((role.to_string(), text))
+    let msg_id = event
+        .msg_id
+        .map(|id| id.trim().chars().take(128).collect::<String>())
+        .filter(|id| !id.is_empty());
+    Some(ParsedChatLine {
+        role: role.to_string(),
+        text,
+        msg_id,
+    })
 }
 
 /// The `chat-delta` bridge event wire shape (B14b): a cumulative snapshot of an assistant
@@ -1376,7 +1514,10 @@ impl ActivityTailRegistry {
     /// teardown via [`is_current_generation`]; a relaunch bumps it, so the OLD task's teardown
     /// recognizes it is no longer current and skips `mark_coder_stopped` (no spinner flip-off
     /// on the live successor).
-    fn register(&self, agent_id: &str) -> (Arc<AtomicBool>, u64) {
+    /// Returns `(stop flag, generation, had_predecessor)` — the last tells the caller
+    /// whether an entry was actually replaced (a same-id relaunch), so the new tail
+    /// can skip its stray-push grace sleep on a genuinely fresh first registration.
+    fn register(&self, agent_id: &str) -> (Arc<AtomicBool>, u64, bool) {
         let flag = Arc::new(AtomicBool::new(false));
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // The new generation is one past the predecessor's (or 0 for a first registration).
@@ -1385,10 +1526,14 @@ impl ActivityTailRegistry {
             stop: Arc::clone(&flag),
             generation,
         };
-        if let Some(old) = map.insert(agent_id.to_string(), entry) {
-            old.stop.store(true, Ordering::SeqCst);
-        }
-        (flag, generation)
+        let had_predecessor = match map.insert(agent_id.to_string(), entry) {
+            Some(old) => {
+                old.stop.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        };
+        (flag, generation, had_predecessor)
     }
 
     /// FIX 2(a): whether a teardown for `(agent_id, generation)` should run `mark_coder_stopped`.
@@ -1483,6 +1628,19 @@ pub fn activity_file_path(projects_dir: &Path, agent_id: &str) -> Option<PathBuf
     Some(dir.join(name))
 }
 
+/// D1 (planner-chat demolition): best-effort purge of an agent's bridge + steer files.
+/// Used by project DELETE — project ids are title slugs and can be REUSED by a later
+/// unrelated project; the stable orchestrator id (`orchestrator-<project id>`) would
+/// then hydrate the dead project's conversation into the namesake. Never creates the
+/// holding dir; missing files are the normal case.
+pub fn purge_agent_bridge_files(projects_dir: &Path, agent_id: &str) {
+    if let Some(name) = activity_file_name(agent_id) {
+        let dir = projects_dir.join(ACTIVITY_SUBDIR);
+        let _ = std::fs::remove_file(dir.join(&name));
+        let _ = std::fs::remove_file(dir.join(format!("{name}.steer")));
+    }
+}
+
 /// Resolve the per-agent STEER inbox path (app → running orchestrator), mirroring
 /// [`activity_file_path`] but with a distinct extension so the two bridge files never
 /// collide. The app APPENDS one message per line here; the orchestrator drains it via
@@ -1513,14 +1671,49 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
     };
     // Capture the generation this tail was registered under (FIX 2(a)): teardown only marks
     // the agent stopped if this generation is STILL current (a relaunch bumps it → no-op).
-    let (stop, generation) = registry.register(agent_id);
+    let (stop, generation, had_predecessor) = registry.register(agent_id);
     let app = app.clone();
     let agent_id = agent_id.to_string();
 
     tauri::async_runtime::spawn(async move {
+        // D2 RESET + HYDRATE: from here on this tail OWNS the console entry for its id.
+        // On a same-id RELAUNCH, wait one poll tick first: the just-stopped predecessor
+        // (register() flipped its flag under the lock) may still be inside its final
+        // synchronous chunk-processing; landing the atomic replace AFTER one tick lets
+        // those stray pushes finish so the replace wipes them (their lines are re-read
+        // from disk) instead of leaving them stacked as duplicates on top of the
+        // hydrated state. A fresh first registration has no predecessor — skip the
+        // grace sleep so the console's first paint isn't needlessly delayed.
+        if had_predecessor {
+            tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
+        }
         // Byte offset already consumed from the file. Persists across ticks so we only
-        // ever read NEW bytes (true tail, not re-read).
+        // ever read NEW bytes (true tail, not re-read). Starts where hydration ended.
         let mut offset: u64 = 0;
+        if !stop.load(Ordering::SeqCst) {
+            let path = file_path.clone();
+            let hydrated = tauri::async_runtime::spawn_blocking(move || {
+                hydrate_from_bridge_file(&path, HYDRATE_WINDOW_BYTES, true)
+            })
+            .await;
+            // Re-check AFTER the await (same discipline as FIX 2(b) below): if a
+            // relaunch superseded us while hydrating, the successor owns the reset —
+            // fall through, the loop's first stop-check exits straight to teardown.
+            if !stop.load(Ordering::SeqCst) {
+                if let Ok(hydrated) = hydrated {
+                    // Absent file → plain reset (empty console): stale same-id state
+                    // from a previous generation must not leak into this launch.
+                    let (activity, end) =
+                        hydrated.unwrap_or_else(|| (ConsoleActivity::empty(), 0));
+                    offset = end;
+                    if let Some(store) = app.try_state::<MiniActivityStore>() {
+                        // ATOMIC REPLACE, not a push: reset + hydration land as one
+                        // mutation so no observer ever sees stale + new state mixed.
+                        store.update(&app, &agent_id, |a| *a = activity);
+                    }
+                }
+            }
+        }
         // A RAW-BYTE carry for a trailing partial line (a write that landed without its
         // newline yet). We carry BYTES — not a decoded String — so a multi-byte UTF-8
         // codepoint that happens to straddle a per-tick read boundary is reassembled
@@ -1575,11 +1768,11 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
                                 push_websearch(a, &query, pages, &time)
                             });
                         }
-                    } else if let Some((role, text)) = parse_chat_line(&line) {
+                    } else if let Some(chat) = parse_chat_line(&line) {
                         if let Some(store) = app.try_state::<MiniActivityStore>() {
                             let time = now_clock();
                             store.update(&app, &agent_id, |a| {
-                                push_chat(a, &role, &text, &time)
+                                push_chat(a, &chat.role, &chat.text, &time, chat.msg_id.as_deref())
                             });
                         }
                     } else if let Some((seq, text)) = parse_chat_delta_line(&line) {
@@ -1663,6 +1856,86 @@ fn read_new_chunk(path: &Path, offset: u64) -> Option<(Vec<u8>, u64, bool)> {
     }
     buf.truncate(n);
     Some((buf, start + n as u64, was_reset))
+}
+
+/// D2 (planner-chat demolition): bytes of bridge-file TAIL replayed when a console
+/// hydrates from disk — both the tail-start reset and the snapshot-on-miss rebuild the
+/// in-memory render cache from the last window of the durable file. ~200 chat turns fit
+/// comfortably; anything older stays on disk for `read_activity_chat` (the full-history
+/// escape hatch). Bounded so a months-old project file can never stall a project open.
+const HYDRATE_WINDOW_BYTES: u64 = 256 * 1024;
+
+/// D2: whether a stored console has NO renderable content — used to decide that a disk
+/// hydration is warranted (store miss, CAP eviction, app restart). Resting flags don't
+/// count; only timeline entries or a live streaming tail do.
+fn is_console_blank(activity: &ConsoleActivity) -> bool {
+    activity.entries.as_deref().unwrap_or(&[]).is_empty() && activity.streaming_chat.is_none()
+}
+
+/// D2: replay the TAIL of an on-disk bridge file into a FRESH `ConsoleActivity`.
+/// Returns the rebuilt activity plus the byte offset consumed through the last COMPLETE
+/// line — the live tail continues from exactly there, so hydration + tailing partition
+/// the file with no overlap and no gap. `None` only when the file is absent/unreadable
+/// (callers treat that as "no history", never an error).
+///
+/// Semantics:
+/// - Reads at most the trailing `window` bytes; a window that starts mid-file begins
+///   mid-LINE, so replay starts at the first line boundary inside the window (a whole
+///   window with no newline is one giant unterminated fragment — consume nothing and
+///   hand the live tail EOF; a later completion parses as malformed and is skipped).
+/// - `chat-delta` lines are deliberately NOT replayed: a stale delta would resurrect a
+///   ghost streaming bubble for a session that is not streaming.
+/// - Replayed rows carry an EMPTY time stamp: bridge lines have no timestamps and
+///   stamping the hydration clock would fabricate arrival times.
+/// - The pushers stamp `running=true` as they replay; the caller knows better, so the
+///   final flag is forced to `mark_running` (launch-time reset ⇒ `true`, a snapshot of
+///   a session with no live tail ⇒ `false`) — only when anything was replayed. An empty
+///   replay stays the plain resting state.
+///
+/// Blocking I/O — call on a blocking thread from async contexts.
+fn hydrate_from_bridge_file(
+    path: &Path,
+    window: u64,
+    mark_running: bool,
+) -> Option<(ConsoleActivity, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(window);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    // Cap the read at the metadata length: the file may grow while we read; growth
+    // belongs to the live tail, which continues from the offset we return.
+    file.take(len - start).read_to_end(&mut buf).ok()?;
+    let mut pos = 0usize;
+    if start > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(nl) => pos = nl + 1,
+            None => return Some((ConsoleActivity::empty(), len)),
+        }
+    }
+    let mut activity = ConsoleActivity::empty();
+    let mut consumed = pos;
+    while let Some(nl) = buf[pos..].iter().position(|&b| b == b'\n') {
+        let line_end = pos + nl;
+        let line = String::from_utf8_lossy(&buf[pos..line_end]);
+        if let Some((text, node)) = parse_milestone_line(&line) {
+            push_coder_milestone(&mut activity, &text, node, "");
+        } else if let Some((query, pages)) = parse_websearch_line(&line) {
+            push_websearch(&mut activity, &query, pages, "");
+        } else if let Some(chat) = parse_chat_line(&line) {
+            push_chat(&mut activity, &chat.role, &chat.text, "", chat.msg_id.as_deref());
+        } else if let Some(question) = parse_question_line(&line) {
+            push_question(&mut activity, question, "");
+        }
+        pos = line_end + 1;
+        consumed = pos;
+    }
+    activity.streaming_chat = None;
+    if !activity.entries.as_deref().unwrap_or(&[]).is_empty() {
+        activity.running = Some(mark_running);
+    }
+    Some((activity, start + consumed as u64))
 }
 
 #[cfg(test)]
@@ -1835,7 +2108,7 @@ not json\n";
         let turns: Vec<ChatTurn> = on_disk
             .lines()
             .filter_map(parse_chat_line)
-            .map(|(role, text)| ChatTurn { role, text })
+            .map(|c| ChatTurn { role: c.role, text: c.text, msg_id: c.msg_id })
             .collect();
         assert_eq!(turns.len(), 2, "only the two chat lines survive");
         assert_eq!(turns[0].role, "user");
@@ -2010,9 +2283,10 @@ not json\n";
     #[test]
     fn parse_and_push_chat_round_trips() {
         let line = r#"{"kind":"chat","role":"assistant","text":"I drafted a 6-task plan."}"#;
-        let (role, text) = parse_chat_line(line).expect("parses a chat line");
-        assert_eq!(role, "assistant");
-        assert_eq!(text, "I drafted a 6-task plan.");
+        let parsed = parse_chat_line(line).expect("parses a chat line");
+        assert_eq!(parsed.role, "assistant");
+        assert_eq!(parsed.text, "I drafted a 6-task plan.");
+        assert_eq!(parsed.msg_id, None, "no msgId on the wire ⇒ None");
         // wrong kind / unknown role / blank text / bad json -> None
         assert!(parse_chat_line(r#"{"kind":"milestone","text":"x"}"#).is_none());
         assert!(parse_chat_line(r#"{"kind":"chat","role":"system","text":"x"}"#).is_none());
@@ -2020,7 +2294,7 @@ not json\n";
         assert!(parse_chat_line("not json").is_none());
         // push appends a Chat entry + marks live
         let mut a = ConsoleActivity::empty();
-        push_chat(&mut a, &role, &text, "14:00:00");
+        push_chat(&mut a, &parsed.role, &parsed.text, "14:00:00", None);
         assert_eq!(a.running, Some(true));
         match &a.entries.as_ref().unwrap()[0] {
             ConsoleEntry::Chat { role: r, text: t, .. } => {
@@ -2029,6 +2303,36 @@ not json\n";
             }
             _ => panic!("expected a chat entry"),
         }
+    }
+
+    #[test]
+    fn parse_chat_line_carries_the_msg_id_through_the_bridge() {
+        // D3 (planner-chat demolition): the client-generated send id, echoed back on the
+        // wire as `msgId`, is what lets the frontend drain its optimistic pending list BY
+        // IDENTITY instead of by counting user rows.
+        let line = r#"{"kind":"chat","role":"user","text":"go on","msgId":"m-42"}"#;
+        let parsed = parse_chat_line(line).expect("parses");
+        assert_eq!(parsed.msg_id.as_deref(), Some("m-42"));
+        // Untrusted read side: an absurd msgId is capped, a blank one is dropped to None.
+        let big = format!(
+            r#"{{"kind":"chat","role":"user","text":"x","msgId":"{}"}}"#,
+            "i".repeat(500)
+        );
+        let capped = parse_chat_line(&big).expect("parses");
+        assert!(capped.msg_id.as_deref().unwrap_or("").len() <= 128);
+        let blank = parse_chat_line(r#"{"kind":"chat","role":"user","text":"x","msgId":"  "}"#)
+            .expect("parses");
+        assert_eq!(blank.msg_id, None, "a blank msgId reads back as absent");
+        // The id survives push → entry → snapshot serialization as `msgId`.
+        let mut a = ConsoleActivity::empty();
+        push_chat(&mut a, &parsed.role, &parsed.text, "14:00:00", parsed.msg_id.as_deref());
+        let json = to_value(&a).expect("serializes");
+        assert_eq!(json["entries"][0]["msgId"], json!("m-42"));
+        // And an id-less push serializes WITHOUT the key (wire compat with old readers).
+        let mut b = ConsoleActivity::empty();
+        push_chat(&mut b, "user", "plain", "14:00:01", None);
+        let json_b = to_value(&b).expect("serializes");
+        assert!(json_b["entries"][0].get("msgId").is_none());
     }
 
     #[test]
@@ -2185,7 +2489,7 @@ not json\n";
         );
         assert_eq!(a.running, Some(true));
         // the final turn lands ONE real entry and clears the tail (no duplicate, no leftover)
-        push_chat(&mut a, "assistant", "Hello there", "10:00:01");
+        push_chat(&mut a, "assistant", "Hello there", "10:00:01", None);
         assert_eq!(a.streaming_chat, None, "tail cleared on finalize");
         let entries = a.entries.as_ref().unwrap();
         assert_eq!(entries.len(), 1);
@@ -2517,6 +2821,212 @@ not json\n";
         }
     }
 
+    // ---- D-resume: transcript tail → relaunched orchestrator's first-turn context ------
+
+    #[test]
+    fn format_chat_resume_block_is_none_for_empty_history() {
+        assert!(format_chat_resume_block(&[], 12, 2000).is_none());
+    }
+
+    #[test]
+    fn format_chat_resume_block_keeps_order_roles_and_frames_the_resume() {
+        let turns = vec![
+            ChatTurn { role: "user".into(), text: "build OAuth".into(), msg_id: None },
+            ChatTurn { role: "assistant".into(), text: "drafting a plan".into(), msg_id: None },
+        ];
+        let block = format_chat_resume_block(&turns, 12, 2000).expect("non-empty");
+        let u = block.find("user: build OAuth").expect("user turn present");
+        let a = block.find("assistant: drafting a plan").expect("assistant turn present");
+        assert!(u < a, "chronological order preserved");
+        assert!(block.starts_with("<conversation-so-far>"));
+        assert!(block.contains("</conversation-so-far>"));
+        assert!(
+            block.to_lowercase().contains("resuming"),
+            "the block explains WHY the history is there (relaunch/backend switch)"
+        );
+    }
+
+    #[test]
+    fn format_chat_resume_block_takes_from_the_end_within_turn_and_token_budgets() {
+        // Turn cap: only the LAST max_turns survive, still in order.
+        let many: Vec<ChatTurn> = (0..20)
+            .map(|i| ChatTurn {
+                role: "user".into(),
+                text: format!("turn-{i}"),
+                msg_id: None,
+            })
+            .collect();
+        let block = format_chat_resume_block(&many, 3, 2000).expect("non-empty");
+        assert!(!block.contains("turn-16 "), "older than the last 3 dropped");
+        assert!(block.contains("turn-17") && block.contains("turn-19"));
+        assert!(
+            block.find("turn-17").unwrap() < block.find("turn-19").unwrap(),
+            "kept turns stay chronological"
+        );
+        // Token budget (compact.rs estimate: ~4 chars/token): turns are taken from
+        // the END until the budget is exhausted — the newest always survives.
+        let big: Vec<ChatTurn> = (0..5)
+            .map(|i| ChatTurn {
+                role: "assistant".into(),
+                text: format!("{}-{i}", "x".repeat(100)),
+                msg_id: None,
+            })
+            .collect();
+        // Each line ≈ (11 + 100 + 2)/4 ≈ 28 tokens; budget 60 fits exactly the last two.
+        let capped = format_chat_resume_block(&big, 12, 60).expect("non-empty");
+        assert!(capped.contains("-4"), "the newest turn always survives");
+        assert!(!capped.contains("-0"), "the oldest is dropped once over budget");
+    }
+
+    // ---- D2 hydration (planner-chat demolition): the bridge FILE is the one source of
+    // truth; the store is a render cache rebuilt from the file's tail. ------------------
+
+    #[test]
+    fn hydrate_from_bridge_file_absent_file_is_none() {
+        let dir = TestDir::new("hydrate-absent");
+        assert!(hydrate_from_bridge_file(&dir.path().join("nope.jsonl"), 1024, true).is_none());
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_replays_whole_lines_in_order() {
+        let dir = TestDir::new("hydrate-order");
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"ciao\"}\n",
+                "{\"kind\":\"milestone\",\"text\":\"Reading files\",\"node\":\"dot\"}\n",
+                "{\"kind\":\"chat\",\"role\":\"assistant\",\"text\":\"hello back\"}\n",
+            ),
+        )
+        .unwrap();
+        let (activity, end) =
+            hydrate_from_bridge_file(&path, 64 * 1024, true).expect("file exists");
+        let entries = activity.entries.as_deref().unwrap_or(&[]);
+        assert_eq!(entries.len(), 3, "chat + milestone + chat replayed");
+        assert!(
+            matches!(&entries[0], ConsoleEntry::Chat { role, text, .. } if role == "user" && text == "ciao")
+        );
+        assert!(
+            matches!(&entries[1], ConsoleEntry::Coder { text, .. } if text == "Reading files")
+        );
+        assert!(
+            matches!(&entries[2], ConsoleEntry::Chat { role, .. } if role == "assistant")
+        );
+        assert_eq!(
+            end,
+            std::fs::metadata(&path).unwrap().len(),
+            "every complete line consumed"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_skips_deltas_and_the_partial_tail() {
+        // A process that died mid-stream leaves chat-delta lines and possibly a partial
+        // final line. Replaying a stale delta would resurrect a ghost streaming bubble
+        // on a session that is not streaming; the partial line belongs to the LIVE tail
+        // (it may still be completed by a writer) so hydration must not consume it.
+        use std::io::Write;
+        let dir = TestDir::new("hydrate-delta");
+        let path = dir.path().join("a.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            "{{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"go\"}}\n{{\"kind\":\"chat-delta\",\"seq\":1,\"text\":\"half a rep\"}}\n{{\"kind\":\"chat\",\"role\":\"assist" // dangling partial line
+        )
+        .unwrap();
+        drop(f);
+        let (activity, end) =
+            hydrate_from_bridge_file(&path, 64 * 1024, false).expect("file exists");
+        let entries = activity.entries.as_deref().unwrap_or(&[]);
+        assert_eq!(entries.len(), 1, "only the complete chat line lands");
+        assert!(activity.streaming_chat.is_none(), "no ghost streaming tail");
+        let full = std::fs::metadata(&path).unwrap().len();
+        assert!(end < full, "the dangling partial line is NOT consumed");
+        let consumed = std::fs::read(&path).unwrap()[..end as usize].to_vec();
+        assert!(
+            consumed.ends_with(b"\n"),
+            "hydration stops exactly after the last complete line"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_running_follows_mark_running() {
+        let dir = TestDir::new("hydrate-running");
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(&path, "{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"hi\"}\n").unwrap();
+        let (live, _) = hydrate_from_bridge_file(&path, 1024, true).unwrap();
+        assert_eq!(live.running, Some(true), "launch-time hydration marks live");
+        let (dead, _) = hydrate_from_bridge_file(&path, 1024, false).unwrap();
+        assert_eq!(
+            dead.running,
+            Some(false),
+            "snapshot-on-miss hydration must NOT resurrect a spinner for a dead session"
+        );
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_empty_file_yields_blank_console() {
+        let dir = TestDir::new("hydrate-empty");
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let (activity, end) = hydrate_from_bridge_file(&path, 1024, true).unwrap();
+        assert!(activity.entries.as_deref().unwrap_or(&[]).is_empty());
+        assert!(
+            activity.running.is_none(),
+            "an empty file must not set running at all (fresh-launch reset)"
+        );
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_window_starts_at_a_line_boundary() {
+        // A window smaller than the file must start replaying at the FIRST line boundary
+        // inside the window — never mid-line (a mid-line start would assemble garbage).
+        let dir = TestDir::new("hydrate-window");
+        let path = dir.path().join("a.jsonl");
+        let old = "{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"OLD OLD OLD OLD\"}\n";
+        let recent = "{\"kind\":\"chat\",\"role\":\"assistant\",\"text\":\"recent\"}\n";
+        std::fs::write(&path, format!("{old}{recent}")).unwrap();
+        // Window covers `recent` plus the TAIL of `old` (cuts `old` mid-line).
+        let window = (recent.len() + 10) as u64;
+        let (activity, end) = hydrate_from_bridge_file(&path, window, false).unwrap();
+        let entries = activity.entries.as_deref().unwrap_or(&[]);
+        assert_eq!(entries.len(), 1, "the cut line is skipped, not garbled");
+        assert!(
+            matches!(&entries[0], ConsoleEntry::Chat { text, .. } if text == "recent")
+        );
+        assert_eq!(end, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_window_without_newline_skips_to_len() {
+        // Pathological: the whole window is the tail of ONE giant unterminated line.
+        // Hydration must consume nothing and hand the live tail an offset at EOF (the
+        // garbled fragment is unrecoverable; a later completion parses as malformed
+        // and is skipped — same class as the MAX_LINE_BYTES guard).
+        use std::io::Write;
+        let dir = TestDir::new("hydrate-giant");
+        let path = dir.path().join("a.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"{}", "x".repeat(4000)).unwrap();
+        drop(f);
+        let (activity, end) = hydrate_from_bridge_file(&path, 1024, false).unwrap();
+        assert!(activity.entries.as_deref().unwrap_or(&[]).is_empty());
+        assert_eq!(end, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn is_console_blank_distinguishes_content_from_resting_state() {
+        assert!(is_console_blank(&ConsoleActivity::empty()));
+        let mut with_chat = ConsoleActivity::empty();
+        push_chat(&mut with_chat, "user", "hi", "10:00:00", None);
+        assert!(!is_console_blank(&with_chat));
+        let mut with_stream = ConsoleActivity::empty();
+        push_chat_delta(&mut with_stream, 1, "partial");
+        assert!(!is_console_blank(&with_stream));
+    }
+
     #[test]
     fn read_new_chunk_tails_only_new_bytes_and_advances_offset() {
         use std::io::Write;
@@ -2663,16 +3173,18 @@ not json\n";
     #[test]
     fn activity_tail_registry_register_and_stop_flip_the_flag() {
         let reg = ActivityTailRegistry::default();
-        let (flag, gen0) = reg.register("orch-1");
+        let (flag, gen0, had_pred0) = reg.register("orch-1");
         assert!(!flag.load(Ordering::SeqCst), "fresh flag starts un-stopped");
         assert_eq!(gen0, 0, "first registration is generation 0");
+        assert!(!had_pred0, "a first registration reports no predecessor (no grace sleep)");
 
         // Re-registering the same id flips the PREDECESSOR's flag (clean relaunch) and bumps
         // the generation.
-        let (flag2, gen1) = reg.register("orch-1");
+        let (flag2, gen1, had_pred1) = reg.register("orch-1");
         assert!(flag.load(Ordering::SeqCst), "predecessor task is told to stop");
         assert!(!flag2.load(Ordering::SeqCst));
         assert_eq!(gen1, 1, "relaunch bumps the generation");
+        assert!(had_pred1, "a same-id relaunch reports the replaced predecessor");
 
         // stop() flips the current flag; a second stop / unknown id is a no-op.
         reg.stop("orch-1");
@@ -2687,9 +3199,9 @@ not json\n";
         // same-id relaunch bumped the generation — otherwise it would flip `running=false` on
         // the live successor that already pushed a milestone.
         let reg = ActivityTailRegistry::default();
-        let (_flag_old, gen_old) = reg.register("orch-1");
+        let (_flag_old, gen_old, _) = reg.register("orch-1");
         // Relaunch: a fresh tail registers under a NEW generation (predecessor flag flipped).
-        let (_flag_new, gen_new) = reg.register("orch-1");
+        let (_flag_new, gen_new, _) = reg.register("orch-1");
         assert_ne!(gen_old, gen_new);
 
         // The PREDECESSOR's teardown checks its own (now stale) generation → must be a no-op.
@@ -2711,7 +3223,7 @@ not json\n";
         // relies on this teardown (mark_agent_session_closed calls stop() and counts on the
         // tail to flip Console `running=false`).
         let reg = ActivityTailRegistry::default();
-        let (_flag, gen) = reg.register("orch-1");
+        let (_flag, gen, _) = reg.register("orch-1");
         reg.stop("orch-1");
         assert!(
             reg.should_mark_stopped("orch-1", gen),
@@ -2727,12 +3239,16 @@ not json\n";
         // contract: after stop() returns, the predecessor flag is set AND the entry is gone
         // (so a subsequent register() starts a fresh generation 0-relative chain cleanly).
         let reg = ActivityTailRegistry::default();
-        let (flag, _gen) = reg.register("orch-1");
+        let (flag, _gen, _) = reg.register("orch-1");
         reg.stop("orch-1");
         assert!(flag.load(Ordering::SeqCst), "the predecessor flag is set by stop()");
         // The entry is removed: a fresh register() sees NO predecessor → generation resets to 0.
-        let (_flag2, gen2) = reg.register("orch-1");
+        let (_flag2, gen2, had_pred2) = reg.register("orch-1");
         assert_eq!(gen2, 0, "after stop() removed the entry, the next register is generation 0");
+        assert!(
+            !had_pred2,
+            "a cleanly-stopped entry is gone — the re-register reports no predecessor"
+        );
     }
 
     #[test]
@@ -2787,8 +3303,8 @@ not json\n";
         // FIX 3: app-exit teardown. stop_all() flips EVERY registered flag and empties the
         // map. Idempotent + safe when no tails are registered.
         let reg = ActivityTailRegistry::default();
-        let (flag_a, _) = reg.register("orch-a");
-        let (flag_b, _) = reg.register("orch-b");
+        let (flag_a, _, _) = reg.register("orch-a");
+        let (flag_b, _, _) = reg.register("orch-b");
         assert!(!flag_a.load(Ordering::SeqCst));
         assert!(!flag_b.load(Ordering::SeqCst));
 

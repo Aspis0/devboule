@@ -193,9 +193,11 @@ class EvalPairBridgeTests(unittest.TestCase):
         # contract lines must exist verbatim in the Rust prompt builder.
         from oracle.evalbench.heldout import REPLAY_CONTRACT
 
+        # role-untangle Phase 2 (ca5395a) moved the prompt builder out of
+        # mini_coder_executor.rs into the dedicated mini_prompt.rs module.
         rust = (
             Path(__file__).resolve().parents[2]
-            / "src-tauri/src/backend/mini_coder_executor.rs"
+            / "src-tauri/src/backend/mini_prompt.rs"
         ).read_text(encoding="utf-8")
         for anchor in [
             "RESULT (your FINAL action):",

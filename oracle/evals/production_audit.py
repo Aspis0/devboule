@@ -25,7 +25,7 @@ REQUIRED_AGENT_IDS = {"prod-architect", "prod-code", "prod-verifier"}
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Aspis Oracle production readiness audit.")
-    parser.add_argument("--root", default=".", help="Aspis Management root")
+    parser.add_argument("--root", default=".", help="Devboule root")
     parser.add_argument("--project-root", default=str(Path.home() / "Desktop" / "aspis bio"))
     parser.add_argument("--sqlite", default=str(SQLITE_PATH))
     parser.add_argument("--vectors", default=str(LANCE_DB_PATH))

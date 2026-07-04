@@ -214,11 +214,11 @@ impl RmcpBackend {
             }
         };
 
-        let text = match first_text(&result) {
-            Some(t) => t,
-            None => {
+        let text = match register_text(result.is_error.unwrap_or(false), first_text(&result)) {
+            Ok(t) => t,
+            Err(e) => {
                 cleanup.cancel();
-                return Err("agent_register returned no text content".to_string());
+                return Err(e);
             }
         };
         // MANAGED vs UNMANAGED token handling. A MANAGED launch supplies a launch
@@ -507,6 +507,30 @@ fn build_register_args(config: &RmcpConfig) -> Map<String, Value> {
     reg_args
 }
 
+/// Validate the `agent_register` tool result BEFORE token extraction. A
+/// tool-level error (`is_error == Some(true)`) must fail the CONNECT: the server
+/// REFUSED the registration (invalid management root, bad/expired launch token,
+/// role conflict), so sailing on would run the whole session against a server
+/// that never registered us — on the unmanaged path `resolve_session_token`
+/// tolerates the missing token and the rejection would be silently swallowed
+/// (found live: a root-validation rejection produced a "working" backend with
+/// no session recorded server-side). Pure + total so it is unit-testable
+/// without a live server.
+fn register_text(is_error: bool, text: Option<String>) -> Result<String, String> {
+    let text = text.unwrap_or_default();
+    if is_error {
+        return Err(if text.is_empty() {
+            "agent_register reported an error with no detail".to_string()
+        } else {
+            format!("agent_register rejected: {text}")
+        });
+    }
+    if text.is_empty() {
+        return Err("agent_register returned no text content".to_string());
+    }
+    Ok(text)
+}
+
 /// Extract the first text-content block from a tool result. The Oracle returns
 /// its JSON payload as a text content block (the MCP convention).
 fn first_text(result: &CallToolResult) -> Option<String> {
@@ -632,6 +656,40 @@ mod tests {
         assert_eq!(extract_session_token(r#"{"role":"x"}"#), None);
         assert_eq!(extract_session_token(r#"{"sessionToken":""}"#), None);
         assert_eq!(extract_session_token("not json"), None);
+    }
+
+    /// F2 (mute-orchestrator fix): a tool-level `is_error` on `agent_register`
+    /// must FAIL the connect with the server's own rejection text — before this
+    /// guard, an unmanaged register rejection (e.g. "management root is
+    /// invalid") sailed through `resolve_session_token` and produced a backend
+    /// with no server-side session.
+    #[test]
+    fn register_text_error_result_fails_with_server_detail() {
+        let err = register_text(
+            true,
+            Some("Error executing tool agent_register: root is invalid".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("agent_register rejected"));
+        assert!(err.contains("root is invalid"));
+    }
+
+    #[test]
+    fn register_text_error_without_detail_still_fails() {
+        let err = register_text(true, None).unwrap_err();
+        assert!(err.contains("agent_register reported an error"));
+    }
+
+    #[test]
+    fn register_text_ok_requires_text_content() {
+        // Pre-existing contract: a success result with NO text block is an error.
+        let err = register_text(false, None).unwrap_err();
+        assert!(err.contains("no text content"));
+        // And a normal success passes its text through verbatim.
+        assert_eq!(
+            register_text(false, Some("{\"sessionToken\":\"t\"}".to_string())).unwrap(),
+            "{\"sessionToken\":\"t\"}"
+        );
     }
 
     #[test]

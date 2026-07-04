@@ -282,7 +282,7 @@ export function DevicesView() {
               placeholder="Paste device join request JSON or raw public key"
               rows={5}
               data-help-title="Paste the collaborator's device join request here."
-              data-help-lines="The safest format is the JSON copied from their Aspis Management app.|A raw 32-byte X25519 public key in hex is also accepted for emergency/manual setup.|Never paste a private key here.|If this request came through chat or email, compare the fingerprint with the collaborator out-of-band."
+              data-help-lines="The safest format is the JSON copied from their Devboule app.|A raw 32-byte X25519 public key in hex is also accepted for emergency/manual setup.|Never paste a private key here.|If this request came through chat or email, compare the fingerprint with the collaborator out-of-band."
               className="resize-none rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
             />
             <input
@@ -412,7 +412,7 @@ function LocalDeviceCard({
     <section
       className="rounded-lg border border-cream-200 bg-white p-4"
       data-help-title="This device identity is how encrypted packages target this app install."
-      data-help-lines="The public key can be shared with an admin or another Aspis Management install.|The private key stays inside the operating-system credential vault.|On macOS that means Keychain and Touch ID/macOS auth; on Windows it means Credential Manager and Windows Hello.|If you reset this identity, old packages encrypted to the previous key cannot be opened by this install."
+      data-help-lines="The public key can be shared with an admin or another Devboule install.|The private key stays inside the operating-system credential vault.|On macOS that means Keychain and Touch ID/macOS auth; on Windows it means Credential Manager and Windows Hello.|If you reset this identity, old packages encrypted to the previous key cannot be opened by this install."
     >
       <div className="mb-3 flex items-start justify-between gap-3">
         <div className="min-w-0">

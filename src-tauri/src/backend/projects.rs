@@ -251,6 +251,21 @@ pub fn delete_project(
     state.ensure_unlocked()?;
     let path = project_path_by_id(&app, &project_id)?;
     delete_project_file(&path)?;
+    // D1 (planner-chat demolition): the orchestrator agent id — and therefore its
+    // bridge/steer file — is now STABLE per project id. Project ids are title slugs,
+    // so a deleted project's id can be REUSED by a later unrelated project; without
+    // this purge the new project's planner would hydrate the dead project's whole
+    // conversation (cross-project transcript leak). STOP the project's orchestrator
+    // first (full stop: row close is right — its project is gone): a still-live
+    // writer would re-create/keep writing the purged file (and on Windows an open
+    // handle makes remove_file fail with a sharing violation — max-recall finding).
+    // Best-effort throughout: a missing session/file is the normal case, and a
+    // purge failure must not block the delete.
+    let orch_id = stable_orchestrator_agent_id(&project_id);
+    let _ = crate::backend::agents::stop_agent_core(&app, &orch_id);
+    if let Ok(projects_dir) = ensure_projects_dir(&app) {
+        crate::backend::mini_activity::purge_agent_bridge_files(&projects_dir, &orch_id);
+    }
     Ok(())
 }
 
@@ -1268,6 +1283,28 @@ pub fn get_main_coder_client(
     Ok(read_main_coder_client(&app))
 }
 
+/// Which cloud CLIs are actually installed on this machine (augmented-PATH scan,
+/// same resolver the launch path uses). The UI disables — never hides — the
+/// orchestrator/coder options whose binary is missing, so a user without codex
+/// can't select a backend that could only fail at launch.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCliAvailability {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+#[tauri::command]
+pub fn get_cloud_cli_availability(
+    state: State<'_, BackendState>,
+) -> Result<CloudCliAvailability, String> {
+    state.ensure_unlocked()?;
+    Ok(CloudCliAvailability {
+        claude: command_exists("claude"),
+        codex: command_exists("codex"),
+    })
+}
+
 /// S5 — persist the default external main-coder CLI (claude|codex) into config.json
 /// (read-modify-write + atomic temp/rename, mirroring `set_mini_write_behavior`).
 #[tauri::command]
@@ -1360,6 +1397,7 @@ fn apply_censor_local_ai_to_config(
             base_url: None,
             model: None,
             ollama_model: None,
+            ..Default::default()
         };
     if is_bare_default {
         obj.remove("censorLocalAi");
@@ -1483,7 +1521,8 @@ fn prepare_or_launch_project_agent(
     // gate, the vault/provider env (orchestrator ⇒ none) AND the persisted session
     // role — replacing the former stored_role/canonical-role split, so the stored
     // role always equals what the binary registers as (`agent_register`, config.rs).
-    let role = super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
+    let role =
+        super::agent_role::effective_launch_role(&client, &normalize_agent_role(&input.role)?);
     // "app" -> hosted PTY inside Aspis Management; anything else (incl. None and
     // garbage) -> the legacy external console path. The current TS invoke sends no
     // host, so it normalizes to "external" = zero behavior change.
@@ -1520,9 +1559,17 @@ fn prepare_or_launch_project_agent(
         ),
         None => None,
     };
-    let agent_id = clean_optional(input.agent_id.as_deref())
-        .unwrap_or_else(|| format!("{}-{}", role, Utc::now().timestamp_millis()));
+    // D1 (planner-chat demolition): orchestrator ⇒ the project's STABLE id (the
+    // conversation belongs to the project, not the process); other roles ⇒ fresh
+    // per-launch id, unchanged. See `launch_agent_id`/`stable_orchestrator_agent_id`.
+    let agent_id = launch_agent_id(input.agent_id.as_deref(), &role, &project.metadata.id);
     let task_id = clean_optional(input.task_id.as_deref());
+    // D1 FENCE: defined further down (it needs `projects_path` for the steer purge);
+    // called at the three spawn points, deliberately NOT here at the top — every step
+    // between here and the spawn can still abort the launch with `?` (task gate,
+    // binary resolution, oMLX preflight, duplex build), and killing a live, healthy
+    // predecessor for a launch that then FAILS would leave the user with no
+    // orchestrator at all (hostile-review BLOCKER).
     validate_agent_task_launch(&project, &role, task_id.as_deref())?;
     let launch_token = generate_launch_token()?;
     let launch_token_hash = hash_launch_token(&launch_token);
@@ -1603,6 +1650,39 @@ fn prepare_or_launch_project_agent(
         }
     }
     let projects_path = ensure_projects_dir(&app)?;
+    // D1 FENCE (called at the three spawn points below, once the launch is committed):
+    // the stable orchestrator id means a relaunch REUSES the bridge file and steer
+    // inbox — there must be AT MOST ONE live writer generation per project.
+    let fence_stale_orchestrator = |app: &tauri::AppHandle| {
+        if role != "orchestrator" {
+            return;
+        }
+        // PROCESS-ONLY stop of whatever predecessor still holds this id (app PTY,
+        // cloud duplex child, external window, stale ledger entry). Deliberately NOT
+        // the full stop (max-recall BLOCKER): `record_launch_pending` already wrote
+        // the NEW generation's launch_pending row under this same stable id, so a
+        // row-close here would stamp the fresh launch closed at birth; and the
+        // registry teardown would defeat the new tail's `had_predecessor` detection.
+        // Errors swallowed: a missing/dead predecessor is the normal case, and the
+        // fence must never block a launch.
+        let _ = crate::backend::agents::stop_agent_process_only(app, &agent_id);
+        // Truncate the steer inbox ONLY NOW, after the predecessor is dead — the
+        // path is deterministic per (stable) agent_id, so truncating it earlier
+        // (as the old config-build site did) would wipe messages a still-LIVE
+        // predecessor had queued but not yet drained. Local orchestrator only:
+        // cloud CLIs take stdin, not a steer file.
+        if client == "orchestrator" {
+            if let Some(steer) =
+                crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
+            {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(&steer);
+            }
+        }
+    };
     let management_root = management_root_for_mcp(&app, &projects_path);
     // ROLE UNTANGLE — the provider env is ROLE-scoped, one call, no client special
     // case (the former `launch_injects_cloudflare_env` client strip-hack is gone).
@@ -1657,11 +1737,52 @@ fn prepare_or_launch_project_agent(
         };
         // CLOUD (opt-in) env: non-empty ONLY when the configured kind is `cloud`. The base
         // URL + model are NON-secret (they ride inline like the oMLX ones); the API KEY is a
-        // SECRET appended to `provider_env` below (off argv, never logged).
+        // SECRET appended to `provider_env` below (off argv, never logged). Resolved HERE
+        // (moved up from below the preflight block) so the B2 gate right below can inspect
+        // the ACTUAL cloud env the binary will receive, not re-derive its own copy of the
+        // "is cloud configured" logic — this stays the single source of truth.
         let (cloud_base_url, cloud_model) = match &local_backend {
             Some(backend) => super::local_coder::resolve_cloud_env(backend),
             None => (String::new(), String::new()),
         };
+        // FAIL-FAST PREFLIGHT / B2 FAIL-LOUD GATE: a configured loopback backend must be
+        // reachable and actually serve the configured model BEFORE we spawn the binary
+        // (without this, a dead server / missing model left the planner on "thinking…" for
+        // minutes — 3 × 60s silent request timeouts — with zero user feedback); and an
+        // orchestrator launch with NEITHER a local NOR a cloud model configured must be
+        // rejected outright, rather than spawning a binary whose `build_model` silently
+        // selects the safe MockModel — the user then chats with a nonsense "Mock reply
+        // to: …" with no signal anything is wrong (bug B2). Mirrors the sibling Main-coder
+        // gate (`mini_coder_executor.rs`: a `None` resolved backend refuses to spawn).
+        // ~2.5s worst-case cost for the preflight probe. GATED on launch_terminal: the
+        // prepare-only path (Copy prompt — clipboard, no process) must never grow a
+        // network probe or a new failure mode (hostile-review BLOCKER).
+        if launch_terminal {
+            match &local_backend {
+                Some(backend) => {
+                    if let Err(preflight_err) =
+                        super::local_coder::preflight_local_orchestrator_backend(backend)
+                    {
+                        // Close the launch_pending session recorded above — otherwise
+                        // every "oMLX isn't running" failure would strand a pending
+                        // ghost card in the rail.
+                        super::agents::mark_agent_session_closed_public(&app, &agent_id);
+                        return Err(preflight_err);
+                    }
+                }
+                None => {
+                    if let Err(gate_err) = super::local_coder::orchestrator_model_configured_verdict(
+                        &omlx_base_url,
+                        &cloud_base_url,
+                    ) {
+                        // Same cleanup as the preflight-failure path above: don't strand a
+                        // pending ghost card in the rail for a launch that never spawned.
+                        super::agents::mark_agent_session_closed_public(&app, &agent_id);
+                        return Err(gate_err);
+                    }
+                }
+            }
+        }
         // SECRET 1: the app-issued launch token (the SAME one hashed into the pending
         // session above). The binary's agent_register REQUIRES it for this managed
         // launch. Env only — never argv / never the launch line.
@@ -1704,16 +1825,10 @@ fn prepare_or_launch_project_agent(
         let steer_file = crate::backend::mini_activity::steer_file_path(&projects_path, &agent_id)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // Truncate it at launch: the path is deterministic per agent_id, so without this a
-        // PRIOR run's leftover messages would replay into this fresh burst (drain starts at
-        // offset 0). Best-effort — a failure just leaves the (rare) stale tail.
-        if !steer_file.is_empty() {
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(&steer_file);
-        }
+        // (Steer-inbox truncation moved into the D1 fence: with the STABLE id this
+        // path now belongs to the predecessor too, so it must only be wiped AFTER
+        // the fence killed that predecessor — never here, where the launch can
+        // still fail and leave a live predecessor robbed of its queued steers.)
         Some(OrchestratorLaunchConfig {
             binary,
             omlx_base_url,
@@ -1893,6 +2008,21 @@ fn prepare_or_launch_project_agent(
         } else {
             None
         };
+        // D-resume: hand the fresh duplex child the TAIL of this project's durable
+        // transcript as first-turn context, so a relaunch/backend switch resumes the
+        // conversation instead of starting amnesiac (the UI history survives via the
+        // stable-id bridge file; this closes the MODEL-memory half). Read BEFORE the
+        // spawn so the goal's own echo (written during spawn) is not swallowed back;
+        // BOUNDED to the hydration window (max-recall: never the whole file on the
+        // launch path). Empty history ⇒ None ⇒ byte-identical first turn.
+        let resume_context = crate::backend::mini_activity::format_chat_resume_block(
+            &crate::backend::mini_activity::recent_chat_turns(&activity_file),
+            24,
+            2000,
+        );
+        // D1 FENCE: launch is committed (every fallible step above passed) — stop the
+        // stable id's predecessor so the bridge file has one writer generation.
+        fence_stale_orchestrator(&app);
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
             &sessions,
@@ -1904,6 +2034,8 @@ fn prepare_or_launch_project_agent(
             &root_path,
             activity_file,
             input.initial_goal.as_deref(),
+            input.initial_goal_msg_id.as_deref(),
+            resume_context.as_deref(),
             &input.project_id,
             input.model.as_deref(),
             codex_policy,
@@ -1930,6 +2062,9 @@ fn prepare_or_launch_project_agent(
         // None. The PTY child deletes its own prompt temp file in-script; the
         // ledger still records the prompt-file path so stop_agent can clean it up
         // if the child died early.
+        // D1 FENCE: committed to spawning — stop the stable orchestrator id's
+        // predecessor first (no-op for every other role).
+        fence_stale_orchestrator(&app);
         let prompt_file_label = spawn_agent_terminal_app(
             &app,
             &agent_id,
@@ -1976,6 +2111,9 @@ fn prepare_or_launch_project_agent(
         // leave a live, token-bearing agent that the app has no usable kill handle
         // for.
         let window_title = agent_window_title(&agent_id);
+        // D1 FENCE: committed to spawning — stop the stable orchestrator id's
+        // predecessor first (no-op for every other role).
+        fence_stale_orchestrator(&app);
         let spawned = spawn_agent_terminal(
             &agent_id,
             &root_path,
@@ -2163,6 +2301,23 @@ fn delete_project_file(path: &Path) -> Result<bool, String> {
        // Best-effort sidecar cleanup, now that no handle holds it open.
     let _ = fs::remove_file(project_lock_path(path));
     Ok(existed)
+}
+
+/// Promote a "draft" project (planner-created, plan not yet approved) to
+/// "active" — the moment its plan is approved or its first task actually lands.
+/// Idempotent + best-effort: a non-draft status is left untouched, and a failure
+/// must never break the approval/task write that triggered it (the promotion is
+/// a board-visibility side effect, not the source of truth).
+pub(crate) fn promote_draft_project_to_active(app: &tauri::AppHandle, project_id: &str) {
+    let Ok(path) = project_path_by_id(app, project_id) else {
+        return;
+    };
+    let _ = mutate_project_file_latest(&path, |project| {
+        if project.metadata.status == "draft" {
+            project.metadata.status = "active".into();
+        }
+        Ok(())
+    });
 }
 
 fn mutate_project_file_latest<F>(
@@ -3227,7 +3382,11 @@ fn validate_main_coder_engine_id(value: &str) -> Result<(), String> {
 /// The value is a plain unquoted engine/client id (no colons or newlines by construction —
 /// it comes from the configured Main-coder engine set), read back verbatim by the parser.
 fn main_coder_frontmatter_line(main_coder: &Option<String>) -> String {
-    match main_coder.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    match main_coder
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         Some(value) => format!("main_coder: {value}\n"),
         None => String::new(),
     }
@@ -3400,8 +3559,7 @@ const CUSTOM_CLIENT_LABEL_MAX_LEN: usize = 40;
 const CUSTOM_CLIENT_COMMAND_MAX_LEN: usize = 400;
 // "local" is reserved (P6b): it is the Roles-table / hand-off placement marker for the
 // in-process agentic engine, so a user-registered custom client can never collide with it.
-const RESERVED_CLIENT_IDS: [&str; 5] =
-    ["codex", "claude", "powershell", "orchestrator", "local"];
+const RESERVED_CLIENT_IDS: [&str; 5] = ["codex", "claude", "powershell", "orchestrator", "local"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -3701,7 +3859,19 @@ fn validate_agent_task_launch(
     role: &str,
     task_id: Option<&str>,
 ) -> Result<(), String> {
-    if project.metadata.status != "active" {
+    if project.metadata.status == "draft" {
+        // A DRAFT project is exactly the state where the planner conversation
+        // happens: the ORCHESTRATOR must launch there (that's how the plan gets
+        // made and approved). Worker roles stay gated until approval promotes
+        // the project to active.
+        if role != "orchestrator" {
+            return Err(
+                "This project's plan is not approved yet — approve the plan before launching \
+                 coders/verifiers on it."
+                    .into(),
+            );
+        }
+    } else if project.metadata.status != "active" {
         return Err("Cannot launch agents on paused, done or archived projects.".into());
     }
     let Some(task_id) = task_id else {
@@ -3994,37 +4164,40 @@ fn project_agent_prompt(
     // like before, so a non-panel role still never injects.
     skill_role: Option<&str>,
 ) -> String {
-    // ROLE UNTANGLE (2026-07): three distinct role rules. The coder (Main coder)
-    // PLANS and CODES; the orchestrator PLANS and DELEGATES but NEVER writes (every
-    // code change goes through spawn_mini_coder — English mirror of the Python
-    // ROLE_RULES orchestrator mandate); the verifier reviews. The role string is
-    // normalized to {coder, verifier, orchestrator} by normalize_agent_role; the
-    // catch-all falls back to the coder rule.
+    // ROLE UNTANGLE (2026-07) + SSoT follow-up: three distinct role rules, now
+    // looked up from oracle/server/role_rules.json's `launchPrompt` (via
+    // `agents::role_launch_prompt`) instead of hardcoded here — the coder (Main
+    // coder) PLANS and CODES; the orchestrator PLANS and DELEGATES but NEVER
+    // writes (every code change goes through spawn_main_coder/spawn_mini_coder);
+    // the verifier reviews. The role string is normalized to
+    // {coder, verifier, orchestrator} by normalize_agent_role; the catch-all
+    // falls back to the coder's launchPrompt. `expect` is deliberate: coder,
+    // orchestrator and verifier all carry a launchPrompt in the SSoT JSON (only
+    // "mini" — never launched via this bootstrap path — does not), so a miss
+    // here means the JSON lost a required field and must fail loudly.
     let role_rule = match role {
-        "orchestrator" => {
-            "Plan and DELEGATE — you NEVER write or edit files yourself: you have no file-write or mutation tool, and EVERY code change goes through spawn_mini_coder (you plan and front-load context; the mini writes). For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start delegating before this call. Pass plan_id = the `planId` field returned by plan_submit, and tasks = one entry per plan PHASE, each REQUIRING {id, title} plus optional {acceptance, scope:[files], dependsOn}. To SUPERVISE a delegated mini call spawn_mini_coder with wait=false to get its directiveId immediately, watch its activity, steer it with steer_mini_coder(directiveId, message) (or \"stop\" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation. If spawn_mini_coder returns status='aborted_by_human', STOP that line of work and escalate via ask_user; if it returns status='escalated' (retries exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file. For project or codebase questions use oracle_ask / oracle_context FIRST — do not guess. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when a sub-task is ready for the verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent."
-        }
-        "verifier" => {
-            "Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence. When you have FINISHED reviewing (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent."
-        }
-        _ => {
-            "Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Pass plan_id = the `planId` field returned by plan_submit, and tasks = one entry per plan PHASE, each REQUIRING {id, title} plus optional {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. \"P1\", \"P2\"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. [\"P1\"]) — NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status=\"done\" so the app marks you complete and the project can advance — do NOT just close the terminal, or you will linger as a stale active agent."
-        }
+        "orchestrator" => super::agents::role_launch_prompt("orchestrator")
+            .expect("role_rules.json orchestrator entry must carry a launchPrompt"),
+        "verifier" => super::agents::role_launch_prompt("verifier")
+            .expect("role_rules.json verifier entry must carry a launchPrompt"),
+        _ => super::agents::role_launch_prompt("coder")
+            .expect("role_rules.json coder entry must carry a launchPrompt"),
     };
-    // Phase H — Censor launch-prompt addendum (complementary to the ROLE_RULES
-    // contract surfaced by the `agent_rules` MCP tool; this carries the same
-    // mandate into the bootstrap prompt). It is plain instruction text: it names
-    // the `censor_findings`/`censor_dispose` MCP tools and carries NO token or
-    // secret, so the prompt-token-off-argv + restricted-prompt-file guarantees
-    // are untouched.
-    // - coder: an UNCONDITIONAL per-step batch check.
-    // - verifier: the residual-adjudication step, ONLY when this is a "final
-    //   review" launch (`censor_review`). Without the flag the verifier prompt is
-    //   byte-for-byte unchanged (back-compat).
+    // ── Launch-prompt addenda (Phase H / MC-P5 / MC-P7 / GH-P5 / Phase D) ──
+    // Every block below is plain instruction text — it names MCP tools only, never
+    // a token/secret — so the prompt-token-off-argv + restricted-prompt-file
+    // guarantees are untouched. Each is gated with a POSITIVE allowlist keyed on
+    // `role` (F4), NOT a `_ => addendum` catch-all: a future/unknown role string
+    // must never silently inherit a coder-only or verifier-only addendum. They are
+    // assembled, in this fixed order, into `addenda` below.
+
+    // Phase H — Censor addendum, complementary to the ROLE_RULES contract surfaced
+    // by the `agent_rules` MCP tool. coder: UNCONDITIONAL per-step batch check.
+    // verifier: the residual-adjudication step, ONLY on a "final review" launch
+    // (`censor_review`) — byte-for-byte unchanged without the flag (back-compat).
+    // orchestrator: none (ROLE UNTANGLE — its MCP allowlist has no censor tools;
+    // Censor runs on the minis it delegates to).
     let censor_addendum = match role {
-        // ROLE UNTANGLE: the orchestrator has NO censor tools in its MCP allowlist
-        // (aspis_mcp.py ROLE_RULES — Censor runs on the minis it delegates to), so
-        // it gets no censor addendum at all.
         "orchestrator" => "",
         "verifier" => {
             if censor_review {
@@ -4037,34 +4210,16 @@ fn project_agent_prompt(
             "At each step boundary call censor_findings(project_id, file=<files you just touched>); fix the real local findings; mark false positives with censor_dispose. This is a batch at the step boundary, not a live interrupt.\n"
         }
     };
-    // MC-P5 — mini-coder escalation addendum (coder only). Names the terminal
-    // outcomes `spawn_mini_coder` returns and, crucially, the human-kill contract: an
-    // `aborted_by_human` means the human hit the Stop button on the mini's terminal —
-    // STOP that line of work, do NOT silently retry the mini, and escalate to the
-    // human (set status needs_user with what happened). The mini never contacts the
-    // human; the coder is the only human-contact point. Plain instruction text — no
-    // token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
-    // has no spawn_mini_coder access, so it gets no addendum.
-    // MC-P7 — mini-coder ROUTING guidance (coder only), prepended to the MC-P5
-    // outcome-handling text. It tells the coder WHEN/HOW to delegate to save its own
-    // context/limit (the "Claude=thinking, cheap model=I/O" routing pattern):
-    // delegate only cheap/mechanical sub-tasks, front-load the needed context into
-    // the task, and REVIEW the mini's returned output before using it (the mini is a
-    // cheaper model — its output is a draft). Plain instruction text — no
-    // token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
-    // has no spawn_mini_coder access, so it gets no addendum at all.
-    // F4: POSITIVE allowlist (coder-only), not a `_ => addendum` denylist. A future
-    // role string would otherwise silently inherit the coder's mini-coder addendum;
-    // only the coder gets it, every other role (verifier or anything new) gets "".
-    // ROLE UNTANGLE: deliberately NOT extended to the orchestrator — its dedicated
-    // role_rule above already embeds its own delegation/supervision mandate, and the
-    // coder text here ("delegate only cheap mechanical sub-tasks, do the thinking
-    // yourself") would CONTRADICT the orchestrator's delegate-everything mandate.
-    // A3 appends the MINI-CODER DELEGATION write_mode block (pre-built by the caller)
-    // right AFTER the routing addendum, CODER-ONLY and only when a mini backend is
-    // configured (the caller passes `None` otherwise / for a verifier). Owned `String`
-    // so the optional A3 block can be concatenated; an empty/absent block leaves the
-    // base routing text byte-identical to today.
+    // MC-P7 (routing: WHEN/HOW to delegate cheap/mechanical sub-tasks, front-load
+    // context, review the mini's draft output) + MC-P5 (escalation: the terminal
+    // `spawn_mini_coder` outcomes, crucially the `aborted_by_human` human-kill
+    // contract — STOP, do NOT retry, escalate via needs_user). Coder-only —
+    // deliberately NOT extended to the orchestrator: its own role_rule already
+    // carries a delegate-everything mandate that this "do the thinking yourself,
+    // delegate only I/O" text would CONTRADICT; the verifier has no
+    // spawn_mini_coder access either. A3 appends the caller-built MINI-CODER
+    // DELEGATION write_mode block right after the routing text, coder-only and
+    // only when a mini backend is configured (`None` otherwise ⇒ byte-identical).
     let mini_coder_addendum: String = match role {
         "coder" => {
             let base = "For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.\n\
@@ -4078,40 +4233,27 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
         }
         _ => String::new(),
     };
-    // GH-P5 — cooperative git-push addendum (coder only). Mirrors the ROLE_RULES
-    // coder.push mandate surfaced by the agent_rules MCP tool; this carries the
-    // same guidance into the bootstrap prompt: commit freely, but NEVER raw
-    // `git push` — your launch environment's git config has no credential helper
-    // (GIT_CONFIG_GLOBAL resets it; see write_session_gitconfig), so a raw push has
-    // no credential to use and fails. Publish via the request_git_push MCP tool +
-    // human approval, and STOP + escalate via needs_user if a push is denied or
-    // times out. Plain instruction text — no token/secret — so the
-    // prompt-token-off-argv guarantees are untouched.
-    // F4: POSITIVE allowlist (coder-only) — a future role string must NOT silently
-    // inherit the push addendum. The verifier has no request_git_push access
-    // (coder-only, gated in P4); it and any new role get "".
-    // F6: the "no git credentials, a raw push fails" claim is TRUE for a cooperative
-    // agent under our neutralized env, but kept as best-effort wording — it is NOT a
-    // hard sandbox (a determined agent can re-add a helper). The real gate is
-    // request_git_push + human approval.
-    // ROLE UNTANGLE: coder-LIKE (coder + orchestrator), not coder-only — the
-    // orchestrator holds request_git_push too, and a prompt-consuming orchestrator
-    // (a future cloud-CLI planner; the local binary ignores the prompt) must carry
-    // the "never raw push" guardrail, not just the MCP-side ROLE_RULES copy.
+    // GH-P5 — cooperative git-push addendum, mirroring the ROLE_RULES coder.push
+    // mandate: commit freely, but NEVER raw `git push` (the launch env's git config
+    // has no credential helper — GIT_CONFIG_GLOBAL resets it, see
+    // write_session_gitconfig — so a raw push has nothing to authenticate with;
+    // F6: best-effort wording, not a hard sandbox). Publish via request_git_push +
+    // human approval, STOP + needs_user on deny/timeout. Coder-LIKE (coder +
+    // orchestrator), not coder-only (ROLE UNTANGLE) — the orchestrator holds
+    // request_git_push too and a prompt-consuming orchestrator must carry the same
+    // guardrail; the verifier has no request_git_push access (gated in P4).
     let git_push_addendum = if super::agent_role::is_coder_like(role) {
         "Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status=\"needs_user\"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.\n"
     } else {
         ""
     };
-    // Phase D — design "Save & hand off" addendum (coder only). FIXED wording: the ONLY
-    // variable is the bundle's path RELATIVE to the working root (computed from two
-    // already-canonicalized, confinement-checked paths; the validated path is the sole
-    // interpolation, no caller free text). It names the bundle's expected inventory as
-    // "may include" (some files are optional — preview.png only exists after a capture),
-    // tells the coder to IMPLEMENT the design respecting design.md as the design contract,
-    // and leaves mini-coder delegation to the coder's own judgment. Plain instruction text
-    // — no token/secret — so the prompt-token-off-argv guarantees are untouched. Verifier
-    // never gets it (it does not implement). `None` => "" keeps the prompt unchanged.
+    // Phase D — design "Save & hand off" addendum, coder-only (verifier never
+    // implements a design). FIXED wording — the only variable is the bundle's path
+    // RELATIVE to the working root (both inputs already canonicalized +
+    // confinement-checked, so no caller free text reaches the prompt). Lists the
+    // inventory as "may include" (e.g. preview.png only exists after a capture) and
+    // leaves mini-coder delegation to the coder's own judgment. `None` ⇒ ""
+    // (byte-identical without a bundle).
     let design_handoff_addendum = match (role, design_handoff_folder) {
         ("coder", Some(folder)) => {
             let rel = design_handoff_relative_label(folder, root_path);
@@ -4141,8 +4283,25 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
                 project_id = project.metadata.id
             )
         });
+    // Every addendum above is already self-terminated (either "" when its guard is
+    // false, or literal text ending in its own "\n"), so the six pluggable blocks
+    // collapse into ONE ordered array, concatenated once — same bytes as the old
+    // per-placeholder interpolation, but the ORDER lives in one place instead of
+    // being implicit in the format! template below. `role_rule` is the one
+    // exception (it has no trailing newline of its own), so its line break is
+    // added here, at the join site, rather than baked into the SSoT string.
+    let role_rule_line = format!("{role_rule}\n");
+    let addenda: [&str; 6] = [
+        &role_rule_line,
+        censor_addendum,
+        &mini_coder_addendum,
+        git_push_addendum,
+        &design_handoff_addendum,
+        workflow_addendum.unwrap_or(""),
+    ];
+    let addenda_block: String = addenda.concat();
     let mut prompt = format!(
-        "You are an Aspis Management {role} agent.\n\
+        "You are a Devboule {role} agent.\n\
 Project id: {project_id}\n\
 Project title: {project_title}\n\
 Agent id: {agent_id}\n\
@@ -4157,18 +4316,12 @@ Then call provider_credentials_status(agent_id=\"{agent_id}\", role=\"{role}\", 
 Task entrypoint: {task_action}\n\
 Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.\n\
 Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.\n\
-{role_rule}\n\
-{censor_addendum}\
-{mini_coder_addendum}\
-{git_push_addendum}\
-{design_handoff_addendum}\
-{workflow_addendum}\
+{addenda_block}\
 Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.\n",
         project_id = project.metadata.id,
         project_title = project.metadata.title,
         root_path = root_path.to_string_lossy(),
         launch_token = launch_token,
-        workflow_addendum = workflow_addendum.unwrap_or(""),
     );
     // P10(b): inject the project's <role> SKILL.md (house conventions) when present,
     // sentinel-fenced AFTER the role rules. Absent ⇒ byte-identical (canonicalize
@@ -6895,8 +7048,11 @@ fn normalize_project_id(value: &str) -> Result<String, String> {
 fn normalize_project_status(value: &str) -> Result<String, String> {
     let status = value.trim().to_ascii_lowercase();
     match status.as_str() {
-        "active" | "paused" | "done" | "archived" => Ok(status),
-        _ => Err("Project status must be active, paused, done or archived.".into()),
+        // "draft": a planner-created project whose plan is NOT approved yet. It
+        // must not appear on the kanban board; plan approval (or the first task
+        // actually landing) promotes it to "active".
+        "active" | "paused" | "done" | "archived" | "draft" => Ok(status),
+        _ => Err("Project status must be draft, active, paused, done or archived.".into()),
     }
 }
 
@@ -8724,6 +8880,45 @@ fn clean_description(value: Option<&str>) -> Option<String> {
         .map(|value| value.chars().take(4_000).collect::<String>())
 }
 
+/// D1 (planner-chat demolition): the STABLE planner-orchestrator agent id for a
+/// project — `orchestrator-<project id>`. The planner conversation's identity is the
+/// PROJECT, not the process: a stable id ⇒ a stable bridge/steer file ⇒ the transcript
+/// survives relaunches, app restarts, and backend switches (local binary, Claude and
+/// Codex duplex all append to the same file). The project id is reduced to the
+/// bridge-file-safe charset (`[A-Za-z0-9._-]`, the `activity_file_name` rules) and
+/// length-capped, because the id doubles as the activity/steer file basename.
+pub fn stable_orchestrator_agent_id(project_id: &str) -> String {
+    let clean: String = project_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        // `normalize_project_id` allows ids up to 80 chars — take MORE than that so two
+        // distinct legal ids can never collide by truncation ("orchestrator-" + 100 stays
+        // well under `activity_file_name`'s own 128-char basename cap). The cap only
+        // guards against a pathological non-project-id input.
+        .take(100)
+        .collect();
+    format!("orchestrator-{clean}")
+}
+
+/// The agent id a launch runs under: an explicit caller id wins; an orchestrator
+/// launch gets the project's STABLE id (D1 above); every other role keeps the
+/// per-launch timestamp id (each coder/verifier run is its own session).
+fn launch_agent_id(explicit: Option<&str>, role: &str, project_id: &str) -> String {
+    if let Some(id) = clean_optional(explicit) {
+        return id;
+    }
+    if role == "orchestrator" {
+        return stable_orchestrator_agent_id(project_id);
+    }
+    format!("{}-{}", role, Utc::now().timestamp_millis())
+}
+
 fn clean_optional(value: Option<&str>) -> Option<String> {
     value
         .map(|value| {
@@ -8904,6 +9099,54 @@ pub(crate) fn hash_launch_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- D1 (planner-chat demolition): stable orchestrator identity ---------------
+
+    #[test]
+    fn launch_agent_id_orchestrator_is_stable_per_project() {
+        let a = launch_agent_id(None, "orchestrator", "1f2e3d4c-aa-bb");
+        let b = launch_agent_id(None, "orchestrator", "1f2e3d4c-aa-bb");
+        assert_eq!(
+            a, b,
+            "same project ⇒ same id across launches (the whole point)"
+        );
+        assert_eq!(a, "orchestrator-1f2e3d4c-aa-bb");
+        let other = launch_agent_id(None, "orchestrator", "other-project");
+        assert_ne!(a, other, "different projects never share a transcript");
+    }
+
+    #[test]
+    fn launch_agent_id_sanitizes_the_project_id_for_the_bridge_filename() {
+        // The id doubles as the activity/steer file basename — it must be
+        // filename-clean by construction, whatever the project id contains.
+        let id = launch_agent_id(None, "orchestrator", "we ird/../id");
+        assert_eq!(id, "orchestrator-we_ird_.._id");
+        // Pathological long input is capped — but ABOVE the 80-char ceiling
+        // `normalize_project_id` allows, so two distinct legal project ids can
+        // never collide by truncation.
+        let long = launch_agent_id(None, "orchestrator", &"x".repeat(500));
+        assert!(long.len() <= "orchestrator-".len() + 100);
+        let a = launch_agent_id(None, "orchestrator", &format!("{}a", "x".repeat(79)));
+        let b = launch_agent_id(None, "orchestrator", &format!("{}b", "x".repeat(79)));
+        assert_ne!(
+            a, b,
+            "80-char ids (the normalize_project_id max) must not collide"
+        );
+    }
+
+    #[test]
+    fn launch_agent_id_explicit_id_and_other_roles_are_unchanged() {
+        assert_eq!(
+            launch_agent_id(Some("my-explicit"), "orchestrator", "p1"),
+            "my-explicit",
+            "an explicit caller id always wins"
+        );
+        let coder = launch_agent_id(None, "coder", "p1");
+        assert!(
+            coder.starts_with("coder-") && coder != "coder-p1",
+            "non-orchestrator roles keep the per-launch timestamp id, got {coder}"
+        );
+    }
 
     #[test]
     fn command_exists_resolves_known_and_rejects_bogus() {
@@ -10140,8 +10383,7 @@ mod tests {
             serialized_codex.contains("main_coder: codex"),
             "an override must write the main_coder key"
         );
-        let (reparsed, _) =
-            parse_frontmatter(&serialized_codex, Path::new("proj-mc.md")).unwrap();
+        let (reparsed, _) = parse_frontmatter(&serialized_codex, Path::new("proj-mc.md")).unwrap();
         assert_eq!(
             reparsed.main_coder.as_deref(),
             Some("codex"),
@@ -10182,7 +10424,11 @@ mod tests {
         // line must never contain a raw newline that breaks the single-line invariant.
         let line = main_coder_frontmatter_line(&Some("codex".into()));
         assert_eq!(line, "main_coder: codex\n");
-        assert_eq!(line.matches('\n').count(), 1, "exactly one trailing newline");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one trailing newline"
+        );
     }
 
     #[test]
@@ -11342,6 +11588,13 @@ updated_at: 2026-05-28T00:00:00Z
     fn app_project_status_rejects_direct_done() {
         assert_eq!(normalize_app_project_status("active").unwrap(), "active");
         assert!(normalize_app_project_status("done").is_err());
+    }
+
+    #[test]
+    fn app_project_status_accepts_draft() {
+        // "draft" = planner-created, plan not yet approved (off the kanban).
+        assert_eq!(normalize_app_project_status("draft").unwrap(), "draft");
+        assert_eq!(normalize_project_status("Draft ").unwrap(), "draft");
     }
 
     #[test]
@@ -12767,6 +13020,85 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         assert!(vault::cloudflare_agent_token_profile_ids_for_role("unknown").is_empty());
     }
 
+    // BUG B2 — the orchestrator launch site (the `client == "orchestrator"` branch of
+    // `prepare_or_launch_project_agent`) resolves `(omlx_base_url, omlx_model)` /
+    // `(cloud_base_url, cloud_model)` via `match &local_backend { Some(b) => resolve_*(b),
+    // None => ("", "") }`, EXACTLY the same match arms exercised here — so this test pins
+    // the launch site's env resolution to the gate's contract without needing a full
+    // `AppHandle`/Tauri test harness (none exists in this crate). A `None` backend ⇒ BOTH
+    // pairs are empty ⇒ the gate must reject with the shared preflight message (reused
+    // verbatim, no new copy). A `Some` backend (either kind) ⇒ at least one pair is
+    // non-empty ⇒ the gate must pass, leaving the existing preflight/spawn path untouched.
+    #[test]
+    fn orchestrator_no_backend_gate_matches_launch_site_env_resolution() {
+        let local_backend: Option<super::super::local_coder::LocalCoderBackend> = None;
+        let (omlx_base_url, _omlx_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let (cloud_base_url, _cloud_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let err = super::super::local_coder::orchestrator_model_configured_verdict(
+            &omlx_base_url,
+            &cloud_base_url,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            super::super::local_coder::NO_LOCAL_ORCHESTRATOR_MODEL_MSG
+        );
+    }
+
+    #[test]
+    fn orchestrator_configured_omlx_backend_gate_passes_unaffected() {
+        let local_backend = Some(super::super::local_coder::LocalCoderBackend {
+            kind: super::super::local_coder::LocalCoderBackendKind::Omlx,
+            base_url: Some("http://127.0.0.1:8000/v1".into()),
+            model: Some("qwen".into()),
+        });
+        let (omlx_base_url, _omlx_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let (cloud_base_url, _cloud_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
+            None => (String::new(), String::new()),
+        };
+        assert!(
+            super::super::local_coder::orchestrator_model_configured_verdict(
+                &omlx_base_url,
+                &cloud_base_url,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn orchestrator_configured_cloud_backend_gate_passes_unaffected() {
+        let local_backend = Some(super::super::local_coder::LocalCoderBackend {
+            kind: super::super::local_coder::LocalCoderBackendKind::Cloud,
+            base_url: Some("https://api.example.com/v1".into()),
+            model: Some("big-model".into()),
+        });
+        let (omlx_base_url, _omlx_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_omlx_env(backend),
+            None => (String::new(), String::new()),
+        };
+        let (cloud_base_url, _cloud_model) = match &local_backend {
+            Some(backend) => super::super::local_coder::resolve_cloud_env(backend),
+            None => (String::new(), String::new()),
+        };
+        assert!(
+            super::super::local_coder::orchestrator_model_configured_verdict(
+                &omlx_base_url,
+                &cloud_base_url,
+            )
+            .is_ok()
+        );
+    }
+
     // ROLE UNTANGLE — the orchestrator launches on the SAME task statuses as a coder
     // (Python CODER_LIKE_ROLES mirror): todo/wip/blocked OK, review/done rejected.
     #[test]
@@ -12800,8 +13132,10 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
     #[test]
     fn workflow_run_rejected_for_orchestrator_client() {
         let client = "orchestrator";
-        let role =
-            super::super::agent_role::effective_launch_role(client, &normalize_agent_role("coder").unwrap());
+        let role = super::super::agent_role::effective_launch_role(
+            client,
+            &normalize_agent_role("coder").unwrap(),
+        );
         assert_eq!(role, "orchestrator");
         assert!(client == "orchestrator", "client-keyed guard rejects this");
         assert!(role != "coder", "role-keyed guard rejects it too");
@@ -13080,8 +13414,14 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // (mini_command_build owns the command assembly + env scrub now): none may
         // reference a Phase B wiring symbol (backend, action, merge/serialize).
         let mini_sources = [
-            ("mini_coder_executor.rs", include_str!("mini_coder_executor.rs")),
-            ("mini_command_build.rs", include_str!("mini_command_build.rs")),
+            (
+                "mini_coder_executor.rs",
+                include_str!("mini_coder_executor.rs"),
+            ),
+            (
+                "mini_command_build.rs",
+                include_str!("mini_command_build.rs"),
+            ),
             ("mini_edit_apply.rs", include_str!("mini_edit_apply.rs")),
             ("mini_prompt.rs", include_str!("mini_prompt.rs")),
             ("agentic_worker.rs", include_str!("agentic_worker.rs")),
@@ -15312,6 +15652,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("ollama default must persist");
@@ -15336,6 +15677,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("reset to default must persist");
@@ -15441,6 +15783,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://localhost:8000/v1/".to_string()),
                 model: Some("mlx-community/gemma".to_string()),
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("valid omlx must persist");
@@ -15457,6 +15800,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://localhost:8000/v1".to_string()),
                 model: Some("mlx-community/gemma".to_string()),
                 ollama_model: None,
+                ..Default::default()
             }),
             "omlx config must read back identically (normalized)"
         );
@@ -15473,6 +15817,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             base_url: Some("http://evil.com/v1".to_string()),
             model: Some("m".to_string()),
             ollama_model: None,
+            ..Default::default()
         })
         .and_then(|normalized| apply_censor_local_ai_to_config(&mut value, &normalized));
         assert!(result.is_err(), "non-loopback omlx base must be rejected");
@@ -15487,6 +15832,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             base_url: Some("http://localhost:8000/v1".to_string()),
             model: None,
             ollama_model: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -15502,6 +15848,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://127.0.0.1:11434".to_string()),
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             },
         )
         .expect("ollama-with-base must persist");
@@ -15513,6 +15860,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: Some("http://127.0.0.1:11434".to_string()),
                 model: None,
                 ollama_model: None,
+                ..Default::default()
             })
         );
     }
@@ -15531,6 +15879,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: Some("gemma4:x".to_string()),
+                ..Default::default()
             },
         )
         .expect("ollama-with-override must persist");
@@ -15553,6 +15902,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
                 base_url: None,
                 model: None,
                 ollama_model: Some("gemma4:x".to_string()),
+                ..Default::default()
             }),
             "the override must read back identically (not dropped)"
         );
@@ -15655,6 +16005,294 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
         // The leading literal survives (minus the stripped \n) so the addendum still
         // points at a meaningful path.
         assert!(label.starts_with("injectme"), "got {label:?}");
+    }
+
+    // ── STEP 0: byte-parity snapshot guard (2026-07 project_agent_prompt
+    // addendum-assembly refactor). Pins the CURRENT output byte-for-byte for 3
+    // representative role combos, plus structural (contains/absent) coverage
+    // across the rest of the {role} x {task_id} x {censor_review} x
+    // {design_handoff} x {mini_delegation} matrix. This test must stay GREEN
+    // through the refactor that collapses the addendum blocks into an ordered
+    // list — that is the proof the collapsed assembly is byte-identical to the
+    // hand-concatenated original.
+    #[test]
+    fn project_agent_prompt_snapshot_matrix() {
+        let project = censor_prompt_test_project();
+        let root = PathBuf::from(project.metadata.root_path.clone().unwrap());
+
+        // ── 1) exact byte-for-byte pins (3 representative combos) ──
+        const CODER_BASELINE_EXPECTED: &str = r#"You are a Devboule coder agent.
+Project id: scrna-seq
+Project title: scRNA-seq UX and Backend
+Agent id: coder-1
+Working root: C:\Users\gualt\Desktop\aspis bio
+Launch token: test-launch-token
+Preferred task_id: T1
+
+Use the MCP server named aspis-management.
+First call agent_register(agent_id="coder-1", role="coder", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
+Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
+Then call provider_credentials_status(agent_id="coder-1", role="coder", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="coder-1", role="coder", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="coder-1", role="coder", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Task entrypoint: project_claim_task(project_id="scrna-seq", task_id="T1", agent_id="coder-1", role="coder", session_token="<sessionToken>")
+Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
+Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
+Plan and code. For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start coding before this call. Split the plan into SMALL, self-contained tasks (one testable, committable unit each; a task's scope has AT MOST 3 files — split anything larger; give every task a deterministically verifiable acceptance). Pass plan_id = the `planId` field returned by plan_submit, and tasks = that list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. `id` is a short internal ref you assign (e.g. "P1", "P2"); `dependsOn` lists the ids of OTHER tasks in THIS SAME call (e.g. ["P1"]) — NOT the Kanban T-numbers (the server allocates those and remaps your refs). Scale clarifying questions to complexity: ask the human UP TO 3 targeted questions via ask_user before planning a non-trivial or ambiguous task (zero is fine when it is clear), and skip them on simple/obvious tasks. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when ready for verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete and the project can advance — do NOT just close the terminal, or you will linger as a stale active agent.
+At each step boundary call censor_findings(project_id, file=<files you just touched>); fix the real local findings; mark false positives with censor_dispose. This is a batch at the step boundary, not a live interrupt.
+For cheap, mechanical sub-tasks (boilerplate, bulk read->summary, simple edits, docstrings, tests) you MAY delegate to spawn_mini_coder(task, files, ...) to save your own context and usage limit. Front-load the needed context into the task and files; do the THINKING yourself and delegate only the I/O and boilerplate. REVIEW the mini's returned output before using it — the mini is a cheaper model, so treat its output as a draft and decide false positives yourself.
+When you call spawn_mini_coder it BLOCKS and returns a terminal status: done -> verify its output and filesTouched, then use it; needs_clarification -> re-invoke with the answer or do it yourself; aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do NOT silently retry the mini, and escalate to the human (agent_heartbeat status="needs_user" with what happened); failed/timeout -> handle as an error. The mini never contacts the human — you are the only contact point.
+Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
+Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+"#;
+        let coder_baseline = project_agent_prompt(
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            coder_baseline, CODER_BASELINE_EXPECTED,
+            "coder baseline (task_id, no censor_review, no design_handoff, no mini_delegation) drifted"
+        );
+
+        const VERIFIER_FINAL_REVIEW_EXPECTED: &str = r#"You are a Devboule verifier agent.
+Project id: scrna-seq
+Project title: scRNA-seq UX and Backend
+Agent id: verifier-1
+Working root: C:\Users\gualt\Desktop\aspis bio
+Launch token: test-launch-token
+
+Use the MCP server named aspis-management.
+First call agent_register(agent_id="verifier-1", role="verifier", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
+Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
+Then call provider_credentials_status(agent_id="verifier-1", role="verifier", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="verifier-1", role="verifier", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Task entrypoint: project_next_task(project_id="scrna-seq", agent_id="verifier-1", role="verifier", session_token="<sessionToken>") then claim the returned task_id before working.
+Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
+Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
+Do not code. Audit review tasks, inspect evidence, run verification where useful, then set done or blocked with concrete evidence and confidence. When you have FINISHED reviewing (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent.
+Final review: call censor_findings(project_id) for the residual ledger, ignore findings already resolved, focus on cross-file / architectural / multi-file-security issues the small model cannot see, and censor_dispose to confirm or reject each.
+Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+"#;
+        let verifier_final_review = project_agent_prompt(
+            &project,
+            "verifier",
+            "verifier-1",
+            None,
+            &root,
+            "test-launch-token",
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            verifier_final_review, VERIFIER_FINAL_REVIEW_EXPECTED,
+            "verifier final-review (censor_review=true, no task_id) drifted"
+        );
+
+        const ORCHESTRATOR_BASELINE_EXPECTED: &str = r#"You are a Devboule orchestrator agent.
+Project id: scrna-seq
+Project title: scRNA-seq UX and Backend
+Agent id: orch-1
+Working root: C:\Users\gualt\Desktop\aspis bio
+Launch token: test-launch-token
+Preferred task_id: T1
+
+Use the MCP server named aspis-management.
+First call agent_register(agent_id="orch-1", role="orchestrator", model="<your model>", message="starting scrna-seq", launch_token="test-launch-token"). Report your REAL model name in that model field (e.g. opus, sonnet, haiku) so fleet counts are accurate.
+Keep the returned sessionToken private and pass it as session_token="<sessionToken>" on every later MCP call.
+Then call provider_credentials_status(agent_id="orch-1", role="orchestrator", session_token="<sessionToken>"), project_get(project_id="scrna-seq", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>") and oracle_context(query="<specific question>", agent_id="orch-1", role="orchestrator", project_id="scrna-seq", session_token="<sessionToken>") before acting.
+Task entrypoint: project_claim_task(project_id="scrna-seq", task_id="T1", agent_id="orch-1", role="orchestrator", session_token="<sessionToken>")
+Use project_append_note for evidence, project_update_status for visible Kanban movement, and agent_heartbeat while running.
+Provider mutation tools require management_project_id, task_id and evidence from an active coder claim.
+Plan and DELEGATE — you NEVER write or edit files yourself: you have no file-write or mutation tool, and EVERY code change goes through delegation (spawn_main_coder for substantial work, spawn_mini_coder for cheap mechanical sub-tasks; you plan and front-load context; they write). For multi-step work, submit a plan with plan_submit and WAIT for approval; ON APPROVAL, immediately call project_create_plan_tasks with the structured task list — the Kanban has ZERO tasks until you do, so never start delegating before this call. Split the plan into SMALL, self-contained tasks (nanophases) — NOT one per phase: one task = one testable, committable unit; a task's scope (the files it modifies) has AT MOST 3 entries, so split anything larger; give every task a deterministically verifiable acceptance (a test/typecheck/lint command). Pass plan_id = the `planId` field returned by plan_submit, and tasks = the nano-task list, each REQUIRING {id, title} plus {acceptance, scope:[files], dependsOn}. Route by weight: set weight:"main" for substantial multi-file or build-and-verify tasks; omit it (or "mini") for cheap mechanical edits. The assigned coder may be a small local model that relies SOLELY on your task title, acceptance and scope — make them unambiguous and complete, front-load everything it needs, and preserve exact file paths, function names and error messages. To SUPERVISE a delegated mini call spawn_mini_coder with wait=false to get its directiveId immediately, watch its activity, steer it with steer_mini_coder(directiveId, message) (or "stop" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation. If spawn_mini_coder returns status='aborted_by_human', STOP that line of work and escalate via ask_user; if it returns status='escalated' (retries exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file. For project or codebase questions use oracle_ask / oracle_context FIRST — do not guess. You may claim tasks, create follow-ups, reopen or move tasks, read providers and Oracle, and use Cloudflare/Scaleway mutation tools only when the project requires it. Do not set tasks to done; leave evidence and set review when a sub-task is ready for the verifier, or blocked when stuck. When you have FINISHED all your work (or are about to exit), send a final agent_heartbeat with status="done" so the app marks you complete — do NOT just close the terminal, or you will linger as a stale active agent.
+Git: commit freely (git add -u / git commit) to save your work, but NEVER run a raw `git push` — your launch environment carries no git credentials and a raw push fails. To publish, call the request_git_push MCP tool and a human approves it. If the push is denied or times out, STOP and escalate via agent_heartbeat status="needs_user"; do NOT retry, do NOT attempt a raw push, do NOT work around the gate.
+Never print provider tokens, launch tokens, session tokens or secrets. Provider scopes must stay Aspis Bio only.
+"#;
+        let orchestrator_baseline = project_agent_prompt(
+            &project,
+            "orchestrator",
+            "orch-1",
+            Some("T1"),
+            &root,
+            "test-launch-token",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            orchestrator_baseline, ORCHESTRATOR_BASELINE_EXPECTED,
+            "orchestrator baseline (task_id) drifted"
+        );
+
+        // ── 2) structural coverage for the rest of the matrix ──
+        // coder: task_id absent -> project_next_task entrypoint, no "Preferred task_id" line.
+        let coder_no_task = project_agent_prompt(
+            &project, "coder", "coder-1", None, &root, "tok", None, false, None, None, None, None,
+        );
+        assert!(!coder_no_task.contains("Preferred task_id"));
+        assert!(coder_no_task.contains("project_next_task(project_id=\"scrna-seq\""));
+
+        // coder: design_handoff_folder present/absent.
+        let (dh_root, dh_folder) = design_handoff_fixture();
+        let mut dh_project = censor_prompt_test_project();
+        dh_project.metadata.root_path = Some(dh_root.to_string_lossy().into_owned());
+        let coder_with_handoff = project_agent_prompt(
+            &dh_project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &dh_root,
+            "tok",
+            None,
+            false,
+            Some(dh_folder.as_path()),
+            None,
+            None,
+            None,
+        );
+        assert!(coder_with_handoff.contains("a design bundle has been saved"));
+        let coder_without_handoff = project_agent_prompt(
+            &dh_project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &dh_root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!coder_without_handoff.contains("a design bundle has been saved"));
+
+        // coder: mini_delegation_addendum present/absent.
+        let backend = test_mini_backend(Some("qwen3.6-27b"));
+        let block = build_mini_delegation_addendum(
+            Some(&backend),
+            &["Python"],
+            crate::backend::mini_coder::MiniWriteBehavior::Auto,
+        )
+        .unwrap();
+        let coder_with_mini = project_agent_prompt(
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            Some(block.as_str()),
+            None,
+        );
+        assert!(coder_with_mini.contains("MINI-CODER DELEGATION write_mode"));
+        let coder_without_mini = project_agent_prompt(
+            &project,
+            "coder",
+            "coder-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!coder_without_mini.contains("MINI-CODER DELEGATION write_mode"));
+
+        // verifier: task_id present, censor_review off -> NO censor text at all.
+        let verifier_with_task_no_review = project_agent_prompt(
+            &project,
+            "verifier",
+            "verifier-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(verifier_with_task_no_review.contains("Preferred task_id: T1"));
+        assert!(
+            !verifier_with_task_no_review.contains("censor_findings"),
+            "verifier without censor_review contains NO censor text"
+        );
+
+        // verifier: no task_id, censor_review off.
+        let verifier_no_task_no_review = project_agent_prompt(
+            &project,
+            "verifier",
+            "verifier-1",
+            None,
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!verifier_no_task_no_review.contains("Preferred task_id"));
+        assert!(!verifier_no_task_no_review.contains("residual ledger"));
+
+        // verifier: task_id present, censor_review on.
+        let verifier_with_task_review = project_agent_prompt(
+            &project,
+            "verifier",
+            "verifier-1",
+            Some("T1"),
+            &root,
+            "tok",
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(verifier_with_task_review.contains("residual ledger"));
+        assert!(verifier_with_task_review.contains("Preferred task_id: T1"));
+
+        // orchestrator: no task_id -> project_next_task entrypoint, own role text kept.
+        let orch_no_task = project_agent_prompt(
+            &project,
+            "orchestrator",
+            "orch-1",
+            None,
+            &root,
+            "tok",
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!orch_no_task.contains("Preferred task_id"));
+        assert!(orch_no_task.contains("Plan and DELEGATE"));
     }
 }
 

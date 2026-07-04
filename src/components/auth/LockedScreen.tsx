@@ -70,7 +70,7 @@ export function LockedScreen({
           <p className="max-w-sm text-[12px] leading-5 text-coral-dark mt-4">
             {error ||
               (!desktopRuntimeAvailable
-                ? "Browser preview cannot access Tauri or device authentication. Launch Aspis Management as the desktop app."
+                ? "Browser preview cannot access Tauri or device authentication. Launch Devboule as the desktop app."
                 : "Set up device authentication (Windows Hello or Touch ID) in your system settings before using this app.")}
           </p>
         )}

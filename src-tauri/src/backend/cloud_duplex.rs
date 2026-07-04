@@ -111,6 +111,9 @@ pub fn encode_user_turn(provider: Provider, msg: &str) -> String {
 struct DuplexSession {
     child: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<ChildStdin>>,
+    /// Bridge path, so live sends can echo the USER turn into the transcript
+    /// (see `append_user_echo`). Empty when the launch had no bridge.
+    activity_file: PathBuf,
     reader: Option<JoinHandle<()>>,
     exited: Arc<AtomicBool>,
     provider: Provider,
@@ -138,6 +141,54 @@ impl CloudDuplexSessions {
 /// Append one bridge line (+newline) to the activity file in ONE atomic `write_all` (so a partial
 /// write can never leave a half-line the tail parser would choke on). Best-effort: any I/O error
 /// no-ops, so the read loop never dies on a transient FS hiccup.
+/// Encode a Claude stream-json INTERRUPT control request (the same message the
+/// Agent SDK's `interrupt()` writes to stdin in streaming mode). The CLI aborts
+/// the in-flight turn and answers with a `control_response`; the session and
+/// its context stay alive, so the next user turn continues the conversation.
+pub fn encode_claude_interrupt(request_id: u64) -> String {
+    let json = serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("devboule-int-{request_id}"),
+        "request": { "subtype": "interrupt" }
+    });
+    format!("{json}\n")
+}
+
+/// `turn/interrupt` request for a Codex app-server thread (mirrors turn/start
+/// naming). ⚠️ Documented-but-unstable protocol, same caveat as
+/// `encode_thread_start`: validate against a live `codex app-server`.
+pub fn encode_turn_interrupt(id: u64, thread_id: &str) -> String {
+    let json = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "turn/interrupt",
+        "params": { "threadId": thread_id }
+    });
+    format!("{json}\n")
+}
+
+/// Echo a USER turn into the activity bridge as a finalized chat line. The
+/// LOCAL orchestrator echoes user steers into its bridge, and the planner
+/// transcript trusts the bridge as the chronological source of truth — without
+/// this echo a cloud duplex bridge contains only ASSISTANT turns, so the
+/// frontend's optimistic user copies sort BELOW the reply (the "answer above
+/// my message" flip), the last row always looks like the user's turn, and the
+/// thinking pill + silence watchdog misfire forever.
+/// `msg_id` (D3, planner-chat demolition): the client-generated send id, echoed back
+/// on the wire as `msgId` so the frontend drains its optimistic pending copy BY
+/// IDENTITY instead of counting user rows. Blank/absent ⇒ the key is omitted (wire
+/// compat with old readers and with the local binary's id-less echoes).
+fn append_user_echo(activity_file: &std::path::Path, text: &str, msg_id: Option<&str>) {
+    if activity_file.as_os_str().is_empty() {
+        return;
+    }
+    let mut obj = serde_json::json!({"kind": "chat", "role": "user", "text": text});
+    if let Some(id) = msg_id.map(str::trim).filter(|id| !id.is_empty()) {
+        obj["msgId"] = serde_json::Value::String(id.to_string());
+    }
+    append_bridge_line(activity_file, &obj.to_string());
+}
+
 fn append_bridge_line(path: &std::path::Path, line: &str) {
     if path.as_os_str().is_empty() {
         return;
@@ -177,6 +228,16 @@ pub fn spawn_cloud_duplex(
     cwd: &std::path::Path,
     activity_file: PathBuf,
     initial_goal: Option<&str>,
+    // D3: the frontend's send id for the INITIAL GOAL turn, echoed into the bridge
+    // (`msgId`) exactly like a live send's — the optimistic goal copy then drains by
+    // identity too. Optional + lenient (absent ⇒ id-less echo, byte-identical).
+    initial_goal_msg_id: Option<&str>,
+    // D-resume: the formatted tail of the project's durable transcript
+    // (`format_chat_resume_block`). When present it is PREPENDED to the delivered
+    // first turn so a relaunched/switched orchestrator resumes the conversation —
+    // but the bridge ECHO stays the bare goal (the transcript must not swallow its
+    // own history back, and the visible bubble must be what the user typed).
+    resume_context: Option<&str>,
     project_id: &str,
     model: Option<&str>,
     codex_policy: Option<crate::backend::broker::CodexThreadPolicy>,
@@ -218,13 +279,21 @@ pub fn spawn_cloud_duplex(
     };
 
     match provider {
-        // Claude: send the opening goal as the first user turn inline (byte-identical to before).
+        // Claude: send the opening goal as the first user turn inline (byte-identical to before
+        // when there is no resume context).
         Provider::Claude => {
             if let Some(goal) = initial_goal.filter(|g| !g.trim().is_empty()) {
+                // D-resume: deliver history + goal; echo the GOAL alone (see the
+                // `resume_context` param doc).
+                let delivered = match resume_context {
+                    Some(ctx) => format!("{ctx}\n\n{goal}"),
+                    None => goal.to_string(),
+                };
                 if let Ok(mut w) = stdin.lock() {
-                    let _ = w.write_all(encode_user_turn(provider, goal).as_bytes());
+                    let _ = w.write_all(encode_user_turn(provider, &delivered).as_bytes());
                     let _ = w.flush();
                 }
+                append_user_echo(&activity_file, goal, initial_goal_msg_id);
             }
         }
         // Codex: the app-server requires an `initialize` → `thread/start` handshake BEFORE any
@@ -251,6 +320,9 @@ pub fn spawn_cloud_duplex(
             let initial_goal_owned: Option<String> = initial_goal
                 .filter(|g| !g.trim().is_empty())
                 .map(str::to_string);
+            let initial_goal_msg_id_owned: Option<String> =
+                initial_goal_msg_id.map(str::to_string);
+            let resume_context_owned: Option<String> = resume_context.map(str::to_string);
 
             let _ = std::thread::Builder::new()
                 .name(format!("cloud-duplex-codex-handshake-{agent_id}"))
@@ -263,6 +335,8 @@ pub fn spawn_cloud_duplex(
                         model_owned,
                         policy_owned,
                         initial_goal_owned,
+                        initial_goal_msg_id_owned,
+                        resume_context_owned,
                     );
                 });
         }
@@ -323,10 +397,19 @@ pub fn spawn_cloud_duplex(
                 } else {
                     OpenOptions::new().create(true).append(true).open(&activity_file).ok()
                 };
+                // Liveness heartbeat: cloud CLIs have no agent_register/heartbeat of
+                // their own, so stamp the session's last_seen_at from the OUTPUT
+                // stream — any line proves the child is alive. Throttled so a token
+                // storm costs one locked state write per minute, not per token.
+                let mut last_touch = std::time::Instant::now();
                 for line in BufReader::new(child_stdout).lines() {
                     let Ok(line) = line else { break };
                     if line.trim().is_empty() {
                         continue;
+                    }
+                    if last_touch.elapsed() >= std::time::Duration::from_secs(60) {
+                        crate::backend::agents::touch_agent_session(&app, &agent_id, None);
+                        last_touch = std::time::Instant::now();
                     }
                     // Codex JSON-RPC dispatch: peek the line; route responses to the correlator and
                     // approval server-requests to the bridge. Everything else (and any non-JSON
@@ -415,6 +498,7 @@ pub fn spawn_cloud_duplex(
     let session = DuplexSession {
         child,
         stdin,
+        activity_file: activity_file.clone(),
         reader: Some(reader),
         exited,
         provider,
@@ -424,6 +508,11 @@ pub fn spawn_cloud_duplex(
     match sessions.inner.lock() {
         Ok(mut map) => {
             map.insert(agent_id.to_string(), session);
+            // The duplex spawn IS this session's registration: cloud CLIs never call
+            // agent_register, so without this promotion the session sat in
+            // launch_pending forever with a frozen last_seen_at and the frontend's
+            // recency filter eventually dropped it mid-conversation.
+            crate::backend::agents::touch_agent_session(app, agent_id, Some("active"));
             Ok(())
         }
         Err(_) => {
@@ -442,10 +531,11 @@ pub fn cloud_duplex_send(
     sessions: &CloudDuplexSessions,
     agent_id: &str,
     message: &str,
+    msg_id: Option<&str>,
 ) -> Result<(), String> {
     // Clone the stdin handle + provider + Codex correlator under the map lock, then DROP the lock
     // BEFORE the (blocking) pipe write so it can never deadlock against `kill_cloud_duplex`.
-    let (stdin, provider, codex) = {
+    let (stdin, provider, codex, activity_file) = {
         let map = sessions.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
         let session = map
             .get(agent_id)
@@ -453,7 +543,12 @@ pub fn cloud_duplex_send(
         if session.exited.load(Ordering::SeqCst) {
             return Err("the cloud orchestrator has exited".to_string());
         }
-        (Arc::clone(&session.stdin), session.provider, session.codex.clone())
+        (
+            Arc::clone(&session.stdin),
+            session.provider,
+            session.codex.clone(),
+            session.activity_file.clone(),
+        )
     };
     let encoded = match provider {
         Provider::Claude => encode_user_turn(provider, message),
@@ -473,13 +568,79 @@ pub fn cloud_duplex_send(
     w.write_all(encoded.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     w.flush().map_err(|e| format!("flush failed: {e}"))?;
+    drop(w);
+    // Echo the delivered user turn into the bridge — the transcript's source of
+    // truth. Only AFTER a successful write, so a failed send never fabricates a
+    // user row the child never received.
+    append_user_echo(&activity_file, message, msg_id);
     Ok(())
+}
+
+/// Interrupt the IN-FLIGHT turn of a live duplex orchestrator (Esc in the
+/// planner chat). Claude: a stream-json `control_request/interrupt` on stdin.
+/// Codex: `turn/interrupt` on the open thread. The child and its context stay
+/// alive — this cancels the current turn, it does not stop the agent.
+pub fn cloud_duplex_interrupt(
+    sessions: &CloudDuplexSessions,
+    agent_id: &str,
+) -> Result<(), String> {
+    static INTERRUPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let (stdin, provider, codex, activity_file) = {
+        let map = sessions.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+        let session = map
+            .get(agent_id)
+            .ok_or_else(|| "no live cloud orchestrator for this agent".to_string())?;
+        if session.exited.load(Ordering::SeqCst) {
+            return Err("the cloud orchestrator has exited".to_string());
+        }
+        (
+            Arc::clone(&session.stdin),
+            session.provider,
+            session.codex.clone(),
+            session.activity_file.clone(),
+        )
+    };
+    let encoded = match provider {
+        Provider::Claude => {
+            encode_claude_interrupt(INTERRUPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        }
+        Provider::Codex => {
+            let codex = codex.ok_or_else(|| "the Codex session has no client".to_string())?;
+            let tid = codex
+                .thread_id()
+                .ok_or_else(|| "the Codex thread is not ready yet".to_string())?;
+            encode_turn_interrupt(codex.alloc_id(), &tid)
+        }
+    };
+    let mut w = stdin.lock().map_err(|_| "stdin lock poisoned".to_string())?;
+    w.write_all(encoded.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
+    w.flush().map_err(|e| format!("flush failed: {e}"))?;
+    drop(w);
+    // Make the interruption visible in the transcript (milestone, not a chat turn).
+    append_bridge_line(
+        &activity_file,
+        &serde_json::json!({"kind": "milestone", "text": "⏹ interrupted by user", "node": "dot"})
+            .to_string(),
+    );
+    Ok(())
+}
+
+/// IPC: interrupt the in-flight turn of a live cloud duplex orchestrator (Esc).
+#[tauri::command]
+pub fn project_cloud_orchestrator_interrupt(
+    app: tauri::AppHandle,
+    agent_id: String,
+) -> Result<(), String> {
+    let sessions = app.state::<CloudDuplexSessions>();
+    cloud_duplex_interrupt(&sessions, &agent_id)
 }
 
 /// Kill + reap a duplex child (idempotent; no-op if absent). The child handle is shared with the
 /// reader thread, so whichever runs first reaps it exactly once.
 pub fn kill_cloud_duplex(app: &tauri::AppHandle, sessions: &CloudDuplexSessions, agent_id: &str) {
     let session = sessions.inner.lock().ok().and_then(|mut m| m.remove(agent_id));
+    let had_session = session.is_some();
     if let Some(mut session) = session {
         session.exited.store(true, Ordering::SeqCst);
         // Kill via the shared handle (the OS then closes the child's stdout → the reader hits EOF
@@ -489,7 +650,38 @@ pub fn kill_cloud_duplex(app: &tauri::AppHandle, sessions: &CloudDuplexSessions,
             let _ = reader.join();
         }
     }
-    crate::backend::agents::mark_agent_session_closed_public(app, agent_id);
+    // Stamp the session closed ONLY when something was actually killed. The
+    // unconditional stamp was the cloud-orchestrator "mute" bug: spawn_cloud_duplex
+    // calls this defensively BEFORE registering the new session ("clean relaunch"),
+    // so with nothing in the map it closed the launch_pending session that
+    // record_launch_pending had created 3ms earlier — the child then ran fine but
+    // its session was born dead, the planner never bound to it, and every reply
+    // landed in a chat no one was reading. Callers that need a close for a
+    // map-absent agent (stop_agent) already call mark_agent_session_closed
+    // themselves.
+    if had_session {
+        crate::backend::agents::mark_agent_session_closed_public(app, agent_id);
+    }
+}
+
+/// App-exit teardown: kill + reap EVERY live duplex child and mark its session
+/// closed. Without this, quitting/restarting the app orphaned the `claude -p`/
+/// codex children (pipes intact, process detached) and left their session rows
+/// "active" in the state file — ghosts the frontend kept binding to after the
+/// restart, dead-ending every send. Mirrors `agent_pty::kill_all_on_exit`.
+pub fn kill_all_on_exit(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let Some(sessions) = app.try_state::<CloudDuplexSessions>() else {
+        return;
+    };
+    let ids: Vec<String> = sessions
+        .inner
+        .lock()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    for id in ids {
+        kill_cloud_duplex(app, &sessions, &id);
+    }
 }
 
 /// IPC: send a planner-chat message to a live cloud DUPLEX orchestrator's stdin (the cloud
@@ -499,9 +691,29 @@ pub fn project_cloud_orchestrator_send(
     app: tauri::AppHandle,
     agent_id: String,
     message: String,
+    // D3: the frontend's send id, echoed into the bridge (`msgId`) so the optimistic
+    // pending copy drains by identity. Optional + lenient: an absent/blank id keeps
+    // the echo line byte-identical to before.
+    msg_id: Option<String>,
 ) -> Result<(), String> {
     let sessions = app.state::<CloudDuplexSessions>();
-    cloud_duplex_send(&sessions, &agent_id, &message)
+    let result = cloud_duplex_send(&sessions, &agent_id, &message, msg_id.as_deref());
+    // SELF-HEAL: "no live session" here means the ledger/state row is a GHOST —
+    // typically a duplex child that died with a previous app process (app
+    // restart/crash), whose session row survived as "active" with a fresh-enough
+    // last_seen_at. Left alone, the frontend keeps binding to it and EVERY send
+    // dead-ends here forever ("session no longer live" loop). Marking it closed
+    // reconciles the state so the next send launches a fresh orchestrator.
+    if result.is_err()
+        && sessions
+            .inner
+            .lock()
+            .map(|map| !map.contains_key(&agent_id))
+            .unwrap_or(false)
+    {
+        crate::backend::agents::mark_agent_session_closed_public(&app, &agent_id);
+    }
+    result
 }
 
 /// Ask a live Codex duplex session to compact its thread context (`thread/compact/start`).
@@ -583,6 +795,10 @@ fn codex_handshake_driver(
     model: Option<String>,
     policy: crate::backend::broker::CodexThreadPolicy,
     initial_goal: Option<String>,
+    // D3: the frontend send id for the opening-goal echo (see `append_user_echo`).
+    initial_goal_msg_id: Option<String>,
+    // D-resume: history prepended to the DELIVERED goal turn; the echo stays the goal.
+    resume_context: Option<String>,
 ) {
     // 1. initialize
     let id1 = codex.alloc_id();
@@ -636,7 +852,13 @@ fn codex_handshake_driver(
     //    its streamed notifications drive the Stage like any other turn).
     if let Some(goal) = initial_goal.filter(|g| !g.trim().is_empty()) {
         let id3 = codex.alloc_id();
-        write_codex_line(&stdin, &encode_turn_start(id3, &tid, &goal));
+        // D-resume: deliver history + goal; echo the GOAL alone (mirrors the Claude path).
+        let delivered = match resume_context.as_deref() {
+            Some(ctx) => format!("{ctx}\n\n{goal}"),
+            None => goal.clone(),
+        };
+        write_codex_line(&stdin, &encode_turn_start(id3, &tid, &delivered));
+        append_user_echo(&activity_file, &goal, initial_goal_msg_id.as_deref());
     }
 }
 
@@ -1098,6 +1320,31 @@ impl Default for CodexClient {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn user_echo_carries_the_msg_id_and_omits_it_when_absent() {
+        // D3: the echo line is what the frontend's identity drain matches against —
+        // `msgId` must round-trip exactly, and an absent/blank id must not add the key
+        // (wire compat with the local binary's id-less echoes).
+        let dir = std::env::temp_dir().join(format!("aspis-echo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("echo.jsonl");
+        append_user_echo(&path, "hello", Some("m-7"));
+        append_user_echo(&path, "plain", None);
+        append_user_echo(&path, "blankid", Some("   "));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["msgId"], Value::String("m-7".into()));
+        assert_eq!(lines[0]["kind"], "chat");
+        assert_eq!(lines[0]["role"], "user");
+        assert!(lines[1].get("msgId").is_none(), "no id ⇒ no key");
+        assert!(lines[2].get("msgId").is_none(), "blank id ⇒ no key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn claude_user_turn_is_a_stream_json_user_message() {

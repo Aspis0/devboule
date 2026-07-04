@@ -252,9 +252,9 @@ def describe_file(filepath: str, area: str, cluster: str, technologies: list[str
     if "oracle/store/" in path:
         return "Architecture Oracle local storage adapter for SQLite metadata and embedded vector records."
     if path.endswith(".tsx"):
-        return f"React UI component for the {area} area of Aspis Management."
+        return f"React UI component for the {area} area of Devboule."
     if path.endswith(".rs"):
-        return f"Rust backend module for {cluster.lower()} behavior in Aspis Management."
+        return f"Rust backend module for {cluster.lower()} behavior in Devboule."
     if path.endswith(".py"):
         return f"Python Oracle module for {cluster.lower()} behavior."
     tech = ", ".join(technologies[:3]) if technologies else area

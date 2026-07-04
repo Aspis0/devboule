@@ -4,7 +4,7 @@ import gc
 import logging
 import threading
 
-from oracle.config import EMBED_BATCH_SIZE, EMBED_DIMS, EMBED_MODEL, MIN_GPU_FREE_GB
+from oracle.config import EMBED_DIMS, EMBED_MODEL, MIN_GPU_FREE_GB
 from oracle.store.lance_store import embed_text
 
 logger = logging.getLogger(__name__)
@@ -266,6 +266,107 @@ def embedding_device() -> str | None:
         return None
 
 
+def choose_embed_batch_size(
+    device: str | None,
+    free_ram_gb: float | None,
+    free_vram_gb: float | None,
+    override_raw: str,
+) -> int:
+    """Pure batch-size policy (no torch/psutil calls — unit testable).
+
+    Scales the encode batch UP with the machine instead of the old flat
+    worst-case default (4). Scaling DOWN under pressure stays where it always
+    was: the OOM->CPU fallback, the free-RAM floor and the thermal cooldown in
+    the index loop — this policy only picks the ceiling for a healthy machine.
+
+      1. An explicit ``ORACLE_EMBED_BATCH_SIZE`` override always wins.
+      2. CUDA: sized by FREE VRAM (separate pool); unknown free VRAM is
+         treated conservatively, mirroring choose_device.
+      3. MPS: Apple UNIFIED memory — sized by free system RAM.
+      4. CPU / unknown device: small batch (throughput is bounded by the
+         bounded thread pool, bigger batches only grow peak RSS) — 8 with
+         clear RAM headroom, the legacy 4 on tight/unmeasurable machines.
+    """
+    if override_raw:
+        try:
+            override = int(override_raw)
+        except ValueError:
+            override = 0
+        if override > 0:
+            return override
+    if device == "cuda":
+        if free_vram_gb is None:
+            return 16
+        if free_vram_gb >= 8:
+            return 64
+        if free_vram_gb >= 4:
+            return 32
+        return 16
+    if device == "mps":
+        if free_ram_gb is None:
+            return 8
+        if free_ram_gb >= 16:
+            return 32
+        if free_ram_gb >= 8:
+            return 16
+        return 8
+    # CPU / unknown device: consult the RAM signal like every other branch —
+    # keep the old flat 4 on a tight (or unmeasurable) machine, 8 with headroom.
+    if free_ram_gb is None or free_ram_gb < 8:
+        return 4
+    return 8
+
+
+def _free_ram_gb() -> float | None:
+    """Free system RAM in GB via chunk_index.free_memory_gb (the repo's
+    ctypes-based, dependency-free reader — psutil is NOT in the venv).
+
+    Imported lazily INSIDE the call to keep module import one-way
+    (chunk_index imports embedder at load time; by the time an encode runs,
+    chunk_index is already in sys.modules, so this is a cheap dict lookup).
+    """
+    try:
+        from oracle.ingestion.chunk_index import free_memory_gb
+
+        return free_memory_gb()
+    except Exception:
+        return None
+
+
+def _free_vram_gb() -> float | None:
+    """Free CUDA VRAM in GB; None off-CUDA or when detection fails.
+
+    Only consults torch when it is ALREADY imported — by the time an encode
+    runs, embedding_device() has imported it; and we never trigger the
+    torch-before-pyarrow Windows crash order from here.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        free_bytes, _total = torch.cuda.mem_get_info()
+        return free_bytes / (1024**3)
+    except Exception:
+        return None
+
+
+def effective_embed_batch_size() -> int:
+    """Resolve the encode batch size for the CURRENT device and memory state.
+
+    Cheap enough to call per embed_texts() call, which also makes it follow the
+    OOM->CPU downgrade automatically (embedding_device() returns "cpu" after
+    _force_cpu_after_oom, so the batch drops to the CPU size on the retry).
+    """
+    return choose_embed_batch_size(
+        embedding_device(),
+        _free_ram_gb(),
+        _free_vram_gb(),
+        os.getenv("ORACLE_EMBED_BATCH_SIZE", "").strip(),
+    )
+
+
 def release_embedding_memory(unload_model: bool = False) -> None:
     global _ST_MODEL
     if unload_model:
@@ -330,7 +431,9 @@ def embed_texts(
                 _bound_cpu_threads(embedding_device())
             try:
                 embeddings = model.encode(
-                    texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=False
+                    texts,
+                    batch_size=effective_embed_batch_size(),
+                    show_progress_bar=False,
                 )
             except Exception as encode_exc:
                 # GPU OOM safety net: a CUDA/MPS out-of-memory error must NOT
@@ -352,8 +455,12 @@ def embed_texts(
                 # Reload on CPU (embedding_device now returns "cpu") and retry.
                 cpu_model = _sentence_model()
                 _bound_cpu_threads("cpu")
+                # Re-resolve: after _force_cpu_after_oom the device is "cpu",
+                # so this retry (and every later call) uses the small CPU batch.
                 embeddings = cpu_model.encode(
-                    texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=False
+                    texts,
+                    batch_size=effective_embed_batch_size(),
+                    show_progress_bar=False,
                 )
             return [list(map(float, emb)) for emb in embeddings]
         except Exception as exc:

@@ -13,7 +13,6 @@ import { StageDesign } from "./StageDesign";
 import { DoubtPanel } from "./DoubtPanel";
 import { PlannerChat } from "./PlannerChat";
 import { PlannerControls } from "./PlannerControls";
-import { AgentTerminalViewer } from "../../agents/AgentTerminalViewer";
 
 interface PlannerPlanModeProps {
   goal: string | null;
@@ -55,16 +54,17 @@ interface PlannerPlanModeProps {
   onGenerated: () => void;
   messages: PlannerMessage[];
   awaitingReply: boolean;
+  /** D4: composer chrome (delivery/stall/launch feedback) — see PlannerChat.banner. */
+  banner?: string | null;
   onSend: (text: string) => void;
+  /** Esc in the chat: interrupt the orchestrator's in-flight turn (cloud duplex). */
+  onInterrupt?: () => void;
   // Orchestrator backend selector — who you TALK TO (the planner). Replaces the redundant
   // status strip (searching/planning/designing duplicated the view tabs). The active one
   // pulses. Local = our Stage/TUI; Claude/Codex run their own CLI (their terminal is shown).
-  orchestrators: { id: string; label: string }[];
+  orchestrators: { id: string; label: string; disabled?: boolean }[];
   orchestratorId: string;
   onOrchestratorChange: (id: string) => void;
-  // When a CLOUD orchestrator (Claude/Codex) is running, its agent id — we show ITS terminal
-  // instead of the local Stage (the Stage bridges are local-devboule only). null = local/none.
-  cloudTerminalAgentId: string | null;
   // Hand-off + auto-create controls (preserved from the old composer — never strip choices).
   // Role untangle (P6b): the hand-off targets the Main coder ROLE; `coders` are the engines
   // the PER-PROJECT override can pick, `mainCoderOverride` is this project's override (null =
@@ -100,11 +100,12 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
     onGenerated,
     messages,
     awaitingReply,
+    banner,
     onSend,
+    onInterrupt,
     orchestrators,
     orchestratorId,
     onOrchestratorChange,
-    cloudTerminalAgentId,
     coders,
     mainCoderOverride,
     defaultCoderLabel,
@@ -293,12 +294,17 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           </span>
           {orchestrators.map((o) => {
             const isActive = o.id === orchestratorId;
+            const disabled = o.disabled === true;
             return (
               <button
                 type="button"
                 className="pp-mono"
                 key={o.id}
-                onClick={() => onOrchestratorChange(o.id)}
+                onClick={() => {
+                  if (!disabled) onOrchestratorChange(o.id);
+                }}
+                disabled={disabled}
+                title={disabled ? `${o.label} CLI is not installed on this machine` : undefined}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -306,7 +312,8 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
                   fontSize: 10.5,
                   borderRadius: 8,
                   padding: '5px 9px',
-                  cursor: 'pointer',
+                  cursor: disabled ? 'not-allowed' : 'pointer',
+                  opacity: disabled ? 0.45 : 1,
                   fontWeight: isActive ? 600 : 400,
                   color: isActive ? '#9A6A2E' : '#A89F90',
                   background: isActive ? '#F1E4D2' : '#fff',
@@ -328,23 +335,9 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           })}
         </div>
 
-        {cloudTerminalAgentId ? (
-          /* Cloud orchestrator (Claude/Codex) runs its OWN CLI — show ITS terminal here. The
-             Stage bridges (chat/websearch/design events) are local-devboule only (Phase D), so
-             for a cloud orchestrator the terminal IS the interaction. Bounded; scrolls internally. */
-          <div
-            style={{
-              height: 316,
-              borderRadius: 12,
-              overflow: 'hidden',
-              border: '1px solid #ECE6DB',
-            }}
-          >
-            <AgentTerminalViewer agentId={cloudTerminalAgentId} />
-          </div>
-        ) : (
-          <>
-        {/* 3) Stage Container */}
+        {/* 3) Stage Container — cloud duplex orchestrators drive the SAME Stage as the
+            local one (their reader thread writes the same bridge file), so the former
+            cloud-terminal branch here was unreachable dead code and is gone. */}
         <div
           style={{
             background: '#FAF7F1',
@@ -491,10 +484,10 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
           modelLabel={`Orchestrator · ${plannerModelLabel}`}
           live={live}
           awaitingReply={awaitingReply}
+          banner={banner}
           onSend={onSend}
+          onInterrupt={onInterrupt}
         />
-          </>
-        )}
 
         {/* 5) Hand-off + auto-create controls (preserved choices) */}
         <PlannerControls

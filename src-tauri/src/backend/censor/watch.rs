@@ -381,9 +381,13 @@ fn run_loop(
                     None
                 }
             };
+            // Resolve the voting/temperature/prompt-style knobs ONCE from the same snapshot
+            // the client is built from (so probe + worker + params can never split-brain).
+            let gemma_params = local_ai.review_params();
             let gemma_ctx: Option<GemmaCtx<'_>> = gemma_client.as_deref().map(|client| GemmaCtx {
                 client,
                 available: gemma_available,
+                params: gemma_params,
             });
             loop {
                 if !worker_running.load(Ordering::SeqCst) {
@@ -695,7 +699,10 @@ mod tests {
         );
         assert!(fine.pending());
         assert!(fine_files.contains("cmd/main.go"));
-        assert!(!coarse_pending, "a go edit alone must not flip coarse pending");
+        assert!(
+            !coarse_pending,
+            "a go edit alone must not flip coarse pending"
+        );
     }
 
     #[test]
@@ -718,7 +725,10 @@ mod tests {
         );
         assert!(fine.pending());
         assert!(fine_files.contains("src/main.cpp"));
-        assert!(!coarse_pending, "a cpp edit alone must not flip coarse pending");
+        assert!(
+            !coarse_pending,
+            "a cpp edit alone must not flip coarse pending"
+        );
     }
 
     #[test]
@@ -741,7 +751,10 @@ mod tests {
         );
         assert!(fine.pending());
         assert!(fine_files.contains("public/index.html"));
-        assert!(!coarse_pending, "an html edit alone must not flip coarse pending");
+        assert!(
+            !coarse_pending,
+            "an html edit alone must not flip coarse pending"
+        );
     }
 
     #[test]
@@ -764,7 +777,10 @@ mod tests {
         );
         assert!(fine.pending());
         assert!(fine_files.contains("app/src/Main.kt"));
-        assert!(!coarse_pending, "a kotlin edit alone must not flip coarse pending");
+        assert!(
+            !coarse_pending,
+            "a kotlin edit alone must not flip coarse pending"
+        );
     }
 
     #[test]
@@ -795,7 +811,10 @@ mod tests {
                 &mut coarse_pending,
             );
             assert!(fine.pending(), "{lang:?} should make fine pending");
-            assert!(fine_files.contains(rel), "{lang:?} should land in fine_files");
+            assert!(
+                fine_files.contains(rel),
+                "{lang:?} should land in fine_files"
+            );
             assert!(
                 !coarse_pending,
                 "a {lang:?} edit alone must not flip coarse pending"
@@ -828,7 +847,10 @@ mod tests {
                 &mut coarse_pending,
             );
             assert!(fine.pending(), "{lang:?} should make fine pending");
-            assert!(fine_files.contains(rel), "{lang:?} should land in fine_files");
+            assert!(
+                fine_files.contains(rel),
+                "{lang:?} should land in fine_files"
+            );
             assert!(
                 !coarse_pending,
                 "a {lang:?} edit alone must not flip coarse pending"

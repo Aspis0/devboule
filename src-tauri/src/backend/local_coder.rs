@@ -403,12 +403,223 @@ pub fn resolve_cloud_env(backend: &LocalCoderBackend) -> (String, String) {
     }
 }
 
+/// PURE preflight verdict for a LOCAL (loopback) orchestrator model backend.
+/// `listed` is the id list from the server's `/v1/models` — `None` when the
+/// server could not be reached at all. Errors are user-facing launch errors:
+/// the alternative was the "planner is thinking forever" hang (the binary
+/// retries a dead/empty backend in silence for minutes before any signal).
+///
+/// Honesty note: oMLX's `/v1/models` lists AVAILABLE (on-disk) models, not
+/// loaded ones — a listed model may still need a long first-request load. This
+/// preflight catches "server down", "nothing configured" and "model missing";
+/// load latency is the UI watchdog's job, not ours.
+/// Shared user-facing copy for "no orchestrator model at all is configured" — used both by
+/// the reachable-server preflight below (model configured but blank) AND by the launch-time
+/// gate (`orchestrator_model_configured_verdict`) that runs BEFORE any network probe, when
+/// there is no backend to probe in the first place. ONE string, so the two call sites can
+/// never drift apart.
+pub const NO_LOCAL_ORCHESTRATOR_MODEL_MSG: &str =
+    "No local orchestrator model is configured — pick one in Settings → Providers, or switch \
+     the orchestrator to Claude/Codex.";
+
+pub fn local_model_preflight_verdict(
+    base_url: &str,
+    model: &str,
+    listed: Option<&[String]>,
+) -> Result<(), String> {
+    let Some(ids) = listed else {
+        return Err(format!(
+            "The local model server is not reachable at {base_url}. Start oMLX/Ollama (or fix \
+             the base URL in Settings → Providers), then relaunch the orchestrator."
+        ));
+    };
+    if model.trim().is_empty() {
+        return Err(NO_LOCAL_ORCHESTRATOR_MODEL_MSG.to_string());
+    }
+    if ids.is_empty() {
+        return Err(format!(
+            "The local model server at {base_url} reports no models. Load/pull the model \
+             \"{model}\" there, then relaunch the orchestrator."
+        ));
+    }
+    if !ids.iter().any(|id| id == model) {
+        let available = ids
+            .iter()
+            .take(5)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "The configured orchestrator model \"{model}\" is not available on the local model \
+             server at {base_url} (it has: {available}). Pick an available model in Settings → \
+             Providers, then relaunch."
+        ));
+    }
+    Ok(())
+}
+
+/// Blocking fetch of the loopback server's `/v1/models` id list; `None` on any
+/// network/HTTP/parse failure (the verdict fn turns that into the user-facing
+/// error). Bounded timeouts — this runs synchronously inside the launch command,
+/// so the worst case adds ~2.5s to a launch against a dead server, versus the
+/// minutes-long silent hang it prevents.
+fn fetch_local_models_blocking(base_url: &str) -> Option<Vec<String>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(2500))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // Bounded read (mirrors provider_detect's MAX_PROBE_BODY_BYTES rationale): a
+    // buggy/hostile loopback server must not stream an unbounded body into RAM.
+    use std::io::Read;
+    let mut body = String::new();
+    resp.take(256 * 1024).read_to_string(&mut body).ok()?;
+    Some(super::provider_detect::parse_omlx_models(&body))
+}
+
+/// Launch-time preflight for the LOCAL orchestrator: verify the configured
+/// loopback backend is reachable and actually serves the configured model,
+/// BEFORE spawning the binary. A `cloud` backend (empty oMLX env) is not ours
+/// to probe — Ok. Called only from the `client == "orchestrator"` launch path.
+pub fn preflight_local_orchestrator_backend(backend: &LocalCoderBackend) -> Result<(), String> {
+    let (base_url, model) = resolve_omlx_env(backend);
+    if base_url.trim().is_empty() {
+        return Ok(());
+    }
+    let listed = fetch_local_models_blocking(&base_url);
+    local_model_preflight_verdict(&base_url, &model, listed.as_deref())
+}
+
+/// FAIL-LOUD launch gate (bug B2): an orchestrator launch with NEITHER a local (oMLX/
+/// Ollama) model NOR a cloud model configured must be REJECTED before the binary spawns —
+/// without this gate, `build_model` (devboule-coder/src/config.rs) silently selects its
+/// safe MockModel, and the user ends up chatting with a nonsense "Mock reply to: …" with
+/// zero signal that anything is wrong.
+///
+/// Pure: takes the SAME two already-resolved env pairs the launch site builds
+/// (`resolve_omlx_env` / `resolve_cloud_env`) — never a `LocalCoderBackend` directly — so
+/// this can never drift from what the child process will actually receive. `Ok(())` when
+/// EITHER base URL is non-blank (either one keeps the binary off the Mock path).
+pub fn orchestrator_model_configured_verdict(
+    omlx_base_url: &str,
+    cloud_base_url: &str,
+) -> Result<(), String> {
+    if omlx_base_url.trim().is_empty() && cloud_base_url.trim().is_empty() {
+        return Err(NO_LOCAL_ORCHESTRATOR_MODEL_MSG.to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     // Only the tests assert against the base-URL cap directly; the validator delegates the
     // length check to `validate_omlx_base_url`, so this const is test-scoped here.
     use super::super::mini_coder::MINI_BASE_URL_MAX_LEN;
+
+    // -- preflight verdict ----------------------------------------------------
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn preflight_unreachable_server_is_a_launch_error() {
+        let err = local_model_preflight_verdict("http://127.0.0.1:8000/v1", "m", None)
+            .unwrap_err();
+        assert!(err.contains("not reachable"), "{err}");
+        assert!(err.contains("127.0.0.1:8000"), "{err}");
+    }
+
+    #[test]
+    fn preflight_empty_model_is_a_launch_error() {
+        let err =
+            local_model_preflight_verdict("http://x/v1", "  ", Some(&ids(&["a"]))).unwrap_err();
+        assert!(err.contains("No local orchestrator model"), "{err}");
+    }
+
+    #[test]
+    fn preflight_empty_model_list_is_a_launch_error() {
+        let err = local_model_preflight_verdict("http://x/v1", "qwen", Some(&[])).unwrap_err();
+        assert!(err.contains("reports no models"), "{err}");
+        assert!(err.contains("qwen"), "{err}");
+    }
+
+    #[test]
+    fn preflight_missing_model_lists_available_ones() {
+        let err = local_model_preflight_verdict(
+            "http://x/v1",
+            "qwen-42b",
+            Some(&ids(&["small-1", "small-2"])),
+        )
+        .unwrap_err();
+        assert!(err.contains("qwen-42b"), "{err}");
+        assert!(err.contains("small-1, small-2"), "{err}");
+    }
+
+    #[test]
+    fn preflight_listed_model_passes() {
+        assert!(
+            local_model_preflight_verdict("http://x/v1", "qwen", Some(&ids(&["other", "qwen"])))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn preflight_cloud_backend_is_skipped() {
+        let backend = LocalCoderBackend {
+            kind: LocalCoderBackendKind::Cloud,
+            base_url: Some("https://api.example.com/v1".into()),
+            model: Some("big".into()),
+        };
+        assert!(preflight_local_orchestrator_backend(&backend).is_ok());
+    }
+
+    // -- B2: no-model launch gate ---------------------------------------------
+    // A `None` local-coder backend yields EMPTY oMLX env AND empty cloud env (both
+    // resolvers return `("", "")` for a `None` backend at the call site in
+    // `projects.rs`); without a gate, the launch proceeded anyway and the binary's
+    // `build_model` silently picked its MockModel — the user chatted with a
+    // nonsense "Mock reply to: …" with zero signal (bug B2). This is the pure
+    // decision the launch site calls with its two already-resolved env pairs.
+
+    #[test]
+    fn orchestrator_gate_rejects_when_both_envs_are_empty() {
+        let err = orchestrator_model_configured_verdict("", "").unwrap_err();
+        assert_eq!(err, NO_LOCAL_ORCHESTRATOR_MODEL_MSG);
+        assert!(err.contains("No local orchestrator model is configured"), "{err}");
+    }
+
+    #[test]
+    fn orchestrator_gate_rejects_whitespace_only_urls() {
+        // Defense in depth: a whitespace-only value must not be treated as "configured".
+        assert!(orchestrator_model_configured_verdict("   ", "\t").is_err());
+    }
+
+    #[test]
+    fn orchestrator_gate_passes_with_omlx_configured() {
+        assert!(orchestrator_model_configured_verdict("http://127.0.0.1:8000/v1", "").is_ok());
+    }
+
+    #[test]
+    fn orchestrator_gate_passes_with_cloud_configured() {
+        assert!(orchestrator_model_configured_verdict("", "https://api.example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn preflight_verdict_uses_the_shared_gate_message() {
+        // Guards against copy drift between the launch-time gate and the reachable-
+        // server preflight: both must say the exact same thing for "no model".
+        let err =
+            local_model_preflight_verdict("http://x/v1", "  ", Some(&ids(&["a"]))).unwrap_err();
+        assert_eq!(err, NO_LOCAL_ORCHESTRATOR_MODEL_MSG);
+    }
 
     // -- serde --------------------------------------------------------------
 

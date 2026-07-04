@@ -937,6 +937,7 @@ mod tests {
             attempt: 0,
             parent_directive_id: None,
             pigeon_ticket: None,
+            collected: None,
         }
     }
 

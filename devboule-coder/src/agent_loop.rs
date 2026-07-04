@@ -44,7 +44,15 @@ pub const MAX_FORMAT_ERRORS: usize = 3;
 
 /// Default wall-clock budget for one burst. The deadline is enforced via the
 /// injected [`Clock`] so the cap is testable without real time.
-pub const DEFAULT_BURST_BUDGET: Duration = Duration::from_secs(120);
+/// Override with DEVBOULE_BURST_BUDGET_SECS (integer seconds).
+pub fn burst_budget() -> Duration {
+    std::env::var("DEVBOULE_BURST_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| (30..=3600).contains(&s))
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(300))
+}
 
 /// Size of the no-progress window: the last N EXECUTED `(tool, target)` pairs are
 /// remembered so the guard catches not just an immediate repeat but a short
@@ -514,8 +522,12 @@ pub async fn run_burst(
                 // recent-executed window means the model is spinning — catches an
                 // immediate repeat AND a short A→B→A→B oscillation. Check BEFORE
                 // dispatch so we never re-run the same side-effect.
+                // oracle_ask/oracle_context are QUERIES (free text), not fixed
+                // targets — repeating a query after reading a file is legitimate
+                // exploration, not a loop. Only guard tools with stable targets.
+                let is_query_tool = matches!(action.tool_name(), "oracle_ask" | "oracle_context");
                 let this = (action.tool_name().to_string(), action.target());
-                if executed_window.contains(&this) {
+                if !is_query_tool && executed_window.contains(&this) {
                     let reason = format!("no progress: cycling on {} {}", this.0, elide(&this.1));
                     emit(progress_tx, format!("⚠ {reason}")).await;
                     return BurstOutcome::Escalated(reason);
@@ -769,7 +781,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -823,7 +835,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -882,7 +894,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -914,7 +926,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -942,7 +954,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -974,7 +986,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1009,7 +1021,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1038,7 +1050,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1069,7 +1081,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1097,7 +1109,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1129,7 +1141,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1189,7 +1201,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1249,7 +1261,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1291,7 +1303,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             false,
             &tx,
         )
@@ -1332,7 +1344,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             false,
             &tx,
         )
@@ -1373,7 +1385,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1497,7 +1509,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1547,7 +1559,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1592,7 +1604,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             false, // WEB egress OFF — must NOT block a known-server mcp_tool
             &tx,
         )
@@ -1637,7 +1649,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             false, // egress OFF
             &tx,
         )
@@ -1665,7 +1677,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1687,7 +1699,7 @@ mod tests {
             &model,
             &exec,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1832,7 +1844,7 @@ mod tests {
             &ask_user_model(),
             &coder,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx,
         )
@@ -1857,7 +1869,7 @@ mod tests {
             &ask_user_model(),
             &orch,
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             true,
             &tx2,
         )

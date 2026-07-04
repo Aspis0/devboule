@@ -4,7 +4,7 @@ import os
 import sys
 from typing import Any
 
-from oracle.config import CHUNK_BATCH_CHARS, CHUNK_BATCH_CHUNKS, CHUNK_BATCH_FILES, CHUNK_DB_PATH, CHUNK_MANIFEST_PATH, CHUNK_MAX_GPU_TEMP_C, LANCE_DB_PATH, SQLITE_PATH
+from oracle.config import CHUNK_BATCH_CHARS, CHUNK_BATCH_FILES, CHUNK_DB_PATH, CHUNK_MANIFEST_PATH, CHUNK_MAX_GPU_TEMP_C, LANCE_DB_PATH, SQLITE_PATH
 from oracle.ingestion.chunk_index import chunk_index_status, index_file_chunks, prune_excluded_chunks, sync_text_chunks
 from oracle.verify_coverage import coverage
 from oracle.verify_runtime import runtime_status
@@ -30,7 +30,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cluster-id", default="")
     parser.add_argument("--limit", type=int, default=8)
     parser.add_argument("--batch-files", type=int, default=CHUNK_BATCH_FILES)
-    parser.add_argument("--batch-chunks", type=int, default=CHUNK_BATCH_CHUNKS)
+    # Tri-state: omitted -> None -> effective_chunk_batch_size derives the value
+    # from the hardware-sized encode batch. ANY explicit value — including one
+    # equal to the config default — is honored literally.
+    parser.add_argument("--batch-chunks", type=int, default=None)
     parser.add_argument("--batch-chars", type=int, default=CHUNK_BATCH_CHARS)
     parser.add_argument("--max-batches", type=int, default=0)
     parser.add_argument("--min-free-gb", type=float, default=None)

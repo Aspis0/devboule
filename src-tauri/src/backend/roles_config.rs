@@ -377,10 +377,7 @@ pub fn set_roles_config_cmd(
 pub(crate) fn read_main_coder_backend(
     app: &tauri::AppHandle,
 ) -> Option<super::mini_coder::MiniCoderBackend> {
-    let path = match locate_config_path(app) {
-        Some(p) => p,
-        None => return None,
-    };
+    let path = locate_config_path(app)?;
     let raw = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return None,

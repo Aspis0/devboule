@@ -2,7 +2,6 @@ import type { ProjectTask } from "../../../types/backend";
 import type { DesignProjectEntry } from "../../../types/design";
 import type {
   ConsoleEntry,
-  ChatEntry,
   QuestionEntry,
   QuestionOption,
 } from "../../agents/agentConsoleModel";
@@ -31,11 +30,92 @@ export interface StageFinding {
 export type ChatRole = 'user' | 'assistant';
 
 export interface PlannerMessage {
-  role: ChatRole;
+  /** 'milestone' = a tiny system ROW (tool use / activity), not a chat bubble. */
+  role: ChatRole | 'milestone';
   text: string;
   /** B14b: this bubble is the live, in-progress reply being streamed token-by-token (render a
    *  caret / "typing" affordance). Absent/false for finalized turns. */
   streaming?: boolean;
+  /** D3: the client-generated send id (user rows only) — the echo carries it back
+   *  through the bridge and the pending copy drains by identity. */
+  msgId?: string;
+}
+
+/** D3: one optimistic user send awaiting its bridge echo. `msgId` is the
+ *  client-generated identity the echo carries back. */
+export interface PendingSend {
+  text: string;
+  msgId: string;
+}
+
+/** D3 (planner-chat demolition): merge the bridge's REAL conversation with the
+ *  optimistic pending sends — BY IDENTITY, not by counting user rows (the old
+ *  `echoedUserCount` watermark broke on every restart/relaunch/generation change).
+ *
+ *  A pending is DRAINED (already visible in `real`, so not re-appended) when:
+ *  - a real user row carries its exact `msgId` (the app-written cloud echo), or
+ *  - an ID-LESS real user row matches its text — each id-less row consumes exactly
+ *    ONE pending, oldest first (the local binary echoes steers without a msgId).
+ *  Everything still pending rides at the END in send order. Pure + total. */
+export function mergePendingSends(
+  real: PlannerMessage[],
+  pending: PendingSend[],
+): PlannerMessage[] {
+  const still = drainPendingSends(real, pending);
+  return still.length === 0
+    ? real
+    : [...real, ...still.map((p) => ({ role: 'user' as const, text: p.text, msgId: p.msgId }))];
+}
+
+/** D3: the subset of `pending` the bridge has NOT echoed yet (the drain rules of
+ *  [mergePendingSends]). Exposed separately so the view can also garbage-collect its
+ *  pending state once echoes land (the merge alone would just re-hide them forever). */
+export function drainPendingSends(
+  real: PlannerMessage[],
+  pending: PendingSend[],
+): PendingSend[] {
+  if (pending.length === 0) return pending;
+  const echoedIds = new Set<string>();
+  const idlessTexts = new Map<string, number>();
+  for (const m of real) {
+    if (m.role !== 'user') continue;
+    if (m.msgId) echoedIds.add(m.msgId);
+    else idlessTexts.set(m.text, (idlessTexts.get(m.text) ?? 0) + 1);
+  }
+  const still: PendingSend[] = [];
+  for (const p of pending) {
+    if (echoedIds.has(p.msgId)) continue;
+    const idless = idlessTexts.get(p.text) ?? 0;
+    if (idless > 0) {
+      idlessTexts.set(p.text, idless - 1);
+      continue;
+    }
+    still.push(p);
+  }
+  return still;
+}
+
+/** D3: guarded message-id generator (the repo's defaultNewId pattern —
+ *  useDesignStream.ts): crypto.randomUUID when available, a time+random fallback
+ *  otherwise. A send must never throw synchronously inside a click/keydown handler. */
+export function newMsgId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** D1: the STABLE planner-orchestrator agent id for a project — the frontend mirror
+ *  of Rust `stable_orchestrator_agent_id` (projects.rs). MUST stay byte-identical:
+ *  charset `[A-Za-z0-9._-]` (everything else → `_`), project id capped at 100 chars.
+ *  Stable ⇒ the planner console binds the moment a project opens (live session or
+ *  not) and the transcript survives relaunches/restarts/backend switches. */
+export function stableOrchestratorAgentId(projectId: string): string {
+  const clean = Array.from(projectId)
+    .slice(0, 100)
+    .map((c) => (/[A-Za-z0-9._-]/.test(c) ? c : '_'))
+    .join('');
+  return `orchestrator-${clean}`;
 }
 
 export interface StatusPill {
@@ -97,12 +177,28 @@ export function pickProjectDesign(
   return best;
 }
 
-/** Map the orchestrator's chat console entries to planner chat bubbles, in order
- *  (skips non-chat entries). The real two-way conversation surfaced from the bridge. */
-export function chatMessages(entries: ConsoleEntry[] | undefined): PlannerMessage[] {
-  return (entries ?? [])
-    .filter((e): e is ChatEntry => e.type === "chat")
-    .map((e) => ({ role: e.role, text: e.text }));
+/** Map the orchestrator's console entries to planner chat bubbles, interleaving
+ *  coder milestones (tool use: Bash, reads, spawns…) as tiny 'milestone' rows, in
+ *  timeline order. The milestone rows are the planner chat's visibility into WHAT
+ *  the orchestrator is doing between replies — without them a cloud orchestrator
+ *  running tools looks identical to one that hung ("thinking" forever). */
+export function chatMessagesWithMilestones(
+  entries: ConsoleEntry[] | undefined,
+): PlannerMessage[] {
+  const out: PlannerMessage[] = [];
+  for (const e of entries ?? []) {
+    if (e.type === "chat")
+      out.push(
+        // D3: thread the echoed msgId through so `mergePendingSends` can drain
+        // the optimistic copy by identity (omit the key entirely when absent).
+        e.msgId
+          ? { role: e.role, text: e.text, msgId: e.msgId }
+          : { role: e.role, text: e.text },
+      );
+    else if (e.type === "coder" || e.type === "spawn")
+      out.push({ role: "milestone", text: e.text });
+  }
+  return out;
 }
 
 /** Extract the orchestrator's OPEN Kairion doubts from a console timeline, upserted by

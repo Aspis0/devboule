@@ -668,7 +668,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
                       <button
                         onClick={() => void openExternal(consoleUrl)}
                         data-help-title={`This opens the ${health.name} web console.`}
-                        data-help-lines="The provider console is outside Aspis Management.|Use it to revoke tokens, inspect permissions, or confirm billing directly.|Opening it does not change anything by itself.|For repeatable operations, prefer adding a guarded app action later."
+                        data-help-lines="The provider console is outside Devboule.|Use it to revoke tokens, inspect permissions, or confirm billing directly.|Opening it does not change anything by itself.|For repeatable operations, prefer adding a guarded app action later."
                         className="flex items-center gap-1.5 rounded-xl border border-cream-200 px-3 py-1.5 text-[12px] font-medium text-cream-600 transition-all duration-200 hover:border-terracotta-200 hover:bg-terracotta-50 hover:text-terracotta"
                       >
                         <ExternalLink className="w-3.5 h-3.5" />

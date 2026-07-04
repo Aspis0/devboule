@@ -170,6 +170,10 @@ export interface ChatEntry {
   role: "assistant" | "user";
   text: string;
   time: string;
+  /** D3 (planner-chat demolition): the client-generated send id echoed back through
+   *  the bridge (cloud-duplex user echoes). The planner drains its optimistic pending
+   *  copy BY this id; absent for local-binary echoes and historical lines. */
+  msgId?: string;
 }
 
 // ---- Kairion doubt (orchestrator-only) --------------------------------------

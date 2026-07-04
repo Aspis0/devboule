@@ -23,6 +23,7 @@ mod model;
 mod model_client;
 mod multi_mcp;
 mod planner;
+mod preplan;
 mod prompt;
 mod reply_stream;
 mod rmcp_backend;
@@ -44,7 +45,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use tui_textarea::Input;
 
-use agent_loop::{run_burst, BurstOutcome, SystemClock, DEFAULT_BURST_BUDGET};
+use agent_loop::{run_burst, burst_budget, BurstOutcome, SystemClock};
 use app::{render, Activity, App};
 use config::Runtime;
 use terminal::TerminalGuard;
@@ -286,6 +287,10 @@ async fn run_session(goal: String) -> std::io::Result<()> {
             }
         }
     }
+    // Clean up session persistence so next launch starts fresh.
+    if let Some(ref f) = session_file {
+        let _ = std::fs::remove_file(f);
+    }
     Ok(())
 }
 
@@ -304,7 +309,7 @@ async fn run_one_burst(
             burst_runtime.model.as_ref(),
             burst_runtime.executor.as_ref(),
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             burst_runtime.allow_egress,
             &tx,
         )
@@ -528,7 +533,7 @@ fn submit(app: &mut App, runtime: &Arc<Runtime>, chunk_rx: &mut Option<mpsc::Rec
             runtime.model.as_ref(),
             runtime.executor.as_ref(),
             &clock,
-            DEFAULT_BURST_BUDGET,
+            burst_budget(),
             runtime.allow_egress,
             &tx,
         )

@@ -810,6 +810,43 @@ pub fn save_oracle_index_preferences(
     read_oracle_index_preferences()
 }
 
+/// TEST SEAM: unit tests must NEVER reach the OS keyring through this read. On a
+/// dev machine the "Aspis Management" keychain item EXISTS but the per-build test
+/// binary is not in the item's ACL, so `get_password()` blocks forever on an
+/// authorization prompt no headless test can answer — two resolver tests
+/// (`http_command_root_resolver_is_the_workspace_resolver`,
+/// `index_root_uses_the_same_shared_resolver_as_the_operator_path`) hung at 0%
+/// CPU because of exactly this (2026-07-03 finding). In `cfg(test)` builds the
+/// read returns the process-shared override (or the defaults), never the vault.
+#[cfg(test)]
+pub(crate) fn set_oracle_index_preferences_override_for_test(
+    preferences: Option<OracleIndexPreferences>,
+) {
+    *test_oracle_index_preferences_override()
+        .lock()
+        .expect("oracle index preferences test override lock poisoned") = preferences;
+}
+
+#[cfg(test)]
+fn test_oracle_index_preferences_override(
+) -> &'static std::sync::Mutex<Option<OracleIndexPreferences>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<OracleIndexPreferences>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// cfg(test) twin of [`read_oracle_index_preferences`]: never touches the
+/// keyring (see the seam doc above) — returns the override or the defaults.
+#[cfg(test)]
+pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String> {
+    Ok(test_oracle_index_preferences_override()
+        .lock()
+        .expect("oracle index preferences test override lock poisoned")
+        .clone()
+        .unwrap_or_else(default_oracle_index_preferences))
+}
+
+#[cfg(not(test))]
 pub fn read_oracle_index_preferences() -> Result<OracleIndexPreferences, String> {
     match oracle_index_preferences_entry()?.get_password() {
         Ok(raw) => {
@@ -1012,8 +1049,11 @@ pub fn oracle_llm_settings_status() -> Result<OracleLlmSettingsStatus, String> {
     let api_key_configured = dedicated_api_key_configured || provider_api_key_configured;
     // LOCAL providers are keyless by design: never nag "missing_api_key".
     let is_local_provider = matches!(settings.provider.as_str(), "omlx" | "ollama");
-    let status = if is_local_provider {
-        "configured"
+    let is_disabled = !settings.remote_enabled && settings.provider.is_empty();
+    let status = if is_disabled {
+        "disabled"
+    } else if is_local_provider {
+        "local"
     } else if settings.remote_enabled && !api_key_configured {
         "missing_api_key"
     } else if settings.remote_enabled {
@@ -1021,7 +1061,9 @@ pub fn oracle_llm_settings_status() -> Result<OracleLlmSettingsStatus, String> {
     } else {
         "local"
     };
-    let message = if is_local_provider {
+    let message = if is_disabled {
+        Some("Answer LLM is disabled — Oracle returns retrieval-only answers.".into())
+    } else if is_local_provider {
         Some("Local loopback provider — keyless; prompts never leave this machine.".into())
     } else if settings.remote_enabled && !api_key_configured {
         Some("Remote Oracle LLM API key is not configured.".into())
@@ -1070,6 +1112,15 @@ fn llm_provider_label(provider: &str) -> &'static str {
 
 fn sanitize_oracle_llm_settings(settings: &OracleLlmSettings) -> Result<OracleLlmSettings, String> {
     let provider = settings.provider.trim().to_ascii_lowercase();
+    // Empty provider + disabled = user explicitly turned off answer LLM.
+    if provider.is_empty() && !settings.remote_enabled {
+        return Ok(OracleLlmSettings {
+            provider: String::new(),
+            model: String::new(),
+            base_url: None,
+            remote_enabled: false,
+        });
+    }
     let allowed = ["scaleway", "infomaniak", "mistral", "omlx", "ollama"];
     if !allowed.contains(&provider.as_str()) {
         return Err("Oracle LLM provider is not allowlisted.".into());
@@ -1100,13 +1151,20 @@ fn sanitize_llm_base_url(provider: &str, base_url: Option<&str>) -> Result<Optio
                 // LOCAL providers: loopback-only, http allowed (no TLS on
                 // 127.0.0.1), credentials/placeholders still rejected.
                 let lower = value.to_ascii_lowercase();
-                let loopback = ["http://127.0.0.1", "https://127.0.0.1", "http://localhost", "https://localhost", "http://[::1]", "https://[::1]"]
-                    .iter()
-                    .any(|prefix| {
-                        lower.strip_prefix(prefix).is_some_and(|rest| {
-                            rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
-                        })
-                    });
+                let loopback = [
+                    "http://127.0.0.1",
+                    "https://127.0.0.1",
+                    "http://localhost",
+                    "https://localhost",
+                    "http://[::1]",
+                    "https://[::1]",
+                ]
+                .iter()
+                .any(|prefix| {
+                    lower.strip_prefix(prefix).is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
+                    })
+                });
                 if !loopback || value.contains('@') || value.contains('<') || value.contains('>') {
                     return Err(
                         "Local Oracle LLM base URL must stay on loopback (127.0.0.1).".to_string(),
@@ -1390,6 +1448,27 @@ fn provider_scope_missing_message(provider: ProviderId) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_oracle_index_preferences_in_tests_never_touches_the_keyring() {
+        // The cfg(test) twin returns defaults (or the override) WITHOUT any
+        // keyring call: on a dev machine the real keychain item's ACL does not
+        // include the per-build test binary, and get_password() would block
+        // forever on an authorization prompt (the 2026-07-03 hanging-resolver
+        // finding). If this test ever hangs or prompts, the seam regressed.
+        let defaults = read_oracle_index_preferences().expect("defaults must load");
+        assert_eq!(defaults.auto_watch_on_unlock, true);
+
+        let mut custom = default_oracle_index_preferences();
+        custom.auto_watch_on_unlock = false;
+        set_oracle_index_preferences_override_for_test(Some(custom));
+        let overridden = read_oracle_index_preferences().expect("override must load");
+        assert_eq!(overridden.auto_watch_on_unlock, false);
+
+        set_oracle_index_preferences_override_for_test(None);
+        let restored = read_oracle_index_preferences().expect("defaults again");
+        assert_eq!(restored.auto_watch_on_unlock, true);
+    }
 
     /// RAII guard that snapshots EVERY Oracle LLM credential slot the mutating
     /// `#[ignore]` tests can touch (settings entry, provider-only key slot,
@@ -1913,16 +1992,13 @@ mod tests {
     fn sanitize_oracle_index_preferences_coerces_empty_to_none() {
         let out = sanitize_oracle_index_preferences(&prefs_with_mode(Some("")))
             .expect("sanitize must succeed for empty mode");
-        assert_eq!(
-            out.index_mode, None,
-            "empty mode must be coerced to None"
-        );
+        assert_eq!(out.index_mode, None, "empty mode must be coerced to None");
     }
 
     #[test]
     fn sanitize_oracle_index_preferences_keeps_none() {
-        let out = sanitize_oracle_index_preferences(&prefs_with_mode(None))
-            .expect("None mode is valid");
+        let out =
+            sanitize_oracle_index_preferences(&prefs_with_mode(None)).expect("None mode is valid");
         assert_eq!(out.index_mode, None);
     }
 
@@ -1979,7 +2055,9 @@ mod tests {
         // status(present): never the value.
         let status_present = exa_key_status().unwrap();
         assert!(status_present.configured);
-        assert!(!serde_json::to_string(&status_present).unwrap().contains(key));
+        assert!(!serde_json::to_string(&status_present)
+            .unwrap()
+            .contains(key));
         // The backend-internal reader (launch path) DOES see the raw value.
         assert_eq!(read_exa_key().unwrap().as_deref(), Some(key));
 
@@ -2084,7 +2162,10 @@ mod tests {
         // internal read_cloud_llm_key (used by the launch) ever sees it.
         let key = "sk-cloud-test-key-abcdef1234567890";
         let _ = delete_cloud_llm_key();
-        assert!(!cloud_llm_key_status().unwrap().configured, "must start absent");
+        assert!(
+            !cloud_llm_key_status().unwrap().configured,
+            "must start absent"
+        );
 
         let after_set = save_cloud_llm_key(key).unwrap();
         assert!(after_set.configured, "set must report present");
@@ -2092,7 +2173,9 @@ mod tests {
         assert!(after_set.message.is_none());
         let status_present = cloud_llm_key_status().unwrap();
         assert!(status_present.configured);
-        assert!(!serde_json::to_string(&status_present).unwrap().contains(key));
+        assert!(!serde_json::to_string(&status_present)
+            .unwrap()
+            .contains(key));
         assert_eq!(read_cloud_llm_key().unwrap().as_deref(), Some(key));
 
         let after_clear = delete_cloud_llm_key().unwrap();
