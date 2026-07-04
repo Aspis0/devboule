@@ -66,6 +66,7 @@ import {
 } from "react-resizable-panels";
 import { LivingPlan } from "../work/LivingPlan";
 import { SpawnPanel } from "../agents/SpawnPanel";
+import { SkillsToolsModal } from "../work/SkillsToolsModal";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
@@ -254,6 +255,10 @@ export function ProjectWorkspace({
   // Split view: when set, pins a SECOND agent's focus pane beside the primary selection.
   // Local to the console (not shared with the board) — split is a pure view concern.
   const [splitAgentId, setSplitAgentId] = useState<string | null>(null);
+  // Work Console "Skills & Tools" modal (per-role skills/tools for this project).
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  // Stable so the modal's Escape-key effect isn't re-registered on every parent render.
+  const closeSkills = useCallback(() => setSkillsOpen(false), []);
   // defaultSize is initial-mount-only in react-resizable-panels, so drive the proportions
   // imperatively: toggling split rebalances to 50/50, unsplit restores the primary to 100%.
   const panelGroupRef = useRef<ImperativePanelGroupHandle>(null);
@@ -276,7 +281,11 @@ export function ProjectWorkspace({
   // twin + a reaped-mini→parent fallback stay in sync across the live (DOM) poll.
   const selectedAgentId = useMemo(
     () =>
-      reconcileSelectedAgentId(storeSelectedAgentId, sessions, prevSessionsRef.current),
+      reconcileSelectedAgentId(
+        storeSelectedAgentId,
+        sessions,
+        prevSessionsRef.current,
+      ),
     [storeSelectedAgentId, sessions],
   );
 
@@ -372,7 +381,10 @@ export function ProjectWorkspace({
 
   // Archiving (readOnly) closes the launcher so a stale-open SpawnPanel can't re-mount on unarchive.
   useEffect(() => {
-    if (readOnly) setLauncherOpen(false);
+    if (readOnly) {
+      setLauncherOpen(false);
+      setSkillsOpen(false);
+    }
   }, [readOnly]);
   // Split: the model rebuilds only when sessions/tasks change (the 5s poll), and the node
   // lookup re-runs when the SELECTION changes — so switching agents doesn't rebuild the model.
@@ -436,12 +448,17 @@ export function ProjectWorkspace({
 
     const refreshMissingTools = async () => {
       try {
-        const status = await invokeBackendCommand<CensorStatus>("censor_status", {
-          root: censorRoot,
-          projectId: pid,
-        });
+        const status = await invokeBackendCommand<CensorStatus>(
+          "censor_status",
+          {
+            root: censorRoot,
+            projectId: pid,
+          },
+        );
         if (!cancelled) {
-          setCensorMissingTools((status.tools ?? []).filter((t) => !t.available).map((t) => t.name));
+          setCensorMissingTools(
+            (status.tools ?? []).filter((t) => !t.available).map((t) => t.name),
+          );
         }
       } catch {
         // Status is advisory; a failure just hides the missing-tool hints.
@@ -453,7 +470,10 @@ export function ProjectWorkspace({
       if (cancelled) return; // torn down before the dynamic import resolved — register nothing.
       const un1 = await listen("censor://scan-started", (event) => {
         if (cancelled) return;
-        const payload = event.payload as { projectId: string; fileCount?: number };
+        const payload = event.payload as {
+          projectId: string;
+          fileCount?: number;
+        };
         if (payload.projectId !== pid) return;
         setCensorScanning(true);
         setCensorScannedFiles(payload.fileCount ?? 0);
@@ -517,7 +537,6 @@ export function ProjectWorkspace({
     workConsoleModel.unplaced.forEach(walk);
     return ids;
   }, [censorStrip, workConsoleModel]);
-
 
   // MC-P5: 1-click kill of the selected mini-coder. It is a TRUE safety brake (no
   // two-step confirm): `mini_coder_kill` records killRequested THEN kills the PTY so
@@ -681,7 +700,9 @@ export function ProjectWorkspace({
   // a stale in-flight poll snapshot must not resurrect a decided request after the pop.
   const handleBridgePending = useCallback((pending: ConsentRequest[]) => {
     const decided = decidedConsentIdsRef.current;
-    const fresh = pending.filter((req) => !(req.approvalId && decided.has(req.approvalId)));
+    const fresh = pending.filter(
+      (req) => !(req.approvalId && decided.has(req.approvalId)),
+    );
     if (fresh.length > 0) {
       setPendingConsents((prev) =>
         fresh.reduce((acc, req) => enqueueConsent(acc, req), prev),
@@ -768,7 +789,9 @@ export function ProjectWorkspace({
           // there is no on-disk grant to fall back on. Pop the head so the modal can't get
           // permanently stuck. Local net/folder errors are left queued (retry is valid there).
           if (head.approvalId) {
-            setPendingConsents((prev) => prev.filter((r) => !sameConsentRequest(r, head)));
+            setPendingConsents((prev) =>
+              prev.filter((r) => !sameConsentRequest(r, head)),
+            );
           }
         }
       } finally {
@@ -965,45 +988,52 @@ export function ProjectWorkspace({
           Hidden when archived (no live agents to prompt). Grant applies on NEXT spawn. */}
       {/* FIX 1: render the HEAD of the queue; subsequent requests queue up and
           become the new head once the user acts on the current one. */}
-      {!readOnly && pendingConsents.length > 0 && (() => {
-        const head = pendingConsents[0];
-        const decisionHandler = (d: "allowRemember" | "allowOnce" | "deny") =>
-          void handleConsentDecision(d);
-        // Slice 5: Exec/Patch from a live cloud agent (Claude/Codex) → generic card.
-        if (head.kind === "exec" || head.kind === "patch") {
+      {!readOnly &&
+        pendingConsents.length > 0 &&
+        (() => {
+          const head = pendingConsents[0];
+          const decisionHandler = (d: "allowRemember" | "allowOnce" | "deny") =>
+            void handleConsentDecision(d);
+          // Slice 5: Exec/Patch from a live cloud agent (Claude/Codex) → generic card.
+          if (head.kind === "exec" || head.kind === "patch") {
+            return (
+              <AgentConsentModal
+                request={head}
+                busy={consentBusy}
+                error={consentError}
+                onDecision={decisionHandler}
+              />
+            );
+          }
+          if (head.kind === "folderWrite") {
+            return (
+              <FolderConsentModal
+                request={head}
+                busy={consentBusy}
+                error={consentError}
+                onDecision={decisionHandler}
+              />
+            );
+          }
           return (
-            <AgentConsentModal
+            <NetConsentModal
               request={head}
               busy={consentBusy}
               error={consentError}
               onDecision={decisionHandler}
             />
           );
-        }
-        if (head.kind === "folderWrite") {
-          return (
-            <FolderConsentModal
-              request={head}
-              busy={consentBusy}
-              error={consentError}
-              onDecision={decisionHandler}
-            />
-          );
-        }
-        return (
-          <NetConsentModal
-            request={head}
-            busy={consentBusy}
-            error={consentError}
-            onDecision={decisionHandler}
-          />
-        );
-      })()}
+        })()}
 
       {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
+      {skillsOpen && (
+        <SkillsToolsModal projectRoot={censorRoot} onClose={closeSkills} />
+      )}
       {launcherOpen && !readOnly && (
         <SpawnPanel
-          projects={[{ id: project.metadata.id, title: project.metadata.title }]}
+          projects={[
+            { id: project.metadata.id, title: project.metadata.title },
+          ]}
           lockedProjectId={project.metadata.id}
           selectedProjectId={project.metadata.id}
           tasks={project.state.tasks}
@@ -1040,19 +1070,20 @@ export function ProjectWorkspace({
                   <TokenUsageBadge usage={tokenUsage} />
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  {/* MC-P7: the Compact action — ONLY for a selected Claude agent
-                      (resolved client === "claude"). Runs `/compact` in the agent's
-                      terminal to shrink its context window. Independent of the mini
-                      Stop brake: a claude coder shows Compact (not Stop); a mini
-                      shows Stop (not Compact, unless it is itself a claude mini). */}
+                  {/* MC-P7: the Compact action — for a selected Claude OR Codex agent
+                      (resolved client === "claude" || client === "codex"). Claude runs
+                      `/compact` in its terminal; Codex calls the app-server thread compact
+                      JSON-RPC. Both shrink the agent's context window. Independent of the
+                      mini Stop brake: a coder shows Compact (not Stop); a mini shows Stop
+                      (not Compact, unless it is itself a claude/codex mini). */}
                   {selectedCanCompact && (
                     <button
                       type="button"
                       onClick={compactSelected}
                       disabled={readOnly}
                       className="inline-flex items-center gap-1 rounded-2xl border border-teal bg-teal px-2.5 py-0.5 text-[10px] font-semibold text-white hover:bg-teal/90 disabled:opacity-60"
-                      data-help-title="Runs /compact in this Claude agent to shrink its context."
-                      data-help-lines="Sends the /compact slash command to this Claude agent's terminal.|Claude Code summarizes the conversation so far, freeing context window so the agent can keep working longer.|Only Claude agents show this button — /compact is a Claude Code command.|It is a one-click convenience; you can also type /compact yourself in the reply bar."
+                      data-help-title="Compacts this agent's context to free up its context window."
+                      data-help-lines="Sends a compact command to this agent.|The agent summarizes the conversation so far, freeing context window so it can keep working longer.|Shown for Claude and Codex agents — both support context compaction.|A one-click convenience."
                     >
                       <Minimize2 className="h-3 w-3" aria-hidden />
                       Compact
@@ -1149,6 +1180,24 @@ export function ProjectWorkspace({
                   >
                     <Columns2 className="h-3 w-3" aria-hidden />
                     {splitAgentId ? "unsplit" : "split"}
+                  </button>
+                  {/* Skills & Tools: per-role skills/tools for this project's agents.
+                      Opens the modal; needs a resolved project root. */}
+                  <button
+                    type="button"
+                    onClick={() => setSkillsOpen(true)}
+                    disabled={!censorRoot || readOnly}
+                    title={
+                      readOnly
+                        ? "Archived project — skills & tools are read-only"
+                        : censorRoot
+                          ? "Manage skills & tools for this project's agents"
+                          : "Open a project folder first"
+                    }
+                    className="inline-flex items-center gap-1 rounded-md border border-cream-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-cream-600 hover:text-terracotta disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Sparkles className="h-3 w-3" aria-hidden />
+                    skills &amp; tools
                   </button>
                   <button
                     type="button"
@@ -1312,7 +1361,6 @@ export function ProjectWorkspace({
             <PlansDockTab projectId={project.metadata.id} />
           )}
 
-
           {dockTab === "mcp" &&
             (project.metadata.rootPath ? (
               <ProjectMcpServersCard projectRoot={project.metadata.rootPath} />
@@ -1349,7 +1397,10 @@ function DockGit({ project }: { project: ProjectDetail }) {
   const rows: { label: string; value: string }[] = [
     { label: "Branch", value: git.branch ?? "—" },
     { label: "Upstream", value: git.upstream ?? "no upstream" },
-    { label: "Ahead / Behind", value: `↑${git.aheadCount} / ↓${git.behindCount}` },
+    {
+      label: "Ahead / Behind",
+      value: `↑${git.aheadCount} / ↓${git.behindCount}`,
+    },
     { label: "Staged", value: String(git.stagedCount) },
     { label: "Unstaged", value: String(git.unstagedCount) },
     { label: "Untracked", value: String(git.untrackedCount) },
@@ -1359,7 +1410,10 @@ function DockGit({ project }: { project: ProjectDetail }) {
   return (
     <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
       {rows.map((row) => (
-        <div key={row.label} className="flex items-center justify-between gap-3">
+        <div
+          key={row.label}
+          className="flex items-center justify-between gap-3"
+        >
           <dt className="text-[10px] font-semibold uppercase tracking-widest text-cream-500">
             {row.label}
           </dt>

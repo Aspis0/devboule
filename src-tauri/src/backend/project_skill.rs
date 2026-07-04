@@ -85,6 +85,75 @@ fn validate_role(role: &str) -> Result<(), String> {
     }
 }
 
+/// The Work Console ASSIGNMENT layer: the capability tiers a project assigns skills/tools to
+/// from the "Skills & Tools" modal. This is SEPARATE from [`KNOWN_ROLES`] (the injection +
+/// traversal-safety gate, which is deliberately left unchanged so the legacy mini injection
+/// path keeps reading `mini/`). The single legacy `mini` role splits here into two tiers —
+/// `mini-big` (capable local model) and `mini-small` (8B, edits-only) — via the non-destructive
+/// [`migrate_legacy_mini`]. These profile literals become directory names under
+/// `.claude/skills/`, so any user-supplied profile MUST first pass [`validate_profile`].
+pub(crate) const ASSIGNMENT_PROFILES: &[&str] =
+    &["coder", "mini-big", "mini-small", "design", "orchestrator"];
+
+/// Reject any `profile` not in [`ASSIGNMENT_PROFILES`]. Mirrors [`validate_role`]'s error shape.
+/// Gate on every assignment write so a crafted profile can never become a directory name. NOTE:
+/// `mini` is intentionally NOT a valid profile (it split into the two tiers); the legacy role
+/// stays addressable only via the unchanged [`KNOWN_ROLES`]/[`validate_role`] injection gate.
+// Consumed by the per-profile assignment write paths (P3 tools_assignment).
+pub(crate) fn validate_profile(profile: &str) -> Result<(), String> {
+    if ASSIGNMENT_PROFILES.contains(&profile) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown assignment profile '{profile}' (expected one of: {})",
+            ASSIGNMENT_PROFILES.join(", ")
+        ))
+    }
+}
+
+/// ONE-TIME, NON-DESTRUCTIVE migration of the legacy single `mini` skill into the `mini-big`
+/// tier. If `.claude/skills/mini/SKILL.md` exists as a regular file AND
+/// `.claude/skills/mini-big/SKILL.md` does NOT, copy the legacy body into `mini-big/SKILL.md`
+/// (the capable tier inherits the existing house-style persona). The legacy `mini/` is LEFT
+/// INTACT — the unchanged injection path still reads it. Idempotent and never overwrites an
+/// existing `mini-big`. `canonical_root` MUST already be the canonicalized working folder.
+fn migrate_legacy_mini(canonical_root: &Path) -> Result<(), String> {
+    // Never clobber a customized mini-big (idempotent re-runs land here).
+    let (big_exists, _, _) = read_skill_raw(canonical_root, "mini-big");
+    if big_exists {
+        return Ok(());
+    }
+    // Nothing to migrate if there is no legacy mini SKILL.md.
+    let (mini_exists, mini_content, mini_truncated) = read_skill_raw(canonical_root, "mini");
+    if !mini_exists {
+        return Ok(());
+    }
+    // DATA-LOSS GUARD: `read_skill_raw` caps at MAX_SKILL_BYTES, so an over-cap legacy mini
+    // would migrate only its first MAX_SKILL_BYTES — and because the copy then sits at/under
+    // the cap, the truncation becomes INVISIBLE forever. Refuse to migrate a truncated source;
+    // warn the user to trim it first. The legacy `mini/` keeps serving the old injection path,
+    // so skipping is safe (the modal just shows an empty mini-big until the user trims + re-opens).
+    if mini_truncated {
+        eprintln!(
+            "skipping mini→mini-big migration: .claude/skills/mini/SKILL.md exceeds {MAX_SKILL_BYTES} bytes; trim it first so no content is lost"
+        );
+        return Ok(());
+    }
+    // Copy into mini-big (create_dir_all + atomic_write). "mini-big" is a fixed literal from
+    // ASSIGNMENT_PROFILES, never user input, so it is a safe directory segment.
+    write_skill_file(canonical_root, "mini-big", &mini_content)?;
+    // Also migrate per-language overrides so the tier keeps the customized personas (it now OWNS
+    // the skill via active_language_profile_skill_or_legacy and won't fall back to mini/lang-*.md).
+    // Skip a truncated source (same data-loss guard as the SKILL.md above).
+    for lang in bundled_lang_keys() {
+        let (source, content, truncated) = read_lang_raw(canonical_root, "mini", lang);
+        if source == "project" && !truncated {
+            write_lang_file(canonical_root, "mini-big", lang, &content)?;
+        }
+    }
+    Ok(())
+}
+
 /// Largest char-boundary byte offset at or below `max` in `s` (a stable-Rust
 /// stand-in for the unstable `str::floor_char_boundary`). `is_char_boundary`
 /// is true at 0 and at len, so this always terminates with a valid index.
@@ -252,6 +321,145 @@ pub(crate) fn active_project_skill(project_root: &Path, role: &str) -> Option<St
     read_project_skill(project_root, role)
 }
 
+/// P5 (Work Console): the toggle-aware SKILL.md for a launched MINI, resolved by its capability
+/// TIER PROFILE (`profile`, e.g. "mini-big" / "mini-small") with a NON-REGRESSING fallback to the
+/// LEGACY `legacy_role` ("mini") skill. Resolution:
+/// - If a tier-specific `.claude/skills/<profile>/SKILL.md` FILE exists, it OWNS injection: its own
+///   toggle decides (enabled → its body; disabled → None). NO legacy fallback in this case — an
+///   author who created a tier file expressed intent for that tier, so a disabled tier skill must
+///   not silently resurrect the legacy one.
+/// - If NO tier file exists, fall back to the legacy `legacy_role` skill (toggle-aware) — so a
+///   project that only ever authored `.claude/skills/mini/SKILL.md` keeps injecting exactly as
+///   before (the tiers are additive, not a breaking rename).
+///
+/// `profile`/`legacy_role` are FIXED caller literals (derived from the model tier + the legacy
+/// role), never user input — same path-safety contract as [`read_project_skill`].
+pub(crate) fn active_profile_skill_or_legacy(
+    project_root: &Path,
+    profile: &str,
+    legacy_role: &str,
+) -> Option<String> {
+    // Ownership is decided by FILE EXISTENCE, not content: an EMPTY tier SKILL.md still
+    // takes ownership (so clearing a tier deliberately suppresses the legacy skill rather
+    // than silently resurrecting it). `read_skill_raw().0` = a regular file exists; using
+    // `read_project_skill().is_some()` here was wrong — it returns None for an empty file
+    // AND re-opens the file (a TOCTOU double-read). One existence check, no double-open.
+    let (tier_exists, _, _) = read_skill_raw(project_root, profile);
+    if tier_exists {
+        return active_project_skill(project_root, profile);
+    }
+    // No tier file → the legacy role skill (toggle-aware) so nothing regresses.
+    active_project_skill(project_root, legacy_role)
+}
+
+/// Mirrors [`active_profile_skill_or_legacy`] for the LANGUAGE layer: ownership follows the tier's
+/// SKILL.md (an existing tier SKILL.md means the tier owns the skill, so read the tier's lang
+/// override too); otherwise fall back to the legacy role's language persona. Toggle-aware via
+/// [`active_language_skill`]. This is what lets mini-big/mini-small carry per-language overrides.
+pub(crate) fn active_language_profile_skill_or_legacy(
+    project_root: &Path,
+    profile: &str,
+    legacy_role: &str,
+    lang: &str,
+) -> Option<String> {
+    let (tier_exists, _, _) = read_skill_raw(project_root, profile);
+    if tier_exists {
+        return active_language_skill(project_root, profile, lang);
+    }
+    active_language_skill(project_root, legacy_role, lang)
+}
+
+#[cfg(test)]
+mod profile_skill_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("devboule_profskill_{}_{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_skill(root: &std::path::Path, profile: &str, body: &str) {
+        let d = root.join(".claude/skills").join(profile);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn tier_file_present_wins() {
+        let root = fresh_dir("tier_present");
+        write_skill(&root, "mini", "LEGACY MINI");
+        write_skill(&root, "mini-big", "BIG TIER");
+        assert_eq!(
+            active_profile_skill_or_legacy(&root, "mini-big", "mini").as_deref(),
+            Some("BIG TIER")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn falls_back_to_legacy_when_no_tier_file() {
+        let root = fresh_dir("tier_absent");
+        write_skill(&root, "mini", "LEGACY MINI");
+        assert_eq!(
+            active_profile_skill_or_legacy(&root, "mini-big", "mini").as_deref(),
+            Some("LEGACY MINI")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disabled_tier_does_not_fall_back_to_legacy() {
+        // A tier file that exists but is toggled OFF must suppress injection entirely — it must
+        // NOT silently resurrect the legacy mini skill.
+        let root = fresh_dir("tier_disabled");
+        write_skill(&root, "mini", "LEGACY MINI");
+        write_skill(&root, "mini-big", "BIG TIER");
+        fs::write(
+            root.join(".claude/skills/skills-state.json"),
+            r#"{"skills":{"mini-big":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(active_profile_skill_or_legacy(&root, "mini-big", "mini").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn none_when_neither_present() {
+        let root = fresh_dir("tier_none");
+        assert!(active_profile_skill_or_legacy(&root, "mini-small", "mini").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_tier_file_owns_and_suppresses_legacy() {
+        // An EMPTY tier SKILL.md must still TAKE OWNERSHIP (existence, not content) — so
+        // deliberately clearing a tier suppresses the legacy skill instead of resurrecting it.
+        let root = fresh_dir("tier_empty");
+        write_skill(&root, "mini", "LEGACY MINI");
+        fs::create_dir_all(root.join(".claude/skills/mini-big")).unwrap();
+        fs::write(root.join(".claude/skills/mini-big/SKILL.md"), "").unwrap();
+        // Tier owns (empty content -> no body), legacy NOT resurrected.
+        assert!(active_profile_skill_or_legacy(&root, "mini-big", "mini").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mini_small_tier_file_is_read() {
+        let root = fresh_dir("tier_small");
+        write_skill(&root, "mini-small", "SMALL TIER");
+        assert_eq!(
+            active_profile_skill_or_legacy(&root, "mini-small", "mini").as_deref(),
+            Some("SMALL TIER")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 /// The bundled LANGUAGE-persona pack — the ONE source of truth for the (role × language) layer.
 /// Add a PERSONA = drop `assets/skills/lang/<key>.md` and add ONE line here (`include_str!` needs
 /// the path at compile time). Everything in THIS module (the allowlist `is_known_lang`, the key
@@ -316,10 +524,12 @@ fn read_project_lang_file(project_root: &Path, role: &str, lang: &str) -> Option
     if !is_known_lang(lang) {
         return None;
     }
-    // Same allowlist discipline for the role path segment (defense-in-depth): callers already
-    // pre-validate, but a future caller must never be able to thread an untrusted `role` into the
-    // path even though canonicalize-and-contain below would still block actual traversal.
-    if !KNOWN_ROLES.contains(&role) {
+    // Same allowlist discipline for the role/profile path segment (defense-in-depth): callers already
+    // pre-validate, but a future caller must never be able to thread an untrusted segment into the
+    // path even though canonicalize-and-contain below would still block actual traversal. Accept both
+    // the legacy injection roles (KNOWN_ROLES) AND the Work Console capability tiers
+    // (ASSIGNMENT_PROFILES, e.g. mini-big/mini-small) so per-tier language overrides are injected.
+    if !KNOWN_ROLES.contains(&role) && validate_profile(role).is_err() {
         return None;
     }
     let rel = format!(".claude/skills/{role}/lang-{lang}.md");
@@ -771,7 +981,9 @@ fn neutralize_sentinels(skill: &str) -> String {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillEntry {
-    /// Role key: one of [`KNOWN_ROLES`] ("mini" | "coder" | "design").
+    /// Role/profile key. From [`skills_list`] this is one of [`KNOWN_ROLES`]
+    /// ("mini" | "coder" | "design" | "orchestrator"); from [`skills_list_profiles`] it is
+    /// one of [`ASSIGNMENT_PROFILES`] (the Work Console tiers, e.g. "mini-big" | "mini-small").
     role: String,
     /// A regular SKILL.md is present + readable for this role.
     exists: bool,
@@ -949,10 +1161,10 @@ pub struct LibrarySkillTemplate {
     pub body: String,
 }
 
-/// The 6 bundled library skills (devboule originals, agentskills.io-conformant — they pass our own
+/// The 7 bundled library skills (devboule originals, agentskills.io-conformant — they pass our own
 /// `validate_skill`). Bodies are `include_str!`'d from `assets/skills/library/<id>/SKILL.md`, the
 /// same in-binary pattern as the language personas; name+description are parsed from each body.
-fn bundled_library_skills() -> Vec<LibrarySkillTemplate> {
+pub(crate) fn bundled_library_skills() -> Vec<LibrarySkillTemplate> {
     let raw_bodies: &[&str] = &[
         include_str!("../../assets/skills/library/code-review/SKILL.md"),
         include_str!("../../assets/skills/library/debugging/SKILL.md"),
@@ -1002,6 +1214,10 @@ mod bundled_library_tests {
         }
         // Catch drift: a skill added to the include_str! list without updating EXPECTED (or vice versa).
         assert_eq!(skills.len(), EXPECTED.len(), "bundled_library_skills count != EXPECTED");
+        // Names must be pairwise distinct: `install_bundled_impl` selects by name via `find`,
+        // so a duplicate name would make the second skill permanently unreachable to install.
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "bundled library skill names must be unique");
     }
 
     #[test]
@@ -1106,6 +1322,58 @@ fn skills_list_impl(working_folder_path: &str) -> Result<Vec<SkillEntry>, String
     Ok(entries)
 }
 
+/// List the editor + toggle state for every Work Console ASSIGNMENT PROFILE
+/// ([`ASSIGNMENT_PROFILES`]) in this project — the tier-aware sibling of [`skills_list`].
+/// Runs the one-time non-destructive `mini` → `mini-big` migration first (so the modal shows
+/// the migrated content), then maps over the profiles exactly like [`skills_list_impl`]
+/// (fail-open `enabled = true`). The design write guard is taken ONLY around the migration
+/// write (see the impl), NOT across the read/list phase.
+#[tauri::command]
+pub fn skills_list_profiles(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+) -> Result<Vec<SkillEntry>, String> {
+    state.ensure_unlocked()?;
+    skills_list_profiles_impl(&working_folder_path)
+}
+
+fn skills_list_profiles_impl(working_folder_path: &str) -> Result<Vec<SkillEntry>, String> {
+    let canonical = canonical_working_folder(working_folder_path)?;
+    // Take the EXCLUSIVE design write guard ONLY for the migration write, then release it
+    // before the read/list phase — listing is a pure read that must not serialize against the
+    // design system. Non-fatal: a migration failure (e.g. a read-only tree, or a poisoned
+    // guard) must not break listing — the legacy `mini/` still serves the old injection path,
+    // so listing degrades to an empty mini-big row rather than erroring.
+    {
+        if let Ok(_guard) = design_write_guard() {
+            let _ = migrate_legacy_mini(&canonical);
+        }
+    } // guard dropped here — the reads below run WITHOUT it (benign TOCTOU, self-heals on reopen)
+    // Read the toggle state ONCE so the `enabled` column is internally consistent (same
+    // rationale as skills_list_impl: per-profile re-reads could race a concurrent toggle).
+    let state = read_skills_state(&canonical);
+    let entries = ASSIGNMENT_PROFILES
+        .iter()
+        .map(|&profile| {
+            let (exists, content, truncated) = read_skill_raw(&canonical, profile);
+            let enabled = state
+                .as_ref()
+                .and_then(|s| s.skills.get(profile))
+                .map(|t| t.enabled)
+                .unwrap_or(true);
+            SkillEntry {
+                role: profile.to_string(),
+                exists,
+                enabled,
+                bytes: content.len(),
+                content,
+                truncated,
+            }
+        })
+        .collect();
+    Ok(entries)
+}
+
 /// Persist (create or overwrite) the `role` SKILL.md for this project. Rejects an unknown
 /// role (no traversal) and a `content` over MAX_SKILL_BYTES with a clear, UI-surfaceable
 /// message (the editor must not silently lose the tail). Serialized via the design write
@@ -1164,17 +1432,54 @@ fn skills_set_enabled_impl(
 ) -> Result<(), String> {
     validate_role(&role)?;
     let canonical = canonical_working_folder(working_folder_path)?;
-    // Read the current state and mutate ONLY this role so the other roles' explicit entries
+    apply_skill_toggle(&canonical, role, enabled)
+}
+
+/// Mirrors [`skills_set_enabled`] but validates against [`ASSIGNMENT_PROFILES`] (the Work
+/// Console capability tiers, e.g. "mini-big" / "mini-small") instead of [`KNOWN_ROLES`], so
+/// the per-tier toggle in the "Skills & Tools" modal can disable a profile the legacy role
+/// gate would reject. Same RMW + design-write-guard semantics as the role command.
+#[tauri::command]
+pub fn skills_set_enabled_profile(
+    state: State<'_, BackendState>,
+    working_folder_path: String,
+    profile: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_set_enabled_profile_impl(&working_folder_path, profile, enabled)
+}
+
+fn skills_set_enabled_profile_impl(
+    working_folder_path: &str,
+    profile: String,
+    enabled: bool,
+) -> Result<(), String> {
+    validate_profile(&profile)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    apply_skill_toggle(&canonical, profile, enabled)
+}
+
+/// Read-modify-write of skills-state.json shared by the role and profile toggle commands.
+/// `canonical` MUST already be the canonicalized working folder; `key` MUST already be
+/// validated by the caller (`validate_role` / `validate_profile`).
+fn apply_skill_toggle(
+    canonical: &std::path::Path,
+    key: String,
+    enabled: bool,
+) -> Result<(), String> {
+    // Read the current state and mutate ONLY this key so the other entries' explicit values
     // survive the write. CRUCIAL: distinguish ABSENT from CORRUPT. `read_skills_state`
     // returns None for both, but treating a corrupt/oversized/non-regular file as an empty
-    // map would let this read-modify-write DROP every other role's entry on the next save.
+    // map would let this read-modify-write DROP every other entry on the next save.
     // So: only an actually-missing file fails open to a fresh map; an existing-but-unreadable
     // file is a hard error the user must fix or delete first (we never silently overwrite it).
     let state_path = canonical
         .join(".claude")
         .join("skills")
         .join("skills-state.json");
-    let mut current = match read_skills_state(&canonical) {
+    let mut current = match read_skills_state(canonical) {
         Some(s) => s,
         None => {
             if state_path.exists() {
@@ -1183,7 +1488,7 @@ fn skills_set_enabled_impl(
             SkillsState::default()
         }
     };
-    current.skills.entry(role).or_default().enabled = enabled;
+    current.skills.entry(key).or_default().enabled = enabled;
     let json = serde_json::to_string_pretty(&current)
         .map_err(|e| format!("could not serialize skills state: {e}"))?;
     let dir = canonical.join(".claude").join("skills");
@@ -1588,6 +1893,70 @@ fn skills_reset_lang_impl(working_folder_path: &str, role: &str, lang: &str) -> 
         _ => {}
     }
     Ok(())
+}
+
+// --- PROFILE-AWARE language personas (Work Console modal): mirror the role versions above but
+// validate ASSIGNMENT_PROFILES so the capability tiers (mini-big/mini-small) can carry per-language
+// overrides at `.claude/skills/<profile>/lang-<lang>.md`. read_lang_raw/write_lang_file take the
+// segment as-is and are traversal-safe, so they work unchanged with a profile segment. ---
+
+/// Mirrors `skills_list_langs_impl` but validates ASSIGNMENT_PROFILES (tiers like mini-big/mini-small).
+fn skills_list_langs_profile_impl(working_folder_path: &str, profile: &str) -> Result<Vec<LangEntry>, String> {
+    validate_profile(profile)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    let entries = bundled_lang_keys().map(|lang| {
+        let (source, content, truncated) = read_lang_raw(&canonical, profile, lang);
+        LangEntry { role: profile.to_string(), lang: lang.to_string(), bytes: content.len(), source, content, truncated }
+    }).collect();
+    Ok(entries)
+}
+
+/// List a PROFILE's language personas (Work Console modal). Mirrors `skills_list_langs`.
+#[tauri::command]
+pub fn skills_list_langs_profile(state: State<'_, BackendState>, working_folder_path: String, profile: String) -> Result<Vec<LangEntry>, String> {
+    state.ensure_unlocked()?;
+    skills_list_langs_profile_impl(&working_folder_path, &profile)
+}
+
+/// Mirrors `skills_save_lang_impl` but validates ASSIGNMENT_PROFILES.
+fn skills_save_lang_profile_impl(working_folder_path: &str, profile: &str, lang: &str, content: &str) -> Result<(), String> {
+    validate_profile(profile)?;
+    validate_lang(lang)?;
+    if content.len() > MAX_SKILL_BYTES {
+        return Err(format!("skill too large ({} bytes > {MAX_SKILL_BYTES} max); trim it before saving", content.len()));
+    }
+    let canonical = canonical_working_folder(working_folder_path)?;
+    write_lang_file(&canonical, profile, lang, content)
+}
+
+/// Save a PROFILE's language persona override (Work Console modal). Mirrors `skills_save_lang`.
+#[tauri::command]
+pub fn skills_save_lang_profile(state: State<'_, BackendState>, working_folder_path: String, profile: String, lang: String, content: String) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_save_lang_profile_impl(&working_folder_path, &profile, &lang, &content)
+}
+
+/// Mirrors `skills_reset_lang_impl` but validates ASSIGNMENT_PROFILES.
+fn skills_reset_lang_profile_impl(working_folder_path: &str, profile: &str, lang: &str) -> Result<(), String> {
+    validate_profile(profile)?;
+    validate_lang(lang)?;
+    let canonical = canonical_working_folder(working_folder_path)?;
+    let target = canonical.join(".claude").join("skills").join(profile).join(format!("lang-{lang}.md"));
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_file() => std::fs::remove_file(&target)
+            .map_err(|e| format!("could not reset language persona: {e}"))?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Reset a PROFILE's language persona to the bundled default (Work Console modal). Mirrors `skills_reset_lang`.
+#[tauri::command]
+pub fn skills_reset_lang_profile(state: State<'_, BackendState>, working_folder_path: String, profile: String, lang: String) -> Result<(), String> {
+    state.ensure_unlocked()?;
+    let _guard = design_write_guard()?;
+    skills_reset_lang_profile_impl(&working_folder_path, &profile, &lang)
 }
 
 /// The installable bundled language personas (Discover tab). No folder/lock needed (pure binary).
@@ -2104,6 +2473,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // --- Per-PROFILE toggle (Work Console tiers) — skills_set_enabled_profile ---
+
+    #[test]
+    fn set_enabled_profile_false_reflects_in_list_profiles_and_preserves_others() {
+        let root = fresh_root("toggle-profile-list");
+        // Pre-seed an explicit OTHER-profile entry so we can prove the RMW preserves it.
+        write_state(&root, r#"{ "skills": { "coder": { "enabled": false } } }"#);
+        // Disable the mini-big TIER — a profile the legacy validate_role gate would REJECT,
+        // so this proves the new command validates against ASSIGNMENT_PROFILES, not KNOWN_ROLES.
+        skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), false).unwrap();
+        let entries = skills_list_profiles_impl(&root_str(&root)).unwrap();
+        assert!(!entries.iter().find(|e| e.role == "mini-big").unwrap().enabled);
+        assert!(!entries.iter().find(|e| e.role == "coder").unwrap().enabled);
+        assert!(entries.iter().find(|e| e.role == "mini-small").unwrap().enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_enabled_profile_reenable_flips_back_to_true() {
+        let root = fresh_root("toggle-profile-reenable");
+        skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), false).unwrap();
+        skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), true).unwrap();
+        let entries = skills_list_profiles_impl(&root_str(&root)).unwrap();
+        assert!(entries.iter().find(|e| e.role == "mini-big").unwrap().enabled);
+        // The on-disk JSON carries the explicit re-enabled value (not just a fail-open default).
+        let state =
+            read_skills_state(&std::fs::canonicalize(&root).unwrap()).expect("state parses");
+        assert_eq!(state.skills.get("mini-big").map(|t| t.enabled), Some(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lang_profile_save_list_reset_roundtrip_for_a_tier() {
+        let root = fresh_root("lang-profile");
+        // mini-big is an ASSIGNMENT_PROFILE, NOT a KNOWN_ROLE — the role-based lang command rejects it.
+        skills_save_lang_profile_impl(&root_str(&root), "mini-big", "rust", "VETERAN RUST").unwrap();
+        let langs = skills_list_langs_profile_impl(&root_str(&root), "mini-big").unwrap();
+        let rust = langs.iter().find(|e| e.lang == "rust").unwrap();
+        assert_eq!(rust.source, "project");
+        assert_eq!(rust.content, "VETERAN RUST");
+        // reset removes the override → back to the bundled default
+        skills_reset_lang_profile_impl(&root_str(&root), "mini-big", "rust").unwrap();
+        let langs2 = skills_list_langs_profile_impl(&root_str(&root), "mini-big").unwrap();
+        assert_eq!(langs2.iter().find(|e| e.lang == "rust").unwrap().source, "bundled");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lang_profile_rejects_legacy_mini_unknown_and_bad_lang() {
+        let root = fresh_root("lang-profile-reject");
+        assert!(skills_save_lang_profile_impl(&root_str(&root), "mini", "rust", "x").is_err());
+        assert!(skills_save_lang_profile_impl(&root_str(&root), "bogus", "rust", "x").is_err());
+        assert!(skills_save_lang_profile_impl(&root_str(&root), "mini-big", "klingon", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_legacy_mini_also_copies_language_overrides() {
+        let root = fresh_root("migrate-lang");
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        // Legacy mini with a SKILL.md + a rust language override.
+        write_skill_file(&canonical, "mini", "legacy mini skill").unwrap();
+        write_lang_file(&canonical, "mini", "rust", "LEGACY RUST OVERRIDE").unwrap();
+        migrate_legacy_mini(&canonical).unwrap();
+        // mini-big (which now OWNS the skill) must inherit the language override, else it would be
+        // silently lost (active_language_profile_skill_or_legacy reads the tier, not legacy mini).
+        let (source, content, _) = read_lang_raw(&canonical, "mini-big", "rust");
+        assert_eq!(source, "project");
+        assert_eq!(content, "LEGACY RUST OVERRIDE");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_enabled_profile_rejects_legacy_mini_and_unknown() {
+        let root = fresh_root("toggle-profile-reject");
+        // `mini` is NOT a valid assignment profile (it split into mini-big / mini-small).
+        assert!(
+            skills_set_enabled_profile_impl(&root_str(&root), "mini".to_string(), false).is_err()
+        );
+        assert!(
+            skills_set_enabled_profile_impl(&root_str(&root), "reviewer".to_string(), false)
+                .is_err()
+        );
+        assert!(
+            skills_set_enabled_profile_impl(&root_str(&root), "../etc".to_string(), false).is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_enabled_profile_errors_on_corrupt_state_and_leaves_it_untouched() {
+        let root = fresh_root("toggle-profile-corrupt");
+        let corrupt = "{ not json";
+        write_state(&root, corrupt);
+        let err = skills_set_enabled_profile_impl(&root_str(&root), "mini-big".to_string(), false)
+            .unwrap_err();
+        assert!(err.contains("unreadable or corrupt"), "unexpected error: {err}");
+        let on_disk = std::fs::read_to_string(
+            root.join(".claude").join("skills").join("skills-state.json"),
+        )
+        .unwrap();
+        assert_eq!(on_disk, corrupt);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn save_rejects_content_over_the_byte_cap() {
         let root = fresh_root("save-toobig");
@@ -2245,3 +2719,249 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+// ---------------------------------------------------------------------------
+// P2 — Work Console assignment PROFILES (mini tiers + non-destructive migration).
+// The ASSIGNMENT layer (`coder/mini-big/mini-small/design/orchestrator`) is SEPARATE
+// from `KNOWN_ROLES` (the injection/traversal gate, deliberately left untouched). These
+// tests are written FIRST (RED): the symbols below do not exist yet.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod assignment_profile_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Fresh, unique temp project root (created on disk so `canonicalize` succeeds).
+    /// The caller removes it. Mirrors `tests::fresh_root`.
+    fn fresh_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aspis-profile-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_micros()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Write a `<profile>/SKILL.md` under the project root.
+    fn write_skill(root: &Path, profile: &str, body: &str) {
+        let dir = root.join(".claude").join("skills").join(profile);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn root_str(root: &Path) -> String {
+        root.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn assignment_profiles_are_the_five_work_console_tiers() {
+        assert_eq!(
+            ASSIGNMENT_PROFILES,
+            &["coder", "mini-big", "mini-small", "design", "orchestrator"]
+        );
+        // The assignment layer is SEPARATE from the injection/traversal gate: the tiers are
+        // NOT known roles, and the legacy single `mini` is NOT an assignment profile.
+        assert!(!KNOWN_ROLES.contains(&"mini-big"));
+        assert!(!KNOWN_ROLES.contains(&"mini-small"));
+        assert!(!ASSIGNMENT_PROFILES.contains(&"mini"));
+        assert!(KNOWN_ROLES.contains(&"mini"));
+    }
+
+    #[test]
+    fn validate_profile_accepts_tiers_and_rejects_legacy_mini_and_bogus() {
+        assert!(validate_profile("coder").is_ok());
+        assert!(validate_profile("mini-big").is_ok());
+        assert!(validate_profile("mini-small").is_ok());
+        assert!(validate_profile("design").is_ok());
+        assert!(validate_profile("orchestrator").is_ok());
+        // Legacy `mini` is no longer a valid assignment target (it split into the tiers).
+        assert!(validate_profile("mini").is_err());
+        assert!(validate_profile("bogus").is_err());
+        assert!(validate_profile("../etc").is_err());
+    }
+
+    #[test]
+    fn migrate_copies_legacy_mini_into_mini_big_and_leaves_legacy_intact() {
+        let root = fresh_root("migrate-copy");
+        let canon = std::fs::canonicalize(&root).unwrap();
+        write_skill(&canon, "mini", "MINI LEGACY BODY");
+        migrate_legacy_mini(&canon).unwrap();
+        // mini-big now carries the legacy content...
+        let (big_exists, big_content, _) = read_skill_raw(&canon, "mini-big");
+        assert!(big_exists);
+        assert_eq!(big_content, "MINI LEGACY BODY");
+        // ...and the legacy `mini/` is left untouched (non-destructive: the old injection
+        // path still reads it).
+        let (mini_exists, mini_content, _) = read_skill_raw(&canon, "mini");
+        assert!(mini_exists);
+        assert_eq!(mini_content, "MINI LEGACY BODY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_never_overwrites_an_existing_mini_big() {
+        let root = fresh_root("migrate-nondestructive");
+        let canon = std::fs::canonicalize(&root).unwrap();
+        write_skill(&canon, "mini", "LEGACY");
+        write_skill(&canon, "mini-big", "ALREADY CUSTOMIZED");
+        migrate_legacy_mini(&canon).unwrap();
+        // An existing mini-big is preserved verbatim — never clobbered by the legacy body.
+        let (_, big_content, _) = read_skill_raw(&canon, "mini-big");
+        assert_eq!(big_content, "ALREADY CUSTOMIZED");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_and_a_noop_without_legacy_mini() {
+        let root = fresh_root("migrate-idempotent");
+        let canon = std::fs::canonicalize(&root).unwrap();
+        // No legacy `mini` ⇒ nothing is created.
+        migrate_legacy_mini(&canon).unwrap();
+        let (big_exists, _, _) = read_skill_raw(&canon, "mini-big");
+        assert!(!big_exists);
+        // With a legacy `mini`, running twice yields the same result (idempotent).
+        write_skill(&canon, "mini", "BODY");
+        migrate_legacy_mini(&canon).unwrap();
+        migrate_legacy_mini(&canon).unwrap();
+        let (_, big_content, _) = read_skill_raw(&canon, "mini-big");
+        assert_eq!(big_content, "BODY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_profiles_returns_the_five_tiers_with_migrated_mini_big_content() {
+        let root = fresh_root("list-profiles");
+        let canon = std::fs::canonicalize(&root).unwrap();
+        write_skill(&canon, "mini", "MINI BODY FOR MIGRATION");
+        write_skill(&canon, "coder", "CODER BODY");
+        let entries = skills_list_profiles_impl(&root_str(&root)).unwrap();
+        // Exactly the five assignment profiles, one row each.
+        assert_eq!(entries.len(), ASSIGNMENT_PROFILES.len());
+        for profile in ASSIGNMENT_PROFILES {
+            assert_eq!(
+                entries.iter().filter(|e| &e.role == profile).count(),
+                1,
+                "profile {profile} should appear exactly once"
+            );
+        }
+        // The migration ran INSIDE list: mini-big inherits the legacy `mini` content.
+        let big = entries.iter().find(|e| e.role == "mini-big").unwrap();
+        assert!(big.exists);
+        assert_eq!(big.content, "MINI BODY FOR MIGRATION");
+        assert!(big.enabled); // no state file ⇒ fail-open enabled
+        // coder is unaffected; mini-small is absent + fail-open enabled.
+        let coder = entries.iter().find(|e| e.role == "coder").unwrap();
+        assert_eq!(coder.content, "CODER BODY");
+        let small = entries.iter().find(|e| e.role == "mini-small").unwrap();
+        assert!(!small.exists);
+        assert_eq!(small.content, "");
+        assert!(small.enabled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_skips_a_truncated_legacy_mini_to_avoid_silent_data_loss() {
+        let root = fresh_root("migrate-truncated");
+        let canon = std::fs::canonicalize(&root).unwrap();
+        // A legacy mini larger than the cap: migrating it via read_skill_raw would copy only
+        // the first MAX_SKILL_BYTES and make the loss invisible forever — so migration must
+        // SKIP it (and warn the user to trim the file first).
+        write_skill(&canon, "mini", &"z".repeat(MAX_SKILL_BYTES + 100));
+        migrate_legacy_mini(&canon).unwrap();
+        let (big_exists, _, _) = read_skill_raw(&canon, "mini-big");
+        assert!(!big_exists, "an over-cap legacy mini must NOT be migrated");
+        // The legacy file is left untouched (still present, still over-cap).
+        let (mini_exists, _, mini_truncated) = read_skill_raw(&canon, "mini");
+        assert!(mini_exists);
+        assert!(mini_truncated);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_recovers_from_a_partial_write_empty_mini_big_dir() {
+        let root = fresh_root("migrate-partial");
+        let canon = std::fs::canonicalize(&root).unwrap();
+        write_skill(&canon, "mini", "LEGACY BODY");
+        // A prior interrupted run left an EMPTY `mini-big/` dir (no SKILL.md). Migration must
+        // still complete: read_skill_raw treats a dir-without-SKILL.md as absent (exists=false),
+        // and write_skill_file's create_dir_all is idempotent over the existing dir.
+        std::fs::create_dir_all(canon.join(".claude").join("skills").join("mini-big")).unwrap();
+        migrate_legacy_mini(&canon).unwrap();
+        let (big_exists, big_content, _) = read_skill_raw(&canon, "mini-big");
+        assert!(big_exists, "migration must produce mini-big/SKILL.md");
+        assert_eq!(big_content, "LEGACY BODY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[tauri::command]
+   pub fn skills_save_profile(
+       state: State<'_, BackendState>,
+       working_folder_path: String,
+       profile: String,
+       content: String,
+   ) -> Result<(), String> {
+       state.ensure_unlocked()?;
+       let _guard = design_write_guard()?;
+       skills_save_profile_impl(&working_folder_path, &profile, &content)
+   }
+
+   fn skills_save_profile_impl(
+       working_folder_path: &str,
+       profile: &str,
+       content: &str,
+   ) -> Result<(), String> {
+       validate_profile(profile)?;
+       if content.len() > MAX_SKILL_BYTES {
+           return Err(format!(
+               "Content exceeds maximum allowed size of {} bytes",
+               MAX_SKILL_BYTES
+           ));
+       }
+       let canonical = canonical_working_folder(working_folder_path)?;
+       write_skill_file(&canonical, profile, content)
+   }
+
+   #[cfg(test)]
+   mod save_profile_tests {
+       use super::*;
+       use std::env;
+       use std::fs::{self, create_dir_all, remove_dir_all};
+       use std::path::PathBuf;
+       use std::process;
+
+       fn fresh_dir(tag: &str) -> PathBuf {
+           let dir = env::temp_dir().join(format!("skill_test_{}_{}", process::id(), tag));
+           create_dir_all(&dir).expect("Failed to create temp dir");
+           dir
+       }
+
+       #[test]
+       fn test_save_profile_impl_ok() {
+           let dir = fresh_dir("ok");
+           let canonical = fs::canonicalize(&dir).unwrap();
+           assert!(skills_save_profile_impl(dir.to_str().unwrap(), "mini-big", "BODY").is_ok());
+           let (exists, content, _) = read_skill_raw(&canonical, "mini-big");
+           assert!(exists);
+           assert_eq!(content, "BODY");
+           remove_dir_all(&dir).ok();
+       }
+
+       #[test]
+       fn test_save_profile_impl_bad_profile() {
+           let dir = fresh_dir("bad_profile");
+           let result = skills_save_profile_impl(dir.to_str().unwrap(), "mini", "BODY");
+           assert!(result.is_err());
+           remove_dir_all(&dir).ok();
+       }
+
+       #[test]
+       fn test_save_profile_impl_too_large() {
+           let dir = fresh_dir("too_large");
+           let large_content = "A".repeat(MAX_SKILL_BYTES + 1);
+           let result = skills_save_profile_impl(dir.to_str().unwrap(), "mini-big", &large_content);
+           assert!(result.is_err());
+           remove_dir_all(&dir).ok();
+       }
+   }

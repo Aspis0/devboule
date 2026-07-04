@@ -38,6 +38,12 @@ pub fn run_structure_cli_from_args() -> Option<i32> {
     backend::structure::run_structure_cli(std::env::args())
 }
 
+/// Headless CKG bridge: `aspis-management ckg --root <path>` prints the code-knowledge-graph
+/// JSON and exits with NO GUI. Reused by the Python CKG ingester by shelling this binary.
+pub fn run_ckg_cli_from_args() -> Option<i32> {
+    backend::ckg::run_ckg_cli(std::env::args())
+}
+
 /// Slice 5b: the body of the standalone `claude_consent_hook` binary. It reads the
 /// Claude `PreToolUse` hook JSON from STDIN, bridges Patch/Exec tool calls through the
 /// `.aspis-agents.json` consent file-bridge into the app's existing consent UI, prints
@@ -666,13 +672,27 @@ pub fn run() {
             backend::design::design_write_export,
             backend::design::design_write_artifact,
             backend::project_skill::skills_list,
+            backend::project_skill::skills_list_profiles,
+            backend::tools_assignment::tools_assignment_list,
+            backend::tools_assignment::tools_assignment_set,
+            backend::tools_assignment::tools_library_list,
+            backend::global_skills::global_skills_list,
+            backend::global_skills::global_skills_save,
+            backend::global_skills::global_skills_delete,
+            backend::global_skills::global_skills_install_bundled,
+            backend::global_skills::global_skills_marketplace_install,
             backend::project_skill::skills_save,
+            backend::project_skill::skills_save_profile,
             backend::project_skill::skills_set_enabled,
+            backend::project_skill::skills_set_enabled_profile,
             backend::project_skill::skills_catalog,
             backend::project_skill::skills_install_from_catalog,
             backend::project_skill::skills_list_langs,
             backend::project_skill::skills_save_lang,
             backend::project_skill::skills_reset_lang,
+            backend::project_skill::skills_list_langs_profile,
+            backend::project_skill::skills_save_lang_profile,
+            backend::project_skill::skills_reset_lang_profile,
             backend::project_skill::skills_lang_catalog,
             backend::project_skill::skills_marketplace_preview,
             backend::project_skill::skills_marketplace_install,

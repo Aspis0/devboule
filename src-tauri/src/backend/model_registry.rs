@@ -266,6 +266,21 @@ fn model_param_billions(name: &str, param_size: Option<&str>) -> Option<f64> {
     param_size.and_then(largest_b).or_else(|| largest_b(name))
 }
 
+/// P5 (Work Console skill injection): map a mini's MODEL name to its capability-tier PROFILE
+/// (`"mini-big"` | `"mini-small"`) so a launched mini receives the correct tier's SKILL.md.
+/// Reuses the SAME size threshold as [`recommended_tier`] (>= 20B params -> capable) so the
+/// runtime tier matches the size shown in the Work Console tier switcher ("32B big / 8B small").
+/// An UNKNOWN/absent size -> `"mini-big"` (the plan's default: the capable tier is the safer
+/// fallback for a missing signal, and the skill reader still falls back to the legacy `mini`
+/// skill when no `mini-big/SKILL.md` exists, so nothing regresses).
+pub(crate) fn mini_tier_profile(model: Option<&str>) -> &'static str {
+    match model.and_then(|m| model_param_billions(m, None)) {
+        Some(billions) if billions >= 20.0 => "mini-big",
+        Some(_) => "mini-small",
+        None => "mini-big",
+    }
+}
+
 /// Size-recommended tier (UI hint; the user still chooses). >= 20B -> "agentic",
 /// else (or unknown size) -> the safer "emitEdits".
 fn recommended_tier(name: &str, param_size: Option<&str>) -> String {
@@ -362,6 +377,18 @@ mod tests {
         assert_eq!(recommended_tier("anything", Some("7B")), "emitEdits");
         // Unknown size → the safer default.
         assert_eq!(recommended_tier("mystery-model", None), "emitEdits");
+    }
+
+    #[test]
+    fn mini_tier_profile_maps_by_size() {
+        // Capable (>= 20B) -> mini-big; small (< 20B) -> mini-small.
+        assert_eq!(mini_tier_profile(Some("Qwen3.6-35B-A3B-4bit-DWQ")), "mini-big");
+        assert_eq!(mini_tier_profile(Some("qwen3:30b-a3b")), "mini-big");
+        assert_eq!(mini_tier_profile(Some("Qwen3.5-9B-MLX-4bit")), "mini-small");
+        assert_eq!(mini_tier_profile(Some("gemma-2-2b")), "mini-small");
+        // Unknown size or no model -> the capable default (skill reader falls back to legacy mini).
+        assert_eq!(mini_tier_profile(Some("mystery-model")), "mini-big");
+        assert_eq!(mini_tier_profile(None), "mini-big");
     }
 
     #[test]

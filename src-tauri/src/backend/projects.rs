@@ -1813,7 +1813,28 @@ fn prepare_or_launch_project_agent(
     // The MINI never reaches this path — design §6 mini-exclusion holds by construction.
     let user_servers: Vec<user_mcp_config::UserMcpServer> =
         if client == "codex" || client == "claude" {
-            user_mcp_config::merged_servers(&app, &root_path)
+            let merged = user_mcp_config::merged_servers(&app, &root_path);
+            // P5 (Work Console per-role tools): when this launch is the MAIN coder (role "coder";
+            // the owner's "main = coder" resolution of the open item), NARROW the merged catalog to
+            // the `coder` profile's `.claude/tools/coder/tools.json` assignment. `inject_servers_for_profile`
+            // only ever REMOVES servers from the already-§9-allowlisted `merged` set; an ABSENT
+            // assignment keeps ALL servers (byte-identical to the pre-P5 launch), so a project that
+            // never opened the modal is unaffected. `role == "coder"` is the VAULT role: it covers
+            // the codex/claude main coder AND a cloud-duplex orchestrator (which normalizes to the
+            // "coder" vault role) — both are "main" under the owner's main=coder decision, so both
+            // honor the coder profile assignment. Non-coder vault roles (e.g. design/verifier) fall
+            // through unfiltered — their profiles are "coming soon" / not active yet. The LOCAL
+            // orchestrator client never reaches this branch (it gets Vec::new() and injects via
+            // `orchestrator_env_json` below), so it is unaffected.
+            if role == "coder" {
+                if let Some(root_str) = root_path.to_str() {
+                    super::tools_assignment::inject_servers_for_profile(root_str, "coder", merged)
+                } else {
+                    merged
+                }
+            } else {
+                merged
+            }
         } else {
             Vec::new()
         };

@@ -116,7 +116,7 @@ const TOP_REFERENCED_SYMBOLS: usize = 5;
 /// artifacts / dependency trees that are never part of the project's own architecture
 /// and would blow the file cap with vendored code. `.git` is already skipped as a
 /// hidden dir; the rest are NOT hidden so we must name them.
-const SKIP_DIRS: [&str; 6] = ["target", "node_modules", "dist", "build", "out", ".git"];
+pub(crate) const SKIP_DIRS: [&str; 6] = ["target", "node_modules", "dist", "build", "out", ".git"];
 
 /// One node in the structure graph: a single source file and its degree in the
 /// cross-file reference graph. Serialized camelCase for the later MCP/JSON exposure +
@@ -189,14 +189,19 @@ pub struct StructureGraph {
 
 /// Per-file facts collected during the walk, before the cross-file edge pass. Kept in
 /// walk order; the graph output is sorted at the end.
-struct FileFacts {
+pub(crate) struct FileFacts {
     /// `/`-separated, root-relative path string (the stable node key).
-    path: String,
-    lang: FileLang,
+    pub(crate) path: String,
+    pub(crate) lang: FileLang,
     /// DISTINCT top-level defined symbol names (non-empty `ReviewItem.name`s).
-    defined: BTreeSet<String>,
+    pub(crate) defined: BTreeSet<String>,
     /// Whole-file identifier set the grammar saw (referenced names).
-    identifiers: BTreeSet<String>,
+    pub(crate) identifiers: BTreeSet<String>,
+    /// Total source lines (for the CKG FILE node's end_line).
+    pub(crate) total_lines: u32,
+    /// The full parsed top-level items (kind/name/start_line/end_line) — the CKG's symbol nodes.
+    /// Carried so the CKG reuses THIS parse instead of re-walking + re-parsing the tree.
+    pub(crate) items: Vec<ReviewItem>,
 }
 
 /// Build the deterministic cross-file structure graph + spine for `project_root`.
@@ -389,7 +394,7 @@ where
 /// Parse exactly the `--root <path>` flag out of the trailing args (everything after the
 /// `structure` subcommand). Requires the flag and a non-empty value; rejects unknown
 /// tokens so a typo fails loudly instead of silently walking the wrong tree.
-fn parse_root_flag(rest: &[String]) -> Result<String, String> {
+pub(crate) fn parse_root_flag(rest: &[String]) -> Result<String, String> {
     let mut root: Option<String> = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
@@ -428,12 +433,12 @@ fn top_referenced_symbols(symbol_referrers: &BTreeMap<String, BTreeSet<usize>>) 
 
 /// The outcome of [`collect_files`]: the per-file facts plus the skip tallies and the
 /// `capped` flag (set when a hard work bound stopped the walk early).
-struct ScanResult {
-    facts: Vec<FileFacts>,
-    skipped_too_large: u32,
-    skipped_unsupported: u32,
-    skipped_unreadable: u32,
-    capped: bool,
+pub(crate) struct ScanResult {
+    pub(crate) facts: Vec<FileFacts>,
+    pub(crate) skipped_too_large: u32,
+    pub(crate) skipped_unsupported: u32,
+    pub(crate) skipped_unreadable: u32,
+    pub(crate) capped: bool,
 }
 
 /// Walk `project_root` and collect the per-file facts for every parseable source file.
@@ -454,7 +459,7 @@ struct ScanResult {
 /// non-UTF-8 path segment (a node key MUST be lossless) in `skipped_unreadable`. None of
 /// these is fatal — they are dropped from the graph but always counted, so every walk
 /// entry that reached the per-file stage is accounted for.
-fn collect_files(project_root: &Path) -> ScanResult {
+pub(crate) fn collect_files(project_root: &Path) -> ScanResult {
     collect_files_bounded(project_root, MAX_FILES, MAX_WALK_ENTRIES)
 }
 
@@ -565,6 +570,7 @@ fn collect_files_bounded(
 
         let parsed = extract::parse_file(&source, lang);
         let defined = defined_symbol_names(&parsed.items);
+        let total_lines = parsed.total_lines;
         // Move the grammar's identifier set into a BTreeSet for deterministic iteration.
         let identifiers: BTreeSet<String> = parsed.identifiers.into_iter().collect();
 
@@ -573,6 +579,8 @@ fn collect_files_bounded(
             lang,
             defined,
             identifiers,
+            total_lines,
+            items: parsed.items,
         });
     }
 
@@ -590,7 +598,7 @@ fn collect_files_bounded(
 /// `GithubActions`/`Css`) and [`FileLang::Other`] yield empty items + empty identifiers
 /// (see `extract::parse_file`), so they contribute NOTHING to the graph — we skip them
 /// up front and count them as unsupported rather than parsing to an empty result.
-fn is_parseable(lang: FileLang) -> bool {
+pub(crate) fn is_parseable(lang: FileLang) -> bool {
     matches!(
         lang,
         FileLang::Rust
@@ -628,7 +636,7 @@ fn defined_symbol_names(items: &[ReviewItem]) -> BTreeSet<String> {
 /// replacement would let two distinct non-UTF-8 names collide onto the same key. On
 /// macOS/Linux/Windows, ordinary UTF-8 names are unaffected. Normalizing the separator
 /// makes the key — and the whole graph + spine ordering — identical across OSes.
-fn relative_path_string(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn relative_path_string(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let mut out = String::new();
     for comp in rel.components() {

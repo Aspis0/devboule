@@ -22,6 +22,8 @@ from oracle.server.answerer import answer_from_context
 from oracle.server.query_engine import lexical_chunk_context
 from oracle.store.lance_store import LanceStore
 from oracle.store.sqlite_store import SQLiteStore
+from oracle.store.ckg_store import CkgStore
+from oracle.config import CKG_DB_PATH
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -353,6 +355,8 @@ ROLE_RULES = [
             "oracle_ask",
             "oracle_context",
             "project_structure",
+            "get_neighborhood",
+            "find_imports",
             "censor_findings",
             "censor_dispose",
             "visual_check",
@@ -437,6 +441,8 @@ ROLE_RULES = [
             "oracle_ask",
             "oracle_context",
             "project_structure",
+            "get_neighborhood",
+            "find_imports",
             "spawn_mini_coder",
             # ROLE UNTANGLE Phase 3: the orchestrator dispatches substantial work
             # to the first-class MAIN CODER (always-agentic sandboxed engine).
@@ -492,6 +498,8 @@ ROLE_RULES = [
             "oracle_ask",
             "oracle_context",
             "project_structure",
+            "get_neighborhood",
+            "find_imports",
             "censor_findings",
             "censor_dispose",
             "visual_check",
@@ -517,6 +525,8 @@ ROLE_RULES = [
             "agent_register",
             "oracle_context",
             "project_structure",
+            "get_neighborhood",
+            "find_imports",
         ],
         "forbidden": [
             "Non modifica codice, task, Kanban, provider o findings: NESSUN tool di mutazione.",
@@ -1033,6 +1043,30 @@ TOOLS = [
         "parameters": {
             "project_id": {"type": "string"},
             "full": {"type": "boolean", "default": False},
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "get_neighborhood",
+        "description": "Read-only (CKG): i nodi a k-hop da un nodo simbolo/file nel grafo di conoscenza del codice (archi CONTAIN/IMPORT/...). `node_id` e' un file_id o 'file#start-end-idx' (ottienilo da project_structure).",
+        "parameters": {
+            "project_id": {"type": "string"},
+            "node_id": {"type": "string"},
+            "k": {"type": "integer", "default": 1},
+            "kind": {"type": "string", "default": ""},
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "find_imports",
+        "description": "Read-only (CKG): gli IMPORT in uscita da un file (gli archi IMPORT del grafo di conoscenza del codice).",
+        "parameters": {
+            "project_id": {"type": "string"},
+            "file": {"type": "string"},
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
@@ -5506,6 +5540,65 @@ def dispatch_project_structure(
     }
 
 
+def dispatch_get_neighborhood(projects_dir: Path, state_lock: Path, args: dict[str, Any], *, store: Any = None) -> dict[str, Any]:
+    """Read-only CKG tool: the k-hop neighborhood of a symbol/file node, SCOPED to the agent's
+    project (a node outside the project's allowed file_ids is rejected, and the returned
+    neighborhood is filtered to in-scope nodes only — never another project's graph)."""
+    agent_id, role = require_agent_tool(projects_dir, args, "get_neighborhood")
+    if "get_neighborhood" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use get_neighborhood.")
+    project_id = normalize_project_id(str(args.get("project_id") or "").strip())
+    if not project_id:
+        raise McpError("project_id is required.")
+    enforce_mini_oracle_project_scope(projects_dir, agent_id, role, args)
+    node_id = str(args.get("node_id") or "").strip()
+    if not node_id:
+        raise McpError("node_id is required.")
+    raw_k = args.get("k")
+    try:
+        k = int(raw_k) if raw_k is not None else 1
+    except (TypeError, ValueError):
+        k = 1
+    k = max(1, min(k, 4))
+    kind = args.get("kind")
+    if isinstance(kind, str) and not kind.strip():
+        kind = None
+    allowed = oracle_allowed_file_ids(projects_dir, args) or set()
+    if node_id.split("#", 1)[0] not in allowed:
+        raise McpError("node is not in this project's scope.")
+    s = store or CkgStore(CKG_DB_PATH)
+    rows = s.get_neighborhood(node_id, k, kind)
+    neighborhood = [r for r in rows if r["id"].split("#", 1)[0] in allowed]
+    audit_agent_read(projects_dir, state_lock, agent_id, role, "get_neighborhood",
+                     f"Read CKG neighborhood of {node_id} (k={k}, {len(neighborhood)} nodes).", project_id)
+    return {"projectId": project_id, "nodeId": node_id, "neighborhood": neighborhood}
+
+
+def dispatch_find_imports(projects_dir: Path, state_lock: Path, args: dict[str, Any], *, store: Any = None) -> dict[str, Any]:
+    """Read-only CKG tool: the IMPORT edges out of a file, SCOPED to the agent's project."""
+    agent_id, role = require_agent_tool(projects_dir, args, "find_imports")
+    if "find_imports" not in ROLE_ALLOWED_TOOLS.get(role, set()):
+        raise McpError(f"{role} agents cannot use find_imports.")
+    project_id = normalize_project_id(str(args.get("project_id") or "").strip())
+    if not project_id:
+        raise McpError("project_id is required.")
+    enforce_mini_oracle_project_scope(projects_dir, agent_id, role, args)
+    file = str(args.get("file") or "").strip()
+    if not file:
+        raise McpError("file is required.")
+    allowed = oracle_allowed_file_ids(projects_dir, args) or set()
+    if file not in allowed:
+        raise McpError("file is not in this project's scope.")
+    s = store or CkgStore(CKG_DB_PATH)
+    imports = s.find_imports(file)
+    # SCOPE: drop any IMPORT edge whose TARGET is outside the project (mirrors the neighborhood
+    # filter) — prevents leaking out-of-scope file paths once a multi-project CKG / IMPORT edges land.
+    imports = [i for i in imports if i.get("dst", "").split("#", 1)[0] in allowed]
+    audit_agent_read(projects_dir, state_lock, agent_id, role, "find_imports",
+                     f"Read CKG imports of {file} ({len(imports)} edges).", project_id)
+    return {"projectId": project_id, "file": file, "imports": imports}
+
+
 def _read_censor_shard(path: Path) -> dict[str, Any] | None:
     """Read one shard JSON. `None` for a genuinely-absent file; a present-but-
     corrupt shard is returned as `None` here for the LISTING path (best-effort,
@@ -7798,6 +7891,12 @@ def handle_tool_call(
 
     if name == "project_structure":
         return dispatch_project_structure(projects_dir, state_lock, args)
+
+    if name == "get_neighborhood":
+        return dispatch_get_neighborhood(projects_dir, state_lock, args)
+
+    if name == "find_imports":
+        return dispatch_find_imports(projects_dir, state_lock, args)
 
     if name == "project_list":
         agent_id, role = require_agent_tool(projects_dir, args, name)

@@ -9,6 +9,10 @@ fn main() {
     if let Some(code) = aspis_management_lib::run_structure_cli_from_args() {
         std::process::exit(code);
     }
+    // Headless CKG bridge: `aspis-management ckg --root <path>` (parallel to `structure`).
+    if let Some(code) = aspis_management_lib::run_ckg_cli_from_args() {
+        std::process::exit(code);
+    }
     if let Some(code) = aspis_management_lib::run_auth_helper_from_args() {
         std::process::exit(code);
     }

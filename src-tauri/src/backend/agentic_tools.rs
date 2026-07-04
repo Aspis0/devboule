@@ -179,6 +179,9 @@ pub struct ScopedAgentTools {
     /// `write_allowlist` is a task-scope error — it does NOT set this signal.  Only paths
     /// genuinely outside (root + working_set) trigger the folder-consent flow.
     out_of_scope_write: Option<String>,
+    /// A3: when `Some`, the read-only `oracle_ask` tool is enabled, scoped to these allowed
+    /// file_ids (the mini's project's indexed files). `None` = the tool is unavailable.
+    oracle_scope: Option<Vec<String>>,
 }
 
 impl ScopedAgentTools {
@@ -191,6 +194,7 @@ impl ScopedAgentTools {
             net_blocked: false,
             working_set: Vec::new(),
             out_of_scope_write: None,
+            oracle_scope: None,
         }
     }
 
@@ -219,6 +223,14 @@ impl ScopedAgentTools {
             .into_iter()
             .filter_map(|p| p.canonicalize().ok())
             .collect();
+        self
+    }
+
+    /// A3: enable the read-only `oracle_ask` tool, scoped to these allowed file_ids (the mini's
+    /// project's indexed files, resolved by `oracle_agent_scope_file_ids`). An empty Vec still
+    /// enables the tool but the bounded endpoint returns a grounded-empty answer (no documents).
+    pub fn with_oracle(mut self, allowed_file_ids: Vec<String>) -> Self {
+        self.oracle_scope = Some(allowed_file_ids);
         self
     }
 
@@ -914,6 +926,16 @@ impl AgentTools for ScopedAgentTools {
                     args["command"].as_str().ok_or_else(|| "missing 'command'".to_string())?;
                 self.run(command)
             }
+            "oracle_ask" => match &self.oracle_scope {
+                Some(scope) => {
+                    let query = args["query"].as_str().unwrap_or("");
+                    if query.trim().is_empty() {
+                        return Err("oracle_ask requires a non-empty 'query'".to_string());
+                    }
+                    crate::oracle::python_oracle::oracle_agent_ask(query, scope)
+                }
+                None => Err("oracle_ask is not available for this run".to_string()),
+            },
             other => Err(format!("tool not available: {other}")),
         }
     }

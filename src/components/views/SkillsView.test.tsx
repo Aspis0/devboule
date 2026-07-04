@@ -1,718 +1,80 @@
 // @vitest-environment jsdom
 //
-// P10(b) Step 3 — SkillsView. The view owns a native folder picker, lists per-role
-// skills on pick/refresh, and saves/toggles/installs against the backend. This uses
-// jsdom + createRoot + act (the repo's interactive-test pattern, mirroring
-// MiniWriteBehaviorCard.test.tsx). We mock invokeBackendCommand to drive the five
-// skills_* commands and the dialog plugin's `open` to return a chosen folder.
+// SkillsView is now GLOBAL-only: a Library tab (global skill store + URL install) and a Tools tab
+// (global MCP). All per-project/per-role skill editing moved to the Work Console modal, so this
+// suite only covers the global shell + tab switching.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
-import type {
-  CatalogEntry,
-  LangCatalogEntry,
-  LangEntry,
-  SkillEntry,
-} from "../../types/skills";
-
-(
-  globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }
-).IS_REACT_ACT_ENVIRONMENT = true;
-
-// --- mock state --------------------------------------------------------------
-const FOLDER = "/tmp/project";
-
-function makeEntries(
-  overrides: Partial<Record<string, Partial<SkillEntry>>> = {},
-): SkillEntry[] {
-  const base: SkillEntry[] = [
-    {
-      role: "mini",
-      exists: true,
-      enabled: true,
-      content: "mini body",
-      bytes: 9,
-      truncated: false,
-    },
-    {
-      role: "coder",
-      exists: true,
-      enabled: false,
-      content: "coder body",
-      bytes: 10,
-      truncated: false,
-    },
-    {
-      role: "design",
-      exists: false,
-      enabled: true,
-      content: "",
-      bytes: 0,
-      truncated: false,
-    },
-  ];
-  return base.map((e) => ({ ...e, ...(overrides[e.role] ?? {}) }));
-}
-
-const CATALOG: CatalogEntry[] = [
-  {
-    id: "starter-mini",
-    name: "Mini executor — edit discipline",
-    role: "mini",
-    description: "Stay in scope, emit clean edits.",
-    sourceUrl: null,
-    body: "# mini template",
-  },
-  {
-    id: "starter-coder",
-    name: "Coder agent — delivery discipline",
-    role: "coder",
-    description: "Delegate mechanical edits.",
-    sourceUrl: null,
-    body: "# coder template",
-  },
-];
-
-const LANG_CATALOG: LangCatalogEntry[] = [
-  {
-    lang: "rust",
-    name: "rust idioms",
-    description: "Veteran rust conventions.",
-    source: "bundled",
-    body: "rust body",
-  },
-  {
-    lang: "node",
-    name: "node idioms",
-    description: "Veteran node conventions.",
-    source: "bundled",
-    body: "node body",
-  },
-];
-
-// skills_list_langs(role) → two rows; rust is a PROJECT override for coder, bundled elsewhere.
-function langEntriesFor(role: string): LangEntry[] {
-  const r = role as SkillEntry["role"];
-  return [
-    {
-      role: r,
-      lang: "rust",
-      source: role === "coder" ? "project" : "bundled",
-      content: role === "coder" ? "PROJECT RUST" : "rust body",
-      bytes: 9,
-      truncated: role === "coder", // coder/rust is an oversized override (truncation guard test)
-    },
-    {
-      role: r,
-      lang: "node",
-      source: "bundled",
-      content: "node body",
-      bytes: 9,
-      truncated: false,
-    },
-  ];
-}
-
-let listEntries: SkillEntry[];
-let listThrowsOnce = false;
-let setEnabledThrowsOnce = false;
-const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
-
-const invokeMock = vi.fn(
-  async (name: string, args?: Record<string, unknown>) => {
-    calls.push({ name, args });
-    if (name === "skills_catalog") return CATALOG;
-    if (name === "skills_list") {
-      if (listThrowsOnce) {
-        listThrowsOnce = false;
-        throw new Error("list failed");
-      }
-      return listEntries;
-    }
-    if (name === "skills_set_enabled") {
-      if (setEnabledThrowsOnce) {
-        setEnabledThrowsOnce = false;
-        throw new Error(
-          "skills-state.json exists but is unreadable or corrupt; fix or delete it before changing a skill toggle",
-        );
-      }
-      return null;
-    }
-    if (name === "skills_save") return null;
-    if (name === "skills_install_from_catalog") return null;
-    if (name === "skills_lang_catalog") return LANG_CATALOG;
-    if (name === "skills_list_langs")
-      return langEntriesFor((args?.role as string) ?? "");
-    if (name === "skills_save_lang") return null;
-    if (name === "skills_reset_lang") return null;
-    return null;
-  },
-);
+const invokeMock = vi.fn(async (...args: unknown[]): Promise<unknown> => {
+  const cmd = args[0] as string;
+  if (cmd === "global_skills_list") return [];
+  if (cmd === "skills_library_catalog") return [];
+  if (cmd === "user_mcp_list" || cmd === "user_mcp_allowed_commands_list") return [];
+  return undefined;
+});
 
 vi.mock("../../context/AppContext", () => ({
-  invokeBackendCommand: (name: string, args?: Record<string, unknown>) =>
-    invokeMock(name, args),
-}));
-
-// Mock the dialog plugin's dynamic import so pickFolder resolves to FOLDER.
-let dialogReturns: string | null = FOLDER;
-vi.mock("@tauri-apps/plugin-dialog", () => ({
-  open: vi.fn(async () => dialogReturns),
+  invokeBackendCommand: (...a: unknown[]) => invokeMock(...(a as [])),
 }));
 
 import { SkillsView } from "./SkillsView";
 
-let container: HTMLDivElement;
-let root: Root;
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function flush() {
-  await act(async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-  });
-}
+describe("SkillsView (global-only shell)", () => {
+  let root: Root;
+  let container: HTMLDivElement;
 
-async function mount() {
-  container = document.createElement("div");
-  document.body.appendChild(container);
-  root = createRoot(container);
-  await act(async () => {
-    root.render(createElement(SkillsView));
-  });
-  await flush();
-}
-
-// Click the "Choose project folder" button and let the list resolve.
-async function chooseFolder() {
-  const btn = Array.from(container.querySelectorAll("button")).find((b) =>
-    b.textContent?.includes("Choose project folder"),
-  ) as HTMLButtonElement;
-  await act(async () => {
-    btn.click();
-    await Promise.resolve();
-  });
-  await flush();
-}
-
-function roleSwitches(): HTMLButtonElement[] {
-  return Array.from(
-    container.querySelectorAll('[role="switch"]'),
-  ) as HTMLButtonElement[];
-}
-
-// Drive a React-controlled <textarea>: set the value via the native prototype
-// setter, then dispatch a real InputEvent (React 18 listens for `input` on
-// textareas), all inside act(). Centralised so the brittle bits live in ONE
-// place if React/jsdom change. Mirrors the repo's pure-jsdom test pattern (no
-// @testing-library/react in this project).
-const NATIVE_TEXTAREA_VALUE_SETTER = Object.getOwnPropertyDescriptor(
-  window.HTMLTextAreaElement.prototype,
-  "value",
-)!.set!;
-
-async function editTextarea(el: HTMLTextAreaElement, value: string) {
-  await act(async () => {
-    NATIVE_TEXTAREA_VALUE_SETTER.call(el, value);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await Promise.resolve();
-  });
-}
-
-const NATIVE_INPUT_VALUE_SETTER = Object.getOwnPropertyDescriptor(
-  window.HTMLInputElement.prototype,
-  "value",
-)!.set!;
-
-async function editInput(el: HTMLInputElement, value: string) {
-  await act(async () => {
-    NATIVE_INPUT_VALUE_SETTER.call(el, value);
-    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await Promise.resolve();
-  });
-}
-
-function saveButton(): HTMLButtonElement {
-  return Array.from(container.querySelectorAll("button")).find(
-    (b) => b.textContent === "Save",
-  ) as HTMLButtonElement;
-}
-
-beforeEach(() => {
-  listEntries = makeEntries();
-  listThrowsOnce = false;
-  setEnabledThrowsOnce = false;
-  dialogReturns = FOLDER;
-  calls.length = 0;
-  invokeMock.mockClear();
-});
-
-afterEach(() => {
-  act(() => root.unmount());
-  container.remove();
-});
-
-describe("SkillsView", () => {
-  it("shows the empty-state prompt and NO role cards before a folder is chosen", async () => {
-    await mount();
-    expect(container.innerHTML).toContain(
-      "Choose a project folder to manage its skills",
-    );
-    // No role toggles render until a folder is chosen.
-    expect(roleSwitches().length).toBe(0);
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    invokeMock.mockClear();
   });
 
-  it("renders the role cards from skills_list after choosing a folder", async () => {
-    await mount();
-    await chooseFolder();
-    // Four roles now (orchestrator joined mini/coder/design).
-    expect(roleSwitches().length).toBe(4);
-    const html = container.innerHTML;
-    expect(html).toContain("Mini");
-    expect(html).toContain("Coder");
-    expect(html).toContain("Design");
-    expect(html).toContain("Orchestrator");
-    // The status lines reflect the mocked entries.
-    expect(html).toContain("active"); // mini exists+enabled
-    expect(html).toContain("disabled"); // coder exists+disabled
-    expect(html).toContain("no skill yet"); // design absent
-    // skills_list was called with the picked folder.
-    const listCall = calls.find((c) => c.name === "skills_list");
-    expect(listCall?.args).toEqual({ workingFolderPath: FOLDER });
-  });
-
-  it("toggles a role via skills_set_enabled with the right args and re-lists", async () => {
-    await mount();
-    await chooseFolder();
-    calls.length = 0;
-    // mini is the first card (enabled) -> clicking should set enabled=false.
-    const miniSwitch = roleSwitches()[0];
+  afterEach(async () => {
     await act(async () => {
-      miniSwitch.click();
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  async function mount(): Promise<void> {
+    await act(async () => {
+      root.render(createElement(SkillsView));
+    });
+    await act(async () => {
       await Promise.resolve();
     });
-    await flush();
-    const setCall = calls.find((c) => c.name === "skills_set_enabled");
-    expect(setCall?.args).toEqual({
-      workingFolderPath: FOLDER,
-      role: "mini",
-      enabled: false,
-    });
-    // It re-lists after the toggle.
-    expect(calls.some((c) => c.name === "skills_list")).toBe(true);
+  }
+
+  it("renders the global view container and both tabs (no folder picker)", async () => {
+    await mount();
+    expect(document.querySelector("[data-testid='skills-view']")).toBeTruthy();
+    expect(document.querySelector("[data-testid='skills-view-tab-library']")).toBeTruthy();
+    expect(document.querySelector("[data-testid='skills-view-tab-tools']")).toBeTruthy();
   });
 
-  it("saves the draft via skills_save with the current content", async () => {
+  it("defaults to the Library tab: global library panel + URL install section", async () => {
     await mount();
-    await chooseFolder();
-    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
-    await editTextarea(textarea, "edited mini body");
-    calls.length = 0;
+    expect(document.querySelector("[data-testid='global-library-panel']")).toBeTruthy();
+    expect(document.body.textContent).toContain("Install from a URL");
+  });
+
+  it("switches to the Tools tab (library panel unmounts)", async () => {
+    await mount();
+    expect(document.querySelector("[data-testid='global-library-panel']")).toBeTruthy();
     await act(async () => {
-      saveButton().click();
+      document
+        .querySelector("[data-testid='skills-view-tab-tools']")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
       await Promise.resolve();
     });
-    await flush();
-    const saveCall = calls.find((c) => c.name === "skills_save");
-    // The EDITED text (not the seeded "mini body") reaches the backend.
-    expect(saveCall?.args).toEqual({
-      workingFolderPath: FOLDER,
-      role: "mini",
-      content: "edited mini body",
-    });
-  });
-
-  it("drops a second mutation fired before the first settles (synchronous busy lock)", async () => {
-    await mount();
-    await chooseFolder();
-    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
-    await editTextarea(textarea, "edited mini body");
-    calls.length = 0;
-    // Two Save clicks in the SAME tick, before `busy` state propagates: the
-    // synchronous busyRef gate must drop the second so skills_save fires once.
-    await act(async () => {
-      const btn = saveButton();
-      btn.click();
-      btn.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const saveCalls = calls.filter((c) => c.name === "skills_save");
-    expect(saveCalls.length).toBe(1);
-  });
-
-  it("disables Save when the draft byte length exceeds 8192", async () => {
-    await mount();
-    await chooseFolder();
-    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
-    await editTextarea(textarea, "a".repeat(8193));
-    expect(saveButton().disabled).toBe(true);
-    expect(container.innerHTML).toContain("trim to 8192 bytes before saving");
-  });
-
-  it("counts BYTES not chars (multi-byte chars push over the cap)", async () => {
-    await mount();
-    await chooseFolder();
-    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
-    // 3000 "€" = 3000 chars but 9000 bytes (3 bytes each) -> over cap.
-    await editTextarea(textarea, "€".repeat(3000));
-    expect(saveButton().disabled).toBe(true);
-    expect(container.innerHTML).toContain("9000 / 8192 bytes");
-  });
-
-  it("gates Save behind the explicit acknowledgement when truncated, and shows the warning", async () => {
-    listEntries = makeEntries({
-      mini: { truncated: true, content: "a".repeat(8192), bytes: 8192 },
-    });
-    await mount();
-    await chooseFolder();
-    expect(container.innerHTML).toContain(
-      "Saving will permanently discard everything past",
-    );
-    // The mini card's Save is disabled until the checkbox is ticked.
-    expect(saveButton().disabled).toBe(true);
-    const checkbox = container.querySelector(
-      'input[type="checkbox"]',
-    ) as HTMLInputElement;
-    expect(checkbox).not.toBeNull();
-    await act(async () => {
-      checkbox.click();
-      await Promise.resolve();
-    });
-    expect(saveButton().disabled).toBe(false);
-  });
-
-  it("installs a template via skills_install_from_catalog (confirming overwrite when the skill exists)", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-    await mount();
-    await chooseFolder();
-    calls.length = 0;
-    // The mini card exists -> install must confirm before overwriting.
-    const installBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Mini executor — edit discipline"),
-    ) as HTMLButtonElement;
-    expect(installBtn).toBeDefined();
-    await act(async () => {
-      installBtn.click();
-      await Promise.resolve();
-    });
-    await flush();
-    expect(confirmSpy).toHaveBeenCalledTimes(1);
-    const installCall = calls.find(
-      (c) => c.name === "skills_install_from_catalog",
-    );
-    expect(installCall?.args).toEqual({
-      workingFolderPath: FOLDER,
-      role: "mini",
-      catalogId: "starter-mini",
-    });
-    confirmSpy.mockRestore();
-  });
-
-  it("does NOT install when the overwrite confirm is declined", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    await mount();
-    await chooseFolder();
-    calls.length = 0;
-    const installBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Mini executor — edit discipline"),
-    ) as HTMLButtonElement;
-    await act(async () => {
-      installBtn.click();
-      await Promise.resolve();
-    });
-    await flush();
-    expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(calls.some((c) => c.name === "skills_install_from_catalog")).toBe(
-      false,
-    );
-    confirmSpy.mockRestore();
-  });
-
-  it("preserves an unsaved draft in one role when another role is toggled (re-list)", async () => {
-    await mount();
-    await chooseFolder();
-    // Edit the coder draft (2nd textarea) but do NOT save it.
-    const textareas = Array.from(
-      container.querySelectorAll("textarea"),
-    ) as HTMLTextAreaElement[];
-    const coderArea = textareas[1];
-    await editTextarea(coderArea, "UNSAVED coder edit");
-    // Toggle the mini skill — this triggers a re-list. The coder draft must survive.
-    const miniSwitch = roleSwitches()[0];
-    await act(async () => {
-      miniSwitch.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const coderAreaAfter = (
-      Array.from(
-        container.querySelectorAll("textarea"),
-      ) as HTMLTextAreaElement[]
-    )[1];
-    expect(coderAreaAfter.value).toBe("UNSAVED coder edit");
-  });
-
-  it("force-reseeds the just-saved role from the backend re-list while preserving another role's unsaved edit", async () => {
-    await mount();
-    await chooseFolder();
-    // Diverge BOTH the mini (1st) and coder (2nd) textareas from their loaded
-    // content. Only mini gets saved; coder's edit must survive the post-save
-    // re-list (it diverged and was not the forceReseed role).
-    const textareas = Array.from(
-      container.querySelectorAll("textarea"),
-    ) as HTMLTextAreaElement[];
-    const miniArea = textareas[0];
-    const coderArea = textareas[1];
-    await editTextarea(miniArea, "edited mini draft");
-    await editTextarea(coderArea, "UNSAVED coder edit");
-    // The post-save re-list returns NEW mini content (the backend normalised the
-    // saved body); the just-saved mini role must force-reseed to THIS value, not
-    // keep the pre-save "edited mini draft".
-    listEntries = makeEntries({
-      mini: { content: "normalised mini body", bytes: 20 },
-    });
-    calls.length = 0;
-    await act(async () => {
-      // saveButton() returns the FIRST Save button — the mini card's.
-      saveButton().click();
-      await Promise.resolve();
-    });
-    await flush();
-    // skills_save fired with the edited mini draft, then a re-list followed.
-    const saveCall = calls.find((c) => c.name === "skills_save");
-    expect(saveCall?.args).toEqual({
-      workingFolderPath: FOLDER,
-      role: "mini",
-      content: "edited mini draft",
-    });
-    expect(calls.some((c) => c.name === "skills_list")).toBe(true);
-    const after = Array.from(
-      container.querySelectorAll("textarea"),
-    ) as HTMLTextAreaElement[];
-    // (1) mini force-reseeded to the new backend content (NOT the pre-save draft).
-    expect(after[0].value).toBe("normalised mini body");
-    // (2) coder's unsaved edit preserved (diverged, not the saved role).
-    expect(after[1].value).toBe("UNSAVED coder edit");
-  });
-
-  it("surfaces a backend error (corrupt skills-state) verbatim in the banner", async () => {
-    await mount();
-    await chooseFolder();
-    setEnabledThrowsOnce = true;
-    const miniSwitch = roleSwitches()[0];
-    await act(async () => {
-      miniSwitch.click();
-      await Promise.resolve();
-    });
-    await flush();
-    expect(container.innerHTML).toContain(
-      "skills-state.json exists but is unreadable or corrupt",
-    );
-  });
-
-  // --- Phase 3b/3c: language personas + Discover + search --------------------
-
-  it("renders language persona rows per role with bundled/project source badges", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-rust"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-node"]'),
-    ).not.toBeNull();
-    const html = container.innerHTML;
-    expect(html).toContain("project"); // coder/rust is a project override
-    expect(html).toContain("bundled"); // coder/node is the bundled default
-  });
-
-  it("forks a bundled language persona via skills_save_lang (Customize → Save)", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    calls.length = 0;
-    const row = container.querySelector(
-      '[data-testid="lang-row-coder-node"]',
-    ) as HTMLElement;
-    const customize = Array.from(row.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Customize"),
-    ) as HTMLButtonElement;
-    await act(async () => {
-      customize.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const saveBtn = Array.from(row.querySelectorAll("button")).find(
-      (b) => b.textContent === "Save",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      saveBtn.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const call = calls.find((c) => c.name === "skills_save_lang");
-    expect(call?.args).toMatchObject({
-      workingFolderPath: FOLDER,
-      role: "coder",
-      lang: "node",
-    });
-  });
-
-  it("resets a project language override via skills_reset_lang", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    calls.length = 0;
-    const row = container.querySelector(
-      '[data-testid="lang-row-coder-rust"]',
-    ) as HTMLElement;
-    const reset = Array.from(row.querySelectorAll("button")).find(
-      (b) => b.textContent === "Reset",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      reset.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const call = calls.find((c) => c.name === "skills_reset_lang");
-    expect(call?.args).toMatchObject({
-      workingFolderPath: FOLDER,
-      role: "coder",
-      lang: "rust",
-    });
-  });
-
-  it("switches to Discover and shows installable bundled language cards", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    const discoverTab = Array.from(
-      container.querySelectorAll('[role="tab"]'),
-    ).find((b) => b.textContent?.includes("Discover")) as HTMLButtonElement;
-    await act(async () => {
-      discoverTab.click();
-      await Promise.resolve();
-    });
-    await flush();
-    // The role/language catalog now lives in a collapsed "Role & language templates" section
-    // (IA redesign) — expand it before asserting on its cards.
-    const templatesSection = Array.from(container.querySelectorAll("button")).find((b) =>
-      b.textContent?.includes("Role & language templates"),
-    ) as HTMLButtonElement;
-    await act(async () => {
-      templatesSection.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const html = container.innerHTML;
-    expect(html).toContain("Veteran rust conventions"); // a bundled language catalog card
-    expect(html).toContain("Install");
-  });
-
-  it("filters language rows by the global search query", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    const search = container.querySelector(
-      'input[type="search"]',
-    ) as HTMLInputElement;
-    await editInput(search, "rust");
-    await flush();
-    // The rust rows stay; the node rows are filtered out.
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-rust"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-node"]'),
-    ).toBeNull();
-  });
-
-  it("closes a language editor when the search hides its row (no stale draft)", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    const rustRow = container.querySelector(
-      '[data-testid="lang-row-coder-rust"]',
-    ) as HTMLElement;
-    const editBtn = Array.from(rustRow.querySelectorAll("button")).find(
-      (b) => b.textContent === "Edit" || b.textContent === "Customize",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      editBtn.click();
-      await Promise.resolve();
-    });
-    await flush();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-rust"] textarea'),
-    ).not.toBeNull();
-    // Search hides the rust row → its open editor must reset.
-    const search = container.querySelector(
-      'input[type="search"]',
-    ) as HTMLInputElement;
-    await editInput(search, "node");
-    await flush();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-rust"]'),
-    ).toBeNull();
-    // Clearing the search brings the row back WITHOUT its editor (no stale draft).
-    await editInput(search, "");
-    await flush();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-rust"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="lang-row-coder-rust"] textarea'),
-    ).toBeNull();
-  });
-
-  it("marks an already-forked language as Installed in Discover (no overwrite button)", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    const discoverTab = Array.from(
-      container.querySelectorAll('[role="tab"]'),
-    ).find((b) => b.textContent?.includes("Discover")) as HTMLButtonElement;
-    await act(async () => {
-      discoverTab.click();
-      await Promise.resolve();
-    });
-    await flush();
-    // coder/rust is a project override → its Discover card shows "Installed".
-    expect(container.innerHTML).toContain("Installed");
-  });
-
-  it("gates a truncated language override's Save behind the truncation ack", async () => {
-    await mount();
-    await chooseFolder();
-    await flush();
-    // coder/rust is flagged truncated by the mock → opening its editor shows the ack guard.
-    const row = container.querySelector(
-      '[data-testid="lang-row-coder-rust"]',
-    ) as HTMLElement;
-    const editBtn = Array.from(row.querySelectorAll("button")).find(
-      (b) => b.textContent === "Edit",
-    ) as HTMLButtonElement;
-    await act(async () => {
-      editBtn.click();
-      await Promise.resolve();
-    });
-    await flush();
-    const saveBtn = Array.from(row.querySelectorAll("button")).find(
-      (b) => b.textContent === "Save",
-    ) as HTMLButtonElement;
-    // Save is BLOCKED until the user acknowledges the tail-loss.
-    expect(saveBtn.disabled).toBe(true);
-    const ack = row.querySelector('input[type="checkbox"]') as HTMLInputElement;
-    expect(ack).not.toBeNull();
-    await act(async () => {
-      ack.click();
-      await Promise.resolve();
-    });
-    await flush();
-    expect(saveBtn.disabled).toBe(false);
+    expect(document.querySelector("[data-testid='global-library-panel']")).toBeNull();
   });
 });

@@ -29,8 +29,9 @@ impl SamplingParams {
             // Per-TURN output budget. Phase 7: the agentic path intentionally does NOT use
             // the one-shot caps (MAX_PROMPT_FILE_BYTES=32K front-load / OMLX_MAX_TOKENS_DEFAULT
             // =6144) — it reads files on demand and the runaway guard is `max_rounds`, not a
-            // truncating token cap. 8192/turn is ample for one tool call or a final message.
-            max_tokens: 8192,
+            // truncating token cap. A6: the per-turn budget is now MACHINE-TIERED (replaces the
+            // blind 8192) so big-RAM hosts get more headroom and small hosts stay safe.
+            max_tokens: crate::backend::oracle_coordinator::detected_max_tokens(),
         }
     }
 

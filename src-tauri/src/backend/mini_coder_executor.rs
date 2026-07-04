@@ -3187,7 +3187,8 @@ mod mini_language_tests {
 
     #[test]
     fn task_scope_rust() {
-        let b = mini_language_block(Path::new("/nonexistent_xyz"), &["a.rs".to_string()]).unwrap();
+        let b = mini_language_block(Path::new("/nonexistent_xyz"), "mini", &["a.rs".to_string()])
+            .unwrap();
         assert!(b.contains("--- BEGIN LANGUAGE SKILL"));
         assert!(b.contains("veteran Rust"));
     }
@@ -3196,6 +3197,7 @@ mod mini_language_tests {
     fn task_scope_wins_python() {
         let b = mini_language_block(
             Path::new("/nonexistent_xyz"),
+            "mini",
             &["a.py".to_string(), "b.py".to_string()],
         )
         .unwrap();
@@ -3205,24 +3207,39 @@ mod mini_language_tests {
     #[test]
     fn no_mappable_file_nonexistent_project_is_none() {
         assert!(
-            mini_language_block(Path::new("/nonexistent_xyz"), &["a.md".to_string()]).is_none()
+            mini_language_block(Path::new("/nonexistent_xyz"), "mini", &["a.md".to_string()])
+                .is_none()
         );
     }
 
     #[test]
     fn empty_file_list_nonexistent_project_is_none() {
-        assert!(mini_language_block(Path::new("/nonexistent_xyz"), &[]).is_none());
+        assert!(mini_language_block(Path::new("/nonexistent_xyz"), "mini", &[]).is_none());
     }
 
     #[test]
     fn agentic_system_prompt_separates_and_falls_back() {
         let base = crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT;
-        // None → exactly the base (byte-identical to the pre-feature path).
-        assert_eq!(compose_agentic_system_prompt(None), base);
-        // Some → base, then a NEWLINE separator, then the block (no fused boundary).
-        let composed = compose_agentic_system_prompt(Some("--- BEGIN LANGUAGE SKILL marker"));
+        // None/None → exactly the base (byte-identical to the pre-feature path).
+        assert_eq!(compose_agentic_system_prompt(None, None), base);
+        // Lang only → base, then a NEWLINE separator, then the block (no fused boundary).
+        let composed = compose_agentic_system_prompt(None, Some("--- BEGIN LANGUAGE SKILL marker"));
         assert!(composed.starts_with(base));
         assert!(composed.contains("\n--- BEGIN LANGUAGE SKILL marker"));
+    }
+
+    #[test]
+    fn agentic_system_prompt_orders_skill_before_lang() {
+        // P5: the per-profile SKILL block precedes the language block, both after the base.
+        let base = crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT;
+        let composed = compose_agentic_system_prompt(
+            Some("--- BEGIN PROJECT SKILL marker"),
+            Some("--- BEGIN LANGUAGE SKILL marker"),
+        );
+        assert!(composed.starts_with(base));
+        let skill_at = composed.find("BEGIN PROJECT SKILL").unwrap();
+        let lang_at = composed.find("BEGIN LANGUAGE SKILL").unwrap();
+        assert!(skill_at < lang_at, "skill block must precede the language block");
     }
 
     #[test]
@@ -3233,8 +3250,24 @@ mod mini_language_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        let b = mini_language_block(&dir, &[]).unwrap();
+        let b = mini_language_block(&dir, "mini", &[]).unwrap();
         assert!(b.contains("veteran Rust"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mini_language_block_uses_tier_profile_override() {
+        // The tier owns the skill (mini-big/SKILL.md exists) → its lang override must be injected,
+        // proving mini-big/mini-small language personas reach the launch prompt, not just "mini".
+        let dir =
+            std::env::temp_dir().join(format!("devboule_minilang_{}_tier", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let skills = dir.join(".claude").join("skills").join("mini-big");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("SKILL.md"), "tier skill").unwrap();
+        std::fs::write(skills.join("lang-rust.md"), "MINIBIG RUST PERSONA").unwrap();
+        let b = mini_language_block(&dir, "mini-big", &["a.rs".to_string()]).unwrap();
+        assert!(b.contains("MINIBIG RUST PERSONA"), "tier lang override not injected: {b}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

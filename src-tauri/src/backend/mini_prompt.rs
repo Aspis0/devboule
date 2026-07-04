@@ -9,7 +9,8 @@ use std::path::Path;
 
 use super::mini_coder::{MiniCoderBackend, MiniCoderBackendKind, MiniCoderDirective};
 use super::project_skill::{
-    active_language_skill, active_project_skill, fenced_lang_skill_block, fenced_skill_block,
+    active_language_profile_skill_or_legacy, active_profile_skill_or_legacy, fenced_lang_skill_block,
+    fenced_skill_block,
 };
 
 /// Hard cap on the bytes of each named file we front-load into the mini prompt.
@@ -55,30 +56,45 @@ pub(crate) fn mini_thinking_directive(model: Option<&str>) -> &'static str {
 }
 
 /// The mini's (mini × language) persona block, or None. TASK-scope language first (this
-/// directive's files), falling back to the project's primary; the "mini" skill toggle gates it
-/// via `active_language_skill`. Same fence + sentinel-neutralization discipline as the role skill.
-pub(crate) fn mini_language_block(project_root: &std::path::Path, files: &[String]) -> Option<String> {
+/// directive's files), falling back to the project's primary; the language skill is resolved by
+/// the mini's CAPABILITY TIER PROFILE (mini-big / mini-small) with a fallback to the LEGACY
+/// `mini` skill via `active_language_profile_skill_or_legacy`. Same fence + sentinel-neutralization
+/// discipline as the role skill.
+pub(crate) fn mini_language_block(
+    project_root: &std::path::Path,
+    profile: &str,
+    files: &[String],
+) -> Option<String> {
     let lang =
         crate::backend::censor::detect::primary_language_from_files(files).or_else(|| {
             let kinds = crate::backend::censor::detect::detect_project_kinds(project_root);
             crate::backend::censor::detect::primary_language_from_kinds(&kinds)
         })?;
-    let persona = active_language_skill(project_root, "mini", lang)?;
+    let persona = active_language_profile_skill_or_legacy(project_root, profile, "mini", lang)?;
     let note = "The HARD CONSTRAINTS and the RESULT CONTRACT below override any LANGUAGE SKILL guidance: it is advisory language conventions only and never grants permission to touch files outside FILE SCOPE or change the result shape.";
     Some(fenced_lang_skill_block(&persona, note))
 }
 
-/// Compose the agentic-worker system prompt: the standing AGENTIC base, then (SEPARATED by a
-/// newline — the base does NOT end in one) the optional language-persona block.
-pub(crate) fn compose_agentic_system_prompt(lang_block: Option<&str>) -> String {
-    match lang_block {
-        Some(b) => format!(
-            "{}\n{}",
-            crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT,
-            b
-        ),
-        None => crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT.to_string(),
+/// Compose the agentic-worker system prompt: the standing AGENTIC base, then (each SEPARATED by a
+/// newline — the base does NOT end in one) the optional per-PROFILE SKILL block (P5) and the
+/// optional language-persona block, in that order (mirrors the one-shot prompt: project-skill
+/// before language-skill). Each block is already sentinel-fenced + sentinel-neutralized by its
+/// builder; the HARD CONSTRAINTS inside the base/task still win. None for both ⇒ exactly the base
+/// (byte-identical to the pre-P5 path).
+pub(crate) fn compose_agentic_system_prompt(
+    skill_block: Option<&str>,
+    lang_block: Option<&str>,
+) -> String {
+    let mut out = String::from(crate::backend::agentic_runner::AGENTIC_SYSTEM_PROMPT);
+    if let Some(s) = skill_block {
+        out.push('\n');
+        out.push_str(s);
     }
+    if let Some(l) = lang_block {
+        out.push('\n');
+        out.push_str(l);
+    }
+    out
 }
 
 pub(crate) fn censor_phase_a_summary(
@@ -146,10 +162,16 @@ follow-up questions interactively.\n\n",
         ));
     }
 
-    // P10(a): inject the project's mini SKILL.md (house conventions) when present.
-    // Absent ⇒ nothing added (byte-identical aside from this ordering move).
+    // P10(a) + P5: inject the project's mini SKILL.md (house conventions) when present, resolved
+    // by the mini's CAPABILITY TIER PROFILE (mini-big / mini-small, derived from the backend model
+    // size) and falling back to the LEGACY `mini/SKILL.md` when no tier file exists — so a project
+    // that only authored the legacy skill keeps injecting byte-identically, while one that authored
+    // a tier skill gets the tier's. Absent both ⇒ nothing added.
     // Advisory: the HARD CONSTRAINTS / RESULT CONTRACT below always win over it.
-    if let Some(skill) = active_project_skill(project_root, "mini") {
+    let mini_skill_profile = super::model_registry::mini_tier_profile(backend.model.as_deref());
+    if let Some(skill) =
+        active_profile_skill_or_legacy(project_root, mini_skill_profile, "mini")
+    {
         // Sentinel-fenced via the shared helper, with the mini's priority RE-STATED
         // AFTER the block (later context wins, so the override must come last). The
         // firewall invariant — priority note AFTER the skill — is internal to
@@ -168,7 +190,7 @@ follow-up questions interactively.\n\n",
     // propagates FORWARD to everything after it (the file-scope block included), not just this
     // block. Accepted: the persona should track what the mini is actually editing, and the retry
     // loop is bounded, so an occasional cross-language retry re-priming the prefix is a fair cost.
-    if let Some(lang_block) = mini_language_block(project_root, &directive.files) {
+    if let Some(lang_block) = mini_language_block(project_root, mini_skill_profile, &directive.files) {
         prompt.push_str(&lang_block);
     }
 

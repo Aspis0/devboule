@@ -518,6 +518,124 @@ fn oracle_http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// A3 (pure, unit-testable): from a parsed chunk-index manifest, the canonical `index_root`,
+/// and the mini's `project_root` (both already verbatim-stripped), return the file_ids
+/// (project-relative POSIX paths) that fall UNDER `project_root`. `project_root == index_root`
+/// => all indexed files. Reads `manifest["roots"][index_root_str]["files"]` keys, falling back to
+/// the legacy top-level `manifest["files"]` when `manifest["root"] == index_root_str`. Sorted.
+pub(crate) fn scope_file_ids_from_manifest(
+    manifest: &serde_json::Value,
+    index_root: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Vec<String> {
+    let index_key = index_root.to_string_lossy().to_string();
+
+    // The files map: modern "roots" structure first, then the legacy top-level form.
+    let files_map = match manifest.get("roots") {
+        Some(roots) => roots
+            .get(&index_key)
+            .and_then(|r| r.get("files"))
+            .and_then(|f| f.as_object()),
+        None => {
+            if manifest.get("root").and_then(|r| r.as_str()) == Some(index_key.as_str()) {
+                manifest.get("files").and_then(|f| f.as_object())
+            } else {
+                None
+            }
+        }
+    };
+    let files_map = match files_map {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    // The prefix the file_ids must start with to be UNDER project_root.
+    let prefix = if project_root == index_root {
+        String::new()
+    } else {
+        match project_root.strip_prefix(index_root) {
+            Ok(rel) => {
+                // Normalize Windows backslashes so a nested-project prefix matches the
+                // POSIX-keyed manifest file_ids (else nested projects get an empty scope).
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if rel_str.is_empty() {
+                    String::new()
+                } else {
+                    format!("{rel_str}/")
+                }
+            }
+            // project_root is NOT under index_root: never widen scope.
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    let mut matched: Vec<String> = files_map
+        .keys()
+        .filter(|file_id| prefix.is_empty() || file_id.starts_with(&prefix))
+        .cloned()
+        .collect();
+    matched.sort();
+    matched.dedup();
+    matched
+}
+
+/// A3: resolve the mini's Oracle scope — the indexed file_ids under `project_root`. Best-effort:
+/// returns an empty Vec on any failure (no index root, missing/invalid manifest), which the
+/// bounded endpoint treats as "no documents in scope" (safe default, never the full corpus).
+pub(crate) fn oracle_agent_scope_file_ids(project_root: &std::path::Path) -> Vec<String> {
+    let index_root = match crate::oracle::commands::current_oracle_index_root() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let manifest_path = index_root
+        .join("oracle-data")
+        .join("chunk-index-manifest.json");
+    let manifest_content = match std::fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let manifest: serde_json::Value = match serde_json::from_str(&manifest_content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let project_root_norm = strip_windows_verbatim_prefix(project_root.to_path_buf());
+    scope_file_ids_from_manifest(&manifest, &index_root, &project_root_norm)
+}
+
+/// A3: POST a SCOPED agent ask to the resident Oracle's bounded endpoint with the agent token.
+/// Returns the answer text. `allowed_file_ids` confines retrieval to the mini's project files.
+pub(crate) fn oracle_agent_ask(query: &str, allowed_file_ids: &[String]) -> Result<String, String> {
+    // Fail-CLOSED short-circuit: an empty scope means no indexed docs for this project — don't
+    // even hit the server (the bounded endpoint would answer grounded-empty anyway).
+    if allowed_file_ids.is_empty() {
+        return Ok("(oracle: no indexed files in scope for this project)".to_string());
+    }
+
+    let (base_url, _port) = oracle_session_endpoint();
+    let url = format!("{base_url}/ask-bounded");
+    let body = serde_json::json!({
+        "query": query,
+        "allowed_file_ids": allowed_file_ids,
+        "limit": 5,
+    });
+    let resp = oracle_http_client()
+        .post(&url)
+        .header("x-oracle-auth-token", oracle_agent_token())
+        .timeout(std::time::Duration::from_secs(90))
+        .json(&body)
+        // `.without_url()` keeps the loopback URL/port out of the error text returned to the model.
+        .send()
+        .map_err(|e| format!("oracle request failed: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("oracle returned HTTP {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().map_err(|e| format!("oracle bad json: {e}"))?;
+    match v.get("answer").and_then(|a| a.as_str()) {
+        Some(s) => Ok(s.to_string()),
+        None => Err("oracle returned an unexpected response format".to_string()),
+    }
+}
+
 fn oracle_child() -> &'static Mutex<Option<Child>> {
     ORACLE_CHILD.get_or_init(|| Mutex::new(None))
 }
@@ -1493,6 +1611,14 @@ fn build_oracle_server_command_with_package_root(
         // reads this exact key (oracle/config.py: ORACLE_DISABLE_IDLE_EXIT).
         .env(ORACLE_DISABLE_IDLE_EXIT_ENV, "1")
         .env("PYTHONPATH", &package_root);
+    // A4 (live wiring) — authoritative embed-device override: force the resident embedder to CPU when
+    // the coordinator reports GPU pressure (a local decode active / low free memory) at spawn time, so
+    // the featherweight query embed doesn't fight the coder. When NOT under pressure we leave the env
+    // UNSET so the embedder's own A1 device logic picks cuda/mps/cpu — never force "mps" (wrong on a
+    // CUDA host). The resident embedder loads once, so this is a spawn-time decision.
+    if crate::backend::oracle_coordinator::current_embed_device() == "cpu" {
+        command.env("ORACLE_EMBED_DEVICE", "cpu");
+    }
     Ok(command)
 }
 
@@ -2262,6 +2388,43 @@ mod tests {
     fn test_oracle_lock() -> &'static Mutex<()> {
         static TEST_ORACLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         TEST_ORACLE_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn scope_file_ids_from_manifest_filters_to_project_root() {
+        use std::path::Path;
+        let manifest = serde_json::json!({
+            "roots": {
+                "/idx": { "files": { "a.rs": 1, "projA/b.rs": 1, "projB/c.rs": 1 } }
+            }
+        });
+        let idx = Path::new("/idx");
+        // project_root == index_root -> all indexed files (sorted).
+        assert_eq!(
+            scope_file_ids_from_manifest(&manifest, idx, idx),
+            vec!["a.rs", "projA/b.rs", "projB/c.rs"]
+        );
+        // a subdir scopes to only that project's files.
+        assert_eq!(
+            scope_file_ids_from_manifest(&manifest, idx, Path::new("/idx/projA")),
+            vec!["projA/b.rs"]
+        );
+        // legacy top-level form.
+        let legacy = serde_json::json!({ "root": "/idx", "files": { "x.rs": 1 } });
+        assert_eq!(
+            scope_file_ids_from_manifest(&legacy, idx, idx),
+            vec!["x.rs"]
+        );
+        // project_root NOT under index_root -> empty (never widen scope).
+        assert_eq!(
+            scope_file_ids_from_manifest(&manifest, idx, Path::new("/other")),
+            Vec::<String>::new()
+        );
+        // a root absent from the manifest -> empty.
+        assert_eq!(
+            scope_file_ids_from_manifest(&manifest, Path::new("/missing"), Path::new("/missing")),
+            Vec::<String>::new()
+        );
     }
 
     /// PRIVACY (suspect localization): a malformed `/context` body — which can

@@ -1,0 +1,340 @@
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  useMemo,
+  type MouseEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import { invokeBackendCommand } from "../../context/AppContext";
+import { Sparkles, X } from "lucide-react";
+import { ToolsPicker } from "./ToolsPicker";
+import { LibrarySearch } from "./LibrarySearch";
+import { ModalLanguages } from "./ModalLanguages";
+import { SkillEditor } from "./SkillEditor";
+
+// Work Console ASSIGNMENT PROFILES (capability tiers), mirroring the backend's
+// `ASSIGNMENT_PROFILES`. The single legacy `mini` role splits into two tiers here:
+// `mini-big` (capable local model) and `mini-small` (8B, edits-only). This is the
+// assignment layer — separate from the backend injection/traversal `KNOWN_ROLES` gate.
+type SkillProfile =
+  "coder" | "mini-big" | "mini-small" | "design" | "orchestrator";
+
+interface SkillEntry {
+  role: SkillProfile;
+  exists: boolean;
+  enabled: boolean;
+  content: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+type Props = {
+  projectRoot: string;
+  onClose: () => void;
+};
+
+type Status = "loading" | "ok" | "error";
+
+// `coder` + both mini tiers are active now; `design`/`orchestrator` are predisposed but
+// disabled ("coming soon", managed in the sidebar for now). `label` carries the nice
+// human form since the tier names aren't a simple capitalize.
+const PROFILES: { profile: SkillProfile; label: string; enabled: boolean }[] = [
+  { profile: "coder", label: "Coder", enabled: true },
+  { profile: "mini-big", label: "Mini · big", enabled: true },
+  { profile: "mini-small", label: "Mini · small", enabled: true },
+  // design/orchestrator are now edited HERE (the sidebar Skills view became global-only), so all
+  // five capability profiles are first-class tabs in the Work Console modal.
+  { profile: "design", label: "Design", enabled: true },
+  { profile: "orchestrator", label: "Orchestrator", enabled: true },
+];
+
+export function SkillsToolsModal({ projectRoot, onClose }: Props) {
+  const [entries, setEntries] = useState<SkillEntry[]>([]);
+  const [active, setActive] = useState<SkillProfile>("coder");
+  const [status, setStatus] = useState<Status>("loading");
+  // Bumped after a library skill is applied so the active profile's content refreshes.
+  const [reload, setReload] = useState(0);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  // Tracks the last project so a reload-only refetch (after save/apply/toggle) keeps the current
+  // entries + the mounted SkillEditor visible instead of flashing the loading state.
+  const prevRootRef = useRef<string | null>(null);
+  // Synchronous in-flight guard: a useState bool alone loses to a stale closure on a
+  // rapid double-click, so the ref gates the second call; `toggling` only drives the
+  // disabled styling (mirrors ToolsPicker's busy pattern).
+  const togglingRef = useRef(false);
+  const [toggling, setToggling] = useState(false);
+
+  // Reset the active tab to the always-enabled default when the project changes.
+  useEffect(() => {
+    setActive("coder");
+  }, [projectRoot]);
+
+  // Fetch per-role skills for the project. Re-runs on project change OR after an
+  // apply (reload). The cancelled flag prevents setState after unmount / superseded fetch.
+  useEffect(() => {
+    let cancelled = false;
+    const isProjectChange = prevRootRef.current !== projectRoot;
+    prevRootRef.current = projectRoot;
+    // Only clear to the loading state on a PROJECT change — a reload-only refetch keeps the
+    // current entries (and the mounted editor) and updates them in place when the fetch resolves.
+    if (isProjectChange) {
+      setStatus("loading");
+      setEntries([]);
+    }
+    (async () => {
+      try {
+        const result = await invokeBackendCommand("skills_list_profiles", {
+          workingFolderPath: projectRoot,
+        });
+        if (cancelled) return;
+        setEntries(Array.isArray(result) ? (result as SkillEntry[]) : []);
+        setStatus("ok");
+      } catch {
+        if (cancelled) return;
+        setStatus("error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectRoot, reload]);
+
+  // Escape-to-close (WAI-ARIA modal requirement).
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  // Move focus into the dialog on open; restore to the trigger on close.
+  useEffect(() => {
+    const prev = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    return () => prev?.focus?.();
+  }, []);
+
+  const activeEntry = useMemo(
+    () => entries.find((e) => e.role === active),
+    [entries, active],
+  );
+
+  // Clear the in-flight toggle lock when the profile changes, so switching tabs while a
+  // toggle IPC is in flight doesn't leave the new tab's toggle wrongly disabled.
+  useEffect(() => {
+    togglingRef.current = false;
+    setToggling(false);
+  }, [active]);
+  const activeLabel =
+    PROFILES.find((p) => p.profile === active)?.label ?? active;
+
+  const handleTabClick = useCallback((profile: SkillProfile) => {
+    const profileDef = PROFILES.find((p) => p.profile === profile);
+    if (profileDef?.enabled) setActive(profile);
+  }, []);
+
+  const handleCardClick = useCallback((e: MouseEvent) => {
+    e.stopPropagation();
+  }, []);
+
+  // Stable so LibrarySearch's apply callback isn't recreated each parent render.
+  const handleApplied = useCallback(() => setReload((r) => r + 1), []);
+
+  // Per-tier enable/disable toggle. No-op if the active profile has no manual yet.
+  // On success bump `reload` so the refetched entry reflects the new enabled state;
+  // on error leave the UI unchanged (the toggle simply doesn't flip).
+  const handleToggle = useCallback(async () => {
+    if (!activeEntry?.exists || togglingRef.current) return;
+    togglingRef.current = true;
+    setToggling(true);
+    try {
+      await invokeBackendCommand("skills_set_enabled_profile", {
+        workingFolderPath: projectRoot,
+        profile: active,
+        enabled: !activeEntry.enabled,
+      });
+      setReload((r) => r + 1);
+    } catch (e) {
+      console.error("skills_set_enabled_profile failed", e);
+    } finally {
+      togglingRef.current = false;
+      setToggling(false);
+    }
+  }, [activeEntry, active, projectRoot]);
+
+  // Focus trap: aria-modal promises focus stays inside, so cycle Tab/Shift+Tab at the
+  // boundaries instead of letting focus escape to the work console behind the scrim.
+  const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const root = dialogRef.current;
+    if (!root) return;
+    const focusable = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const activeEl = document.activeElement;
+    if (e.shiftKey && (activeEl === first || activeEl === root)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && activeEl === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }, []);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-cream-900/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Skills and Tools"
+        data-testid="skills-tools-modal"
+        className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-2xl border border-cream-200 bg-white shadow-xl outline-none"
+        onClick={handleCardClick}
+        onKeyDown={handleKeyDown}
+      >
+        <div className="flex items-center justify-between border-b border-cream-100 px-5 py-4">
+          <div className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-teal" />
+            <span className="text-[13px] font-semibold text-cream-800">
+              Skills &amp; Tools
+            </span>
+          </div>
+          <button
+            type="button"
+            data-testid="skills-tools-close"
+            aria-label="Close"
+            onClick={onClose}
+            className="rounded-lg p-1 text-cream-400 transition-colors hover:bg-cream-100 hover:text-cream-700"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div
+          role="tablist"
+          aria-label="Agent profiles"
+          className="flex gap-2 border-b border-cream-100 px-5 py-3"
+        >
+          {PROFILES.map(({ profile, label, enabled }) => (
+            <button
+              key={profile}
+              type="button"
+              role="tab"
+              id={`skills-tools-tab-id-${profile}`}
+              aria-selected={active === profile}
+              aria-controls="skills-tools-panel"
+              data-testid={`skills-tools-tab-${profile}`}
+              onClick={() => handleTabClick(profile)}
+              disabled={!enabled}
+              className={`rounded-lg border px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+                active === profile
+                  ? "border-teal/30 bg-teal/10 text-teal"
+                  : enabled
+                    ? "border-cream-200 bg-white text-cream-600 hover:border-cream-300"
+                    : "cursor-not-allowed border-cream-200 text-cream-400 opacity-50"
+              }`}
+            >
+              {label}
+              {!enabled && (
+                <span className="ml-1 text-[10px] font-normal opacity-70">
+                  · coming soon
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div
+          role="tabpanel"
+          id="skills-tools-panel"
+          aria-labelledby={`skills-tools-tab-id-${active}`}
+          className="overflow-y-auto px-5 py-4"
+        >
+          <div className="mb-2 flex items-center justify-between">
+            <div className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+              Skills
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!!activeEntry?.enabled}
+              aria-label={`Toggle the ${activeLabel} skill`}
+              aria-busy={status === "loading"}
+              disabled={status !== "ok" || !activeEntry?.exists || toggling}
+              onClick={() => void handleToggle()}
+              data-testid="skills-tools-toggle"
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${activeEntry?.enabled ? "bg-teal" : "bg-cream-300"}`}
+            >
+              <span
+                aria-hidden="true"
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${activeEntry?.enabled ? "translate-x-4" : "translate-x-0.5"}`}
+              />
+            </button>
+          </div>
+          {status === "loading" || status === "error" ? (
+            <div
+              data-testid="skills-tools-skill-content"
+              className="whitespace-pre-wrap rounded-xl border border-cream-100 bg-cream-50 p-3 text-[12px] text-cream-800"
+            >
+              {status === "loading"
+                ? "Loading skills…"
+                : "Couldn't load skills for this project."}
+            </div>
+          ) : (
+            <SkillEditor
+              key={`skill-${active}`}
+              projectRoot={projectRoot}
+              profile={active}
+              content={activeEntry?.content ?? ""}
+              truncated={!!activeEntry?.truncated}
+              onSaved={() => setReload((r) => r + 1)}
+            />
+          )}
+          {status === "ok" && (
+            <>
+              <div className="mb-2 mt-5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+                Languages
+              </div>
+              <ModalLanguages key={`lang-${active}`} projectRoot={projectRoot} profile={active} />
+            </>
+          )}
+          <div className="mb-2 mt-4 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+            From your global library
+          </div>
+          <LibrarySearch
+            key={`library-${active}`}
+            projectRoot={projectRoot}
+            profile={active}
+            onApplied={handleApplied}
+          />
+          <div className="mb-2 mt-5 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+            Tools
+          </div>
+          <ToolsPicker
+            key={`tools-${active}`}
+            projectRoot={projectRoot}
+            profile={active}
+          />
+        </div>
+
+        <div className="border-t border-cream-100 px-5 py-3 text-[11px] text-cream-500">
+          The active skill manual for the{" "}
+          <span className="font-semibold">{activeLabel}</span> profile.
+        </div>
+      </div>
+    </div>
+  );
+}

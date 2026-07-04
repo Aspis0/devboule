@@ -193,16 +193,18 @@ describe("ProjectWorkspace Compact button (MC-P7)", () => {
     const html = render(sessions, new Set(["coder-1"]));
     expect(html).toContain(">Compact<");
     expect(html).toContain(
-      "Runs /compact in this Claude agent to shrink its context.",
+      "free up its context window.",
     );
   });
 
-  it("does NOT render the Compact button for a non-claude agent (codex)", () => {
+  it("DOES render the Compact button for a codex agent (Slice 5a thread compact)", () => {
+    // Codex compaction is wired via the app-server thread/compact/start JSON-RPC,
+    // so the Compact button is shown for a selected codex agent too.
     const sessions = [session({ agentId: "coder-1", client: "codex" })];
     const html = render(sessions, new Set(["coder-1"]));
-    expect(html).not.toContain(">Compact<");
-    expect(html).not.toContain(
-      "Runs /compact in this Claude agent to shrink its context.",
+    expect(html).toContain(">Compact<");
+    expect(html).toContain(
+      "free up its context window.",
     );
   });
 

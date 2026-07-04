@@ -2588,6 +2588,69 @@ class OraclePhase2Test(unittest.TestCase):
             "cpu",
         )
 
+    def test_choose_device_mps_gates_on_unified_free(self):
+        """MPS is pre-emptively diverted to CPU when free unified memory is KNOWN
+        to be below the GPU floor, but stays MPS when memory is sufficient or
+        unknown (None) — the resident embedder loads once and the index burst
+        keeps the GPU; only positive evidence of low memory diverts to CPU."""
+        threshold = oracle_config.MIN_GPU_FREE_GB
+        # MPS available, free unified memory sufficient -> "mps".
+        self.assertEqual(
+            choose_device(
+                cuda_available=False, free_vram_gb=None, mps_available=True,
+                override="", free_unified_gb=threshold + 1.0,
+            ),
+            "mps",
+        )
+        # MPS available, free unified memory below floor -> "cpu".
+        self.assertEqual(
+            choose_device(
+                cuda_available=False, free_vram_gb=None, mps_available=True,
+                override="", free_unified_gb=threshold - 1.0,
+            ),
+            "cpu",
+        )
+        # MPS available, free unified memory unknown (None) -> "mps".
+        self.assertEqual(
+            choose_device(
+                cuda_available=False, free_vram_gb=None, mps_available=True,
+                override="", free_unified_gb=None,
+            ),
+            "mps",
+        )
+        # CUDA available but too little VRAM, MPS present, low unified -> "cpu".
+        self.assertEqual(
+            choose_device(
+                cuda_available=True, free_vram_gb=threshold - 1.0, mps_available=True,
+                override="", free_unified_gb=threshold - 1.0,
+            ),
+            "cpu",
+        )
+        # CUDA available but too little VRAM, MPS present, sufficient unified -> "mps".
+        self.assertEqual(
+            choose_device(
+                cuda_available=True, free_vram_gb=threshold - 1.0, mps_available=True,
+                override="", free_unified_gb=threshold + 1.0,
+            ),
+            "mps",
+        )
+        # Exactly AT the floor is sufficient (the gate is strict `<`) -> "mps".
+        self.assertEqual(
+            choose_device(
+                cuda_available=False, free_vram_gb=None, mps_available=True,
+                override="", free_unified_gb=threshold,
+            ),
+            "mps",
+        )
+        # CUDA with enough VRAM wins BEFORE the MPS gate; low unified is irrelevant.
+        self.assertEqual(
+            choose_device(
+                cuda_available=True, free_vram_gb=threshold + 1.0, mps_available=True,
+                override="", free_unified_gb=threshold - 1.0,
+            ),
+            "cuda",
+        )
+
     def test_embed_texts_recovers_from_cuda_oom_by_retrying_on_cpu(self):
         # A CUDA OOM during encode must NOT crash the index: the embedder frees
         # VRAM, forces CPU for the rest of the process, and retries the batch on

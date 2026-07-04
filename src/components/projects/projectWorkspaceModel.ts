@@ -419,14 +419,15 @@ export function cloneProjectCall(url: string, destParent?: string): IpcCall {
   };
 }
 
-/** MC-P7: whether the work-mode Compact button should show for this session.
- *  GATED on the RESOLVED built-in client being EXACTLY "claude" (case-insensitive
- *  after trim) — `/compact` is a Claude Code slash command, meaningless to a
- *  codex/powershell/ollama-mini/custom CLI. This is an EXACT match, never a
- *  substring: a custom client whose id merely CONTAINS "claude" (e.g. "claudex")
- *  must NOT trip it — the reserved built-in id "claude" can never be shadowed by a
- *  custom client (validateCustomClient rejects the reserved ids), so an exact
- *  equality is the right and only safe test. Empty/absent client -> false. */
+/** MC-P7 + Slice 5a: whether the work-mode Compact button should show for this session.
+ *  GATED on the RESOLVED built-in client being EXACTLY "claude" OR "codex"
+ *  (case-insensitive after trim). Claude -> its PTY `/compact` slash command;
+ *  codex -> the app-server `thread/compact/start` JSON-RPC. Meaningless to a
+ *  powershell/ollama-mini/custom CLI, so those stay false. This is an EXACT match,
+ *  never a substring: a custom client whose id merely CONTAINS "claude"/"codex"
+ *  (e.g. "claudex") must NOT trip it — the reserved built-in ids can never be
+ *  shadowed by a custom client (validateCustomClient rejects the reserved ids), so
+ *  exact equality is the right and only safe test. Empty/absent client -> false. */
 export function shouldShowCompact(session: AgentSession): boolean {
   // EXACT match (never substring): "claude" → its PTY `/compact` slash command;
   // "codex" → the Codex app-server `thread/compact/start` JSON-RPC (Slice 5a), which
