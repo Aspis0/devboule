@@ -4272,7 +4272,7 @@ aborted_by_human -> the human hit Stop on the mini: STOP that line of work, do N
     let role_rule_line = format!("{role_rule}\n");
     let addenda: [&str; 6] = [
         &role_rule_line,
-        &censor_addendum,
+        censor_addendum,
         &mini_coder_addendum,
         git_push_addendum,
         &design_handoff_addendum,

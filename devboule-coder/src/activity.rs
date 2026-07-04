@@ -175,6 +175,9 @@ impl Activity {
             .open(path)
         {
             let _ = file.write_all(line.as_bytes());
+            // D3: fsync so frontend polling sees user message BEFORE
+            // burst output that follows (response-before-question fix).
+            let _ = file.sync_all();
         }
     }
 
@@ -414,7 +417,10 @@ mod tests {
         let long = "é".repeat(MAX_CHAT_TEXT_CHARS + 50);
         let line = encode_chat_delta(1, &long);
         let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["text"].as_str().unwrap().chars().count(), MAX_CHAT_TEXT_CHARS);
+        assert_eq!(
+            v["text"].as_str().unwrap().chars().count(),
+            MAX_CHAT_TEXT_CHARS
+        );
     }
 
     #[test]
@@ -482,7 +488,10 @@ mod tests {
         assert_eq!(v["options"].as_array().unwrap().len(), 0);
         assert_eq!(v["unrest"], 0.0);
         assert_eq!(v["candidates"].as_array().unwrap().len(), 0);
-        assert!(v["lean"].is_null(), "lean serializes as JSON null when None");
+        assert!(
+            v["lean"].is_null(),
+            "lean serializes as JSON null when None"
+        );
         assert_eq!(v["directionConfidence"], 0.0);
         assert_eq!(v["status"], "reopened");
         assert_eq!(v["affects"].as_array().unwrap().len(), 0);
@@ -501,7 +510,10 @@ mod tests {
         let line = encode_question("q3", &long, &[], &signal, "open", &[]);
         assert_eq!(line.matches('\n').count(), 1);
         let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["text"].as_str().unwrap().chars().count(), MAX_CHAT_TEXT_CHARS);
+        assert_eq!(
+            v["text"].as_str().unwrap().chars().count(),
+            MAX_CHAT_TEXT_CHARS
+        );
     }
 
     #[test]
@@ -599,8 +611,7 @@ mod tests {
 
         // Text is char-capped at the larger CHAT cap (codepoint-safe).
         let long = "é".repeat(MAX_CHAT_TEXT_CHARS + 40);
-        let capped: Value =
-            serde_json::from_str(encode_chat("user", &long).trim_end()).unwrap();
+        let capped: Value = serde_json::from_str(encode_chat("user", &long).trim_end()).unwrap();
         assert_eq!(
             capped["text"].as_str().unwrap().chars().count(),
             MAX_CHAT_TEXT_CHARS,

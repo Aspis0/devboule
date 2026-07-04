@@ -1049,8 +1049,11 @@ pub fn oracle_llm_settings_status() -> Result<OracleLlmSettingsStatus, String> {
     let api_key_configured = dedicated_api_key_configured || provider_api_key_configured;
     // LOCAL providers are keyless by design: never nag "missing_api_key".
     let is_local_provider = matches!(settings.provider.as_str(), "omlx" | "ollama");
-    let status = if is_local_provider {
-        "configured"
+    let is_disabled = !settings.remote_enabled && settings.provider.is_empty();
+    let status = if is_disabled {
+        "disabled"
+    } else if is_local_provider {
+        "local"
     } else if settings.remote_enabled && !api_key_configured {
         "missing_api_key"
     } else if settings.remote_enabled {
@@ -1058,7 +1061,9 @@ pub fn oracle_llm_settings_status() -> Result<OracleLlmSettingsStatus, String> {
     } else {
         "local"
     };
-    let message = if is_local_provider {
+    let message = if is_disabled {
+        Some("Answer LLM is disabled — Oracle returns retrieval-only answers.".into())
+    } else if is_local_provider {
         Some("Local loopback provider — keyless; prompts never leave this machine.".into())
     } else if settings.remote_enabled && !api_key_configured {
         Some("Remote Oracle LLM API key is not configured.".into())
@@ -1107,6 +1112,15 @@ fn llm_provider_label(provider: &str) -> &'static str {
 
 fn sanitize_oracle_llm_settings(settings: &OracleLlmSettings) -> Result<OracleLlmSettings, String> {
     let provider = settings.provider.trim().to_ascii_lowercase();
+    // Empty provider + disabled = user explicitly turned off answer LLM.
+    if provider.is_empty() && !settings.remote_enabled {
+        return Ok(OracleLlmSettings {
+            provider: String::new(),
+            model: String::new(),
+            base_url: None,
+            remote_enabled: false,
+        });
+    }
     let allowed = ["scaleway", "infomaniak", "mistral", "omlx", "ollama"];
     if !allowed.contains(&provider.as_str()) {
         return Err("Oracle LLM provider is not allowlisted.".into());
@@ -1137,13 +1151,20 @@ fn sanitize_llm_base_url(provider: &str, base_url: Option<&str>) -> Result<Optio
                 // LOCAL providers: loopback-only, http allowed (no TLS on
                 // 127.0.0.1), credentials/placeholders still rejected.
                 let lower = value.to_ascii_lowercase();
-                let loopback = ["http://127.0.0.1", "https://127.0.0.1", "http://localhost", "https://localhost", "http://[::1]", "https://[::1]"]
-                    .iter()
-                    .any(|prefix| {
-                        lower.strip_prefix(prefix).is_some_and(|rest| {
-                            rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
-                        })
-                    });
+                let loopback = [
+                    "http://127.0.0.1",
+                    "https://127.0.0.1",
+                    "http://localhost",
+                    "https://localhost",
+                    "http://[::1]",
+                    "https://[::1]",
+                ]
+                .iter()
+                .any(|prefix| {
+                    lower.strip_prefix(prefix).is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
+                    })
+                });
                 if !loopback || value.contains('@') || value.contains('<') || value.contains('>') {
                     return Err(
                         "Local Oracle LLM base URL must stay on loopback (127.0.0.1).".to_string(),
@@ -1971,16 +1992,13 @@ mod tests {
     fn sanitize_oracle_index_preferences_coerces_empty_to_none() {
         let out = sanitize_oracle_index_preferences(&prefs_with_mode(Some("")))
             .expect("sanitize must succeed for empty mode");
-        assert_eq!(
-            out.index_mode, None,
-            "empty mode must be coerced to None"
-        );
+        assert_eq!(out.index_mode, None, "empty mode must be coerced to None");
     }
 
     #[test]
     fn sanitize_oracle_index_preferences_keeps_none() {
-        let out = sanitize_oracle_index_preferences(&prefs_with_mode(None))
-            .expect("None mode is valid");
+        let out =
+            sanitize_oracle_index_preferences(&prefs_with_mode(None)).expect("None mode is valid");
         assert_eq!(out.index_mode, None);
     }
 
@@ -2037,7 +2055,9 @@ mod tests {
         // status(present): never the value.
         let status_present = exa_key_status().unwrap();
         assert!(status_present.configured);
-        assert!(!serde_json::to_string(&status_present).unwrap().contains(key));
+        assert!(!serde_json::to_string(&status_present)
+            .unwrap()
+            .contains(key));
         // The backend-internal reader (launch path) DOES see the raw value.
         assert_eq!(read_exa_key().unwrap().as_deref(), Some(key));
 
@@ -2142,7 +2162,10 @@ mod tests {
         // internal read_cloud_llm_key (used by the launch) ever sees it.
         let key = "sk-cloud-test-key-abcdef1234567890";
         let _ = delete_cloud_llm_key();
-        assert!(!cloud_llm_key_status().unwrap().configured, "must start absent");
+        assert!(
+            !cloud_llm_key_status().unwrap().configured,
+            "must start absent"
+        );
 
         let after_set = save_cloud_llm_key(key).unwrap();
         assert!(after_set.configured, "set must report present");
@@ -2150,7 +2173,9 @@ mod tests {
         assert!(after_set.message.is_none());
         let status_present = cloud_llm_key_status().unwrap();
         assert!(status_present.configured);
-        assert!(!serde_json::to_string(&status_present).unwrap().contains(key));
+        assert!(!serde_json::to_string(&status_present)
+            .unwrap()
+            .contains(key));
         assert_eq!(read_cloud_llm_key().unwrap().as_deref(), Some(key));
 
         let after_clear = delete_cloud_llm_key().unwrap();

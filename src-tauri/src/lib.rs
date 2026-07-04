@@ -471,6 +471,7 @@ pub fn run() {
             backend::commands::delete_provider_token,
             backend::commands::delete_provider_scope,
             backend::commands::delete_oracle_llm_api_key,
+            backend::commands::disable_oracle_llm,
             backend::commands::delete_scaleway_object_access_key,
             backend::commands::delete_scaleway_object_secret_key,
             backend::commands::get_exa_key_status,

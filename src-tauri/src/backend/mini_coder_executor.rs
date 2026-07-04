@@ -1018,7 +1018,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
     //    lock (claim_and_launch) so a stale snapshot can't double-claim overlapping files.
     for claim_id in &plan.claims {
         if let Some(directive) = directives.iter().find(|d| &d.id == claim_id) {
-            let parent_project = directive_project(&snapshot, &directive);
+            let parent_project = directive_project(&snapshot, directive);
             claim_and_launch(app, directive, parent_project);
         }
     }

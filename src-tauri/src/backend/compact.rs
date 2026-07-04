@@ -292,8 +292,8 @@ pub fn compact_built_prompt(
     let non_preamble_tokens = file_section_tokens + hard_task_tokens;
     // If the non-preamble portion alone exceeds budget, there's nothing to fix
     // (we can't drop the task); leave out as-is.
-    if non_preamble_tokens <= budget {
-        if estimate_tokens(&out) > budget {
+    if non_preamble_tokens <= budget
+        && estimate_tokens(&out) > budget {
             // Rebuild out with a truncated preamble (dropping it ENTIRELY when its
             // budget is 0 — build(0) yields "" safely), keeping the file section,
             // hard constraints and task block intact. NOTE: no `preamble_budget > 0`
@@ -323,7 +323,6 @@ pub fn compact_built_prompt(
             }
             out = fixed;
         }
-    }
 
     let tokens_after = estimate_tokens(&out);
     (

@@ -510,9 +510,15 @@ impl OmlxModel {
         let client = reqwest::Client::builder()
             // Bound a stalled oMLX call: without a timeout the `.await` in
             // `run_completion` can hang forever and the burst's wall-clock check
-            // (top of the loop) never runs again. 60s comfortably covers a slow
-            // local generation while still capping a wedged server.
-            .timeout(std::time::Duration::from_secs(60))
+            // (top of the loop) never runs again. Default 120s covers slow local
+            // generation; override with DEVBOULE_OMLX_HTTP_TIMEOUT_SECS.
+            .timeout(std::time::Duration::from_secs(
+                std::env::var("DEVBOULE_OMLX_HTTP_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&s| (10..=600).contains(&s))
+                    .unwrap_or(300),
+            ))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
         Ok(Self {
