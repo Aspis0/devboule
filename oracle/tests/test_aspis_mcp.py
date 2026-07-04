@@ -7176,6 +7176,83 @@ class VisualCheckTests(unittest.TestCase):
             self.assertNotIn("parent_agent_id", d)
             self.assertNotIn("plan_context", d)
 
+    def test_design_request_accepts_mode_and_frame(self):
+        """Phase 3: mode + frame are written into the directive camelCase."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.DESIGN_REQUEST_POLL_TIMEOUT_SECS", 0.0):
+                out = handle_tool_call(
+                    "design_request",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "prompt": "Android home screen",
+                        "mode": "interactive",
+                        "frame": "android",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            self.assertIn("directiveId", out)
+            directives = self._read_state(root)["designRequestDirectives"]
+            d = directives[0]
+            self.assertEqual(d["mode"], "interactive")
+            self.assertEqual(d["frame"], "android")
+
+    def test_design_request_omits_mode_frame_when_not_supplied(self):
+        """Phase 3: missing mode/frame must NOT appear in the directive (backward compat)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.DESIGN_REQUEST_POLL_TIMEOUT_SECS", 0.0):
+                handle_tool_call(
+                    "design_request",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "prompt": "a billing dashboard",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            directives = self._read_state(root)["designRequestDirectives"]
+            d = directives[0]
+            self.assertNotIn("mode", d, "no mode key when param omitted")
+            self.assertNotIn("frame", d, "no frame key when param omitted")
+
+    def test_design_request_ignores_invalid_mode(self):
+        """Phase 3: an unknown mode value must be silently ignored (not stored)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._project_dir(tmp)
+            token = self._register_coder(root)
+            with patch("oracle.server.aspis_mcp.DESIGN_REQUEST_POLL_TIMEOUT_SECS", 0.0):
+                handle_tool_call(
+                    "design_request",
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "prompt": "a page",
+                        "mode": "hack",
+                        "frame": "unknown",
+                        "session_token": token,
+                    },
+                    root=root,
+                )
+            directives = self._read_state(root)["designRequestDirectives"]
+            d = directives[0]
+            self.assertNotIn("mode", d, "invalid mode must not be stored")
+            self.assertNotIn("frame", d, "invalid frame must not be stored")
+
+    def test_design_request_tool_schema_has_mode_and_frame_params(self):
+        """Phase 3: the TOOLS schema exposes mode and frame parameters."""
+        from oracle.server import aspis_mcp
+        tool = next(t for t in aspis_mcp.TOOLS if t["name"] == "design_request")
+        params = tool["parameters"]
+        self.assertIn("mode", params, "mode param missing from design_request schema")
+        self.assertIn("frame", params, "frame param missing from design_request schema")
+        self.assertEqual(params["mode"]["default"], "static")
+
     def test_visual_check_poll_returns_critique_without_holding_lock(self):
         import threading
 

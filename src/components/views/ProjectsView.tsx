@@ -266,11 +266,22 @@ export function ProjectsView() {
   const [plannerLaunching, setPlannerLaunching] = useState(false);
   const plannerLaunchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The project's most-recent design (read-only preview in the planner's Design tab).
+  // Phase 3: extended with kind + artifactId so StageDesign can show the Open affordance.
   const [plannerDesign, setPlannerDesign] = useState<{
     name: string;
     version: string | null;
     ago: string | null;
     thumbnailUri: string | null;
+    /** Registry entry id — forwarded to StageDesign for the task-link command. */
+    id?: string;
+    kind?: import('../../types/design').ArtifactKind;
+    artifactId?: string;
+    /** Phase 4: device-frame skin stored on the registry entry. Forwarded to
+     *  StageDesign so a returning interactive artifact restores the user's frame
+     *  instead of falling back to the heuristic. Absent ⇒ inferred. */
+    frame?: import('../../types/design').ArtifactFrameKind;
+    /** OPTIONAL linked plan-task number (1-based). Absent ⇒ unlinked. */
+    linkedTaskN?: number;
   } | null>(null);
   // Bumped when a design-request the watcher fulfilled completes, to re-run the design
   // load effect so the freshly-generated design surfaces in the Stage Design view (P-B L5).
@@ -1204,12 +1215,21 @@ export function ProjectsView() {
     plannerConvo.length > 0 &&
     plannerConvo[plannerConvo.length - 1].role === "assistant";
 
+  // Stable callback: bumps the planner design nonce to trigger a re-load of the
+  // registry entry after a generation or a task-link change. Hoisted out of JSX to
+  // avoid recreating the callback on every render (which would defeat the useCallback
+  // in PlannerPlanMode's handleLinkTask, causing unnecessary re-subscriptions).
+  const onPlannerDesignGenerated = useCallback(
+    () => setPlannerDesignNonce((n) => n + 1),
+    [],
+  );
+
   // Phase B L4/L5: fulfill the orchestrator's design_request directives (run the reused
   // design pipeline) and refresh the Stage Design view when one completes.
   useDesignRequestWatcher(
     orchestratorAgentId,
     currentProject?.metadata.rootPath ?? null,
-    () => setPlannerDesignNonce((n) => n + 1),
+    onPlannerDesignGenerated,
   );
 
   // Load the project's most-recent design for the planner's read-only Design tab:
@@ -1251,6 +1271,18 @@ export function ProjectsView() {
             version: null,
             ago: entry.updatedAt ? entry.updatedAt.slice(0, 10) : null,
             thumbnailUri,
+            // Registry entry id — forwarded so StageDesign can call set_linked_task.
+            id: entry.id,
+            // Phase 3: carry artifact metadata so StageDesign can offer the Open affordance.
+            // Fix 6: only interactive entries carry an artifactId — static entries have no
+            // artifact:// URL, so set it to undefined rather than a spurious id.
+            kind: entry.kind,
+            artifactId: entry.kind === 'interactive' ? entry.id : undefined,
+            // Phase 4 (Fix 3): carry the stored frame skin so StageDesign's effectiveFrameKind
+            // falls back to the user's stored choice rather than the heuristic on reload.
+            frame: entry.frame,
+            // OPTIONAL link to a plan task (1-based number). Absent ⇒ unlinked.
+            linkedTaskN: entry.linkedTaskN,
           });
         }
       } catch {
@@ -3234,8 +3266,10 @@ export function ProjectsView() {
               );
             }}
             design={plannerDesign}
-            linkedTask={null}
+            linkedTask={plannerDesign?.linkedTaskN ?? null}
             onOpenInDesign={() => requestView("design")}
+            projectRoot={currentProject?.metadata.rootPath ?? null}
+            onGenerated={onPlannerDesignGenerated}
             messages={plannerConvoLive}
             awaitingReply={plannerAwaitingReply}
             onSend={(text) => {

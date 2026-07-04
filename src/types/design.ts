@@ -98,6 +98,20 @@ export interface Point {
 }
 
 /**
+ * Output mode of a design (Phase 2, "two-mode output"). `"static"` = DOMPurify-sanitized
+ * canvas nodes (the default + every legacy design); `"interactive"` = a self-contained
+ * scripted document rendered in the sandboxed `artifact:` iframe. Mirrors the Rust
+ * `ArtifactKind` (lowercase). An ABSENT `kind` on a registry entry ⇒ treated as `"static"`.
+ */
+export type ArtifactKind = "static" | "interactive";
+
+/**
+ * Device/browser frame skin an interactive artifact renders in. Phase 4 wires the actual
+ * skins; the field is carried on the entry from Phase 2 so storage is forward-compatible.
+ */
+export type ArtifactFrameKind = "android" | "ios" | "web" | "component";
+
+/**
  * One design-project registry entry (Phase 3, management plane). METADATA ONLY —
  * mirrors the Rust `DesignProjectEntry` (camelCase). Lives in config.json under
  * `designProjects`; NEVER holds the authoritative manifest/markup/prompt (the
@@ -113,6 +127,21 @@ export interface DesignProjectEntry {
   lastOpenedAt: string;
   thumbnailPath?: string;
   /**
+   * Output mode of this design. ABSENT ⇒ `"static"` (legacy entries + static designs).
+   * Mirrors the Rust `kind` (`Option<ArtifactKind>`, omitted on the wire when `None`).
+   */
+  kind?: ArtifactKind;
+  /**
+   * Working-folder-relative path to the stored interactive artifact (`artifact/index.html`).
+   * Absent for static designs. Mirrors the Rust `artifactPath` (omitted when `None`).
+   */
+  artifactPath?: string;
+  /**
+   * Frame skin to render the interactive artifact in. Absent ⇒ the default skin. Mirrors
+   * the Rust `frame` (omitted when `None`).
+   */
+  frame?: ArtifactFrameKind;
+  /**
    * SHA-256 (lowercase hex) of the design.md content the user last APPROVED in the
    * contract editor. Provenance gate (Fix 3): on load the on-disk design.md is re-hashed
    * and only INJECTED into prompts when it matches this value — an out-of-band (agent)
@@ -121,6 +150,12 @@ export interface DesignProjectEntry {
    * `None`).
    */
   contractSha?: string;
+  /**
+   * OPTIONAL link to a plan task by its 1-based number. Absent ⇒ unlinked. Set/cleared
+   * via `design_registry_set_linked_task`. Mirrors the Rust `linked_task_n` (omitted on
+   * the wire when `None`).
+   */
+  linkedTaskN?: number;
 }
 
 /**

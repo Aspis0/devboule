@@ -728,12 +728,47 @@ TOOLS = [
     },
     {
         "name": "design_request",
-        "description": "Orchestrator only: ask the DESIGNER AI to generate a UI screen for the plan (e.g. a dashboard / home page). Pass `prompt` (what to design) + optional `context` (the conversation/plan context). The designer generates it and it appears in the planner's Design view. Returns the generated design's id + path.",
+        "description": (
+            "Orchestrator only: ask the DESIGNER AI to generate a UI screen for the plan "
+            "(e.g. a dashboard / home page / settings screen). Pass `prompt` (what to design) "
+            "+ optional `context` (the conversation/plan context). The designer generates it "
+            "and it appears in the planner's Design view. Returns the generated design's id + "
+            "path.\n\n"
+            "IMPORTANT — request a design ONLY for user-facing UI projects (a web app, mobile "
+            "app, or desktop UI that a human will interact with visually). Do NOT request a "
+            "design for a backend service, library, CLI tool, data pipeline, or any project "
+            "whose deliverable is not a visual UI. An ill-timed design request blocks the "
+            "orchestrator for up to 5 minutes.\n\n"
+            "Set `mode` to 'interactive' for a real runnable HTML artifact (recommended for "
+            "clickable prototypes, dashboards, or any screen with JS interactions). Use "
+            "'static' for a lightweight non-interactive mockup. Omitting `mode` defaults to "
+            "'static' for backward compatibility.\n\n"
+            "Set `frame` to the target platform skin: 'android', 'ios', 'web', or 'component'. "
+            "Omit for the default skin."
+        ),
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "prompt": {"type": "string"},
             "context": {"type": "string", "default": ""},
+            "mode": {
+                "type": "string",
+                "enum": ["static", "interactive"],
+                "default": "static",
+                "description": (
+                    "Output mode. 'interactive' = runnable HTML artifact (real JS); "
+                    "'static' = sanitized mockup. Default: 'static'."
+                ),
+            },
+            "frame": {
+                "type": "string",
+                "enum": ["android", "ios", "web", "component", ""],
+                "default": "",
+                "description": (
+                    "Device frame skin. One of 'android', 'ios', 'web', 'component', or "
+                    "empty string for the default skin. Applies to interactive mode only."
+                ),
+            },
             "session_token": {"type": "string"},
         },
     },
@@ -6685,21 +6720,30 @@ def dispatch_design_request(projects_dir, state_lock, args):
     if "design_request" not in ROLE_ALLOWED_TOOLS.get(role, set()):
         raise McpError(f"{role} agents cannot use design_request.")
     prompt = clean_text(args.get("prompt"), "Design prompt", 4000)
-    if not prompt:
-        raise McpError("Design prompt is required.")
-    context = args.get("context")
-    plan_context = clean_text(context, "Design context", 4000) if context else None
-    directive_id = uuid.uuid4().hex
-    directive = {
-        "id": directive_id,
-        "parentAgentId": agent_id,
-        "status": "pending",
-        "prompt": prompt,
-        "resultPath": f"{directive_id}.json",
-        "createdAt": now(),
-    }
-    if plan_context:
-        directive["planContext"] = plan_context
+	    if not prompt:
+	        raise McpError("Design prompt is required.")
+	    context = args.get("context")
+	    plan_context = clean_text(context, "Design context", 4000) if context else None
+	    # Phase 3: optional mode / frame forwarded to the watcher unchanged.
+	    raw_mode = args.get("mode") or ""
+	    mode = raw_mode if raw_mode in ("static", "interactive") else None
+	    raw_frame = args.get("frame") or ""
+	    frame = raw_frame if raw_frame in ("android", "ios", "web", "component") else None
+	    directive_id = uuid.uuid4().hex
+	    directive = {
+	        "id": directive_id,
+	        "parentAgentId": agent_id,
+	        "status": "pending",
+	        "prompt": prompt,
+	        "resultPath": f"{directive_id}.json",
+	        "createdAt": now(),
+	    }
+	    if plan_context:
+	        directive["planContext"] = plan_context
+	    if mode:
+	        directive["mode"] = mode
+	    if frame:
+	        directive["frame"] = frame
     with file_lock(state_lock):
         state = read_agents_state(projects_dir)
         session = next(
