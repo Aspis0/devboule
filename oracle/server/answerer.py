@@ -80,9 +80,49 @@ NON_ENGLISH_PHRASES = (
     " pourrait ",
 )
 NON_ENGLISH_MARKER_SETS = (
-    {"risposta", "forniti", "fornito", "codice", "agenti", "questo", "questa", "usando", "evita", "limita", "sono", "perche", "perché"},
-    {"respuesta", "codigo", "código", "archivo", "agentes", "tarea", "estado", "usa", "usan", "desde", "porque", "sin"},
-    {"réponse", "reponse", "fichier", "agents", "tâche", "tache", "état", "etat", "utilise", "depuis", "parce", "sans"},
+    {
+        "risposta",
+        "forniti",
+        "fornito",
+        "codice",
+        "agenti",
+        "questo",
+        "questa",
+        "usando",
+        "evita",
+        "limita",
+        "sono",
+        "perche",
+        "perché",
+    },
+    {
+        "respuesta",
+        "codigo",
+        "código",
+        "archivo",
+        "agentes",
+        "tarea",
+        "estado",
+        "usa",
+        "usan",
+        "desde",
+        "porque",
+        "sin",
+    },
+    {
+        "réponse",
+        "reponse",
+        "fichier",
+        "agents",
+        "tâche",
+        "tache",
+        "état",
+        "etat",
+        "utilise",
+        "depuis",
+        "parce",
+        "sans",
+    },
 )
 COMMON_GROUNDED_TERMS = {
     "api",
@@ -145,12 +185,16 @@ HIGH_RISK_CLAIM_TERMS = {
 }
 
 
-def answer_from_context(query: str, chunks: list[dict], llm_config: dict | None = None) -> dict:
+def answer_from_context(
+    query: str, chunks: list[dict], llm_config: dict | None = None
+) -> dict:
     context = prepared_context(chunks, query)
     if not context:
         return not_found_answer(query, [])
     if os.getenv("ORACLE_ASK_DISABLE_LLM", "").strip() == "1":
-        return extractive_answer(query, context, reason="LLM disabled for bounded smoke/test run")
+        return extractive_answer(
+            query, context, reason="LLM disabled for bounded smoke/test run"
+        )
 
     prompt = build_answer_prompt(query, context)
     config = normalize_llm_config(llm_config)
@@ -160,7 +204,9 @@ def answer_from_context(query: str, chunks: list[dict], llm_config: dict | None 
     return answer_with_llm_config(query, prompt, context, config)
 
 
-def answer_with_llm_config(query: str, prompt: str, context: list[dict], config: dict) -> dict:
+def answer_with_llm_config(
+    query: str, prompt: str, context: list[dict], config: dict
+) -> dict:
     # Oracle answers are API-only: the remote OpenAI-compatible path (the local
     # Ollama chat path has been removed).
     #
@@ -170,7 +216,9 @@ def answer_with_llm_config(query: str, prompt: str, context: list[dict], config:
     # an extractive, retrieval-only answer so the user still gets grounded context
     # with a clear reason (per plan: "no key -> extractive answers"). There is no
     # LLM-to-LLM fallback and no ZDR/GDPR gate.
-    needs_key = str(config.get("provider") or "").strip().lower() not in LOCAL_LLM_PROVIDERS
+    needs_key = (
+        str(config.get("provider") or "").strip().lower() not in LOCAL_LLM_PROVIDERS
+    )
     if (needs_key and not config.get("api_key")) or not config.get("model"):
         answer = extractive_answer(
             query,
@@ -192,7 +240,9 @@ def answer_with_llm_config(query: str, prompt: str, context: list[dict], config:
         # it to an extractive answer. Re-raise so it propagates unchanged.
         raise
     except Exception as exc:
-        answer = extractive_answer(query, context, reason=f"LLM generation failed: {short_error(exc)}")
+        answer = extractive_answer(
+            query, context, reason=f"LLM generation failed: {short_error(exc)}"
+        )
         answer["llm_provider"] = config["provider"]
         answer["llm_model"] = config["model"]
         return answer
@@ -311,7 +361,9 @@ def generate_with_openai_compatible(prompt: str, config: dict) -> str:
     try:
         import httpx
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("Oracle remote LLM requires httpx from oracle/requirements.txt.") from exc
+        raise RuntimeError(
+            "Oracle remote LLM requires httpx from oracle/requirements.txt."
+        ) from exc
 
     body: dict[str, Any] = {
         "model": config["model"],
@@ -361,7 +413,11 @@ def generate_with_openai_compatible(prompt: str, config: dict) -> str:
 
 def normalize_llm_config(config: dict | None = None) -> dict:
     source = dict(config or {})
-    provider = str(source.get("provider") or os.getenv("ORACLE_LLM_PROVIDER", "scaleway")).strip().lower()
+    provider = (
+        str(source.get("provider") or os.getenv("ORACLE_LLM_PROVIDER", "scaleway"))
+        .strip()
+        .lower()
+    )
     # The local Ollama chat path has been removed: answers are API-only. Any
     # provider must be a remote one; validate_remote_llm_config (called by the
     # consumers of this config) rejects anything outside the remote allowlist
@@ -376,14 +432,22 @@ def normalize_llm_config(config: dict | None = None) -> dict:
         )
     model = str(source.get("model") or os.getenv("ORACLE_LLM_MODEL", LLM_MODEL)).strip()
 
-    base_url = str(source.get("base_url") or source.get("baseUrl") or os.getenv("ORACLE_LLM_BASE_URL", "")).strip()
+    base_url = str(
+        source.get("base_url")
+        or source.get("baseUrl")
+        or os.getenv("ORACLE_LLM_BASE_URL", "")
+    ).strip()
     if not base_url:
         base_url = default_base_url(provider)
     return {
         "provider": provider,
         "model": model,
         "base_url": base_url,
-        "api_key": str(source.get("api_key") or source.get("apiKey") or os.getenv("ORACLE_LLM_API_KEY", "")).strip(),
+        "api_key": str(
+            source.get("api_key")
+            or source.get("apiKey")
+            or os.getenv("ORACLE_LLM_API_KEY", "")
+        ).strip(),
     }
 
 
@@ -433,7 +497,11 @@ def validate_remote_llm_config(config: dict) -> None:
         local_parsed = urlparse(local_url)
         if local_parsed.scheme not in {"http", "https"} or not local_parsed.netloc:
             raise RuntimeError("Local Oracle LLM base URL is invalid.")
-        if (local_parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        if (local_parsed.hostname or "").lower() not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
             raise OraclePrivacyGateError(
                 "Local Oracle LLM endpoints must stay on loopback (127.0.0.1)."
             )
@@ -452,7 +520,9 @@ def validate_remote_llm_config(config: dict) -> None:
         "mistral": {"api.mistral.ai"},
     }
     if parsed.netloc.lower() not in allowed_hosts[provider]:
-        raise RuntimeError("Remote Oracle LLM base URL host does not match the selected provider.")
+        raise RuntimeError(
+            "Remote Oracle LLM base URL host does not match the selected provider."
+        )
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -468,7 +538,9 @@ def chat_completions_url(base_url: str) -> str:
 
 def prepared_context(chunks: list[dict], query: str = "") -> list[dict]:
     candidate_chunks = chunks[: max(MAX_PROMPT_CHUNKS * 2, MAX_PROMPT_CHUNKS)]
-    current_chunks = [chunk for chunk in candidate_chunks if not is_superseded_context(chunk)]
+    current_chunks = [
+        chunk for chunk in candidate_chunks if not is_superseded_context(chunk)
+    ]
     if current_chunks:
         candidate_chunks = current_chunks
     candidate_chunks = filter_domain_context(candidate_chunks, query)
@@ -481,13 +553,22 @@ def prepared_context(chunks: list[dict], query: str = "") -> list[dict]:
             {
                 "ref": f"C{index}",
                 "chunk_id": str(chunk.get("chunk_id") or chunk.get("id") or ""),
-                "file_source": str(chunk.get("file_source") or chunk.get("file_sorgente") or ""),
+                "file_source": str(
+                    chunk.get("file_source") or chunk.get("file_sorgente") or ""
+                ),
                 "chunk_index": int_or_none(chunk.get("chunk_index")),
                 "start_char": int_or_none(chunk.get("start_char")),
                 "end_char": int_or_none(chunk.get("end_char")),
                 "retrieval": str(chunk.get("retrieval") or ""),
                 "score": float_or_zero(chunk.get("score")),
                 "text": focused_excerpt(text, query, MAX_CHARS_PER_CHUNK),
+                # Phase 1 structural synthesis: carry chunk metadata through.
+                "kind": str(chunk.get("kind") or ""),
+                "symbol_name": str(chunk.get("symbol_name") or ""),
+                "signature": str(chunk.get("signature") or ""),
+                "language": str(chunk.get("language") or ""),
+                "line_start": int_or_none(chunk.get("line_start")) or 0,
+                "line_end": int_or_none(chunk.get("line_end")) or 0,
             }
         )
     return prepared
@@ -513,9 +594,13 @@ def filter_domain_context(chunks: list[dict], query: str) -> list[dict]:
         orasis = [chunk for chunk in chunks if "/orasis/" in chunk_source(chunk)]
         return orasis or chunks
     if "biovision" in q:
-        direct_biovision = [chunk for chunk in chunks if "/orasis/" not in chunk_source(chunk)]
+        direct_biovision = [
+            chunk for chunk in chunks if "/orasis/" not in chunk_source(chunk)
+        ]
         return direct_biovision or chunks
-    if ("rna-seq" in q or "rnaseq" in q) and any(term in q for term in ["output", "result", "download", "browser", "release"]):
+    if ("rna-seq" in q or "rnaseq" in q) and any(
+        term in q for term in ["output", "result", "download", "browser", "release"]
+    ):
         implementation = [
             chunk
             for chunk in chunks
@@ -527,7 +612,11 @@ def filter_domain_context(chunks: list[dict], query: str) -> list[dict]:
 
 
 def chunk_source(chunk: dict) -> str:
-    return str(chunk.get("file_source") or chunk.get("file_sorgente") or "").replace("\\", "/").lower()
+    return (
+        str(chunk.get("file_source") or chunk.get("file_sorgente") or "")
+        .replace("\\", "/")
+        .lower()
+    )
 
 
 def focused_excerpt(text: str, query: str, limit: int) -> str:
@@ -580,7 +669,15 @@ def query_terms(query: str) -> set[str]:
 
 
 def term_weight(term: str) -> int:
-    if term in {"gpu", "min_scale", "max_scale", "scaleway", "cloudflare", "worker", "workers"}:
+    if term in {
+        "gpu",
+        "min_scale",
+        "max_scale",
+        "scaleway",
+        "cloudflare",
+        "worker",
+        "workers",
+    }:
         return 3
     return 1
 
@@ -610,9 +707,15 @@ def normalize_answer(query: str, parsed: dict, context: list[dict]) -> dict:
     answer = clean_answer(parsed.get("answer"))
     not_found = bool(parsed.get("not_found")) or NOT_FOUND_PHRASE in answer.lower()
     if not answer:
-        return extractive_answer(query, context, reason="LLM returned empty or invalid JSON")
+        return extractive_answer(
+            query, context, reason="LLM returned empty or invalid JSON"
+        )
     if not_found:
-        grounded = domain_extractive_answer(query, context, reason="LLM returned not_found despite matching code evidence")
+        grounded = domain_extractive_answer(
+            query,
+            context,
+            reason="LLM returned not_found despite matching code evidence",
+        )
         if grounded:
             return grounded
         suggested = suggest_path(query, context)
@@ -626,13 +729,21 @@ def normalize_answer(query: str, parsed: dict, context: list[dict]) -> dict:
 
     citations = normalize_citations(parsed.get("citations"), context)
     if not citations:
-        return extractive_answer(query, context, reason="LLM returned no valid citations")
+        return extractive_answer(
+            query, context, reason="LLM returned no valid citations"
+        )
     if answer_is_too_generic(query, answer, context):
         return extractive_answer(query, context, reason="LLM returned a generic answer")
     if answer_has_non_english_markers(answer):
-        return extractive_answer(query, context, reason="LLM returned a non-English answer")
+        return extractive_answer(
+            query, context, reason="LLM returned a non-English answer"
+        )
     if answer_has_unsupported_natural_claims(answer, citations, context):
-        return extractive_answer(query, context, reason="LLM answer included unsupported natural-language claims")
+        return extractive_answer(
+            query,
+            context,
+            reason="LLM answer included unsupported natural-language claims",
+        )
     if answer_has_unsupported_grounding_terms(answer, citations, context):
         return extractive_answer(
             query,
@@ -683,7 +794,9 @@ def normalize_citations(raw_citations: Any, context: list[dict]) -> list[dict]:
     return citations
 
 
-def not_found_answer(query: str, context: list[dict], reason: str | None = None) -> dict:
+def not_found_answer(
+    query: str, context: list[dict], reason: str | None = None
+) -> dict:
     suffix = f": {reason}" if reason else ""
     return {
         "answer": f"{NOT_FOUND_PHRASE}{suffix}.",
@@ -694,12 +807,20 @@ def not_found_answer(query: str, context: list[dict], reason: str | None = None)
     }
 
 
-def extractive_answer(query: str, context: list[dict], reason: str | None = None) -> dict:
+def extractive_answer(
+    query: str, context: list[dict], reason: str | None = None
+) -> dict:
     if not context:
         return not_found_answer(query, context, reason=reason)
     domain = domain_extractive_answer(query, context, reason=reason)
     if domain:
         return domain
+    # Phase 1: try clean structural synthesis before the apology fallback.
+    from oracle.server.structural_synthesis import structural_extractive_answer
+
+    structural = structural_extractive_answer(query, context, reason=reason)
+    if structural:
+        return structural
 
     citations = [
         {
@@ -723,7 +844,9 @@ def extractive_answer(query: str, context: list[dict], reason: str | None = None
     if excerpts:
         body = " ".join(excerpts)
     else:
-        files = ", ".join(item["file_source"] for item in context[: min(3, len(context))])
+        files = ", ".join(
+            item["file_source"] for item in context[: min(3, len(context))]
+        )
         body = f"The best matching Oracle context is in {files}."
     prefix = "Oracle found relevant code evidence, but the answer model could not produce a complete grounded response."
     if reason:
@@ -738,32 +861,95 @@ def extractive_answer(query: str, context: list[dict], reason: str | None = None
     }
 
 
-def domain_extractive_answer(query: str, context: list[dict], reason: str | None = None) -> dict | None:
+def domain_extractive_answer(
+    query: str, context: list[dict], reason: str | None = None
+) -> dict | None:
     q = query.lower()
-    if ("rna-seq" in q or "rnaseq" in q) and any(term in q for term in ["output", "outputs", "result", "results", "download", "release"]):
+    if ("rna-seq" in q or "rnaseq" in q) and any(
+        term in q
+        for term in ["output", "outputs", "result", "results", "download", "release"]
+    ):
         return rnaseq_output_extractive_answer(context, reason=reason)
-    if "scaleway" in q and any(term in q for term in ["paid", "cleanup", "stop", "stops", "terminate", "terminal", "job", "resource", "resources"]):
+    if "scaleway" in q and any(
+        term in q
+        for term in [
+            "paid",
+            "cleanup",
+            "stop",
+            "stops",
+            "terminate",
+            "terminal",
+            "job",
+            "resource",
+            "resources",
+        ]
+    ):
         return scaleway_cleanup_extractive_answer(context, reason=reason)
-    if any(term in q for term in ["agent", "agents", "terminal", "cli"]) and any(term in q for term in ["project", "task", "status", "finished", "done"]):
+    if any(term in q for term in ["agent", "agents", "terminal", "cli"]) and any(
+        term in q for term in ["project", "task", "status", "finished", "done"]
+    ):
         return agent_project_extractive_answer(context, reason=reason)
-    if "oracle" in q and any(term in q for term in ["privacy", "safe", "zdr", "gdpr", "provider", "providers", "llm", "answers"]):
+    if "oracle" in q and any(
+        term in q
+        for term in [
+            "privacy",
+            "safe",
+            "zdr",
+            "gdpr",
+            "provider",
+            "providers",
+            "llm",
+            "answers",
+        ]
+    ):
         return oracle_privacy_extractive_answer(context, reason=reason)
-    if "windows" in q and any(term in q for term in ["hello", "webcam", "camera", "unlock", "pin", "loop"]):
+    if "windows" in q and any(
+        term in q for term in ["hello", "webcam", "camera", "unlock", "pin", "loop"]
+    ):
         return windows_hello_extractive_answer(context, reason=reason)
     return None
 
 
-def rnaseq_output_extractive_answer(context: list[dict], reason: str | None = None) -> dict | None:
+def rnaseq_output_extractive_answer(
+    context: list[dict], reason: str | None = None
+) -> dict | None:
     combined = "\n".join(item["text"] for item in context).lower()
     required = ["output_renders", "artifact_url", "manifest_url"]
     if not all(term in combined for term in required):
         return None
 
-    done_ref = find_context_ref(context, ["results ready", 'status === "done"', "status: \"done\""])
-    request_ref = find_context_ref(context, ["requestoutputrenderrecordwithpayload", "outputs_not_ready", "createoutputrenderrecord", "enqueueoutputrender"])
-    callback_ref = find_context_ref(context, ["syncoutputrenderrecordtojob", "normalizeoutputrenderstatuspayload", 'status: "ready"', "manifest_url"])
-    download_ref = find_context_ref(context, ["downloadrenderedartifact", "content-disposition", "registeredartifactisdownloadable"])
-    refs = unique_context_refs([item for item in [done_ref, request_ref, callback_ref, download_ref] if item])
+    done_ref = find_context_ref(
+        context, ["results ready", 'status === "done"', 'status: "done"']
+    )
+    request_ref = find_context_ref(
+        context,
+        [
+            "requestoutputrenderrecordwithpayload",
+            "outputs_not_ready",
+            "createoutputrenderrecord",
+            "enqueueoutputrender",
+        ],
+    )
+    callback_ref = find_context_ref(
+        context,
+        [
+            "syncoutputrenderrecordtojob",
+            "normalizeoutputrenderstatuspayload",
+            'status: "ready"',
+            "manifest_url",
+        ],
+    )
+    download_ref = find_context_ref(
+        context,
+        [
+            "downloadrenderedartifact",
+            "content-disposition",
+            "registeredartifactisdownloadable",
+        ],
+    )
+    refs = unique_context_refs(
+        [item for item in [done_ref, request_ref, callback_ref, download_ref] if item]
+    )
     if len(refs) < 2:
         return None
 
@@ -786,14 +972,27 @@ def rnaseq_output_extractive_answer(context: list[dict], reason: str | None = No
     }
 
 
-def scaleway_cleanup_extractive_answer(context: list[dict], reason: str | None = None) -> dict | None:
+def scaleway_cleanup_extractive_answer(
+    context: list[dict], reason: str | None = None
+) -> dict | None:
     combined = "\n".join(item["text"] for item in context).lower()
-    if not ("terminatescalewayinstance" in combined and "releasescalewayinstanceslot" in combined):
+    if not (
+        "terminatescalewayinstance" in combined
+        and "releasescalewayinstanceslot" in combined
+    ):
         return None
-    cleanup_ref = find_context_ref(context, ["cleanupscalewayinstanceafterterminal", "terminal"])
-    terminate_ref = find_context_ref(context, ["terminatescalewayinstance", "delete", "with_volumes=all"])
-    release_ref = find_context_ref(context, ["releasescalewayinstanceslot", "scaleway_instance_active_key"])
-    refs = unique_context_refs([item for item in [cleanup_ref, terminate_ref, release_ref] if item])
+    cleanup_ref = find_context_ref(
+        context, ["cleanupscalewayinstanceafterterminal", "terminal"]
+    )
+    terminate_ref = find_context_ref(
+        context, ["terminatescalewayinstance", "delete", "with_volumes=all"]
+    )
+    release_ref = find_context_ref(
+        context, ["releasescalewayinstanceslot", "scaleway_instance_active_key"]
+    )
+    refs = unique_context_refs(
+        [item for item in [cleanup_ref, terminate_ref, release_ref] if item]
+    )
     if not refs:
         return None
     answer = (
@@ -814,14 +1013,20 @@ def scaleway_cleanup_extractive_answer(context: list[dict], reason: str | None =
     }
 
 
-def agent_project_extractive_answer(context: list[dict], reason: str | None = None) -> dict | None:
+def agent_project_extractive_answer(
+    context: list[dict], reason: str | None = None
+) -> dict | None:
     combined = "\n".join(item["text"] for item in context).lower()
     if not ("project_claim_task" in combined and "project_update_status" in combined):
         return None
-    read_ref = find_context_ref(context, ["project_get", "project_list", "oracle_context", "oracle_ask"])
+    read_ref = find_context_ref(
+        context, ["project_get", "project_list", "oracle_context", "oracle_ask"]
+    )
     claim_ref = find_context_ref(context, ["project_claim_task"])
     update_ref = find_context_ref(context, ["project_update_status"])
-    refs = unique_context_refs([item for item in [read_ref, claim_ref, update_ref] if item])
+    refs = unique_context_refs(
+        [item for item in [read_ref, claim_ref, update_ref] if item]
+    )
     if not refs:
         return None
     answer = (
@@ -839,16 +1044,36 @@ def agent_project_extractive_answer(context: list[dict], reason: str | None = No
     }
 
 
-def oracle_privacy_extractive_answer(context: list[dict], reason: str | None = None) -> dict | None:
+def oracle_privacy_extractive_answer(
+    context: list[dict], reason: str | None = None
+) -> dict | None:
     combined = "\n".join(item["text"] for item in context).lower()
-    if not ("scaleway" in combined and "infomaniak" in combined and "mistral" in combined):
+    if not (
+        "scaleway" in combined and "infomaniak" in combined and "mistral" in combined
+    ):
         return None
-    if not ("zdr" in combined or "gdpr" in combined or "allowlisted" in combined or "provider not allowlisted" in combined):
+    if not (
+        "zdr" in combined
+        or "gdpr" in combined
+        or "allowlisted" in combined
+        or "provider not allowlisted" in combined
+    ):
         return None
-    vault_ref = find_context_ref(context, ["allow only", "scaleway", "infomaniak", "mistral", "oracle_llm"])
-    answerer_ref = find_context_ref(context, ["remote oracle llm provider is not allowlisted", "allowlisted", "allowed_hosts"])
+    vault_ref = find_context_ref(
+        context, ["allow only", "scaleway", "infomaniak", "mistral", "oracle_llm"]
+    )
+    answerer_ref = find_context_ref(
+        context,
+        [
+            "remote oracle llm provider is not allowlisted",
+            "allowlisted",
+            "allowed_hosts",
+        ],
+    )
     graph_ref = find_context_ref(context, ["provider", "base_url", "scaleway"])
-    refs = unique_context_refs([item for item in [vault_ref, answerer_ref, graph_ref] if item])
+    refs = unique_context_refs(
+        [item for item in [vault_ref, answerer_ref, graph_ref] if item]
+    )
     if not refs:
         return None
     answer = (
@@ -867,11 +1092,15 @@ def oracle_privacy_extractive_answer(context: list[dict], reason: str | None = N
     }
 
 
-def windows_hello_extractive_answer(context: list[dict], reason: str | None = None) -> dict | None:
+def windows_hello_extractive_answer(
+    context: list[dict], reason: str | None = None
+) -> dict | None:
     combined = "\n".join(item["text"] for item in context).lower()
     if not ("windows hello" in combined and "unlock" in combined):
         return None
-    auth_ref = find_context_ref(context, ["windows hello", "unlock", "credential", "biometric"])
+    auth_ref = find_context_ref(
+        context, ["windows hello", "unlock", "credential", "biometric"]
+    )
     state_ref = find_context_ref(context, ["cooldown", "retry", "unlock"])
     refs = unique_context_refs([item for item in [auth_ref, state_ref] if item])
     if not refs:
@@ -935,7 +1164,9 @@ def answer_is_too_generic(query: str, answer: str, context: list[dict]) -> bool:
     if lower.startswith(meta_prefixes) or "here is an analysis" in lower:
         return True
     q_terms = query_terms(query)
-    if ({"rna-seq", "rnaseq", "output", "outputs", "download", "browser"} & q_terms) and len(answer) > 40:
+    if (
+        {"rna-seq", "rnaseq", "output", "outputs", "download", "browser"} & q_terms
+    ) and len(answer) > 40:
         domain_terms = {
             "output_renders",
             "artifact_url",
@@ -960,7 +1191,9 @@ def answer_has_non_english_markers(answer: str) -> bool:
     return any(len(words & markers) >= 2 for markers in NON_ENGLISH_MARKER_SETS)
 
 
-def answer_has_unsupported_natural_claims(answer: str, citations: list[dict], context: list[dict]) -> bool:
+def answer_has_unsupported_natural_claims(
+    answer: str, citations: list[dict], context: list[dict]
+) -> bool:
     support = normalize_support_text(cited_support_text(citations, context))
     if not support:
         return False
@@ -978,7 +1211,11 @@ def answer_has_unsupported_natural_claims(answer: str, citations: list[dict], co
 
 
 def answer_sentences(answer: str) -> list[str]:
-    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", answer) if sentence.strip()]
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", answer)
+        if sentence.strip()
+    ]
 
 
 def natural_claim_terms(sentence: str) -> set[str]:
@@ -990,7 +1227,9 @@ def natural_claim_terms(sentence: str) -> set[str]:
     }
 
 
-def answer_has_unsupported_grounding_terms(answer: str, citations: list[dict], context: list[dict]) -> bool:
+def answer_has_unsupported_grounding_terms(
+    answer: str, citations: list[dict], context: list[dict]
+) -> bool:
     terms = answer_grounding_terms(answer)
     if not terms:
         return False
@@ -998,7 +1237,9 @@ def answer_has_unsupported_grounding_terms(answer: str, citations: list[dict], c
     # With several retrieved chunks the model frequently references a real
     # identifier from a retrieved-but-uncited chunk; since we showed that chunk
     # to the model, the term IS grounded and must not flag the whole answer.
-    support = normalize_support_text("\n".join(context_support_text(item) for item in context))
+    support = normalize_support_text(
+        "\n".join(context_support_text(item) for item in context)
+    )
     unsupported = [
         term
         for term in terms
@@ -1014,7 +1255,9 @@ def answer_has_unsupported_grounding_terms(answer: str, citations: list[dict], c
 
 def cited_support_text(citations: list[dict], context: list[dict]) -> str:
     refs = {citation.get("ref") for citation in citations}
-    return "\n".join(context_support_text(item) for item in context if item.get("ref") in refs)
+    return "\n".join(
+        context_support_text(item) for item in context if item.get("ref") in refs
+    )
 
 
 def context_support_text(item: dict) -> str:
@@ -1035,7 +1278,13 @@ def answer_grounding_terms(answer: str) -> set[str]:
     terms: set[str] = set()
     for value in re.findall(r"`([^`]{2,120})`", answer):
         terms.update(split_grounding_value(value))
-    terms.update(re.findall(r"[\w./\\-]+\.(?:rs|py|tsx|ts|jsx|js|mjs|md|json|toml|ya?ml)\b", answer, flags=re.IGNORECASE))
+    terms.update(
+        re.findall(
+            r"[\w./\\-]+\.(?:rs|py|tsx|ts|jsx|js|mjs|md|json|toml|ya?ml)\b",
+            answer,
+            flags=re.IGNORECASE,
+        )
+    )
     terms.update(re.findall(r"\b[a-z]+[A-Z][A-Za-z0-9]*\b", answer))
     terms.update(re.findall(r"\b[a-z][a-z0-9]+_[a-z0-9_]+\b", answer))
     terms.update(re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", answer))
@@ -1075,7 +1324,9 @@ def best_sentence(text: str, query: str) -> str:
         return truncate_text(candidates[0], 260)
     best = max(
         candidates,
-        key=lambda sentence: sum(sentence.lower().count(term) * term_weight(term) for term in terms),
+        key=lambda sentence: sum(
+            sentence.lower().count(term) * term_weight(term) for term in terms
+        ),
     )
     return truncate_text(best, 260)
 
