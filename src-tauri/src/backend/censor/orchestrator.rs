@@ -968,7 +968,7 @@ fn emit_scan_started(
 }
 
 /// Collect all Open findings for the given files by reading their Censor shards.
-fn collect_open_findings(root: &Path, files: &[String]) -> Vec<Finding> {
+pub fn collect_open_findings(root: &Path, files: &[String]) -> Vec<Finding> {
     files
         .iter()
         .filter_map(|file| {

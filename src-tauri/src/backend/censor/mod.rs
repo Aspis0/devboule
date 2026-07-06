@@ -20,7 +20,10 @@ pub mod runners;
 pub mod schema;
 pub mod severity;
 pub mod votes;
-pub mod watch;
+
+// watch.rs removed — no more filesystem watcher. FINE runners are triggered
+// synchronously by the mini-coder executor on task completion; COARSE is on
+// a cooldown timer in the same executor loop.
 
 #[cfg(test)]
 mod live_e2e;

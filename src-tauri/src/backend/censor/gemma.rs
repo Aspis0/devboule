@@ -788,6 +788,13 @@ pub trait GemmaClient: Send + Sync {
     fn cache_identity(&self) -> String {
         format!("{}||{}", self.provider_label(), self.model_label())
     }
+
+    /// Current server load from the backend: `(loaded_model_count, memory_bytes_in_use)`.
+    /// Returns `None` when not determinable (AppleFM, Cloud, or unreachable).
+    /// Used by the Pigeon censor-pool to skip reviews when another model is loaded.
+    fn server_load(&self) -> Option<(usize, u64)> {
+        None
+    }
 }
 
 /// The real loopback Ollama client. Holds a `reqwest::blocking::Client` with no
@@ -1354,6 +1361,24 @@ impl GemmaClient for OmlxClient {
         };
         format!("{}|{}|{}", prefix, self.base, self.model)
     }
+
+    fn server_load(&self) -> Option<(usize, u64)> {
+        let url = format!("{}/health", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(self.probe_timeout)
+            .send()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().ok()?;
+        let pool = body.get("engine_pool")?;
+        let count = pool.get("loaded_count")?.as_u64()? as usize;
+        let mem = pool.get("current_model_memory")?.as_u64()?;
+        Some((count, mem))
+    }
 }
 
 /// Is `base` a loopback HTTP origin? Only `http://127.x`, `http://[::1]`, and
@@ -1563,6 +1588,27 @@ impl GemmaClient for OllamaClient {
             self.base,
             self.configured_model.as_deref().unwrap_or("")
         )
+    }
+
+    fn server_load(&self) -> Option<(usize, u64)> {
+        let url = format!("{}/api/ps", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(self.probe_timeout)
+            .send()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().ok()?;
+        let models = body.get("models")?.as_array()?;
+        let count = models.len();
+        let mem: u64 = models
+            .iter()
+            .filter_map(|m| m.get("size_vram")?.as_u64())
+            .sum();
+        Some((count, mem))
     }
 }
 
@@ -4310,5 +4356,45 @@ mod tests {
             findings.len(),
             findings
         );
+    }
+
+    // ---- server_load trait method ----
+
+    #[test]
+    fn server_load_default_returns_none() {
+        let client = StubClient::new(true, Ok("[]".to_string()));
+        assert_eq!(client.server_load(), None, "default impl returns None");
+    }
+
+    #[test]
+    fn server_load_stub_can_override() {
+        struct LoadStub {
+            load: Option<(usize, u64)>,
+        }
+        impl GemmaClient for LoadStub {
+            fn probe(&self) -> bool {
+                true
+            }
+            fn generate(&self, _: &str) -> Result<String, GemmaError> {
+                Ok("[]".into())
+            }
+            fn provider_label(&self) -> &'static str {
+                "load-stub"
+            }
+            fn model_label(&self) -> String {
+                "load-stub".into()
+            }
+            fn server_load(&self) -> Option<(usize, u64)> {
+                self.load
+            }
+        }
+        let busy = LoadStub {
+            load: Some((1, 8 * 1024 * 1024 * 1024)),
+        };
+        assert_eq!(busy.server_load(), Some((1, 8 * 1024 * 1024 * 1024)));
+        let free = LoadStub { load: Some((0, 0)) };
+        assert_eq!(free.server_load(), Some((0, 0)));
+        let unknown = LoadStub { load: None };
+        assert_eq!(unknown.server_load(), None);
     }
 }
