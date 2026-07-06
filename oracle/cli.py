@@ -2,10 +2,36 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
-from oracle.config import CHUNK_BATCH_CHARS, CHUNK_BATCH_FILES, CHUNK_DB_PATH, CHUNK_MANIFEST_PATH, CHUNK_MAX_GPU_TEMP_C, LANCE_DB_PATH, SQLITE_PATH
-from oracle.ingestion.chunk_index import chunk_index_status, index_file_chunks, prune_excluded_chunks, sync_text_chunks
+
+class CliError(Exception):
+    """Structured CLI error: prints JSON and exits non-zero."""
+
+
+def _error_payload(message: str) -> dict:
+    return {"error": message}
+
+
+from oracle.config import (
+    CHUNK_BATCH_CHARS,
+    CHUNK_BATCH_FILES,
+    CHUNK_DB_PATH,
+    CHUNK_MANIFEST_PATH,
+    CHUNK_MAX_GPU_TEMP_C,
+    CKG_DB_PATH,
+    LANCE_DB_PATH,
+    SQLITE_PATH,
+)
+from oracle.ingestion.build_cards import build_cards_from_chunks
+from oracle.ingestion.ckg_index import build_ckg
+from oracle.ingestion.chunk_index import (
+    chunk_index_status,
+    index_file_chunks,
+    prune_excluded_chunks,
+    sync_text_chunks,
+)
 from oracle.verify_coverage import coverage
 from oracle.verify_runtime import runtime_status
 from oracle.server.query_engine import QueryEngine
@@ -19,12 +45,33 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Architecture Oracle Phase 0/1 CLI")
-    parser.add_argument("command", choices=["snapshot", "ask", "context", "node", "similar", "duplicates", "cluster", "coverage", "runtime", "index-chunks", "chunk-status", "sync-text-chunks", "prune-chunks"])
+    parser.add_argument(
+        "command",
+        choices=[
+            "snapshot",
+            "ask",
+            "context",
+            "node",
+            "similar",
+            "duplicates",
+            "cluster",
+            "coverage",
+            "runtime",
+            "index-chunks",
+            "chunk-status",
+            "sync-text-chunks",
+            "prune-chunks",
+            "build-cards",
+            "ingest-ckg",
+        ],
+    )
     parser.add_argument("--sqlite", default=str(SQLITE_PATH))
     parser.add_argument("--vectors", default=str(LANCE_DB_PATH))
     parser.add_argument("--chunks", default=str(CHUNK_DB_PATH))
     parser.add_argument("--manifest", default=str(CHUNK_MANIFEST_PATH))
     parser.add_argument("--root", default=os.getenv("ORACLE_INDEX_ROOT", "."))
+    parser.add_argument("--app-bin", default=os.getenv("ASPIS_APP_BIN", ""))
+    parser.add_argument("--ckg", default=str(CKG_DB_PATH))
     parser.add_argument("--query", default="")
     parser.add_argument("--node-id", default="")
     parser.add_argument("--cluster-id", default="")
@@ -62,59 +109,101 @@ def main(argv: list[str] | None = None) -> int:
             from oracle.server.index_jobs import resolve_min_free_gb
 
             min_free_gb = resolve_min_free_gb(embedding_device(), idle=False)
-        print(json.dumps(
-            index_file_chunks(
-                args.root,
-                args.sqlite,
-                args.chunks,
-                manifest_path=args.manifest,
-                batch_files=args.batch_files,
-                batch_chunks=args.batch_chunks,
-                batch_chars=args.batch_chars,
-                min_free_gb=min_free_gb,
-                max_gpu_temp_c=args.max_gpu_temp_c,
-                max_batches=args.max_batches or None,
-                force=args.force,
-                use_sentence_transformer=True,
-                require_sentence_transformer=not args.fallback_hash,
-                progress=args.progress,
-            ),
-            ensure_ascii=False,
-        ))
+        print(
+            json.dumps(
+                index_file_chunks(
+                    args.root,
+                    args.sqlite,
+                    args.chunks,
+                    manifest_path=args.manifest,
+                    batch_files=args.batch_files,
+                    batch_chunks=args.batch_chunks,
+                    batch_chars=args.batch_chars,
+                    min_free_gb=min_free_gb,
+                    max_gpu_temp_c=args.max_gpu_temp_c,
+                    max_batches=args.max_batches or None,
+                    force=args.force,
+                    use_sentence_transformer=True,
+                    require_sentence_transformer=not args.fallback_hash,
+                    progress=args.progress,
+                ),
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     if args.command == "sync-text-chunks":
-        print(json.dumps(
-            sync_text_chunks(args.root, args.sqlite, batch_files=args.batch_files, progress=args.progress),
-            ensure_ascii=False,
-        ))
+        print(
+            json.dumps(
+                sync_text_chunks(
+                    args.root,
+                    args.sqlite,
+                    batch_files=args.batch_files,
+                    progress=args.progress,
+                ),
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     if args.command == "prune-chunks":
-        print(json.dumps(
-            prune_excluded_chunks(
-                args.root,
-                args.sqlite,
-                args.chunks,
-                args.manifest,
-                node_vector_path=args.vectors,
-                progress=args.progress,
-            ),
-            ensure_ascii=False,
-        ))
+        print(
+            json.dumps(
+                prune_excluded_chunks(
+                    args.root,
+                    args.sqlite,
+                    args.chunks,
+                    args.manifest,
+                    node_vector_path=args.vectors,
+                    progress=args.progress,
+                ),
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     if args.command == "chunk-status":
-        print(json.dumps(
-            chunk_index_status(args.root, args.sqlite, args.chunks, args.manifest),
-            ensure_ascii=False,
-        ))
+        print(
+            json.dumps(
+                chunk_index_status(args.root, args.sqlite, args.chunks, args.manifest),
+                ensure_ascii=False,
+            )
+        )
         return 0
 
-    engine = QueryEngine(SQLiteStore(args.sqlite), LanceStore(args.vectors), LanceStore(args.chunks))
-    payload = dispatch(engine, args)
-    print(json.dumps(payload, ensure_ascii=False))
-    return 0
+    if args.command == "build-cards":
+        count = build_cards_from_chunks(args.sqlite, args.vectors)
+        print(json.dumps({"cards_built": count}, ensure_ascii=False))
+        return 0
+
+    if args.command == "ingest-ckg":
+        app_bin = args.app_bin
+        if not app_bin:
+            print(
+                json.dumps({"error": "--app-bin required (or set ASPIS_APP_BIN env)"})
+            )
+            return 1
+        root = Path(args.root)
+        if not root.is_dir():
+            print(json.dumps({"error": f"root is not a directory: {root}"}))
+            return 1
+        from oracle.store.ckg_store import CkgStore
+
+        ckg_store = CkgStore(args.ckg)
+        result = build_ckg(root, app_bin, store=ckg_store)
+        print(json.dumps({"ckg_ingested": result}, ensure_ascii=False))
+        return 0
+
+    engine = QueryEngine(
+        SQLiteStore(args.sqlite), LanceStore(args.vectors), LanceStore(args.chunks)
+    )
+    try:
+        payload = dispatch(engine, args)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    except CliError as exc:
+        print(json.dumps(exc.args[0], ensure_ascii=False))
+        return 1
 
 
 def dispatch(engine: QueryEngine, args: argparse.Namespace) -> Any:
@@ -125,9 +214,14 @@ def dispatch(engine: QueryEngine, args: argparse.Namespace) -> Any:
     if args.command == "context":
         return {"query": args.query, "chunks": engine.context(args.query, args.limit)}
     if args.command == "node":
+        if not args.node_id:
+            raise CliError(_error_payload("node_id required"))
         return node_payload(engine, args.node_id)
     if args.command == "similar":
-        return [result_payload(result) for result in engine.similar(args.node_id, args.limit)]
+        return [
+            result_payload(result)
+            for result in engine.similar(args.node_id, args.limit)
+        ]
     if args.command == "duplicates":
         return duplicate_label_payload(engine)
     if args.command == "cluster":
@@ -135,7 +229,10 @@ def dispatch(engine: QueryEngine, args: argparse.Namespace) -> Any:
         return {
             "name": args.cluster_id,
             "node_count": len(nodes),
-            "nodes": [result_payload(card_to_result(node)) for node in nodes[: max(1, args.limit)]],
+            "nodes": [
+                result_payload(card_to_result(node))
+                for node in nodes[: max(1, args.limit)]
+            ],
         }
     if args.command == "coverage":
         return coverage(args.sqlite)
@@ -176,7 +273,10 @@ def answer_payload(engine: QueryEngine, query: str, limit: int) -> dict:
 
 
 def node_payload(engine: QueryEngine, node_id: str) -> dict:
-    node = engine.node(node_id)
+    try:
+        node = engine.node(node_id)
+    except KeyError:
+        return {"error": "not_found", "node_id": node_id}
     return {
         "id": node["id"],
         "label": node["label"],
@@ -219,8 +319,12 @@ def result_payload(result: dict) -> dict:
         "node_type": result.get("node_type", "file"),
         "cluster": parse_cluster(result.get("cluster", 0)),
         "score": float(result.get("score", 0.0)),
-        "file_source": result.get("file_sorgente") or result.get("file_source") or result["id"],
-        "function_primary": result.get("funzione_primaria") or result.get("function_primary") or "",
+        "file_source": result.get("file_sorgente")
+        or result.get("file_source")
+        or result["id"],
+        "function_primary": result.get("funzione_primaria")
+        or result.get("function_primary")
+        or "",
         "dependencies": result.get("dipende_da") or result.get("dependencies") or [],
         "chunk_id": result.get("chunk_id"),
         "chunk_index": result.get("chunk_index"),
