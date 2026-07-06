@@ -91,7 +91,9 @@ class OraclePhase2Test(unittest.TestCase):
             )
 
             self.assertEqual(learned, 1)
-            card = SQLiteStore(sqlite_path).get_node("src/components/views/OracleView.tsx")
+            card = SQLiteStore(sqlite_path).get_node(
+                "src/components/views/OracleView.tsx"
+            )
             self.assertIsNotNone(card)
             self.assertEqual(card["source"], "oracle")
             self.assertEqual(card["embedding_dims"], 1024)
@@ -105,7 +107,9 @@ class OraclePhase2Test(unittest.TestCase):
                 "where is the oracle page implemented",
                 limit=1,
             )
-            self.assertEqual(answer["results"][0]["id"], "src/components/views/OracleView.tsx")
+            self.assertEqual(
+                answer["results"][0]["id"], "src/components/views/OracleView.tsx"
+            )
 
     def test_parser_skips_sensitive_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,7 +125,9 @@ class OraclePhase2Test(unittest.TestCase):
             source = root / "src" / "tokens.ts"
             source.write_text("export const A = 1;\n", encoding="utf-8")
             secrets_view = root / "src" / "SecretsView.tsx"
-            secrets_view.write_text("export function SecretsView(){ return null; }\n", encoding="utf-8")
+            secrets_view.write_text(
+                "export function SecretsView(){ return null; }\n", encoding="utf-8"
+            )
 
             self.assertIsNotNone(parse_file(source, root))
             self.assertIsNotNone(parse_file(secrets_view, root))
@@ -205,7 +211,9 @@ class OraclePhase2Test(unittest.TestCase):
                                 "label": "mcp_handler.py",
                                 "cluster": "Oracle",
                                 "community": "Oracle",
-                                "metadata": {"docstring": "Architecture Oracle MCP tools."},
+                                "metadata": {
+                                    "docstring": "Architecture Oracle MCP tools."
+                                },
                             }
                         ],
                         "edges": [],
@@ -228,8 +236,12 @@ class OraclePhase2Test(unittest.TestCase):
             try:
                 oracle_config.SQLITE_PATH = sqlite_path
                 oracle_config.LANCE_DB_PATH = vector_path
-                result = handle_tool_call("oracle_ask", {"query": "mcp tools", "limit": 1})
-                self.assertEqual(result["results"][0]["id"], "oracle/server/mcp_handler.py")
+                result = handle_tool_call(
+                    "oracle_ask", {"query": "mcp tools", "limit": 1}
+                )
+                self.assertEqual(
+                    result["results"][0]["id"], "oracle/server/mcp_handler.py"
+                )
                 self.assertIsNotNone(create_mcp_server())
             finally:
                 oracle_config.SQLITE_PATH = old_sqlite
@@ -244,7 +256,19 @@ class OraclePhase2Test(unittest.TestCase):
             test_result = root / "test-results" / ".last-run.json"
             vendor_bundle = root / "public" / "vendor" / "react.production.min.js"
             compiled_minified = root / "public" / "app.min.js"
-            cmake_generated = root / "android" / "app" / ".cxx" / "Debug" / "arm64-v8a" / ".cmake" / "api" / "v1" / "reply" / "cache-v2.json"
+            cmake_generated = (
+                root
+                / "android"
+                / "app"
+                / ".cxx"
+                / "Debug"
+                / "arm64-v8a"
+                / ".cmake"
+                / "api"
+                / "v1"
+                / "reply"
+                / "cache-v2.json"
+            )
             secrets_view = root / "src" / "components" / "SecretsView.tsx"
             worker.parent.mkdir(parents=True)
             scaleway.parent.mkdir(parents=True)
@@ -263,18 +287,29 @@ class OraclePhase2Test(unittest.TestCase):
             scaleway.write_text("pub fn spawn_gpu() {}\n", encoding="utf-8")
             session.write_text("do not index agent session noise", encoding="utf-8")
             test_result.write_text('{"status":"passed"}', encoding="utf-8")
-            vendor_bundle.write_text("/* React minified vendor bundle */", encoding="utf-8")
-            compiled_minified.write_text("function app(){return true}", encoding="utf-8")
+            vendor_bundle.write_text(
+                "/* React minified vendor bundle */", encoding="utf-8"
+            )
+            compiled_minified.write_text(
+                "function app(){return true}", encoding="utf-8"
+            )
             cmake_generated.write_text('{"generated":"cmake"}', encoding="utf-8")
-            secrets_view.write_text("export function SecretsView() { return null; }\n", encoding="utf-8")
+            secrets_view.write_text(
+                "export function SecretsView() { return null; }\n", encoding="utf-8"
+            )
 
-            collected = [path.relative_to(root).as_posix() for path in collect_text_files(root)]
+            collected = [
+                path.relative_to(root).as_posix() for path in collect_text_files(root)
+            ]
             self.assertIn("src/components/SecretsView.tsx", collected)
             self.assertNotIn("codex-sessions/log.md", collected)
             self.assertNotIn("test-results/.last-run.json", collected)
             self.assertNotIn("public/vendor/react.production.min.js", collected)
             self.assertNotIn("public/app.min.js", collected)
-            self.assertNotIn("android/app/.cxx/Debug/arm64-v8a/.cmake/api/v1/reply/cache-v2.json", collected)
+            self.assertNotIn(
+                "android/app/.cxx/Debug/arm64-v8a/.cmake/api/v1/reply/cache-v2.json",
+                collected,
+            )
 
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
@@ -306,16 +341,26 @@ class OraclePhase2Test(unittest.TestCase):
             self.assertEqual(status["sqlite_chunk_files"], 3)
 
             with patch.dict(os.environ, {"ORACLE_QUERY_EMBEDDER": "hash"}):
-                engine = QueryEngine(SQLiteStore(sqlite_path), LanceStore(root / "vectors.json"), LanceStore(chunk_vectors))
-                context = engine.context("how worker biovision limits gpu spawning in scaleway", limit=1)
+                engine = QueryEngine(
+                    SQLiteStore(sqlite_path),
+                    LanceStore(root / "vectors.json"),
+                    LanceStore(chunk_vectors),
+                )
+                context = engine.context(
+                    "how worker biovision limits gpu spawning in scaleway", limit=1
+                )
 
-            self.assertEqual(context[0]["file_source"], "cloudflare/workers/biovision-worker.ts")
+            self.assertEqual(
+                context[0]["file_source"], "cloudflare/workers/biovision-worker.ts"
+            )
             self.assertIn("limits Scaleway GPU spawning", context[0]["text"])
 
     def test_text_chunk_sync_makes_unembedded_files_retrievable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = root / "aspis-biovision" / "deploy" / "scaleway-vault" / "destroy.sh"
+            source = (
+                root / "aspis-biovision" / "deploy" / "scaleway-vault" / "destroy.sh"
+            )
             source.parent.mkdir(parents=True)
             source.write_text(
                 "#!/usr/bin/env bash\n"
@@ -327,11 +372,18 @@ class OraclePhase2Test(unittest.TestCase):
             vector_path = root / "empty-vectors.json"
 
             synced = sync_text_chunks(root, sqlite_path, batch_files=10)
-            engine = QueryEngine(SQLiteStore(sqlite_path), LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                SQLiteStore(sqlite_path),
+                LanceStore(vector_path),
+                LanceStore(vector_path),
+            )
             context = engine.context("what does scaleway vault destroy do", limit=1)
 
             self.assertEqual(synced["files"], 1)
-            self.assertEqual(context[0]["file_source"], "aspis-biovision/deploy/scaleway-vault/destroy.sh")
+            self.assertEqual(
+                context[0]["file_source"],
+                "aspis-biovision/deploy/scaleway-vault/destroy.sh",
+            )
             self.assertEqual(context[0]["retrieval"], "lexical")
             self.assertIn("Serverless Postgres", context[0]["text"])
 
@@ -367,7 +419,9 @@ class OraclePhase2Test(unittest.TestCase):
             # Record the current signature in the manifest (mirrors what the dense
             # index pass writes after embedding) so the incremental check can match.
             manifest = load_manifest(manifest_path)
-            manifest_files = manifest_files_for_root(manifest, root.resolve(), create=True)
+            manifest_files = manifest_files_for_root(
+                manifest, root.resolve(), create=True
+            )
             sqlite = SQLiteStore(sqlite_path)
             file_id = "src/worker.ts"
             chunk_count = len(sqlite.chunks_for_file(file_id))
@@ -408,9 +462,16 @@ class OraclePhase2Test(unittest.TestCase):
         # workspace must map to ONE manifest key, and a stale verbatim duplicate
         # must be merged + pruned — otherwise Python treats the verbatim form as a
         # new workspace and re-embeds every file ("always indexing").
-        self.assertEqual(strip_verbatim_prefix(r"\\?\C:\Users\me\aspis bio"), r"C:\Users\me\aspis bio")
-        self.assertEqual(strip_verbatim_prefix(r"\\?\UNC\server\share\x"), r"\\server\share\x")
-        self.assertEqual(strip_verbatim_prefix(r"C:\Users\me\aspis bio"), r"C:\Users\me\aspis bio")
+        self.assertEqual(
+            strip_verbatim_prefix(r"\\?\C:\Users\me\aspis bio"),
+            r"C:\Users\me\aspis bio",
+        )
+        self.assertEqual(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\x"), r"\\server\share\x"
+        )
+        self.assertEqual(
+            strip_verbatim_prefix(r"C:\Users\me\aspis bio"), r"C:\Users\me\aspis bio"
+        )
 
         plain = r"C:\Users\me\aspis bio"
         verbatim = r"\\?\C:\Users\me\aspis bio"
@@ -447,8 +508,17 @@ class OraclePhase2Test(unittest.TestCase):
             code = root / "src" / "worker.ts"
             doc.parent.mkdir(parents=True)
             code.parent.mkdir(parents=True)
-            doc.write_text(("Architecture paragraph about Scaleway and Oracle.\n" * 520), encoding="utf-8")
-            code.write_text(("export function workerStep() { return 'small focused code chunk'; }\n" * 520), encoding="utf-8")
+            doc.write_text(
+                ("Architecture paragraph about Scaleway and Oracle.\n" * 520),
+                encoding="utf-8",
+            )
+            code.write_text(
+                (
+                    "export function workerStep() { return 'small focused code chunk'; }\n"
+                    * 520
+                ),
+                encoding="utf-8",
+            )
 
             doc_chunks = build_chunks_for_file(doc, root)
             code_chunks = build_chunks_for_file(code, root)
@@ -476,7 +546,9 @@ class OraclePhase2Test(unittest.TestCase):
         self.assertIn("SOURCE_KIND: implementation_primary", semantic_text)
         self.assertIn("DOMAIN_TAGS: cloudflare_worker_secret_rotation", semantic_text)
         self.assertIn("SYMBOLS: rotate_cloudflare_worker_secret", semantic_text)
-        self.assertIn("Where is Cloudflare Worker secret rotation implemented?", semantic_text)
+        self.assertIn(
+            "Where is Cloudflare Worker secret rotation implemented?", semantic_text
+        )
         self.assertIn("RAW_CHUNK:", semantic_text)
         self.assertIn("pub fn rotate_cloudflare_worker_secret", semantic_text)
         self.assertEqual(raw_text, f"{chunk['file_id']}\n{chunk['text']}")
@@ -486,7 +558,10 @@ class OraclePhase2Test(unittest.TestCase):
             root = Path(tmp)
             source = root / "src" / "worker.ts"
             source.parent.mkdir(parents=True)
-            source.write_text("export function worker() { return 'Cloudflare Worker'; }\n", encoding="utf-8")
+            source.write_text(
+                "export function worker() { return 'Cloudflare Worker'; }\n",
+                encoding="utf-8",
+            )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
@@ -514,8 +589,12 @@ class OraclePhase2Test(unittest.TestCase):
         # Change 3: the active semantic-prefix profile version must be the bumped
         # constant so that the c2500 re-chunk is forced corpus-wide.
         with patch.dict(os.environ, {"ORACLE_EMBED_PROFILE": "semantic-prefix-v2"}):
-            self.assertEqual(active_chunk_profile_version(), SEMANTIC_PREFIX_PROFILE_VERSION)
-        self.assertEqual(SEMANTIC_PREFIX_PROFILE_VERSION, "semantic-prefix-qwen3-2026-06-02-c2500")
+            self.assertEqual(
+                active_chunk_profile_version(), SEMANTIC_PREFIX_PROFILE_VERSION
+            )
+        self.assertEqual(
+            SEMANTIC_PREFIX_PROFILE_VERSION, "semantic-prefix-qwen3-2026-06-02-c2500"
+        )
 
     def test_old_chunk_profile_manifest_entry_is_stale(self):
         # Change 3: a manifest entry recorded under the OLD profile string must be
@@ -525,7 +604,10 @@ class OraclePhase2Test(unittest.TestCase):
             root = Path(tmp).resolve()
             source = root / "src" / "worker.ts"
             source.parent.mkdir(parents=True)
-            source.write_text("export function worker() { return 'Cloudflare Worker'; }\n", encoding="utf-8")
+            source.write_text(
+                "export function worker() { return 'Cloudflare Worker'; }\n",
+                encoding="utf-8",
+            )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
@@ -558,30 +640,56 @@ class OraclePhase2Test(unittest.TestCase):
         # Change 1: an identifier present in a RETRIEVED-but-UNCITED chunk is
         # grounded (we showed it to the model) and must NOT flag the answer.
         context = [
-            {"ref": "1", "file_source": "a.py", "chunk_id": "a#1", "text": "def cited_helper(): pass"},
-            {"ref": "2", "file_source": "b.py", "chunk_id": "b#1", "text": "def uncited_helper(): pass"},
+            {
+                "ref": "1",
+                "file_source": "a.py",
+                "chunk_id": "a#1",
+                "text": "def cited_helper(): pass",
+            },
+            {
+                "ref": "2",
+                "file_source": "b.py",
+                "chunk_id": "b#1",
+                "text": "def uncited_helper(): pass",
+            },
         ]
         citations = [{"ref": "1"}]
         answer = "It calls `uncited_helper` which is defined in `b.py`."
-        self.assertFalse(answer_has_unsupported_grounding_terms(answer, citations, context))
+        self.assertFalse(
+            answer_has_unsupported_grounding_terms(answer, citations, context)
+        )
 
     def test_grounding_tolerates_up_to_two_stray_terms(self):
         # Change 1: up to 2 unsupported terms are tolerated.
         context = [
-            {"ref": "1", "file_source": "a.py", "chunk_id": "a#1", "text": "def real_helper(): pass"},
+            {
+                "ref": "1",
+                "file_source": "a.py",
+                "chunk_id": "a#1",
+                "text": "def real_helper(): pass",
+            },
         ]
         citations = [{"ref": "1"}]
         answer = "It uses `real_helper`, `strayOne` and `strayTwo`."
-        self.assertFalse(answer_has_unsupported_grounding_terms(answer, citations, context))
+        self.assertFalse(
+            answer_has_unsupported_grounding_terms(answer, citations, context)
+        )
 
     def test_grounding_flags_many_fabricated_identifiers(self):
         # Change 1: a fabricated answer with >2 invented identifiers is flagged.
         context = [
-            {"ref": "1", "file_source": "a.py", "chunk_id": "a#1", "text": "def real_helper(): pass"},
+            {
+                "ref": "1",
+                "file_source": "a.py",
+                "chunk_id": "a#1",
+                "text": "def real_helper(): pass",
+            },
         ]
         citations = [{"ref": "1"}]
         answer = "It calls `fakeOne`, `fakeTwo`, `fakeThree` and `fakeFour` in `bogus/path.py`."
-        self.assertTrue(answer_has_unsupported_grounding_terms(answer, citations, context))
+        self.assertTrue(
+            answer_has_unsupported_grounding_terms(answer, citations, context)
+        )
 
     def test_chunk_index_batches_embedding_across_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -602,7 +710,9 @@ class OraclePhase2Test(unittest.TestCase):
                 embed_calls.append(list(texts))
                 return [[1.0, 0.0] for _text in texts]
 
-            with patch("oracle.ingestion.chunk_index.embed_texts", side_effect=fake_embed):
+            with patch(
+                "oracle.ingestion.chunk_index.embed_texts", side_effect=fake_embed
+            ):
                 result = index_file_chunks(
                     root,
                     sqlite_path,
@@ -680,12 +790,20 @@ class OraclePhase2Test(unittest.TestCase):
                     "embedding_dims": 1024,
                 },
             ]
-            sqlite.replace_chunks_for_files([chunk["file_id"] for chunk in chunks], chunks)
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            sqlite.replace_chunks_for_files(
+                [chunk["file_id"] for chunk in chunks], chunks
+            )
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
 
-            context = engine.context("how the worker biovision limit the gpu spawning in scaleway", limit=1)
+            context = engine.context(
+                "how the worker biovision limit the gpu spawning in scaleway", limit=1
+            )
 
-            self.assertEqual(context[0]["file_source"], "aspis-biovision/docs/scaleway-services.md")
+            self.assertEqual(
+                context[0]["file_source"], "aspis-biovision/docs/scaleway-services.md"
+            )
 
     def test_ask_generates_local_qwen_answer_with_chunk_citations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -704,7 +822,9 @@ class OraclePhase2Test(unittest.TestCase):
                 "embedding_dims": 1024,
             }
             sqlite.replace_chunks_for_files([chunk["file_id"]], [chunk])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
             captured = {}
 
             def fake_generate(prompt, *args, **_kwargs):
@@ -718,12 +838,21 @@ class OraclePhase2Test(unittest.TestCase):
                     }
                 )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible", side_effect=fake_generate):
-                answer = engine.ask("how does biovision limit scaleway gpu spawning", limit=1, llm_config=self.API_LLM_CONFIG)
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible",
+                side_effect=fake_generate,
+            ):
+                answer = engine.ask(
+                    "how does biovision limit scaleway gpu spawning",
+                    limit=1,
+                    llm_config=self.API_LLM_CONFIG,
+                )
 
             self.assertIn("min_scale=0", answer["answer"])
             self.assertFalse(answer["not_found"])
-            self.assertEqual(answer["citations"][0]["file_source"], chunk["file_sorgente"])
+            self.assertEqual(
+                answer["citations"][0]["file_source"], chunk["file_sorgente"]
+            )
             self.assertEqual(answer["citations"][0]["chunk_id"], chunk["id"])
             self.assertEqual(answer["citations"][0]["start_char"], 120)
             self.assertIn(chunk["text"], captured["prompt"])
@@ -746,18 +875,26 @@ class OraclePhase2Test(unittest.TestCase):
                 "embedding_dims": 1024,
             }
             sqlite.replace_chunks_for_files([chunk["file_id"]], [chunk])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
 
             with patch(
                 "oracle.server.answerer.generate_with_openai_compatible",
                 side_effect=RuntimeError("model requires more system memory"),
             ):
-                answer = engine.ask("which files control Scaleway VM lifecycle actions", limit=1, llm_config=self.API_LLM_CONFIG)
+                answer = engine.ask(
+                    "which files control Scaleway VM lifecycle actions",
+                    limit=1,
+                    llm_config=self.API_LLM_CONFIG,
+                )
 
             self.assertFalse(answer["not_found"])
             self.assertIn("Oracle found relevant code evidence", answer["answer"])
             self.assertIn("Scaleway VM lifecycle actions", answer["answer"])
-            self.assertEqual(answer["citations"][0]["file_source"], chunk["file_sorgente"])
+            self.assertEqual(
+                answer["citations"][0]["file_source"], chunk["file_sorgente"]
+            )
 
     def test_ask_falls_back_to_extractive_answer_when_llm_returns_empty_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -776,10 +913,19 @@ class OraclePhase2Test(unittest.TestCase):
                 "embedding_dims": 1024,
             }
             sqlite.replace_chunks_for_files([chunk["file_id"]], [chunk])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible", return_value=""):
-                answer = engine.ask("how does WorkersTable ask Oracle", limit=1, llm_config=self.API_LLM_CONFIG)
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible",
+                return_value="",
+            ):
+                answer = engine.ask(
+                    "how does WorkersTable ask Oracle",
+                    limit=1,
+                    llm_config=self.API_LLM_CONFIG,
+                )
 
             self.assertFalse(answer["not_found"])
             self.assertIn("LLM returned empty or invalid JSON", answer["answer"])
@@ -803,7 +949,9 @@ class OraclePhase2Test(unittest.TestCase):
             }
         ]
 
-        with patch("oracle.server.answerer.generate_with_openai_compatible", return_value=""):
+        with patch(
+            "oracle.server.answerer.generate_with_openai_compatible", return_value=""
+        ):
             answer = answer_from_context(
                 "Where do we stop paid Scaleway compute resources after a job or terminal session is done?",
                 chunks,
@@ -832,7 +980,9 @@ class OraclePhase2Test(unittest.TestCase):
             }
         ]
 
-        with patch("oracle.server.answerer.generate_with_openai_compatible", return_value=""):
+        with patch(
+            "oracle.server.answerer.generate_with_openai_compatible", return_value=""
+        ):
             answer = answer_from_context(
                 "How do terminal agents know the current project task and mark it finished without editing the UI manually?",
                 chunks,
@@ -871,7 +1021,9 @@ class OraclePhase2Test(unittest.TestCase):
             },
         ]
 
-        with patch("oracle.server.answerer.generate_with_openai_compatible", return_value=""):
+        with patch(
+            "oracle.server.answerer.generate_with_openai_compatible", return_value=""
+        ):
             answer = answer_from_context(
                 "Where is the rule that only privacy safe AI providers can be used for Oracle answers?",
                 chunks,
@@ -909,9 +1061,13 @@ class OraclePhase2Test(unittest.TestCase):
                 }
             ),
         ):
-            answer = answer_from_context("which file controls Scaleway VM lifecycle actions", chunks, llm_config=self.API_LLM_CONFIG)
+            answer = answer_from_context(
+                "which file controls Scaleway VM lifecycle actions",
+                chunks,
+                llm_config=self.API_LLM_CONFIG,
+            )
 
-        self.assertEqual(answer["answer_source"], "extractive_fallback")
+        self.assertEqual(answer["answer_source"], "extractive_synthesis")
         self.assertEqual(answer["fallback_reason"], "LLM returned a non-English answer")
         self.assertNotIn("La risposta", answer["answer"])
         self.assertIn("perform_scaleway_resource_action_request", answer["answer"])
@@ -949,10 +1105,17 @@ class OraclePhase2Test(unittest.TestCase):
                 }
             ),
         ):
-            answer = answer_from_context("how do agents update project status", chunks, llm_config=self.API_LLM_CONFIG)
+            answer = answer_from_context(
+                "how do agents update project status",
+                chunks,
+                llm_config=self.API_LLM_CONFIG,
+            )
 
         self.assertNotEqual(answer["answer_source"], "llm")
-        self.assertEqual(answer["fallback_reason"], "LLM answer included unsupported identifiers or paths")
+        self.assertEqual(
+            answer["fallback_reason"],
+            "LLM answer included unsupported identifiers or paths",
+        )
         self.assertNotIn("teleportTaskToDone", answer["answer"])
 
     def test_ask_rejects_unsupported_natural_language_claims(self):
@@ -980,10 +1143,15 @@ class OraclePhase2Test(unittest.TestCase):
                 }
             ),
         ):
-            answer = answer_from_context("how are project tasks closed", chunks, llm_config=self.API_LLM_CONFIG)
+            answer = answer_from_context(
+                "how are project tasks closed", chunks, llm_config=self.API_LLM_CONFIG
+            )
 
         self.assertNotEqual(answer["answer_source"], "llm")
-        self.assertEqual(answer["fallback_reason"], "LLM answer included unsupported natural-language claims")
+        self.assertEqual(
+            answer["fallback_reason"],
+            "LLM answer included unsupported natural-language claims",
+        )
         self.assertNotIn("automatically marks tasks done", answer["answer"])
 
     def test_ask_rejects_spanish_llm_answer_even_with_valid_citation(self):
@@ -1011,7 +1179,11 @@ class OraclePhase2Test(unittest.TestCase):
                 }
             ),
         ):
-            answer = answer_from_context("how do agents update project status", chunks, llm_config=self.API_LLM_CONFIG)
+            answer = answer_from_context(
+                "how do agents update project status",
+                chunks,
+                llm_config=self.API_LLM_CONFIG,
+            )
 
         self.assertNotEqual(answer["answer_source"], "llm")
         self.assertEqual(answer["fallback_reason"], "LLM returned a non-English answer")
@@ -1041,7 +1213,11 @@ class OraclePhase2Test(unittest.TestCase):
                 }
             ),
         ):
-            answer = answer_from_context("where is the moon billing terraform pipeline", chunks, llm_config=self.API_LLM_CONFIG)
+            answer = answer_from_context(
+                "where is the moon billing terraform pipeline",
+                chunks,
+                llm_config=self.API_LLM_CONFIG,
+            )
 
         self.assertTrue(answer["not_found"])
         self.assertEqual(answer["suggested_path"], "oracle/server/answerer.py")
@@ -1060,9 +1236,13 @@ class OraclePhase2Test(unittest.TestCase):
             }
         ]
 
-        with patch("oracle.server.answerer.generate_with_openai_compatible") as generate:
+        with patch(
+            "oracle.server.answerer.generate_with_openai_compatible"
+        ) as generate:
             with patch.dict(os.environ, {"ORACLE_ASK_DISABLE_LLM": "1"}):
-                answer = answer_from_context("how do agents update project status", chunks)
+                answer = answer_from_context(
+                    "how do agents update project status", chunks
+                )
 
         generate.assert_not_called()
         self.assertFalse(answer["not_found"])
@@ -1094,7 +1274,11 @@ class OraclePhase2Test(unittest.TestCase):
                 }
             ),
         ):
-            answer = answer_from_context("how do agents update project status", chunks, llm_config=self.API_LLM_CONFIG)
+            answer = answer_from_context(
+                "how do agents update project status",
+                chunks,
+                llm_config=self.API_LLM_CONFIG,
+            )
 
         self.assertEqual(answer["answer_source"], "llm")
         self.assertIn("project_update_status", answer["answer"])
@@ -1108,8 +1292,12 @@ class OraclePhase2Test(unittest.TestCase):
                 LanceStore(root / "empty-chunks.json"),
             )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible") as generate:
-                answer = engine.ask("where is the moon billing terraform pipeline", limit=3)
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible"
+            ) as generate:
+                answer = engine.ask(
+                    "where is the moon billing terraform pipeline", limit=3
+                )
 
             self.assertFalse(generate.called)
             self.assertTrue(answer["not_found"])
@@ -1154,7 +1342,10 @@ class OraclePhase2Test(unittest.TestCase):
                         }
                     ),
                 ):
-                    result = handle_tool_call("oracle_ask", {"query": "how do local agents query oracle", "limit": 1})
+                    result = handle_tool_call(
+                        "oracle_ask",
+                        {"query": "how do local agents query oracle", "limit": 1},
+                    )
 
                 self.assertIn("/ask", result["answer"])
                 self.assertEqual(result["citations"][0]["chunk_id"], chunk["id"])
@@ -1170,7 +1361,11 @@ class OraclePhase2Test(unittest.TestCase):
             sqlite = SQLiteStore(root / "metadata.sqlite")
             vector_path = root / "empty-vectors.json"
             relevant = "The GPU spawning path is limited by min_scale=0 and max_scale controls CPU bursts."
-            chunk_text = ("unrelated architecture notes.\n" * 360) + relevant + ("\nmore unrelated notes." * 360)
+            chunk_text = (
+                ("unrelated architecture notes.\n" * 360)
+                + relevant
+                + ("\nmore unrelated notes." * 360)
+            )
             chunk = {
                 "id": "aspis-biovision/docs/large-scaleway.md#chunk-0000",
                 "file_id": "aspis-biovision/docs/large-scaleway.md",
@@ -1183,7 +1378,9 @@ class OraclePhase2Test(unittest.TestCase):
                 "embedding_dims": 1024,
             }
             sqlite.replace_chunks_for_files([chunk["file_id"]], [chunk])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
             captured = {}
 
             def fake_generate(prompt, *args, **_kwargs):
@@ -1197,8 +1394,15 @@ class OraclePhase2Test(unittest.TestCase):
                     }
                 )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible", side_effect=fake_generate):
-                answer = engine.ask("how is scaleway gpu spawning limited by min_scale and max_scale", limit=1, llm_config=self.API_LLM_CONFIG)
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible",
+                side_effect=fake_generate,
+            ):
+                answer = engine.ask(
+                    "how is scaleway gpu spawning limited by min_scale and max_scale",
+                    limit=1,
+                    llm_config=self.API_LLM_CONFIG,
+                )
 
             self.assertFalse(answer["not_found"])
             self.assertIn(relevant, captured["prompt"])
@@ -1231,8 +1435,12 @@ class OraclePhase2Test(unittest.TestCase):
                 "ultima_modifica": "2026-05-28T00:00:00Z",
                 "embedding_dims": 1024,
             }
-            sqlite.replace_chunks_for_files([current["file_id"], superseded["file_id"]], [current, superseded])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            sqlite.replace_chunks_for_files(
+                [current["file_id"], superseded["file_id"]], [current, superseded]
+            )
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
             captured = {}
 
             def fake_generate(prompt, *args, **_kwargs):
@@ -1246,8 +1454,15 @@ class OraclePhase2Test(unittest.TestCase):
                     }
                 )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible", side_effect=fake_generate):
-                answer = engine.ask("how does biovision limit gpu on scaleway", limit=2, llm_config=self.API_LLM_CONFIG)
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible",
+                side_effect=fake_generate,
+            ):
+                answer = engine.ask(
+                    "how does biovision limit gpu on scaleway",
+                    limit=2,
+                    llm_config=self.API_LLM_CONFIG,
+                )
 
             self.assertFalse(answer["not_found"])
             self.assertIn("Serverless Containers", captured["prompt"])
@@ -1280,8 +1495,12 @@ class OraclePhase2Test(unittest.TestCase):
                 "ultima_modifica": "2026-05-28T00:00:00Z",
                 "embedding_dims": 1024,
             }
-            sqlite.replace_chunks_for_files([biovision["file_id"], orasis["file_id"]], [biovision, orasis])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            sqlite.replace_chunks_for_files(
+                [biovision["file_id"], orasis["file_id"]], [biovision, orasis]
+            )
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
             captured = {}
 
             def fake_generate(prompt, *args, **_kwargs):
@@ -1295,8 +1514,15 @@ class OraclePhase2Test(unittest.TestCase):
                     }
                 )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible", side_effect=fake_generate):
-                answer = engine.ask("how does biovision limit gpu spawning in scaleway", limit=2, llm_config=self.API_LLM_CONFIG)
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible",
+                side_effect=fake_generate,
+            ):
+                answer = engine.ask(
+                    "how does biovision limit gpu spawning in scaleway",
+                    limit=2,
+                    llm_config=self.API_LLM_CONFIG,
+                )
 
             self.assertFalse(answer["not_found"])
             self.assertIn("Biovision uses Scaleway", captured["prompt"])
@@ -1319,7 +1545,9 @@ class OraclePhase2Test(unittest.TestCase):
                 "embedding_dims": 1024,
             }
             sqlite.replace_chunks_for_files([chunk["file_id"]], [chunk])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
             captured = {}
 
             def fake_remote(prompt, config):
@@ -1334,7 +1562,10 @@ class OraclePhase2Test(unittest.TestCase):
                     }
                 )
 
-            with patch("oracle.server.answerer.generate_with_openai_compatible", side_effect=fake_remote):
+            with patch(
+                "oracle.server.answerer.generate_with_openai_compatible",
+                side_effect=fake_remote,
+            ):
                 answer = engine.ask(
                     "how does biovision avoid scaleway gpu spawning",
                     limit=1,
@@ -1347,7 +1578,9 @@ class OraclePhase2Test(unittest.TestCase):
                 )
 
             self.assertFalse(answer["not_found"])
-            self.assertEqual(answer["citations"][0]["file_source"], chunk["file_sorgente"])
+            self.assertEqual(
+                answer["citations"][0]["file_source"], chunk["file_sorgente"]
+            )
             self.assertEqual(captured["config"]["provider"], "scaleway")
             self.assertIn("min_scale=0", captured["prompt"])
 
@@ -1363,7 +1596,7 @@ class OraclePhase2Test(unittest.TestCase):
                 return None
 
             def json(self):
-                return {"choices": [{"message": {"content": "{\"answer\":\"ok\"}"}}]}
+                return {"choices": [{"message": {"content": '{"answer":"ok"}'}}]}
 
         config = {
             "provider": "scaleway",
@@ -1375,7 +1608,9 @@ class OraclePhase2Test(unittest.TestCase):
         with patch.dict(sys.modules, {"httpx": SimpleNamespace(post=post)}):
             generate_with_openai_compatible("answer from context", config)
 
-        self.assertEqual(post.call_args.args[0], "https://api.scaleway.ai/v1/chat/completions")
+        self.assertEqual(
+            post.call_args.args[0], "https://api.scaleway.ai/v1/chat/completions"
+        )
         request_body = post.call_args.kwargs["json"]
         self.assertEqual(request_body["model"], "mistral-small-3.2-24b-instruct-2506")
 
@@ -1391,7 +1626,7 @@ class OraclePhase2Test(unittest.TestCase):
                 return None
 
             def json(self):
-                return {"choices": [{"message": {"content": "{\"answer\":\"ok\"}"}}]}
+                return {"choices": [{"message": {"content": '{"answer":"ok"}'}}]}
 
         config = {
             "provider": "infomaniak",
@@ -1428,7 +1663,9 @@ class OraclePhase2Test(unittest.TestCase):
                 "embedding_dims": 1024,
             }
             sqlite.replace_chunks_for_files([chunk["file_id"]], [chunk])
-            engine = QueryEngine(sqlite, LanceStore(vector_path), LanceStore(vector_path))
+            engine = QueryEngine(
+                sqlite, LanceStore(vector_path), LanceStore(vector_path)
+            )
 
             # A missing API key is RECOVERABLE: Oracle degrades to an extractive,
             # retrieval-only answer (per plan: "no key -> extractive answers") — the
@@ -1558,10 +1795,13 @@ class OraclePhase2Test(unittest.TestCase):
         ]
 
         def raise_gate(*_a, **_k):
-            raise OraclePrivacyGateError("Remote Oracle LLM provider is not allowlisted.")
+            raise OraclePrivacyGateError(
+                "Remote Oracle LLM provider is not allowlisted."
+            )
 
         with patch(
-            "oracle.server.answerer.generate_with_openai_compatible", side_effect=raise_gate
+            "oracle.server.answerer.generate_with_openai_compatible",
+            side_effect=raise_gate,
         ):
             with self.assertRaises(OraclePrivacyGateError):
                 answer_with_llm_config("q", "prompt", context, config)
@@ -1571,7 +1811,8 @@ class OraclePhase2Test(unittest.TestCase):
             raise RuntimeError("transient network blip")
 
         with patch(
-            "oracle.server.answerer.generate_with_openai_compatible", side_effect=raise_generic
+            "oracle.server.answerer.generate_with_openai_compatible",
+            side_effect=raise_generic,
         ):
             answer = answer_with_llm_config("q", "prompt", context, config)
         self.assertNotEqual(answer.get("answer_source"), "llm")
@@ -1581,7 +1822,9 @@ class OraclePhase2Test(unittest.TestCase):
 
         calls = []
 
-        def fake_sync(root, sqlite_path, batch_files, progress, manifest_path=None, force=False):
+        def fake_sync(
+            root, sqlite_path, batch_files, progress, manifest_path=None, force=False
+        ):
             # P4: the text sync now receives the manifest (for the incremental
             # skip) and the `force` flag forwarded from run_once, so a warm run is
             # incremental and a forced reindex is a full rewrite.
@@ -1598,11 +1841,21 @@ class OraclePhase2Test(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             manager = OracleIndexJobManager()
-            with patch("oracle.server.index_jobs.sync_text_chunks", side_effect=fake_sync), patch(
-                "oracle.server.index_jobs.prune_excluded_chunks",
-                side_effect=fake_prune,
-            ), patch("oracle.server.index_jobs.index_file_chunks", side_effect=fake_index):
-                result = manager.run_once(root=tmp, force=False, max_batches=2, idle=True)
+            with (
+                patch(
+                    "oracle.server.index_jobs.sync_text_chunks", side_effect=fake_sync
+                ),
+                patch(
+                    "oracle.server.index_jobs.prune_excluded_chunks",
+                    side_effect=fake_prune,
+                ),
+                patch(
+                    "oracle.server.index_jobs.index_file_chunks", side_effect=fake_index
+                ),
+            ):
+                result = manager.run_once(
+                    root=tmp, force=False, max_batches=2, idle=True
+                )
 
         self.assertEqual(result["status"], "complete")
         self.assertEqual([call[0] for call in calls], ["sync", "prune", "index"])
@@ -1627,9 +1880,10 @@ class OraclePhase2Test(unittest.TestCase):
             raise RuntimeError(f"torch exploded at {secret_path}")
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(manager, "run_once", side_effect=boom), self.assertLogs(
-                "oracle.server.index_jobs", level="ERROR"
-            ) as captured:
+            with (
+                patch.object(manager, "run_once", side_effect=boom),
+                self.assertLogs("oracle.server.index_jobs", level="ERROR") as captured,
+            ):
                 manager._background_target(
                     root=tmp, force=False, max_batches=None, idle=False
                 )
@@ -1681,7 +1935,9 @@ class OraclePhase2Test(unittest.TestCase):
             for name in ("a.ts", "b.ts", "c.ts"):
                 source = root / "src" / name
                 source.parent.mkdir(parents=True, exist_ok=True)
-                source.write_text(f"export const {name[0]} = 'Cloudflare Worker';\n", encoding="utf-8")
+                source.write_text(
+                    f"export const {name[0]} = 'Cloudflare Worker';\n", encoding="utf-8"
+                )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
@@ -1695,12 +1951,17 @@ class OraclePhase2Test(unittest.TestCase):
                 use_sentence_transformer=False,
             )
 
-            result = manifest_indexed_files(root, limit=100, offset=0, manifest_path=manifest)
+            result = manifest_indexed_files(
+                root, limit=100, offset=0, manifest_path=manifest
+            )
 
             self.assertEqual(result["total"], 3)
             self.assertEqual(result["limit"], 100)
             self.assertEqual(result["offset"], 0)
-            self.assertEqual([f["path"] for f in result["files"]], ["src/a.ts", "src/b.ts", "src/c.ts"])
+            self.assertEqual(
+                [f["path"] for f in result["files"]],
+                ["src/a.ts", "src/b.ts", "src/c.ts"],
+            )
             first = result["files"][0]
             self.assertEqual(set(first), {"path", "chunks", "updatedAt"})
             self.assertGreaterEqual(first["chunks"], 1)
@@ -1715,7 +1976,9 @@ class OraclePhase2Test(unittest.TestCase):
             for name in ("a.ts", "b.ts", "c.ts"):
                 source = root / "src" / name
                 source.parent.mkdir(parents=True, exist_ok=True)
-                source.write_text(f"export const {name[0]} = 'Worker';\n", encoding="utf-8")
+                source.write_text(
+                    f"export const {name[0]} = 'Worker';\n", encoding="utf-8"
+                )
             extra = root / "docs" / "readme.md"
             extra.parent.mkdir(parents=True, exist_ok=True)
             extra.write_text("# Cloudflare Worker docs\n", encoding="utf-8")
@@ -1723,24 +1986,36 @@ class OraclePhase2Test(unittest.TestCase):
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
             index_file_chunks(
-                root, sqlite_path, chunk_vectors, manifest_path=manifest,
-                min_free_gb=0, use_sentence_transformer=False,
+                root,
+                sqlite_path,
+                chunk_vectors,
+                manifest_path=manifest,
+                min_free_gb=0,
+                use_sentence_transformer=False,
             )
 
-            page = manifest_indexed_files(root, limit=2, offset=1, manifest_path=manifest)
+            page = manifest_indexed_files(
+                root, limit=2, offset=1, manifest_path=manifest
+            )
             self.assertEqual(page["total"], 4)
             self.assertEqual(page["limit"], 2)
             self.assertEqual(page["offset"], 1)
-            self.assertEqual([f["path"] for f in page["files"]], ["src/a.ts", "src/b.ts"])
+            self.assertEqual(
+                [f["path"] for f in page["files"]], ["src/a.ts", "src/b.ts"]
+            )
 
-            filtered = manifest_indexed_files(root, filter_substr="readme", manifest_path=manifest)
+            filtered = manifest_indexed_files(
+                root, filter_substr="readme", manifest_path=manifest
+            )
             self.assertEqual(filtered["total"], 1)
             self.assertEqual(filtered["files"][0]["path"], "docs/readme.md")
 
     def test_manifest_indexed_files_caps_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            result = manifest_indexed_files(root, limit=10_000, offset=-5, manifest_path=root / "manifest.json")
+            result = manifest_indexed_files(
+                root, limit=10_000, offset=-5, manifest_path=root / "manifest.json"
+            )
             self.assertEqual(result["limit"], MAX_INDEXED_FILES_LIMIT)
             self.assertEqual(result["offset"], 0)
             self.assertEqual(result["total"], 0)
@@ -1756,13 +2031,19 @@ class OraclePhase2Test(unittest.TestCase):
             root = Path(tmp)
             source = root / "src" / "worker.ts"
             source.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text("export const w = 'Cloudflare Worker';\n", encoding="utf-8")
+            source.write_text(
+                "export const w = 'Cloudflare Worker';\n", encoding="utf-8"
+            )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
             index_file_chunks(
-                root, sqlite_path, chunk_vectors, manifest_path=manifest,
-                min_free_gb=0, use_sentence_transformer=False,
+                root,
+                sqlite_path,
+                chunk_vectors,
+                manifest_path=manifest,
+                min_free_gb=0,
+                use_sentence_transformer=False,
             )
 
             # Clear any cache state leaked from prior tests in this process so the
@@ -1776,7 +2057,9 @@ class OraclePhase2Test(unittest.TestCase):
                 calls["n"] += 1
                 return real_load_manifest(path)
 
-            with patch.object(chunk_index_mod, "load_manifest", side_effect=counting_load_manifest):
+            with patch.object(
+                chunk_index_mod, "load_manifest", side_effect=counting_load_manifest
+            ):
                 first = manifest_indexed_files(root, manifest_path=manifest)
                 second = manifest_indexed_files(root, manifest_path=manifest)
                 # Two reads on an unchanged manifest parse the file exactly once.
@@ -1828,7 +2111,11 @@ class OraclePhase2Test(unittest.TestCase):
             return _FakeObserver()
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("oracle.server.index_jobs.start_watching", side_effect=slow_start_watching):
+            with patch(
+                "oracle.server.index_jobs.start_watching",
+                side_effect=slow_start_watching,
+            ):
+
                 def worker():
                     ready.wait()
                     manager.start_watcher(root=tmp)
@@ -1840,7 +2127,8 @@ class OraclePhase2Test(unittest.TestCase):
                     t.join()
 
         self.assertEqual(
-            call_count["n"], 1,
+            call_count["n"],
+            1,
             "concurrent start_watcher calls must invoke start_watching exactly once",
         )
 
@@ -1867,7 +2155,10 @@ class OraclePhase2Test(unittest.TestCase):
             root = Path(tmp)
             source = root / "src" / "worker.ts"
             source.parent.mkdir(parents=True)
-            source.write_text("export const gpuPolicy = 'limit Scaleway GPU spawning';\n", encoding="utf-8")
+            source.write_text(
+                "export const gpuPolicy = 'limit Scaleway GPU spawning';\n",
+                encoding="utf-8",
+            )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
@@ -1876,13 +2167,16 @@ class OraclePhase2Test(unittest.TestCase):
             # helper still reports a shortfall after its cycles -> genuine
             # give-up: paused_low_memory. Patch the recovery helper so the test
             # does not sleep; it reports RAM never recovered (0.5 < 1.0 floor).
-            with patch(
-                "oracle.ingestion.chunk_index.free_memory_gb",
-                side_effect=[10.0, 10.0, 0.5],
-            ), patch(
-                "oracle.ingestion.chunk_index.wait_for_memory_recovery",
-                return_value=0.5,
-            ) as recovery:
+            with (
+                patch(
+                    "oracle.ingestion.chunk_index.free_memory_gb",
+                    side_effect=[10.0, 10.0, 0.5],
+                ),
+                patch(
+                    "oracle.ingestion.chunk_index.wait_for_memory_recovery",
+                    return_value=0.5,
+                ) as recovery,
+            ):
                 result = index_file_chunks(
                     root,
                     sqlite_path,
@@ -1922,13 +2216,16 @@ class OraclePhase2Test(unittest.TestCase):
                 except StopIteration:
                     return 9.0
 
-            with patch(
-                "oracle.ingestion.chunk_index.free_memory_gb",
-                side_effect=fake_free_ram,
-            ), patch(
-                "oracle.ingestion.chunk_index.wait_for_memory_recovery",
-                return_value=9.0,
-            ) as recovery:
+            with (
+                patch(
+                    "oracle.ingestion.chunk_index.free_memory_gb",
+                    side_effect=fake_free_ram,
+                ),
+                patch(
+                    "oracle.ingestion.chunk_index.wait_for_memory_recovery",
+                    return_value=9.0,
+                ) as recovery,
+            ):
                 result = index_file_chunks(
                     root,
                     sqlite_path,
@@ -1948,7 +2245,10 @@ class OraclePhase2Test(unittest.TestCase):
             root = Path(tmp)
             source = root / "src" / "worker.ts"
             source.parent.mkdir(parents=True)
-            source.write_text("export const gpuPolicy = 'keep laptop thermals safe';\n", encoding="utf-8")
+            source.write_text(
+                "export const gpuPolicy = 'keep laptop thermals safe';\n",
+                encoding="utf-8",
+            )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
@@ -1957,9 +2257,15 @@ class OraclePhase2Test(unittest.TestCase):
             # cycles) -> genuine give-up: paused_gpu_temperature. Patch the
             # cooldown helper so the test does not sleep for real; it reports the
             # GPU is still at/above the ceiling.
-            with patch("oracle.ingestion.chunk_index.gpu_temperature_c", return_value=83), patch(
-                "oracle.ingestion.chunk_index.wait_for_gpu_cooldown", return_value=83
-            ) as cooldown:
+            with (
+                patch(
+                    "oracle.ingestion.chunk_index.gpu_temperature_c", return_value=83
+                ),
+                patch(
+                    "oracle.ingestion.chunk_index.wait_for_gpu_cooldown",
+                    return_value=83,
+                ) as cooldown,
+            ):
                 result = index_file_chunks(
                     root,
                     sqlite_path,
@@ -2004,9 +2310,17 @@ class OraclePhase2Test(unittest.TestCase):
                 except StopIteration:
                     return 60
 
-            with patch("oracle.ingestion.chunk_index.gpu_temperature_c", side_effect=fake_temp), patch(
-                "oracle.ingestion.chunk_index.wait_for_gpu_cooldown", return_value=60
-            ) as cooldown, patch("oracle.ingestion.chunk_index.time.sleep") as sleeper:
+            with (
+                patch(
+                    "oracle.ingestion.chunk_index.gpu_temperature_c",
+                    side_effect=fake_temp,
+                ),
+                patch(
+                    "oracle.ingestion.chunk_index.wait_for_gpu_cooldown",
+                    return_value=60,
+                ) as cooldown,
+                patch("oracle.ingestion.chunk_index.time.sleep") as sleeper,
+            ):
                 result = index_file_chunks(
                     root,
                     sqlite_path,
@@ -2034,7 +2348,9 @@ class OraclePhase2Test(unittest.TestCase):
             root = Path(tmp)
             source = root / "src" / "a.ts"
             source.parent.mkdir(parents=True)
-            source.write_text("export const a = 'keep thermals safe';\n", encoding="utf-8")
+            source.write_text(
+                "export const a = 'keep thermals safe';\n", encoding="utf-8"
+            )
             sqlite_path = root / "metadata.sqlite"
             chunk_vectors = root / "chunks.json"
             manifest = root / "manifest.json"
@@ -2049,8 +2365,15 @@ class OraclePhase2Test(unittest.TestCase):
 
             phases: list[tuple[str, dict]] = []
 
-            with patch("oracle.ingestion.chunk_index.gpu_temperature_c", side_effect=fake_temp), patch(
-                "oracle.ingestion.chunk_index.wait_for_gpu_cooldown", return_value=60
+            with (
+                patch(
+                    "oracle.ingestion.chunk_index.gpu_temperature_c",
+                    side_effect=fake_temp,
+                ),
+                patch(
+                    "oracle.ingestion.chunk_index.wait_for_gpu_cooldown",
+                    return_value=60,
+                ),
             ):
                 result = index_file_chunks(
                     root,
@@ -2095,16 +2418,22 @@ class OraclePhase2Test(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             manager = OracleIndexJobManager()
-            with patch(
-                "oracle.server.index_jobs.sync_text_chunks",
-                return_value={"status": "complete"},
-            ), patch(
-                "oracle.server.index_jobs.prune_excluded_chunks",
-                return_value={"status": "complete"},
-            ), patch(
-                "oracle.server.index_jobs.index_file_chunks", side_effect=fake_index
+            with (
+                patch(
+                    "oracle.server.index_jobs.sync_text_chunks",
+                    return_value={"status": "complete"},
+                ),
+                patch(
+                    "oracle.server.index_jobs.prune_excluded_chunks",
+                    return_value={"status": "complete"},
+                ),
+                patch(
+                    "oracle.server.index_jobs.index_file_chunks", side_effect=fake_index
+                ),
             ):
-                result = manager.run_once(root=tmp, force=False, max_batches=2, idle=True)
+                result = manager.run_once(
+                    root=tmp, force=False, max_batches=2, idle=True
+                )
 
         self.assertEqual(result["status"], "complete")
         # During cooling: job.phase == cooling_gpu + a path-free message.
@@ -2131,14 +2460,18 @@ class OraclePhase2Test(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             manager = OracleIndexJobManager()
-            with patch(
-                "oracle.server.index_jobs.sync_text_chunks",
-                return_value={"status": "complete"},
-            ), patch(
-                "oracle.server.index_jobs.prune_excluded_chunks",
-                return_value={"status": "complete"},
-            ), patch(
-                "oracle.server.index_jobs.index_file_chunks", side_effect=fake_index
+            with (
+                patch(
+                    "oracle.server.index_jobs.sync_text_chunks",
+                    return_value={"status": "complete"},
+                ),
+                patch(
+                    "oracle.server.index_jobs.prune_excluded_chunks",
+                    return_value={"status": "complete"},
+                ),
+                patch(
+                    "oracle.server.index_jobs.index_file_chunks", side_effect=fake_index
+                ),
             ):
                 manager.run_once(root=tmp, force=False, max_batches=2, idle=True)
 
@@ -2198,12 +2531,29 @@ class OraclePhase2Test(unittest.TestCase):
             )
             LanceStore(chunk_vectors).replace_all(
                 [
-                    {"id": f"{noisy_file}#chunk-0000", "label": "noise", "area": "FileChunk", "cluster_semantic": "json", "vector": [1.0, 0.0]},
-                    {"id": f"{useful_file}#chunk-0000", "label": "app", "area": "FileChunk", "cluster_semantic": "ts", "vector": [0.0, 1.0]},
+                    {
+                        "id": f"{noisy_file}#chunk-0000",
+                        "label": "noise",
+                        "area": "FileChunk",
+                        "cluster_semantic": "json",
+                        "vector": [1.0, 0.0],
+                    },
+                    {
+                        "id": f"{useful_file}#chunk-0000",
+                        "label": "app",
+                        "area": "FileChunk",
+                        "cluster_semantic": "ts",
+                        "vector": [0.0, 1.0],
+                    },
                 ]
             )
             manifest.write_text(
-                json.dumps({"root": str(root.resolve()), "files": {noisy_file: {}, useful_file: {}}}),
+                json.dumps(
+                    {
+                        "root": str(root.resolve()),
+                        "files": {noisy_file: {}, useful_file: {}},
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -2243,8 +2593,20 @@ class OraclePhase2Test(unittest.TestCase):
             )
             LanceStore(chunk_vectors).replace_all(
                 [
-                    {"id": f"{useful_file}#chunk-0000", "label": "app", "area": "FileChunk", "cluster_semantic": "ts", "vector": [0.0, 1.0]},
-                    {"id": f"{useful_file}#chunk-9999", "label": "orphan", "area": "FileChunk", "cluster_semantic": "ts", "vector": [1.0, 0.0]},
+                    {
+                        "id": f"{useful_file}#chunk-0000",
+                        "label": "app",
+                        "area": "FileChunk",
+                        "cluster_semantic": "ts",
+                        "vector": [0.0, 1.0],
+                    },
+                    {
+                        "id": f"{useful_file}#chunk-9999",
+                        "label": "orphan",
+                        "area": "FileChunk",
+                        "cluster_semantic": "ts",
+                        "vector": [1.0, 0.0],
+                    },
                 ]
             )
             manifest.write_text(
@@ -2287,14 +2649,18 @@ class OraclePhase2Test(unittest.TestCase):
 
             self.assertEqual(store.backend, "lancedb")
             self.assertEqual(store.count(), 2)
-            self.assertEqual(store.similar("src/App.tsx", 1)[0]["id"], "oracle/server/main.py")
+            self.assertEqual(
+                store.similar("src/App.tsx", 1)[0]["id"], "oracle/server/main.py"
+            )
 
     def test_empty_vector_store_search_does_not_load_query_embedder(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = LanceStore(Path(tmp) / "vectors.json")
 
             with patch("oracle.store.lance_store.embed_query_text") as embed_query:
-                embed_query.side_effect = AssertionError("query embedder should not be loaded")
+                embed_query.side_effect = AssertionError(
+                    "query embedder should not be loaded"
+                )
 
                 self.assertEqual(store.search("scaleway gpu", 3), [])
                 embed_query.assert_not_called()
@@ -2314,16 +2680,26 @@ class OraclePhase2Test(unittest.TestCase):
                 ]
             )
 
-            with patch.dict(os.environ, {"ORACLE_QUERY_PROFILE": "semantic-prefix-v2"}), patch(
-                "oracle.store.lance_store.embed_query_text",
-                return_value=[1.0, 0.0],
-            ) as embed_query:
-                result = store.search("where is Cloudflare worker secret rotation implemented", 1)
+            with (
+                patch.dict(os.environ, {"ORACLE_QUERY_PROFILE": "semantic-prefix-v2"}),
+                patch(
+                    "oracle.store.lance_store.embed_query_text",
+                    return_value=[1.0, 0.0],
+                ) as embed_query,
+            ):
+                result = store.search(
+                    "where is Cloudflare worker secret rotation implemented", 1
+                )
 
-            self.assertEqual(result[0]["id"], "src-tauri/src/backend/commands.rs#chunk-0000")
+            self.assertEqual(
+                result[0]["id"], "src-tauri/src/backend/commands.rs#chunk-0000"
+            )
             called_query = embed_query.call_args.args[0]
             self.assertIn("TASK: retrieve Aspis Bio", called_query)
-            self.assertIn("QUERY: where is Cloudflare worker secret rotation implemented", called_query)
+            self.assertIn(
+                "QUERY: where is Cloudflare worker secret rotation implemented",
+                called_query,
+            )
             self.assertIn("cloudflare_worker_secret_rotation", called_query)
 
     def test_runtime_status_reports_vector_backend_and_ollama_shape(self):
@@ -2439,8 +2815,12 @@ class OraclePhase2Test(unittest.TestCase):
         class Model:
             model = "qwen3.5:4b"
 
-        self.assertEqual(model_names({"models": [{"name": "a"}, {"model": "b"}]}), {"a", "b"})
-        self.assertEqual(model_names(type("Payload", (), {"models": [Model()]})()), {"qwen3.5:4b"})
+        self.assertEqual(
+            model_names({"models": [{"name": "a"}, {"model": "b"}]}), {"a", "b"}
+        )
+        self.assertEqual(
+            model_names(type("Payload", (), {"models": [Model()]})()), {"qwen3.5:4b"}
+        )
 
     def test_ollama_placeholder_card_is_rejected(self):
         self.assertTrue(
@@ -2468,14 +2848,16 @@ class OraclePhase2Test(unittest.TestCase):
             resolve_min_free_gb("cuda", idle=False), oracle_config.CHUNK_GPU_MIN_FREE_GB
         )
         self.assertEqual(
-            resolve_min_free_gb("mps", idle=True), max(oracle_config.CHUNK_MIN_FREE_GB, 8.0)
+            resolve_min_free_gb("mps", idle=True),
+            max(oracle_config.CHUNK_MIN_FREE_GB, 8.0),
         )
         self.assertEqual(
             resolve_min_free_gb("mps", idle=False), oracle_config.CHUNK_MIN_FREE_GB
         )
 
         self.assertEqual(
-            resolve_min_free_gb("cpu", idle=True), max(oracle_config.CHUNK_MIN_FREE_GB, 8.0)
+            resolve_min_free_gb("cpu", idle=True),
+            max(oracle_config.CHUNK_MIN_FREE_GB, 8.0),
         )
         self.assertEqual(
             resolve_min_free_gb("cpu", idle=False), oracle_config.CHUNK_MIN_FREE_GB
@@ -2527,13 +2909,19 @@ class OraclePhase2Test(unittest.TestCase):
         # Explicit override always wins, even when nothing is available.
         self.assertEqual(
             choose_device(
-                cuda_available=False, free_vram_gb=None, mps_available=False, override="cuda"
+                cuda_available=False,
+                free_vram_gb=None,
+                mps_available=False,
+                override="cuda",
             ),
             "cuda",
         )
         self.assertEqual(
             choose_device(
-                cuda_available=True, free_vram_gb=0.5, mps_available=False, override="cpu"
+                cuda_available=True,
+                free_vram_gb=0.5,
+                mps_available=False,
+                override="cpu",
             ),
             "cpu",
         )
@@ -2575,7 +2963,10 @@ class OraclePhase2Test(unittest.TestCase):
         )
         self.assertEqual(
             choose_device(
-                cuda_available=False, free_vram_gb=None, mps_available=False, override=""
+                cuda_available=False,
+                free_vram_gb=None,
+                mps_available=False,
+                override="",
             ),
             "cpu",
         )
@@ -2597,56 +2988,77 @@ class OraclePhase2Test(unittest.TestCase):
         # MPS available, free unified memory sufficient -> "mps".
         self.assertEqual(
             choose_device(
-                cuda_available=False, free_vram_gb=None, mps_available=True,
-                override="", free_unified_gb=threshold + 1.0,
+                cuda_available=False,
+                free_vram_gb=None,
+                mps_available=True,
+                override="",
+                free_unified_gb=threshold + 1.0,
             ),
             "mps",
         )
         # MPS available, free unified memory below floor -> "cpu".
         self.assertEqual(
             choose_device(
-                cuda_available=False, free_vram_gb=None, mps_available=True,
-                override="", free_unified_gb=threshold - 1.0,
+                cuda_available=False,
+                free_vram_gb=None,
+                mps_available=True,
+                override="",
+                free_unified_gb=threshold - 1.0,
             ),
             "cpu",
         )
         # MPS available, free unified memory unknown (None) -> "mps".
         self.assertEqual(
             choose_device(
-                cuda_available=False, free_vram_gb=None, mps_available=True,
-                override="", free_unified_gb=None,
+                cuda_available=False,
+                free_vram_gb=None,
+                mps_available=True,
+                override="",
+                free_unified_gb=None,
             ),
             "mps",
         )
         # CUDA available but too little VRAM, MPS present, low unified -> "cpu".
         self.assertEqual(
             choose_device(
-                cuda_available=True, free_vram_gb=threshold - 1.0, mps_available=True,
-                override="", free_unified_gb=threshold - 1.0,
+                cuda_available=True,
+                free_vram_gb=threshold - 1.0,
+                mps_available=True,
+                override="",
+                free_unified_gb=threshold - 1.0,
             ),
             "cpu",
         )
         # CUDA available but too little VRAM, MPS present, sufficient unified -> "mps".
         self.assertEqual(
             choose_device(
-                cuda_available=True, free_vram_gb=threshold - 1.0, mps_available=True,
-                override="", free_unified_gb=threshold + 1.0,
+                cuda_available=True,
+                free_vram_gb=threshold - 1.0,
+                mps_available=True,
+                override="",
+                free_unified_gb=threshold + 1.0,
             ),
             "mps",
         )
         # Exactly AT the floor is sufficient (the gate is strict `<`) -> "mps".
         self.assertEqual(
             choose_device(
-                cuda_available=False, free_vram_gb=None, mps_available=True,
-                override="", free_unified_gb=threshold,
+                cuda_available=False,
+                free_vram_gb=None,
+                mps_available=True,
+                override="",
+                free_unified_gb=threshold,
             ),
             "mps",
         )
         # CUDA with enough VRAM wins BEFORE the MPS gate; low unified is irrelevant.
         self.assertEqual(
             choose_device(
-                cuda_available=True, free_vram_gb=threshold + 1.0, mps_available=True,
-                override="", free_unified_gb=threshold - 1.0,
+                cuda_available=True,
+                free_vram_gb=threshold + 1.0,
+                mps_available=True,
+                override="",
+                free_unified_gb=threshold - 1.0,
             ),
             "cuda",
         )
@@ -2668,11 +3080,13 @@ class OraclePhase2Test(unittest.TestCase):
                 return [[0.1, 0.2, 0.3] for _ in texts]
 
         fake = _FakeModel()
-        with patch.dict(os.environ, {"ORACLE_REQUIRE_REAL_EMBEDDER": "1"}, clear=False), patch.object(
-            embedder, "_sentence_model", return_value=fake
-        ), patch.object(embedder, "embedding_device", return_value="cuda"), patch.object(
-            embedder, "release_embedding_memory"
-        ) as release, patch.object(embedder, "_force_cpu_after_oom") as force_cpu:
+        with (
+            patch.dict(os.environ, {"ORACLE_REQUIRE_REAL_EMBEDDER": "1"}, clear=False),
+            patch.object(embedder, "_sentence_model", return_value=fake),
+            patch.object(embedder, "embedding_device", return_value="cuda"),
+            patch.object(embedder, "release_embedding_memory") as release,
+            patch.object(embedder, "_force_cpu_after_oom") as force_cpu,
+        ):
             vectors = embed_texts(["hello world"], require_sentence_transformer=True)
 
         self.assertEqual(len(vectors), 1)
@@ -2793,14 +3207,10 @@ class OracleVendoredEnvExclusionTest(unittest.TestCase):
         )
 
     def test_is_vendored_env_path_dist_info_component(self):
-        self.assertTrue(
-            is_vendored_env_path("Orasis/numpy-1.26.4.dist-info/RECORD")
-        )
+        self.assertTrue(is_vendored_env_path("Orasis/numpy-1.26.4.dist-info/RECORD"))
 
     def test_is_vendored_env_path_egg_info_component(self):
-        self.assertTrue(
-            is_vendored_env_path("vendor/somepkg-2.0.egg-info/PKG-INFO")
-        )
+        self.assertTrue(is_vendored_env_path("vendor/somepkg-2.0.egg-info/PKG-INFO"))
 
     def test_is_vendored_env_path_keeps_normal_source(self):
         self.assertFalse(is_vendored_env_path("src/app.py"))
@@ -2844,18 +3254,28 @@ class OracleVendoredEnvExclusionTest(unittest.TestCase):
             (dist_info / "METADATA").write_text("Name: numpy\n", encoding="utf-8")
             lib_pkg = root / "Orasis" / "numpy"
             lib_pkg.mkdir(parents=True)
-            (lib_pkg / "__init__.py").write_text("__version__ = '1.26.4'\n", encoding="utf-8")
-            (lib_pkg / "core.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            (lib_pkg / "__init__.py").write_text(
+                "__version__ = '1.26.4'\n", encoding="utf-8"
+            )
+            (lib_pkg / "core.py").write_text(
+                "def add(a, b):\n    return a + b\n", encoding="utf-8"
+            )
             # A site-packages tree elsewhere.
             sp = root / "build" / "Lib" / "site-packages" / "torch"
             sp.mkdir(parents=True)
-            (sp / "_tensor.py").write_text("class Tensor:\n    pass\n", encoding="utf-8")
+            (sp / "_tensor.py").write_text(
+                "class Tensor:\n    pass\n", encoding="utf-8"
+            )
             # Real workspace source that must survive.
             real = root / "aspis-biovision" / "src"
             real.mkdir(parents=True)
-            (real / "pipeline.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+            (real / "pipeline.py").write_text(
+                "def run():\n    return 1\n", encoding="utf-8"
+            )
 
-            collected = {path.relative_to(root).as_posix() for path in collect_text_files(root)}
+            collected = {
+                path.relative_to(root).as_posix() for path in collect_text_files(root)
+            }
             self.assertIn("aspis-biovision/src/pipeline.py", collected)
             self.assertNotIn("Orasis/numpy/__init__.py", collected)
             self.assertNotIn("Orasis/numpy/core.py", collected)
@@ -2873,7 +3293,9 @@ class OracleVendoredEnvExclusionTest(unittest.TestCase):
             src = root / "src" / "worker.ts"
             src.parent.mkdir(parents=True)
             src.write_text("export const x = 1;\n", encoding="utf-8")
-            collected = {path.relative_to(root).as_posix() for path in collect_text_files(root)}
+            collected = {
+                path.relative_to(root).as_posix() for path in collect_text_files(root)
+            }
             self.assertIn("src/worker.ts", collected)
             self.assertNotIn("config/token.txt", collected)
 

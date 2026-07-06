@@ -47,6 +47,7 @@ from oracle.ingestion.retrieval_text import (
     active_chunk_profile_version,
     chunk_embedding_text,
 )
+from oracle.ingestion.ast_chunker import chunk_file_semantically
 from oracle.store.lance_store import LanceStore
 from oracle.store.sqlite_store import SQLiteStore
 
@@ -297,7 +298,9 @@ def directory_contains_install_marker(directory: Path) -> bool:
                     is_dir = entry.is_dir()
                 except OSError:
                     is_dir = False
-                if is_dir and (lower.endswith(".dist-info") or lower.endswith(".egg-info")):
+                if is_dir and (
+                    lower.endswith(".dist-info") or lower.endswith(".egg-info")
+                ):
                     return True
                 if not is_dir:
                     if name == "RECORD":
@@ -346,7 +349,9 @@ def collect_text_files(root: Path | str = ".") -> list[Path]:
     return sorted(files, key=lambda path: priority_key(path, root))
 
 
-def directory_path_allowed(path: Path, root: Path, ignore_policy: dict | None = None) -> bool:
+def directory_path_allowed(
+    path: Path, root: Path, ignore_policy: dict | None = None
+) -> bool:
     try:
         relative = path.relative_to(root)
     except ValueError:
@@ -400,7 +405,9 @@ def path_explicitly_rescued(relative: Path, ignore_policy: dict | None = None) -
     return decision is True
 
 
-def chunk_path_allowed(path: Path, root: Path, ignore_policy: dict | None = None) -> bool:
+def chunk_path_allowed(
+    path: Path, root: Path, ignore_policy: dict | None = None
+) -> bool:
     try:
         relative = path.relative_to(root)
     except ValueError:
@@ -467,7 +474,9 @@ def load_workspace_ignore_policy(root: Path) -> dict:
         if not ignore_path.is_file():
             continue
         try:
-            lines = ignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = ignore_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
         except OSError:
             continue
         for raw_line in lines:
@@ -522,7 +531,9 @@ def _ignore_rule_matches(
         return _path_prefix_glob_match(relative_text, pattern)
 
     if anchored:
-        return fnmatch.fnmatchcase(relative_text, pattern) or relative_text.startswith(pattern + "/")
+        return fnmatch.fnmatchcase(relative_text, pattern) or relative_text.startswith(
+            pattern + "/"
+        )
 
     # Unanchored file/glob rule: match any single path component (e.g. `*.secret.txt`
     # against the basename, or a bare `name` against any segment), OR the full path.
@@ -620,7 +631,8 @@ def priority_rank(relative: str) -> int:
         or "/workers/" in relative
         or "scaleway" in relative
         or "cloudflare" in relative
-        or "biovision" in relative and "worker" in relative
+        or "biovision" in relative
+        and "worker" in relative
     ):
         return 0
     if (
@@ -631,7 +643,11 @@ def priority_rank(relative: str) -> int:
         or relative.startswith("aspis-biovision/tests/")
     ):
         return 1
-    if relative.endswith((".md", ".txt")) or "/docs/" in relative or relative.startswith("docs/"):
+    if (
+        relative.endswith((".md", ".txt"))
+        or "/docs/" in relative
+        or relative.startswith("docs/")
+    ):
         return 2
     return 3
 
@@ -643,7 +659,9 @@ def read_text_file(path: Path) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
-def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[tuple[int, int, str]]:
+def split_text(
+    text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS
+) -> list[tuple[int, int, str]]:
     clean = text.replace("\r\n", "\n")
     if not clean.strip():
         return []
@@ -688,9 +706,27 @@ def build_chunks_for_file(path: Path, root: Path) -> list[dict]:
         return []
     file_id = path.relative_to(root).as_posix()
     mtime = utc_mtime(path)
-    max_chars, overlap = chunk_limits_for_file(path)
+    max_chars, _overlap = chunk_limits_for_file(path)
+
+    # Phase 2: try semantic chunking first (AST-aware, definition boundaries).
+    # Falls back to sliding window for non-code languages or when no
+    # definitions are detected.
+    semantic_chunks = chunk_file_semantically(
+        path, root, text=text, max_chars=max_chars
+    )
+    if semantic_chunks:
+        for chunk in semantic_chunks:
+            chunk["ultima_modifica"] = mtime
+            chunk["embedding_dims"] = EMBED_DIMS
+            # Ensure backward-compatible field names
+            chunk.setdefault("file_sorgente", file_id)
+        return semantic_chunks
+
+    # Sliding-window fallback
     chunks = []
-    for index, (start, end, piece) in enumerate(split_text(text, max_chars=max_chars, overlap=overlap)):
+    for index, (start, end, piece) in enumerate(
+        split_text(text, max_chars=max_chars, overlap=max(200, max_chars // 8))
+    ):
         chunks.append(
             {
                 "id": f"{file_id}#chunk-{index:04d}",
@@ -705,6 +741,14 @@ def build_chunks_for_file(path: Path, root: Path) -> list[dict]:
                 "file_sorgente": file_id,
                 "ultima_modifica": mtime,
                 "embedding_dims": EMBED_DIMS,
+                # New metadata (empty, for schema consistency)
+                "kind": "text_slice",
+                "symbol_name": "",
+                "signature": "",
+                "line_start": 0,
+                "line_end": 0,
+                "language": "",
+                "symbols_used": "[]",
             }
         )
     return chunks
@@ -874,7 +918,15 @@ def index_file_chunks(
 
     if min_free_gb > 0 and free_memory_gb() < min_free_gb:
         log_progress(progress, f"chunk-index paused_low_memory before scan root={root}")
-        return status_payload("paused_low_memory", root, sqlite_path, chunk_vector_path, manifest_path, scanned=0, processed=0)
+        return status_payload(
+            "paused_low_memory",
+            root,
+            sqlite_path,
+            chunk_vector_path,
+            manifest_path,
+            scanned=0,
+            processed=0,
+        )
 
     output_paths = {
         Path(sqlite_path).resolve(),
@@ -882,9 +934,7 @@ def index_file_chunks(
         manifest_path.resolve(),
     }
     files = [
-        path
-        for path in collect_text_files(root)
-        if path.resolve() not in output_paths
+        path for path in collect_text_files(root) if path.resolve() not in output_paths
     ]
     sqlite = SQLiteStore(sqlite_path)
     vector_store = LanceStore(chunk_vector_path)
@@ -907,7 +957,9 @@ def index_file_chunks(
     # max_batches semantics stay anchored to the BASE size (a "batch" budget is
     # sized in base units even while the adaptive controller grows/shrinks the
     # actual per-iteration slice).
-    max_files_per_run = max_batches * base_file_batch_size if max_batches is not None else None
+    max_files_per_run = (
+        max_batches * base_file_batch_size if max_batches is not None else None
+    )
     chunk_batch_size = effective_chunk_batch_size(batch_chunks)
     chunk_char_budget = max(1, batch_chars)
 
@@ -941,7 +993,9 @@ def index_file_chunks(
             )
             free_gb = wait_for_memory_recovery(min_free_gb, progress)
             if free_gb < min_free_gb:
-                log_progress(progress, f"chunk-index paused_low_memory free_gb={free_gb}")
+                log_progress(
+                    progress, f"chunk-index paused_low_memory free_gb={free_gb}"
+                )
                 return status_payload(
                     "paused_low_memory",
                     root,
@@ -971,7 +1025,9 @@ def index_file_chunks(
         )
 
         vector_records = []
-        for chunk_batch in chunk_batches(batch_chunks_to_index, chunk_batch_size, chunk_char_budget):
+        for chunk_batch in chunk_batches(
+            batch_chunks_to_index, chunk_batch_size, chunk_char_budget
+        ):
             gpu_temp = gpu_temperature_c()
             if max_gpu_temp_c and gpu_temp is not None and gpu_temp >= max_gpu_temp_c:
                 # COOL-AND-RESUME: a thermal event must not abort the whole run.
@@ -1062,7 +1118,9 @@ def index_file_chunks(
         vector_store.replace_ids(old_ids, vector_records)
         sqlite.replace_chunks_for_files(batch_file_ids, batch_chunks_to_index)
         for path, file_id in zip(batch_paths, batch_file_ids):
-            manifest_files[file_id] = file_signature(path, chunks=len(file_chunks_by_id[file_id]))
+            manifest_files[file_id] = file_signature(
+                path, chunks=len(file_chunks_by_id[file_id])
+            )
         sync_legacy_manifest_root(manifest, root)
         save_manifest(manifest_path, manifest)
         processed_files += committed_file_count
@@ -1072,7 +1130,9 @@ def index_file_chunks(
         del vector_records
         del batch_chunks_to_index
         del file_chunks_by_id
-        release_embedding_memory(unload_model=min_free_gb > 0 and free_memory_gb() < min_free_gb)
+        release_embedding_memory(
+            unload_model=min_free_gb > 0 and free_memory_gb() < min_free_gb
+        )
         log_progress(
             progress,
             f"chunk-index batch committed processed_files={processed_files} "
@@ -1083,7 +1143,10 @@ def index_file_chunks(
     sync_legacy_manifest_root(manifest, root)
     save_manifest(manifest_path, manifest)
     release_embedding_memory(unload_model=True)
-    log_progress(progress, f"chunk-index {status} processed_files={processed_files} processed_chunks={processed_chunks}")
+    log_progress(
+        progress,
+        f"chunk-index {status} processed_files={processed_files} processed_chunks={processed_chunks}",
+    )
     return status_payload(
         status,
         root,
@@ -1118,7 +1181,10 @@ def text_chunks_up_to_date(
     if not previous:
         return False
     current = file_signature(path)
-    if previous.get("size") != current["size"] or previous.get("mtime_ns") != current["mtime_ns"]:
+    if (
+        previous.get("size") != current["size"]
+        or previous.get("mtime_ns") != current["mtime_ns"]
+    ):
         return False
     if previous.get("chunk_profile") != active_chunk_profile_version():
         return False
@@ -1206,7 +1272,8 @@ def prune_excluded_chunks(
         if other_root == root or not other_root.is_dir():
             continue
         expected_all_roots.update(
-            path.relative_to(other_root).as_posix() for path in collect_text_files(other_root)
+            path.relative_to(other_root).as_posix()
+            for path in collect_text_files(other_root)
         )
     existing = {chunk["file_id"] for chunk in sqlite.all_chunks()}
     removed_files = sorted(existing - expected_all_roots)
@@ -1229,7 +1296,9 @@ def prune_excluded_chunks(
         sqlite.delete_nodes(removed_node_ids)
     valid_node_ids = {node["id"] for node in sqlite.all_nodes()}
     orphan_node_vector_ids = sorted(set(node_vector_store.ids()) - valid_node_ids)
-    removed_node_vector_ids = sorted(set(removed_node_ids) | set(orphan_node_vector_ids))
+    removed_node_vector_ids = sorted(
+        set(removed_node_ids) | set(orphan_node_vector_ids)
+    )
     if removed_node_vector_ids:
         node_vector_store.replace_ids(removed_node_vector_ids, [])
 
@@ -1267,13 +1336,18 @@ def prune_excluded_chunks(
     }
 
 
-def file_needs_index(path: Path, root: Path, manifest_files: dict, sqlite: SQLiteStore) -> bool:
+def file_needs_index(
+    path: Path, root: Path, manifest_files: dict, sqlite: SQLiteStore
+) -> bool:
     file_id = path.relative_to(root).as_posix()
     current = file_signature(path)
     previous = manifest_files.get(file_id)
     if not previous:
         return True
-    if previous.get("size") != current["size"] or previous.get("mtime_ns") != current["mtime_ns"]:
+    if (
+        previous.get("size") != current["size"]
+        or previous.get("mtime_ns") != current["mtime_ns"]
+    ):
         return True
     if previous.get("chunk_profile") != active_chunk_profile_version():
         return True
@@ -1300,9 +1374,7 @@ def chunk_index_status(
         manifest_path.resolve(),
     }
     files = [
-        path
-        for path in collect_text_files(root)
-        if path.resolve() not in output_paths
+        path for path in collect_text_files(root) if path.resolve() not in output_paths
     ]
     expected = {path.relative_to(root).as_posix() for path in files}
     indexed = set(manifest_files)
@@ -1469,9 +1541,9 @@ def strip_verbatim_prefix(value: str) -> str:
     No-op on non-Windows path strings.
     """
     if value.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + value[len("\\\\?\\UNC\\"):]
+        return "\\\\" + value[len("\\\\?\\UNC\\") :]
     if value.startswith("\\\\?\\"):
-        return value[len("\\\\?\\"):]
+        return value[len("\\\\?\\") :]
     return value
 
 
@@ -1547,7 +1619,7 @@ def free_memory_gb() -> float:
             status = MemoryStatusEx()
             status.dwLength = ctypes.sizeof(status)
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-            return round(status.ullAvailPhys / (1024 ** 3), 2)
+            return round(status.ullAvailPhys / (1024**3), 2)
         except Exception:
             return 0.0
     if sys.platform == "darwin":
@@ -1566,14 +1638,19 @@ def free_memory_gb() -> float:
         page_size = int(page_match.group(1)) if page_match else 4096
         pages = 0
         free_only_pages = 0
-        for name in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+        for name in (
+            "Pages free",
+            "Pages inactive",
+            "Pages speculative",
+            "Pages purgeable",
+        ):
             line_match = re.search(rf"^{name}:\s+(\d+)\.", result.stdout, re.MULTILINE)
             if line_match:
                 pages += int(line_match.group(1))
                 if name == "Pages free":
                     free_only_pages = int(line_match.group(1))
-        vm_stat_gb = round(pages * page_size / (1024 ** 3), 2)
-        free_only_gb = round(free_only_pages * page_size / (1024 ** 3), 2)
+        vm_stat_gb = round(pages * page_size / (1024**3), 2)
+        free_only_gb = round(free_only_pages * page_size / (1024**3), 2)
         return darwin_effective_free_gb(
             vm_stat_gb, free_only_gb, darwin_memory_pressure_level()
         )
@@ -1581,7 +1658,7 @@ def free_memory_gb() -> float:
         with open("/proc/meminfo", encoding="utf-8") as handle:
             for line in handle:
                 if line.startswith("MemAvailable:"):
-                    return round(int(line.split()[1]) / (1024 ** 2), 2)
+                    return round(int(line.split()[1]) / (1024**2), 2)
     except OSError:
         pass
     return 0.0

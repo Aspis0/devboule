@@ -779,7 +779,7 @@ TOOLS = [
     },
     {
         "name": "oracle_ask",
-        "description": "Ask the Oracle for information about the project's architecture.",
+        "description": "Ask the Oracle for information about the project's architecture. Pre-filter with kind/language/symbols for precise results. Set group_by_file=true to get chunks grouped per file with total scores.",
         "parameters": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 5},
@@ -787,11 +787,37 @@ TOOLS = [
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "project_id": {"type": "string", "default": ""},
             "session_token": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "default": "",
+                "description": "Filter by chunk kind: function, struct, class, enum, trait, impl, module, type, macro, module_header, text_slice. Empty = no filter.",
+            },
+            "language": {
+                "type": "string",
+                "default": "",
+                "description": "Filter by language: rust, python, typescript, javascript, java, kotlin. Empty = no filter.",
+            },
+            "symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Only return chunks containing these symbol names (defined or referenced).",
+            },
+            "group_by_file": {
+                "type": "boolean",
+                "default": False,
+                "description": "Group results by file instead of a flat list. Each file gets a total_score and its matching chunks.",
+            },
+            "expand_ckg": {
+                "type": "boolean",
+                "default": False,
+                "description": "Expand retrieval to include neighbor files from the Code Knowledge Graph (IMPORT/CONTAIN edges).",
+            },
         },
     },
     {
         "name": "oracle_context",
-        "description": "Returns semantically relevant text chunks for agents.",
+        "description": "Returns semantically relevant text chunks for agents. Pre-filter with kind/language/symbols for precise results. Use oracle_ask for AI-generated answers; use oracle_context for raw chunk data.",
         "parameters": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 8},
@@ -799,6 +825,33 @@ TOOLS = [
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "project_id": {"type": "string", "default": ""},
             "session_token": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "default": "",
+                "description": "Filter by chunk kind: function, struct, class, enum, trait, impl, module, type, macro, module_header, text_slice. Empty = no filter.",
+            },
+            "language": {
+                "type": "string",
+                "default": "",
+                "description": "Filter by language: rust, python, typescript, javascript, java, kotlin. Empty = no filter.",
+            },
+            "symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Only return chunks containing these symbol names.",
+            },
+            "imports": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Only return chunks that import/reference these modules or packages.",
+            },
+            "module": {
+                "type": "string",
+                "default": "",
+                "description": "Only return chunks from files whose path contains this string (e.g. 'backend::cleanup' or 'oracle/ingestion').",
+            },
         },
     },
     {
@@ -831,6 +884,31 @@ TOOLS = [
         "parameters": {
             "project_id": {"type": "string"},
             "file": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "role": {"type": "string", "enum": sorted(VALID_ROLES)},
+            "session_token": {"type": "string"},
+        },
+    },
+    {
+        "name": "oracle_find",
+        "description": "PRECISE search: find EXACT symbols, functions, structs, or classes by name. Much faster and more precise than oracle_ask for 'where is X defined?' queries. Use kind to filter by symbol type (function, struct, class, enum...). Returns chunk metadata with exact line ranges.",
+        "parameters": {
+            "project_id": {"type": "string"},
+            "query": {
+                "type": "string",
+                "description": "Symbol name or keyword to find.",
+            },
+            "kind": {
+                "type": "string",
+                "default": "",
+                "description": "Symbol kind: function, struct, class, enum, trait, impl, module, type, macro, module_header. Empty = any.",
+            },
+            "language": {
+                "type": "string",
+                "default": "",
+                "description": "Language filter: rust, python, typescript, javascript, java, kotlin. Empty = any.",
+            },
+            "limit": {"type": "integer", "default": 10},
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
             "session_token": {"type": "string"},
@@ -1210,9 +1288,10 @@ def validate_management_root(candidate: Path) -> Path:
     # A `src-tauri` candidate (the dev app's cwd) normalizes to the repo root
     # whenever the parent actually carries the oracle package — the parent IS
     # the management root regardless of where config.json sits (see below).
-    if root.name == "src-tauri" and root.parent.joinpath(
-        "oracle", "server", "aspis_mcp.py"
-    ).is_file():
+    if (
+        root.name == "src-tauri"
+        and root.parent.joinpath("oracle", "server", "aspis_mcp.py").is_file()
+    ):
         root = root.parent.resolve()
     # SPLIT LAYOUT (F1, mute-orchestrator fix 2026-07-02): the dev app writes
     # `config.json` under `src-tauri/`, not the repo root. Accept either
@@ -1225,7 +1304,10 @@ def validate_management_root(candidate: Path) -> Path:
         root.joinpath("config.json").is_file()
         or root.joinpath("src-tauri", "config.json").is_file()
     )
-    if not has_config or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file():
+    if (
+        not has_config
+        or not root.joinpath("oracle", "server", "aspis_mcp.py").is_file()
+    ):
         raise McpError(
             "Devboule MCP management root is invalid. Run from Devboule, pass --root, or set ASPIS_MANAGEMENT_ROOT."
         )
@@ -2616,9 +2698,7 @@ def require_session_token(session: dict[str, Any], session_token: str | None) ->
         issued_at is None
         or datetime.now(timezone.utc) - issued_at > SESSION_TOKEN_WINDOW
     ):
-        raise McpError(
-            "Agent session token expired. Relaunch the agent from Devboule."
-        )
+        raise McpError("Agent session token expired. Relaunch the agent from Devboule.")
     if not hmac.compare_digest(hash_session_token(token), expected_hash):
         raise McpError("Agent session token is invalid for this agent id and role.")
 
@@ -3532,13 +3612,54 @@ def mcp_oracle_context(
     query: str,
     limit: int,
     allowed_file_ids: set[str] | None = None,
+    # ── Phase 3: pre-filtering ──
+    kind: str | None = None,
+    language: str | None = None,
+    symbols: list[str] | None = None,
+    imports: list[str] | None = None,
+    module: str | None = None,
 ) -> list[dict]:
     if os.getenv("ASPIS_MCP_DENSE_CONTEXT", "").strip() == "1":
-        return engine.context(query, limit, allowed_file_ids=allowed_file_ids)
+        return engine.context(
+            query,
+            limit,
+            allowed_file_ids=allowed_file_ids,
+            kind=kind,
+            language=language,
+            symbols=symbols,
+            imports=imports,
+            module=module,
+        )
     chunks = engine.sqlite.all_chunks()
     if allowed_file_ids is not None:
         chunks = [chunk for chunk in chunks if chunk["file_id"] in allowed_file_ids]
+    # Apply pre-filters
+    chunks = [
+        c
+        for c in chunks
+        if engine._chunk_matches_filters(c, kind, language, symbols, imports, module)
+    ]
     return lexical_chunk_context(query, chunks, max(1, limit))
+
+
+def _parse_filter_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Extract filtering parameters from MCP tool arguments."""
+    kind = str(args.get("kind", "")).strip() or None
+    language = str(args.get("language", "")).strip() or None
+    symbols: list[str] | None = args.get("symbols") if args.get("symbols") else None
+    imports: list[str] | None = args.get("imports") if args.get("imports") else None
+    module = str(args.get("module", "")).strip() or None
+    group_by_file = bool(args.get("group_by_file"))
+    expand_ckg = bool(args.get("expand_ckg"))
+    return {
+        "kind": kind,
+        "language": language,
+        "symbols": symbols,
+        "imports": imports,
+        "module": module,
+        "group_by_file": group_by_file,
+        "expand_ckg": expand_ckg,
+    }
 
 
 def mcp_oracle_ask(
@@ -3546,6 +3667,14 @@ def mcp_oracle_ask(
     query: str,
     limit: int,
     allowed_file_ids: set[str] | None = None,
+    # ── Phase 3-4: filtering & grouping ──
+    kind: str | None = None,
+    language: str | None = None,
+    symbols: list[str] | None = None,
+    imports: list[str] | None = None,
+    module: str | None = None,
+    group_by_file: bool = False,
+    expand_ckg: bool = False,
 ) -> dict:
     if os.getenv("ASPIS_MCP_DENSE_ASK", "").strip() == "1":
         return engine.ask(
@@ -3553,9 +3682,24 @@ def mcp_oracle_ask(
             limit,
             llm_config=oracle_llm_config_from_app_vault(),
             allowed_file_ids=allowed_file_ids,
+            kind=kind,
+            language=language,
+            symbols=symbols,
+            imports=imports,
+            module=module,
+            group_by_file=group_by_file,
+            expand_ckg_neighbors=expand_ckg,
         )
     chunks = mcp_oracle_context(
-        engine, query, max(1, limit), allowed_file_ids=allowed_file_ids
+        engine,
+        query,
+        max(1, limit),
+        allowed_file_ids=allowed_file_ids,
+        kind=kind,
+        language=language,
+        symbols=symbols,
+        imports=imports,
+        module=module,
     )
     generated = answer_from_context(
         query, chunks, llm_config=oracle_llm_config_from_app_vault()
@@ -3660,8 +3804,17 @@ def dispatch_oracle_context(
             )
     index_status = ensure_oracle_index_ready(projects_dir, args)
     engine = make_mcp_engine(projects_dir)
+    filters = _parse_filter_args(args)
     return mcp_oracle_context(
-        engine, query, limit, allowed_file_ids=allowed_file_ids
+        engine,
+        query,
+        limit,
+        allowed_file_ids=allowed_file_ids,
+        kind=filters["kind"],
+        language=filters["language"],
+        symbols=filters["symbols"],
+        imports=filters["imports"],
+        module=filters["module"],
     ), index_status
 
 
@@ -3691,18 +3844,35 @@ def dispatch_oracle_ask(
             logger.warning("Oracle HTTP ask failed, using in-process fallback: %s", exc)
     index_status = ensure_oracle_index_ready(projects_dir, args)
     engine = make_mcp_engine(projects_dir)
+    filters = _parse_filter_args(args)
     return mcp_oracle_ask(
-        engine, query, limit, allowed_file_ids=allowed_file_ids
+        engine,
+        query,
+        limit,
+        allowed_file_ids=allowed_file_ids,
+        kind=filters["kind"],
+        language=filters["language"],
+        symbols=filters["symbols"],
+        imports=filters["imports"],
+        module=filters["module"],
+        group_by_file=filters["group_by_file"],
+        expand_ckg=filters["expand_ckg"],
     ), index_status
 
 
 def mcp_chunk_result(chunk: dict[str, Any]) -> dict[str, Any]:
     file_source = str(chunk.get("file_source") or "")
+    chunk_kind = str(chunk.get("kind") or "")
+    chunk_sym = str(chunk.get("symbol_name") or "")
+    chunk_lang = str(chunk.get("language") or "")
     return {
         "id": file_source or chunk.get("chunk_id"),
-        "label": Path(file_source).name
-        if file_source
-        else str(chunk.get("chunk_id") or "chunk"),
+        "label": chunk_sym
+        or (
+            Path(file_source).name
+            if file_source
+            else str(chunk.get("chunk_id") or "chunk")
+        ),
         "node_type": "chunk",
         "cluster": 0,
         "score": float(chunk.get("score") or 0.0),
@@ -3714,6 +3884,14 @@ def mcp_chunk_result(chunk: dict[str, Any]) -> dict[str, Any]:
         "start_char": chunk.get("start_char"),
         "end_char": chunk.get("end_char"),
         "chunk_preview": summarize_mcp_chunk(chunk),
+        # ── Phase 3: structured metadata ──
+        "kind": chunk_kind or "text_slice",
+        "symbol_name": chunk_sym,
+        "signature": str(chunk.get("signature") or ""),
+        "language": chunk_lang,
+        "line_start": chunk.get("line_start") or 0,
+        "line_end": chunk.get("line_end") or 0,
+        "symbols_used": chunk.get("symbols_used", []),
     }
 
 
@@ -4094,7 +4272,9 @@ def _resolve_oracle_http_target_uncached(projects_dir: Path) -> tuple[str, str] 
     # `bool` is an `int` subclass — a corrupt `"pid": true` must not probe pid 1.
     pid = data.get("pid")
     if isinstance(pid, int) and not isinstance(pid, bool) and not _pid_alive(pid):
-        logger.info("Oracle discovery pid %s is not alive; using in-process engine.", pid)
+        logger.info(
+            "Oracle discovery pid %s is not alive; using in-process engine.", pid
+        )
         return None
     return base, token
 
@@ -4118,9 +4298,7 @@ def _pid_alive(pid: int) -> bool:
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             ERROR_ACCESS_DENIED = 5
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            handle = kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not handle:
                 # NULL means EITHER "no such process" or "access denied" — the
                 # latter proves the pid is alive (mirrors the POSIX
@@ -4168,9 +4346,7 @@ class HttpOracleEngine:
         # capped separately at 1s in `_post` (loopback-only contract).
         if timeout is None:
             try:
-                timeout = float(
-                    os.environ.get("ASPIS_ORACLE_HTTP_TIMEOUT_SECS") or 8.0
-                )
+                timeout = float(os.environ.get("ASPIS_ORACLE_HTTP_TIMEOUT_SECS") or 8.0)
             except (TypeError, ValueError):
                 timeout = 8.0
             # Clamp to a FINITE positive range (adversarial-verify finding):
@@ -5450,7 +5626,9 @@ def dispatch_project_structure(
     }
 
 
-def dispatch_get_neighborhood(projects_dir: Path, state_lock: Path, args: dict[str, Any], *, store: Any = None) -> dict[str, Any]:
+def dispatch_get_neighborhood(
+    projects_dir: Path, state_lock: Path, args: dict[str, Any], *, store: Any = None
+) -> dict[str, Any]:
     """Read-only CKG tool: the k-hop neighborhood of a symbol/file node, SCOPED to the agent's
     project (a node outside the project's allowed file_ids is rejected, and the returned
     neighborhood is filtered to in-scope nodes only — never another project's graph)."""
@@ -5479,12 +5657,21 @@ def dispatch_get_neighborhood(projects_dir: Path, state_lock: Path, args: dict[s
     s = store or CkgStore(CKG_DB_PATH)
     rows = s.get_neighborhood(node_id, k, kind)
     neighborhood = [r for r in rows if r["id"].split("#", 1)[0] in allowed]
-    audit_agent_read(projects_dir, state_lock, agent_id, role, "get_neighborhood",
-                     f"Read CKG neighborhood of {node_id} (k={k}, {len(neighborhood)} nodes).", project_id)
+    audit_agent_read(
+        projects_dir,
+        state_lock,
+        agent_id,
+        role,
+        "get_neighborhood",
+        f"Read CKG neighborhood of {node_id} (k={k}, {len(neighborhood)} nodes).",
+        project_id,
+    )
     return {"projectId": project_id, "nodeId": node_id, "neighborhood": neighborhood}
 
 
-def dispatch_find_imports(projects_dir: Path, state_lock: Path, args: dict[str, Any], *, store: Any = None) -> dict[str, Any]:
+def dispatch_find_imports(
+    projects_dir: Path, state_lock: Path, args: dict[str, Any], *, store: Any = None
+) -> dict[str, Any]:
     """Read-only CKG tool: the IMPORT edges out of a file, SCOPED to the agent's project."""
     agent_id, role = require_agent_tool(projects_dir, args, "find_imports")
     if "find_imports" not in ROLE_ALLOWED_TOOLS.get(role, set()):
@@ -5504,8 +5691,15 @@ def dispatch_find_imports(projects_dir: Path, state_lock: Path, args: dict[str, 
     # SCOPE: drop any IMPORT edge whose TARGET is outside the project (mirrors the neighborhood
     # filter) — prevents leaking out-of-scope file paths once a multi-project CKG / IMPORT edges land.
     imports = [i for i in imports if i.get("dst", "").split("#", 1)[0] in allowed]
-    audit_agent_read(projects_dir, state_lock, agent_id, role, "find_imports",
-                     f"Read CKG imports of {file} ({len(imports)} edges).", project_id)
+    audit_agent_read(
+        projects_dir,
+        state_lock,
+        agent_id,
+        role,
+        "find_imports",
+        f"Read CKG imports of {file} ({len(imports)} edges).",
+        project_id,
+    )
     return {"projectId": project_id, "file": file, "imports": imports}
 
 
@@ -6375,7 +6569,10 @@ def _stamp_mini_directive_collected(
         with file_lock(state_lock):
             state = read_agents_state(projects_dir)
             for directive in state.get("miniCoderDirectives", []):
-                if isinstance(directive, dict) and str(directive.get("id") or "") == directive_id:
+                if (
+                    isinstance(directive, dict)
+                    and str(directive.get("id") or "") == directive_id
+                ):
                     directive["collected"] = True
                     break
             write_agents_state(projects_dir, state)
@@ -8868,6 +9065,47 @@ def handle_tool_call(
                 "staleFiles": index_status.get("stale_files"),
             },
             "chunks": chunks,
+        }
+
+    if name == "oracle_find":
+        agent_id, role = require_agent_tool(projects_dir, args, name)
+        enforce_mini_oracle_project_scope(projects_dir, agent_id, role, args)
+        query = clean_text(args.get("query"), "Query", 2000)
+        find_kind = str(args.get("kind", "")).strip() or None
+        find_lang = str(args.get("language", "")).strip() or None
+        find_limit = int(args.get("limit", 10))
+        audit_agent_read(
+            projects_dir,
+            state_lock,
+            agent_id,
+            role,
+            "oracle_find",
+            query,
+            args.get("project_id") or None,
+        )
+        scope = oracle_allowed_file_ids(projects_dir, args)
+        # Use context with symbol-matching for precise find
+        chunks, index_status = dispatch_oracle_context(
+            projects_dir,
+            query,
+            find_limit,
+            scope,
+            args={
+                "kind": find_kind or "",
+                "language": find_lang or "",
+                "symbols": [query] if query else [],
+            },
+        )
+        return {
+            "query": query,
+            "kind": find_kind,
+            "language": find_lang,
+            "indexStatus": {
+                "root": _safe_index_root(index_status.get("root")),
+                "indexedFiles": index_status.get("indexed_files"),
+            },
+            "chunks": chunks,
+            "hint": "Each chunk has kind, symbol_name, signature, language, line_start, line_end, and symbols_used — use these to decide which files to open.",
         }
 
     if name == "censor_findings":

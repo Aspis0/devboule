@@ -23,8 +23,12 @@ SYMBOL_PATTERNS = (
     re.compile(r"\bclass\s+([A-Za-z_][\w]*)\s*[:\(]"),
 )
 
-ROUTE_PATTERN = re.compile(r"['\"](/(?:api/|workers/|artifacts/|outputs/|jobs/|projects/)[^'\"\s)]+)")
-MCP_TOOL_PATTERN = re.compile(r"\b(?:oracle|project|cloudflare|scaleway)_[a-z0-9_]+\b", re.IGNORECASE)
+ROUTE_PATTERN = re.compile(
+    r"['\"](/(?:api/|workers/|artifacts/|outputs/|jobs/|projects/)[^'\"\s)]+)"
+)
+MCP_TOOL_PATTERN = re.compile(
+    r"\b(?:oracle|project|cloudflare|scaleway)_[a-z0-9_]+\b", re.IGNORECASE
+)
 TAG_PATTERN = re.compile(r"@([a-z0-9_-]+)\(([^)]+)\)", re.IGNORECASE)
 
 
@@ -40,7 +44,12 @@ def active_embed_profile() -> str:
 
 
 def active_query_profile() -> str:
-    return normalize_profile(os.getenv("ORACLE_QUERY_PROFILE", os.getenv("ORACLE_EMBED_PROFILE", "semantic-prefix-v2")))
+    return normalize_profile(
+        os.getenv(
+            "ORACLE_QUERY_PROFILE",
+            os.getenv("ORACLE_EMBED_PROFILE", "semantic-prefix-v2"),
+        )
+    )
 
 
 def active_chunk_profile_version(profile: str | None = None) -> str:
@@ -65,6 +74,17 @@ def chunk_embedding_text(chunk: dict, profile: str | None = None) -> str:
     source_kind = classify_source_kind(source)
     questions = question_templates(domains, source, symbols)
 
+    # ── Phase 3: structured metadata from AST chunking ──
+    chunk_kind = str(chunk.get("kind") or "")
+    symbol_name = str(chunk.get("symbol_name") or "")
+    chunk_lang = str(chunk.get("language") or "")
+    line_range = (
+        f"L{chunk.get('line_start', 0)}-L{chunk.get('line_end', 0)}"
+        if chunk.get("line_start")
+        else ""
+    )
+    symbols_used = chunk.get("symbols_used", [])
+
     header = [
         "TASK: retrieve Aspis Bio and Aspis Management code/docs chunks that answer architecture, implementation, cloud, oracle, and project-management questions.",
         f"SOURCE_PATH: {source}",
@@ -74,8 +94,20 @@ def chunk_embedding_text(chunk: dict, profile: str | None = None) -> str:
         f"PRIORITY_HINT: {priority_hint(source_kind)}",
         f"DOMAIN_TAGS: {', '.join(domains) if domains else 'general'}",
     ]
+    if chunk_kind:
+        header.append(f"CHUNK_KIND: {chunk_kind}")
+    if symbol_name:
+        header.append(f"SYMBOL_NAME: {symbol_name}")
+    if chunk_lang:
+        header.append(f"LANGUAGE: {chunk_lang}")
+    if line_range and line_range != "L0-L0":
+        header.append(f"LINE_RANGE: {line_range}")
     if symbols:
         header.append(f"SYMBOLS: {', '.join(symbols[:40])}")
+    if symbols_used:
+        used = [s for s in symbols_used if s not in (symbol_name, Path(source).stem)]
+        if used:
+            header.append(f"REFERENCES: {', '.join(used[:20])}")
     if routes:
         header.append(f"ROUTES_APIS: {', '.join(routes[:30])}")
     if questions:
@@ -101,13 +133,38 @@ def query_embedding_text(query: str, profile: str | None = None) -> str:
 
 def classify_source_kind(source: str) -> str:
     lower = source.lower()
-    if "/tests/" in lower or lower.endswith((".test.js", ".test.ts", ".spec.js", ".spec.ts", "_test.py")):
+    if "/tests/" in lower or lower.endswith(
+        (".test.js", ".test.ts", ".spec.js", ".spec.ts", "_test.py")
+    ):
         return "test_regression_secondary"
-    if lower.endswith((".md", ".txt", ".rmd")) or "/docs/" in lower or "roadmap" in lower or "handoff" in lower:
+    if (
+        lower.endswith((".md", ".txt", ".rmd"))
+        or "/docs/" in lower
+        or "roadmap" in lower
+        or "handoff" in lower
+    ):
         return "documentation_or_plan_secondary"
-    if any(marker in lower for marker in ("/dist/", "/build/", "/coverage/", ".min.js", ".bundle.js")):
+    if any(
+        marker in lower
+        for marker in ("/dist/", "/build/", "/coverage/", ".min.js", ".bundle.js")
+    ):
         return "generated_low_priority"
-    if lower.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs", ".py", ".rs", ".kt", ".java", ".r", ".sh", ".ps1")):
+    if lower.endswith(
+        (
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".mjs",
+            ".py",
+            ".rs",
+            ".kt",
+            ".java",
+            ".r",
+            ".sh",
+            ".ps1",
+        )
+    ):
         return "implementation_primary"
     return "structured_config"
 
@@ -132,19 +189,101 @@ def classify_domains(source: str, text: str) -> list[str]:
         if any(needle in haystack for needle in needles) and name not in domains:
             domains.append(name)
 
-    add("rnaseq_output_release", "output_renders", "artifact_url", "manifest_url", "downloadrenderedartifact", "outputs/render")
-    add("rnaseq_browser_upload", "browseruploadsession", "createbrowseruploadsession", "completebrowseruploadfile", "rna_upload_sessions")
-    add("rnaseq_scaleway_lifecycle", "cleanupscalewayinstanceafterterminal", "terminatescalewayinstance", "releasescalewayinstanceslot", "scaleway.mjs")
-    add("cloudflare_worker_secret_rotation", "rotate_cloudflare_worker_secret", "put_cloudflare_worker_secret", "worker secret", "workers scripts write")
-    add("cloudflare_provider_console", "cloudflare", "workers", "routes", "zone", "account_id")
-    add("scaleway_provider_console", "scaleway", "instance", "serverless", "commercial_type", "project_id")
-    add("oracle_indexing", "index_file_chunks", "chunk_index_status", "lancedb", "qwen3-embedding", "chunk-profile")
-    add("oracle_answering", "answer_from_context", "queryengine", "oracle_ask", "oracle_context")
-    add("oracle_mcp_agents", "mcp", "project_claim_task", "project_update_status", "create_mcp_server")
-    add("projects_mini_notion", "projectsview", "kanban", "project.md", "project_claim_task", "agent claims")
+    add(
+        "rnaseq_output_release",
+        "output_renders",
+        "artifact_url",
+        "manifest_url",
+        "downloadrenderedartifact",
+        "outputs/render",
+    )
+    add(
+        "rnaseq_browser_upload",
+        "browseruploadsession",
+        "createbrowseruploadsession",
+        "completebrowseruploadfile",
+        "rna_upload_sessions",
+    )
+    add(
+        "rnaseq_scaleway_lifecycle",
+        "cleanupscalewayinstanceafterterminal",
+        "terminatescalewayinstance",
+        "releasescalewayinstanceslot",
+        "scaleway.mjs",
+    )
+    add(
+        "cloudflare_worker_secret_rotation",
+        "rotate_cloudflare_worker_secret",
+        "put_cloudflare_worker_secret",
+        "worker secret",
+        "workers scripts write",
+    )
+    add(
+        "cloudflare_provider_console",
+        "cloudflare",
+        "workers",
+        "routes",
+        "zone",
+        "account_id",
+    )
+    add(
+        "scaleway_provider_console",
+        "scaleway",
+        "instance",
+        "serverless",
+        "commercial_type",
+        "project_id",
+    )
+    add(
+        "oracle_indexing",
+        "index_file_chunks",
+        "chunk_index_status",
+        "lancedb",
+        "qwen3-embedding",
+        "chunk-profile",
+    )
+    add(
+        "oracle_answering",
+        "answer_from_context",
+        "queryengine",
+        "oracle_ask",
+        "oracle_context",
+    )
+    add(
+        "oracle_mcp_agents",
+        "mcp",
+        "project_claim_task",
+        "project_update_status",
+        "create_mcp_server",
+    )
+    add(
+        "projects_mini_notion",
+        "projectsview",
+        "kanban",
+        "project.md",
+        "project_claim_task",
+        "agent claims",
+    )
     add("windows_hello_auth", "windows hello", "biometric", "webcam", "pin", "unlock")
-    add("provider_privacy", "zdr", "gdpr", "infomaniak", "mistral", "openrouter", "scaleway")
-    add("gpu_cpu_lifecycle", "gpu", "cpu", "vm", "egpu", "terminate", "delete", "scale-to-zero")
+    add(
+        "provider_privacy",
+        "zdr",
+        "gdpr",
+        "infomaniak",
+        "mistral",
+        "openrouter",
+        "scaleway",
+    )
+    add(
+        "gpu_cpu_lifecycle",
+        "gpu",
+        "cpu",
+        "vm",
+        "egpu",
+        "terminate",
+        "delete",
+        "scale-to-zero",
+    )
     return domains
 
 
@@ -185,7 +324,9 @@ def add_symbol(symbols: list[str], seen: set[str], value: str) -> None:
     symbols.append(clean[:160])
 
 
-def question_templates(domains: list[str], source: str, symbols: list[str]) -> list[str]:
+def question_templates(
+    domains: list[str], source: str, symbols: list[str]
+) -> list[str]:
     questions: list[str] = []
     mapping = {
         "rnaseq_output_release": [

@@ -11,13 +11,85 @@ if hasattr(sys.stderr, "reconfigure"):
 TOOLS = [
     {
         "name": "oracle_ask",
-        "description": "Ask the Oracle for information about the project's architecture.",
-        "parameters": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
+        "description": "Ask the Oracle for information about the project's architecture. Pre-filter with kind/language/symbols.",
+        "parameters": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "default": 5},
+            "kind": {
+                "type": "string",
+                "default": "",
+                "description": "Filter: function, struct, class, enum, trait, impl, module, type, macro, module_header.",
+            },
+            "language": {
+                "type": "string",
+                "default": "",
+                "description": "Filter: rust, python, typescript, javascript, java, kotlin.",
+            },
+            "symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Only chunks containing these symbols.",
+            },
+            "group_by_file": {
+                "type": "boolean",
+                "default": False,
+                "description": "Group results by file.",
+            },
+        },
     },
     {
         "name": "oracle_context",
-        "description": "Returns semantically relevant text chunks, ready to pass to Codex/Claude.",
-        "parameters": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 8}},
+        "description": "Returns semantically relevant text chunks. Pre-filter with kind/language/symbols.",
+        "parameters": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "default": 8},
+            "kind": {
+                "type": "string",
+                "default": "",
+                "description": "Filter: function, struct, class, enum, trait, impl, module, type, macro, module_header.",
+            },
+            "language": {
+                "type": "string",
+                "default": "",
+                "description": "Filter: rust, python, typescript, javascript, java, kotlin.",
+            },
+            "symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Only chunks containing these symbols.",
+            },
+            "imports": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Only chunks that reference these imports.",
+            },
+            "module": {
+                "type": "string",
+                "default": "",
+                "description": "Only chunks from files whose path contains this.",
+            },
+        },
+    },
+    {
+        "name": "oracle_find",
+        "description": "PRECISE: find EXACT symbols (functions, structs, classes) by name. Returns kind, symbol_name, signature, language, and exact line ranges (line_start, line_end) — open the file at that line.",
+        "parameters": {
+            "query": {"type": "string", "description": "Symbol name to find."},
+            "kind": {
+                "type": "string",
+                "default": "",
+                "description": "Symbol kind: function, struct, class, enum, trait, impl, module, type, macro.",
+            },
+            "language": {
+                "type": "string",
+                "default": "",
+                "description": "Language: rust, python, typescript, javascript, java, kotlin.",
+            },
+            "limit": {"type": "integer", "default": 10},
+        },
     },
     {
         "name": "oracle_node",
@@ -27,7 +99,10 @@ TOOLS = [
     {
         "name": "oracle_similar",
         "description": "Find similar components before duplicating logic.",
-        "parameters": {"id": {"type": "string"}, "limit": {"type": "integer", "default": 5}},
+        "parameters": {
+            "id": {"type": "string"},
+            "limit": {"type": "integer", "default": 5},
+        },
     },
     {
         "name": "oracle_duplicates",
@@ -62,9 +137,45 @@ TOOLS = [
 def handle_tool_call(name: str, arguments: dict) -> dict | list:
     engine = make_engine()
     if name == "oracle_ask":
-        return engine.ask(arguments["query"], arguments.get("limit", 5))
+        return engine.ask(
+            arguments["query"],
+            arguments.get("limit", 5),
+            kind=arguments.get("kind") or None,
+            language=arguments.get("language") or None,
+            symbols=arguments.get("symbols", []),
+            group_by_file=arguments.get("group_by_file", False),
+        )
     if name == "oracle_context":
-        return {"query": arguments["query"], "chunks": engine.context(arguments["query"], arguments.get("limit", 8))}
+        return {
+            "query": arguments["query"],
+            "chunks": engine.context(
+                arguments["query"],
+                arguments.get("limit", 8),
+                kind=arguments.get("kind") or None,
+                language=arguments.get("language") or None,
+                symbols=arguments.get("symbols", []),
+                imports=arguments.get("imports", []),
+                module=arguments.get("module") or None,
+            ),
+        }
+    if name == "oracle_find":
+        find_kind = arguments.get("kind") or None
+        find_lang = arguments.get("language") or None
+        find_query = arguments["query"]
+        chunks = engine.context(
+            find_query,
+            arguments.get("limit", 10),
+            kind=find_kind,
+            language=find_lang,
+            symbols=[find_query],
+        )
+        return {
+            "query": find_query,
+            "kind": find_kind,
+            "language": find_lang,
+            "chunks": chunks,
+            "hint": "Each chunk has kind, symbol_name, signature, language, line_start, line_end — use these to decide which files to open.",
+        }
     if name == "oracle_node":
         return engine.node(arguments["id"])
     if name == "oracle_similar":
@@ -86,7 +197,9 @@ def create_mcp_server():
     try:
         from mcp.server.fastmcp import FastMCP
     except Exception as exc:  # pragma: no cover
-        raise RuntimeError("Install oracle/requirements.txt to run the Oracle MCP server.") from exc
+        raise RuntimeError(
+            "Install oracle/requirements.txt to run the Oracle MCP server."
+        ) from exc
 
     server = FastMCP("architecture-oracle")
 
@@ -116,7 +229,13 @@ def create_mcp_server():
         return handle_tool_call("oracle_duplicates", {})
 
     @server.tool()
-    def visual_check(agent_id: str, role: str, html_path: str, focus: str = "", session_token: str = "") -> dict:
+    def visual_check(
+        agent_id: str,
+        role: str,
+        html_path: str,
+        focus: str = "",
+        session_token: str = "",
+    ) -> dict:
         """Render a self-contained HTML artifact in Devboule and return a local visual critique."""
         return handle_tool_call(
             "visual_check",
@@ -130,7 +249,13 @@ def create_mcp_server():
         )
 
     @server.tool()
-    def design_request(agent_id: str, role: str, prompt: str, context: str = "", session_token: str = "") -> dict:
+    def design_request(
+        agent_id: str,
+        role: str,
+        prompt: str,
+        context: str = "",
+        session_token: str = "",
+    ) -> dict:
         """Ask the designer AI to generate a UI screen for the plan; it appears in the planner Design view."""
         return handle_tool_call(
             "design_request",
