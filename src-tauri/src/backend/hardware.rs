@@ -425,6 +425,16 @@ pub fn collect_hardware() -> HardwareInfo {
     info
 }
 
+/// Quick available RAM probe (no GPU/CPU). Uses sysinfo refresh_memory (cheap).
+pub fn available_ram_bytes() -> u64 {
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    sys.refresh_memory();
+    sys.available_memory()
+}
+
 /// Tauri command. UNGATED (mirrors `detect_providers`): returns ONLY non-secret machine
 /// capability metadata so the renderer can size Polis even while the vault is locked. Reads
 /// no vault secret, sends nothing off-box, and never panics (every probe is fail-soft).
@@ -444,12 +454,20 @@ mod tests {
         // (vram_bytes, name, expected)
         let cases: &[(u64, &str, &str)] = &[
             // Clear discrete by VRAM.
-            (8 * 1024 * 1024 * 1024, "NVIDIA GeForce RTX 4070", "discrete"),
+            (
+                8 * 1024 * 1024 * 1024,
+                "NVIDIA GeForce RTX 4070",
+                "discrete",
+            ),
             (2 * 1024 * 1024 * 1024, "AMD Radeon RX 6600", "discrete"),
             // Exactly the threshold => discrete (>=).
             (DISCRETE_VRAM_THRESHOLD_BYTES, "Some Card", "discrete"),
             // Just under the threshold, no discrete token => integrated.
-            (DISCRETE_VRAM_THRESHOLD_BYTES - 1, "Intel UHD Graphics 770", "integrated"),
+            (
+                DISCRETE_VRAM_THRESHOLD_BYTES - 1,
+                "Intel UHD Graphics 770",
+                "integrated",
+            ),
             // Integrated parts report ~0 dedicated VRAM.
             (0, "Intel(R) UHD Graphics 630", "integrated"),
             (128 * 1024 * 1024, "AMD Radeon Graphics", "integrated"),
@@ -482,8 +500,7 @@ mod tests {
 
     #[test]
     fn adapter_to_gpu_discrete_card() {
-        let (name, vram, kind) =
-            adapter_to_gpu("NVIDIA GeForce RTX 4070", 8 * 1024 * 1024 * 1024);
+        let (name, vram, kind) = adapter_to_gpu("NVIDIA GeForce RTX 4070", 8 * 1024 * 1024 * 1024);
         assert_eq!(name, "NVIDIA GeForce RTX 4070");
         assert_eq!(kind, "discrete");
         let v = vram.expect("discrete card must report vram");
@@ -635,7 +652,10 @@ Graphics/Displays:
     fn parse_vram_size_units() {
         assert_eq!(parse_vram_size("8 GB"), Some(8.0));
         let mb = parse_vram_size("512 MB").unwrap();
-        assert!((mb - 0.5).abs() < 0.001, "512 MB should be ~0.5 GiB, got {mb}");
+        assert!(
+            (mb - 0.5).abs() < 0.001,
+            "512 MB should be ~0.5 GiB, got {mb}"
+        );
         assert_eq!(parse_vram_size("garbage"), None);
         assert_eq!(parse_vram_size(""), None);
         assert_eq!(parse_vram_size("0 GB"), None);

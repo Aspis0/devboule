@@ -1705,6 +1705,10 @@ export interface CensorStatus {
    *  for a board-level read (no projectId) or an untrusted project. The panel shows
    *  a "Trust this project to run Censor" prompt when false. */
   trusted: boolean;
+  /** COARSE review policy: "off" | "manual" | "auto". */
+  coarsePolicy: string;
+  /** ISO timestamp of last COARSE pass, or null. */
+  lastCoarseRun: string | null;
 }
 
 export interface OracleCitation {

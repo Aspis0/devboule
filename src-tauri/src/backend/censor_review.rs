@@ -57,6 +57,9 @@ const CENSOR_REVIEW_MAX_PER_PASS: usize = 8;
 /// holds a stack) and exhaust memory. We stop draining when the cap is reached, leaving tasks
 /// PENDING in the durable mailbox (not claimed) for a later pass.
 const CENSOR_REVIEW_MAX_INFLIGHT: usize = 4;
+/// Min free RAM (bytes) required to start a censor review thread. Default 6 GiB.
+const CENSOR_REVIEW_MIN_FREE_RAM: u64 = 6 * 1024 * 1024 * 1024;
+
 /// Count of review threads currently in flight (decremented by `InflightGuard` on drop, incl. panic).
 static CENSOR_REVIEW_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
@@ -177,27 +180,42 @@ pub fn process_censor_review(
 /// Takes `app` BY VALUE (owned) so Phase 3 can `app.clone()` it into the review thread for LLM
 /// config + the resource budget gate; today it is intentionally unused.
 pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
-    let Some(client) = crate::backend::pigeon_service::pigeon_client_from_running() else {
+    let Some(pigeon) = crate::backend::pigeon_service::pigeon_client_from_running() else {
         return;
     };
     // Probe the Censor model ONCE per pass (not per file). If no model is configured/loaded, AI
     // review is a clean no-op: we DON'T drain, leaving the tasks PENDING in the durable mailbox for
     // a later pass — never claiming work we cannot run, and never O(N)-probing the backend.
     let cfg = crate::backend::projects::read_censor_local_ai(&app);
-    let llm_available = match build_censor_client(&cfg) {
-        Ok(c) => crate::backend::censor::gemma::probe_available(c.as_ref()),
-        Err(_) => false,
+    let censor_client = match build_censor_client(&cfg) {
+        Ok(c) => c,
+        Err(_) => return,
     };
-    if !llm_available {
+    if !crate::backend::censor::gemma::probe_available(censor_client.as_ref()) {
         return;
     }
+
+    // Resource gate: skip this tick if another model is loaded in the backend or free RAM is low.
+    // Tickets stay PENDING in the Pigeon mailbox; they're polled again next tick (1.5s).
+    if let Some((count, mem)) =
+        crate::backend::censor::gemma::GemmaClient::server_load(censor_client.as_ref())
+    {
+        if count > 0 && mem > 0 {
+            return; // another model occupies the GPU — don't contend
+        }
+    }
+    let free_ram = crate::backend::hardware::available_ram_bytes();
+    if free_ram < CENSOR_REVIEW_MIN_FREE_RAM {
+        return; // not enough free RAM to load another model
+    }
+
     for _ in 0..CENSOR_REVIEW_MAX_PER_PASS {
         // Back-pressure: never claim more than we can run concurrently. Tasks stay PENDING in the
         // durable mailbox until a later pass has a free slot.
         if CENSOR_REVIEW_INFLIGHT.load(Ordering::SeqCst) >= CENSOR_REVIEW_MAX_INFLIGHT {
             break;
         }
-        match client.poll(PIGEON_CENSOR_POOL_RECEIVER) {
+        match pigeon.poll(PIGEON_CENSOR_POOL_RECEIVER) {
             Ok(Some((ticket, payload))) => {
                 match serde_json::from_value::<CensorReviewRequest>(payload) {
                     Ok(req) => {
@@ -248,7 +266,7 @@ pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
                         if spawned.is_err() {
                             // OS refused the thread: undo the reserved slot and let the sweep requeue.
                             CENSOR_REVIEW_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-                            let _ = client.fail(
+                            let _ = pigeon.fail(
                                 ticket,
                                 PIGEON_CENSOR_POOL_RECEIVER,
                                 "censor review thread spawn failed",
@@ -259,7 +277,7 @@ pub fn ingest_pigeon_censor_reviews(app: tauri::AppHandle) {
                         eprintln!(
                             "censor-review ingest: undecodable request (ticket {ticket}): {e}"
                         );
-                        let _ = client.fail(
+                        let _ = pigeon.fail(
                             ticket,
                             PIGEON_CENSOR_POOL_RECEIVER,
                             "undecodable censor-review request",

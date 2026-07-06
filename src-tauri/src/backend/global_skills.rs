@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
                if !skill_path.is_file() {
                    continue;
                }
-               let mut file = match std::fs::File::open(&skill_path) {
+               let file = match std::fs::File::open(&skill_path) {
                    Ok(f) => f,
                    Err(_) => continue,
                };

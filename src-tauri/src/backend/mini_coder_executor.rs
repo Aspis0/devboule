@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -120,29 +120,31 @@ pub struct MiniCoderState {
     running: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// BLOCKER 2 (EXECUTOR-LOOP STALL): process-wide set of directive ids whose
-    /// deferred Censor-VERDICT thread is currently running. The FINE linters (5–30s) ran
-    /// SYNCHRONOUSLY inside `finalize_finished_mini` on the single executor thread,
-    /// blocking ALL scheduling (timeouts, new claims, sibling finalizes) for their whole
-    /// duration. Now a clean `done` on a TRUSTED project defers the verdict to a
-    /// dedicated thread; the executor loop continues immediately. This set is the
-    /// IN-FLIGHT GUARD so `run_pass` does NOT re-detect + re-spawn the same finished mini
-    /// (its PTY is already gone), AND the TIMEOUT EXCLUSION so `plan_tick` does not
-    /// wall-cap-timeout a directive that is Running-but-awaiting-its-verdict-thread. The
-    /// thread always clears its id (success, error, or panic — fail-closed).
+    /// deferred Censor-VERDICT thread is currently running.
     verdict_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Process-wide set of directive ids whose AGENTIC tool-loop worker thread is currently
-    /// running. The agentic path has NO PTY, so `run_pass`'s PTY-gone completion check can't
-    /// see it; this set keeps such a directive "live" (not prematurely finalized) until the
-    /// worker writes its result + releases the id, AND excludes it from `plan_tick`'s
-    /// wall-clock timeout (the loop is bounded by its own max_rounds + per-turn HTTP timeout;
-    /// there is no PTY to kill). The worker clears its id on EVERY exit path (RAII).
+    /// running.
     agentic_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Per-directive cancel flags for in-flight agentic workers (directive id → flag). The
-    /// agentic loop checks its flag between rounds + before each tool call, so a user Stop
-    /// (`mini_coder_kill`) actually halts the worker (it has no PTY to kill). The worker
-    /// removes its entry on every exit path (same RAII guard as the in-flight set).
+    /// Per-directive cancel flags for in-flight agentic workers.
     agentic_cancel: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    /// FINE coalescing: per-file last FINE-censor timestamp. Entries older than
+    /// FINE_COOLDOWN_S × 4 are evicted every 10 minutes.
+    fine_cooldown: Mutex<std::collections::HashMap<String, Instant>>,
+    /// COARSE trigger: set of project IDs whose working tree has pending COARSE work.
+    /// Phase A inserts on every mini finish; the COARSE sweep drains and spawns.
+    /// Shared with spawned COARSE threads so they can remove on success (B3).
+    coarse_dirty: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Last COARSE pass timestamp per project, for cooldown.
+    last_coarse: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
+    /// Last FINE cooldown sweep timestamp.
+    last_cooldown_sweep: Mutex<Instant>,
 }
+
+/// Fine-runner cooldown in seconds: skip re-censoring a file that was censorated
+/// in the last N seconds (coalescing rapid retries).
+const FINE_COOLDOWN_S: u64 = 5;
+/// Coarse cooldown in seconds: at most one coarse pass every N seconds.
+const COARSE_COOLDOWN_S: u64 = 120;
 
 impl Default for MiniCoderState {
     fn default() -> Self {
@@ -158,6 +160,10 @@ impl MiniCoderState {
             verdict_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             agentic_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             agentic_cancel: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            fine_cooldown: Mutex::new(std::collections::HashMap::new()),
+            coarse_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            last_coarse: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            last_cooldown_sweep: Mutex::new(Instant::now()),
         }
     }
 
@@ -1022,6 +1028,86 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             claim_and_launch(app, directive, parent_project);
         }
     }
+
+    // 5) COARSE cooldown check + FINE cooldown sweep.
+    if let Some(st) = app.try_state::<MiniCoderState>() {
+        // COARSE: per-project. Drain dirty set, read each project's policy from file,
+        // check per-project cooldown, spawn coarse pass. Dirty flag is cleared INSIDE
+        // the spawned thread on success (B3: no lost COARSE on transient failure).
+        {
+            let mut dirty = st.coarse_dirty.lock().unwrap();
+            if !dirty.is_empty() {
+                let mut last_map = st.last_coarse.lock().unwrap();
+                let now = Instant::now();
+                let mut deferred: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                for project_id in dirty.drain() {
+                    // Resolve project root.
+                    let Ok(root) =
+                        crate::backend::projects::resolve_project_root_by_id(app, &project_id)
+                    else {
+                        // Project gone or unresolvable — drop from dirty set.
+                        continue;
+                    };
+                    // B1: read per-project coarse policy from file (not global mutex).
+                    let policy = std::fs::read_to_string(root.join(".aspis").join("coarse_policy"))
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| matches!(s.as_str(), "off" | "manual" | "auto"))
+                        .unwrap_or_else(|| "auto".to_string());
+                    if policy != "auto" {
+                        // Policy is off/manual — skip, don't re-dirty.
+                        continue;
+                    }
+                    // Per-project cooldown check.
+                    let last = last_map.get(&project_id).copied();
+                    if last.is_some_and(|t| {
+                        now.duration_since(t) <= Duration::from_secs(COARSE_COOLDOWN_S)
+                    }) {
+                        // Cooldown not elapsed — re-insert for next tick.
+                        deferred.insert(project_id);
+                        continue;
+                    }
+                    // Spawn coarse pass.
+                    let app = app.clone();
+                    let pid = project_id.clone();
+                    let dirty_ref = Arc::clone(&st.coarse_dirty);
+                    std::thread::spawn(move || {
+                        let running = AtomicBool::new(true);
+                        crate::backend::censor::orchestrator::run_coarse_pass(
+                            &app, &pid, &root, &running,
+                        );
+                        let _ = std::fs::create_dir_all(root.join(".aspis"));
+                        let _ = std::fs::write(
+                            root.join(".aspis").join("last_coarse_run"),
+                            chrono::Utc::now().to_rfc3339(),
+                        );
+                        // B3: clear dirty only AFTER successful completion.
+                        dirty_ref.lock().unwrap().remove(&pid);
+                    });
+                    last_map.insert(project_id, now);
+                }
+                // Re-insert projects that were deferred (cooldown not elapsed).
+                for pid in deferred {
+                    dirty.insert(pid);
+                }
+            }
+        }
+
+        // FINE cooldown sweep: evict entries older than cooldown × 4, every 10 minutes.
+        {
+            let mut sweep = st.last_cooldown_sweep.lock().unwrap();
+            if sweep.elapsed() > Duration::from_secs(600) {
+                let mut map = st.fine_cooldown.lock().unwrap();
+                let cutoff = Duration::from_secs(FINE_COOLDOWN_S * 4);
+                let now = Instant::now();
+                map.retain(|_, t| now.duration_since(*t) <= cutoff);
+                *sweep = now;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1756,9 +1842,11 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
         }
     }
 
-    // Phase A: async Censor fast runners on modified files (3s timeout, non-blocking).
-    // Findings now reach the UI via the "censor://mini-findings" event and remain
-    // available via the persistent Censor queue — the scheduler is never blocked.
+    // Phase A: async Censor FINE runners on modified files.
+    // Runs `run_fine_batch_no_rail` (deterministic only, no Gemma) on modified files
+    // with FINE coalescing (skip files censorated in the last 5s). Findings are written
+    // atomically to `.aspis-mini/<agent_id>/steer_censor` + `steer_ready` flag for retry
+    // injection, and pushed to the Activity Console for the human.
     if !write_diffs.is_empty() && trusted {
         let modified_files: Vec<String> =
             write_diffs.iter().map(|(path, _)| path.clone()).collect();
@@ -1766,28 +1854,127 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             let app = app.clone();
             let root = root.clone();
             let agent_id = directive.id.clone();
+            let project_id_for_censor = project_id.clone().unwrap_or_default();
+
+            // FINE cooldown: skip files censorated in the last FINE_COOLDOWN_S seconds.
+            let st = app.try_state::<MiniCoderState>();
+            let files_to_censor: Vec<String> = if let Some(st) = st.as_ref() {
+                let map = st.fine_cooldown.lock().unwrap();
+                let now = Instant::now();
+                let filtered: Vec<String> = modified_files
+                    .iter()
+                    .filter(|f| {
+                        map.get(*f).is_none_or(|t| {
+                            now.duration_since(*t) > Duration::from_secs(FINE_COOLDOWN_S)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                // H1: cooldown insert moved INSIDE the spawned thread
+                // (after successful run_fine_batch_no_rail).
+                filtered
+            } else {
+                modified_files.clone()
+            };
+
+            // Set coarse dirty flag — triggers COARSE on next executor tick.
+            if let Some(st) = st.as_ref() {
+                st.coarse_dirty
+                    .lock()
+                    .unwrap()
+                    .insert(project_id_for_censor.clone());
+            }
+
             std::thread::spawn(move || {
-                let findings = crate::backend::censor::commands::wait_for_censor_findings(
-                    &root,
-                    &modified_files,
-                    Duration::from_secs(3),
-                );
-                if !findings.is_empty() {
-                    let (high, medium, low, total) = censor_phase_a_summary(&findings);
-                    let _ = app.emit(
-                        "censor://mini-findings",
-                        serde_json::json!({
-                            "agentId": agent_id,
-                            "total": total, "high": high, "medium": medium, "low": low,
-                            "files": modified_files,
-                        }),
-                    );
+                if files_to_censor.is_empty() {
+                    return;
                 }
+                // Build Gemma LLM client (if configured) for the Censor LLM tier.
+                let local_ai = crate::backend::projects::read_censor_local_ai(&app);
+                let gemma_client =
+                    crate::backend::censor::gemma::build_gemma_client(&local_ai).ok();
+                let gemma_available = gemma_client
+                    .as_deref()
+                    .is_some_and(crate::backend::censor::gemma::probe_available);
+                let gemma_ctx = gemma_client.as_deref().map(|client| {
+                    crate::backend::censor::orchestrator::GemmaCtx {
+                        client,
+                        available: gemma_available,
+                        params: local_ai.review_params(),
+                    }
+                });
+                // Run FINE deterministic + optional LLM tier.
+                let running = AtomicBool::new(true);
+                crate::backend::censor::orchestrator::run_fine_batch_no_rail(
+                    &app,
+                    &project_id_for_censor,
+                    &root,
+                    &files_to_censor,
+                    gemma_ctx,
+                    &running,
+                );
+                // H1 (cooldown): insert inside thread AFTER successful FINE run.
+                // (If the thread or run_fine_batch_no_rail fails, the file was not
+                // actually re-censorated — don't block it from the next attempt.)
+                if let Some(st) = app.try_state::<MiniCoderState>() {
+                    let mut map = st.fine_cooldown.lock().unwrap();
+                    let now = Instant::now();
+                    for f in &files_to_censor {
+                        map.insert(f.clone(), now);
+                    }
+                }
+                // Collect open findings from shards.
+                let findings = crate::backend::censor::orchestrator::collect_open_findings(
+                    &root,
+                    &files_to_censor,
+                );
+                if findings.is_empty() {
+                    return;
+                }
+                // Format findings text for steer.
+                let text = format!(
+                    "=== [Censor FINE Check] ===\n{}\n=== [End Censor] ===",
+                    crate::backend::censor::commands::format_findings_text(&findings)
+                );
+                // Atomic write per-agent steer_censor + ready flag.
+                let agent_dir = root.join(MINI_SCRATCH_DIR).join(&agent_id);
+                if let Err(e) = std::fs::create_dir_all(&agent_dir) {
+                    eprintln!(
+                        "censor phase-a: create_dir_all {}: {e}",
+                        agent_dir.display()
+                    );
+                    return;
+                }
+                let tmp = agent_dir.join(".steer_censor.tmp");
+                let target = agent_dir.join("steer_censor");
+                if let Err(e) = std::fs::write(&tmp, &text) {
+                    eprintln!("censor phase-a: write steer tmp: {e}");
+                    return;
+                }
+                // H2: only write steer_ready if rename succeeds.
+                if std::fs::rename(&tmp, &target).is_ok() {
+                    if let Err(e) = std::fs::write(agent_dir.join("steer_ready"), "") {
+                        eprintln!("censor phase-a: write steer_ready: {e}");
+                    }
+                } else {
+                    eprintln!("censor phase-a: rename steer_censor failed");
+                }
+                // Push to Activity Console (human-visible).
+                let total = findings.len();
+                let _ = app.emit(
+                    "censor://mini-findings",
+                    serde_json::json!({
+                        "agentId": agent_id,
+                        "total": total,
+                        "files": files_to_censor,
+                    }),
+                );
             });
         } else {
             eprintln!(
                 "censor phase-a skipped for directive {}: project root not resolvable ({} files modified)",
-                directive.id, modified_files.len()
+                directive.id,
+                modified_files.len()
             );
         }
     }
@@ -3050,9 +3237,31 @@ fn spawn_one_shot_mini(
         ));
     }
     // Front-load the file scope + contents into the prompt (bounded per file).
+    // For retries (attempt > 0), check for censor steer feedback and append to task.
+    let mut directive_for_prompt = directive.clone();
+    if directive.attempt > 0 {
+        if let Some(parent_id) = directive.parent_directive_id.as_deref() {
+            let steer_dir = scratch_root.join(parent_id);
+            let ready_path = steer_dir.join("steer_ready");
+            let steer_path = steer_dir.join("steer_censor");
+            if ready_path.exists() {
+                let _ = std::fs::remove_file(&ready_path);
+                if let Ok(text) = std::fs::read_to_string(&steer_path) {
+                    if !text.trim().is_empty() {
+                        directive_for_prompt.task.push_str("\n\n");
+                        directive_for_prompt
+                            .task
+                            .push_str("CENSOR FINDINGS (fix these this round):\n");
+                        directive_for_prompt.task.push_str(&text);
+                    }
+                }
+                let _ = std::fs::remove_file(&steer_path);
+            }
+        }
+    }
     let prompt = build_mini_prompt(
         backend,
-        directive,
+        &directive_for_prompt,
         project_root,
         &result_target,
         oracle_access.as_ref(),
@@ -3239,7 +3448,10 @@ mod mini_language_tests {
         assert!(composed.starts_with(base));
         let skill_at = composed.find("BEGIN PROJECT SKILL").unwrap();
         let lang_at = composed.find("BEGIN LANGUAGE SKILL").unwrap();
-        assert!(skill_at < lang_at, "skill block must precede the language block");
+        assert!(
+            skill_at < lang_at,
+            "skill block must precede the language block"
+        );
     }
 
     #[test]
@@ -3267,7 +3479,10 @@ mod mini_language_tests {
         std::fs::write(skills.join("SKILL.md"), "tier skill").unwrap();
         std::fs::write(skills.join("lang-rust.md"), "MINIBIG RUST PERSONA").unwrap();
         let b = mini_language_block(&dir, "mini-big", &["a.rs".to_string()]).unwrap();
-        assert!(b.contains("MINIBIG RUST PERSONA"), "tier lang override not injected: {b}");
+        assert!(
+            b.contains("MINIBIG RUST PERSONA"),
+            "tier lang override not injected: {b}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
