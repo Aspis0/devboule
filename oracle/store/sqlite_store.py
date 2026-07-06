@@ -66,7 +66,9 @@ class SQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_node_cluster ON node_cards(cluster_semantic)"
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_node_label ON node_cards(label)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_node_label ON node_cards(label)"
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS file_chunks (
@@ -78,11 +80,20 @@ class SQLiteStore:
                   text TEXT NOT NULL,
                   file_sorgente TEXT NOT NULL,
                   ultima_modifica TEXT NOT NULL,
-                  embedding_dims INTEGER NOT NULL
+                  embedding_dims INTEGER NOT NULL,
+                  kind TEXT NOT NULL DEFAULT '',
+                  symbol_name TEXT NOT NULL DEFAULT '',
+                  signature TEXT NOT NULL DEFAULT '',
+                  line_start INTEGER NOT NULL DEFAULT 0,
+                  line_end INTEGER NOT NULL DEFAULT 0,
+                  language TEXT NOT NULL DEFAULT '',
+                  symbols_used TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_file ON file_chunks(file_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunk_file ON file_chunks(file_id)"
+            )
 
     def upsert_many(self, cards: list[dict]) -> None:
         with self._connect() as conn:
@@ -123,7 +134,10 @@ class SQLiteStore:
         if not node_ids:
             return
         with self._connect() as conn:
-            conn.executemany("DELETE FROM node_cards WHERE id = ?", [(node_id,) for node_id in node_ids])
+            conn.executemany(
+                "DELETE FROM node_cards WHERE id = ?",
+                [(node_id,) for node_id in node_ids],
+            )
 
     def get_node(self, node_id: str) -> dict | None:
         with self._connect() as conn:
@@ -142,11 +156,15 @@ class SQLiteStore:
 
     def by_cluster(self, cluster: str) -> list[dict]:
         return [
-            node for node in self.all_nodes() if node["cluster_semantic"].lower() == cluster.lower()
+            node
+            for node in self.all_nodes()
+            if node["cluster_semantic"].lower() == cluster.lower()
         ]
 
     def by_area(self, area: str) -> list[dict]:
-        return [node for node in self.all_nodes() if node["area"].lower() == area.lower()]
+        return [
+            node for node in self.all_nodes() if node["area"].lower() == area.lower()
+        ]
 
     def count(self) -> int:
         with self._connect() as conn:
@@ -154,15 +172,20 @@ class SQLiteStore:
 
     def replace_chunks_for_files(self, file_ids: list[str], chunks: list[dict]) -> None:
         with self._connect() as conn:
-            conn.executemany("DELETE FROM file_chunks WHERE file_id = ?", [(file_id,) for file_id in file_ids])
+            conn.executemany(
+                "DELETE FROM file_chunks WHERE file_id = ?",
+                [(file_id,) for file_id in file_ids],
+            )
             conn.executemany(
                 """
                 INSERT INTO file_chunks (
                   id, file_id, chunk_index, start_char, end_char, text,
-                  file_sorgente, ultima_modifica, embedding_dims
+                  file_sorgente, ultima_modifica, embedding_dims,
+                  kind, symbol_name, signature, line_start, line_end, language, symbols_used
                 ) VALUES (
                   :id, :file_id, :chunk_index, :start_char, :end_char, :text,
-                  :file_sorgente, :ultima_modifica, :embedding_dims
+                  :file_sorgente, :ultima_modifica, :embedding_dims,
+                  :kind, :symbol_name, :signature, :line_start, :line_end, :language, :symbols_used
                 )
                 ON CONFLICT(id) DO UPDATE SET
                   file_id=excluded.file_id,
@@ -172,7 +195,14 @@ class SQLiteStore:
                   text=excluded.text,
                   file_sorgente=excluded.file_sorgente,
                   ultima_modifica=excluded.ultima_modifica,
-                  embedding_dims=excluded.embedding_dims
+                  embedding_dims=excluded.embedding_dims,
+                  kind=excluded.kind,
+                  symbol_name=excluded.symbol_name,
+                  signature=excluded.signature,
+                  line_start=excluded.line_start,
+                  line_end=excluded.line_end,
+                  language=excluded.language,
+                  symbols_used=excluded.symbols_used
                 """,
                 chunks,
             )
@@ -181,7 +211,9 @@ class SQLiteStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM file_chunks")
         if chunks:
-            self.replace_chunks_for_files(sorted({chunk["file_id"] for chunk in chunks}), chunks)
+            self.replace_chunks_for_files(
+                sorted({chunk["file_id"] for chunk in chunks}), chunks
+            )
 
     def chunk_ids_for_files(self, file_ids: list[str]) -> list[str]:
         if not file_ids:
@@ -201,19 +233,34 @@ class SQLiteStore:
                 (file_id,),
             ).fetchall()
             columns = [col[1] for col in conn.execute("PRAGMA table_info(file_chunks)")]
-        return [dict(zip(columns, row)) for row in rows]
+        return [self._deserialize_chunk(dict(zip(columns, row))) for row in rows]
 
     def get_chunk(self, chunk_id: str) -> dict | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM file_chunks WHERE id = ?", (chunk_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM file_chunks WHERE id = ?", (chunk_id,)
+            ).fetchone()
             columns = [col[1] for col in conn.execute("PRAGMA table_info(file_chunks)")]
-        return dict(zip(columns, row)) if row else None
+        return self._deserialize_chunk(dict(zip(columns, row))) if row else None
 
     def all_chunks(self) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM file_chunks ORDER BY id").fetchall()
             columns = [col[1] for col in conn.execute("PRAGMA table_info(file_chunks)")]
-        return [dict(zip(columns, row)) for row in rows]
+        return [self._deserialize_chunk(dict(zip(columns, row))) for row in rows]
+
+    @staticmethod
+    def _deserialize_chunk(chunk: dict) -> dict:
+        """Convert JSON-stored fields back to Python objects."""
+        syms = chunk.get("symbols_used")
+        if isinstance(syms, str) and syms:
+            try:
+                chunk["symbols_used"] = json.loads(syms)
+            except (json.JSONDecodeError, TypeError):
+                chunk["symbols_used"] = []
+        elif not isinstance(syms, list):
+            chunk["symbols_used"] = []
+        return chunk
 
     def chunk_count(self) -> int:
         with self._connect() as conn:
@@ -221,7 +268,11 @@ class SQLiteStore:
 
     def chunk_file_count(self) -> int:
         with self._connect() as conn:
-            return int(conn.execute("SELECT COUNT(DISTINCT file_id) FROM file_chunks").fetchone()[0])
+            return int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM file_chunks"
+                ).fetchone()[0]
+            )
 
     def _serialize(self, card: dict) -> dict:
         out = dict(card)
