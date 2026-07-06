@@ -60,3 +60,6 @@ polis-dev-city.json
 .aspis-censor/
 aspis.html
 tsconfig.tsbuildinfo
+
+# Pi agent sessions
+.pi/
