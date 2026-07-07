@@ -1,25 +1,38 @@
 #!/usr/bin/env node
 /**
- * pi-sidecar — Phase 0 spike: embeds pi SDK in-process and bridges to Devboule's Rust
- * backend via JSONL over stdio.
+ * pi-sidecar — Phase 1: per-session lifecycle + vault-based model config.
  *
  * Protocol:
  *   stdin:  JSONL commands — {"type":"prompt","message":"..."}
  *   stdout: JSONL events  — raw pi SDK events + {"type":"response","command":"prompt","success":true}
  *
- * Env vars:
- *   DEVBOULE_PI_PROVIDER  — e.g. "openai" (default; Claude blocked per decision #10)
- *   DEVBOULE_PI_MODEL     — e.g. "gpt-4o" (default)
- *   OPENAI_API_KEY        — (or ANTHROPIC_API_KEY etc.) needed for the provider
+ * Env vars (set by the Rust backend at spawn time, decision #9):
+ *   DEVBOULE_PI_PROVIDER  — pi provider id (e.g. "openrouter", "openai")
+ *   DEVBOULE_PI_MODEL     — model id (e.g. "tencent/hy3:free", "qwen2.5-coder:7b")
+ *   DEVBOULE_PI_BASE_URL  — custom base URL for local endpoints (optional; if set,
+ *                            a temp models.json is written with a custom provider)
+ *   OPENAI_API_KEY        — for openai provider (set by Rust for local omlx/ollama)
+ *   OPENROUTER_API_KEY    — for openrouter provider (set by Rust for cloud backend)
+ *   ANTHROPIC_API_KEY     — for anthropic provider (NOT used; Claude blocked per #10)
  */
+
+import { writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:path";
 
 // ---------------------------------------------------------------------------
 // JSONL helpers
 // ---------------------------------------------------------------------------
 
 function emit(obj) {
-	// Strict JSONL: one JSON object per line, LF only (matches pi rpc.md framing).
-	process.stdout.write(JSON.stringify(obj) + "\n");
+	try {
+		process.stdout.write(JSON.stringify(obj) + "\n");
+	} catch (e) {
+		// Log non-EPIPE errors to stderr; swallow EPIPE (pipe closed).
+		if (e.code !== "EPIPE") {
+			console.error("[pi-sidecar] emit failed:", e);
+		}
+	}
 }
 
 function emitError(context, err) {
@@ -31,9 +44,7 @@ function emitError(context, err) {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL framer — manual, NOT readline (finding #2: readline splits on
-// U+2028/U+2029 which are valid inside JSON strings, corrupting the protocol).
-// Reference: /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/docs/rpc.md §Framing
+// JSONL framer — manual, NOT readline
 // ---------------------------------------------------------------------------
 
 function createJsonlReader(stream, onLine) {
@@ -45,13 +56,11 @@ function createJsonlReader(stream, onLine) {
 			if (nl === -1) break;
 			let line = buffer.slice(0, nl);
 			buffer = buffer.slice(nl + 1);
-			// Strip optional \r (Windows compat) — the ONLY \r handling.
 			if (line.endsWith("\r")) line = line.slice(0, -1);
 			if (line.length > 0) onLine(line);
 		}
 	});
 	stream.on("end", () => {
-		// Flush trailing buffer (no trailing newline).
 		if (buffer.length > 0) {
 			let line = buffer;
 			if (line.endsWith("\r")) line = line.slice(0, -1);
@@ -61,13 +70,57 @@ function createJsonlReader(stream, onLine) {
 }
 
 // ---------------------------------------------------------------------------
+// Model configuration (decision #9: vault → env → sidecar)
+// ---------------------------------------------------------------------------
+
+// Track temp dir for cleanup.
+let activeTmpDir = null;
+
+/**
+ * Build a MINIMAL temp models.json with ONLY the Devboule-configured provider.
+ * Decision #9: do NOT read ~/.pi/agent/models.json — avoids leaking user's
+ * cloud API keys (OpenRouter/Anthropic/OpenAI) to /tmp on crash.
+ *
+ * Returns the path to the temp models.json, or null if no custom base URL is set.
+ */
+function buildCustomModelsJson() {
+	const baseUrl = process.env.DEVBOULE_PI_BASE_URL;
+	if (!baseUrl) return null;
+
+	const provider = process.env.DEVBOULE_PI_PROVIDER || "openai";
+	const model = process.env.DEVBOULE_PI_MODEL || "gpt-4o";
+
+	// Minimal config: only the Devboule provider. No user keys leaked.
+	const minimalModels = {
+		providers: {
+			[provider]: {
+				baseUrl,
+				api: "openai-completions",
+				apiKey: process.env.OPENAI_API_KEY || "dummy",
+				compat: {
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: false,
+				},
+				models: [{ id: model }],
+			},
+		},
+	};
+
+	const tmpDir = mkdtempSync(join(tmpdir(), "pi-sidecar-"));
+	const modelsJsonPath = join(tmpDir, "models.json");
+	writeFileSync(modelsJsonPath, JSON.stringify(minimalModels, null, 2));
+
+	activeTmpDir = tmpDir;
+	return modelsJsonPath;
+}
+
+// ---------------------------------------------------------------------------
 // pi SDK bootstrap
 // ---------------------------------------------------------------------------
 
-let activeSession = null; // for SIGTERM cleanup
+let activeSession = null;
 
 async function main() {
-	// Dynamic import — the package is a local dependency of this sidecar.
 	const {
 		createAgentSession,
 		SessionManager,
@@ -76,7 +129,6 @@ async function main() {
 		defineTool,
 	} = await import("@earendil-works/pi-coding-agent");
 
-	// Typebox for custom tool parameter schemas.
 	const { Type } = await import("typebox");
 
 	// ---- custom tool: oracle_ask (canned/echo) ----------------------------
@@ -90,8 +142,6 @@ async function main() {
 			question: Type.String({ description: "The question to ask the Oracle." }),
 		}),
 		execute: async (_toolCallId, params) => {
-			// TODO: proxy to real Oracle MCP (Python RAG server).
-			// For the spike, return a canned response clearly marked as placeholder.
 			const answer =
 				`[SPIKE PLACEHOLDER — Oracle not wired yet]\n` +
 				`Question received: "${params.question}"\n` +
@@ -104,21 +154,26 @@ async function main() {
 		},
 	});
 
-	// ---- create session ---------------------------------------------------
-	const authStorage = AuthStorage.create();
-	const modelRegistry = ModelRegistry.create(authStorage);
-
-	// Decision #10: Claude blocked for external MCP (2026-07). Default to OpenAI.
+	// ---- model configuration (decision #9) --------------------------------
 	const provider = process.env.DEVBOULE_PI_PROVIDER || "openai";
 	const modelId = process.env.DEVBOULE_PI_MODEL || "gpt-4o";
+	const customModelsJsonPath = buildCustomModelsJson();
 
-	// Attempt to resolve the configured model. If unavailable (missing API key,
-	// unknown provider), createAgentSession falls back to the first available.
+	const authStorage = AuthStorage.create();
+
+	// If a custom base URL is set, use the MERGED temp models.json.
+	// Otherwise, use the default models.json (user's ~/.pi/agent/models.json).
+	const modelRegistry = customModelsJsonPath
+		? ModelRegistry.create(authStorage, customModelsJsonPath)
+		: ModelRegistry.create(authStorage);
+
 	let resolvedModel;
 	try {
 		resolvedModel = modelRegistry.find(provider, modelId);
-	} catch {
-		// Ignore — the session will use its default.
+	} catch (err) {
+		console.error(
+			`[pi-sidecar] Could not resolve model ${provider}/${modelId}: ${err instanceof Error ? err.message : String(err)}`,
+		);
 	}
 
 	const sessionOpts = {
@@ -136,18 +191,14 @@ async function main() {
 
 	// ---- subscribe to all events and forward as JSONL ---------------------
 	session.subscribe((event) => {
-		// Forward the raw pi SDK event verbatim — the Rust side maps it to the
-		// existing MiniActivityEvent / ConsoleActivity schema.
 		emit(event);
-		// If stdin already closed and the in-flight prompt just finished,
-		// tear down the sidecar gracefully.
 		if (stdinClosed && event.type === "agent_end") {
 			clearTimeout(stdinGraceTimer);
 			cleanup(0);
 		}
 	});
 
-	// ---- read JSONL commands from stdin (manual framer, NOT readline) -----
+	// ---- read JSONL commands from stdin -----------------------------------
 	let promptInFlight = false;
 	let stdinClosed = false;
 	let stdinGraceTimer = null;
@@ -208,21 +259,17 @@ async function main() {
 	process.stdin.on("end", () => {
 		stdinClosed = true;
 		if (promptInFlight) {
-			// An agent turn is still running — let it finish.
-			// Safety net: force-cleanup after 120 s so a hung agent
-			// can't keep the process alive forever.
 			stdinGraceTimer = setTimeout(() => cleanup(0), 120_000);
 		} else {
 			cleanup(0);
 		}
 	});
 
-	// Signal readiness.
 	emit({ type: "ready" });
 }
 
 // ---------------------------------------------------------------------------
-// Process lifecycle (finding #6)
+// Process lifecycle
 // ---------------------------------------------------------------------------
 
 function cleanup(exitCode) {
@@ -233,6 +280,15 @@ function cleanup(exitCode) {
 			// best-effort
 		}
 		activeSession = null;
+	}
+	// Clean up temp models.json dir (finding #2).
+	if (activeTmpDir) {
+		try {
+			rmSync(activeTmpDir, { recursive: true, force: true });
+		} catch {
+			// best-effort
+		}
+		activeTmpDir = null;
 	}
 	process.exit(exitCode);
 }

@@ -784,6 +784,8 @@ pub fn run() {
             backend::api_fuzz::api_fuzz_run,
             // Phase 0 spike: send a prompt to the pi sidecar.
             backend::pi_sidecar::spike_pi_prompt,
+            // Phase 1: stop a specific pi sidecar session.
+            backend::pi_sidecar::spike_pi_stop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
