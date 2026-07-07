@@ -92,7 +92,7 @@ pub struct SessionInfo {
 
 /// Resolved coder-backend env vars to pass to the Node sidecar at spawn time.
 /// Read from the Devboule config.json (`localCoderBackend`) + vault API key.
-struct SidecarEnvVars {
+pub(crate) struct SidecarEnvVars {
     provider: String,
     model: String,
     api_key_env: Option<(String, String)>, // (env_var_name, value)
