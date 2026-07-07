@@ -55,6 +55,7 @@ pub mod oracle_coordinator;
 pub mod oracle_service;
 pub mod pigeon_client;
 pub mod pigeon_service;
+pub mod pi_sidecar;
 pub mod plan_approval;
 pub mod project_skill;
 pub mod projects;

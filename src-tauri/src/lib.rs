@@ -375,6 +375,8 @@ pub fn run() {
         .manage(backend::broker::CloudConsentState::new())
         .manage(backend::mini_activity::MiniActivityStore::default())
         .manage(backend::mini_activity::ActivityTailRegistry::default())
+        // Phase 0 spike: pi sidecar state (Node.js sidecar embedding pi SDK).
+        .manage(backend::pi_sidecar::PiSidecarState::default())
         .manage(backend::cloud_duplex::CloudDuplexSessions::new())
         .manage(design_gen_state)
         // `artifact:` scheme — PATH B (separate-origin) interactive-artifact render surface.
@@ -780,6 +782,8 @@ pub fn run() {
             backend::model_registry::set_model_registry,
             backend::model_registry::discover_installed_models,
             backend::api_fuzz::api_fuzz_run,
+            // Phase 0 spike: send a prompt to the pi sidecar.
+            backend::pi_sidecar::spike_pi_prompt,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

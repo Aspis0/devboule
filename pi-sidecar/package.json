@@ -1,0 +1,11 @@
+{
+  "name": "pi-sidecar",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Phase 0 spike: Node.js sidecar embedding pi SDK for Devboule-on-pi bridge",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.3",
+    "typebox": "1.1.38"
+  }
+}
