@@ -162,14 +162,18 @@ The Tauri backend code that **launches** devboule-coder (`projects.rs` orchestra
 
 ---
 
-## 9. Migration phases (proposed, not started)
+## 9. Migration phases
 
-1. **Phase 0 — Spike (no deletion):** build a minimal Node sidecar in the repo that embeds pi SDK, registers ONE custom tool (e.g. `oracle_ask`), and streams a single prompt's events to the existing React frontend via Tauri IPC. Proves the bridge end-to-end. Nothing deleted.
-2. **Phase 1 — Tool surface:** port Oracle tools + mini-coder tool + Censor hook into the extension. Run pi as the agent for real tasks, still keeping devboule-coder around as fallback.
-3. **Phase 2 — Pigeon Routing (2026-07-07 design, pending implementation):** Pigeon stays as a Python FastAPI HTTP service (complex logic, existing transport). The routing intelligence is added in **Rust** (reusing `model_registry.rs` + `task_size.rs`) and exposed as a thin endpoint that the Node sidecar's `before_agent_start` hook calls. Two new enums: `PromptTier` (`Cheap` | `Moderate` | `Expensive` — extends the existing `DirectiveTier`) and `AgentPath` (`Pi` | `Terminal` — for Claude). Classifier: **heuristic first** (prompt length + regex complexity → tier), upgradeable to LLM-based later. Tier table: `PromptTier` → provider/model, reusing `model_registry.rs` schema. **Self-learning = threshold-finding (bandit problem), NOT model ranking:** Pigeon sends the same task to cheap + Claude in parallel, compares via human/AI reviewer (Censor), and adjusts the complexity threshold where cheap is "good enough" — cheap fails → raise threshold; cheap passes → lower threshold. Claude is the ground truth, not a competitor. Hook: the sidecar calls the Rust endpoint before each turn, receives `{ tier, provider, model, path }`, and calls `pi.setModel()` + `pi.setProvider()`; if `path == Terminal`, the prompt is forwarded to the existing Claude-terminal subprocess instead of pi.
-4. **Phase 3 — Subagents:** port main coder / mini coder to pi subagents (adapt `examples/extensions/subagent/`).
-5. **Phase 4 — Delete:** remove `devboule-coder/` crate and its launcher once the Tauri app + sidecar cover all flows. ~22K LOC gone.
-6. **Phase 5 — Polish:** session persistence, error handling, packaging of the Node runtime, end-user install experience.
+1. **Phase 0 — Spike ✅ (bfd11bb):** minimal Node sidecar embeds pi SDK, registers `oracle_ask` tool, streams to React via Tauri IPC. Bridge proven end-to-end with `openrouter/tencent/hy3:free`.
+2. **Phase 1 — Tool surface + infra ✅ (ea015be→c7c58e7):** per-session IDs, real vault→env adapter, UI trigger in WorkConsole. Oracle: removed canned `oracle_ask` (MCP already configured via `~/.pi/agent/mcp.json`). Censor LLM hook: `tool_execution_start`→`tool_execution_end`→`agent_end`, `DEVBOULE_CENSOR_REVIEW_ENABLED` toggle, uses correct pi SDK event fields.
+3. **Phase 2 — Pigeon routing ✅ (8f8ade7):** multi-factor heuristic classifier (`classify_capability_needed()`, adapted from Puppetmaster MIT) in Rust: role base score, hard/easy/UI signal patterns, clamp 5→100 → `PromptTier` (`Cheap|Moderate|Expensive`). `AgentPath` (`Pi|Terminal`) for Claude. Vault-aware tier table. Sidecar JSONL protocol: `classify_prompt`→`classified`→`setModel()`. Self-learning bandit = TODO (Phase 5).
+4. **Phase 3 — Subagents ✅ (096ec2a):** `main-coder.md` (full tools, cloud) + `mini-coder.md` (budget worker, local). Pi agent `.md` definitions in `.pi/agents/`. User/Pigeon spawns main-coder session; main-coder spawns mini subagents.
+5. **Phase 3.5 — Reviewer/Verifier ✅ (now):** task-level mandatory reviewer subagent (`.pi/agents/reviewer.md`). Architecture per M:
+   - **During writes**: Censor A (pi-lens, deterministic, instant) + Censor B (LLM, optional) fire after EACH file write.
+   - **After task complete**: Reviewer (NOT optional) verifies the ENTIRE task: `git diff` → read files → construct targeted tests → execute (test/lint/type-check) → report (Critical/Warnings/Suggestions) + verdict (✅ VERIFIED / ⚠️ NEEDS FIX / ❌ FAILED). The deterministic slow tests run INSIDE the reviewer's verification pass — the reviewer orchestrates them, it doesn't just review code passively.
+   - Model: `auto` (Pigeon → Moderate tier). Tools: `read, grep, find, ls, bash, run`.
+6. **Phase 4 — Delete:** remove `devboule-coder/` crate and its launcher once all flows are covered. ~22K LOC gone. **IRREVERSIBLE — requires test pass before proceeding.**
+7. **Phase 5 — Polish:** session persistence, error handling, packaging of the Node runtime (`pkg --sea`), self-learning bandit for Pigeon, sandbox wrapping for main-coder sidecar.
 
 Each phase is independently shippable and reversible until Phase 4.
 
