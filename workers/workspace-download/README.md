@@ -1,8 +1,8 @@
-# Aspis workspace download Worker
+# Devboule workspace download Worker
 
 Serves the encrypted `.aspiswspkg` bootstrap package from an R2 bucket so a
-collaborator who does **not** have the Aspis Bio folder yet can pull it from
-inside Aspis Management (Workspace → **Download from cloud**).
+collaborator who does **not** have the project folder yet can pull it from
+inside Devboule (Workspace → **Download from cloud**).
 
 ## Security model
 

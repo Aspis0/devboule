@@ -27,14 +27,14 @@ function gitStatus(
   overrides: Partial<ProjectGitStatus> = {},
 ): ProjectGitStatus {
   return {
-    rootPath: "C:/Users/gualt/Desktop/Aspis Management",
-    repoRoot: "C:/Users/gualt/Desktop/Aspis Management",
-    repoName: "aspis-management",
+    rootPath: "C:/Users/gualt/Desktop/Devboule",
+    repoRoot: "C:/Users/gualt/Desktop/Devboule",
+    repoName: "devboule",
     branch: "main",
     upstream: "origin/main",
-    origin: "git@github.com:aspis/aspis-management.git",
-    githubUrl: "https://github.com/aspis/aspis-management",
-    cloneCommand: "git clone git@github.com:aspis/aspis-management.git",
+    origin: "git@github.com:aspis/devboule.git",
+    githubUrl: "https://github.com/aspis/devboule",
+    cloneCommand: "git clone git@github.com:aspis/devboule.git",
     pullRequestUrl: null,
     commit: "a1b2c3d",
     dirtyCount: 2,
@@ -59,7 +59,7 @@ function gitStatus(
 
 export const summaryActiveNoAgent: ProjectSummary = {
   id: "proj-bio",
-  title: "Aspis Bio — sequencing pipeline",
+  title: "Devboule — sequencing pipeline",
   status: "active",
   updatedAt: "2026-05-29T14:12:00Z",
   rootPath: "C:/Users/gualt/Desktop/aspis-bio",

@@ -12,7 +12,12 @@ from urllib.parse import unquote
 
 from oracle.config import CHUNK_DB_PATH, CHUNK_MANIFEST_PATH, LANCE_DB_PATH, SQLITE_PATH
 from oracle.ingestion.chunk_index import chunk_index_status
-from oracle.server.aspis_mcp import public_project, read_agents_state, read_project_file, summarize_project
+from oracle.server.aspis_mcp import (
+    public_project,
+    read_agents_state,
+    read_project_file,
+    summarize_project,
+)
 from oracle.server.query_engine import QueryEngine
 from oracle.store.lance_store import LanceStore
 from oracle.store.sqlite_store import SQLiteStore
@@ -57,14 +62,18 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
         try:
             length = int(self.headers.get("content-length") or "0")
             payload = json.loads(self.rfile.read(length) or b"{}")
-            result = self.invoke(str(payload.get("cmd") or ""), payload.get("args") or {})
+            result = self.invoke(
+                str(payload.get("cmd") or ""), payload.get("args") or {}
+            )
             self.send_json({"ok": True, "result": result})
         except Exception as exc:
             self.send_json({"ok": False, "error": str(exc)}, status=500)
 
     def send_index(self) -> None:
         index = (self.dist / "index.html").read_text(encoding="utf-8")
-        injected = index.replace("<head>", f"<head>\n<script>{mock_script()}</script>", 1)
+        injected = index.replace(
+            "<head>", f"<head>\n<script>{mock_script()}</script>", 1
+        )
         body = injected.encode("utf-8")
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
@@ -75,7 +84,11 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
     def send_dist_asset(self) -> None:
         request_path = unquote(self.path.split("?", 1)[0]).lstrip("/")
         path = (self.dist / request_path).resolve()
-        if not str(path).startswith(str(self.dist.resolve())) or not path.exists() or not path.is_file():
+        if (
+            not str(path).startswith(str(self.dist.resolve()))
+            or not path.exists()
+            or not path.is_file()
+        ):
             self.send_error(404)
             return
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -97,7 +110,11 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
     @classmethod
     def query_engine(cls) -> QueryEngine:
         if cls.engine is None:
-            cls.engine = QueryEngine(SQLiteStore(SQLITE_PATH), LanceStore(LANCE_DB_PATH), LanceStore(CHUNK_DB_PATH))
+            cls.engine = QueryEngine(
+                SQLiteStore(SQLITE_PATH),
+                LanceStore(LANCE_DB_PATH),
+                LanceStore(CHUNK_DB_PATH),
+            )
         return cls.engine
 
     def invoke(self, cmd: str, args: dict[str, Any]) -> Any:
@@ -106,7 +123,11 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
         if cmd == "lock_app":
             return {**unlocked_auth(), "locked": True, "lockReason": "manual"}
         if cmd == "get_config":
-            return {"raw": json.loads((self.root / "config.json").read_text(encoding="utf-8"))}
+            return {
+                "raw": json.loads(
+                    (self.root / "config.json").read_text(encoding="utf-8")
+                )
+            }
         if cmd in {"get_cloud_dashboard_snapshot", "sync_provider_inventory"}:
             return empty_cloud_snapshot()
         if cmd == "get_secret_status":
@@ -134,7 +155,9 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
         if cmd == "list_projects":
             return self.list_projects()
         if cmd == "get_project":
-            return self.get_project(str(args.get("projectId") or args.get("project_id") or ""))
+            return self.get_project(
+                str(args.get("projectId") or args.get("project_id") or "")
+            )
         if cmd == "get_agent_live_state":
             return camelize(read_agents_state(self.projects_dir))
         if cmd == "get_oracle_snapshot":
@@ -186,7 +209,11 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
         if cmd == "get_graph_overview":
             return graph_overview(self.load_graph())
         if cmd == "search_nodes":
-            return search_graph_nodes(self.load_graph(), str(args.get("query") or ""), int(args.get("limit") or 15))
+            return search_graph_nodes(
+                self.load_graph(),
+                str(args.get("query") or ""),
+                int(args.get("limit") or 15),
+            )
         if cmd == "get_subgraph":
             return graph_subgraph(
                 self.load_graph(),
@@ -194,7 +221,9 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
                 int(args.get("depth") or 2),
             )
         if cmd == "get_context_packet":
-            return graph_context_packet(self.load_graph(), args.get("nodeIds") or args.get("node_ids") or [])
+            return graph_context_packet(
+                self.load_graph(), args.get("nodeIds") or args.get("node_ids") or []
+            )
         raise ValueError(f"UI smoke backend does not implement {cmd}")
 
     @classmethod
@@ -211,16 +240,24 @@ class UiSmokeHandler(SimpleHTTPRequestHandler):
         projects = []
         for path in self.projects_dir.glob("*.md"):
             projects.append(summarize_project(read_project_file(path)))
-        projects.sort(key=lambda item: (item.get("updatedAt") or "", item.get("title") or ""), reverse=True)
+        projects.sort(
+            key=lambda item: (item.get("updatedAt") or "", item.get("title") or ""),
+            reverse=True,
+        )
         return camelize(projects)
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         safe_id = re.sub(r"[^a-z0-9-]", "", project_id.lower())
         if not safe_id:
             raise ValueError("projectId is required")
-        project = camelize(public_project(read_project_file(self.projects_dir / f"{safe_id}.md")))
+        project = camelize(
+            public_project(read_project_file(self.projects_dir / f"{safe_id}.md"))
+        )
         project.setdefault("modifiedAt", None)
-        project.setdefault("liveStatus", {"resources": [], "checkedAt": datetime.now(timezone.utc).isoformat()})
+        project.setdefault(
+            "liveStatus",
+            {"resources": [], "checkedAt": datetime.now(timezone.utc).isoformat()},
+        )
         return project
 
 
@@ -287,7 +324,10 @@ def empty_cloud_snapshot() -> dict[str, Any]:
 
 def oracle_snapshot(engine: QueryEngine) -> dict[str, Any]:
     health = engine.health()
-    duplicates = [{"label": engine.node(ids[0])["label"], "nodeIds": ids} for ids in engine.duplicates()]
+    duplicates = [
+        {"label": engine.node(ids[0])["label"], "nodeIds": ids}
+        for ids in engine.duplicates()
+    ]
     clusters = {node["cluster_semantic"] for node in engine.sqlite.all_nodes()}
     return {
         "status": health["status"],
@@ -341,7 +381,15 @@ def graph_overview(graph: dict[str, Any]) -> dict[str, Any]:
     clusters: dict[int, dict[str, Any]] = {}
     for node in nodes.values():
         cluster = int(node.get("cluster") or 0)
-        item = clusters.setdefault(cluster, {"id": cluster, "nodeCount": 0, "totalWeight": 0.0, "label": f"Cluster {cluster}"})
+        item = clusters.setdefault(
+            cluster,
+            {
+                "id": cluster,
+                "nodeCount": 0,
+                "totalWeight": 0.0,
+                "label": f"Cluster {cluster}",
+            },
+        )
         item["nodeCount"] += 1
         item["totalWeight"] += float((node.get("metadata") or {}).get("weight") or 0.0)
         if node.get("label"):
@@ -353,8 +401,12 @@ def graph_overview(graph: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def search_graph_nodes(graph: dict[str, Any], query: str, limit: int) -> list[dict[str, Any]]:
-    terms = [term.lower() for term in re.findall(r"[A-Za-z0-9_/-]+", query) if len(term) >= 2]
+def search_graph_nodes(
+    graph: dict[str, Any], query: str, limit: int
+) -> list[dict[str, Any]]:
+    terms = [
+        term.lower() for term in re.findall(r"[A-Za-z0-9_/-]+", query) if len(term) >= 2
+    ]
     if not terms:
         return []
     results = []
@@ -410,7 +462,11 @@ def graph_subgraph(graph: dict[str, Any], target: str, depth: int) -> dict[str, 
         if not frontier:
             break
     selected_edges = [
-        {"source": edge.get("source"), "target": edge.get("target"), "weight": float(edge.get("weight") or 1.0)}
+        {
+            "source": edge.get("source"),
+            "target": edge.get("target"),
+            "weight": float(edge.get("weight") or 1.0),
+        }
         for edge in edges
         if edge.get("source") in seen and edge.get("target") in seen
     ]
@@ -429,7 +485,9 @@ def graph_context_packet(graph: dict[str, Any], node_ids: list[Any]) -> str:
         node = nodes.get(str(raw_id))
         if node:
             metadata = node.get("metadata") or {}
-            lines.append(f"- {node.get('id')}: {metadata.get('docstring') or node.get('label') or ''}")
+            lines.append(
+                f"- {node.get('id')}: {metadata.get('docstring') or node.get('label') or ''}"
+            )
     return "\n".join(lines)
 
 
@@ -459,7 +517,9 @@ def graph_node_payload(node: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Serve a Tauri-mocked Aspis UI for browser smoke checks.")
+    parser = argparse.ArgumentParser(
+        description="Serve a Tauri-mocked Devboule UI for browser smoke checks."
+    )
     parser.add_argument("--root", default=".")
     parser.add_argument("--port", type=int, default=4174)
     args = parser.parse_args()

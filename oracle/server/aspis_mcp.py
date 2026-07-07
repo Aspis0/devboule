@@ -310,7 +310,7 @@ ROLE_ALLOWED_TOOLS = {rule["role"]: set(rule["allowedTools"]) for rule in ROLE_R
 TOOLS = [
     {
         "name": "agent_rules",
-        "description": "Returns roles, responsibilities, and practical restrictions for Aspis agents.",
+        "description": "Returns roles, responsibilities, and practical restrictions for Devboule agents.",
         "parameters": {},
     },
     {
@@ -726,7 +726,7 @@ TOOLS = [
     },
     {
         "name": "cloudflare_list_workers",
-        "description": "Read-only: lists Workers in the Aspis Bio Cloudflare account.",
+        "description": "Read-only: lists Workers in the Devboule Cloudflare account.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -736,7 +736,7 @@ TOOLS = [
     },
     {
         "name": "cloudflare_rotate_worker_secret",
-        "description": "Coder-only: rotates a secret of an Aspis Bio Cloudflare Worker.",
+        "description": "Coder-only: rotates a secret of a Devboule Cloudflare Worker.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -752,7 +752,7 @@ TOOLS = [
     },
     {
         "name": "scaleway_list_resources",
-        "description": "Read-only: lists VMs, functions, and containers in the Aspis Bio Scaleway project.",
+        "description": "Read-only: lists VMs, functions, and containers in the Devboule Scaleway project.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -762,7 +762,7 @@ TOOLS = [
     },
     {
         "name": "scaleway_resource_action",
-        "description": "Coder-only: start/stop/reboot/terminate a VM or serverless deploy in the Aspis Bio project.",
+        "description": "Coder-only: start/stop/reboot/terminate a VM or serverless deploy in the Devboule project.",
         "parameters": {
             "agent_id": {"type": "string"},
             "role": {"type": "string", "enum": sorted(VALID_ROLES)},
@@ -1378,21 +1378,21 @@ def validate_project_work_root(
         # username + machine layout). Name only the basename + actionable phrase.
         raise McpError(
             f"Project working root '{root.name}' is too broad; "
-            "point it at a specific project folder under the Aspis workspace."
+            "point it at a specific project folder under the Devboule workspace."
         )
     lower = str(root).lower()
     if lower.endswith("\\windows") or "\\windows\\system32" in lower:
         raise McpError(
             f"Project working root '{root.name}' is unsafe (system directory); "
-            "use a folder under the Aspis workspace."
+            "use a folder under the Devboule workspace."
         )
     # SECURITY (M2): constrain rootPath to an approved workspace parent so a
     # project markdown cannot index an arbitrary sensitive tree (e.g. ~/.ssh).
     parents = approved_work_root_parents(management_root)
     if not any(root == parent or path_is_within(root, parent) for parent in parents):
         raise McpError(
-            "Project working root is outside the approved Aspis workspace roots. "
-            "Place it under the management root or the configured Aspis Bio workspace."
+            "Project working root is outside the approved Devboule workspace roots. "
+            "Place it under the management root or the configured Devboule workspace."
         )
     return root
 
@@ -1542,7 +1542,7 @@ def ensure_oracle_index_ready(
         # PRIVACY: no absolute paths in the message (the index root may reveal a
         # user home directory). Keep it ACTIONABLE for an agent operator.
         raise McpError(
-            "Oracle index not ready — open Aspis -> Oracle -> Index now "
+            "Oracle index not ready — open Devboule -> Oracle -> Index now "
             "(or wait for the resident indexer). "
             f"(indexed={status.get('indexed_files')} "
             f"pending={status.get('pending_files')} stale={status.get('stale_files')})"
@@ -4560,7 +4560,7 @@ def resolve_cloudflare_account(
                 name = str(account.get("name") or "")
                 return {"id": account["id"], "name": name}
         raise McpError(
-            "Pinned Cloudflare Aspis Bio account was not visible to this token."
+            "Pinned Cloudflare Devboule account was not visible to this token."
         )
     matches = [
         item
@@ -4573,7 +4573,7 @@ def resolve_cloudflare_account(
             account = accounts[0]
             return {"id": account["id"], "name": str(account.get("name") or "")}
         raise McpError(
-            "Cloudflare Aspis Bio account is ambiguous or missing. Set ASPIS_CLOUDFLARE_ACCOUNT_ID."
+            "Cloudflare Devboule account is ambiguous or missing. Set ASPIS_CLOUDFLARE_ACCOUNT_ID."
         )
     return {
         "id": matches[0]["id"],
@@ -4658,7 +4658,7 @@ def cloudflare_rotate_secret(
     inventory = cloudflare_list_workers(token, account_id)
     account = inventory["account"]
     if not any(worker["name"] == worker_name for worker in inventory["workers"]):
-        raise McpError("Worker is not in the Aspis Bio Cloudflare inventory.")
+        raise McpError("Worker is not in the Devboule Cloudflare inventory.")
     encoded_worker = worker_name.replace("/", "%2F")
     url = f"{CF_API}/accounts/{account['id']}/workers/scripts/{encoded_worker}/secrets"
     payload = {"name": secret_name, "text": secret_value, "type": "secret_text"}
@@ -4709,7 +4709,7 @@ def resolve_scaleway_project(
                     )
                 return {"id": project["id"], "name": name}
         raise McpError(
-            "Pinned Scaleway Aspis Bio project was not visible to this token."
+            "Pinned Scaleway Devboule project was not visible to this token."
         )
     matches = [
         item
@@ -4719,7 +4719,7 @@ def resolve_scaleway_project(
     ]
     if len(matches) != 1:
         raise McpError(
-            "Scaleway Aspis Bio project is ambiguous or missing. Set ASPIS_SCALEWAY_PROJECT_ID."
+            "Scaleway Devboule project is ambiguous or missing. Set ASPIS_SCALEWAY_PROJECT_ID."
         )
     return {
         "id": matches[0]["id"],
@@ -4920,7 +4920,7 @@ def scaleway_resource_action(
         (item for item in inventory["resources"] if item.get("id") == resource_id), None
     )
     if not resource:
-        raise McpError("Scaleway resource is not in the Aspis Bio inventory.")
+        raise McpError("Scaleway resource is not in the Devboule inventory.")
     action_aliases = {
         "start": "poweron",
         "stop": "poweroff",
@@ -8918,7 +8918,7 @@ def handle_tool_call(
                 agent_id,
                 role,
                 status="scaleway-read",
-                message="Read Scaleway Aspis Bio inventory.",
+                message="Read Scaleway Devboule inventory.",
             )
             add_event(
                 state,
@@ -9196,7 +9196,7 @@ def handle_tool_call(
             "ok": True,
         }
 
-    raise McpError(f"Unknown Aspis MCP tool: {name}")
+    raise McpError(f"Unknown Devboule MCP tool: {name}")
 
 
 def create_mcp_server(
@@ -9206,17 +9206,17 @@ def create_mcp_server(
         from mcp.server.fastmcp import FastMCP
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
-            "Install oracle/requirements.txt to run the Aspis MCP server."
+            "Install oracle/requirements.txt to run the Devboule MCP server."
         ) from exc
 
-    server = FastMCP("aspis-management")
+    server = FastMCP("devboule")
 
     def call(name: str, arguments: dict[str, Any] | None = None) -> Any:
         return handle_tool_call(name, arguments, root=root, projects_dir=projects_dir)
 
     @server.tool()
     def agent_rules() -> dict:
-        """Practical roles, responsibilities and prohibitions for Aspis agents."""
+        """Practical roles, responsibilities and prohibitions for Devboule agents."""
         return call("agent_rules")
 
     @server.tool()
@@ -9724,7 +9724,7 @@ def create_mcp_server(
     def cloudflare_list_workers(
         agent_id: str, role: str, account_id: str = "", session_token: str = ""
     ) -> dict:
-        """Read-only: list Workers in the Aspis Bio Cloudflare account."""
+        """Read-only: list Workers in the Devboule Cloudflare account."""
         return call(
             "cloudflare_list_workers",
             {
@@ -9769,7 +9769,7 @@ def create_mcp_server(
     def scaleway_list_resources(
         agent_id: str, role: str, project_id: str = "", session_token: str = ""
     ) -> dict:
-        """Read-only: list VMs and serverless resources in the Aspis Bio Scaleway project."""
+        """Read-only: list VMs and serverless resources in the Devboule Scaleway project."""
         return call(
             "scaleway_list_resources",
             {

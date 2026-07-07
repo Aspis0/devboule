@@ -24,22 +24,36 @@ REQUIRED_AGENT_IDS = {"prod-architect", "prod-code", "prod-verifier"}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Aspis Oracle production readiness audit.")
+    parser = argparse.ArgumentParser(
+        description="Devboule Oracle production readiness audit."
+    )
     parser.add_argument("--root", default=".", help="Devboule root")
-    parser.add_argument("--project-root", default=str(Path.home() / "Desktop" / "aspis bio"))
+    parser.add_argument(
+        "--project-root", default=str(Path.home() / "Desktop" / "aspis bio")
+    )
     parser.add_argument("--sqlite", default=str(SQLITE_PATH))
     parser.add_argument("--vectors", default=str(LANCE_DB_PATH))
     parser.add_argument("--chunks", default=str(CHUNK_DB_PATH))
     parser.add_argument("--manifest", default=str(CHUNK_MANIFEST_PATH))
     parser.add_argument("--skip-mcp-smoke", action="store_true")
-    parser.add_argument("--live-remote", action="store_true", help="Call the configured remote Oracle provider.")
-    parser.add_argument("--strict-remote", action="store_true", help="Fail if primary+fallback remote providers are not configured.")
+    parser.add_argument(
+        "--live-remote",
+        action="store_true",
+        help="Call the configured remote Oracle provider.",
+    )
+    parser.add_argument(
+        "--strict-remote",
+        action="store_true",
+        help="Fail if primary+fallback remote providers are not configured.",
+    )
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
     project_root = Path(args.project_root).resolve()
-    engine = QueryEngine(SQLiteStore(args.sqlite), LanceStore(args.vectors), LanceStore(args.chunks))
+    engine = QueryEngine(
+        SQLiteStore(args.sqlite), LanceStore(args.vectors), LanceStore(args.chunks)
+    )
     checks = [
         audit_index("management_index", root, args),
         audit_index("project_index", project_root, args),
@@ -64,7 +78,9 @@ def main() -> int:
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        out.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if payload["status"] == "pass" else 1
 
@@ -113,21 +129,34 @@ def audit_app_surface(root: Path) -> dict[str, Any]:
             texts[name] = path.read_text(encoding="utf-8", errors="replace")
 
     source_requirements = {
-        "projects_route": '"projects"' in texts["app"] and "ProjectsView" in texts["app"],
+        "projects_route": '"projects"' in texts["app"]
+        and "ProjectsView" in texts["app"],
         "oracle_route": '"oracle"' in texts["app"] and "OracleView" in texts["app"],
         "agents_route": '"agents"' in texts["app"] and "AgentsView" in texts["app"],
-        "projects_surface": "Project workspace" in texts["projects"] and "Launch agents" in texts["projects"],
-        "task_sessions_visible": "sessionsByTask" in texts["projects"] and "currentTaskId" in texts["projects"],
-        "project_stage_active_priority": "project.taskCounts.wip > 0" in texts["projects"] and "currentProjectSessions" in texts["projects"],
-        "project_stage_launching_split": "launching" in texts["projects"] and "launch_pending" in texts["projects"],
-        "leaseless_claims_expire": "ACTIVE_SESSION_WINDOW_MS" in texts["agent_claims"] and "updatedAt" in texts["agent_claims"],
-        "agents_mcp_config": "mcpClientConfig" in texts["agents"] and "Copy MCP config" in texts["agents"],
-        "agent_launch_tokens": "prepare_project_agent_prompt" in texts["projects"] and "launch_token" in texts["projects_backend"],
+        "projects_surface": "Project workspace" in texts["projects"]
+        and "Launch agents" in texts["projects"],
+        "task_sessions_visible": "sessionsByTask" in texts["projects"]
+        and "currentTaskId" in texts["projects"],
+        "project_stage_active_priority": "project.taskCounts.wip > 0"
+        in texts["projects"]
+        and "currentProjectSessions" in texts["projects"],
+        "project_stage_launching_split": "launching" in texts["projects"]
+        and "launch_pending" in texts["projects"],
+        "leaseless_claims_expire": "ACTIVE_SESSION_WINDOW_MS" in texts["agent_claims"]
+        and "updatedAt" in texts["agent_claims"],
+        "agents_mcp_config": "mcpClientConfig" in texts["agents"]
+        and "Copy MCP config" in texts["agents"],
+        "agent_launch_tokens": "prepare_project_agent_prompt" in texts["projects"]
+        and "launch_token" in texts["projects_backend"],
         "agent_session_tokens": "session_token" in texts["projects_backend"],
         "launcher_no_management_add_dir": "--add-dir" not in texts["projects_backend"],
-        "tauri_launcher_mcp_attached": "mcp_servers.aspis-management" in texts["projects_backend"] and "--mcp-config" in texts["projects_backend"],
-        "oracle_dense_index_surface": "Index now" in texts["oracle"] and "Dense index ready" in texts["oracle"],
-        "oracle_fallback_surface": "Fallback used" in texts["oracle"] and "fallbackFromProvider" in texts["oracle"],
+        "tauri_launcher_mcp_attached": "mcp_servers.aspis-management"
+        in texts["projects_backend"]
+        and "--mcp-config" in texts["projects_backend"],
+        "oracle_dense_index_surface": "Index now" in texts["oracle"]
+        and "Dense index ready" in texts["oracle"],
+        "oracle_fallback_surface": "Fallback used" in texts["oracle"]
+        and "fallbackFromProvider" in texts["oracle"],
         "tauri_projects_commands": all(
             token in texts["lib"]
             for token in [
@@ -139,29 +168,44 @@ def audit_app_surface(root: Path) -> dict[str, Any]:
         ),
         "tauri_oracle_commands": all(
             token in texts["lib"]
-            for token in ["graph::commands::get_oracle_snapshot", "graph::commands::ask_oracle"]
+            for token in [
+                "graph::commands::get_oracle_snapshot",
+                "graph::commands::ask_oracle",
+            ]
         ),
     }
 
     dist_dir = root / "dist"
-    built_js = "\n".join(
-        path.read_text(encoding="utf-8", errors="replace")
-        for path in (dist_dir / "assets").glob("*.js")
-    ) if (dist_dir / "assets").exists() else ""
-    dist_assets = list((dist_dir / "assets").glob("*")) if (dist_dir / "assets").exists() else []
+    built_js = (
+        "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in (dist_dir / "assets").glob("*.js")
+        )
+        if (dist_dir / "assets").exists()
+        else ""
+    )
+    dist_assets = (
+        list((dist_dir / "assets").glob("*")) if (dist_dir / "assets").exists() else []
+    )
     newest_source_mtime = max(
         (path.stat().st_mtime for path in files.values() if path.exists()),
         default=0,
     )
     newest_dist_mtime = max(
-        ([path.stat().st_mtime for path in dist_assets if path.is_file()] + [(dist_dir / "index.html").stat().st_mtime] if (dist_dir / "index.html").exists() else []),
+        (
+            [path.stat().st_mtime for path in dist_assets if path.is_file()]
+            + [(dist_dir / "index.html").stat().st_mtime]
+            if (dist_dir / "index.html").exists()
+            else []
+        ),
         default=0,
     )
     bundle_requirements = {
         "dist_exists": (dist_dir / "index.html").exists() and bool(built_js),
         "dist_fresh": newest_dist_mtime >= newest_source_mtime,
         "bundle_projects": "Project workspace" in built_js,
-        "bundle_agents": "Agent control room" in built_js and "Copy MCP config" in built_js,
+        "bundle_agents": "Agent control room" in built_js
+        and "Copy MCP config" in built_js,
         "bundle_oracle": "Oracle ready" in built_js and "Dense index ready" in built_js,
     }
     failed = [
@@ -191,12 +235,18 @@ def audit_project(root: Path) -> dict[str, Any]:
             project = read_project_file(project_path)
         except Exception as exc:
             project_error = str(exc)
-    agents = json.loads(agents_path.read_text(encoding="utf-8")) if agents_path.exists() else {}
+    agents = (
+        json.loads(agents_path.read_text(encoding="utf-8"))
+        if agents_path.exists()
+        else {}
+    )
     sessions = {item.get("agentId"): item for item in agents.get("sessions", [])}
     claims = agents.get("claims", [])
     tasks = project.get("state", {}).get("tasks", []) if project else []
     statuses = {item.get("id"): item.get("status") for item in tasks}
-    project_claims = [item for item in claims if item.get("projectId") == REQUIRED_PROJECT_ID]
+    project_claims = [
+        item for item in claims if item.get("projectId") == REQUIRED_PROJECT_ID
+    ]
     claim_drift = [
         {
             "agent_id": item.get("agentId"),
@@ -205,7 +255,8 @@ def audit_project(root: Path) -> dict[str, Any]:
             "task_status": statuses.get(item.get("taskId")),
         }
         for item in project_claims
-        if item.get("taskId") not in statuses or item.get("status") != statuses.get(item.get("taskId"))
+        if item.get("taskId") not in statuses
+        or item.get("status") != statuses.get(item.get("taskId"))
     ]
     missing_agents = sorted(REQUIRED_AGENT_IDS - set(sessions))
     passed = (
@@ -242,10 +293,7 @@ def audit_retrieval_suite(engine: QueryEngine) -> dict[str, Any]:
         "pass": not failed,
         "case_count": len(results),
         "failed": failed,
-        "top_files": {
-            item["id"]: item.get("top_files", [])[:3]
-            for item in results
-        },
+        "top_files": {item["id"]: item.get("top_files", [])[:3] for item in results},
     }
 
 
@@ -280,7 +328,9 @@ def audit_bounded_answer(engine: QueryEngine) -> dict[str, Any]:
     old_value = os.environ.get("ORACLE_ASK_DISABLE_LLM")
     os.environ["ORACLE_ASK_DISABLE_LLM"] = "1"
     try:
-        answer = engine.ask("How do terminal agents update project task status through MCP?", 5)
+        answer = engine.ask(
+            "How do terminal agents update project task status through MCP?", 5
+        )
     finally:
         if old_value is None:
             os.environ.pop("ORACLE_ASK_DISABLE_LLM", None)
@@ -297,8 +347,12 @@ def audit_bounded_answer(engine: QueryEngine) -> dict[str, Any]:
         "pass": passed,
         "answer_source": answer.get("answer_source"),
         "fallback_reason": answer.get("fallback_reason"),
-        "citation_files": [item.get("file_source") for item in answer.get("citations", [])],
-        "result_files": [item.get("file_source") for item in answer.get("results", [])[:5]],
+        "citation_files": [
+            item.get("file_source") for item in answer.get("citations", [])
+        ],
+        "result_files": [
+            item.get("file_source") for item in answer.get("results", [])[:5]
+        ],
     }
 
 
@@ -345,11 +399,13 @@ def safe_provider_summary(config: dict[str, Any]) -> dict[str, Any]:
 def audit_live_remote_answers(strict_remote: bool = False) -> list[dict[str, Any]]:
     config = oracle_llm_config_from_app_vault()
     if not config or config.get("provider") == "ollama":
-        return [{
-            "name": "oracle_live_remote_answer",
-            "pass": False,
-            "reason": "Remote Oracle provider is not configured as primary.",
-        }]
+        return [
+            {
+                "name": "oracle_live_remote_answer",
+                "pass": False,
+                "reason": "Remote Oracle provider is not configured as primary.",
+            }
+        ]
     chunk = {
         "chunk_id": "oracle/server/aspis_mcp.py#live-audit",
         "file_source": "oracle/server/aspis_mcp.py",
@@ -360,7 +416,11 @@ def audit_live_remote_answers(strict_remote: bool = False) -> list[dict[str, Any
         "score": 99.0,
         "text": "Agents call project_claim_task and project_update_status to update task status through MCP.",
     }
-    answer = answer_from_context("How do agents update project task status through MCP?", [chunk], llm_config=config)
+    answer = answer_from_context(
+        "How do agents update project task status through MCP?",
+        [chunk],
+        llm_config=config,
+    )
     primary_passed = (
         answer.get("answer_source") == "llm"
         and not answer.get("not_found")

@@ -121,7 +121,7 @@ pub struct AgentLedgerEntry {
     /// ran. Legacy/non-launch entries leave this `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_file: Option<String>,
-    /// Terminal host for this agent: "app" (PTY hosted inside Aspis Management) or
+    /// Terminal host for this agent: "app" (PTY hosted inside Devboule) or
     /// "external" (detached OS console). `stop_agent` routes by this value: "app"
     /// goes to `agent_pty_kill`, everything else to the kill-by-title path. Added
     /// with `#[serde(default)]` so legacy ledgers (bare string OR rich struct
@@ -1108,8 +1108,8 @@ fn is_valid_management_root(path: &Path) -> bool {
     // the root copy made every candidate invalid the moment the root copy
     // disappeared, and the silent `projects_dir.parent()` fallback then pointed
     // the MCP children at a directory with no `oracle` package.
-    let has_config = path.join("config.json").is_file()
-        || path.join("src-tauri").join("config.json").is_file();
+    let has_config =
+        path.join("config.json").is_file() || path.join("src-tauri").join("config.json").is_file();
     has_config
         && path
             .join("oracle")
@@ -1129,7 +1129,7 @@ fn is_valid_management_root(path: &Path) -> bool {
 /// running; that case is handled by the verified-pid fallback (image name +
 /// creation time), never by a bare stored pid.
 pub fn agent_window_title(agent_id: &str) -> String {
-    format!("Aspis Agent {agent_id}")
+    format!("Devboule Agent {agent_id}")
 }
 
 /// Canonical terminal-host strings.
@@ -2301,7 +2301,7 @@ mod tests {
             "verifier-2a",
             "claude",
             Some(4242),
-            Some("Aspis Agent verifier-2a"),
+            Some("Devboule Agent verifier-2a"),
             Some(0x01DA_0000_0000_0001),
             Some("C:\\Temp\\aspis-agent-prompt-abc.txt"),
             Some("external"),
@@ -2314,7 +2314,7 @@ mod tests {
             "coder-7f",
             "powershell",
             Some(1234),
-            Some("Aspis Agent coder-7f"),
+            Some("Devboule Agent coder-7f"),
             Some(0x01DA_0000_0000_0002),
             None,
             Some("app"),
@@ -2325,7 +2325,10 @@ mod tests {
         let coder = ledger.get("coder-7f").unwrap();
         assert_eq!(coder.client, "powershell");
         assert_eq!(coder.pid, Some(1234));
-        assert_eq!(coder.window_title.as_deref(), Some("Aspis Agent coder-7f"));
+        assert_eq!(
+            coder.window_title.as_deref(),
+            Some("Devboule Agent coder-7f")
+        );
         assert_eq!(coder.creation_time, Some(0x01DA_0000_0000_0002));
         // The upsert stamped host "app": stop_agent will route this one to the PTY.
         assert_eq!(coder.host.as_deref(), Some("app"));
@@ -2356,7 +2359,7 @@ mod tests {
         fs::create_dir_all(&projects).unwrap();
         fs::write(
             projects.join(AGENT_CLIENTS_FILE),
-            r#"{ "coder-1": "codex", "verifier-1": { "client": "claude", "pid": 9, "windowTitle": "Aspis Agent verifier-1" } }"#,
+            r#"{ "coder-1": "codex", "verifier-1": { "client": "claude", "pid": 9, "windowTitle": "Devboule Agent verifier-1" } }"#,
         )
         .unwrap();
 
@@ -2484,7 +2487,7 @@ mod tests {
         let full = AgentLedgerEntry {
             client: "codex".into(),
             pid: Some(4321),
-            window_title: Some("Aspis Agent coder-9".into()),
+            window_title: Some("Devboule Agent coder-9".into()),
             creation_time: Some(0x01DA_1234_5678_9ABC),
             prompt_file: Some("C:\\Temp\\aspis-agent-prompt-xyz.txt".into()),
             host: Some("app".into()),
@@ -2511,7 +2514,7 @@ mod tests {
         assert!(!bare_json.contains("host"));
 
         // Legacy rich entry JSON that predates `host` still parses (host = None).
-        let legacy_json = r#"{"client":"codex","pid":7,"windowTitle":"Aspis Agent coder-1"}"#;
+        let legacy_json = r#"{"client":"codex","pid":7,"windowTitle":"Devboule Agent coder-1"}"#;
         let legacy: AgentLedgerEntry = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(legacy.host, None);
         assert_eq!(legacy.client, "codex");
@@ -2586,7 +2589,7 @@ mod tests {
         let entry = AgentLedgerEntry {
             client: "deepseek".into(),
             pid: Some(1234),
-            window_title: Some("Aspis Agent coder-1".into()),
+            window_title: Some("Devboule Agent coder-1".into()),
             creation_time: None,
             prompt_file: Some(prompt_path.to_string_lossy().into_owned()),
             host: None,
@@ -2615,7 +2618,7 @@ mod tests {
 
     #[test]
     fn agent_window_title_is_stable_and_contains_id() {
-        assert_eq!(agent_window_title("coder-7f"), "Aspis Agent coder-7f");
+        assert_eq!(agent_window_title("coder-7f"), "Devboule Agent coder-7f");
         assert!(agent_window_title("verifier-2a").contains("verifier-2a"));
     }
 
@@ -2624,19 +2627,19 @@ mod tests {
         let wanted: Vec<u16> = agent_window_title("coder-7f").encode_utf16().collect();
 
         // Exact title matches.
-        let exact: Vec<u16> = "Aspis Agent coder-7f".encode_utf16().collect();
+        let exact: Vec<u16> = "Devboule Agent coder-7f".encode_utf16().collect();
         assert!(title_matches_exact(&exact, &wanted));
 
         // A superstring (e.g. a window that merely CONTAINS the marker, or a CLI
         // that appended status text) must NOT match: this is what makes stop/focus
         // pid-reuse-safe and prevents grabbing an unrelated window.
-        let superstring: Vec<u16> = "Aspis Agent coder-7f - codex running"
+        let superstring: Vec<u16> = "Devboule Agent coder-7f - codex running"
             .encode_utf16()
             .collect();
         assert!(!title_matches_exact(&superstring, &wanted));
 
         // A different agent id must NOT match.
-        let other: Vec<u16> = "Aspis Agent coder-7e".encode_utf16().collect();
+        let other: Vec<u16> = "Devboule Agent coder-7e".encode_utf16().collect();
         assert!(!title_matches_exact(&other, &wanted));
 
         // An empty wanted slice never matches (guards the no-title case).

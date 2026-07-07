@@ -183,7 +183,7 @@ impl DesignGenState {
     fn http_client(&self) -> &reqwest::Client {
         self.http.get_or_init(|| {
             reqwest::Client::builder()
-                .user_agent("Aspis-Management/0.1")
+                .user_agent("Devboule/0.1")
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()

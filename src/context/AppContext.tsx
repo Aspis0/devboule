@@ -73,7 +73,7 @@ const VISIBILITY_LOCK_GRACE_MS = 20_000;
 const SCALEWAY_ACTION_FOLLOWUP_DELAYS_MS = [5_000, 15_000, 30_000];
 
 const EMPTY_CONFIG: AppConfig = {
-  project: { name: "Aspis Bio", version: "" },
+  project: { name: "Devboule", version: "" },
   // Compressed top-level nav (Polis is injected by Sidebar). Re-homed pages now
   // live as tabs: Agents→Projects; Cloudflare/Compute/Budget→Providers;
   // Secrets/Devices/Workspace→Settings (opened from the user area).

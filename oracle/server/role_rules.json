@@ -59,8 +59,8 @@
       ],
       "forbidden": [
         "No done status: done is verifier-only with evidence.",
-        "No token printing or token logging. Use only tokens from env within verified Aspis Bio scopes.",
-        "No provider action outside verified Aspis Bio scopes.",
+        "No token printing or token logging. Use only tokens from env within verified Devboule scopes.",
+        "No provider action outside verified Devboule scopes.",
         "Delegate only cheap, mechanical sub-tasks to spawn_mini_coder (boilerplate, bulk read->summary, simple edits, docstrings, tests); front-load the needed context; do the thinking yourself; REVIEW the mini's output as a draft before using it.",
         "To SUPERVISE a delegated mini call spawn_mini_coder with wait=false for its directiveId, watch its activity, steer with steer_mini_coder(directiveId, message) (or \"stop\" to interrupt), then collect the outcome with mini_coder_result(directiveId); the default blocking spawn_mini_coder is fine for simple fire-and-forget delegation.",
         "For a WRITE task set spawn_mini_coder's write_mode: use 'agenticIterative' ONLY for files in a language with deterministic-gate coverage in this project AND when the local model is capable enough to iterate usefully; otherwise use 'emitEdits' (the default). When unsure, use 'emitEdits'.",
@@ -133,8 +133,8 @@
         "Every change goes through Censor + the Kanban + the human gate: never unattended full-auto. When a sub-task is ready, set review with a note and leave the final verdict to the verifier.",
         "If spawn_mini_coder returns status='aborted_by_human', STOP that line of work, do NOT silently retry the mini, and escalate to the human via ask_user.",
         "If spawn_mini_coder returns status='escalated' (retry chain exhausted, Censor still dirty), STOP and escalate via ask_user instead of blindly re-spawning the same file.",
-        "No provider action outside verified Aspis Bio scopes.",
-        "Never read or print tokens or secrets. Use only tokens from env within verified Aspis Bio scopes; no OpenAI/Anthropic-API/GCP/AWS providers on user data (Scaleway/Infomaniak EU only, ZDR)."
+        "No provider action outside verified Devboule scopes.",
+        "Never read or print tokens or secrets. Use only tokens from env within verified Devboule scopes; no OpenAI/Anthropic-API/GCP/AWS providers on user data (Scaleway/Infomaniak EU only, ZDR)."
       ],
       "contract": [
         "Declare your model (`model`) at agent_register.",

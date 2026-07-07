@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicjhan/tauri-v2-react-template/refs/heads/main/src-tauri/capabilities/default.json",
   "identifier": "default",
-  "description": "Default capabilities for Aspis Management",
+  "description": "Default capabilities for Devboule",
   "windows": ["main"],
   "permissions": [
     "core:default",

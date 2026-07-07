@@ -1,11 +1,12 @@
-# Aspis Bio — Polis Map
+# Devboule — Polis Map
+
 ## Documento di Progettazione Completo
 
 ---
 
 ## Visione
 
-Una mappa isometrica vivente che rappresenta l'intera infrastruttura di Aspis Bio come una città romano-imperiale. Ogni file sorgente è un edificio, ogni import è una strada, ogni agente IA attivo è un cittadino visibile sul territorio. La mappa non è decorazione — è il pannello di controllo principale del progetto.
+Una mappa isometrica vivente che rappresenta l'intera infrastruttura di Devboule come una città romano-imperiale. Ogni file sorgente è un edificio, ogni import è una strada, ogni agente IA attivo è un cittadino visibile sul territorio. La mappa non è decorazione — è il pannello di controllo principale del progetto.
 
 **Riferimento visivo:** Pharaoh (1999), Zeus: Master of Olympus (2000). Movimento fluido e continuo, palette calda crema/terracotta/avorio, edifici isometrici 2.5D con ombre e luci geometriche.
 
@@ -149,6 +150,7 @@ Al primo scan, Rust genera gli UUID e li persiste. Agli scan successivi, usa que
 ### `generate_city_state(project_path: String) -> CityState`
 
 **Fase 1 — Scansione file (Rust puro)**
+
 1. Walk ricorsivo della cartella progetto
 2. Filtra: mantieni solo `.ts`, `.tsx`, `.rs`, `.kt`, `.toml`, `.json` critici
 3. Escludi pattern: `node_modules`, `dist`, `build`, `.d.ts`, `*.test.*`, `*.spec.*`, `*.md`, `docs/`
@@ -159,16 +161,19 @@ Al primo scan, Rust genera gli UUID e li persiste. Agli scan successivi, usa que
    - Legge `tsconfig.json` per risolvere path aliases (`@/` → `src/`)
 
 **Fase 2 — Classificazione (Oracle)**
+
 - Invia a Oracle batch di file con: path + prime 30 righe + import list
 - Oracle restituisce `purpose` e `description` breve per ognuno
 - Fallback se Oracle non disponibile: classificazione euristica su path e nome file
 
 **Fase 3 — Strade**
+
 - **Import diretto** (Rust): import risolti → road `type: "import"`, `style: "lastricata"`, `weight` proporzionale a quante volte il file è importato
 - **Semantico** (Oracle): embedding similarity > 0.82 tra file dello stesso distretto → road `type: "semantic"`, `style: "terra_battuta"`, `weight: 1`
 - **Infrastrutturale** (parser config): binding in `wrangler.toml`, env variables con URL → road `type: "infrastructure"`, `style: "acquedotto"`
 
 **Fase 4 — Layout automatico dinamico**
+
 - La griglia non ha dimensione fissa — cresce in base al numero di file scansionati
 - Formula base: `grid_size = ceil(sqrt(n_buildings * SPACING_FACTOR))` con `SPACING_FACTOR = 6` (ogni edificio occupa in media 6×6 tile di "respiro")
 - Esempio: 30 file → griglia ~44×44. 100 file → griglia ~78×78. 400 file → griglia ~156×156
@@ -177,6 +182,7 @@ Al primo scan, Rust genera gli UUID e li persiste. Agli scan successivi, usa que
 - Persiste coordinate in `.aspis-meta.json` per stabilità tra scan successivi — un nuovo file appare vicino agli edifici correlati, non in posizione casuale
 
 **Fase 5 — Infrastruttura Scaleway**
+
 - Chiama Scaleway API con IAM key (configurata in Tauri settings)
 - Recupera containers, VM, object stores attivi
 - Aggiunge come `ExternalService` con status live
@@ -392,7 +398,7 @@ function getProfile(purpose: string): BuildingProfile {
 **Come Oracle introduce nuovi tipi:**
 Se Oracle classifica un file come `"laboratorio"` (tipo non ancora nel registro), il sistema lo aggiunge con un profilo generato da similarity con i tipi esistenti. Al prossimo avvio, il profilo è già persistito in `.aspis-meta.json` e l'utente può raffinarlo manualmente se vuole.
 
-**Nuovi tipi previsti al crescere del progetto Aspis Bio:**
+**Nuovi tipi previsti al crescere del progetto Devboule:**
 
 | Tipo futuro | File tipici | Edificio suggerito |
 |---|---|---|
@@ -403,8 +409,6 @@ Se Oracle classifica un file come `"laboratorio"` (tipo non ancora nel registro)
 | `anfiteatro` | Event bus, message queue | Struttura circolare aperta |
 
 ---
-
-
 
 **House (Oikos) — file generico UI** _(slug: `house`)_
 Prisma semplice, tetto leggermente spiovente color terracotta, finestre geometriche minuscole sulla faccia destra. Varianti sottili per visual_tier.
@@ -687,8 +691,6 @@ GPU Intel integrata: stabile a 60fps in tutti gli scenari realistici.
 
 ---
 
-
-
 Ogni distretto ha un rettangolo di mura disegnato con `drawIsometricBox` molto sottile (h = 1 tile). I sottomoduli di un Worker Cloudflare sono edifici dentro le mura del distretto padre.
 
 ```typescript
@@ -928,12 +930,14 @@ PixiJS Ticker a 60fps nativo. Il feeling vintage si ottiene non dal framerate ma
 Tutti i movimenti usano `easeInOutQuad` — accelerazione e decelerazione morbida ma percettibile, non lineare.
 
 **2. Animazioni sottili sempre presenti**
+
 - Omini agenti: gambe in movimento, martello oscillante quando lavorano
 - Fumo edifici attivi: particelle PixiJS leggere che salgono
 - Awning market: oscillazione impercettibile
 - Fiamma temple: flickering della fiamma dorata
 
 **3. Transizioni di stato**
+
 - Edificio passa a `burning`: flash bianco → comparsa fiamme in 300ms
 - Agente arriva all'edificio: omino si ferma, martello appare in 150ms
 - Nuovo edificio (scan aggiornato): pop-in dal basso in 400ms
@@ -1034,6 +1038,7 @@ I container e VM spawnable hanno comportamento unico:
 **Always-on:** edificio sempre presente, colore normale. Status `running` → leggera emissione luminosa verde sul tetto.
 
 **On-demand (spawnable):**
+
 - Status `stopped` → edificio desaturato, leggermente traslucido (alpha 0.6)
 - Status `spawning` → animazione costruzione: edificio cresce dal basso in 800ms
 - Status `running` → edificio pieno, pulsazione verde
@@ -1146,7 +1151,7 @@ interface UrbanSin {
 
 | Peccato | Rilevatore | Severità | Come si trova |
 |---|---|---|---|
-| API key hardcodata nel codice | Rust regex | `inferno` | Pattern `sk-`, `Bearer `, `api_key =` nel sorgente |
+| API key hardcodata nel codice | Rust regex | `inferno` | Pattern `sk-`, `Bearer`, `api_key =` nel sorgente |
 | Secret in `.env` committato | Rust + git | `inferno` | File `.env` presente in `git log` |
 | Import ciclico | Rust graph | `fire` | Ciclo nel road graph già costruito |
 | File non toccato da 90+ giorni ma con dipendenze attive | Rust + git log | `smoke` | `git log --follow` + data ultimo commit |

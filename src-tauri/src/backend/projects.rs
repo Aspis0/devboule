@@ -4725,7 +4725,7 @@ fn build_windows_agent_script(
         // `Write-Host $prompt` here would print the token into the ConPTY ring
         // buffer / snapshot / xterm viewer. Only the (non-secret) clipboard hint
         // is echoed; the script-level "prompt copied to clipboard" line follows.
-        "Write-Host 'Aspis agent prompt is copied to clipboard.'".to_string()
+        "Write-Host 'Devboule agent prompt is copied to clipboard.'".to_string()
     } else if client == "codex" {
         let app_bin = resolve_app_binary();
         let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -4779,9 +4779,9 @@ Remove-Item -LiteralPath $promptDir -Recurse -Force -ErrorAction SilentlyContinu
             .to_string()
     };
     let copied_hint = if is_custom {
-        "Write-Host 'Aspis agent prompt copied to clipboard; also at' $env:ASPIS_AGENT_PROMPT_FILE\n"
+        "Write-Host 'Devboule agent prompt copied to clipboard; also at' $env:ASPIS_AGENT_PROMPT_FILE\n"
     } else {
-        "Write-Host 'Aspis agent prompt copied to clipboard.'\n"
+        "Write-Host 'Devboule agent prompt copied to clipboard.'\n"
     };
     // B1 (custom path only): the verbatim operator command — and any interactive
     // shell it leaves behind — runs in THIS PowerShell scope, where `$prompt` still
@@ -5128,10 +5128,10 @@ fn build_macos_agent_script(
     ));
     if is_custom {
         script.push_str(
-            "echo \"Aspis agent prompt copied to clipboard; also at $ASPIS_AGENT_PROMPT_FILE\"\n",
+            "echo \"Devboule agent prompt copied to clipboard; also at $ASPIS_AGENT_PROMPT_FILE\"\n",
         );
     } else {
-        script.push_str("echo 'Aspis agent prompt copied to clipboard.'\n");
+        script.push_str("echo 'Devboule agent prompt copied to clipboard.'\n");
     }
     // FIX 2(c) [corrected by the max-recall adversarial pass] — clear `$PROMPT` before the
     // command line for every client EXCEPT the codex/claude built-ins. `$PROMPT` holds the
@@ -6706,7 +6706,7 @@ fn project_git_status(root_value: Option<&str>) -> ProjectGitStatus {
             .push("Project root is not inside a Git repository.".into());
         status
             .required_actions
-            .push("Use a specific code repo root, not the whole Aspis Bio workspace.".into());
+            .push("Use a specific code repo root, not the whole Devboule workspace.".into());
         status.suggested_repos = suggested_git_repos_for_root(&resolved_root);
         return status;
     };
@@ -12025,7 +12025,7 @@ updated_at: 2026-05-28T00:00:00Z
             "lists the covered languages: {block}"
         );
         // Product-general: no product/cloud hardcoding in the injected text.
-        for needle in ["Aspis", "Cloudflare", "Scaleway"] {
+        for needle in ["Devboule", "Cloudflare", "Scaleway"] {
             assert!(
                 !block.contains(needle),
                 "must be product-general; found {needle}: {block}"
@@ -12145,7 +12145,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             "Safe must not encourage agentic: {block}"
         );
         // Product-general: still no product/cloud hardcoding.
-        for needle in ["Aspis", "Cloudflare", "Scaleway"] {
+        for needle in ["Devboule", "Cloudflare", "Scaleway"] {
             assert!(
                 !block.contains(needle),
                 "product-general; found {needle}: {block}"
@@ -15768,7 +15768,7 @@ TASK SIZING: calibrate each task to 'qwen3.6-27b'. A smaller or less-capable min
             !langs.contains(&"Rust"),
             "Rust has only Coarse runners -> excluded"
         );
-        for needle in ["Aspis", "Cloudflare", "Scaleway"] {
+        for needle in ["Devboule", "Cloudflare", "Scaleway"] {
             assert!(!langs.contains(&needle), "product-general; found {needle}");
         }
     }

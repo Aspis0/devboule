@@ -140,7 +140,7 @@ impl OracleErrorKind {
     fn default_remediation(self) -> &'static str {
         match self {
             OracleErrorKind::NoWorkspaceRoot => {
-                "Open Aspis → Oracle and choose your workspace folder."
+                "Open Devboule → Oracle and choose your workspace folder."
             }
             OracleErrorKind::ServerUnavailable => {
                 "Start the Oracle runtime (Oracle → Run doctor), then try again."

@@ -1246,7 +1246,7 @@ export function CloudflareView() {
                   {resourceTabs.find((t) => t.id === resourceType)?.label} inventory
                 </h3>
                 <p className="mt-1 text-[12px] text-cream-500">
-                  Live inventory from the pinned Aspis Bio account scope. Inspect-only.
+                  Live inventory from the pinned Devboule account scope. Inspect-only.
                 </p>
               </div>
               <label className="flex items-center gap-2 rounded-xl border border-cream-200 bg-white px-3 py-2 sm:w-72">
@@ -1271,7 +1271,7 @@ export function CloudflareView() {
                     type="button"
                     onClick={() => setSelectedResourceId(resource.id)}
                     data-help-title={`${resource.name} is a Cloudflare ${resource.resourceType} resource.`}
-                    data-help-lines="Selecting a resource opens its details and API equivalent on the right.|For Aspis Bio, use this to understand which resources exist before adding app actions.|Selection is read-only and does not modify Cloudflare.|If a resource looks wrong, check the pinned account scope and run sync again."
+                    data-help-lines="Selecting a resource opens its details and API equivalent on the right.|For Devboule, use this to understand which resources exist before adding app actions.|Selection is read-only and does not modify Cloudflare.|If a resource looks wrong, check the pinned account scope and run sync again."
                     className={`grid w-full grid-cols-1 gap-1 border-b border-cream-50 px-3 py-2 text-left last:border-b-0 md:grid-cols-[minmax(0,1.25fr)_130px_minmax(0,0.85fr)] md:items-center ${
                       active ? "bg-terracotta/[0.06]" : "bg-white hover:bg-cream-50"
                     }`}
@@ -1531,7 +1531,7 @@ function Metric({ label, value }: { label: string; value: string }) {
     <div
       className="min-w-0"
       data-help-title={`${label} is a Cloudflare readiness fact.`}
-      data-help-lines="These facts summarize the currently synced Cloudflare account, Worker, resource, token, or write state.|For Aspis Bio, use them to verify scope and readiness before smoke tests, env writes, rotations, or agent launches.|A metric can be stale after token or account changes.|Run Sync Cloudflare when facts do not match the provider console."
+      data-help-lines="These facts summarize the currently synced Cloudflare account, Worker, resource, token, or write state.|For Devboule, use them to verify scope and readiness before smoke tests, env writes, rotations, or agent launches.|A metric can be stale after token or account changes.|Run Sync Cloudflare when facts do not match the provider console."
     >
       <p className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">{label}</p>
       <p className="mt-1 truncate text-[13px] font-semibold text-cream-800">{value}</p>
@@ -1551,7 +1551,7 @@ function DetailList({
   return (
     <div
       data-help-title={`${title} explains part of the selected Worker.`}
-      data-help-lines="Worker details show how traffic reaches edge code and which runtime metadata is known.|For Aspis Bio, use routes, runtime, and drift warnings before changing env or secrets.|Missing metadata is a warning to inspect the Worker directly in Cloudflare.|This list is read-only."
+      data-help-lines="Worker details show how traffic reaches edge code and which runtime metadata is known.|For Devboule, use routes, runtime, and drift warnings before changing env or secrets.|Missing metadata is a warning to inspect the Worker directly in Cloudflare.|This list is read-only."
     >
       <p className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-cream-400">
         {title}

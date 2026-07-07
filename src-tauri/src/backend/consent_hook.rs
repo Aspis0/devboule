@@ -144,8 +144,14 @@ pub fn run() -> i32 {
     // FAIL-CLOSED: any error below prints `deny` and exits 0. We never panic.
     let decision = decide();
     let (allow, reason) = match decision {
-        Ok(true) => (true, "Allowed by the human via Aspis consent.".to_string()),
-        Ok(false) => (false, "Denied by the human via Aspis consent.".to_string()),
+        Ok(true) => (
+            true,
+            "Allowed by the human via Devboule consent.".to_string(),
+        ),
+        Ok(false) => (
+            false,
+            "Denied by the human via Devboule consent.".to_string(),
+        ),
         Err(reason) => (false, reason), // fail-closed deny with the cause.
     };
     println!("{}", hook_output_json(allow, &reason));
@@ -180,7 +186,7 @@ fn decide() -> Result<bool, String> {
     //    we cannot reach the consent UI, so fail-closed deny.
     let bridge = std::env::var("ASPIS_CONSENT_BRIDGE").unwrap_or_default();
     if bridge.trim().is_empty() {
-        return Err("Aspis consent bridge is not configured (no ASPIS_CONSENT_BRIDGE).".into());
+        return Err("Devboule consent bridge is not configured (no ASPIS_CONSENT_BRIDGE).".into());
     }
     let projects_dir = Path::new(&bridge);
     let agent_id = std::env::var("ASPIS_CONSENT_AGENT_ID").unwrap_or_default();
@@ -271,8 +277,7 @@ fn decide() -> Result<bool, String> {
                     );
                 }
                 if !agent_id.is_empty() {
-                    if let Some(session) =
-                        live.sessions.iter_mut().find(|s| s.agent_id == agent_id)
+                    if let Some(session) = live.sessions.iter_mut().find(|s| s.agent_id == agent_id)
                     {
                         session.needs_user = None;
                     }
@@ -335,7 +340,14 @@ mod tests {
     #[test]
     fn read_only_tools_allow_fast() {
         for t in [
-            "Read", "Glob", "Grep", "LS", "Task", "WebFetch", "WebSearch", "TodoWrite",
+            "Read",
+            "Glob",
+            "Grep",
+            "LS",
+            "Task",
+            "WebFetch",
+            "WebSearch",
+            "TodoWrite",
         ] {
             assert_eq!(hook_tool_to_kind(t), None, "tool {t} must allow-fast");
         }

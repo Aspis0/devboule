@@ -1,10 +1,10 @@
-# Aspis Management
+# Devboule
 
 Last major documentation update: 2026-06-03.
 
-Aspis Management is the local command center for Aspis Bio. It is a Windows
-desktop app today, built with Tauri, React and Rust, designed to manage the
-Aspis Bio workspace, cloud infrastructure, AI/Oracle memory, project Kanban,
+Devboule is the local command center for your development workspace. It is a
+desktop app built with Tauri, React and Rust, designed to manage your
+workspace, cloud infrastructure, AI/Oracle memory, project Kanban,
 CLI agents, provider credentials, GitHub access, collaborator device invites
 and encrypted first-setup packages.
 
@@ -12,7 +12,7 @@ The short version:
 
 - It is not a marketing dashboard.
 - It is not a generic cloud console clone.
-- It is the local admin/control plane for Aspis Bio.
+- It is the local admin/control plane for your development workflow.
 - It keeps dangerous tokens in the OS vault, not in React state or Markdown.
 - It tries to make every risky action scoped, explainable and auditable.
 - It is meant to coordinate humans, Codex, Claude and cheaper AI agents without
@@ -22,12 +22,12 @@ The current app is still pre-production, but a lot of the backend is real:
 
 - Windows Hello gate.
 - Cloudflare inventory and guarded Worker secret rotation.
-- Scaleway Aspis Bio project inventory and guarded VM/serverless actions.
+- Scaleway project inventory and guarded VM/serverless actions.
 - Oracle chunk/vector index with API-only (remote, GDPR-gated) LLM answers.
 - Projects as Markdown-backed Kanban files.
 - Agent launch/control room and local MCP tools.
 - GitHub token status and repo access checks.
-- Workspace hygiene scanner for the giant Aspis Bio folder.
+- Workspace hygiene scanner for the project folder.
 - Devices & Invites foundation.
 - Encrypted workspace bootstrap package foundation.
 
@@ -37,14 +37,13 @@ These are product rules, not suggestions.
 
 1. Secrets never go into project Markdown, Oracle, GitHub, package README files,
    agent prompts, logs or screenshots.
-2. Cloudflare and Scaleway operations must stay scoped to Aspis Bio.
+2. Cloudflare and Scaleway operations must stay scoped to the project.
 3. Scaleway default/non-Bio projects must not be treated as safe targets.
 4. Agents should update project state through MCP, not by manually clicking UI.
 5. Coders can mutate code and scoped cloud resources. Verifiers and
    orchestrators should be read/status oriented.
 6. `Done` is verifier-gated for serious project tasks.
-7. The huge `aspis bio` folder is not a Git repo and must not be synced as one
-   blob.
+7. Large data folders are not Git repos and must not be synced as blobs.
 8. Bootstrap packages may be uploaded to any cloud only after encryption.
 9. Mac collaborators need Keychain/Touch ID style flows, not Windows-only
    assumptions.
@@ -123,7 +122,7 @@ per-resource detail with guarded, safe-edit actions**:
 
 ### Scaleway coverage expansion (P0–P8)
 
-`Compute` went from 3 hardcoded tabs to the full set of products Aspis Bio uses,
+`Compute` went from 3 hardcoded tabs to the full set of products Devboule uses,
 each with **full CRUD** behind confirm-by-name + project-pin HARD-FAIL:
 
 - A resource-type selector over GPU / CPU VM / Serverless **Functions** /
@@ -214,7 +213,7 @@ The frontend includes a global Help Mode overlay. The intended UX is:
 
 Help text is embedded through `data-help-title` and `data-help-lines` on UI
 elements. The goal is to explain not only what a button does, but why it matters
-for Aspis Bio.
+for Devboule.
 
 Good help text should explain:
 
@@ -229,44 +228,44 @@ Good help text should explain:
 Local app repo:
 
 ```text
-C:\Users\gualt\Desktop\Aspis Management
+C:\Users\gualt\Desktop\Devboule
 ```
 
-Large Aspis Bio workspace:
+Large Devboule workspace:
 
 ```text
-C:\Users\gualt\Desktop\aspis bio
+C:\Users\gualt\Desktop\devboule
 ```
 
 Project files:
 
 ```text
-C:\Users\gualt\Desktop\Aspis Management\projects\*.md
+C:\Users\gualt\Desktop\Devboule\projects\*.md
 ```
 
 Agent telemetry:
 
 ```text
-C:\Users\gualt\Desktop\Aspis Management\projects\.aspis-agents.json
+C:\Users\gualt\Desktop\Devboule\projects\.aspis-agents.json
 ```
 
 Oracle local code and data:
 
 ```text
-C:\Users\gualt\Desktop\Aspis Management\oracle
-C:\Users\gualt\Desktop\Aspis Management\oracle-data
+C:\Users\gualt\Desktop\Devboule\oracle
+C:\Users\gualt\Desktop\Devboule\oracle-data
 ```
 
-Workspace policy and generated reports in the big Aspis Bio folder:
+Workspace policy and generated reports in the big Devboule folder:
 
 ```text
-C:\Users\gualt\Desktop\aspis bio\.aspisignore
-C:\Users\gualt\Desktop\aspis bio\.oracleignore
-C:\Users\gualt\Desktop\aspis bio\ASPIS_WORKSPACE.md
-C:\Users\gualt\Desktop\aspis bio\_workspace\inventory
-C:\Users\gualt\Desktop\aspis bio\_workspace\manifests
-C:\Users\gualt\Desktop\aspis bio\_workspace\packages
-C:\Users\gualt\Desktop\aspis bio\_workspace\imports
+C:\Users\gualt\Desktop\devboule\.aspisignore
+C:\Users\gualt\Desktop\devboule\.oracleignore
+C:\Users\gualt\Desktop\devboule\ASPIS_WORKSPACE.md
+C:\Users\gualt\Desktop\devboule\_workspace\inventory
+C:\Users\gualt\Desktop\devboule\_workspace\manifests
+C:\Users\gualt\Desktop\devboule\_workspace\packages
+C:\Users\gualt\Desktop\devboule\_workspace\imports
 ```
 
 Session breadcrumbs for Codex/Claude sync are kept outside this repo:
@@ -318,7 +317,7 @@ Never paste secrets into:
 
 ## Cloudflare
 
-Cloudflare is used for Aspis Bio Workers and related platform resources.
+Cloudflare is used for Devboule Workers and related platform resources.
 
 The app currently supports:
 
@@ -361,7 +360,7 @@ Planned/partially represented Cloudflare areas:
 
 Important safety rules:
 
-- Non-Aspis-Bio sibling workers should be hidden from mutation surfaces.
+- Non-project sibling workers should be hidden from mutation surfaces.
 - Worker secret rotation must not expose the secret value in UI, logs or
   returned JSON.
 - If an account is ambiguous, the app should require a pinned account id.
@@ -382,7 +381,7 @@ Kanban-gated.
 
 ## Scaleway
 
-Scaleway is used for Aspis Bio CPU/GPU VMs, serverless, object storage and
+Scaleway is used for Devboule CPU/GPU VMs, serverless, object storage and
 related infrastructure.
 
 The user has multiple Scaleway projects in the same account. A critical rule is
@@ -391,8 +390,8 @@ that the app must target `aspis-bio`, not the default/non-Bio launcher project.
 The app currently supports:
 
 - pinned Scaleway project id
-- Aspis Bio project selector/validation
-- default project exclusion when it is not Aspis Bio
+- Devboule project selector/validation
+- default project exclusion when it is not Devboule
 - CPU/GPU Instance inventory
 - guarded start/stop/reboot/delete operations
 - delete/terminate handling for VMs
@@ -453,7 +452,7 @@ becomes expensive.
 
 ## Workspace Hygiene
 
-The Aspis Bio folder is huge and mixed:
+The Devboule folder is huge and mixed:
 
 - source repos
 - docs
@@ -470,7 +469,7 @@ It must not be treated as one Git repo or one sync folder.
 
 Workspace Hygiene does:
 
-- resolve the configured Aspis Bio root
+- resolve the configured Devboule root
 - scan top-level folder sizes
 - find large files
 - find Git repo roots
@@ -531,7 +530,7 @@ Verified current package-candidate smoke on 2026-05-29:
 
 GitHub is the shared source-code layer.
 
-The big Aspis Bio workspace is not what collaborators should clone. They should
+The big Devboule workspace is not what collaborators should clone. They should
 clone exact source repos.
 
 Known code repos in the workspace policy:
@@ -634,7 +633,7 @@ Projects page includes:
 
 ## Agents
 
-Aspis Management is designed to coordinate several kinds of agents:
+Devboule is designed to coordinate several kinds of agents:
 
 - Codex
 - Claude Code
@@ -753,8 +752,8 @@ system.
 Manual command shape:
 
 ```powershell
-cd "C:\Users\gualt\Desktop\Aspis Management"
-python -m oracle.server.aspis_mcp --root "C:\Users\gualt\Desktop\Aspis Management" --projects-dir "C:\Users\gualt\Desktop\Aspis Management\projects"
+cd "C:\Users\gualt\Desktop\Devboule"
+python -m oracle.server.aspis_mcp --root "C:\Users\gualt\Desktop\Devboule" --projects-dir "C:\Users\gualt\Desktop\Devboule\projects"
 ```
 
 Preflight:
@@ -769,19 +768,19 @@ Client config shape:
 ```json
 {
   "mcpServers": {
-    "aspis-management": {
+    "devboule": {
       "command": "python",
       "args": [
         "-m",
         "oracle.server.aspis_mcp",
         "--root",
-        "C:\\Users\\gualt\\Desktop\\Aspis Management",
+        "C:\\Users\\gualt\\Desktop\\Devboule",
         "--projects-dir",
-        "C:\\Users\\gualt\\Desktop\\Aspis Management\\projects"
+        "C:\\Users\\gualt\\Desktop\\Devboule\\projects"
       ],
-      "cwd": "C:\\Users\\gualt\\Desktop\\Aspis Management",
+      "cwd": "C:\\Users\\gualt\\Desktop\\Devboule",
       "env": {
-        "PYTHONPATH": "C:\\Users\\gualt\\Desktop\\Aspis Management",
+        "PYTHONPATH": "C:\\Users\\gualt\\Desktop\\Devboule",
         "PYTHONIOENCODING": "utf-8",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1"
@@ -793,7 +792,7 @@ Client config shape:
 
 Important MCP behavior:
 
-- MCP fails closed if it is not launched with the Aspis Management root.
+- MCP fails closed if it is not launched with the Devboule root.
 - App-launched agents receive an app-issued launch token.
 - `agent_register` returns a private session token.
 - Every later tool call must include `session_token`.
@@ -846,14 +845,14 @@ Future preflight checks still needed:
 - role token profile exists if cloud tools are needed
 - GitHub access is available if code work needs push/PR
 
-5. App opens the terminal with prompt, role, launch token and MCP config.
-6. UI shows launch pending until `agent_register` succeeds.
-7. UI shows heartbeat age, last event, current claim and last MCP error.
-8. If heartbeat is stale, UI shows recovery guidance and a `Recovery` copy
+1. App opens the terminal with prompt, role, launch token and MCP config.
+2. UI shows launch pending until `agent_register` succeeds.
+3. UI shows heartbeat age, last event, current claim and last MCP error.
+4. If heartbeat is stale, UI shows recovery guidance and a `Recovery` copy
    action. A real `Reconnect` backend action and `Mark stale` command are still
    future work.
-9. If MCP fails, UI tells the human exactly what command/config to fix.
-10. Agent final status is accepted only if the project Markdown and telemetry
+5. If MCP fails, UI tells the human exactly what command/config to fix.
+6. Agent final status is accepted only if the project Markdown and telemetry
     file actually changed.
 
 MCP is enough for local Codex/Claude integration when wrapped like this.
@@ -988,8 +987,8 @@ The server now has **two** tokens, so an agent cannot read your whole corpus:
 
 ## Oracle
 
-Oracle is the local knowledge/retrieval layer for Aspis Management and the
-Aspis Bio workspace.
+Oracle is the local knowledge/retrieval layer for Devboule and the
+Devboule workspace.
 
 It has two jobs:
 
@@ -1047,10 +1046,10 @@ Oracle should not index:
 
 ## Oracle Indexing And Updates
 
-Oracle index root defaults to the Aspis Bio workspace when present:
+Oracle index root defaults to the Devboule workspace when present:
 
 ```text
-C:\Users\gualt\Desktop\aspis bio
+C:\Users\gualt\Desktop\devboule
 ```
 
 It can also be controlled by:
@@ -1073,10 +1072,10 @@ that case, re-run indexing from the app or command line.
 Manual indexing example:
 
 ```powershell
-python -m oracle.cli index-chunks --root "C:\Users\gualt\Desktop\Aspis Management" --progress
+python -m oracle.cli index-chunks --root "C:\Users\gualt\Desktop\Devboule" --progress
 ```
 
-For the big Aspis Bio folder, use the configured Aspis Bio root instead.
+For the big Devboule folder, use the configured Devboule root instead.
 
 ## Oracle LLM Policy
 
@@ -1200,7 +1199,7 @@ Workspace Bootstrap is the first encrypted package system for collaborators.
 
 Problem:
 
-- The Aspis Bio folder is huge.
+- The Devboule folder is huge.
 - GitHub should hold source code, not the entire workspace.
 - A collaborator needs first context without exposing secrets or raw local data.
 - Cloud drives are convenient but should not see plaintext.
@@ -1217,7 +1216,7 @@ Current solution:
 - User uploads the encrypted `.aspiswspkg` manually to kDrive, Google Drive,
   Dropbox, Box, Cloudflare R2 or another storage provider.
 - Collaborator downloads the encrypted file.
-- Collaborator opens Aspis Management and decrypts using their local device key.
+- Collaborator opens Devboule and decrypts using their local device key.
 - Restored files go under `_workspace/imports`.
 
 Current crypto format:
@@ -1375,7 +1374,7 @@ Expected behavior:
 Important token guidance:
 
 - Use narrow scopes.
-- Prefer pinned Aspis Bio account/project ids.
+- Prefer pinned Devboule account/project ids.
 - Temporary tokens expire; replace them in app when sync fails.
 - Human dashboard tokens are not agent tokens.
 - Agent tokens should be role-specific.
@@ -1498,9 +1497,9 @@ npm run tauri -- build
 Release artifacts:
 
 ```text
-src-tauri\target\release\aspis-management.exe
-src-tauri\target\release\bundle\msi\Aspis Management_0.1.0_x64_en-US.msi
-src-tauri\target\release\bundle\nsis\Aspis Management_0.1.0_x64-setup.exe
+src-tauri\target\release\devboule.exe
+src-tauri\target\release\bundle\msi\Devboule_0.1.0_x64_en-US.msi
+src-tauri\target\release\bundle\nsis\Devboule_0.1.0_x64-setup.exe
 ```
 
 Known non-blocking warnings:
@@ -1544,9 +1543,9 @@ Be strict about these. Do not overclaim.
 - Provider inventories can be partial depending on token scopes.
 - Budget is not an invoice.
 - Cloudflare write proof depends on valid scoped tokens.
-- Scaleway write proof depends on valid Aspis Bio project token.
+- Scaleway write proof depends on valid Devboule project token.
 - Agent token injection is still a sensitive area and must stay audited.
-- The huge Aspis Bio folder still needs ongoing hygiene.
+- The huge Devboule folder still needs ongoing hygiene.
 
 ## Development Principles
 
@@ -1613,7 +1612,7 @@ Medium priority:
 
 Oracle:
 
-The local retrieval and answer system for Aspis Management/Aspis Bio files.
+The local retrieval and answer system for Devboule/Devboule files.
 
 MCP:
 
@@ -1660,11 +1659,11 @@ Data protection compliance gate. Required for remote Oracle LLM providers.
 
 ## Final Mental Model
 
-Aspis Management is the local admin cockpit.
+Devboule is the local admin cockpit.
 
 GitHub holds source code.
 
-The huge Aspis Bio folder is a local workspace, not a repo.
+The huge Devboule folder is a local workspace, not a repo.
 
 Oracle makes the workspace searchable and useful to humans/agents.
 
@@ -1680,5 +1679,5 @@ Devices & Invites decide which computers are trusted.
 Workspace Bootstrap gives trusted computers an encrypted first setup package.
 
 The long-term goal is a secure local-first management app that lets humans and
-AI agents operate Aspis Bio together without leaking secrets, spending money by
+AI agents operate Devboule together without leaking secrets, spending money by
 accident, or losing track of who did what.

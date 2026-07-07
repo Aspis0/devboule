@@ -45,7 +45,7 @@ export function SecretsCard({ secrets }: SecretsCardProps) {
               <button
                 onClick={() => toggleSecret(secret.id)}
                 data-help-title={`This reveals or hides ${secret.name}.`}
-                data-help-lines="Reveal is only for local inspection of a masked credential.|For Aspis Bio, raw keys should stay out of screenshots, project notes, Oracle, and agent prompts.|If you need to rotate or replace a provider token, use the full Secrets page.|Hide the value again before sharing the screen."
+                data-help-lines="Reveal is only for local inspection of a masked credential.|For Devboule, raw keys should stay out of screenshots, project notes, Oracle, and agent prompts.|If you need to rotate or replace a provider token, use the full Secrets page.|Hide the value again before sharing the screen."
                 className="p-1.5 rounded-xl hover:bg-cream-50 transition-colors"
               >
                 {revealedSecrets[secret.id] ? (
@@ -57,7 +57,7 @@ export function SecretsCard({ secrets }: SecretsCardProps) {
               <button
                 className="p-1.5 rounded-xl hover:bg-cream-50 transition-colors group"
                 data-help-title={`Rotation shortcut for ${secret.name}.`}
-                data-help-lines="This card-level shortcut is visual only unless wired to a backend rotation flow.|For Aspis Bio, real token rotation should happen in Secrets or the provider console with scope audit after saving.|Temporary tokens expire, so keep expiry dates in task notes without storing raw token values.|Do not assume this icon rotated anything unless the page reports success."
+                data-help-lines="This card-level shortcut is visual only unless wired to a backend rotation flow.|For Devboule, real token rotation should happen in Secrets or the provider console with scope audit after saving.|Temporary tokens expire, so keep expiry dates in task notes without storing raw token values.|Do not assume this icon rotated anything unless the page reports success."
               >
                 <RotateCw className="w-3.5 h-3.5 text-cream-400 group-hover:text-terracotta transition-colors" />
               </button>

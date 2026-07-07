@@ -349,7 +349,7 @@ pub(crate) fn parse_omlx_models(body: &str) -> Vec<String> {
 /// `detect_providers` call (detection is infrequent, so caching is not worth a `OnceLock`).
 pub(crate) fn probe_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent("Aspis-Management/0.1")
+        .user_agent("Devboule/0.1")
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)

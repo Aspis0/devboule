@@ -2680,7 +2680,7 @@ root_path: "{escaped_work_root}"
             # An id absent from the inventory is rejected outright.
             with self.assertRaises(McpError) as ctx2:
                 scaleway_resource_action("token", "ghost-1", "start", None, "proj-1")
-            self.assertIn("not in the Aspis Bio inventory", str(ctx2.exception))
+            self.assertIn("not in the Devboule inventory", str(ctx2.exception))
 
     def test_provider_error_sanitizer_redacts_access_keys_and_bearers(self):
         raw = (

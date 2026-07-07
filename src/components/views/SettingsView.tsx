@@ -113,7 +113,7 @@ export function SettingsView() {
                 <p className="text-[12px] text-cream-400">
                   {roleStatus?.provisioned === false
                     ? "Onboarding not complete"
-                    : "Aspis Bio workspace"}
+                    : "Devboule workspace"}
                 </p>
               </div>
             </div>

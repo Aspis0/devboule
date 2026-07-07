@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn city_state_round_trips_with_camel_case_field_names() {
-        let mut city = CityState::empty("Aspis Bio", "Alpha");
+        let mut city = CityState::empty("Devboule", "Alpha");
         city.generated_at = "2026-05-29T00:00:00Z".into();
         city.buildings.push(Building {
             file_id: "fid-1".into(),
@@ -686,7 +686,7 @@ mod tests {
 
         let json = serde_json::to_string(&city).unwrap();
         // camelCase contract verification (matches TS in src/types/city.ts).
-        assert!(json.contains("\"projectName\":\"Aspis Bio\""));
+        assert!(json.contains("\"projectName\":\"Devboule\""));
         assert!(json.contains("\"generatedAt\""));
         assert!(json.contains("\"gridSize\""));
         assert!(json.contains("\"fileId\":\"fid-1\""));
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn feature_round_trips_with_camel_case_and_kind() {
-        let mut city = CityState::empty("Aspis Bio", "Alpha");
+        let mut city = CityState::empty("Devboule", "Alpha");
         city.features.push(Feature {
             id: "rnaseq".into(),
             label: "Rnaseq".into(),

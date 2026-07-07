@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tauri::State;
 
 const GITHUB_API: &str = "https://api.github.com";
-const USER_AGENT: &str = "Aspis-Management/0.1";
+const USER_AGENT: &str = "Devboule/0.1";
 
 /// One shared blocking GitHub HTTP client. A `reqwest::blocking` client owns an
 /// internal runtime; dropping it inside a tokio async context panics. Holding it

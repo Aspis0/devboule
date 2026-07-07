@@ -326,7 +326,7 @@ def build_answer_prompt(query: str, context: list[dict]) -> str:
             )
         )
     context_text = "\n\n---\n\n".join(blocks)
-    return f"""You are Aspis Architecture Oracle.
+    return f"""You are Devboule Architecture Oracle.
 Answer the user using ONLY the context chunks below.
 Always answer in English, even if the user query is in another language.
 Keep the answer short: at most 5 sentences.
@@ -473,7 +473,7 @@ LOCAL_LLM_PROVIDERS = {"omlx", "ollama"}
 
 def enforce_remote_llm_provider_allowlist(config: dict) -> None:
     # PRIVACY FAIL-CLOSED: a non-allowlisted provider is never allowed to proceed
-    # and must NOT be silently degraded — sending Aspis Bio code/text to an
+    # and must NOT be silently degraded — sending Devboule code/text to an
     # un-vetted endpoint is exactly what this allowlist prevents. Callers raise on
     # this; only missing credentials are recoverable. The ZDR/GDPR gates were
     # removed; the provider allowlist is the sole remaining gate.

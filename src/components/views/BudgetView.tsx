@@ -102,7 +102,7 @@ export function BudgetView() {
         <div
           className="rounded-2xl border border-cream-200 bg-white p-5 lg:col-span-1"
           data-help-title="Unified monthly signal is the rough cost headline."
-          data-help-lines="This is a planning number from the live inventory, not a provider invoice.|For Aspis Bio, use it to spot storage or compute drift before GPU/VM work gets expensive.|Cloudflare live usage metrics are not fully connected yet.|Treat it as a warning layer, then verify in Scaleway or Cloudflare billing."
+          data-help-lines="This is a planning number from the live inventory, not a provider invoice.|For Devboule, use it to spot storage or compute drift before GPU/VM work gets expensive.|Cloudflare live usage metrics are not fully connected yet.|Treat it as a warning layer, then verify in Scaleway or Cloudflare billing."
         >
           <div className="mb-4 flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-teal/10">
@@ -127,7 +127,7 @@ export function BudgetView() {
         <div
           className="rounded-2xl border border-cream-200 bg-white p-5"
           data-help-title="Cloudflare budget card is planning-only for now."
-          data-help-lines="This card prepares Worker, R2, KV, and adjacent Cloudflare pricing context.|For Aspis Bio, it helps estimate edge and storage cost before enabling heavier usage.|It is not invoice-grade until live Cloudflare billing metrics are wired.|Use Cloudflare console billing for final confirmation."
+          data-help-lines="This card prepares Worker, R2, KV, and adjacent Cloudflare pricing context.|For Devboule, it helps estimate edge and storage cost before enabling heavier usage.|It is not invoice-grade until live Cloudflare billing metrics are wired.|Use Cloudflare console billing for final confirmation."
         >
           <div className="mb-4 flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-orange-50">
@@ -152,7 +152,7 @@ export function BudgetView() {
         <div
           className="rounded-2xl border border-cream-200 bg-white p-5"
           data-help-title="Scaleway budget card uses live inventory signals."
-          data-help-lines="This card summarizes synced compute and storage resources from the pinned Scaleway project.|For Aspis Bio, it is the main early warning for idle GPU/CPU VM and storage spend.|Storage estimates are closer than compute totals because VM billing metrics are not full invoices here.|Go to Compute before stopping, terminating, or deleting resources."
+          data-help-lines="This card summarizes synced compute and storage resources from the pinned Scaleway project.|For Devboule, it is the main early warning for idle GPU/CPU VM and storage spend.|Storage estimates are closer than compute totals because VM billing metrics are not full invoices here.|Go to Compute before stopping, terminating, or deleting resources."
         >
           <div className="mb-4 flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sage/10">
@@ -197,7 +197,7 @@ export function BudgetView() {
               key={item.label}
               className="rounded-xl bg-cream-50 px-3 py-3"
               data-help-title={`${item.label} is a Cloudflare Worker pricing reference.`}
-              data-help-lines="This is a published pricing reference, not live usage.|For Aspis Bio, use it before putting heavy API, analysis, or agent traffic behind Workers.|Extra requests and CPU time can matter if pipelines call edge endpoints often.|Confirm exact billing in Cloudflare before treating this as invoice-grade."
+              data-help-lines="This is a published pricing reference, not live usage.|For Devboule, use it before putting heavy API, analysis, or agent traffic behind Workers.|Extra requests and CPU time can matter if pipelines call edge endpoints often.|Confirm exact billing in Cloudflare before treating this as invoice-grade."
             >
               <p className="text-[12px] font-semibold text-cream-800">{item.label}</p>
               <p className="mt-1 text-[11px] text-cream-400">{item.included}</p>
@@ -211,7 +211,7 @@ export function BudgetView() {
               key={item.label}
               className="flex items-center justify-between gap-3 rounded-xl border border-cream-100 px-3 py-2"
               data-help-title={`${item.label} is adjacent Cloudflare pricing context.`}
-              data-help-lines="R2, KV, and related operations can become hidden cost when Workers read/write a lot.|For Aspis Bio, this matters for pipeline artifacts, cache data, queues, and agent-visible storage.|This row is a planning hint, not live usage.|Connect billing metrics before using it as a hard budget gate."
+              data-help-lines="R2, KV, and related operations can become hidden cost when Workers read/write a lot.|For Devboule, this matters for pipeline artifacts, cache data, queues, and agent-visible storage.|This row is a planning hint, not live usage.|Connect billing metrics before using it as a hard budget gate."
             >
               <div className="min-w-0">
                 <p className="truncate text-[12px] font-medium text-cream-700">{item.label}</p>
@@ -233,7 +233,7 @@ export function BudgetView() {
               key={item.id}
               className="rounded-2xl border border-cream-200 bg-white p-5"
               data-help-title={`${item.label} count shows live Scaleway compute inventory.`}
-              data-help-lines="This count comes from the latest Scaleway sync.|For Aspis Bio, GPU and CPU VM counts are important because running resources can cost real money.|A count alone does not prove whether machines are useful or idle.|Open Compute for lifecycle actions and live resource details."
+              data-help-lines="This count comes from the latest Scaleway sync.|For Devboule, GPU and CPU VM counts are important because running resources can cost real money.|A count alone does not prove whether machines are useful or idle.|Open Compute for lifecycle actions and live resource details."
             >
               <div className="mb-4 flex items-center gap-3">
                 <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-cream-50">
@@ -261,7 +261,7 @@ export function BudgetView() {
                 key={item.id}
                 className="flex items-center justify-between gap-3 rounded-xl bg-cream-50 px-3 py-2"
                 data-help-title={`${item.name} is a billable Scaleway storage item.`}
-                data-help-lines="Storage can keep costing money even after a VM is gone.|For Aspis Bio, delete unused VM disks, snapshots, and stale object artifacts after verifier approval.|Object bucket scans may be partial, so large buckets need provider-side confirmation.|Do not delete storage until you know which pipeline or model data it contains."
+                data-help-lines="Storage can keep costing money even after a VM is gone.|For Devboule, delete unused VM disks, snapshots, and stale object artifacts after verifier approval.|Object bucket scans may be partial, so large buckets need provider-side confirmation.|Do not delete storage until you know which pipeline or model data it contains."
               >
                 <div className="flex min-w-0 items-center gap-3">
                   <HardDrive className="h-4 w-4 shrink-0 text-cream-500" />
@@ -307,7 +307,7 @@ export function BudgetView() {
                 key={item.label}
                 className="flex items-center justify-between rounded-xl bg-cream-50 px-3 py-2"
                 data-help-title={`${item.label} is a Scaleway Object Storage price tier.`}
-                data-help-lines="Object Storage pricing depends on size, tier, operations, and retention behavior.|For Aspis Bio, buckets may hold pipeline inputs, outputs, embeddings, or backups.|This row explains the pricing model; it does not prove current bucket usage.|Use saved object credentials and sync to see live buckets."
+                data-help-lines="Object Storage pricing depends on size, tier, operations, and retention behavior.|For Devboule, buckets may hold pipeline inputs, outputs, embeddings, or backups.|This row explains the pricing model; it does not prove current bucket usage.|Use saved object credentials and sync to see live buckets."
               >
                 <div className="flex items-center gap-3">
                   <Boxes className="h-4 w-4 text-cream-500" />
@@ -338,7 +338,7 @@ export function BudgetView() {
               key={resource.id}
               className="flex items-center gap-3 rounded-xl bg-coral/5 px-3 py-2"
               data-help-title={`${resource.name} is flagged as a cost risk.`}
-              data-help-lines="Cost risk means the resource may be running or reserved without clear useful work.|For Aspis Bio, idle GPU/CPU VMs should be stopped or deleted quickly after confirming disks and project evidence.|Do not terminate blindly if the machine holds unsaved analysis output.|A verifier should confirm cleanup for expensive resources."
+              data-help-lines="Cost risk means the resource may be running or reserved without clear useful work.|For Devboule, idle GPU/CPU VMs should be stopped or deleted quickly after confirming disks and project evidence.|Do not terminate blindly if the machine holds unsaved analysis output.|A verifier should confirm cleanup for expensive resources."
             >
               <AlertTriangle className="h-4 w-4 shrink-0 text-coral" />
               <div className="min-w-0">

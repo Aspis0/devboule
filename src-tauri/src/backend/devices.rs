@@ -572,7 +572,7 @@ fn default_device_name() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .and_then(|value| clean_optional(&value))
-        .unwrap_or_else(|| "Aspis device".into())
+        .unwrap_or_else(|| "Devboule device".into())
 }
 
 fn platform_label() -> &'static str {

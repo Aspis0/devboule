@@ -64,7 +64,7 @@ const providerLabels: Record<string, string> = {
 const providerHelp: Record<ProviderId, string> = {
   cloudflare:
     "Use an account-owned API token for production. User/profile tokens are fine for local agents; Wrangler OAuth can read inventory, but secret rotation needs Workers Scripts Write.",
-  scaleway: "API token for Aspis Bio VM/serverless inventory plus start/stop/reboot/delete actions.",
+  scaleway: "API token for Devboule VM/serverless inventory plus start/stop/reboot/delete actions.",
 };
 
 const providerRequirements: Record<ProviderId, string[]> = {
@@ -75,7 +75,7 @@ const providerRequirements: Record<ProviderId, string[]> = {
     "AI Search Edit and AI Search Run for AI Search/AutoRAG checks.",
   ],
   scaleway: [
-    "Project pin must be the Aspis Bio project, not the default launcher project.",
+    "Project pin must be the Devboule project, not the default launcher project.",
     "Instance and Serverless read/write for VM start, stop and delete.",
     "Separate Object Storage access + secret keypair for live bucket inventory.",
   ],
@@ -323,7 +323,7 @@ export function SecretsView() {
               key={secret.provider}
               className="px-5 py-4"
               data-help-title={`${providerLabels[provider] || provider} credentials control provider access.`}
-              data-help-lines="This row is where the app stores and audits provider access for one cloud service.|For Aspis Bio, the important checks are token validity, pinned account/project scope, and whether the token is read-only or write-capable.|Raw token values should never be copied into projects, Oracle, terminal prompts, or source files.|After changing credentials, audit and sync before launching agents."
+              data-help-lines="This row is where the app stores and audits provider access for one cloud service.|For Devboule, the important checks are token validity, pinned account/project scope, and whether the token is read-only or write-capable.|Raw token values should never be copied into projects, Oracle, terminal prompts, or source files.|After changing credentials, audit and sync before launching agents."
             >
               <div className="flex flex-col gap-4">
                 <div className="flex items-start gap-4 min-w-0">
@@ -372,7 +372,7 @@ export function SecretsView() {
                         onChange={(event) => handleDraftChange(provider, event.target.value)}
                         placeholder={`Paste ${providerLabels[provider]} token`}
                         data-help-title={`${providerLabels[provider]} token is a private cloud access key.`}
-                        data-help-lines="A token lets the app read or change provider resources depending on its scopes.|Save human dashboard tokens here, not inside project notes or code.|Temporary tokens expire; rotate and save a new token here when sync starts failing.|Prefer narrow scopes and the pinned Aspis Bio account or project."
+                        data-help-lines="A token lets the app read or change provider resources depending on its scopes.|Save human dashboard tokens here, not inside project notes or code.|Temporary tokens expire; rotate and save a new token here when sync starts failing.|Prefer narrow scopes and the pinned Devboule account or project."
                         autoComplete="off"
                         spellCheck={false}
                         className="min-w-0 flex-1 rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-[12px] font-mono text-cream-800 outline-none focus:border-terracotta-200 focus:ring-2 focus:ring-terracotta/15"
@@ -456,7 +456,7 @@ export function SecretsView() {
                               : "Optional project id"
                           }
                           data-help-title="A provider scope pins the exact account or project."
-                          data-help-lines="Pinning prevents the app from accidentally showing or changing the wrong Cloudflare account or Scaleway project.|For Scaleway, use the Aspis Bio project id, not the default launcher project.|Saving a scope does not create cloud resources.|If the scope is wrong, sync results and agent tools become dangerous."
+                          data-help-lines="Pinning prevents the app from accidentally showing or changing the wrong Cloudflare account or Scaleway project.|For Scaleway, use the Devboule project id, not the default launcher project.|Saving a scope does not create cloud resources.|If the scope is wrong, sync results and agent tools become dangerous."
                           spellCheck={false}
                           className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[11px] font-mono text-cream-800 outline-none focus:border-teal/40 focus:ring-2 focus:ring-teal/10"
                         />
@@ -464,7 +464,7 @@ export function SecretsView() {
                           onClick={() => void handleSaveScope(provider)}
                           disabled={isLoading || scopeDraft.trim().length === 0}
                           data-help-title="This saves the provider scope pin."
-                          data-help-lines="The pin is stored locally and used by dashboard syncs and provider tools.|It helps isolate Aspis Bio from other projects in the same account.|It does not validate all permissions by itself; audit after saving.|Update it if you move resources to another account or project."
+                          data-help-lines="The pin is stored locally and used by dashboard syncs and provider tools.|It helps isolate Devboule from other projects in the same account.|It does not validate all permissions by itself; audit after saving.|Update it if you move resources to another account or project."
                           className="rounded-lg border border-cream-200 px-3 py-2 text-[11px] font-medium text-cream-600 hover:border-teal/30 hover:text-teal-dark disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           Pin

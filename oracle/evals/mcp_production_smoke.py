@@ -99,7 +99,9 @@ def seed_launch_pending_agents(
     state.setdefault("sessions", [])
     state.setdefault("claims", [])
     state.setdefault("events", [])
-    state["sessions"] = [item for item in state["sessions"] if item.get("agentId") not in agents]
+    state["sessions"] = [
+        item for item in state["sessions"] if item.get("agentId") not in agents
+    ]
     for agent_id, (role, token, task_id) in agents.items():
         state["sessions"].append(
             {
@@ -136,11 +138,15 @@ async def call(
     timeout: int = 60,
 ) -> Any:
     print(f"mcp-smoke call {name}", file=sys.stderr, flush=True)
-    result = await asyncio.wait_for(session.call_tool(name, args or {}), timeout=timeout)
+    result = await asyncio.wait_for(
+        session.call_tool(name, args or {}), timeout=timeout
+    )
     is_error = bool(getattr(result, "isError", False))
     if expect_error:
         if not is_error:
-            raise AssertionError(f"{name} unexpectedly succeeded: {text_payload(result)}")
+            raise AssertionError(
+                f"{name} unexpectedly succeeded: {text_payload(result)}"
+            )
         return text_payload(result)
     if is_error:
         raise AssertionError(f"{name} failed: {text_payload(result)}")
@@ -155,7 +161,9 @@ async def call_status(
 ) -> dict[str, Any]:
     print(f"mcp-smoke call {name}", file=sys.stderr, flush=True)
     try:
-        result = await asyncio.wait_for(session.call_tool(name, args or {}), timeout=timeout)
+        result = await asyncio.wait_for(
+            session.call_tool(name, args or {}), timeout=timeout
+        )
     except Exception as exc:
         return {"pass": False, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
     text = text_payload(result)
@@ -164,7 +172,11 @@ async def call_status(
     try:
         payload = json.loads(text) if text else {}
     except json.JSONDecodeError:
-        return {"pass": False, "error": "Tool returned non-JSON payload.", "raw": text[:500]}
+        return {
+            "pass": False,
+            "error": "Tool returned non-JSON payload.",
+            "raw": text[:500],
+        }
     return {"pass": True, "payload": payload}
 
 
@@ -175,7 +187,11 @@ async def run(
     live_providers: bool = False,
     project_id_override: str | None = None,
 ) -> dict[str, Any]:
-    project_id = project_id_override or (PROJECT_ID if keep_project else f"{PROJECT_ID}-smoke-{os.getpid()}-{time.time_ns()}")
+    project_id = project_id_override or (
+        PROJECT_ID
+        if keep_project
+        else f"{PROJECT_ID}-smoke-{os.getpid()}-{time.time_ns()}"
+    )
     agent_suffix = "" if keep_project and not project_id_override else f"-{project_id}"
     architect_id = f"prod-architect{agent_suffix}"
     coder_id = f"prod-code{agent_suffix}"
@@ -231,7 +247,14 @@ async def run(
     )
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "oracle.server.aspis_mcp", "--root", str(root), "--projects-dir", str(projects_dir)],
+        args=[
+            "-m",
+            "oracle.server.aspis_mcp",
+            "--root",
+            str(root),
+            "--projects-dir",
+            str(projects_dir),
+        ],
         cwd=str(root),
         env=env,
     )
@@ -278,42 +301,98 @@ async def run(
                         "launch_token": verifier_token,
                     },
                 )
-                architect_session_token = str(architect_registration.get("sessionToken") or "")
+                architect_session_token = str(
+                    architect_registration.get("sessionToken") or ""
+                )
                 coder_session_token = str(coder_registration.get("sessionToken") or "")
-                verifier_session_token = str(verifier_registration.get("sessionToken") or "")
-                if not architect_session_token or not coder_session_token or not verifier_session_token:
-                    raise AssertionError("agent_register did not return sessionToken values.")
-                architect = {"agent_id": architect_id, "role": "architect", "session_token": architect_session_token}
-                coder = {"agent_id": coder_id, "role": "code", "session_token": coder_session_token}
-                verifier = {"agent_id": verifier_id, "role": "verifier", "session_token": verifier_session_token}
+                verifier_session_token = str(
+                    verifier_registration.get("sessionToken") or ""
+                )
+                if (
+                    not architect_session_token
+                    or not coder_session_token
+                    or not verifier_session_token
+                ):
+                    raise AssertionError(
+                        "agent_register did not return sessionToken values."
+                    )
+                architect = {
+                    "agent_id": architect_id,
+                    "role": "architect",
+                    "session_token": architect_session_token,
+                }
+                coder = {
+                    "agent_id": coder_id,
+                    "role": "code",
+                    "session_token": coder_session_token,
+                }
+                verifier = {
+                    "agent_id": verifier_id,
+                    "role": "verifier",
+                    "session_token": verifier_session_token,
+                }
 
                 spoof_error = await call(
                     session,
                     "project_list",
-                    {"agent_id": architect_id, "role": "architect", "session_token": "wrong-token"},
+                    {
+                        "agent_id": architect_id,
+                        "role": "architect",
+                        "session_token": "wrong-token",
+                    },
                     expect_error=True,
                 )
                 if "session token is invalid" not in spoof_error:
-                    raise AssertionError(f"Wrong session token failed for the wrong reason: {spoof_error}")
+                    raise AssertionError(
+                        f"Wrong session token failed for the wrong reason: {spoof_error}"
+                    )
 
-                anon_project_error = await call(session, "project_get", {"project_id": project_id}, expect_error=True)
-                if "Agent id" not in anon_project_error and "agent_id" not in anon_project_error:
-                    raise AssertionError(f"Anonymous project_get failed for the wrong reason: {anon_project_error}")
+                anon_project_error = await call(
+                    session,
+                    "project_get",
+                    {"project_id": project_id},
+                    expect_error=True,
+                )
+                if (
+                    "Agent id" not in anon_project_error
+                    and "agent_id" not in anon_project_error
+                ):
+                    raise AssertionError(
+                        f"Anonymous project_get failed for the wrong reason: {anon_project_error}"
+                    )
 
-                anon_state_error = await call(session, "agent_state", {}, expect_error=True)
-                if "Agent id" not in anon_state_error and "agent_id" not in anon_state_error:
-                    raise AssertionError(f"Anonymous agent_state failed for the wrong reason: {anon_state_error}")
+                anon_state_error = await call(
+                    session, "agent_state", {}, expect_error=True
+                )
+                if (
+                    "Agent id" not in anon_state_error
+                    and "agent_id" not in anon_state_error
+                ):
+                    raise AssertionError(
+                        f"Anonymous agent_state failed for the wrong reason: {anon_state_error}"
+                    )
 
                 state = await call(
                     session,
                     "agent_state",
                     architect,
                 )
-                roles = {item.get("agentId"): item.get("role") for item in state.get("sessions", [])}
-                if roles.get(architect_id) != "orchestrator" or roles.get(coder_id) != "coder":
-                    raise AssertionError(f"Role aliases did not canonicalize correctly: {roles}")
+                roles = {
+                    item.get("agentId"): item.get("role")
+                    for item in state.get("sessions", [])
+                }
+                if (
+                    roles.get(architect_id) != "orchestrator"
+                    or roles.get(coder_id) != "coder"
+                ):
+                    raise AssertionError(
+                        f"Role aliases did not canonicalize correctly: {roles}"
+                    )
                 serialized_state = json.dumps(state)
-                if "sessionTokenHash" in serialized_state or "launchTokenHash" in serialized_state:
+                if (
+                    "sessionTokenHash" in serialized_state
+                    or "launchTokenHash" in serialized_state
+                ):
                     raise AssertionError(f"Agent state leaked token hashes: {state}")
 
                 credential_status = await call(
@@ -321,18 +400,29 @@ async def run(
                     "provider_credentials_status",
                     verifier,
                 )
-                if "providers" not in credential_status or "oracleLlm" not in credential_status:
-                    raise AssertionError(f"Provider credential status shape is invalid: {credential_status}")
+                if (
+                    "providers" not in credential_status
+                    or "oracleLlm" not in credential_status
+                ):
+                    raise AssertionError(
+                        f"Provider credential status shape is invalid: {credential_status}"
+                    )
                 if has_sensitive_credential_field(credential_status):
-                    raise AssertionError(f"Provider credential status leaks secret-shaped fields: {credential_status}")
+                    raise AssertionError(
+                        f"Provider credential status leaks secret-shaped fields: {credential_status}"
+                    )
 
                 projects = await call(
                     session,
                     "project_list",
                     architect,
                 )
-                if project_id not in {item.get("id") for item in projects.get("projects", [])}:
-                    raise AssertionError("Production project is not visible through project_list.")
+                if project_id not in {
+                    item.get("id") for item in projects.get("projects", [])
+                }:
+                    raise AssertionError(
+                        "Production project is not visible through project_list."
+                    )
 
                 project_get = await call(
                     session,
@@ -340,11 +430,17 @@ async def run(
                     {"project_id": project_id, **architect},
                 )
                 if project_get.get("metadata", {}).get("id") != project_id:
-                    raise AssertionError(f"Registered project_get returned the wrong project: {project_get}")
+                    raise AssertionError(
+                        f"Registered project_get returned the wrong project: {project_get}"
+                    )
                 if project_get.get("metadata", {}).get("rootPath") != str(project_root):
-                    raise AssertionError(f"Registered project_get did not expose the project root: {project_get}")
+                    raise AssertionError(
+                        f"Registered project_get did not expose the project root: {project_get}"
+                    )
                 if len(project_get.get("state", {}).get("tasks", [])) != 2:
-                    raise AssertionError(f"Registered project_get did not expose tasks: {project_get}")
+                    raise AssertionError(
+                        f"Registered project_get did not expose tasks: {project_get}"
+                    )
 
                 next_task = await call(
                     session,
@@ -352,7 +448,9 @@ async def run(
                     {"project_id": project_id, **coder},
                 )
                 if next_task.get("task", {}).get("id") != "T1":
-                    raise AssertionError(f"Coder next task did not point to T1: {next_task}")
+                    raise AssertionError(
+                        f"Coder next task did not point to T1: {next_task}"
+                    )
 
                 context = await call(
                     session,
@@ -365,7 +463,9 @@ async def run(
                     },
                 )
                 if not context.get("chunks"):
-                    raise AssertionError("Oracle context returned no chunks for the project root.")
+                    raise AssertionError(
+                        "Oracle context returned no chunks for the project root."
+                    )
 
                 answer = await call(
                     session,
@@ -379,9 +479,13 @@ async def run(
                     timeout=180,
                 )
                 if answer.get("not_found") or not answer.get("citations"):
-                    raise AssertionError(f"Oracle ask did not return a grounded answer: {answer}")
+                    raise AssertionError(
+                        f"Oracle ask did not return a grounded answer: {answer}"
+                    )
                 if not answer.get("results"):
-                    raise AssertionError(f"Oracle ask did not return result rows: {answer}")
+                    raise AssertionError(
+                        f"Oracle ask did not return result rows: {answer}"
+                    )
 
                 await call(
                     session,
@@ -429,7 +533,11 @@ async def run(
                         **verifier,
                     },
                 )
-                task = next(item for item in done_project["state"]["tasks"] if item["id"] == "T1")
+                task = next(
+                    item
+                    for item in done_project["state"]["tasks"]
+                    if item["id"] == "T1"
+                )
                 if task["status"] != "done":
                     raise AssertionError("Verifier did not close T1.")
 
@@ -439,8 +547,13 @@ async def run(
                     {"project_id": project_id, "task_id": "T2", **verifier},
                     expect_error=True,
                 )
-                if "Verifier agents can only claim review or blocked tasks" not in verifier_todo_error:
-                    raise AssertionError(f"Verifier TODO claim failed for the wrong reason: {verifier_todo_error}")
+                if (
+                    "Verifier agents can only claim review or blocked tasks"
+                    not in verifier_todo_error
+                ):
+                    raise AssertionError(
+                        f"Verifier TODO claim failed for the wrong reason: {verifier_todo_error}"
+                    )
 
                 coder_cloud_context_error = await call(
                     session,
@@ -453,7 +566,9 @@ async def run(
                     expect_error=True,
                 )
                 if "management_project_id" not in coder_cloud_context_error:
-                    raise AssertionError(f"Coder provider mutation was not Kanban-gated: {coder_cloud_context_error}")
+                    raise AssertionError(
+                        f"Coder provider mutation was not Kanban-gated: {coder_cloud_context_error}"
+                    )
 
                 verifier_cloud_error = await call(
                     session,
@@ -468,8 +583,13 @@ async def run(
                     },
                     expect_error=True,
                 )
-                if "verifier agents cannot use scaleway_resource_action" not in verifier_cloud_error:
-                    raise AssertionError(f"Verifier cloud mutation failed for the wrong reason: {verifier_cloud_error}")
+                if (
+                    "verifier agents cannot use scaleway_resource_action"
+                    not in verifier_cloud_error
+                ):
+                    raise AssertionError(
+                        f"Verifier cloud mutation failed for the wrong reason: {verifier_cloud_error}"
+                    )
 
                 architect_cloud_error = await call(
                     session,
@@ -485,8 +605,13 @@ async def run(
                     },
                     expect_error=True,
                 )
-                if "orchestrator agents cannot use cloudflare_rotate_worker_secret" not in architect_cloud_error:
-                    raise AssertionError(f"Architect cloud mutation failed for the wrong reason: {architect_cloud_error}")
+                if (
+                    "orchestrator agents cannot use cloudflare_rotate_worker_secret"
+                    not in architect_cloud_error
+                ):
+                    raise AssertionError(
+                        f"Architect cloud mutation failed for the wrong reason: {architect_cloud_error}"
+                    )
 
                 provider_reads: dict[str, Any] = {"mode": "skipped", "pass": True}
                 if live_providers:
@@ -503,8 +628,12 @@ async def run(
                         verifier,
                         timeout=120,
                     )
-                    provider_reads["cloudflare"] = summarize_provider_read(cloudflare_status, "workers")
-                    provider_reads["scaleway"] = summarize_provider_read(scaleway_status, "resources")
+                    provider_reads["cloudflare"] = summarize_provider_read(
+                        cloudflare_status, "workers"
+                    )
+                    provider_reads["scaleway"] = summarize_provider_read(
+                        scaleway_status, "resources"
+                    )
                     provider_reads["pass"] = bool(
                         provider_reads["cloudflare"].get("pass")
                         and provider_reads["scaleway"].get("pass")
@@ -527,9 +656,15 @@ async def run(
                         **coder,
                     },
                 )
-                task2 = next(item for item in review_project["state"]["tasks"] if item["id"] == "T2")
+                task2 = next(
+                    item
+                    for item in review_project["state"]["tasks"]
+                    if item["id"] == "T2"
+                )
                 if task2["status"] != "review":
-                    raise AssertionError("Coder did not leave T2 in review for the visible Kanban stage.")
+                    raise AssertionError(
+                        "Coder did not leave T2 in review for the visible Kanban stage."
+                    )
 
                 await call(
                     session,
@@ -543,28 +678,47 @@ async def run(
                 await call(
                     session,
                     "agent_heartbeat",
-                    {"agent_id": architect_id, "status": "coordinating", "message": "watching Kanban state", "session_token": architect_session_token},
+                    {
+                        "agent_id": architect_id,
+                        "status": "coordinating",
+                        "message": "watching Kanban state",
+                        "session_token": architect_session_token,
+                    },
                 )
                 final_state = await call(
                     session,
                     "agent_state",
                     architect,
                 )
-                final_sessions = {item.get("agentId"): item for item in final_state.get("sessions", [])}
-                if final_sessions.get(coder_id, {}).get("currentProjectId") != project_id:
-                    raise AssertionError(f"Final agent session state is not project-linked: {final_sessions}")
+                final_sessions = {
+                    item.get("agentId"): item
+                    for item in final_state.get("sessions", [])
+                }
+                if (
+                    final_sessions.get(coder_id, {}).get("currentProjectId")
+                    != project_id
+                ):
+                    raise AssertionError(
+                        f"Final agent session state is not project-linked: {final_sessions}"
+                    )
                 final_claims = [
                     item
                     for item in final_state.get("claims", [])
-                    if item.get("projectId") == project_id and item.get("taskId") == "T2"
+                    if item.get("projectId") == project_id
+                    and item.get("taskId") == "T2"
                 ]
                 if not any(item.get("status") == "review" for item in final_claims):
-                    raise AssertionError(f"Final claims do not expose T2 review state: {final_claims}")
+                    raise AssertionError(
+                        f"Final claims do not expose T2 review state: {final_claims}"
+                    )
                 if not any(
-                    item.get("eventType") == "note" and item.get("projectId") == project_id
+                    item.get("eventType") == "note"
+                    and item.get("projectId") == project_id
                     for item in final_state.get("events", [])
                 ):
-                    raise AssertionError("Final events do not expose project note updates.")
+                    raise AssertionError(
+                        "Final events do not expose project note updates."
+                    )
     finally:
         if not keep_project and temp_projects is not None:
             temp_projects.cleanup()
@@ -581,9 +735,14 @@ async def run(
     }
 
 
-def summarize_provider_read(status: dict[str, Any], collection_key: str) -> dict[str, Any]:
+def summarize_provider_read(
+    status: dict[str, Any], collection_key: str
+) -> dict[str, Any]:
     if not status.get("pass"):
-        return {"pass": False, "error": status.get("error", "unknown provider read failure")}
+        return {
+            "pass": False,
+            "error": status.get("error", "unknown provider read failure"),
+        }
     payload = status.get("payload", {})
     collection = payload.get(collection_key, [])
     scope = payload.get("account") or payload.get("project") or {}
@@ -607,7 +766,14 @@ def summarize_provider_read(status: dict[str, Any], collection_key: str) -> dict
 def has_sensitive_credential_field(value: Any) -> bool:
     if isinstance(value, dict):
         for key, child in value.items():
-            if str(key).lower() in {"value", "password", "secret", "secretvalue", "api_key", "apikey"}:
+            if str(key).lower() in {
+                "value",
+                "password",
+                "secret",
+                "secretvalue",
+                "api_key",
+                "apikey",
+            }:
                 return True
             if has_sensitive_credential_field(child):
                 return True
@@ -617,16 +783,38 @@ def has_sensitive_credential_field(value: Any) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Real MCP stdio smoke for Aspis Projects Kanban agents.")
+    parser = argparse.ArgumentParser(
+        description="Real MCP stdio smoke for Devboule Projects Kanban agents."
+    )
     parser.add_argument("--root", default=".", help="Devboule root")
-    parser.add_argument("--project-root", default=None, help="Root indexed by Oracle for the smoke project")
-    parser.add_argument("--keep-project", action="store_true", help="Leave the production-readiness project visible in the app")
-    parser.add_argument("--project-id", default="", help="Project id to create/use for a kept production smoke project")
-    parser.add_argument("--live-providers", action="store_true", help="Also call Cloudflare/Scaleway read tools with configured credentials")
+    parser.add_argument(
+        "--project-root",
+        default=None,
+        help="Root indexed by Oracle for the smoke project",
+    )
+    parser.add_argument(
+        "--keep-project",
+        action="store_true",
+        help="Leave the production-readiness project visible in the app",
+    )
+    parser.add_argument(
+        "--project-id",
+        default="",
+        help="Project id to create/use for a kept production smoke project",
+    )
+    parser.add_argument(
+        "--live-providers",
+        action="store_true",
+        help="Also call Cloudflare/Scaleway read tools with configured credentials",
+    )
     args = parser.parse_args()
     root = Path(args.root).resolve()
     default_project_root = Path.home() / "Desktop" / "aspis bio"
-    project_root = Path(args.project_root).resolve() if args.project_root else default_project_root.resolve()
+    project_root = (
+        Path(args.project_root).resolve()
+        if args.project_root
+        else default_project_root.resolve()
+    )
     payload = asyncio.run(
         run(
             root,

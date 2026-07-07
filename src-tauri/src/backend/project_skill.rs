@@ -2663,7 +2663,7 @@ mod tests {
             assert!(!entry.body.is_empty());
             assert!(entry.body.len() < MAX_SKILL_BYTES);
             // Product-general: no hardcoded ecosystem names.
-            for banned in ["Aspis", "Cloudflare", "Scaleway"] {
+            for banned in ["Devboule", "Cloudflare", "Scaleway"] {
                 assert!(!entry.body.contains(banned), "{banned} leaked into {role} template");
             }
             // A bundled template is installed VERBATIM into a SKILL.md, then later wrapped by

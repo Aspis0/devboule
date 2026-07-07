@@ -1,6 +1,6 @@
 # Roles and access — a simple guide
 
-Aspis Bio has two kinds of user:
+Devboule has two kinds of user:
 
 - **Admin** (the owner): runs everything, decides who gets in.
 - **Collaborator**: works in the app (projects, agents, cloud, Oracle) but does not manage the team.
@@ -30,12 +30,14 @@ Done. From now on that app trusts the passes you sign.
 ## PART 2 — Adding a collaborator
 
 ### They do (on their machine)
+
 1. Install the app and unlock.
 2. The welcome screen appears → click **"Create device identity"**.
 3. Click **"Copy join request"** and send you that text (chat/email).
    → it's only **public** info, safe to send.
 
 ### You do (on your machine)
+
 1. Go to **Devices → Approve Invite**.
 2. Paste their request and type their name.
 3. Pick the **role**: *Collaborator* or *Admin*.
@@ -45,6 +47,7 @@ Done. From now on that app trusts the passes you sign.
 > ⚠️ **Before approving**, call them and check the *fingerprint* (the code you both see) matches. That stops anyone from impersonating them.
 
 ### They finish
+
 1. Back on the welcome screen, **paste the pass**.
 2. Click **"Verify & continue"** → they're in, with their role. 🎉
 

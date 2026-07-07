@@ -53,7 +53,7 @@ function ProjectsBoardComponent({
               key={stage.id}
               title={projectStageTitles[stage.id]}
               data-help-title={`${stage.label} is a project stage column.`}
-              data-help-lines="Project stages are computed from project lifecycle, task counts, agent claims, and recent sessions.|For Aspis Bio, this is the high-level portfolio board: see what is planned, active, blocked, in review, or verified.|Stages move when agents update project state through MCP or when humans change tasks/status.|Use this board before spawning more agents so work does not duplicate."
+              data-help-lines="Project stages are computed from project lifecycle, task counts, agent claims, and recent sessions.|For Devboule, this is the high-level portfolio board: see what is planned, active, blocked, in review, or verified.|Stages move when agents update project state through MCP or when humans change tasks/status.|Use this board before spawning more agents so work does not duplicate."
               className="flex flex-col rounded-lg border border-cream-200 bg-cream-50 p-3"
             >
               <div className="mb-3 flex items-center justify-between gap-2">

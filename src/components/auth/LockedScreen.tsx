@@ -33,17 +33,17 @@ export function LockedScreen({
       <div className="text-center">
         <div className="mx-auto mb-6 h-24 w-24 overflow-hidden rounded-[28px] border border-cream-200 bg-white shadow-soft-md">
           <img
-            src="/assets/aspis-logo.jpg"
-            alt="Aspis Bio"
+            src="/assets/devboule-logo.jpeg"
+            alt="Devboule"
             className="h-full w-full object-cover"
           />
         </div>
 
         <h1 className="text-xl font-semibold text-cream-800 mb-1">
-          Aspis Bio
+          Devboule
         </h1>
         <p className="text-[13px] text-cream-500 mb-8">
-          Infrastructure Management
+          AI Coding Workflow
         </p>
 
         <button
@@ -53,8 +53,8 @@ export function LockedScreen({
             void onUnlock();
           }}
           disabled={unlockDisabled}
-          data-help-title="Device unlock protects the Aspis Bio control app."
-          data-help-lines="This app can store cloud tokens, launch agents, and operate real infrastructure, so entry should require local device authentication.|Unlock uses Windows Hello on Windows and Touch ID on macOS — PIN, face, or fingerprint depending on your setup.|If biometric unlock loops or fails, the system PIN/password is the safer fallback path.|Unlock does not start cloud writes by itself; it only opens the management dashboard."
+          data-help-title="Device unlock protects the Devboule app."
+          data-help-lines="This app can store cloud tokens, launch agents, and operate real infrastructure, so entry should require local device authentication.|Unlock uses Windows Hello on Windows and Touch ID on macOS — PIN, face, or fingerprint depending on your setup.|If biometric unlock loops or fails, the system PIN/password is the safer fallback path.|Unlock does not start cloud writes by itself; it only opens the dashboard."
           className="inline-flex items-center gap-2.5 px-6 py-3 rounded-2xl
                      bg-terracotta text-white text-[14px] font-medium
                      hover:bg-terracotta-500 active:bg-terracotta-600

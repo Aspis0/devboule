@@ -56,7 +56,7 @@ pub struct ScalewayComputeReplacement {
 impl BackendState {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .user_agent("Aspis-Management/0.1")
+            .user_agent("Devboule/0.1")
             .timeout(StdDuration::from_secs(15))
             .build()
             .expect("failed to build reqwest client");

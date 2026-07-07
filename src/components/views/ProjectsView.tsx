@@ -321,12 +321,12 @@ export function ProjectsView() {
 		thumbnailUri: string | null;
 		/** Registry entry id — forwarded to StageDesign for the task-link command. */
 		id?: string;
-		kind?: import('../../types/design').ArtifactKind;
+		kind?: import("../../types/design").ArtifactKind;
 		artifactId?: string;
 		/** Phase 4: device-frame skin stored on the registry entry. Forwarded to
 		 *  StageDesign so a returning interactive artifact restores the user's frame
 		 *  instead of falling back to the heuristic. Absent ⇒ inferred. */
-		frame?: import('../../types/design').ArtifactFrameKind;
+		frame?: import("../../types/design").ArtifactFrameKind;
 		/** OPTIONAL linked plan-task number (1-based). Absent ⇒ unlinked. */
 		linkedTaskN?: number;
 	} | null>(null);
@@ -1413,7 +1413,7 @@ export function ProjectsView() {
 						// Fix 6: only interactive entries carry an artifactId — static entries have no
 						// artifact:// URL, so set it to undefined rather than a spurious id.
 						kind: entry.kind,
-						artifactId: entry.kind === 'interactive' ? entry.id : undefined,
+						artifactId: entry.kind === "interactive" ? entry.id : undefined,
 						// Phase 4 (Fix 3): carry the stored frame skin so StageDesign's effectiveFrameKind
 						// falls back to the user's stored choice rather than the heuristic on reload.
 						frame: entry.frame,
@@ -2975,7 +2975,7 @@ export function ProjectsView() {
 				summary={`${tasksByColumn.done.length} done · ${tasksByColumn.wip.length} in progress · ${tasksByColumn.review.length} in review`}
 				defaultOpen
 				helpTitle="Board is for tasks and quick coder/verifier launches."
-				helpLines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+				helpLines="Task columns are the project-level Kanban workflow.|For Devboule, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
 			>
 				{/* Create-task form: hidden when the project is archived (read-only). The
           task COLUMNS below stay visible so archived tasks remain inspectable. */}
@@ -3081,7 +3081,7 @@ export function ProjectsView() {
 										handleColumnDrop(column.id);
 									}}
 									data-help-title={`${column.label} is a task status column.`}
-									data-help-lines="Task columns are the project-level Kanban workflow.|For Aspis Bio, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
+									data-help-lines="Task columns are the project-level Kanban workflow.|For Devboule, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
 								>
 									<div className="mb-3 flex items-center justify-between">
 										<div className="flex items-center gap-2">
@@ -3855,7 +3855,7 @@ export function ProjectsView() {
 								<p className="mt-1 text-[12px] text-cream-400">
 									{error && projects.length === 0
 										? "Fix the load error above or reload the project folder."
-										: "Files are stored as local Markdown with a structured Aspis project block."}
+										: "Files are stored as local Markdown with a structured Devboule project block."}
 								</p>
 							</main>
 						)}

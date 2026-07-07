@@ -1098,7 +1098,7 @@ fn read_package_header(
         .map_err(|e| format!("Package header could not be read: {e}"))?;
     if magic != PACKAGE_MAGIC {
         return Err(
-            "Not an Aspis workspace package (or an older unsigned package version).".into(),
+            "Not a Devboule workspace package (or an older unsigned package version).".into(),
         );
     }
     let mut len = [0u8; 4];
@@ -1909,7 +1909,7 @@ fn package_readme(
     created_at: &str,
 ) -> String {
     let mut out = String::new();
-    out.push_str("# Aspis Bio Workspace Bootstrap\n\n");
+    out.push_str("# Devboule Workspace Bootstrap\n\n");
     out.push_str("This package contains source files, docs, tests and small configuration files selected by Devboule.\n\n");
     out.push_str("## Security\n\n");
     out.push_str("- Bulk data is encrypted with AES-256-GCM.\n");
@@ -1985,7 +1985,7 @@ fn resolve_workspace_root() -> Result<PathBuf, String> {
             }
         }
     }
-    Err("Aspis Bio workspace root is not configured. Set Oracle index root first.".into())
+    Err("Devboule workspace root is not configured. Set Oracle index root first.".into())
 }
 
 fn snapshot_from_reports(

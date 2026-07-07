@@ -1932,7 +1932,7 @@ pub async fn rotate_cloudflare_worker_secret(
     // C4: explicit name-scope check before the PUT, not relying solely on the
     // cache filter having already excluded out-of-scope workers.
     if !cloudflare_worker_name_in_aspis_bio_scope(&request.worker_name) {
-        return Err("Worker is not in the Aspis Bio scope. Refusing to rotate its secret.".into());
+        return Err("Worker is not in the Devboule scope. Refusing to rotate its secret.".into());
     }
     cloudflare_rotation_scope_guard(&state, &request.account_id)?;
     state.ensure_same_sensitive_session(session_id)?;
@@ -2000,7 +2000,7 @@ pub async fn fetch_cloudflare_worker_settings(
         );
     }
     if !cloudflare_worker_name_in_aspis_bio_scope(worker_name) {
-        return Err("Worker is not in the Aspis Bio scope. Refusing to read its settings.".into());
+        return Err("Worker is not in the Devboule scope. Refusing to read its settings.".into());
     }
     cloudflare_rotation_scope_guard(&state, account_id)?;
     let settings =
@@ -2166,7 +2166,7 @@ fn resolve_cloudflare_worker_write_target(
     }
     if !cloudflare_worker_name_in_aspis_bio_scope(worker_name) {
         return Err(
-            "Worker is not in the Aspis Bio scope. Refusing to change its env vars.".into(),
+            "Worker is not in the Devboule scope. Refusing to change its env vars.".into(),
         );
     }
     cloudflare_rotation_scope_guard(state, &account_id)?;
@@ -2401,7 +2401,7 @@ pub async fn fetch_cloudflare_ai_gateway_settings(
             rate_limiting_limit: None,
             rate_limiting_technique: None,
             readable: false,
-            message: Some("AI Gateway is not in the Aspis Bio account.".into()),
+            message: Some("AI Gateway is not in the Devboule account.".into()),
         });
     }
     let settings =
@@ -2432,7 +2432,7 @@ pub async fn set_cloudflare_ai_gateway_settings(
     // any network/other error (Err) and refuse on a confirmed absence.
     if !cloudflare_ai_gateway_exists(&state.http, &token, &account_id, &gateway_id).await? {
         return Err(
-            "AI Gateway is not in the Aspis Bio account. Refusing to update settings.".into(),
+            "AI Gateway is not in the Devboule account. Refusing to update settings.".into(),
         );
     }
     // Re-assert the sensitive session immediately BEFORE the write (matching
@@ -2471,7 +2471,7 @@ pub async fn cloudflare_autorag_reindex(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_autorag_instance_exists(&state.http, &token, &account_id, &instance_id).await? {
         return Err(
-            "AI Search instance is not in the Aspis Bio account. Refusing to trigger a sync."
+            "AI Search instance is not in the Devboule account. Refusing to trigger a sync."
                 .into(),
         );
     }
@@ -2502,7 +2502,7 @@ pub async fn fetch_cloudflare_kv_keys(
     let namespace_id = validate_cloudflare_resource_id(&namespace_id, "KV namespace id")?;
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_kv_namespace_exists(&state.http, &token, &account_id, &namespace_id).await? {
-        return Err("KV namespace is not in the Aspis Bio account. Refusing to list keys.".into());
+        return Err("KV namespace is not in the Devboule account. Refusing to list keys.".into());
     }
     let page = fetch_cloudflare_kv_keys_request(
         &state.http,
@@ -2534,7 +2534,7 @@ pub async fn fetch_cloudflare_kv_value(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_kv_namespace_exists(&state.http, &token, &account_id, &namespace_id).await? {
         return Err(
-            "KV namespace is not in the Aspis Bio account. Refusing to read a value.".into(),
+            "KV namespace is not in the Devboule account. Refusing to read a value.".into(),
         );
     }
     let value =
@@ -2565,7 +2565,7 @@ pub async fn set_cloudflare_kv_value(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_kv_namespace_exists(&state.http, &token, &account_id, &namespace_id).await? {
         return Err(
-            "KV namespace is not in the Aspis Bio account. Refusing to write a value.".into(),
+            "KV namespace is not in the Devboule account. Refusing to write a value.".into(),
         );
     }
     state.ensure_same_sensitive_session(session_id)?;
@@ -2621,7 +2621,7 @@ pub async fn delete_cloudflare_kv_value(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_kv_namespace_exists(&state.http, &token, &account_id, &namespace_id).await? {
         return Err(
-            "KV namespace is not in the Aspis Bio account. Refusing to delete a value.".into(),
+            "KV namespace is not in the Devboule account. Refusing to delete a value.".into(),
         );
     }
     state.ensure_same_sensitive_session(session_id)?;
@@ -2688,7 +2688,7 @@ pub async fn cloudflare_d1_query(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_d1_database_exists(&state.http, &token, &account_id, &database_id).await? {
         return Err(
-            "D1 database is not in the Aspis Bio account. Refusing to run the query.".into(),
+            "D1 database is not in the Devboule account. Refusing to run the query.".into(),
         );
     }
     if is_write {
@@ -2729,7 +2729,7 @@ pub async fn fetch_cloudflare_r2_config(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_r2_bucket_exists(&state.http, &token, &account_id, &bucket).await? {
         return Err(
-            "R2 bucket is not in the Aspis Bio account. Refusing to read its config.".into(),
+            "R2 bucket is not in the Devboule account. Refusing to read its config.".into(),
         );
     }
     let config =
@@ -2777,7 +2777,7 @@ async fn set_cloudflare_r2_target(
     let (token, account_id) = resolve_cloudflare_account_action_target(&state)?;
     if !cloudflare_r2_bucket_exists(&state.http, &token, &account_id, &bucket).await? {
         return Err(format!(
-            "R2 bucket is not in the Aspis Bio account. Refusing to write its {target}."
+            "R2 bucket is not in the Devboule account. Refusing to write its {target}."
         ));
     }
     state.ensure_same_sensitive_session(session_id)?;
@@ -4610,7 +4610,7 @@ fn cloudflare_rotation_scope_guard(state: &BackendState, account_id: &str) -> Re
     let explicit_pin = matches!(scope.source.as_str(), "pinned");
     if !name_matches_bio && !explicit_pin {
         return Err(
-            "Cloudflare account is not proven as Aspis Bio. Save the pinned Aspis Bio account id before rotating Worker secrets."
+            "Cloudflare account is not proven as Devboule. Save the pinned Devboule account id before rotating Worker secrets."
                 .into(),
         );
     }
@@ -4726,7 +4726,7 @@ fn assert_scaleway_resource_in_pinned_project(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            "Scaleway project scope is not pinned. Save the Aspis Bio project id before acting."
+            "Scaleway project scope is not pinned. Save the Devboule project id before acting."
                 .to_string()
         })?;
     let resource_project = resource
@@ -4739,7 +4739,7 @@ fn assert_scaleway_resource_in_pinned_project(
         })?;
     if resource_project != pinned {
         return Err(
-            "Scaleway resource is outside the pinned Aspis Bio project. Refusing the action."
+            "Scaleway resource is outside the pinned Devboule project. Refusing the action."
                 .into(),
         );
     }
@@ -4788,7 +4788,7 @@ fn assert_scaleway_storage_in_pinned_project(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            "Scaleway project scope is not pinned. Save the Aspis Bio project id before acting."
+            "Scaleway project scope is not pinned. Save the Devboule project id before acting."
                 .to_string()
         })?;
     let resource_project = resource
@@ -4801,7 +4801,7 @@ fn assert_scaleway_storage_in_pinned_project(
         })?;
     if resource_project != pinned {
         return Err(
-            "Scaleway storage is outside the pinned Aspis Bio project. Refusing the action.".into(),
+            "Scaleway storage is outside the pinned Devboule project. Refusing the action.".into(),
         );
     }
     Ok(())
@@ -4822,12 +4822,12 @@ fn assert_scaleway_create_project_is_pinned(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            "Scaleway project scope is not pinned. Save the Aspis Bio project id before creating."
+            "Scaleway project scope is not pinned. Save the Devboule project id before creating."
                 .to_string()
         })?;
     if target != pinned {
         return Err(
-            "Scaleway create target project does not match the pinned Aspis Bio project. Refusing."
+            "Scaleway create target project does not match the pinned Devboule project. Refusing."
                 .into(),
         );
     }
@@ -4954,7 +4954,7 @@ fn provider_service_catalog(
             "https://developers.cloudflare.com/api/resources/accounts/",
             &["scope pin", "token verify", "audit logs", "future members/roles"],
             &[
-                "Aspis Bio account only",
+                "Devboule account only",
                 "Pinned accounts may warn when the display name is personal",
             ],
         ),
@@ -5029,8 +5029,8 @@ fn provider_service_catalog(
             scaleway_scope_count,
             "IAM read permissions for policies, applications, groups and API keys.",
             "https://www.scaleway.com/en/developers/api/iam",
-            &["Aspis Bio project pin", "future policies", "future API keys"],
-            &["Default project is intentionally excluded unless it is Aspis Bio"],
+            &["Devboule project pin", "future policies", "future API keys"],
+            &["Default project is intentionally excluded unless it is Devboule"],
         ),
         service_summary(
             "scw-compute-live",
@@ -5817,7 +5817,7 @@ fn cloudflare_smoke_dry_run_result(inventory: &ProviderInventory) -> CloudflareS
         });
     let message = if matches!(inventory.health.status.as_str(), "healthy" | "degraded") {
         format!(
-            "Dry run read {} Aspis Bio Worker(s). Secret rotation {}.",
+            "Dry run read {} Devboule Worker(s). Secret rotation {}.",
             inventory.workers.len(),
             if can_rotate_worker_secret {
                 "would be allowed after explicit confirmation"

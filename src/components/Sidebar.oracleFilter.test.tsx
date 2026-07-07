@@ -12,7 +12,7 @@ import type { AppConfig, NavItem } from "../types/config";
 
 // A minimal AppConfig that includes the restored "oracle" nav entry.
 const config: AppConfig = {
-  project: { name: "Aspis Bio", version: "1.0.0" },
+  project: { name: "Devboule", version: "1.0.0" },
   navigation: [
     { id: "projects", label: "Projects", icon: "FolderKanban" } as NavItem,
     { id: "oracle", label: "Oracle", icon: "BrainCircuit" } as NavItem,

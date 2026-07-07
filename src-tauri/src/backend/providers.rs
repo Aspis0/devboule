@@ -110,7 +110,7 @@ fn missing_token_description(provider: ProviderId) -> &'static str {
             "Live Worker inventory needs a Workers read token; Worker secret rotation also requires Workers Scripts Write."
         }
         ProviderId::Scaleway => {
-            "Live inventory and VM/serverless operations require a Scaleway token with Aspis Bio project access and Instance/Serverless operation permissions."
+            "Live inventory and VM/serverless operations require a Scaleway token with Devboule project access and Instance/Serverless operation permissions."
         }
     }
 }
@@ -522,7 +522,7 @@ async fn fetch_cloudflare_inner(
             severity: "low".into(),
             title: "Cloudflare sibling workers hidden".into(),
             description: format!(
-                "{hidden_sibling_worker_count} Worker(s) in the account are outside the Aspis Bio allowlist and are hidden from mutation surfaces."
+                "{hidden_sibling_worker_count} Worker(s) in the account are outside the Devboule allowlist and are hidden from mutation surfaces."
             ),
             source: "Cloudflare".into(),
             timestamp: now(),
@@ -532,7 +532,7 @@ async fn fetch_cloudflare_inner(
         risks.push(RiskFlag {
             id: "cloudflare_scope_name_unverified".into(),
             severity: "medium".into(),
-            title: "Cloudflare account scope not proven as Aspis Bio".into(),
+            title: "Cloudflare account scope not proven as Devboule".into(),
             description: format!(
                 "The selected Cloudflare account name does not match '{CF_TARGET_ACCOUNT_NAME}'. Keep the saved account id pinned and verify listed resources before rotating Worker secrets."
             ),
@@ -576,7 +576,7 @@ async fn fetch_cloudflare_inner(
             } else if deployment_failure_count > 0 {
                 Some("Some Worker deployment metadata could not be read.".into())
             } else if scope_name_unverified {
-                Some("Cloudflare account name does not prove Aspis Bio scope.".into())
+                Some("Cloudflare account name does not prove Devboule scope.".into())
             } else {
                 None
             },
@@ -1451,7 +1451,7 @@ fn select_cloudflare_accounts(
             .find(|account| account.id == account_id)
             .cloned()
             .ok_or_else(|| {
-                "Configured Cloudflare Aspis Bio account id was not visible to this token."
+                "Configured Cloudflare Devboule account id was not visible to this token."
                     .to_string()
             })?;
         return Ok(vec![selected]);
@@ -1475,7 +1475,7 @@ fn select_cloudflare_accounts(
         1 => return Ok(selected),
         len if len > 1 => {
             return Err(format!(
-                "Multiple Cloudflare accounts matched '{CF_TARGET_ACCOUNT_NAME}'. Set ASPIS_CLOUDFLARE_ACCOUNT_ID to pin the Aspis Bio account."
+                "Multiple Cloudflare accounts matched '{CF_TARGET_ACCOUNT_NAME}'. Set ASPIS_CLOUDFLARE_ACCOUNT_ID to pin the Devboule account."
             ));
         }
         _ => {}
@@ -1486,7 +1486,7 @@ fn select_cloudflare_accounts(
     }
 
     Err(format!(
-        "Cloudflare account '{CF_TARGET_ACCOUNT_NAME}' was not found. Pin the Aspis Bio account id before reading account-wide inventory."
+        "Cloudflare account '{CF_TARGET_ACCOUNT_NAME}' was not found. Pin the Devboule account id before reading account-wide inventory."
     ))
 }
 
@@ -3638,12 +3638,12 @@ fn select_scaleway_project(
             .find(|project| project.id == project_id)
             .cloned()
             .ok_or_else(|| {
-                "Configured Scaleway Aspis Bio project id was not visible to this token."
+                "Configured Scaleway Devboule project id was not visible to this token."
                     .to_string()
             })?;
         if normalize_scaleway_project_name(&project.name) != target {
             return Err(format!(
-                "Pinned Scaleway project '{}' is visible, but it is not '{SCW_TARGET_PROJECT_NAME}'. Refusing to show non-Aspis Bio inventory.",
+                "Pinned Scaleway project '{}' is visible, but it is not '{SCW_TARGET_PROJECT_NAME}'. Refusing to show non-Devboule inventory.",
                 project.name
             ));
         }
@@ -3659,7 +3659,7 @@ fn select_scaleway_project(
     match matches.len() {
         1 => Ok(matches[0].clone()),
         len if len > 1 => Err(format!(
-            "Multiple Scaleway projects matched '{SCW_TARGET_PROJECT_NAME}'. Set ASPIS_SCALEWAY_PROJECT_ID to pin the Aspis Bio project."
+            "Multiple Scaleway projects matched '{SCW_TARGET_PROJECT_NAME}'. Set ASPIS_SCALEWAY_PROJECT_ID to pin the Devboule project."
         )),
         _ => Err({
             format!(
@@ -3704,14 +3704,14 @@ async fn scaleway_project_from_api_key(
 ) -> Result<ScwProject, String> {
     let project_id =
         configured_or_pinned_scaleway_project_id(pinned_project_id).ok_or_else(|| {
-            "Scaleway project list was not readable and no Aspis Bio project id is pinned."
+            "Scaleway project list was not readable and no Devboule project id is pinned."
                 .to_string()
         })?;
     let access_key = access_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            "Scaleway project list was not readable; save the API access key so the pinned Aspis Bio project can be verified.".to_string()
+            "Scaleway project list was not readable; save the API access key so the pinned Devboule project can be verified.".to_string()
         })?;
     // B2: the access key is in the URL path; reqwest's error Display echoes the
     // URL, so use static messages here (no `{e}` / URL interpolation) to avoid
@@ -3733,9 +3733,9 @@ async fn scaleway_project_from_api_key(
             name: SCW_TARGET_PROJECT_NAME.into(),
         }),
         Some(_) => Err(
-            "Scaleway API key default project does not match the pinned Aspis Bio project.".into(),
+            "Scaleway API key default project does not match the pinned Devboule project.".into(),
         ),
-        None => Err("Scaleway API key has no default project to verify against Aspis Bio.".into()),
+        None => Err("Scaleway API key has no default project to verify against Devboule.".into()),
     }
 }
 
@@ -6569,7 +6569,7 @@ async fn fetch_scaleway_object_storage_only(
         id: "scaleway_api_token_missing_or_invalid".into(),
         severity: "high".into(),
         title: "Scaleway VM and Serverless inventory unavailable".into(),
-        description: "Object Storage is live through S3 credentials, but Instance and Serverless inventory/actions require a valid Scaleway API token for the pinned Aspis Bio project.".into(),
+        description: "Object Storage is live through S3 credentials, but Instance and Serverless inventory/actions require a valid Scaleway API token for the pinned Devboule project.".into(),
         source: "Scaleway".into(),
         timestamp: now(),
     }];

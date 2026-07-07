@@ -241,7 +241,7 @@ export function OracleAdminPanel() {
     oracleIndexStatus?.job?.phaseMessage,
   );
 
-  // Let the user pick the Aspis Bio workspace folder. After the preference is
+  // Let the user pick the Devboule workspace folder. After the preference is
   // saved, AUTOMATICALLY kick a dense index job + the watcher and refresh status
   // so choosing the folder really points Oracle there and starts working. Shows
   // a confirmation line.
@@ -255,7 +255,7 @@ export function OracleAdminPanel() {
       const result = await open({
         directory: true,
         multiple: false,
-        title: "Choose your Aspis Bio workspace folder",
+        title: "Choose your Devboule workspace folder",
       });
       if (typeof result === "string" && result.trim()) picked = result;
     } catch {
@@ -512,7 +512,7 @@ export function OracleAdminPanel() {
             Oracle administration
           </h2>
           <p className="text-[12px] text-cream-500">
-            Runtime, workspace indexing &amp; health for the Aspis Bio retrieval
+            Runtime, workspace indexing &amp; health for the Devboule retrieval
             index
           </p>
         </div>
@@ -1389,7 +1389,7 @@ function OracleLoadBanner({
           : "border-amber/20 bg-amber/[0.08]"
       }`}
       data-help-title="This banner explains Oracle loading state."
-      data-help-lines="Oracle may need to start a local Python server, load LanceDB, check embeddings, and verify the answer model.|For Aspis Bio, a few minutes of first-load delay is normal, but a visible loading state prevents false failure assumptions.|Errors here mean retrieval or answering may be unreliable until fixed.|Refresh after changing model settings, index state, or watcher status."
+      data-help-lines="Oracle may need to start a local Python server, load LanceDB, check embeddings, and verify the answer model.|For Devboule, a few minutes of first-load delay is normal, but a visible loading state prevents false failure assumptions.|Errors here mean retrieval or answering may be unreliable until fixed.|Refresh after changing model settings, index state, or watcher status."
     >
       <div className="flex flex-wrap items-center gap-3">
         <div

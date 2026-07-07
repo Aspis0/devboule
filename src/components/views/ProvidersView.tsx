@@ -64,7 +64,7 @@ const providerMeta: Record<ProviderId, { description: string; icon: string; url:
     url: "https://dash.cloudflare.com",
   },
   scaleway: {
-    description: "Scaleway Aspis Bio project inventory for Instance CPU/GPU and serverless workloads.",
+    description: "Scaleway Devboule project inventory for Instance CPU/GPU and serverless workloads.",
     icon: "Server",
     url: "https://console.scaleway.com",
   },
@@ -169,7 +169,7 @@ function readinessCopy(
     const detail =
       provider === "cloudflare"
         ? "Inventory is available, but secret rotation stays locked until a verified custom API token has write scope."
-        : "Inventory is available, but VM actions need a valid Aspis Bio project token and live resources.";
+        : "Inventory is available, but VM actions need a valid Devboule project token and live resources.";
     return {
       tone: "limited",
       title: "Read-only ready",
@@ -187,8 +187,8 @@ function readinessCopy(
     title: provider === "cloudflare" ? "Inventory and write guard ready" : "Inventory and VM actions ready",
     detail:
       provider === "cloudflare"
-        ? "Aspis Bio worker inventory is filtered; mutation stays behind explicit guarded actions."
-        : "Aspis Bio project inventory can run guarded start, stop, reboot and delete actions.",
+        ? "Devboule worker inventory is filtered; mutation stays behind explicit guarded actions."
+        : "Devboule project inventory can run guarded start, stop, reboot and delete actions.",
     read: "Ready",
     write: "Ready",
     scope: scopeLabel,
@@ -356,7 +356,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
                 key={provider}
                 className={`rounded-2xl border ${tone.border} ${tone.bg} p-4`}
                 data-help-title={`${provider === "cloudflare" ? "Cloudflare" : "Scaleway"} readiness says whether this provider is safe to use.`}
-                data-help-lines="Readiness combines saved token health, pinned scope, resource counts, and backend inventory status.|For Aspis Bio, do not launch provider-writing agents if write readiness is missing or scope is wrong.|Read-ready is enough for verifiers; write-ready is needed for coders or human mutation actions.|Use Secrets to fix token and scope problems."
+                data-help-lines="Readiness combines saved token health, pinned scope, resource counts, and backend inventory status.|For Devboule, do not launch provider-writing agents if write readiness is missing or scope is wrong.|Read-ready is enough for verifiers; write-ready is needed for coders or human mutation actions.|Use Secrets to fix token and scope problems."
               >
                 <div className="flex items-start gap-3">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white">
@@ -445,7 +445,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
                 key={service.id}
                 className="rounded-2xl border border-cream-200 bg-white p-4"
                 data-help-title={`${service.name} is a mapped provider console section.`}
-                data-help-lines="The console map shows which Cloudflare or Scaleway surfaces the app understands or plans to cover.|For Aspis Bio, this helps decide what UX/backend tool to build next instead of using raw terminal commands.|Live counts mean the app found resources for that service; missing counts can mean missing scope or missing implementation.|Use official docs before adding write permissions."
+                data-help-lines="The console map shows which Cloudflare or Scaleway surfaces the app understands or plans to cover.|For Devboule, this helps decide what UX/backend tool to build next instead of using raw terminal commands.|Live counts mean the app found resources for that service; missing counts can mean missing scope or missing implementation.|Use official docs before adding write permissions."
               >
                 <div className="flex items-start gap-3">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-cream-50">
@@ -527,7 +527,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
                 key={resource.id}
                 className="grid grid-cols-1 gap-2 border-b border-cream-100 px-4 py-3 last:border-b-0 lg:grid-cols-[minmax(0,1.35fr)_120px_minmax(0,1fr)_96px] lg:items-center lg:gap-3"
                 data-help-title={`${resource.name} is a live provider inventory resource.`}
-                data-help-lines="This is one resource the backend found in the current provider scope.|For Aspis Bio, use it to verify what exists before building automations, smoke tests, or cleanup tasks.|Inventory is read-only here; operational writes belong on Cloudflare, Compute, or project-linked actions.|If it should not be here, check account/project isolation."
+                data-help-lines="This is one resource the backend found in the current provider scope.|For Devboule, use it to verify what exists before building automations, smoke tests, or cleanup tasks.|Inventory is read-only here; operational writes belong on Cloudflare, Compute, or project-linked actions.|If it should not be here, check account/project isolation."
               >
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -604,7 +604,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
                 key={health.id}
                 className="bg-white rounded-2xl border border-cream-200 p-5 hover:shadow-soft-sm transition-shadow"
                 data-help-title={`${health.name} provider status summarizes live access.`}
-                data-help-lines="This card tells whether the saved token and provider scope can read inventory and whether writes look safe.|For Aspis Bio, provider status is the gate before letting agents touch Cloudflare or Scaleway.|Read-only can be enough for verifier roles; coder roles need explicit limited write scopes.|If status is degraded, audit the token and pinned scope before using provider tools."
+                data-help-lines="This card tells whether the saved token and provider scope can read inventory and whether writes look safe.|For Devboule, provider status is the gate before letting agents touch Cloudflare or Scaleway.|Read-only can be enough for verifier roles; coder roles need explicit limited write scopes.|If status is degraded, audit the token and pinned scope before using provider tools."
               >
                 <div className="flex items-start gap-4">
                   <div className="w-10 h-10 rounded-xl bg-cream-50 flex items-center justify-center shrink-0">
@@ -708,7 +708,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
                 key={bookmark.id}
                 onClick={() => void openExternal(bookmark.url)}
                 data-help-title={`${bookmark.name} opens a saved provider bookmark.`}
-                data-help-lines="Bookmarks are quick links to external consoles, docs, or project resources.|For Aspis Bio, use them to verify provider state or documentation before adding dangerous app actions.|Opening a bookmark does not change Cloudflare, Scaleway, or local files.|Do not rely on bookmarks as audit evidence; write important findings into the project."
+                data-help-lines="Bookmarks are quick links to external consoles, docs, or project resources.|For Devboule, use them to verify provider state or documentation before adding dangerous app actions.|Opening a bookmark does not change Cloudflare, Scaleway, or local files.|Do not rely on bookmarks as audit evidence; write important findings into the project."
                 className="group flex items-center gap-3 px-4 py-3 bg-white rounded-xl border border-cream-200
                            hover:shadow-soft-xs hover:border-cream-300
                            transition-all duration-200 text-left"

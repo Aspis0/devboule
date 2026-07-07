@@ -503,7 +503,7 @@ export function WorkspaceView() {
                     key={repo.path}
                     className={`rounded-lg border p-3 ${repoTone(repo)}`}
                     data-help-title={`${repo.name} is a code repository.`}
-                    data-help-lines="Collaborators clone code repositories, not the whole Aspis Bio folder.|Dirty changes mean local edits exist and must be reviewed before push.|The clone command is safe to share, but it does not grant access by itself.|Data folders and caches are separate from these Git roots."
+                    data-help-lines="Collaborators clone code repositories, not the whole Devboule folder.|Dirty changes mean local edits exist and must be reviewed before push.|The clone command is safe to share, but it does not grant access by itself.|Data folders and caches are separate from these Git roots."
                   >
                     <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                       <div className="min-w-0">
@@ -581,7 +581,7 @@ export function WorkspaceView() {
                       title={policy.path}
                       className="flex items-center justify-between gap-3 rounded-lg bg-cream-50 px-3 py-2"
                       data-help-title={`${policy.name} controls workspace hygiene.`}
-                      data-help-lines="Policy files tell the app, Oracle and future agents what should be ignored or indexed.|For Aspis Bio, these prevent secrets, model binaries, raw datasets and caches from being treated as source code.|Missing policy files make collaborator setup and Oracle indexing less reliable.|Active rules are non-comment lines."
+                      data-help-lines="Policy files tell the app, Oracle and future agents what should be ignored or indexed.|For Devboule, these prevent secrets, model binaries, raw datasets and caches from being treated as source code.|Missing policy files make collaborator setup and Oracle indexing less reliable.|Active rules are non-comment lines."
                     >
                       <div className="min-w-0">
                         <p className="truncate text-[12px] font-semibold text-cream-800">
@@ -1547,7 +1547,7 @@ function WorkspaceBootstrapPanel({
               onChange={(event) => onDownloadUrlChange(event.target.value)}
               placeholder="https://… link to the encrypted .aspiswspkg"
               data-help-title="Fetch the encrypted package straight from a cloud URL."
-              data-help-lines="For a collaborator who does not have the Aspis Bio folder yet.|Paste an https link (e.g. a Scaleway/S3 presigned URL) to the .aspiswspkg.|The app downloads the encrypted bytes only — it never trusts them; the normal signature-verified decrypt still runs.|On success the local path is filled in below, ready to decrypt."
+              data-help-lines="For a collaborator who does not have the Devboule folder yet.|Paste an https link (e.g. a Scaleway/S3 presigned URL) to the .aspiswspkg.|The app downloads the encrypted bytes only — it never trusts them; the normal signature-verified decrypt still runs.|On success the local path is filled in below, ready to decrypt."
               className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-white px-3 py-2 font-mono text-[11px] text-cream-700 outline-none focus:border-terracotta-200"
             />
             <button
@@ -1894,7 +1894,7 @@ function Metric({
     <article
       className="rounded-lg border border-cream-200 bg-white p-4"
       data-help-title={`${label} is a workspace hygiene metric.`}
-      data-help-lines="Workspace metrics separate source code from local data, caches and generated artifacts.|For Aspis Bio, this prevents collaborators and Oracle from touching the wrong files.|Large counts are not automatically bad, but they need classification.|Use Scan workspace after major file changes."
+      data-help-lines="Workspace metrics separate source code from local data, caches and generated artifacts.|For Devboule, this prevents collaborators and Oracle from touching the wrong files.|Large counts are not automatically bad, but they need classification.|Use Scan workspace after major file changes."
     >
       <div className="mb-2 flex items-center gap-2">
         <Icon className="h-4 w-4 text-terracotta" />
@@ -1924,7 +1924,7 @@ function InventoryPanel({ items }: { items: WorkspaceSizeEntry[] }) {
             title={item.path}
             className="grid grid-cols-[minmax(0,1fr)_84px_84px] items-center gap-2 rounded-lg bg-cream-50 px-3 py-2"
             data-help-title={`${item.name} is a top-level workspace entry.`}
-            data-help-lines="Top-level size shows where the workspace weight actually lives.|For Aspis Bio, code repos can contain local caches and data that should not be pushed.|Large folders should be classified before any cleanup.|This panel is read-only."
+            data-help-lines="Top-level size shows where the workspace weight actually lives.|For Devboule, code repos can contain local caches and data that should not be pushed.|Large folders should be classified before any cleanup.|This panel is read-only."
           >
             <div className="min-w-0">
               <p className="truncate text-[12px] font-semibold text-cream-800">
@@ -1960,7 +1960,7 @@ function LargeFilePanel({ items }: { items: WorkspaceLargeFile[] }) {
             key={file.path}
             className="rounded-lg bg-cream-50 px-3 py-2"
             data-help-title={`${file.relativePath} is a large file.`}
-            data-help-lines="Large files are usually data, models, generated builds or dependency caches.|For Aspis Bio, these should not go to GitHub and should only reach Oracle as summaries or manifests.|The label tells whether it looks regenerable, data-like or suspicious.|Review before delete or move."
+            data-help-lines="Large files are usually data, models, generated builds or dependency caches.|For Devboule, these should not go to GitHub and should only reach Oracle as summaries or manifests.|The label tells whether it looks regenerable, data-like or suspicious.|Review before delete or move."
           >
             <div className="mb-1 flex items-start justify-between gap-3">
               <p className="min-w-0 break-words text-[12px] font-semibold text-cream-800">

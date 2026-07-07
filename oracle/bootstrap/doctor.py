@@ -162,9 +162,7 @@ def check_embedder(deep: bool = False) -> dict:
             "Download the Qwen3 embedding model (Oracle - Setup - Install runtime).",
         )
     if not deep:
-        return _check(
-            "embedder", True, "Qwen3 embedder installed and cached."
-        )
+        return _check("embedder", True, "Qwen3 embedder installed and cached.")
 
     # --deep: explicit, opt-in real load + dims assertion. Slow; only run when the
     # user asks for a deep verification.
@@ -193,7 +191,9 @@ def check_embedder(deep: bool = False) -> dict:
 # --- 3) workspace -----------------------------------------------------------
 
 
-def check_workspace(root: str | None, manifest_path: Path | str = CHUNK_MANIFEST_PATH) -> dict:
+def check_workspace(
+    root: str | None, manifest_path: Path | str = CHUNK_MANIFEST_PATH
+) -> dict:
     """``root`` is set, exists, is a directory, and matches the manifest root (by
     basename) if a manifest exists. Reports only basenames / booleans — never an
     absolute path."""
@@ -202,7 +202,7 @@ def check_workspace(root: str | None, manifest_path: Path | str = CHUNK_MANIFEST
             "workspace",
             False,
             "No workspace folder is selected.",
-            "Open Aspis - Oracle and choose your workspace folder.",
+            "Open Devboule - Oracle and choose your workspace folder.",
         )
     path = Path(str(root).strip())
     if not path.exists():
@@ -210,14 +210,14 @@ def check_workspace(root: str | None, manifest_path: Path | str = CHUNK_MANIFEST
             "workspace",
             False,
             "Selected workspace folder does not exist.",
-            "Open Aspis - Oracle and choose an existing workspace folder.",
+            "Open Devboule - Oracle and choose an existing workspace folder.",
         )
     if not path.is_dir():
         return _check(
             "workspace",
             False,
             "Selected workspace path is not a folder.",
-            "Open Aspis - Oracle and choose a folder, not a file.",
+            "Open Devboule - Oracle and choose a folder, not a file.",
         )
     resolved = path.resolve()
     name = resolved.name or "workspace"
@@ -232,7 +232,9 @@ def check_workspace(root: str | None, manifest_path: Path | str = CHUNK_MANIFEST
     return _check("workspace", True, f"Workspace folder '{name}' is selected.")
 
 
-def _manifest_root_matches(resolved_root: Path, manifest_path: Path | str) -> bool | None:
+def _manifest_root_matches(
+    resolved_root: Path, manifest_path: Path | str
+) -> bool | None:
     """Return True if the manifest's recorded root basename matches ``resolved_root``,
     False on a clear mismatch, or None when there is no manifest / no recorded root
     to compare against. NEVER surfaces an absolute path — only the boolean."""
@@ -270,7 +272,7 @@ def check_index(
             "index",
             False,
             "No workspace folder is selected.",
-            "Open Aspis - Oracle and choose your workspace folder.",
+            "Open Devboule - Oracle and choose your workspace folder.",
         )
     try:
         from oracle.ingestion.chunk_index import chunk_index_status
