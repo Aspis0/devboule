@@ -49,7 +49,7 @@ function emitError(context, err) {
 
 function createJsonlReader(stream, onLine) {
 	let buffer = "";
-	stream.on("data", (chunk) => {
+	stream.on("data", async (chunk) => {
 		buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
 		while (true) {
 			const nl = buffer.indexOf("\n");
@@ -57,7 +57,7 @@ function createJsonlReader(stream, onLine) {
 			let line = buffer.slice(0, nl);
 			buffer = buffer.slice(nl + 1);
 			if (line.endsWith("\r")) line = line.slice(0, -1);
-			if (line.length > 0) onLine(line);
+			if (line.length > 0) await onLine(line);
 		}
 	});
 	stream.on("end", () => {
@@ -66,6 +66,83 @@ function createJsonlReader(stream, onLine) {
 			if (line.endsWith("\r")) line = line.slice(0, -1);
 			if (line.length > 0) onLine(line);
 		}
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 Pigeon routing hooks
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit a `classify_prompt` request to the Rust sidecar and await its `classified`
+ * response (delivered on our stdin). Resolves with { tier, provider, model, path }.
+ */
+function requestClassification(text) {
+	return new Promise((resolve, reject) => {
+		pendingClassification = { resolve, reject };
+		emit({ type: "classify_prompt", text });
+	});
+}
+
+/**
+ * Apply a Pigeon classification to the live session. The pi SDK supports
+ * `session.setModel(model)` mid-session (docs/sdk.md:91), so we switch the model
+ * when the resolved provider/model is present in the current ModelRegistry.
+ * If it is NOT (e.g. the spawn-time minimal models.json only carries the
+ * configured provider), we defer and keep the existing session model — full
+ * multi-tier switching is Phase 3.
+ */
+async function applyPigeonRouting(session, modelRegistry, classification) {
+	const { tier, provider, model } = classification;
+	console.error(
+		`[pi-sidecar] Pigeon: tier=${tier} provider=${provider} model=${model} path=${classification.path}`,
+	);
+	try {
+		const resolved = modelRegistry.find(provider, model);
+		await session.setModel(resolved);
+		console.error(
+			`[pi-sidecar] Pigeon: applied ${provider}/${model} (tier=${tier})`,
+		);
+	} catch (e) {
+		console.error(
+			`[pi-sidecar] Pigeon: setModel deferred — ${e instanceof Error ? e.message : String(e)} (keeping session model)`,
+		);
+	}
+}
+
+/**
+ * Phase 2 Pigeon: classify the prompt via Rust (await the `classified` response),
+ * then either redirect to the Claude-terminal subprocess (path === "terminal")
+ * or apply the tier→model routing and run the turn in pi.
+ */
+async function handlePromptCommand(cmd, session, modelRegistry) {
+	const classification = await requestClassification(cmd.message);
+	// Phase 2: AgentPath routing only. Full multi-tier model switching
+	// (vault-aware tier resolution) deferred to Phase 3 — the spawn-time minimal
+	// models.json can't resolve every classified model, so setModel is deferred.
+	console.error(
+		`[pi-sidecar] Pigeon routing: path=${classification.path}, model switching deferred (Phase 3)`,
+	);
+	if (classification.path === "terminal") {
+		// Route to the legacy Claude-terminal subprocess (decision #10): skip
+		// session.prompt() and let Rust handle the redirect.
+		emit({ type: "redirect_to_claude", message: cmd.message });
+		emit({
+			type: "response",
+			command: "prompt",
+			success: true,
+			routed: "terminal",
+		});
+		return;
+	}
+	await applyPigeonRouting(session, modelRegistry, classification);
+	await session.prompt(cmd.message, {
+		streamingBehavior: cmd.streamingBehavior,
+	});
+	emit({
+		type: "response",
+		command: "prompt",
+		success: true,
 	});
 }
 
@@ -243,6 +320,7 @@ async function main() {
 
 	// ---- read JSONL commands from stdin -----------------------------------
 	let promptInFlight = false;
+	let pendingClassification = null;
 	let stdinClosed = false;
 	let stdinGraceTimer = null;
 
@@ -268,14 +346,9 @@ async function main() {
 				}
 				promptInFlight = true;
 				try {
-					await session.prompt(cmd.message, {
-						streamingBehavior: cmd.streamingBehavior,
-					});
-					emit({
-						type: "response",
-						command: "prompt",
-						success: true,
-					});
+					// Phase 2 Pigeon: classify BEFORE prompting (handlePromptCommand
+					// awaits the Rust `classified` response, then applies routing).
+					await handlePromptCommand(cmd, session, modelRegistry);
 				} catch (err) {
 					emit({
 						type: "response",
@@ -285,6 +358,16 @@ async function main() {
 					});
 				} finally {
 					promptInFlight = false;
+				}
+				break;
+			}
+
+			case "classified": {
+				// Phase 2 Pigeon: Rust classified the prompt; resolve the pending
+				// promise so the `prompt` handler can apply the routing.
+				if (pendingClassification) {
+					pendingClassification.resolve(cmd);
+					pendingClassification = null;
 				}
 				break;
 			}

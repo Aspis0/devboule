@@ -46,7 +46,10 @@ struct SessionSlot {
 /// stdin writer, per-session generation counter, and reader thread handle.
 struct PiSession {
     child: Child,
-    stdin: ChildStdin,
+    /// Shared stdin writer. Also written by the reader thread (which sends
+    /// `classified` responses back to the sidecar), so it is reference-counted
+    /// and mutex-guarded to keep JSONL lines from interleaving.
+    stdin: Arc<Mutex<ChildStdin>>,
     /// Per-session generation counter — bumped ONLY when THIS session respawns.
     /// The reader thread compares against this, NOT a global counter.
     generation: Arc<AtomicU64>,
@@ -240,7 +243,7 @@ fn spawn_pi_session_inner(
         .spawn()
         .map_err(|e| format!("Failed to spawn pi sidecar (is Node.js installed?): {e}"))?;
 
-    let stdin = child
+    let raw_stdin = child
         .stdin
         .take()
         .ok_or_else(|| "pi sidecar stdin not captured".to_string())?;
@@ -248,6 +251,11 @@ fn spawn_pi_session_inner(
         .stdout
         .take()
         .ok_or_else(|| "pi sidecar stdout not captured".to_string())?;
+
+    // Shared, mutex-guarded stdin: both `spike_pi_prompt` (prompt commands) and
+    // the reader thread (`classified` responses) write here. The Arc lets the
+    // reader own a clone; the Mutex serializes their JSONL lines.
+    let stdin = Arc::new(Mutex::new(raw_stdin));
 
     // Per-session generation: reuse existing Arc if respawning the same session,
     // or create a new one for a fresh session.
@@ -258,8 +266,9 @@ fn spawn_pi_session_inner(
     let app_clone = app.clone();
     let sid = session_id.to_string();
     let gen_clone = generation.clone();
+    let stdin_clone = stdin.clone();
     let reader_handle = std::thread::spawn(move || {
-        read_sidecar_events(app_clone, stdout, gen_clone, &sid);
+        read_sidecar_events(app_clone, stdout, stdin_clone, gen_clone, &sid);
     });
 
     Ok(PiSession {
@@ -434,8 +443,14 @@ pub async fn spike_pi_prompt(
         });
         let line =
             serde_json::to_string(&cmd).map_err(|e| format!("JSON serialize error: {e}"))?;
-        session
+        // Phase 2: stdin is shared with the reader thread (which writes
+        // `classified` responses back to the sidecar). Lock it so the JSONL
+        // prompt line never interleaves with a `classified` line.
+        let mut stdin_lock = session
             .stdin
+            .lock()
+            .map_err(|_| format!("pi session {sid} stdin lock poisoned"))?;
+        stdin_lock
             .write_all(format!("{line}\n").as_bytes())
             .map_err(|e| {
                 // F4: on write failure, flag for zombie cleanup after we release session borrow.
@@ -444,8 +459,7 @@ pub async fn spike_pi_prompt(
                 }
                 format!("Failed to write to pi sidecar stdin: {e}")
             })?;
-        session
-            .stdin
+        stdin_lock
             .flush()
             .map_err(|e| format!("Failed to flush pi sidecar stdin: {e}"))?;
     }
@@ -688,6 +702,82 @@ impl EventMapper {
     }
 }
 
+// ---- Phase 2 Pigeon control commands ------------------------------------
+
+/// Phase 2: handle a JSONL *control command* the sidecar emits on its stdout
+/// (`classify_prompt`, `redirect_to_claude`) before it is mistaken for a pi SDK
+/// event. Returns `true` if the line was a control command (and consumed);
+/// `false` lets the caller fall through to normal pi event parsing.
+fn handle_control_line(
+    app: &AppHandle,
+    agent_id: &str,
+    line: &str,
+    stdin: &Arc<Mutex<ChildStdin>>,
+) -> bool {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let t = match v.get("type").and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => return false,
+    };
+    match t {
+        "classify_prompt" => {
+            // Non-blocking: classification is pure + fast, so the `classified`
+            // response is written back to the sidecar's stdin BEFORE the
+            // session.prompt() begins (the sidecar awaits it first).
+            //
+            // Phase 2: AgentPath routing only. Full multi-tier model switching
+            // (vault-aware tier resolution) deferred to Phase 3 — the sidecar's
+            // spawn-time minimal models.json can't resolve every classified
+            // (provider, model) pair, so `setModel` is deferred there.
+            let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let c = crate::backend::prompt_routing::classify_prompt_full(text, app);
+            let response = serde_json::json!({
+                "type": "classified",
+                "tier": c.tier,
+                "provider": c.provider,
+                "model": c.model,
+                "path": c.path,
+            });
+            write_jsonl_to_stdin(stdin, &response);
+            true
+        }
+        "redirect_to_claude" => {
+            // path == Terminal: the sidecar declined to run this in pi and asked
+            // Rust to route it to the legacy Claude-terminal subprocess.
+            // TODO (Phase 3): spawn/route `message` to the existing Claude-terminal
+            // subprocess (decision #10). Spike: log it and surface a Tauri event
+            // so the frontend can later show the redirect.
+            let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            let truncated: String = message.chars().take(60).collect();
+            let suffix = if message.chars().count() > 60 { "…" } else { "" };
+            eprintln!(
+                "[pi-sidecar] Pigeon: path=Terminal redirect_to_claude: {}{}",
+                truncated, suffix
+            );
+            let _ = app.emit(
+                &format!("pigeon-redirect://{agent_id}"),
+                serde_json::json!({ "message": message }),
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Write a JSONL object to the sidecar's stdin (best-effort; used for the
+/// `classified` response). Locked so it never interleaves with prompt commands.
+fn write_jsonl_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
+    if let Ok(mut s) = stdin.lock() {
+        if let Ok(line) = serde_json::to_string(value) {
+            let _ = s.write_all(format!("{line}\n").as_bytes());
+            let _ = s.flush();
+        }
+    }
+}
+
 // ---- stdout reader ---------------------------------------------------------
 
 /// Blocking reader thread: reads JSONL from the sidecar's stdout. Uses a
@@ -696,6 +786,7 @@ impl EventMapper {
 fn read_sidecar_events(
     app: AppHandle,
     stdout: std::process::ChildStdout,
+    stdin: Arc<Mutex<ChildStdin>>,
     generation: Arc<AtomicU64>,
     agent_id: &str,
 ) {
@@ -714,6 +805,13 @@ fn read_sidecar_events(
         // Per-session generation check: only exits if THIS session was superseded.
         if generation.load(Ordering::SeqCst) != gen {
             break;
+        }
+        // Phase 2 Pigeon: intercept control commands BEFORE treating the line as
+        // a pi SDK event. `classify_prompt` → respond with `classified` on the
+        // sidecar's stdin; `redirect_to_claude` → log + emit a Tauri event
+        // (full routing to the Claude-terminal subprocess is deferred to Phase 3).
+        if handle_control_line(&app, agent_id, &line, &stdin) {
+            continue;
         }
         match serde_json::from_str::<PiEvent>(&line) {
             Ok(event) => {
