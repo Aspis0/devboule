@@ -162,6 +162,124 @@ The Tauri backend code that **launches** devboule-coder (`projects.rs` orchestra
 
 ---
 
+## 8b. Console Rendering & Event Mapping (2026-07-07, verified by recon)
+
+Devboule has **3 consoles** that render agent activity. All three use the same mechanism: `useAgentConsole(agentId)` → subscribe to `mini-activity://{agentId}` → render `ConsoleActivity` / `MiniActivityEvent::Snapshot`. Under pi, the data source changes (pi SDK events instead of devboule-coder file bridge), but the React components are **untouched**.
+
+### 8b.1 The Three Consoles
+
+| Console | File | Channel | Agent | Today's Data Source | Pi Data Source |
+|---|---|---|---|---|---|
+| **PlannerPlanMode** (orchestrator) | `ProjectsView.tsx:1243` | `mini-activity://orchestrator-{projectId}` | orchestrator (stable per-project) | `mini_activity.rs` store ← orchestrator binary bridge files | pi session + enrichment → EventMapper → `MiniActivityEvent` |
+| **FocusStagePane** (coder/mini) | `ProjectWorkspace.tsx:1240` | `mini-activity://{agentId}` (coder-*, mini-*, pi-*) | coder / mini (per-launch) | `mini_activity.rs` store ← mini_coder_executor | pi session → EventMapper → `MiniActivityEvent` |
+| **AgentTerminalViewer** (raw PTY) | `AgentTerminalViewer.tsx` | `agent-terminal://{agentId}` | any PTY agent | `agent_pty.rs:315` | **Unchanged** (raw terminal, not pi) |
+
+**All three can be active simultaneously** — PlannerPlanMode is always visible in project view; FocusStagePane shows the selected agent from the LivingPlan tree; up to 2 FocusStagePanes in split view.
+
+### 8b.2 pi SDK Event Catalog (for rendering)
+
+pi emits 3 layers of events via `session.subscribe()` (source: `pi-agent-core/dist/types.d.ts:25-57`, `pi-ai/dist/types.d.ts:162-198`):
+
+**Layer 1 — AgentEvent (core LLM loop, 9 types):**
+
+| Event | Key Fields | Renders As |
+|---|---|---|
+| `agent_start` / `agent_end` | `{ type }` / `{ type, messages, willRetry }` | Agent lifecycle banner |
+| `turn_start` / `turn_end` | `{ type }` / `{ type, message, toolResults }` | Turn separator |
+| `message_start` / `message_end` | `{ type, message }` | Message bubble |
+| `message_update` | `{ type, message, assistantMessageEvent }` | Streaming text/toolcall deltas (see below) |
+| `tool_execution_start` | `{ type, toolCallId, toolName, args }` | Tool card (collapsed) |
+| `tool_execution_update` | `{ type, toolCallId, toolName, partialResult }` | Live output inside tool card |
+| `tool_execution_end` | `{ type, toolCallId, toolName, result: { content, details }, isError }` | Final result + details (diff, patch, output) |
+
+**AssistantMessageEvent (nested in `message_update`, 13 types):** `start`, `text_start`, `text_delta` (streaming text chunks), `text_end`, `thinking_start`/`_delta`/`_end` (thinking blocks), `toolcall_start`/`_delta`/`_end` (tool call args streaming), `done` (stop/length/toolUse), `error`.
+
+**Layer 2 — AgentSessionEvent (SDK embed adds 6 types):** `queue_update`, `compaction_start`/`_end`, `auto_retry_start`/`_end`, `session_info_changed`, `thinking_level_changed`.
+
+**Layer 3 — Extension hooks (19+ lifecycle events via `pi.on()`, NOT in event stream):** `before_agent_start`, `tool_call`, `tool_result` (block/modify capable), `session_start`, `session_shutdown`, `context`, `before_provider_request`, `after_provider_response`, `model_select`, etc. These are NOT forwarded to the console — they're used for Censor hook, Pigeon routing, and provider config.
+
+### 8b.3 Tool Execution Details (for console rendering)
+
+Each tool's `result.details` contains tool-specific structured data for rendering:
+
+- **edit**: `details.patch` (unified diff), `details.diff` (TUI display) — `sdk.md:186`
+- **bash**: `details.truncation`, `details.fullOutputPath` — `rpc.md:164`
+- **write**: `details.path`, `details.bytesWritten`
+- **read**: `details.path`, `details.startLine`, `details.endLine`
+- **grep**: `details.matches[]`
+
+The EventMapper in `pi_sidecar.rs` reads these and converts them to the existing `ConsoleActivity` schema that `useAgentConsole` already renders.
+
+### 8b.4 OpenClaw's Pattern (that we already follow)
+
+OpenClaw does NOT use pi RPC mode. It imports `createAgentSession()` in-process — exactly like our sidecar. Its event pipeline:
+
+1. **Raw pi events** → typed TypeScript subscription (`AgentSessionEvent`)
+2. **Enrichment**: block-chunking, tag stripping (`<think>`), directive parsing (`[[media:url]]`), tool result formatting
+3. **UI rendering**: TUI (`@mariozechner/pi-tui`) + web Control UI (Vite + Lit). Tool calls as expandable cards with live streaming updates.
+
+Devboule already follows this pattern — our sidecar embeds pi SDK in-process, subscribes to `AgentSessionEvent`, and forwards to Rust. The enrichment step (step 2) is what we need to add for the orchestrator console.
+
+### 8b.5 Hybrid Strategy for Devboule Consoles (per M)
+
+| Console | Approach | Detail |
+|---|---|---|
+| **PlannerPlanMode** (orchestrator) | **Keep UI + adapter** | The rich composer (chat bubbles, websearch, LivingPlan, Kairion doubts) stays unchanged. pi events are enriched with Devboule metadata (agentRole, projectId, planSteps, websearchResults) via `pi.sendMessage({ customType: "devboule", details: {...} })` in the sidecar. The Rust EventMapper reads the `devboule` custom message and maps it into `ConsoleActivity` fields that `PlannerPlanMode` already understands. Zero React changes. |
+| **FocusStagePane** (coder/mini) | **Already mapped** | `pi_sidecar.rs` EventMapper converts pi events → `MiniActivityEvent::Snapshot` → `app.emit("mini-activity://{agentId}")`. Works today for pi-* sessions. Extend to coder-*/mini-* agent IDs by allowing the sidecar to use those ID namespaces when spawning sessions for those roles. |
+| **Pi overlay** (alpha) | **Evolve to native** | Replace the current temp inline panel with a first-class pi console using `AgentConsole.tsx` (reusable component). Tool calls rendered as expandable cards (OpenClaw pattern). Multi-agent support: nested agent session components via `agent_start`/`agent_end` events. |
+
+### 8b.6 Agent ID Namespaces Under pi
+
+When pi sessions replace devboule-coder agents, they must emit on the SAME `mini-activity://` channels the frontend already subscribes to:
+
+| Agent Role | Channel Pattern | pi Sidecar Mapping |
+|---|---|---|
+| Orchestrator | `orchestrator-{sanitizedProjectId}` | Spawn pi session with `sessionId = "orchestrator-{projectId}"` → emits on that channel |
+| Main coder | `main-{timestamp}` (or `pi-coder-{N}`) | Spawn pi session with `sessionId = "main-{timestamp}"` or per-session counter |
+| Mini coder | `mini-{timestamp}` (subagent of main) | Main coder spawns pi subagent → subagent events forwarded via main's session |
+| Verifier/Reviewer | `verifier-{timestamp}` | Same as mini — subagent of main |
+
+**Key**: `pi_sidecar.rs` already supports arbitrary session IDs via `spike_pi_prompt(sessionId?)`. When `sessionId` is provided, it reuses/updates that session. When null, creates a new one with auto-generated `pi-{N}`. For orchestrator, we provide the stable project-scoped ID.
+
+### 8b.7 Enrichment Pipeline (what the sidecar adds to raw pi events)
+
+```javascript
+// pi-sidecar/sidecar.mjs (enrichment layer — Phase 5)
+session.subscribe((event) => {
+  // Enrich with Devboule metadata for console rendering
+  const enriched = {
+    ...event,
+    _devboule: {
+      agentRole: currentRole,        // orchestrator | coder | mini | verifier
+      projectId: currentProjectId,
+      taskSpec: currentTaskSpec,     // for PlannerPlanMode
+    }
+  };
+
+  // For orchestrator: inject plan + websearch as custom messages
+  if (event.type === "tool_execution_end" && event.toolName === "web_search") {
+    pi.sendMessage({
+      customType: "devboule.websearch",
+      details: { query: event.args.query, results: event.result.details }
+    });
+  }
+
+  emit(enriched);
+});
+```
+
+The Rust EventMapper reads `_devboule` and maps enriched events to the correct `ConsoleActivity` fields for each console type. The enrichment is entirely in the sidecar — no pi fork needed (pi is MIT, but we prefer to avoid fork maintenance cost).
+
+### 8b.8 What Changes in Phase 4 (delete devboule-coder)
+
+1. `mini_activity.rs` **survives** — it's the store, not the engine
+2. `pi_sidecar.rs` becomes the **primary event source** for ALL agent consoles
+3. The `mini-activity://` channel contract **does not change** — `useAgentConsole` works identically
+4. Agent launch in `projects.rs` switches from spawning devboule-coder binary to spawning pi sidecar sessions with the appropriate `sessionId`
+5. PlannerPlanMode and FocusStagePane receive pi events mapped to their existing schema — **zero React changes**
+
+---
+
 ## 9. Migration phases
 
 1. **Phase 0 — Spike ✅ (bfd11bb):** minimal Node sidecar embeds pi SDK, registers `oracle_ask` tool, streams to React via Tauri IPC. Bridge proven end-to-end with `openrouter/tencent/hy3:free`.
