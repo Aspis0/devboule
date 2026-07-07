@@ -5,20 +5,22 @@ and bridges it to Devboule's Rust backend via JSONL over stdio.
 
 ## What it proves
 
-1. **Tool registration**: `oracle_ask` custom tool is registered via `defineTool()` and
-   invoked by the pi agent during a conversation.
-2. **Event streaming**: All pi SDK events (`text_delta`, `tool_execution_*`, etc.) are
+1. **Event streaming**: All pi SDK events (`text_delta`, `tool_execution_*`, etc.) are
    forwarded as JSONL to stdout.
-3. **JSONL protocol**: The Rust backend spawns this process, sends prompts via stdin,
+2. **JSONL protocol**: The Rust backend spawns this process, sends prompts via stdin,
    and receives streamed events via stdout.
-4. **Console rendering**: The Rust side maps pi events to the existing
+3. **Console rendering**: The Rust side maps pi events to the existing
    `MiniActivityEvent` / `ConsoleActivity` schema so `WorkConsole.tsx` renders them
    WITHOUT any React changes.
+4. **Oracle MCP**: Oracle tools are available via MCP auto-connect (`~/.pi/agent/mcp.json`
+   + `.pi/mcp.json`). The pi agent picks up the Oracle-figlyph MCP server (7 tools) automatically.
+5. **Censor hook**: Optional post-edit Rust code review via pi LLM, gated by
+   `DEVBOULE_CENSOR_REVIEW_ENABLED` env var (default: enabled).
 
 ## Prerequisites
 
-- **Node.js** ≥ 20 (tested with v26.3.0)
-- **An API key** for at least one provider. Set the env var for your provider, e.g.:
++ **Node.js** ≥ 20 (tested with v26.3.0)
++ **An API key** for at least one provider. Set the env var for your provider, e.g.:
 
   ```bash
   export OPENAI_API_KEY="sk-..."
@@ -40,11 +42,10 @@ This installs `@earendil-works/pi-coding-agent@0.80.3` locally.
 ```bash
 cd pi-sidecar
 export OPENAI_API_KEY="sk-..."
-echo '{"type":"prompt","message":"Use oracle_ask to search for authentication code"}' | node sidecar.mjs
+echo '{"type":"prompt","message":"What files are in the current directory?"}' | node sidecar.mjs
 ```
 
-You'll see JSONL events stream to stdout. When the agent calls `oracle_ask`, the
-canned `[SPIKE PLACEHOLDER]` response appears in the `tool_execution_end` event.
+You'll see JSONL events stream to stdout.
 
 ### Option B: Full end-to-end with Tauri
 
@@ -60,7 +61,7 @@ canned `[SPIKE PLACEHOLDER]` response appears in the `tool_execution_end` event.
    `spike_pi_prompt`. You can invoke it from the browser devtools console:
 
    ```js
-   window.__TAURI__.core.invoke("spike_pi_prompt", { text: "Use oracle_ask to search for auth code" });
+   window.__TAURI__.core.invoke("spike_pi_prompt", { text: "List the files in src/" });
    ```
 
    Or via the Tauri CLI:
@@ -77,10 +78,11 @@ canned `[SPIKE PLACEHOLDER]` response appears in the `tool_execution_end` event.
 
 Pass provider/model via env vars to the Rust launcher (defaults shown):
 
-| Env var                | Default                    | Description                     |
-|------------------------|----------------------------|---------------------------------|
-| `DEVBOULE_PI_PROVIDER` | `openai`  | pi provider name (Claude blocked per decision #10) |
-| `DEVBOULE_PI_MODEL`    | `gpt-4o`  | Model ID within the provider    |
+| Env var                        | Default | Description                     |
+|--------------------------------|---------|----------------------------------|
+| `DEVBOULE_PI_PROVIDER`         | `openai`| pi provider name                 |
+| `DEVBOULE_PI_MODEL`            | `gpt-4o`| Model ID within the provider     |
+| `DEVBOULE_CENSOR_REVIEW_ENABLED` | `true` | Enable post-edit Censor review  |
 
 The API key for the chosen provider must be set as an env var the pi SDK recognizes
 (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) — see pi's `AuthStorage` docs.
@@ -105,8 +107,8 @@ The API key for the chosen provider must be set as an env var the pi SDK recogni
 ┌─────────────────────────────────────────────────────────┐
 │  Node Sidecar (sidecar.mjs)                             │
 │  ├─ createAgentSession()                                │
-│  ├─ registerTool("oracle_ask") → canned response        │
 │  ├─ session.subscribe() → emit events to stdout         │
+│  ├─ Censor hook: track .rs edits, trigger review        │
 │  └─ reads prompt commands from stdin                    │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -134,12 +136,10 @@ The API key for the chosen provider must be set as an env var the pi SDK recogni
 
 ## What's NOT wired (TODO for later phases)
 
-- **Real Oracle proxy**: `oracle_ask` returns a canned placeholder. Phase 1 will
-  proxy to the Python Oracle MCP server.
-- **Provider/model from vault**: The spike hardcodes defaults. Decision #9 says the
++ **Provider/model from vault**: The spike hardcodes defaults. Decision #9 says the
   vault is the source of truth; the Rust side will read from
   `save_oracle_llm_settings` (`vault.rs:927`) and pass via env vars.
-- **Node binary bundling**: The spike runs `node` directly. Phase 5 will use
++ **Node binary bundling**: The spike runs `node` directly. Phase 5 will use
   `@yao-pkg/pkg --sea --compress Zstd` per decision #5.
-- **Session persistence**: Uses `SessionManager.inMemory()`. No session survives
++ **Session persistence**: Uses `SessionManager.inMemory()`. No session survives
   a restart.
