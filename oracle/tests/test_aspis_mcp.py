@@ -89,7 +89,9 @@ from oracle.store.sqlite_store import SQLiteStore
 def prepare_management_root(root: Path) -> Path:
     (root / "config.json").write_text("{}", encoding="utf-8")
     (root / "oracle" / "server").mkdir(parents=True, exist_ok=True)
-    (root / "oracle" / "server" / "aspis_mcp.py").write_text("# test marker\n", encoding="utf-8")
+    (root / "oracle" / "server" / "aspis_mcp.py").write_text(
+        "# test marker\n", encoding="utf-8"
+    )
     projects = root / "projects"
     projects.mkdir(exist_ok=True)
     return projects
@@ -137,7 +139,9 @@ updated_at: 2026-05-28T00:00:00Z
 
 class AspisMcpProjectTests(unittest.TestCase):
     def setUp(self):
-        self._old_unmanaged_privileged = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        self._old_unmanaged_privileged = os.environ.get(
+            "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"
+        )
         self._old_disable_app_vault = os.environ.get("ASPIS_MCP_DISABLE_APP_VAULT")
         os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
         os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = "1"
@@ -146,7 +150,9 @@ class AspisMcpProjectTests(unittest.TestCase):
         if self._old_unmanaged_privileged is None:
             os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
         else:
-            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old_unmanaged_privileged
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = (
+                self._old_unmanaged_privileged
+            )
         if self._old_disable_app_vault is None:
             os.environ.pop("ASPIS_MCP_DISABLE_APP_VAULT", None)
         else:
@@ -177,7 +183,9 @@ class AspisMcpProjectTests(unittest.TestCase):
                     },
                 }
                 (paths["root"] / "oracle-data").mkdir(parents=True, exist_ok=True)
-                (paths["root"] / "oracle-data" / "chunk-index-manifest.json").write_text(
+                (
+                    paths["root"] / "oracle-data" / "chunk-index-manifest.json"
+                ).write_text(
                     json.dumps(manifest),
                     encoding="utf-8",
                 )
@@ -221,7 +229,9 @@ class AspisMcpProjectTests(unittest.TestCase):
             projects_dir = prepare_management_root(root)
             work_root = root / "Aspis Bio Work"
             work_root.mkdir()
-            (work_root / "pipeline.py").write_text("print('pipeline')\n", encoding="utf-8")
+            (work_root / "pipeline.py").write_text(
+                "print('pipeline')\n", encoding="utf-8"
+            )
             escaped_work_root = str(work_root).replace("\\", "\\\\")
             (projects_dir / "mcp-scope.md").write_text(
                 f"""---
@@ -262,12 +272,16 @@ root_path: "{escaped_work_root}"
             projects_dir = prepare_management_root(root)
             other_work_root = root / "Other Project Work"
             other_work_root.mkdir()
-            (other_work_root / "secret_pipeline.py").write_text("print('other')\n", encoding="utf-8")
+            (other_work_root / "secret_pipeline.py").write_text(
+                "print('other')\n", encoding="utf-8"
+            )
             manifest = {
                 "version": 2,
                 "roots": {
                     str(root.resolve()): {"files": {"oracle/server/aspis_mcp.py": {}}},
-                    str(other_work_root.resolve()): {"files": {"secret_pipeline.py": {}}},
+                    str(other_work_root.resolve()): {
+                        "files": {"secret_pipeline.py": {}}
+                    },
                 },
             }
             (root / "oracle-data").mkdir(parents=True, exist_ok=True)
@@ -305,19 +319,29 @@ root_path: "{escaped_work_root}"
             with self.assertRaises(McpError) as missing_version:
                 handle_tool_call(
                     "project_get",
-                    {"project_id": "scrna-seq", "agent_id": "schema-auditor", "role": "orchestrator"},
+                    {
+                        "project_id": "scrna-seq",
+                        "agent_id": "schema-auditor",
+                        "role": "orchestrator",
+                    },
                     root=root,
                 )
             self.assertIn("version", str(missing_version.exception))
 
             path.write_text(
-                original.replace('"updatedAt": "2026-05-28T00:00:00Z"', '"updatedAt": ""'),
+                original.replace(
+                    '"updatedAt": "2026-05-28T00:00:00Z"', '"updatedAt": ""'
+                ),
                 encoding="utf-8",
             )
             with self.assertRaises(McpError) as missing_task_updated:
                 handle_tool_call(
                     "project_get",
-                    {"project_id": "scrna-seq", "agent_id": "schema-auditor", "role": "orchestrator"},
+                    {
+                        "project_id": "scrna-seq",
+                        "agent_id": "schema-auditor",
+                        "role": "orchestrator",
+                    },
                     root=root,
                 )
             self.assertIn("updatedAt", str(missing_task_updated.exception))
@@ -329,7 +353,9 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             path = sample_project(projects)
             path.write_text(
-                path.read_text(encoding="utf-8").replace("id: scrna-seq", "id: other-project"),
+                path.read_text(encoding="utf-8").replace(
+                    "id: scrna-seq", "id: other-project"
+                ),
                 encoding="utf-8",
             )
             handle_tool_call(
@@ -346,7 +372,11 @@ root_path: "{escaped_work_root}"
             with self.assertRaises(McpError) as ctx:
                 handle_tool_call(
                     "project_get",
-                    {"project_id": "scrna-seq", "agent_id": "schema-auditor", "role": "orchestrator"},
+                    {
+                        "project_id": "scrna-seq",
+                        "agent_id": "schema-auditor",
+                        "role": "orchestrator",
+                    },
                     root=root,
                 )
 
@@ -378,7 +408,11 @@ root_path: "{escaped_work_root}"
             with self.assertRaises(McpError) as ctx:
                 handle_tool_call(
                     "project_get",
-                    {"project_id": "scrna-seq", "agent_id": "schema-auditor", "role": "orchestrator"},
+                    {
+                        "project_id": "scrna-seq",
+                        "agent_id": "schema-auditor",
+                        "role": "orchestrator",
+                    },
                     root=root,
                 )
 
@@ -415,7 +449,11 @@ root_path: "{escaped_work_root}"
             self.assertEqual(result["metadata"]["title"], "Renamed Plan")
             reloaded = handle_tool_call(
                 "project_get",
-                {"project_id": "scrna-seq", "agent_id": "namer", "role": "orchestrator"},
+                {
+                    "project_id": "scrna-seq",
+                    "agent_id": "namer",
+                    "role": "orchestrator",
+                },
                 root=root,
             )
             self.assertEqual(reloaded["metadata"]["title"], "Renamed Plan")
@@ -438,7 +476,12 @@ root_path: "{escaped_work_root}"
 
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "namer", "role": "orchestrator", "model": "test", "message": "x"},
+                {
+                    "agent_id": "namer",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "x",
+                },
                 root=root,
             )
             handle_tool_call(
@@ -605,7 +648,11 @@ root_path: "{escaped_work_root}"
 
             self.assertEqual(project["state"]["tasks"][0]["status"], "done")
             self.assertEqual(project["metadata"]["status"], "done")
-            self.assertTrue(any("verifier-1" in note["source"] for note in project["state"]["notes"]))
+            self.assertTrue(
+                any(
+                    "verifier-1" in note["source"] for note in project["state"]["notes"]
+                )
+            )
 
     def test_coder_cannot_close_task_without_verifier(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -745,7 +792,9 @@ root_path: "{escaped_work_root}"
                                 "role": "mini",
                                 "status": "active",
                                 "lastSeenAt": "2026-06-12T00:00:00Z",
-                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -795,7 +844,9 @@ root_path: "{escaped_work_root}"
                                 "role": "mini",
                                 "status": "active",
                                 "lastSeenAt": "2026-06-12T00:00:00Z",
-                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -805,9 +856,16 @@ root_path: "{escaped_work_root}"
                 ),
                 encoding="utf-8",
             )
-            base = {"agent_id": "mini-7", "role": "mini", "model": "qwen", "message": "x"}
+            base = {
+                "agent_id": "mini-7",
+                "role": "mini",
+                "model": "qwen",
+                "message": "x",
+            }
             # First register with the right token: succeeds + consumes the hash.
-            handle_tool_call("agent_register", dict(base, launch_token=token), root=root)
+            handle_tool_call(
+                "agent_register", dict(base, launch_token=token), root=root
+            )
             # Second register, now tokenless: must be REJECTED (consumed).
             with self.assertRaises(McpError):
                 handle_tool_call("agent_register", dict(base), root=root)
@@ -905,7 +963,10 @@ root_path: "{escaped_work_root}"
             self.assertEqual(project["state"]["tasks"][0]["status"], "wip")
             self.assertEqual(state["claims"][0]["status"], "wip")
             self.assertTrue(
-                any("moved it to wip" in note["text"] for note in project["state"]["notes"])
+                any(
+                    "moved it to wip" in note["text"]
+                    for note in project["state"]["notes"]
+                )
             )
 
     def test_verifier_next_task_only_returns_review_or_blocked_work(self):
@@ -984,7 +1045,10 @@ root_path: "{escaped_work_root}"
                     root=root,
                 )
 
-            self.assertIn("Verifier agents can only claim review or blocked tasks", str(ctx.exception))
+            self.assertIn(
+                "Verifier agents can only claim review or blocked tasks",
+                str(ctx.exception),
+            )
 
     def test_agent_events_and_notes_use_unique_ids_under_fast_updates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1092,7 +1156,7 @@ root_path: "{escaped_work_root}"
             path.write_text(
                 content.replace(
                     "updated_at: 2026-05-28T00:00:00Z\n",
-                    "updated_at: 2026-05-28T00:00:00Z\nroot_path: \"C:\\\\Users\\\\gualt\\\\Desktop\\\\aspis bio\"\n",
+                    'updated_at: 2026-05-28T00:00:00Z\nroot_path: "C:\\\\Users\\\\gualt\\\\Desktop\\\\aspis bio"\n',
                 ),
                 encoding="utf-8",
             )
@@ -1272,7 +1336,9 @@ root_path: "{escaped_work_root}"
             projects = root / "projects"
             projects.mkdir()
             path = sample_project(projects)
-            content = path.read_text(encoding="utf-8").replace('"id": "T1"', '"id": "T2"', 1)
+            content = path.read_text(encoding="utf-8").replace(
+                '"id": "T1"', '"id": "T2"', 1
+            )
             path.write_text(content, encoding="utf-8")
             (projects / ".aspis-agents.json").write_text(
                 json.dumps(
@@ -1314,7 +1380,10 @@ root_path: "{escaped_work_root}"
             )
 
             self.assertEqual(state["claims"][0]["status"], "blocked")
-            self.assertEqual(state["claims"][0]["evidence"], "Task missing during agent-state reconciliation.")
+            self.assertEqual(
+                state["claims"][0]["evidence"],
+                "Task missing during agent-state reconciliation.",
+            )
 
     def test_coder_can_reopen_claimed_task_to_todo_after_merge(self):
         # Phase B merge: the coder absorbs the former orchestrator's planning
@@ -1411,7 +1480,9 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             path = sample_project(projects)
             path.write_text(
-                path.read_text(encoding="utf-8").replace('"status": "todo"', '"status": "blocked"'),
+                path.read_text(encoding="utf-8").replace(
+                    '"status": "todo"', '"status": "blocked"'
+                ),
                 encoding="utf-8",
             )
             handle_tool_call(
@@ -1459,7 +1530,10 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             path = sample_project(projects)
             content = path.read_text(encoding="utf-8")
-            path.write_text(content.replace('"status": "todo"', '"status": "review"'), encoding="utf-8")
+            path.write_text(
+                content.replace('"status": "todo"', '"status": "review"'),
+                encoding="utf-8",
+            )
 
             handle_tool_call(
                 "agent_register",
@@ -1578,7 +1652,10 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             path = sample_project(projects)
             content = path.read_text(encoding="utf-8")
-            path.write_text(content.replace('"status": "todo"', '"status": "done"'), encoding="utf-8")
+            path.write_text(
+                content.replace('"status": "todo"', '"status": "done"'),
+                encoding="utf-8",
+            )
             handle_tool_call(
                 "agent_register",
                 {
@@ -1611,7 +1688,9 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             path = sample_project(projects)
             path.write_text(
-                path.read_text(encoding="utf-8").replace('"status": "todo"', '"status": "review"'),
+                path.read_text(encoding="utf-8").replace(
+                    '"status": "todo"', '"status": "review"'
+                ),
                 encoding="utf-8",
             )
             handle_tool_call(
@@ -1662,7 +1741,7 @@ root_path: "{escaped_work_root}"
             path.write_text(
                 content.replace(
                     "updated_at: 2026-05-28T00:00:00Z\n",
-                    "updated_at: 2026-05-28T00:00:00Z\nroot_path: \"C:\\\\Users\\\\gualt\\\\Desktop\\\\aspis bio\"\n",
+                    'updated_at: 2026-05-28T00:00:00Z\nroot_path: "C:\\\\Users\\\\gualt\\\\Desktop\\\\aspis bio"\n',
                 ),
                 encoding="utf-8",
             )
@@ -1677,9 +1756,14 @@ root_path: "{escaped_work_root}"
                 root=root,
             )
 
-            result = handle_tool_call("project_list", {"agent_id": "orch", "role": "orchestrator"}, root=root)
+            result = handle_tool_call(
+                "project_list", {"agent_id": "orch", "role": "orchestrator"}, root=root
+            )
 
-            self.assertEqual(result["projects"][0]["rootPath"], "C:\\Users\\gualt\\Desktop\\aspis bio")
+            self.assertEqual(
+                result["projects"][0]["rootPath"],
+                "C:\\Users\\gualt\\Desktop\\aspis bio",
+            )
 
     def test_verifier_cannot_mutate_provider_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1708,7 +1792,10 @@ root_path: "{escaped_work_root}"
                     root=root,
                 )
 
-            self.assertIn("verifier agents cannot use scaleway_resource_action", str(ctx.exception))
+            self.assertIn(
+                "verifier agents cannot use scaleway_resource_action",
+                str(ctx.exception),
+            )
 
     def test_registered_verifier_cannot_spoof_coder_role(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1759,7 +1846,9 @@ root_path: "{escaped_work_root}"
                                 "role": "coder",
                                 "status": "launch_pending",
                                 "lastSeenAt": "2026-05-29T00:00:00Z",
-                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -1773,7 +1862,11 @@ root_path: "{escaped_work_root}"
             with self.assertRaises(McpError) as ctx:
                 handle_tool_call(
                     "project_get",
-                    {"project_id": "scrna-seq", "agent_id": "pending-coder", "role": "coder"},
+                    {
+                        "project_id": "scrna-seq",
+                        "agent_id": "pending-coder",
+                        "role": "coder",
+                    },
                     root=root,
                 )
 
@@ -1799,7 +1892,11 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             sample_project(projects)
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 with self.assertRaises(McpError) as ctx:
                     handle_tool_call(
                         "agent_register",
@@ -1821,7 +1918,11 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             sample_project(projects)
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 with self.assertRaises(McpError) as ctx:
                     handle_tool_call(
                         "agent_register",
@@ -1854,7 +1955,9 @@ root_path: "{escaped_work_root}"
                                 "role": "coder",
                                 "status": "launch_pending",
                                 "lastSeenAt": "2026-05-29T00:00:00+00:00",
-                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -1865,7 +1968,11 @@ root_path: "{escaped_work_root}"
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 state = handle_tool_call(
                     "agent_register",
                     {
@@ -1901,7 +2008,9 @@ root_path: "{escaped_work_root}"
                                 "role": "coder",
                                 "status": "launch_pending",
                                 "lastSeenAt": "2026-05-29T00:00:00+00:00",
-                                "launchTokenHash": hashlib.sha256(launch_token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    launch_token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -1912,7 +2021,11 @@ root_path: "{escaped_work_root}"
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 registered = handle_tool_call(
                     "agent_register",
                     {
@@ -2002,7 +2115,9 @@ root_path: "{escaped_work_root}"
                                 "role": "verifier",
                                 "status": "launch_pending",
                                 "lastSeenAt": "2026-05-29T00:00:00+00:00",
-                                "launchTokenHash": hashlib.sha256(b"right-token").hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    b"right-token"
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -2013,7 +2128,11 @@ root_path: "{escaped_work_root}"
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 with self.assertRaises(McpError) as ctx:
                     handle_tool_call(
                         "agent_register",
@@ -2199,7 +2318,9 @@ root_path: "{escaped_work_root}"
                     root=root,
                 )
 
-            self.assertIn("verifier agents cannot use project_create_followup", str(ctx.exception))
+            self.assertIn(
+                "verifier agents cannot use project_create_followup", str(ctx.exception)
+            )
 
     def test_followup_cannot_reopen_closed_project(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2208,7 +2329,9 @@ root_path: "{escaped_work_root}"
             projects.mkdir()
             path = sample_project(projects)
             path.write_text(
-                path.read_text(encoding="utf-8").replace("status: active", "status: done"),
+                path.read_text(encoding="utf-8").replace(
+                    "status: active", "status: done"
+                ),
                 encoding="utf-8",
             )
             handle_tool_call(
@@ -2250,7 +2373,12 @@ root_path: "{escaped_work_root}"
             sample_project(projects)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "orch", "role": "orchestrator", "model": "test", "message": "starting"},
+                {
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                    "model": "test",
+                    "message": "starting",
+                },
                 root=root,
             )
 
@@ -2273,7 +2401,9 @@ root_path: "{escaped_work_root}"
             self.assertEqual(task["category"], "bug")
             # Trimmed at the ends, newline in the middle preserved (NOT collapsed
             # like a single-line field).
-            self.assertEqual(task["description"], "Worker returns 500\non the first request")
+            self.assertEqual(
+                task["description"], "Worker returns 500\non the first request"
+            )
             self.assertEqual(task["suspectFileIds"], [])
 
             # (2) A blank/whitespace description is omitted from the stored task.
@@ -2447,7 +2577,9 @@ root_path: "{escaped_work_root}"
                 root=root,
             )
             path.write_text(
-                path.read_text(encoding="utf-8").replace('"status": "wip"', '"status": "review"'),
+                path.read_text(encoding="utf-8").replace(
+                    '"status": "wip"', '"status": "review"'
+                ),
                 encoding="utf-8",
             )
 
@@ -2474,7 +2606,9 @@ root_path: "{escaped_work_root}"
             projects = prepare_management_root(root)
             path = sample_project(projects)
             path.write_text(
-                path.read_text(encoding="utf-8").replace("status: active", "status: paused", 1),
+                path.read_text(encoding="utf-8").replace(
+                    "status: active", "status: paused", 1
+                ),
                 encoding="utf-8",
             )
             handle_tool_call(
@@ -2540,11 +2674,20 @@ root_path: "{escaped_work_root}"
 
     def test_provider_mcp_reads_existing_app_vault_fields(self):
         self.assertEqual(APP_VAULT_ACCOUNTS["cloudflare_token"], "provider:cloudflare")
-        self.assertEqual(APP_VAULT_ACCOUNTS["cloudflare_account_id"], "scope:cloudflare_account_id")
+        self.assertEqual(
+            APP_VAULT_ACCOUNTS["cloudflare_account_id"], "scope:cloudflare_account_id"
+        )
         self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_token"], "provider:scaleway")
-        self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_ai_token"], "provider:scaleway_ai")
-        self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_project_id"], "scope:scaleway_project_id")
-        self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_object_secret_key"], "aux:scaleway_object_secret_key")
+        self.assertEqual(
+            APP_VAULT_ACCOUNTS["scaleway_ai_token"], "provider:scaleway_ai"
+        )
+        self.assertEqual(
+            APP_VAULT_ACCOUNTS["scaleway_project_id"], "scope:scaleway_project_id"
+        )
+        self.assertEqual(
+            APP_VAULT_ACCOUNTS["scaleway_object_secret_key"],
+            "aux:scaleway_object_secret_key",
+        )
 
     def test_cloudflare_worker_scope_filter_hides_sibling_workers(self):
         self.assertTrue(cloudflare_worker_in_aspis_bio_scope("aspis-bio-api", []))
@@ -2563,11 +2706,21 @@ root_path: "{escaped_work_root}"
 
         def fake_api_get(url, headers, params=None):
             if "/block/v1/zones/fr-par-1/volumes" in url:
-                return {"volumes": [{"id": "vol-1", "name": "data", "status": "available"}]}
+                return {
+                    "volumes": [{"id": "vol-1", "name": "data", "status": "available"}]
+                }
             if "/block/v1/zones/fr-par-1/snapshots" in url:
-                return {"snapshots": [{"id": "snap-1", "name": "backup", "status": "available"}]}
+                return {
+                    "snapshots": [
+                        {"id": "snap-1", "name": "backup", "status": "available"}
+                    ]
+                }
             if "/file/v1alpha1/regions/fr-par/filesystems" in url:
-                return {"filesystems": [{"id": "fs-1", "name": "shared", "status": "available"}]}
+                return {
+                    "filesystems": [
+                        {"id": "fs-1", "name": "shared", "status": "available"}
+                    ]
+                }
             if "/serverless-sqldb/v1alpha1/regions/fr-par/databases" in url:
                 return {
                     "databases": [
@@ -2586,9 +2739,12 @@ root_path: "{escaped_work_root}"
                 }
             return {}
 
-        with patch(
-            "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-        ), patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get):
+        with (
+            patch(
+                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
+            ),
+            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
+        ):
             result = scaleway_list_resources("token", "proj-1")
 
         by_type = {item["resourceType"]: item for item in result["resources"]}
@@ -2622,16 +2778,27 @@ root_path: "{escaped_work_root}"
             if "/block/v1/zones/fr-par-1/volumes" in url:
                 raise RuntimeError("boom 503")
             if "/block/v1/zones/fr-par-1/snapshots" in url:
-                return {"snapshots": [{"id": "snap-1", "name": "backup", "status": "available"}]}
+                return {
+                    "snapshots": [
+                        {"id": "snap-1", "name": "backup", "status": "available"}
+                    ]
+                }
             if "/file/v1alpha1/regions/fr-par/filesystems" in url:
                 raise RuntimeError("boom 503")
             if "/serverless-sqldb/v1alpha1/regions/fr-par/databases" in url:
-                return {"databases": [{"id": "db-1", "name": "analytics", "status": "ready"}]}
+                return {
+                    "databases": [
+                        {"id": "db-1", "name": "analytics", "status": "ready"}
+                    ]
+                }
             return {}
 
-        with patch(
-            "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-        ), patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get):
+        with (
+            patch(
+                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
+            ),
+            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
+        ):
             result = scaleway_list_resources("token", "proj-1")
 
         ids = {item["id"] for item in result["resources"]}
@@ -2650,12 +2817,19 @@ root_path: "{escaped_work_root}"
             if "/serverless-sqldb/v1alpha1/regions/fr-par/databases" in url:
                 return None
             if "/file/v1alpha1/regions/fr-par/filesystems" in url:
-                return {"filesystems": [{"id": "fs-1", "name": "shared", "status": "available"}]}
+                return {
+                    "filesystems": [
+                        {"id": "fs-1", "name": "shared", "status": "available"}
+                    ]
+                }
             return {}
 
-        with patch(
-            "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-        ), patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get):
+        with (
+            patch(
+                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
+            ),
+            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
+        ):
             result = scaleway_list_resources("token", "proj-1")
 
         ids = {item["id"] for item in result["resources"]}
@@ -2666,12 +2840,17 @@ root_path: "{escaped_work_root}"
 
         def fake_api_get(url, headers, params=None):
             if "/block/v1/zones/fr-par-1/volumes" in url:
-                return {"volumes": [{"id": "vol-1", "name": "data", "status": "available"}]}
+                return {
+                    "volumes": [{"id": "vol-1", "name": "data", "status": "available"}]
+                }
             return {}
 
-        with patch(
-            "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
-        ), patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get):
+        with (
+            patch(
+                "oracle.server.aspis_mcp.resolve_scaleway_project", return_value=project
+            ),
+            patch("oracle.server.aspis_mcp.api_get", side_effect=fake_api_get),
+        ):
             # An inspect-only resource (empty availableActions) rejects any action.
             with self.assertRaises(McpError) as ctx:
                 scaleway_resource_action("token", "vol-1", "delete", "data", "proj-1")
@@ -2732,7 +2911,10 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            with patch("oracle.server.aspis_mcp.app_vault_account_secret", side_effect=fake_secret):
+            with patch(
+                "oracle.server.aspis_mcp.app_vault_account_secret",
+                side_effect=fake_secret,
+            ):
                 with patch.dict(
                     "os.environ",
                     {
@@ -2748,9 +2930,13 @@ root_path: "{escaped_work_root}"
                     )
 
         self.assertTrue(result["providers"]["cloudflare"]["token"]["configured"])
-        self.assertEqual(result["providers"]["cloudflare"]["token"]["source"], "app_vault")
+        self.assertEqual(
+            result["providers"]["cloudflare"]["token"]["source"], "app_vault"
+        )
         self.assertTrue(result["providers"]["scaleway"]["token"]["configured"])
-        self.assertEqual(result["providers"]["scaleway"]["token"]["source"], "env:SCALEWAY_API_TOKEN")
+        self.assertEqual(
+            result["providers"]["scaleway"]["token"]["source"], "env:SCALEWAY_API_TOKEN"
+        )
         # GitHub is reported status-only via its bespoke "provider:github" account.
         github = result["providers"]["github"]
         self.assertTrue(github["configured"])
@@ -2769,8 +2955,14 @@ root_path: "{escaped_work_root}"
         self.assertNotIn("scaleway-ai-test-token", serialized)
         self.assertNotIn("infomaniak-test-token", serialized)
         self.assertNotIn("ghp_github-test-token", serialized)
-        self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_object_access_key"], "aux:scaleway_object_access_key")
-        self.assertEqual(APP_VAULT_ACCOUNTS["scaleway_object_secret_key"], "aux:scaleway_object_secret_key")
+        self.assertEqual(
+            APP_VAULT_ACCOUNTS["scaleway_object_access_key"],
+            "aux:scaleway_object_access_key",
+        )
+        self.assertEqual(
+            APP_VAULT_ACCOUNTS["scaleway_object_secret_key"],
+            "aux:scaleway_object_secret_key",
+        )
         self.assertEqual(APP_VAULT_ACCOUNTS["infomaniak_token"], "provider:infomaniak")
 
     def test_provider_credentials_status_github_missing_when_no_token(self):
@@ -2823,7 +3015,9 @@ root_path: "{escaped_work_root}"
 
         cloudflare = result["providers"]["cloudflare"]
         self.assertTrue(cloudflare["token"]["configured"])
-        self.assertEqual(cloudflare["token"]["source"], "env:ASPIS_CLOUDFLARE_VERIFIER_TOKEN")
+        self.assertEqual(
+            cloudflare["token"]["source"], "env:ASPIS_CLOUDFLARE_VERIFIER_TOKEN"
+        )
         self.assertEqual(
             cloudflare["agentProfiles"]["verifierReadonly"]["source"],
             "env:ASPIS_CLOUDFLARE_VERIFIER_TOKEN",
@@ -2923,6 +3117,7 @@ root_path: "{escaped_work_root}"
             "baseUrl": "https://api.scaleway.ai/v1/chat/completions",
             "remoteEnabled": True,
         }
+
         class FakeEngine:
             def ask(self, query, limit=5, llm_config=None, allowed_file_ids=None):
                 return {
@@ -2956,10 +3151,26 @@ root_path: "{escaped_work_root}"
                 },
                 root=root,
             )
-            with patch("oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value={"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}):
-                    with patch("oracle.server.aspis_mcp.oracle_allowed_file_ids", return_value={"oracle/server/aspis_mcp.py"}):
-                        with patch("oracle.server.aspis_mcp.app_vault_account_secret", side_effect=fake_secret):
+            with patch(
+                "oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()
+            ):
+                with patch(
+                    "oracle.server.aspis_mcp.ensure_oracle_index_ready",
+                    return_value={
+                        "root": str(root),
+                        "indexed_files": 1,
+                        "pending_files": 0,
+                        "stale_files": 0,
+                    },
+                ):
+                    with patch(
+                        "oracle.server.aspis_mcp.oracle_allowed_file_ids",
+                        return_value={"oracle/server/aspis_mcp.py"},
+                    ):
+                        with patch(
+                            "oracle.server.aspis_mcp.app_vault_account_secret",
+                            side_effect=fake_secret,
+                        ):
                             with patch.dict("os.environ", {"ASPIS_MCP_DENSE_ASK": "1"}):
                                 result = handle_tool_call(
                                     "oracle_ask",
@@ -3057,12 +3268,27 @@ root_path: "{escaped_work_root}"
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "oracle-agent", "role": "orchestrator", "model": "t", "message": "x"},
+                {
+                    "agent_id": "oracle-agent",
+                    "role": "orchestrator",
+                    "model": "t",
+                    "message": "x",
+                },
                 root=root,
             )
-            status = {"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}
-            with patch("oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value=status):
+            status = {
+                "root": str(root),
+                "indexed_files": 1,
+                "pending_files": 0,
+                "stale_files": 0,
+            }
+            with patch(
+                "oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()
+            ):
+                with patch(
+                    "oracle.server.aspis_mcp.ensure_oracle_index_ready",
+                    return_value=status,
+                ):
                     with patch(
                         "oracle.server.aspis_mcp.oracle_allowed_file_ids",
                         return_value={"oracle/server/aspis_mcp.py"},
@@ -3095,12 +3321,27 @@ root_path: "{escaped_work_root}"
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "oracle-agent", "role": "orchestrator", "model": "t", "message": "x"},
+                {
+                    "agent_id": "oracle-agent",
+                    "role": "orchestrator",
+                    "model": "t",
+                    "message": "x",
+                },
                 root=root,
             )
-            status = {"root": str(root), "indexed_files": 1, "pending_files": 0, "stale_files": 0}
-            with patch("oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()):
-                with patch("oracle.server.aspis_mcp.ensure_oracle_index_ready", return_value=status):
+            status = {
+                "root": str(root),
+                "indexed_files": 1,
+                "pending_files": 0,
+                "stale_files": 0,
+            }
+            with patch(
+                "oracle.server.aspis_mcp.make_mcp_engine", return_value=FakeEngine()
+            ):
+                with patch(
+                    "oracle.server.aspis_mcp.ensure_oracle_index_ready",
+                    return_value=status,
+                ):
                     with patch(
                         "oracle.server.aspis_mcp.oracle_allowed_file_ids",
                         return_value={"oracle/server/aspis_mcp.py"},
@@ -3143,7 +3384,9 @@ root_path: "{escaped_work_root}"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             projects_dir = prepare_management_root(root)
-            with patch("oracle.server.aspis_mcp.resolve_oracle_http_target", return_value=None):
+            with patch(
+                "oracle.server.aspis_mcp.resolve_oracle_http_target", return_value=None
+            ):
                 with self.assertRaises(McpError):
                     dispatch_oracle_ask(projects_dir, "q", 3, None, args={})
                 with self.assertRaises(McpError):
@@ -3170,7 +3413,9 @@ root_path: "{escaped_work_root}"
                                 "status": "launch_pending",
                                 "client": "codex",
                                 "lastSeenAt": "2026-05-29T00:00:00+00:00",
-                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -3181,7 +3426,11 @@ root_path: "{escaped_work_root}"
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 registered = handle_tool_call(
                     "agent_register",
                     {
@@ -3260,7 +3509,9 @@ root_path: "{escaped_work_root}"
                                 "status": "launch_pending",
                                 "client": "codex",
                                 "lastSeenAt": "2026-05-29T00:00:00+00:00",
-                                "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                                "launchTokenHash": hashlib.sha256(
+                                    token.encode("utf-8")
+                                ).hexdigest(),
                                 "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                             }
                         ],
@@ -3271,7 +3522,11 @@ root_path: "{escaped_work_root}"
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS": ""},
+                clear=False,
+            ):
                 registered = handle_tool_call(
                     "agent_register",
                     {
@@ -3418,16 +3673,22 @@ class NormalizeSubagentsTests(unittest.TestCase):
 
     def test_role_alias_normalized(self):
         # Phase B merge: the architect alias folds to coder; orchestrator is first-class.
-        result = normalize_subagents([{"label": "plan", "model": "opus", "count": 1, "role": "architect"}])
+        result = normalize_subagents(
+            [{"label": "plan", "model": "opus", "count": 1, "role": "architect"}]
+        )
         self.assertEqual(result[0]["role"], "coder")
 
     def test_orchestrator_role_preserved(self):
         # Orchestrator is now a first-class role and normalizes to itself.
-        result = normalize_subagents([{"label": "plan", "model": "opus", "count": 1, "role": "orchestrator"}])
+        result = normalize_subagents(
+            [{"label": "plan", "model": "opus", "count": 1, "role": "orchestrator"}]
+        )
         self.assertEqual(result[0]["role"], "orchestrator")
 
     def test_invalid_role_becomes_none(self):
-        result = normalize_subagents([{"label": "x", "model": "opus", "count": 1, "role": "wizard"}])
+        result = normalize_subagents(
+            [{"label": "x", "model": "opus", "count": 1, "role": "wizard"}]
+        )
         self.assertEqual(result[0]["role"], None)
 
     def test_bad_count_dropped(self):
@@ -3472,7 +3733,9 @@ class NormalizeSubagentsTests(unittest.TestCase):
 
     def test_model_may_be_empty(self):
         result = normalize_subagents([{"label": "noModel", "count": 2}])
-        self.assertEqual(result, [{"label": "noModel", "model": "", "count": 2, "role": None}])
+        self.assertEqual(
+            result, [{"label": "noModel", "model": "", "count": 2, "role": None}]
+        )
 
     def test_cap_list_length_32(self):
         entries = [{"label": f"a{i}", "model": "opus", "count": 1} for i in range(50)]
@@ -3480,7 +3743,9 @@ class NormalizeSubagentsTests(unittest.TestCase):
         self.assertEqual(len(result), 32)
 
     def test_label_cap_80(self):
-        result = normalize_subagents([{"label": "z" * 200, "model": "opus", "count": 1}])
+        result = normalize_subagents(
+            [{"label": "z" * 200, "model": "opus", "count": 1}]
+        )
         self.assertEqual(len(result[0]["label"]), 80)
 
     def test_none_vs_empty_list_distinction(self):
@@ -3490,7 +3755,9 @@ class NormalizeSubagentsTests(unittest.TestCase):
         self.assertEqual(normalize_subagents([]), [])
 
     def test_non_dict_entries_dropped(self):
-        result = normalize_subagents([{"label": "ok", "model": "opus", "count": 1}, "garbage", 5, None])
+        result = normalize_subagents(
+            [{"label": "ok", "model": "opus", "count": 1}, "garbage", 5, None]
+        )
         self.assertEqual([e["label"] for e in result], ["ok"])
 
     def test_extra_unknown_keys_stripped(self):
@@ -3498,9 +3765,19 @@ class NormalizeSubagentsTests(unittest.TestCase):
         # accidental extra key (e.g. "secret") must never survive into the stored
         # entry, which is later written to .aspis-agents.json and surfaced to the UI.
         result = normalize_subagents(
-            [{"label": "x", "model": "opus", "count": 1, "secret": "t", "extra": [1, 2]}]
+            [
+                {
+                    "label": "x",
+                    "model": "opus",
+                    "count": 1,
+                    "secret": "t",
+                    "extra": [1, 2],
+                }
+            ]
         )
-        self.assertEqual(result, [{"label": "x", "model": "opus", "count": 1, "role": None}])
+        self.assertEqual(
+            result, [{"label": "x", "model": "opus", "count": 1, "role": None}]
+        )
         self.assertNotIn("secret", result[0])
         self.assertNotIn("extra", result[0])
 
@@ -3633,7 +3910,12 @@ class OrchestratorRoleTests(unittest.TestCase):
     def _register_orchestrator(self, root: Path, agent_id: str = "orch") -> None:
         handle_tool_call(
             "agent_register",
-            {"agent_id": agent_id, "role": "orchestrator", "model": "opus", "message": "planning"},
+            {
+                "agent_id": agent_id,
+                "role": "orchestrator",
+                "model": "opus",
+                "message": "planning",
+            },
             root=root,
         )
 
@@ -3861,7 +4143,12 @@ class OrchestratorRoleTests(unittest.TestCase):
             self._register_orchestrator(root)
             claimed = handle_tool_call(
                 "project_claim_task",
-                {"project_id": "scrna-seq", "task_id": "T1", "agent_id": "orch", "role": "orchestrator"},
+                {
+                    "project_id": "scrna-seq",
+                    "task_id": "T1",
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                },
                 root=root,
             )
             # Same as coder: claiming a todo auto-advances it to wip.
@@ -3894,7 +4181,12 @@ class OrchestratorRoleTests(unittest.TestCase):
             self._register_orchestrator(root)
             handle_tool_call(
                 "project_claim_task",
-                {"project_id": "scrna-seq", "task_id": "T1", "agent_id": "orch", "role": "orchestrator"},
+                {
+                    "project_id": "scrna-seq",
+                    "task_id": "T1",
+                    "agent_id": "orch",
+                    "role": "orchestrator",
+                },
                 root=root,
             )
             with self.assertRaises(McpError):
@@ -3955,7 +4247,9 @@ class PlanTaskSchemaTests(unittest.TestCase):
                 acceptance="cargo build passes",
                 planId="plan-123",
             ),
-            self._task("T2", dependsOn=["T1"], scope=["src/c.ts"], acceptance="tests green"),
+            self._task(
+                "T2", dependsOn=["T1"], scope=["src/c.ts"], acceptance="tests green"
+            ),
         )
         validate_project_state(state)  # must not raise
         self.assertEqual(state["tasks"][1]["dependsOn"], ["T1"])
@@ -4046,7 +4340,12 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
         sample_project(projects)  # ships one manual task T1
         handle_tool_call(
             "agent_register",
-            {"agent_id": "orch", "role": "orchestrator", "model": "opus", "message": "planning"},
+            {
+                "agent_id": "orch",
+                "role": "orchestrator",
+                "model": "opus",
+                "message": "planning",
+            },
             root=root,
         )
         if seed_approved:
@@ -4086,8 +4385,20 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     "project_id": "scrna-seq",
                     "plan_id": self.APPROVED_PLAN_ID,
                     "tasks": [
-                        {"id": "a", "title": "Scaffold module", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": []},
-                        {"id": "b", "title": "Wire it up", "scope": ["src/b.ts"], "acceptance": "tests pass", "dependsOn": ["a"]},
+                        {
+                            "id": "a",
+                            "title": "Scaffold module",
+                            "scope": ["src/a.ts"],
+                            "acceptance": "builds",
+                            "dependsOn": [],
+                        },
+                        {
+                            "id": "b",
+                            "title": "Wire it up",
+                            "scope": ["src/b.ts"],
+                            "acceptance": "tests pass",
+                            "dependsOn": ["a"],
+                        },
                     ],
                     "agent_id": "orch",
                     "role": "orchestrator",
@@ -4135,9 +4446,29 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     "project_id": "scrna-seq",
                     "plan_id": self.APPROVED_PLAN_ID,
                     "tasks": [
-                        {"id": "a", "title": "Big refactor", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": [], "weight": "main"},
-                        {"id": "b", "title": "Tiny edit", "scope": ["src/b.ts"], "acceptance": "builds", "dependsOn": [], "weight": "mini"},
-                        {"id": "c", "title": "Plain task", "scope": ["src/c.ts"], "acceptance": "builds", "dependsOn": []},
+                        {
+                            "id": "a",
+                            "title": "Big refactor",
+                            "scope": ["src/a.ts"],
+                            "acceptance": "builds",
+                            "dependsOn": [],
+                            "weight": "main",
+                        },
+                        {
+                            "id": "b",
+                            "title": "Tiny edit",
+                            "scope": ["src/b.ts"],
+                            "acceptance": "builds",
+                            "dependsOn": [],
+                            "weight": "mini",
+                        },
+                        {
+                            "id": "c",
+                            "title": "Plain task",
+                            "scope": ["src/c.ts"],
+                            "acceptance": "builds",
+                            "dependsOn": [],
+                        },
                     ],
                     "agent_id": "orch",
                     "role": "orchestrator",
@@ -4158,7 +4489,14 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                         "project_id": "scrna-seq",
                         "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
-                            {"id": "a", "title": "Typo", "scope": ["src/a.ts"], "acceptance": "builds", "dependsOn": [], "weight": "heavy"},
+                            {
+                                "id": "a",
+                                "title": "Typo",
+                                "scope": ["src/a.ts"],
+                                "acceptance": "builds",
+                                "dependsOn": [],
+                                "weight": "heavy",
+                            },
                         ],
                         "agent_id": "orch",
                         "role": "orchestrator",
@@ -4177,8 +4515,20 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                         "project_id": "scrna-seq",
                         "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
-                            {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": ["b"]},
-                            {"id": "b", "title": "B", "scope": ["src/b.ts"], "acceptance": "x", "dependsOn": ["a"]},
+                            {
+                                "id": "a",
+                                "title": "A",
+                                "scope": ["src/a.ts"],
+                                "acceptance": "x",
+                                "dependsOn": ["b"],
+                            },
+                            {
+                                "id": "b",
+                                "title": "B",
+                                "scope": ["src/b.ts"],
+                                "acceptance": "x",
+                                "dependsOn": ["a"],
+                            },
                         ],
                         "agent_id": "orch",
                         "role": "orchestrator",
@@ -4206,7 +4556,13 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                         "project_id": "scrna-seq",
                         "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
-                            {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": ["T1"]},
+                            {
+                                "id": "a",
+                                "title": "A",
+                                "scope": ["src/a.ts"],
+                                "acceptance": "x",
+                                "dependsOn": ["T1"],
+                            },
                         ],
                         "agent_id": "orch",
                         "role": "orchestrator",
@@ -4221,17 +4577,35 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "project_create_plan_tasks",
-                    {"project_id": "scrna-seq", "plan_id": self.APPROVED_PLAN_ID, "tasks": [], "agent_id": "orch", "role": "orchestrator"},
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": self.APPROVED_PLAN_ID,
+                        "tasks": [],
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                    },
                     root=root,
                 )
             too_many = [
-                {"id": f"t{i}", "title": "x", "scope": ["src/x.ts"], "acceptance": "x", "dependsOn": []}
+                {
+                    "id": f"t{i}",
+                    "title": "x",
+                    "scope": ["src/x.ts"],
+                    "acceptance": "x",
+                    "dependsOn": [],
+                }
                 for i in range(MAX_PLAN_TASKS + 1)
             ]
             with self.assertRaises(McpError) as ctx:
                 handle_tool_call(
                     "project_create_plan_tasks",
-                    {"project_id": "scrna-seq", "plan_id": self.APPROVED_PLAN_ID, "tasks": too_many, "agent_id": "orch", "role": "orchestrator"},
+                    {
+                        "project_id": "scrna-seq",
+                        "plan_id": self.APPROVED_PLAN_ID,
+                        "tasks": too_many,
+                        "agent_id": "orch",
+                        "role": "orchestrator",
+                    },
                     root=root,
                 )
             self.assertIn("Too many", str(ctx.exception))
@@ -4246,7 +4620,13 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                         "project_id": "scrna-seq",
                         "plan_id": self.APPROVED_PLAN_ID,
                         "tasks": [
-                            {"id": "a", "title": "A", "scope": ["../escape.ts"], "acceptance": "x", "dependsOn": []},
+                            {
+                                "id": "a",
+                                "title": "A",
+                                "scope": ["../escape.ts"],
+                                "acceptance": "x",
+                                "dependsOn": [],
+                            },
                         ],
                         "agent_id": "orch",
                         "role": "orchestrator",
@@ -4263,7 +4643,12 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             sample_project(projects)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "ver", "role": "verifier", "model": "opus", "message": "checking"},
+                {
+                    "agent_id": "ver",
+                    "role": "verifier",
+                    "model": "opus",
+                    "message": "checking",
+                },
                 root=root,
             )
             with self.assertRaises(McpError) as ctx:
@@ -4272,13 +4657,24 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                     {
                         "project_id": "scrna-seq",
                         "plan_id": "p",
-                        "tasks": [{"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": []}],
+                        "tasks": [
+                            {
+                                "id": "a",
+                                "title": "A",
+                                "scope": ["src/a.ts"],
+                                "acceptance": "x",
+                                "dependsOn": [],
+                            }
+                        ],
                         "agent_id": "ver",
                         "role": "verifier",
                     },
                     root=root,
                 )
-            self.assertIn("verifier agents cannot use project_create_plan_tasks", str(ctx.exception))
+            self.assertIn(
+                "verifier agents cannot use project_create_plan_tasks",
+                str(ctx.exception),
+            )
 
     def _create_one_task(self, root: Path, plan_id: str):
         return handle_tool_call(
@@ -4287,7 +4683,13 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
                 "project_id": "scrna-seq",
                 "plan_id": plan_id,
                 "tasks": [
-                    {"id": "a", "title": "A", "scope": ["src/a.ts"], "acceptance": "x", "dependsOn": []},
+                    {
+                        "id": "a",
+                        "title": "A",
+                        "scope": ["src/a.ts"],
+                        "acceptance": "x",
+                        "dependsOn": [],
+                    },
                 ],
                 "agent_id": "orch",
                 "role": "orchestrator",
@@ -4345,7 +4747,9 @@ class ProjectCreatePlanTasksTests(unittest.TestCase):
             base = root / "projects" / ".aspis-plans" / "scrna-seq"
             base.mkdir(parents=True, exist_ok=True)
             (base / f"{plan_id}.json").write_text(
-                json.dumps({"id": plan_id, "projectId": "scrna-seq", "status": "approved"}),
+                json.dumps(
+                    {"id": plan_id, "projectId": "scrna-seq", "status": "approved"}
+                ),
                 encoding="utf-8",
             )
             out = self._create_one_task(root, plan_id)
@@ -4408,8 +4812,12 @@ class LegacyRolePersistenceTests(unittest.TestCase):
                 {"agent_id": "orch-legacy", "status": "active", "message": "alive"},
                 root=root,
             )
-            on_disk = json.loads((projects / AGENTS_STATE_FILE).read_text(encoding="utf-8"))
-            session = next(s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy")
+            on_disk = json.loads(
+                (projects / AGENTS_STATE_FILE).read_text(encoding="utf-8")
+            )
+            session = next(
+                s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy"
+            )
             # The stored role string is PRESERVED verbatim across the heartbeat.
             self.assertEqual(session["role"], "orchestrator")
 
@@ -4454,8 +4862,12 @@ class LegacyRolePersistenceTests(unittest.TestCase):
                 },
                 root=root,
             )
-            on_disk = json.loads((projects / AGENTS_STATE_FILE).read_text(encoding="utf-8"))
-            session = next(s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy")
+            on_disk = json.loads(
+                (projects / AGENTS_STATE_FILE).read_text(encoding="utf-8")
+            )
+            session = next(
+                s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy"
+            )
             # Still preserved after a coder-tool call routed through upsert_session.
             self.assertEqual(session["role"], "orchestrator")
 
@@ -4510,10 +4922,14 @@ class LegacyRolePersistenceTests(unittest.TestCase):
             )
             # Loads without error and preserves the legacy role + claim/event.
             loaded = read_agents_state(projects)
-            session = next(s for s in loaded["sessions"] if s["agentId"] == "orch-legacy")
+            session = next(
+                s for s in loaded["sessions"] if s["agentId"] == "orch-legacy"
+            )
             self.assertEqual(session["role"], "orchestrator")
             self.assertTrue(any(c.get("taskId") == "T-OLD" for c in loaded["claims"]))
-            self.assertTrue(any(e.get("id") == "evt-legacy-1" for e in loaded["events"]))
+            self.assertTrue(
+                any(e.get("id") == "evt-legacy-1" for e in loaded["events"])
+            )
 
             # Usable: heartbeat works and keeps the role.
             handle_tool_call(
@@ -4526,7 +4942,11 @@ class LegacyRolePersistenceTests(unittest.TestCase):
             # must match it (a "coder" request would be a role mismatch now).
             nxt = handle_tool_call(
                 "project_next_task",
-                {"project_id": "scrna-seq", "agent_id": "orch-legacy", "role": "orchestrator"},
+                {
+                    "project_id": "scrna-seq",
+                    "agent_id": "orch-legacy",
+                    "role": "orchestrator",
+                },
                 root=root,
             )
             self.assertEqual(nxt["task"]["id"], "T1")
@@ -4543,11 +4963,17 @@ class LegacyRolePersistenceTests(unittest.TestCase):
                 root=root,
             )
             self.assertTrue(any(c.get("taskId") == "T1" for c in claimed["claims"]))
-            on_disk = json.loads((projects / AGENTS_STATE_FILE).read_text(encoding="utf-8"))
-            session = next(s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy")
+            on_disk = json.loads(
+                (projects / AGENTS_STATE_FILE).read_text(encoding="utf-8")
+            )
+            session = next(
+                s for s in on_disk["sessions"] if s["agentId"] == "orch-legacy"
+            )
             self.assertEqual(session["role"], "orchestrator")
             self.assertTrue(any(c.get("taskId") == "T-OLD" for c in on_disk["claims"]))
-            self.assertTrue(any(e.get("id") == "evt-legacy-1" for e in on_disk["events"]))
+            self.assertTrue(
+                any(e.get("id") == "evt-legacy-1" for e in on_disk["events"])
+            )
 
 
 class StoredRoleSanitizationTests(unittest.TestCase):
@@ -4660,7 +5086,9 @@ class StoredRoleSanitizationTests(unittest.TestCase):
                 },
             )
             loaded = read_agents_state(projects)
-            session = next(s for s in loaded["sessions"] if s["agentId"] == "orch-legacy")
+            session = next(
+                s for s in loaded["sessions"] if s["agentId"] == "orch-legacy"
+            )
             self.assertEqual(session["role"], "orchestrator")
 
     def test_coerce_role_maps_unknown_to_coder_and_preserves_canonical(self):
@@ -4719,7 +5147,12 @@ class CoderReopenFromReviewTests(unittest.TestCase):
     def _register_coder(self, root: Path) -> None:
         handle_tool_call(
             "agent_register",
-            {"agent_id": "codex", "role": "coder", "model": "codex", "message": "coding"},
+            {
+                "agent_id": "codex",
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+            },
             root=root,
         )
 
@@ -4733,7 +5166,12 @@ class CoderReopenFromReviewTests(unittest.TestCase):
             # Claim a todo task -> auto-moves to wip (claim status "wip").
             handle_tool_call(
                 "project_claim_task",
-                {"project_id": "scrna-seq", "task_id": "T1", "agent_id": "codex", "role": "coder"},
+                {
+                    "project_id": "scrna-seq",
+                    "task_id": "T1",
+                    "agent_id": "codex",
+                    "role": "coder",
+                },
                 root=root,
             )
             # Move to review (claim status becomes "review" = inactive for selection).
@@ -4776,7 +5214,12 @@ class CoderReopenFromReviewTests(unittest.TestCase):
             self._register_coder(root)
             handle_tool_call(
                 "project_claim_task",
-                {"project_id": "scrna-seq", "task_id": "T1", "agent_id": "codex", "role": "coder"},
+                {
+                    "project_id": "scrna-seq",
+                    "task_id": "T1",
+                    "agent_id": "codex",
+                    "role": "coder",
+                },
                 root=root,
             )
             handle_tool_call(
@@ -4927,7 +5370,11 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             event_types = {e.get("eventType") for e in state["events"]}
             self.assertIn("register", event_types)
             self.assertIn("register_incomplete", event_types)
-            incomplete = next(e for e in state["events"] if e.get("eventType") == "register_incomplete")
+            incomplete = next(
+                e
+                for e in state["events"]
+                if e.get("eventType") == "register_incomplete"
+            )
             self.assertIn("model", incomplete.get("message", "").lower())
 
     def test_register_with_model_has_no_incomplete_event(self):
@@ -4936,7 +5383,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             state = handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-ok", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "coder-ok",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             event_types = {e.get("eventType") for e in state["events"]}
@@ -4949,7 +5401,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             state = handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-seed", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "coder-seed",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             session = state["sessions"][0]
@@ -4962,7 +5419,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "orch-1", "role": "orchestrator", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "orch-1",
+                    "role": "orchestrator",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             # Provide subagents.
@@ -4993,7 +5455,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             # Empty list clears.
             hb3 = handle_tool_call(
                 "agent_heartbeat",
-                {"agent_id": "orch-1", "status": "active", "message": "done spawning", "subagents": []},
+                {
+                    "agent_id": "orch-1",
+                    "status": "active",
+                    "message": "done spawning",
+                    "subagents": [],
+                },
                 root=root,
             )
             self.assertEqual(hb3["sessions"][0]["subagents"], [])
@@ -5004,7 +5471,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "orch-m", "role": "orchestrator", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "orch-m",
+                    "role": "orchestrator",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             handle_tool_call(
@@ -5021,7 +5493,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             # breakdown with None — it is treated as "not provided".
             hb = handle_tool_call(
                 "agent_heartbeat",
-                {"agent_id": "orch-m", "status": "active", "message": "x", "subagents": "garbage"},
+                {
+                    "agent_id": "orch-m",
+                    "status": "active",
+                    "message": "x",
+                    "subagents": "garbage",
+                },
                 root=root,
             )
             self.assertEqual(
@@ -5035,7 +5512,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "nu-coder", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "nu-coder",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             hb = handle_tool_call(
@@ -5063,18 +5545,31 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "nu-keep", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "nu-keep",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             hb1 = handle_tool_call(
                 "agent_heartbeat",
-                {"agent_id": "nu-keep", "status": "needs_user", "message": "Approve deploy?"},
+                {
+                    "agent_id": "nu-keep",
+                    "status": "needs_user",
+                    "message": "Approve deploy?",
+                },
                 root=root,
             )
             first_since = hb1["sessions"][0]["needsUser"]["since"]
             hb2 = handle_tool_call(
                 "agent_heartbeat",
-                {"agent_id": "nu-keep", "status": "needs_user", "message": "Approve deploy? (still waiting)"},
+                {
+                    "agent_id": "nu-keep",
+                    "status": "needs_user",
+                    "message": "Approve deploy? (still waiting)",
+                },
                 root=root,
             )
             needs = hb2["sessions"][0]["needsUser"]
@@ -5092,7 +5587,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             for agent_id, alias in (("aw", "awaiting_user"), ("bo", "blocked_on_user")):
                 handle_tool_call(
                     "agent_register",
-                    {"agent_id": agent_id, "role": "coder", "model": "opus", "message": "reg"},
+                    {
+                        "agent_id": agent_id,
+                        "role": "coder",
+                        "model": "opus",
+                        "message": "reg",
+                    },
                     root=root,
                 )
                 hb = handle_tool_call(
@@ -5115,7 +5615,9 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                 {"agent_id": "blk", "status": "blocked", "message": "task blocked"},
                 root=root,
             )
-            blocked_session = next(s for s in hb_blocked["sessions"] if s["agentId"] == "blk")
+            blocked_session = next(
+                s for s in hb_blocked["sessions"] if s["agentId"] == "blk"
+            )
             self.assertEqual(blocked_session["status"], "blocked")
             self.assertIsNone(blocked_session["needsUser"])
 
@@ -5125,7 +5627,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "nu-clear", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "nu-clear",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             handle_tool_call(
@@ -5148,7 +5655,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "nu-cap", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "nu-cap",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             hb = handle_tool_call(
@@ -5176,7 +5688,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "nu-ws", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "nu-ws",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             hb = handle_tool_call(
@@ -5194,7 +5711,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             prepare_management_root(root)
             state = handle_tool_call(
                 "agent_register",
-                {"agent_id": "nu-reg", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "nu-reg",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             self.assertIsNone(state["sessions"][0]["needsUser"])
@@ -5209,7 +5731,9 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
                     "role": "coder",
                     "model": "opus",
                     "status": "active",
-                    "subagents": [{"label": "x", "model": "haiku", "count": 1, "role": None}],
+                    "subagents": [
+                        {"label": "x", "model": "haiku", "count": 1, "role": None}
+                    ],
                     "needsUser": None,
                     "sessionTokenHash": "secret-hash",
                     "sessionTokenIssuedAt": "2026-06-04T00:00:00+00:00",
@@ -5222,7 +5746,10 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
         }
         public = public_agents_state(state)
         session = public["sessions"][0]
-        self.assertEqual(session["subagents"], [{"label": "x", "model": "haiku", "count": 1, "role": None}])
+        self.assertEqual(
+            session["subagents"],
+            [{"label": "x", "model": "haiku", "count": 1, "role": None}],
+        )
         self.assertIsNone(session["needsUser"])
         self.assertNotIn("sessionTokenHash", session)
         self.assertNotIn("sessionTokenIssuedAt", session)
@@ -5313,7 +5840,12 @@ class AgentModelAndSubagentsTests(unittest.TestCase):
             # and must default the legacy session's new fields.
             state = handle_tool_call(
                 "agent_register",
-                {"agent_id": "fresh", "role": "coder", "model": "opus", "message": "reg"},
+                {
+                    "agent_id": "fresh",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "reg",
+                },
                 root=root,
             )
             legacy = next(s for s in state["sessions"] if s["agentId"] == "legacy")
@@ -5326,7 +5858,9 @@ class AgentIdHardeningTests(unittest.TestCase):
     cannot register as e.g. an alarming display name and sign phishing toasts."""
 
     def test_normalize_agent_id_accepts_generated_and_simple_ids(self):
-        self.assertEqual(normalize_agent_id("coder-1717459200000"), "coder-1717459200000")
+        self.assertEqual(
+            normalize_agent_id("coder-1717459200000"), "coder-1717459200000"
+        )
         self.assertEqual(normalize_agent_id("reviewer-7f"), "reviewer-7f")
         self.assertEqual(normalize_agent_id("agent.id_1-2"), "agent.id_1-2")
         self.assertEqual(normalize_agent_id("a"), "a")
@@ -5407,7 +5941,10 @@ class StateCapTests(unittest.TestCase):
         }
 
     def test_sessions_capped_dropping_oldest_closed_only(self):
-        live = [self._session(i, "active", f"2026-06-04T00:{i % 60:02d}:00Z") for i in range(40)]
+        live = [
+            self._session(i, "active", f"2026-06-04T00:{i % 60:02d}:00Z")
+            for i in range(40)
+        ]
         closed = [
             self._session(1000 + i, "closed", f"2026-01-01T00:{i % 60:02d}:00Z")
             for i in range(MAX_SESSIONS)
@@ -5468,8 +6005,14 @@ class StateCapTests(unittest.TestCase):
     def test_caps_applied_through_normalize(self):
         state = {
             "version": AGENTS_STATE_VERSION,
-            "sessions": [self._session(i, "closed", "2026-01-01T00:00:00Z") for i in range(MAX_SESSIONS + 10)],
-            "claims": [self._claim(i, "done", "2000-01-01T00:00:00Z", "2026-01-01T00:00:00Z") for i in range(MAX_CLAIMS + 10)],
+            "sessions": [
+                self._session(i, "closed", "2026-01-01T00:00:00Z")
+                for i in range(MAX_SESSIONS + 10)
+            ],
+            "claims": [
+                self._claim(i, "done", "2000-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+                for i in range(MAX_CLAIMS + 10)
+            ],
             "events": [],
         }
         normalized = normalize_agents_state(state)
@@ -5502,7 +6045,9 @@ def _rust_shaped_finding(**overrides) -> dict:
         "body": "A credential pattern was detected.",
         "verdict": "suspected",
         "disposition": "open",
-        "provenance": [{"actor": "censor", "action": "created", "at": "2026-06-05T00:00:00Z"}],
+        "provenance": [
+            {"actor": "censor", "action": "created", "at": "2026-06-05T00:00:00Z"}
+        ],
         "createdAt": "2026-06-05T00:00:00Z",
         "commit": None,
     }
@@ -5514,7 +6059,9 @@ def _write_shard(work_root: Path, file_rel: str, findings: list[dict]) -> Path:
     shard_path = censor_shard_path(work_root, file_rel)
     shard_path.parent.mkdir(parents=True, exist_ok=True)
     shard_path.write_text(
-        json.dumps(_rust_shaped_shard(file_rel, findings), indent=2, ensure_ascii=False),
+        json.dumps(
+            _rust_shaped_shard(file_rel, findings), indent=2, ensure_ascii=False
+        ),
         encoding="utf-8",
     )
     return shard_path
@@ -5589,7 +6136,19 @@ class CensorLedgerHelperTests(unittest.TestCase):
             # Safe allowlist only — NO contentHash / createdAt / commit leak.
             self.assertEqual(
                 set(f.keys()),
-                {"id", "file", "line", "severity", "category", "source", "title", "body", "verdict", "disposition", "provenance"},
+                {
+                    "id",
+                    "file",
+                    "line",
+                    "severity",
+                    "category",
+                    "source",
+                    "title",
+                    "body",
+                    "verdict",
+                    "disposition",
+                    "provenance",
+                },
             )
             self.assertNotIn("contentHash", f)
             self.assertNotIn("createdAt", f)
@@ -5616,8 +6175,16 @@ class CensorLedgerHelperTests(unittest.TestCase):
     def test_read_open_findings_filters_by_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            _write_shard(work_root, "src/a.ts", [_rust_shaped_finding(id="a-open", file="src/a.ts")])
-            _write_shard(work_root, "src/b.ts", [_rust_shaped_finding(id="b-open", file="src/b.ts")])
+            _write_shard(
+                work_root,
+                "src/a.ts",
+                [_rust_shaped_finding(id="a-open", file="src/a.ts")],
+            )
+            _write_shard(
+                work_root,
+                "src/b.ts",
+                [_rust_shaped_finding(id="b-open", file="src/b.ts")],
+            )
             only_a = read_censor_open_findings(work_root, "src/a.ts")
             self.assertEqual([f["id"] for f in only_a], ["a-open"])
             both = read_censor_open_findings(work_root, None)
@@ -5630,7 +6197,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
     def test_dispose_sets_disposition_and_appends_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             disposed = dispose_censor_finding(
                 work_root, "src/app.ts", "f-1", "fp", "coder-7", "2026-06-05T01:00:00Z"
             )
@@ -5648,7 +6217,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
     def test_dispose_is_idempotent_in_effect(self):
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             dispose_censor_finding(work_root, "src/app.ts", "f-1", "fp", "coder", "t1")
             dispose_censor_finding(work_root, "src/app.ts", "f-1", "fp", "coder", "t2")
             stored = json.loads(shard_path.read_text(encoding="utf-8"))
@@ -5659,9 +6230,13 @@ class CensorLedgerHelperTests(unittest.TestCase):
             work_root = Path(tmp)
             _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
             with self.assertRaises(McpError):
-                dispose_censor_finding(work_root, "src/app.ts", "f-1", "bogus", "coder", "t")
+                dispose_censor_finding(
+                    work_root, "src/app.ts", "f-1", "bogus", "coder", "t"
+                )
             with self.assertRaises(McpError):
-                dispose_censor_finding(work_root, "src/app.ts", "nope", "fp", "coder", "t")
+                dispose_censor_finding(
+                    work_root, "src/app.ts", "nope", "fp", "coder", "t"
+                )
 
     def test_dispose_refuses_corrupt_shard(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5670,7 +6245,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
             shard_path.parent.mkdir(parents=True, exist_ok=True)
             shard_path.write_text("{ not json", encoding="utf-8")
             with self.assertRaises(McpError):
-                dispose_censor_finding(work_root, "src/app.ts", "f-1", "fp", "coder", "t")
+                dispose_censor_finding(
+                    work_root, "src/app.ts", "f-1", "fp", "coder", "t"
+                )
 
     # ---- BLOCKER 1 / N3: provenance stays BOUNDED under repeated disposes ----
 
@@ -5679,7 +6256,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
         # append another provenance entry — repeated re-dispose cannot bloat a shard.
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             for i in range(200):
                 dispose_censor_finding(
                     work_root, "src/app.ts", "f-1", "fp", "coder", f"t{i}", "coder"
@@ -5696,7 +6275,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             toggles = ["fp", "open", "wontfix", "fixed"]
             for i in range(500):
                 disp = toggles[i % len(toggles)]
@@ -5708,7 +6289,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
             self.assertLessEqual(len(prov), CENSOR_PROVENANCE_MAX)
             # The trail keeps the MOST RECENT entries (oldest dropped): the final
             # disposition matches the last applied token.
-            self.assertEqual(stored["findings"][0]["disposition"], toggles[(500 - 1) % len(toggles)])
+            self.assertEqual(
+                stored["findings"][0]["disposition"], toggles[(500 - 1) % len(toggles)]
+            )
 
     # ---- NITPICK 1: double-slash rel path maps to the SAME shard ----
 
@@ -5727,7 +6310,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
     # ---- WARNING 2: a coder cannot override a verifier adjudication ----
 
     def _verifier_disposed(self, work_root: Path, disposition: str) -> Path:
-        shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+        shard_path = _write_shard(
+            work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+        )
         dispose_censor_finding(
             work_root, "src/app.ts", "f-1", disposition, "verifier-9", "tv", "verifier"
         )
@@ -5770,7 +6355,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
         # adjudicating role is coder, not verifier).
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             dispose_censor_finding(
                 work_root, "src/app.ts", "f-1", "fp", "coder-1", "t1", "coder"
             )
@@ -5785,7 +6372,9 @@ class CensorLedgerHelperTests(unittest.TestCase):
         # disposes an OPEN (machine-default) finding.
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             dispose_censor_finding(
                 work_root, "src/app.ts", "f-1", "fp", "coder-1", "t1", "coder"
             )
@@ -5866,7 +6455,12 @@ class CensorPythonRedactionTests(unittest.TestCase):
             )
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-1", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-1",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
             result = handle_tool_call(
@@ -5906,7 +6500,12 @@ class CensorMcpToolTests(unittest.TestCase):
             _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="r-1")])
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-1", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-1",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
             result = handle_tool_call(
@@ -5924,16 +6523,30 @@ class CensorMcpToolTests(unittest.TestCase):
     def test_findings_filters_by_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, work_root = self._setup(tmp)
-            _write_shard(work_root, "src/a.ts", [_rust_shaped_finding(id="a", file="src/a.ts")])
-            _write_shard(work_root, "src/b.ts", [_rust_shaped_finding(id="b", file="src/b.ts")])
+            _write_shard(
+                work_root, "src/a.ts", [_rust_shaped_finding(id="a", file="src/a.ts")]
+            )
+            _write_shard(
+                work_root, "src/b.ts", [_rust_shaped_finding(id="b", file="src/b.ts")]
+            )
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-1", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-1",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
             result = handle_tool_call(
                 "censor_findings",
-                {"project_id": "censor-proj", "agent_id": "coder-1", "role": "coder", "file": "src/a.ts"},
+                {
+                    "project_id": "censor-proj",
+                    "agent_id": "coder-1",
+                    "role": "coder",
+                    "file": "src/a.ts",
+                },
                 root=root,
             )
             self.assertEqual([f["id"] for f in result["findings"]], ["a"])
@@ -5941,10 +6554,17 @@ class CensorMcpToolTests(unittest.TestCase):
     def test_dispose_tool_sets_and_audits(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, work_root = self._setup(tmp)
-            shard_path = _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
+            shard_path = _write_shard(
+                work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")]
+            )
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "verifier-1", "role": "verifier", "model": "cheap", "message": "x"},
+                {
+                    "agent_id": "verifier-1",
+                    "role": "verifier",
+                    "model": "cheap",
+                    "message": "x",
+                },
                 root=root,
             )
             result = handle_tool_call(
@@ -5974,8 +6594,12 @@ class CensorMcpToolTests(unittest.TestCase):
             self.assertNotIn("body", json.dumps(result))
             stored = json.loads(shard_path.read_text(encoding="utf-8"))
             self.assertEqual(stored["findings"][0]["disposition"], "fp")
-            self.assertEqual(stored["findings"][0]["provenance"][-1]["actor"], "verifier-1")
-            self.assertEqual(stored["findings"][0]["provenance"][-1]["role"], "verifier")
+            self.assertEqual(
+                stored["findings"][0]["provenance"][-1]["actor"], "verifier-1"
+            )
+            self.assertEqual(
+                stored["findings"][0]["provenance"][-1]["role"], "verifier"
+            )
 
     def test_findings_is_session_token_gated(self):
         # The tool routes through require_agent_tool → require_session_token. We
@@ -5987,7 +6611,12 @@ class CensorMcpToolTests(unittest.TestCase):
             _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-tok", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-tok",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
             # While the flag is ON the tokenless call works (proves the dispatch path
@@ -6003,7 +6632,11 @@ class CensorMcpToolTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "censor_findings",
-                    {"project_id": "censor-proj", "agent_id": "coder-tok", "role": "coder"},
+                    {
+                        "project_id": "censor-proj",
+                        "agent_id": "coder-tok",
+                        "role": "coder",
+                    },
                     root=root,
                 )
 
@@ -6013,7 +6646,12 @@ class CensorMcpToolTests(unittest.TestCase):
             _write_shard(work_root, "src/app.ts", [_rust_shaped_finding(id="f-1")])
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "verifier-tok", "role": "verifier", "model": "cheap", "message": "x"},
+                {
+                    "agent_id": "verifier-tok",
+                    "role": "verifier",
+                    "model": "cheap",
+                    "message": "x",
+                },
                 root=root,
             )
             os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "0"
@@ -6118,7 +6756,9 @@ class SpawnMiniCoderTests(unittest.TestCase):
                             "role": "coder",
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                token.encode("utf-8")
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         }
                     ],
@@ -6142,7 +6782,9 @@ class SpawnMiniCoderTests(unittest.TestCase):
         return result["sessionToken"]
 
     def _read_state(self, root: Path) -> dict:
-        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
+        )
 
     def test_writes_pending_directive_with_exact_camel_case_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6329,7 +6971,9 @@ class SpawnMiniCoderTests(unittest.TestCase):
         pdesc = param["description"]
         self.assertIn("agenticIterative", pdesc)
         self.assertIn("emitEdits", pdesc)
-        self.assertIn("gate coverage", pdesc, "param description states the coverage rule")
+        self.assertIn(
+            "gate coverage", pdesc, "param description states the coverage rule"
+        )
         # A3 forward-looks past A2's plumbing-only wording.
         self.assertNotIn("behavior wired later", pdesc)
 
@@ -6383,7 +7027,13 @@ class SpawnMiniCoderTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "spawn_mini_coder",
-                    {"agent_id": "codex", "role": "coder", "task": "   ", "files": ["src/a.rs"], "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "   ",
+                        "files": ["src/a.rs"],
+                        "session_token": token,
+                    },
                     root=root,
                 )
 
@@ -6394,7 +7044,13 @@ class SpawnMiniCoderTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "spawn_mini_coder",
-                    {"agent_id": "codex", "role": "coder", "task": "x", "files": [], "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": [],
+                        "session_token": token,
+                    },
                     root=root,
                 )
 
@@ -6405,7 +7061,13 @@ class SpawnMiniCoderTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "spawn_mini_coder",
-                    {"agent_id": "codex", "role": "coder", "task": "x", "files": ["../escape.rs"], "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["../escape.rs"],
+                        "session_token": token,
+                    },
                     root=root,
                 )
 
@@ -6416,7 +7078,13 @@ class SpawnMiniCoderTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "spawn_mini_coder",
-                    {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": "wrong"},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "session_token": "wrong",
+                    },
                     root=root,
                 )
 
@@ -6426,7 +7094,13 @@ class SpawnMiniCoderTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "spawn_mini_coder",
-                    {"agent_id": "ghost", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": "t"},
+                    {
+                        "agent_id": "ghost",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "session_token": "t",
+                    },
                     root=root,
                 )
 
@@ -6466,10 +7140,18 @@ class SpawnMiniCoderTests(unittest.TestCase):
             t = threading.Thread(target=executor)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05):
+                with patch(
+                    "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05
+                ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -6517,12 +7199,21 @@ class SpawnMiniCoderTests(unittest.TestCase):
                 # would hang ~that long; the assertion is that it returns promptly with
                 # `failed`, well before the cap.
                 started = time.monotonic()
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02), patch(
-                    "oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 30.0
+                with (
+                    patch(
+                        "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02
+                    ),
+                    patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 30.0),
                 ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
                 elapsed = time.monotonic() - started
@@ -6531,7 +7222,9 @@ class SpawnMiniCoderTests(unittest.TestCase):
             self.assertEqual(out["result"]["status"], "failed")
             self.assertIn("vanished", out["result"]["error"])
             # Promptly: nowhere near the 30s cap.
-            self.assertLess(elapsed, 10.0, f"poll did not return promptly: {elapsed:.2f}s")
+            self.assertLess(
+                elapsed, 10.0, f"poll did not return promptly: {elapsed:.2f}s"
+            )
 
     def test_kill_requested_wins_over_poll_timeout(self):
         # BLOCKER 1: a human hit Stop (Rust set killRequested=true on the directive)
@@ -6576,12 +7269,21 @@ class SpawnMiniCoderTests(unittest.TestCase):
                 # A small (non-zero) interval so the killer has time to flip the flag,
                 # and a short cap so the deadline fires while killRequested is set but
                 # no terminal result exists.
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02), patch(
-                    "oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.3
+                with (
+                    patch(
+                        "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02
+                    ),
+                    patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.3),
                 ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -6605,7 +7307,11 @@ class SpawnMiniCoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
             token = self._register_coder(root)
-            done = {"status": "done", "output": "retry succeeded", "filesTouched": ["src/a.rs"]}
+            done = {
+                "status": "done",
+                "output": "retry succeeded",
+                "filesTouched": ["src/a.rs"],
+            }
             saw_awaiting_retry = {"value": False}
 
             def executor():
@@ -6646,15 +7352,25 @@ class SpawnMiniCoderTests(unittest.TestCase):
             t = threading.Thread(target=executor)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05):
+                with patch(
+                    "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05
+                ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
                 t.join()
-            self.assertTrue(saw_awaiting_retry["value"], "directive was never set to awaiting_retry")
+            self.assertTrue(
+                saw_awaiting_retry["value"], "directive was never set to awaiting_retry"
+            )
             # The poll did NOT return early on awaiting_retry — it returned the terminal done.
             self.assertEqual(out["result"]["status"], "done")
             self.assertEqual(out["result"]["output"], "retry succeeded")
@@ -6676,8 +7392,18 @@ class SpawnMiniCoderTests(unittest.TestCase):
                 "escalation": {
                     "attempts": 3,
                     "findings": [
-                        {"file": "src/a.rs", "severity": "high", "title": "unsafe deref", "line": 42},
-                        {"file": "src/a.rs", "severity": "medium", "title": "missing guard", "line": 7},
+                        {
+                            "file": "src/a.rs",
+                            "severity": "high",
+                            "title": "unsafe deref",
+                            "line": 42,
+                        },
+                        {
+                            "file": "src/a.rs",
+                            "severity": "medium",
+                            "title": "missing guard",
+                            "line": 7,
+                        },
                     ],
                 },
             }
@@ -6706,10 +7432,18 @@ class SpawnMiniCoderTests(unittest.TestCase):
             t = threading.Thread(target=executor)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05):
+                with patch(
+                    "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05
+                ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -6768,10 +7502,18 @@ class SpawnMiniCoderTests(unittest.TestCase):
             t = threading.Thread(target=executor)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05):
+                with patch(
+                    "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.05
+                ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -6829,7 +7571,13 @@ class SpawnMiniCoderTests(unittest.TestCase):
             with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
                 out = handle_tool_call(
                     "spawn_mini_coder",
-                    {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "task": "x",
+                        "files": ["src/a.rs"],
+                        "session_token": token,
+                    },
                     root=root,
                 )
             self.assertEqual(out["result"]["status"], "failed")
@@ -6872,12 +7620,21 @@ class SpawnMiniCoderTests(unittest.TestCase):
             t = threading.Thread(target=runner)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02), patch(
-                    "oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.3
+                with (
+                    patch(
+                        "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02
+                    ),
+                    patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.3),
                 ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -6921,12 +7678,21 @@ class SpawnMiniCoderTests(unittest.TestCase):
             t = threading.Thread(target=runner)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02), patch(
-                    "oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.3
+                with (
+                    patch(
+                        "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02
+                    ),
+                    patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.3),
                 ):
                     out = handle_tool_call(
                         "spawn_mini_coder",
-                        {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "task": "x",
+                            "files": ["src/a.rs"],
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -6977,7 +7743,9 @@ class SpawnMiniCoderTests(unittest.TestCase):
         # mirroring the Rust default_role_rules coder.forbidden routing line.
         coder = next(r for r in ROLE_RULES if r["role"] == "coder")
         blob = " ".join(coder["forbidden"])
-        self.assertIn("Delegate only cheap, mechanical sub-tasks to spawn_mini_coder", blob)
+        self.assertIn(
+            "Delegate only cheap, mechanical sub-tasks to spawn_mini_coder", blob
+        )
         self.assertIn("REVIEW the mini's output as a draft", blob)
         # The verifier (no spawn_mini_coder) must NOT carry any routing rule.
         verifier = next(r for r in ROLE_RULES if r["role"] == "verifier")
@@ -7035,7 +7803,11 @@ class SpawnMiniCoderTests(unittest.TestCase):
         # Pad with terminal directives past the cap.
         for i in range(MAX_MINI_CODER_DIRECTIVES):
             directives.append(
-                {"id": f"t{i}", "status": "failed", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+                {
+                    "id": f"t{i}",
+                    "status": "failed",
+                    "createdAt": f"2026-06-06T01:00:{i:02d}Z",
+                }
             )
         capped = cap_mini_coder_directives(directives)
         self.assertLessEqual(len(capped), MAX_MINI_CODER_DIRECTIVES)
@@ -7050,7 +7822,11 @@ class SpawnMiniCoderTests(unittest.TestCase):
         # was already successfully handed back, while the uncollected one's
         # caller may still be about to poll for it.
         directives = [
-            {"id": "uncollected-old", "status": "done", "createdAt": "2026-06-06T00:00:01Z"},
+            {
+                "id": "uncollected-old",
+                "status": "done",
+                "createdAt": "2026-06-06T00:00:01Z",
+            },
             {
                 "id": "collected-newer",
                 "status": "done",
@@ -7061,9 +7837,17 @@ class SpawnMiniCoderTests(unittest.TestCase):
         ]
         for i in range(MAX_MINI_CODER_DIRECTIVES - 2):
             directives.append(
-                {"id": f"t{i}", "status": "failed", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+                {
+                    "id": f"t{i}",
+                    "status": "failed",
+                    "createdAt": f"2026-06-06T01:00:{i:02d}Z",
+                }
             )
-        self.assertEqual(len(directives), MAX_MINI_CODER_DIRECTIVES + 1, "test setup: exactly 1 over cap")
+        self.assertEqual(
+            len(directives),
+            MAX_MINI_CODER_DIRECTIVES + 1,
+            "test setup: exactly 1 over cap",
+        )
         capped = cap_mini_coder_directives(directives)
         self.assertEqual(len(capped), MAX_MINI_CODER_DIRECTIVES)
         ids = {d["id"] for d in capped}
@@ -7092,7 +7876,9 @@ class VisualCheckTests(unittest.TestCase):
         sample_project(projects)
         return root
 
-    def _register_coder(self, root: Path, agent_id: str = "codex", role: str = "coder") -> str:
+    def _register_coder(
+        self, root: Path, agent_id: str = "codex", role: str = "coder"
+    ) -> str:
         token = "test-launch-token"
         (root / "projects" / ".aspis-agents.json").write_text(
             json.dumps(
@@ -7106,7 +7892,9 @@ class VisualCheckTests(unittest.TestCase):
                             "status": "launch_pending",
                             "currentProjectId": "scrna-seq",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                token.encode("utf-8")
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         }
                     ],
@@ -7130,7 +7918,9 @@ class VisualCheckTests(unittest.TestCase):
         return result["sessionToken"]
 
     def _read_state(self, root: Path) -> dict:
-        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
+        )
 
     def test_visual_check_in_tool_schema_and_allowed_for_agents(self):
         from oracle.server import aspis_mcp
@@ -7158,7 +7948,7 @@ class VisualCheckTests(unittest.TestCase):
                         "session_token": token,
                     },
                     root=root,
-            )
+                )
             self.assertIn("directiveId", out)
             self.assertIn("did not start", out["error"])
             directives = self._read_state(root)["visualCheckDirectives"]
@@ -7284,6 +8074,7 @@ class VisualCheckTests(unittest.TestCase):
     def test_design_request_tool_schema_has_mode_and_frame_params(self):
         """Phase 3: the TOOLS schema exposes mode and frame parameters."""
         from oracle.server import aspis_mcp
+
         tool = next(t for t in aspis_mcp.TOOLS if t["name"] == "design_request")
         params = tool["parameters"]
         self.assertIn("mode", params, "mode param missing from design_request schema")
@@ -7322,7 +8113,9 @@ class VisualCheckTests(unittest.TestCase):
             t = threading.Thread(target=executor)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.VISUAL_CHECK_POLL_INTERVAL_SECS", 0.02):
+                with patch(
+                    "oracle.server.aspis_mcp.VISUAL_CHECK_POLL_INTERVAL_SECS", 0.02
+                ):
                     out = handle_tool_call(
                         "visual_check",
                         {
@@ -7338,7 +8131,10 @@ class VisualCheckTests(unittest.TestCase):
             self.assertEqual(out["critique"], "Button text overflows on mobile.")
 
     def test_cap_visual_check_directives_evicts_oldest_terminal_keeps_pending(self):
-        from oracle.server.aspis_mcp import MAX_VISUAL_CHECK_DIRECTIVES, cap_visual_check_directives
+        from oracle.server.aspis_mcp import (
+            MAX_VISUAL_CHECK_DIRECTIVES,
+            cap_visual_check_directives,
+        )
 
         directives = [
             {"id": "old", "status": "done", "createdAt": "2026-06-06T00:00:01Z"},
@@ -7346,7 +8142,11 @@ class VisualCheckTests(unittest.TestCase):
         ]
         for i in range(MAX_VISUAL_CHECK_DIRECTIVES):
             directives.append(
-                {"id": f"v{i}", "status": "failed", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+                {
+                    "id": f"v{i}",
+                    "status": "failed",
+                    "createdAt": f"2026-06-06T01:00:{i:02d}Z",
+                }
             )
         capped = cap_visual_check_directives(directives)
         self.assertLessEqual(len(capped), MAX_VISUAL_CHECK_DIRECTIVES)
@@ -7367,7 +8167,9 @@ class RequestGitPushTests(unittest.TestCase):
         sample_project(projects)
         return root
 
-    def _register_coder(self, root: Path, agent_id: str = "codex", role: str = "coder") -> str:
+    def _register_coder(
+        self, root: Path, agent_id: str = "codex", role: str = "coder"
+    ) -> str:
         token = "test-launch-token"
         (root / "projects" / ".aspis-agents.json").write_text(
             json.dumps(
@@ -7380,7 +8182,9 @@ class RequestGitPushTests(unittest.TestCase):
                             "role": role,
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                token.encode("utf-8")
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         }
                     ],
@@ -7404,7 +8208,9 @@ class RequestGitPushTests(unittest.TestCase):
         return result["sessionToken"]
 
     def _read_state(self, root: Path) -> dict:
-        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
+        )
 
     def test_writes_pending_request_with_exact_camel_case_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -7494,7 +8300,12 @@ class RequestGitPushTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "request_git_push",
-                    {"agent_id": "codex", "role": "coder", "project_id": "  ", "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "project_id": "  ",
+                        "session_token": token,
+                    },
                     root=root,
                 )
 
@@ -7505,7 +8316,12 @@ class RequestGitPushTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "request_git_push",
-                    {"agent_id": "codex", "role": "coder", "project_id": "scrna-seq", "session_token": "wrong"},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "project_id": "scrna-seq",
+                        "session_token": "wrong",
+                    },
                     root=root,
                 )
 
@@ -7562,7 +8378,12 @@ class RequestGitPushTests(unittest.TestCase):
             with self.assertRaises(McpError):
                 handle_tool_call(
                     "request_git_push",
-                    {"agent_id": "vfx", "role": "verifier", "project_id": "scrna-seq", "session_token": token},
+                    {
+                        "agent_id": "vfx",
+                        "role": "verifier",
+                        "project_id": "scrna-seq",
+                        "session_token": token,
+                    },
                     root=root,
                 )
 
@@ -7595,8 +8416,9 @@ class RequestGitPushTests(unittest.TestCase):
             t = threading.Thread(target=stamp)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.GIT_PUSH_POLL_TIMEOUT_SECS", 10.0), patch(
-                    "oracle.server.aspis_mcp.GIT_PUSH_POLL_INTERVAL_SECS", 0.02
+                with (
+                    patch("oracle.server.aspis_mcp.GIT_PUSH_POLL_TIMEOUT_SECS", 10.0),
+                    patch("oracle.server.aspis_mcp.GIT_PUSH_POLL_INTERVAL_SECS", 0.02),
                 ):
                     out = handle_tool_call(
                         "request_git_push",
@@ -7631,14 +8453,21 @@ class RequestGitPushTests(unittest.TestCase):
                 with mcp.file_lock(state_lock):
                     state = mcp.read_agents_state(projects_dir)
                     for r in state.get("gitPushRequests", []):
-                        if r.get("id") == request_id and r.get("status") == "pending_approval":
+                        if (
+                            r.get("id") == request_id
+                            and r.get("status") == "pending_approval"
+                        ):
                             r["status"] = "approved"
                             mcp.write_agents_state(projects_dir, state)
                             break
                 return original(projects_dir, state_lock, request_id)
 
-            with patch("oracle.server.aspis_mcp.GIT_PUSH_POLL_TIMEOUT_SECS", 0.0), patch(
-                "oracle.server.aspis_mcp._git_push_request_result", side_effect=flip_to_approved
+            with (
+                patch("oracle.server.aspis_mcp.GIT_PUSH_POLL_TIMEOUT_SECS", 0.0),
+                patch(
+                    "oracle.server.aspis_mcp._git_push_request_result",
+                    side_effect=flip_to_approved,
+                ),
             ):
                 out = handle_tool_call(
                     "request_git_push",
@@ -7665,11 +8494,19 @@ class RequestGitPushTests(unittest.TestCase):
     def test_cap_git_push_requests_evicts_oldest_terminal_keeps_active(self):
         requests = [
             {"id": "old", "status": "pushed", "createdAt": "2026-06-06T00:00:01Z"},
-            {"id": "active", "status": "pending_approval", "createdAt": "2026-06-06T00:00:02Z"},
+            {
+                "id": "active",
+                "status": "pending_approval",
+                "createdAt": "2026-06-06T00:00:02Z",
+            },
         ]
         for i in range(MAX_GIT_PUSH_REQUESTS):
             requests.append(
-                {"id": f"t{i}", "status": "denied", "createdAt": f"2026-06-06T01:00:{i:02d}Z"}
+                {
+                    "id": f"t{i}",
+                    "status": "denied",
+                    "createdAt": f"2026-06-06T01:00:{i:02d}Z",
+                }
             )
         capped = cap_git_push_requests(requests)
         self.assertLessEqual(len(capped), MAX_GIT_PUSH_REQUESTS)
@@ -7710,7 +8547,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
     Mirrors the request_git_push tests above (the structural template)."""
 
     def setUp(self):
-        self._old_unmanaged_privileged = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        self._old_unmanaged_privileged = os.environ.get(
+            "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"
+        )
         self._old_disable_app_vault = os.environ.get("ASPIS_MCP_DISABLE_APP_VAULT")
         os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
         os.environ["ASPIS_MCP_DISABLE_APP_VAULT"] = "1"
@@ -7719,7 +8558,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         if self._old_unmanaged_privileged is None:
             os.environ.pop("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS", None)
         else:
-            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = self._old_unmanaged_privileged
+            os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = (
+                self._old_unmanaged_privileged
+            )
         if self._old_disable_app_vault is None:
             os.environ.pop("ASPIS_MCP_DISABLE_APP_VAULT", None)
         else:
@@ -7732,7 +8573,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         sample_project(projects)
         return root
 
-    def _register(self, root: Path, agent_id: str = "codex", role: str = "coder") -> str:
+    def _register(
+        self, root: Path, agent_id: str = "codex", role: str = "coder"
+    ) -> str:
         token = "test-launch-token"
         (root / "projects" / ".aspis-agents.json").write_text(
             json.dumps(
@@ -7745,7 +8588,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                             "role": role,
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-09T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                token.encode("utf-8")
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         }
                     ],
@@ -7769,10 +8614,14 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         return result["sessionToken"]
 
     def _read_state(self, root: Path) -> dict:
-        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
+        )
 
     def _session(self, root: Path, agent_id: str = "codex") -> dict:
-        return next(s for s in self._read_state(root)["sessions"] if s["agentId"] == agent_id)
+        return next(
+            s for s in self._read_state(root)["sessions"] if s["agentId"] == agent_id
+        )
 
     # ---- plan_submit ------------------------------------------------------
 
@@ -7845,7 +8694,14 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 for _ in range(800):
                     with mcp.file_lock(lock):
                         state = mcp.read_agents_state(projects)
-                        sess = next((s for s in state["sessions"] if s.get("agentId") == "codex"), None)
+                        sess = next(
+                            (
+                                s
+                                for s in state["sessions"]
+                                if s.get("agentId") == "codex"
+                            ),
+                            None,
+                        )
                         needs = (sess or {}).get("needsUser") if sess else None
                     if needs and needs.get("reason") == "needs_plan_approval":
                         seen["needs"] = needs
@@ -7855,8 +8711,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             t = threading.Thread(target=probe)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.3), patch(
-                    "oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.02
+                with (
+                    patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.3),
+                    patch("oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.02),
                 ):
                     handle_tool_call(
                         "plan_submit",
@@ -7872,7 +8729,11 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                     )
             finally:
                 t.join()
-            self.assertIn("needs", seen, "needsUser(needs_plan_approval) was never observed while pending")
+            self.assertIn(
+                "needs",
+                seen,
+                "needsUser(needs_plan_approval) was never observed while pending",
+            )
             self.assertIn("Wire the cache", seen["needs"]["message"])
 
     def test_plan_submit_rejects_verifier(self):
@@ -7986,8 +8847,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             t = threading.Thread(target=stamp)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 10.0), patch(
-                    "oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.02
+                with (
+                    patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 10.0),
+                    patch("oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.02),
                 ):
                     out = handle_tool_call(
                         "plan_submit",
@@ -8020,15 +8882,22 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 with mcp.file_lock(state_lock):
                     state = mcp.read_agents_state(projects_dir)
                     for r in state.get("planApprovalRequests", []):
-                        if r.get("id") == plan_id and r.get("status") == "pending_approval":
+                        if (
+                            r.get("id") == plan_id
+                            and r.get("status") == "pending_approval"
+                        ):
                             r["status"] = "rejected"
                             r["note"] = "no, redo the data model"
                             mcp.write_agents_state(projects_dir, state)
                             break
                 return original(projects_dir, state_lock, plan_id)
 
-            with patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.0), patch(
-                "oracle.server.aspis_mcp._plan_request_outcome", side_effect=flip_to_rejected
+            with (
+                patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.0),
+                patch(
+                    "oracle.server.aspis_mcp._plan_request_outcome",
+                    side_effect=flip_to_rejected,
+                ),
             ):
                 out = handle_tool_call(
                     "plan_submit",
@@ -8073,7 +8942,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             # Best-effort: the sidecar is updated to the terminal status.
             plan_id = out["planId"]
             sidecar = json.loads(
-                (root / "projects" / ".aspis-plans" / "scrna-seq" / f"{plan_id}.json").read_text(encoding="utf-8")
+                (
+                    root / "projects" / ".aspis-plans" / "scrna-seq" / f"{plan_id}.json"
+                ).read_text(encoding="utf-8")
             )
             self.assertEqual(sidecar["status"], "timeout")
 
@@ -8099,7 +8970,12 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             plan_id = submitted["planId"]
             out = handle_tool_call(
                 "plan_status",
-                {"agent_id": "codex", "role": "coder", "plan_id": plan_id, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "plan_id": plan_id,
+                    "session_token": token,
+                },
                 root=root,
             )
             self.assertEqual(out["planId"], plan_id)
@@ -8135,7 +9011,12 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 mcp.write_agents_state(projects, state)
             out = handle_tool_call(
                 "plan_status",
-                {"agent_id": "codex", "role": "coder", "plan_id": plan_id, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "plan_id": plan_id,
+                    "session_token": token,
+                },
                 root=root,
             )
             self.assertEqual(out["planId"], plan_id)
@@ -8145,11 +9026,23 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
             token = self._register(root)
-            for bad in ("../etc/passwd", "ZZZ", "abc", "a" * 31, "a" * 33, "0123456789abcdef0123456789abcdeG"):
+            for bad in (
+                "../etc/passwd",
+                "ZZZ",
+                "abc",
+                "a" * 31,
+                "a" * 33,
+                "0123456789abcdef0123456789abcdeG",
+            ):
                 with self.assertRaises(McpError):
                     handle_tool_call(
                         "plan_status",
-                        {"agent_id": "codex", "role": "coder", "plan_id": bad, "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "plan_id": bad,
+                            "session_token": token,
+                        },
                         root=root,
                     )
 
@@ -8159,7 +9052,12 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             token = self._register(root)
             out = handle_tool_call(
                 "plan_status",
-                {"agent_id": "codex", "role": "coder", "plan_id": "0" * 32, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "plan_id": "0" * 32,
+                    "session_token": token,
+                },
                 root=root,
             )
             self.assertEqual(out["status"], "not_found")
@@ -8181,7 +9079,14 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 for _ in range(400):
                     with mcp.file_lock(lock):
                         state = mcp.read_agents_state(projects)
-                        sess = next((s for s in state["sessions"] if s.get("agentId") == "codex"), None)
+                        sess = next(
+                            (
+                                s
+                                for s in state["sessions"]
+                                if s.get("agentId") == "codex"
+                            ),
+                            None,
+                        )
                         pending = (sess or {}).get("pendingQuestion") if sess else None
                         if pending:
                             sess["userReply"] = {
@@ -8198,8 +9103,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             t = threading.Thread(target=reply)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.ASK_USER_POLL_TIMEOUT_SECS", 10.0), patch(
-                    "oracle.server.aspis_mcp.ASK_USER_POLL_INTERVAL_SECS", 0.02
+                with (
+                    patch("oracle.server.aspis_mcp.ASK_USER_POLL_TIMEOUT_SECS", 10.0),
+                    patch("oracle.server.aspis_mcp.ASK_USER_POLL_INTERVAL_SECS", 0.02),
                 ):
                     out = handle_tool_call(
                         "ask_user",
@@ -8240,7 +9146,14 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 for _ in range(400):
                     with mcp.file_lock(lock):
                         state = mcp.read_agents_state(projects)
-                        sess = next((s for s in state["sessions"] if s.get("agentId") == "codex"), None)
+                        sess = next(
+                            (
+                                s
+                                for s in state["sessions"]
+                                if s.get("agentId") == "codex"
+                            ),
+                            None,
+                        )
                         if sess and sess.get("pendingQuestion"):
                             sess["userReply"] = {
                                 "questionId": "stale-question-id",
@@ -8255,7 +9168,14 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 for _ in range(800):
                     with mcp.file_lock(lock):
                         state = mcp.read_agents_state(projects)
-                        sess = next((s for s in state["sessions"] if s.get("agentId") == "codex"), None)
+                        sess = next(
+                            (
+                                s
+                                for s in state["sessions"]
+                                if s.get("agentId") == "codex"
+                            ),
+                            None,
+                        )
                         pending = (sess or {}).get("pendingQuestion") if sess else None
                         if pending and not (sess or {}).get("userReply"):
                             sess["userReply"] = {
@@ -8270,8 +9190,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             t = threading.Thread(target=reply)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.ASK_USER_POLL_TIMEOUT_SECS", 10.0), patch(
-                    "oracle.server.aspis_mcp.ASK_USER_POLL_INTERVAL_SECS", 0.02
+                with (
+                    patch("oracle.server.aspis_mcp.ASK_USER_POLL_TIMEOUT_SECS", 10.0),
+                    patch("oracle.server.aspis_mcp.ASK_USER_POLL_INTERVAL_SECS", 0.02),
                 ):
                     out = handle_tool_call(
                         "ask_user",
@@ -8285,7 +9206,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                     )
             finally:
                 t.join()
-            self.assertTrue(phase["wrote_stale"], "stale reply was never written by the test thread")
+            self.assertTrue(
+                phase["wrote_stale"], "stale reply was never written by the test thread"
+            )
             self.assertEqual(out["reply"], "the real answer")
 
     def test_ask_user_timeout_clears_state(self):
@@ -8323,10 +9246,17 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
                 for _ in range(400):
                     with mcp.file_lock(lock):
                         state = mcp.read_agents_state(projects)
-                        sess = next((s for s in state["sessions"] if s.get("agentId") == "vfx"), None)
+                        sess = next(
+                            (s for s in state["sessions"] if s.get("agentId") == "vfx"),
+                            None,
+                        )
                         pending = (sess or {}).get("pendingQuestion") if sess else None
                         if pending:
-                            sess["userReply"] = {"questionId": pending["id"], "text": "yes", "createdAt": mcp.now()}
+                            sess["userReply"] = {
+                                "questionId": pending["id"],
+                                "text": "yes",
+                                "createdAt": mcp.now(),
+                            }
                             mcp.write_agents_state(projects, state)
                             return
                     time.sleep(0.02)
@@ -8334,12 +9264,18 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             t = threading.Thread(target=reply)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.ASK_USER_POLL_TIMEOUT_SECS", 10.0), patch(
-                    "oracle.server.aspis_mcp.ASK_USER_POLL_INTERVAL_SECS", 0.02
+                with (
+                    patch("oracle.server.aspis_mcp.ASK_USER_POLL_TIMEOUT_SECS", 10.0),
+                    patch("oracle.server.aspis_mcp.ASK_USER_POLL_INTERVAL_SECS", 0.02),
                 ):
                     out = handle_tool_call(
                         "ask_user",
-                        {"agent_id": "vfx", "role": "verifier", "question": "ok?", "session_token": token},
+                        {
+                            "agent_id": "vfx",
+                            "role": "verifier",
+                            "question": "ok?",
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -8348,7 +9284,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
 
     # ---- needsUser clobber guard (WARNING #5) -----------------------------
 
-    def _light_bell(self, root: Path, reason: str, since: str, agent_id: str = "codex") -> None:
+    def _light_bell(
+        self, root: Path, reason: str, since: str, agent_id: str = "codex"
+    ) -> None:
         """Manually set the session's needsUser bell to a given reason/since."""
         import oracle.server.aspis_mcp as mcp
 
@@ -8404,16 +9342,20 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
 
                 with mcp.file_lock(state_lock):
                     state = mcp.read_agents_state(projects_dir)
-                    sess = next(s for s in state["sessions"] if s.get("agentId") == "codex")
+                    sess = next(
+                        s for s in state["sessions"] if s.get("agentId") == "codex"
+                    )
                     captured["since"] = (sess.get("needsUser") or {}).get("since")
                 # Report still-pending so the loop keeps going until the (real) timeout.
                 return (True, "pending_approval", None)
 
-            with patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.05), patch(
-                "oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.01
-            ), patch(
-                "oracle.server.aspis_mcp._plan_request_outcome",
-                side_effect=capture_then_pending,
+            with (
+                patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.05),
+                patch("oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.01),
+                patch(
+                    "oracle.server.aspis_mcp._plan_request_outcome",
+                    side_effect=capture_then_pending,
+                ),
             ):
                 handle_tool_call(
                     "plan_submit",
@@ -8451,7 +9393,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             self.assertIn("outstanding needsUser", str(ctx.exception))
             # The original plan bell survived; no pendingQuestion was written.
             sess = self._session(root)
-            self.assertEqual(sess.get("needsUser", {}).get("reason"), "needs_plan_approval")
+            self.assertEqual(
+                sess.get("needsUser", {}).get("reason"), "needs_plan_approval"
+            )
             self.assertIsNone(sess.get("pendingQuestion"))
 
     # ---- poll deadline checked at the top of the loop (WARNING #11) --------
@@ -8472,11 +9416,13 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
 
             # timeout < interval: after the first pass the loop sleeps the interval and
             # the NEXT top-of-loop check must break BEFORE a second read.
-            with patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.01), patch(
-                "oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.2
-            ), patch(
-                "oracle.server.aspis_mcp._plan_request_outcome",
-                side_effect=always_pending,
+            with (
+                patch("oracle.server.aspis_mcp.PLAN_POLL_TIMEOUT_SECS", 0.01),
+                patch("oracle.server.aspis_mcp.PLAN_POLL_INTERVAL_SECS", 0.2),
+                patch(
+                    "oracle.server.aspis_mcp._plan_request_outcome",
+                    side_effect=always_pending,
+                ),
             ):
                 out = handle_tool_call(
                     "plan_submit",
@@ -8493,7 +9439,9 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
             self.assertEqual(out["status"], "timeout")
             # Exactly one read: the deadline (0.01s) is well under the interval (0.2s),
             # so the top-of-loop check breaks before a second read.
-            self.assertEqual(calls["n"], 1, "deadline must be checked at top, not after sleep")
+            self.assertEqual(
+                calls["n"], 1, "deadline must be checked at top, not after sleep"
+            )
 
     # ---- role wiring + normalization -------------------------------------
 
@@ -8518,11 +9466,19 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
     def test_cap_plan_approval_requests_evicts_oldest_terminal_keeps_pending(self):
         requests = [
             {"id": "old", "status": "approved", "createdAt": "2026-06-09T00:00:01Z"},
-            {"id": "active", "status": "pending_approval", "createdAt": "2026-06-09T00:00:02Z"},
+            {
+                "id": "active",
+                "status": "pending_approval",
+                "createdAt": "2026-06-09T00:00:02Z",
+            },
         ]
         for i in range(MAX_PLAN_APPROVAL_REQUESTS):
             requests.append(
-                {"id": f"t{i}", "status": "rejected", "createdAt": f"2026-06-09T01:00:{i:02d}Z"}
+                {
+                    "id": f"t{i}",
+                    "status": "rejected",
+                    "createdAt": f"2026-06-09T01:00:{i:02d}Z",
+                }
             )
         capped = cap_plan_approval_requests(requests)
         self.assertLessEqual(len(capped), MAX_PLAN_APPROVAL_REQUESTS)
@@ -8537,11 +9493,18 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
         state = mcp.normalize_agents_state({"version": 2, "planApprovalRequests": []})
         self.assertNotIn("planApprovalRequests", state)
         # A non-list value (hand edit) is reset (and then removed when empty).
-        state2 = mcp.normalize_agents_state({"version": 2, "planApprovalRequests": "garbage"})
+        state2 = mcp.normalize_agents_state(
+            {"version": 2, "planApprovalRequests": "garbage"}
+        )
         self.assertNotIn("planApprovalRequests", state2)
         # A populated list is preserved + capped.
         state3 = mcp.normalize_agents_state(
-            {"version": 2, "planApprovalRequests": [{"id": "p", "status": "pending_approval", "createdAt": "z"}]}
+            {
+                "version": 2,
+                "planApprovalRequests": [
+                    {"id": "p", "status": "pending_approval", "createdAt": "z"}
+                ],
+            }
         )
         self.assertEqual(len(state3["planApprovalRequests"]), 1)
 
@@ -8551,8 +9514,20 @@ class PlanApprovalAndAskUserTests(unittest.TestCase):
 def _fake_structure_graph() -> dict:
     return {
         "files": [
-            {"path": "core.rs", "lang": "rust", "definedSymbols": 2, "inDegree": 3, "outDegree": 0},
-            {"path": "a.rs", "lang": "rust", "definedSymbols": 1, "inDegree": 0, "outDegree": 1},
+            {
+                "path": "core.rs",
+                "lang": "rust",
+                "definedSymbols": 2,
+                "inDegree": 3,
+                "outDegree": 0,
+            },
+            {
+                "path": "a.rs",
+                "lang": "rust",
+                "definedSymbols": 1,
+                "inDegree": 0,
+                "outDegree": 1,
+            },
         ],
         "spine": [
             {"path": "core.rs", "inDegree": 3, "topReferencedSymbols": ["CoreThing"]},
@@ -8571,7 +9546,9 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
     The Rust bridge is STUBBED so these tests need no real binary."""
 
     def setUp(self):
-        self._old_unmanaged = os.environ.get("ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS")
+        self._old_unmanaged = os.environ.get(
+            "ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"
+        )
         os.environ["ASPIS_MCP_ALLOW_UNMANAGED_PRIVILEGED_AGENTS"] = "1"
         # A real existing, EXECUTABLE file so resolve_structure_bridge_binary() passes its
         # is_file() + os.access(X_OK) check; the bridge ITSELF is stubbed, so this file is
@@ -8640,13 +9617,24 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             root, _work_root = self._setup(tmp)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-1", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-1",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
-            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+            with patch.object(
+                mcp, "_run_structure_bridge", return_value=_fake_structure_graph()
+            ) as stub:
                 result = handle_tool_call(
                     "project_structure",
-                    {"project_id": "censor-proj", "agent_id": "coder-1", "role": "coder"},
+                    {
+                        "project_id": "censor-proj",
+                        "agent_id": "coder-1",
+                        "role": "coder",
+                    },
                     root=root,
                 )
             self.assertEqual(result["projectId"], "censor-proj")
@@ -8665,13 +9653,25 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             root, _ = self._setup(tmp)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-2", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-2",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
-            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()):
+            with patch.object(
+                mcp, "_run_structure_bridge", return_value=_fake_structure_graph()
+            ):
                 result = handle_tool_call(
                     "project_structure",
-                    {"project_id": "censor-proj", "agent_id": "coder-2", "role": "coder", "full": True},
+                    {
+                        "project_id": "censor-proj",
+                        "agent_id": "coder-2",
+                        "role": "coder",
+                        "full": True,
+                    },
                     root=root,
                 )
             self.assertIn("files", result)
@@ -8690,11 +9690,17 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root, _ = self._setup(tmp)
             # Unregistered agent → rejected before any bridge call.
-            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+            with patch.object(
+                mcp, "_run_structure_bridge", return_value=_fake_structure_graph()
+            ) as stub:
                 with self.assertRaises(McpError):
                     handle_tool_call(
                         "project_structure",
-                        {"project_id": "censor-proj", "agent_id": "ghost", "role": "coder"},
+                        {
+                            "project_id": "censor-proj",
+                            "agent_id": "ghost",
+                            "role": "coder",
+                        },
                         root=root,
                     )
                 stub.assert_not_called()
@@ -8713,14 +9719,22 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             projects = root / "projects"
             with mcp.file_lock(projects / f"{AGENTS_STATE_FILE}.lock"):
                 state = read_agents_state(projects)
-                session = next(s for s in state["sessions"] if s.get("agentId") == "mini-x")
+                session = next(
+                    s for s in state["sessions"] if s.get("agentId") == "mini-x"
+                )
                 session["currentProjectId"] = "other-project"
                 mcp.write_agents_state(projects, state)
-            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+            with patch.object(
+                mcp, "_run_structure_bridge", return_value=_fake_structure_graph()
+            ) as stub:
                 with self.assertRaises(McpError):
                     handle_tool_call(
                         "project_structure",
-                        {"project_id": "censor-proj", "agent_id": "mini-x", "role": "mini"},
+                        {
+                            "project_id": "censor-proj",
+                            "agent_id": "mini-x",
+                            "role": "mini",
+                        },
                         root=root,
                     )
                 stub.assert_not_called()
@@ -8732,28 +9746,50 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             root, _ = self._setup(tmp)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-3", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-3",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
-            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+            with patch.object(
+                mcp, "_run_structure_bridge", return_value=_fake_structure_graph()
+            ) as stub:
                 first = handle_tool_call(
                     "project_structure",
-                    {"project_id": "censor-proj", "agent_id": "coder-3", "role": "coder"},
+                    {
+                        "project_id": "censor-proj",
+                        "agent_id": "coder-3",
+                        "role": "coder",
+                    },
                     root=root,
                 )
                 # A SECOND call on the unchanged tree must hit the cache (no re-build),
                 # and a full=True call must reuse the SAME cached graph (still 1 build).
                 second = handle_tool_call(
                     "project_structure",
-                    {"project_id": "censor-proj", "agent_id": "coder-3", "role": "coder"},
+                    {
+                        "project_id": "censor-proj",
+                        "agent_id": "coder-3",
+                        "role": "coder",
+                    },
                     root=root,
                 )
                 third_full = handle_tool_call(
                     "project_structure",
-                    {"project_id": "censor-proj", "agent_id": "coder-3", "role": "coder", "full": True},
+                    {
+                        "project_id": "censor-proj",
+                        "agent_id": "coder-3",
+                        "role": "coder",
+                        "full": True,
+                    },
                     root=root,
                 )
-            self.assertEqual(stub.call_count, 1, "the bridge must run exactly once (cached)")
+            self.assertEqual(
+                stub.call_count, 1, "the bridge must run exactly once (cached)"
+            )
             self.assertEqual(first["spine"], second["spine"])
             self.assertIn("files", third_full)
 
@@ -8764,7 +9800,12 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             root, _ = self._setup(tmp)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-4", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-4",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
             # The bridge raises McpError (e.g. timeout / bad exit) — the dispatcher must
@@ -8775,7 +9816,11 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
                 with self.assertRaises(McpError) as ctx:
                     handle_tool_call(
                         "project_structure",
-                        {"project_id": "censor-proj", "agent_id": "coder-4", "role": "coder"},
+                        {
+                            "project_id": "censor-proj",
+                            "agent_id": "coder-4",
+                            "role": "coder",
+                        },
                         root=root,
                     )
             self.assertIn("bridge exploded", str(ctx.exception))
@@ -8787,16 +9832,27 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             root, _ = self._setup(tmp)
             handle_tool_call(
                 "agent_register",
-                {"agent_id": "coder-5", "role": "coder", "model": "opus", "message": "x"},
+                {
+                    "agent_id": "coder-5",
+                    "role": "coder",
+                    "model": "opus",
+                    "message": "x",
+                },
                 root=root,
             )
             os.environ.pop("ASPIS_APP_BIN", None)
             # No bridge binary configured ⇒ a clear error (NEVER a guessed path / hang).
-            with patch.object(mcp, "_run_structure_bridge", return_value=_fake_structure_graph()) as stub:
+            with patch.object(
+                mcp, "_run_structure_bridge", return_value=_fake_structure_graph()
+            ) as stub:
                 with self.assertRaises(McpError) as ctx:
                     handle_tool_call(
                         "project_structure",
-                        {"project_id": "censor-proj", "agent_id": "coder-5", "role": "coder"},
+                        {
+                            "project_id": "censor-proj",
+                            "agent_id": "coder-5",
+                            "role": "coder",
+                        },
                         root=root,
                     )
                 stub.assert_not_called()
@@ -8863,7 +9919,9 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             def worker(i):
                 try:
                     barrier.wait(timeout=5.0)
-                    results[i] = build_project_structure(work_root, False, runner=slow_runner)
+                    results[i] = build_project_structure(
+                        work_root, False, runner=slow_runner
+                    )
                 except Exception as exc:  # noqa: BLE001 - record per-thread failure
                     errors[i] = exc
 
@@ -8876,9 +9934,15 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             for t in threads:
                 t.join(timeout=5.0)
 
-            self.assertTrue(all(not t.is_alive() for t in threads), "threads must not hang")
-            self.assertTrue(all(e is None for e in errors), f"no thread may error: {errors}")
-            self.assertEqual(call_count, 1, "the bridge must build exactly once under dedup")
+            self.assertTrue(
+                all(not t.is_alive() for t in threads), "threads must not hang"
+            )
+            self.assertTrue(
+                all(e is None for e in errors), f"no thread may error: {errors}"
+            )
+            self.assertEqual(
+                call_count, 1, "the bridge must build exactly once under dedup"
+            )
             for r in results:
                 self.assertEqual(r["spine"][0]["path"], "core.rs")
             # The in-flight marker is fully cleared after the build completes.
@@ -8917,7 +9981,9 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
 
             def worker(i):
                 try:
-                    results[i] = build_project_structure(work_root, False, runner=flaky_runner)
+                    results[i] = build_project_structure(
+                        work_root, False, runner=flaky_runner
+                    )
                 except Exception as exc:  # noqa: BLE001
                     errors[i] = exc
 
@@ -8932,16 +9998,22 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             for t in threads:
                 t.join(timeout=5.0)
 
-            self.assertTrue(all(not t.is_alive() for t in threads), "no thread may hang")
+            self.assertTrue(
+                all(not t.is_alive() for t in threads), "no thread may hang"
+            )
             # Exactly one caller saw the transient error (the original builder); the rest
             # were served by the retry build.
             errored = [e for e in errors if e is not None]
-            self.assertEqual(len(errored), 1, f"only the first builder errors: {errors}")
+            self.assertEqual(
+                len(errored), 1, f"only the first builder errors: {errors}"
+            )
             self.assertIsInstance(errored[0], McpError)
             served = [r for r in results if r is not None]
             self.assertEqual(len(served), n - 1, "every other caller gets a result")
             self.assertGreaterEqual(attempts, 2, "the failed build must be retried")
-            self.assertEqual(len(mcp._STRUCTURE_INFLIGHT), 0, "in-flight marker cleared")
+            self.assertEqual(
+                len(mcp._STRUCTURE_INFLIGHT), 0, "in-flight marker cleared"
+            )
 
     def test_global_semaphore_bounds_concurrent_builds(self):
         # Distinct keys do NOT dedup, so without the semaphore N distinct projects would
@@ -8950,7 +10022,9 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
         import oracle.server.aspis_mcp as mcp
         import threading as _threading
 
-        self.assertIsInstance(mcp._STRUCTURE_BUILD_SEMAPHORE, _threading.BoundedSemaphore)
+        self.assertIsInstance(
+            mcp._STRUCTURE_BUILD_SEMAPHORE, _threading.BoundedSemaphore
+        )
         self.assertEqual(_STRUCTURE_MAX_CONCURRENT_BUILDS, 4)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -8999,8 +10073,12 @@ class AspisMcpProjectStructureTests(unittest.TestCase):
             for t in threads:
                 t.join(timeout=10.0)
 
-            self.assertTrue(all(not t.is_alive() for t in threads), "no thread may hang")
-            self.assertTrue(all(e is None for e in errors), f"no thread may error: {errors}")
+            self.assertTrue(
+                all(not t.is_alive() for t in threads), "no thread may hang"
+            )
+            self.assertTrue(
+                all(e is None for e in errors), f"no thread may error: {errors}"
+            )
             self.assertLessEqual(
                 observed_peak,
                 _STRUCTURE_MAX_CONCURRENT_BUILDS,
@@ -9045,11 +10123,19 @@ class SteerMiniCoderTests(unittest.TestCase):
         projects = prepare_management_root(root)
         handle_tool_call(
             "agent_register",
-            {"agent_id": "codex", "role": "coder", "model": "codex", "message": "coding"},
+            {
+                "agent_id": "codex",
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+            },
             root=root,
         )
         for directive in directives:
-            if not directive.get("parentDirectiveId") and "parentAgentId" not in directive:
+            if (
+                not directive.get("parentDirectiveId")
+                and "parentAgentId" not in directive
+            ):
                 directive["parentAgentId"] = "codex"
         state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
         from oracle.server.aspis_mcp import file_lock
@@ -9064,7 +10150,14 @@ class SteerMiniCoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             projects, state_lock = self._setup(
                 tmp,
-                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+                [
+                    {
+                        "id": "d1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "d1.json",
+                    }
+                ],
             )
             res = dispatch_steer_mini_coder(
                 projects,
@@ -9087,7 +10180,12 @@ class SteerMiniCoderTests(unittest.TestCase):
             res2 = dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "add a test"},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": "add a test",
+                },
             )
             self.assertEqual(res2["queued"], 2)
             state = read_agents_state(projects)
@@ -9101,7 +10199,12 @@ class SteerMiniCoderTests(unittest.TestCase):
             projects, state_lock = self._setup(
                 tmp,
                 [
-                    {"id": "root", "status": "awaiting_retry", "task": "x", "resultPath": "root.json"},
+                    {
+                        "id": "root",
+                        "status": "awaiting_retry",
+                        "task": "x",
+                        "resultPath": "root.json",
+                    },
                     {
                         "id": "root-r1",
                         "status": "running",
@@ -9115,25 +10218,46 @@ class SteerMiniCoderTests(unittest.TestCase):
             res = dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "root", "message": "fix the live retry"},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "root",
+                    "message": "fix the live retry",
+                },
             )
             self.assertEqual(res["status"], "queued")
             state = read_agents_state(projects)
             root = next(x for x in state["miniCoderDirectives"] if x["id"] == "root")
-            retry = next(x for x in state["miniCoderDirectives"] if x["id"] == "root-r1")
-            self.assertNotIn("steerQueue", root, "the parked predecessor must not be steered")
+            retry = next(
+                x for x in state["miniCoderDirectives"] if x["id"] == "root-r1"
+            )
+            self.assertNotIn(
+                "steerQueue", root, "the parked predecessor must not be steered"
+            )
             self.assertEqual(retry["steerQueue"], ["fix the live retry"])
 
     def test_stop_sentinel_sets_kill_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
             projects, state_lock = self._setup(
                 tmp,
-                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+                [
+                    {
+                        "id": "d1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "d1.json",
+                    }
+                ],
             )
             res = dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "  STOP  "},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": "  STOP  ",
+                },
             )
             self.assertEqual(res["status"], "stopped")
             state = read_agents_state(projects)
@@ -9147,7 +10271,12 @@ class SteerMiniCoderTests(unittest.TestCase):
             res = dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "nope", "message": "hi"},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "nope",
+                    "message": "hi",
+                },
             )
             self.assertEqual(res["status"], "not_found")
 
@@ -9160,7 +10289,12 @@ class SteerMiniCoderTests(unittest.TestCase):
             res = dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "too late"},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": "too late",
+                },
             )
             self.assertEqual(res["status"], "terminal")
             state = read_agents_state(projects)
@@ -9172,30 +10306,57 @@ class SteerMiniCoderTests(unittest.TestCase):
             full = [f"msg {i}" for i in range(MINI_CODER_MAX_STEER_QUEUE)]
             projects, state_lock = self._setup(
                 tmp,
-                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json", "steerQueue": list(full)}],
+                [
+                    {
+                        "id": "d1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "d1.json",
+                        "steerQueue": list(full),
+                    }
+                ],
             )
             res = dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "over the cap"},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": "over the cap",
+                },
             )
             self.assertEqual(res["status"], "queue_full")
             self.assertEqual(res["queued"], MINI_CODER_MAX_STEER_QUEUE)
             state = read_agents_state(projects)
             d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
-            self.assertEqual(d["steerQueue"], full, "a full queue must not drop an existing message")
+            self.assertEqual(
+                d["steerQueue"], full, "a full queue must not drop an existing message"
+            )
 
     def test_message_length_is_capped(self):
         with tempfile.TemporaryDirectory() as tmp:
             projects, state_lock = self._setup(
                 tmp,
-                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+                [
+                    {
+                        "id": "d1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "d1.json",
+                    }
+                ],
             )
             long = "x" * (MINI_CODER_MAX_STEER_LEN + 500)
             dispatch_steer_mini_coder(
                 projects,
                 state_lock,
-                {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": long},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "d1",
+                    "message": long,
+                },
             )
             state = read_agents_state(projects)
             d = next(x for x in state["miniCoderDirectives"] if x["id"] == "d1")
@@ -9205,13 +10366,25 @@ class SteerMiniCoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             projects, state_lock = self._setup(
                 tmp,
-                [{"id": "d1", "status": "running", "task": "x", "resultPath": "d1.json"}],
+                [
+                    {
+                        "id": "d1",
+                        "status": "running",
+                        "task": "x",
+                        "resultPath": "d1.json",
+                    }
+                ],
             )
             with self.assertRaises(McpError):
                 dispatch_steer_mini_coder(
                     projects,
                     state_lock,
-                    {"agent_id": "codex", "role": "coder", "directive_id": "d1", "message": "   "},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "directive_id": "d1",
+                        "message": "   ",
+                    },
                 )
 
     def test_steer_tool_is_registered_in_schema_and_dispatch(self):
@@ -9249,7 +10422,9 @@ class SpawnMainCoderTests(unittest.TestCase):
                             "role": role,
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                token.encode("utf-8")
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         }
                     ],
@@ -9303,7 +10478,9 @@ class SpawnMainCoderTests(unittest.TestCase):
             self.assertEqual(d["writeMode"], "agenticIterative")
             self.assertEqual(d["parentAgentId"], "orch")
 
-    def test_spawn_main_coder_does_not_require_the_callers_role_to_also_hold_spawn_mini_coder(self):
+    def test_spawn_main_coder_does_not_require_the_callers_role_to_also_hold_spawn_mini_coder(
+        self,
+    ):
         # F-F hardening (double-auth coupling): dispatch_spawn_main_coder used to
         # reuse dispatch_spawn_mini_coder's OWN internal re-authentication, which
         # ALSO required the caller's role to separately hold "spawn_mini_coder" —
@@ -9433,7 +10610,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                             "role": "coder",
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                token.encode("utf-8")
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         }
                     ],
@@ -9457,7 +10636,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
         return result["sessionToken"]
 
     def _read_state(self, root: Path) -> dict:
-        return json.loads((root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8"))
+        return json.loads(
+            (root / "projects" / ".aspis-agents.json").read_text(encoding="utf-8")
+        )
 
     def test_spawn_wait_false_returns_running_without_polling(self):
         # wait=false must return {directiveId, status:'running'} IMMEDIATELY and never
@@ -9538,7 +10719,13 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             # Single read while still pending -> running.
             out = handle_tool_call(
                 "mini_coder_result",
-                {"agent_id": "codex", "role": "coder", "directive_id": did, "wait": False, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": did,
+                    "wait": False,
+                    "session_token": token,
+                },
                 root=root,
             )
             self.assertEqual(out, {"directiveId": did, "status": "running"})
@@ -9552,7 +10739,11 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
 
             projects_dir = root / "projects"
             lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
-            done = {"status": "done", "output": "wrote the docstring", "filesTouched": ["src/a.rs"]}
+            done = {
+                "status": "done",
+                "output": "wrote the docstring",
+                "filesTouched": ["src/a.rs"],
+            }
             with file_lock(lock):
                 state = read_agents_state(projects_dir)
                 d = next(x for x in state["miniCoderDirectives"] if x["id"] == did)
@@ -9561,7 +10752,13 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                 write_agents_state(projects_dir, state)
             out2 = handle_tool_call(
                 "mini_coder_result",
-                {"agent_id": "codex", "role": "coder", "directive_id": did, "wait": False, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": did,
+                    "wait": False,
+                    "session_token": token,
+                },
                 root=root,
             )
             self.assertEqual(out2["directiveId"], did)
@@ -9607,7 +10804,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                 write_agents_state(projects_dir, state)
 
             pre = next(
-                x for x in self._read_state(root)["miniCoderDirectives"] if x["id"] == did
+                x
+                for x in self._read_state(root)["miniCoderDirectives"]
+                if x["id"] == did
             )
             self.assertNotIn("collected", pre, "not yet collected before the read")
 
@@ -9625,7 +10824,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             self.assertEqual(out["result"], done)
 
             post = next(
-                x for x in self._read_state(root)["miniCoderDirectives"] if x["id"] == did
+                x
+                for x in self._read_state(root)["miniCoderDirectives"]
+                if x["id"] == did
             )
             self.assertIs(
                 post.get("collected"),
@@ -9639,7 +10840,13 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             token = self._register_coder(root)
             out = handle_tool_call(
                 "mini_coder_result",
-                {"agent_id": "codex", "role": "coder", "directive_id": "nope", "wait": False, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "directive_id": "nope",
+                    "wait": False,
+                    "session_token": token,
+                },
                 root=root,
             )
             self.assertEqual(out, {"directiveId": "nope", "status": "not_found"})
@@ -9691,10 +10898,17 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             t = threading.Thread(target=executor)
             t.start()
             try:
-                with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02):
+                with patch(
+                    "oracle.server.aspis_mcp.MINI_CODER_POLL_INTERVAL_SECS", 0.02
+                ):
                     out = handle_tool_call(
                         "mini_coder_result",
-                        {"agent_id": "codex", "role": "coder", "directive_id": did, "session_token": token},
+                        {
+                            "agent_id": "codex",
+                            "role": "coder",
+                            "directive_id": did,
+                            "session_token": token,
+                        },
                         root=root,
                     )
             finally:
@@ -9724,7 +10938,12 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
                 out = handle_tool_call(
                     "mini_coder_result",
-                    {"agent_id": "codex", "role": "coder", "directive_id": did, "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "directive_id": did,
+                        "session_token": token,
+                    },
                     root=root,
                 )
             self.assertEqual(out["result"]["status"], "failed")
@@ -9738,14 +10957,26 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             token = self._register_coder(root)
             spawn = handle_tool_call(
                 "spawn_mini_coder",
-                {"agent_id": "codex", "role": "coder", "task": "x", "files": ["src/a.rs"], "wait": False, "session_token": token},
+                {
+                    "agent_id": "codex",
+                    "role": "coder",
+                    "task": "x",
+                    "files": ["src/a.rs"],
+                    "wait": False,
+                    "session_token": token,
+                },
                 root=root,
             )
             did = spawn["directiveId"]
             with patch("oracle.server.aspis_mcp.MINI_CODER_POLL_TIMEOUT_SECS", 0.0):
                 out = handle_tool_call(
                     "mini_coder_result",
-                    {"agent_id": "codex", "role": "coder", "directive_id": did, "session_token": token},
+                    {
+                        "agent_id": "codex",
+                        "role": "coder",
+                        "directive_id": did,
+                        "session_token": token,
+                    },
                     root=root,
                 )
             self.assertIn("result", out)
@@ -9769,7 +11000,12 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
             try:
                 handle_tool_call(
                     "agent_register",
-                    {"agent_id": "ver", "role": "verifier", "model": "opus", "message": "reviewing"},
+                    {
+                        "agent_id": "ver",
+                        "role": "verifier",
+                        "model": "opus",
+                        "message": "reviewing",
+                    },
                     root=root,
                 )
                 state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
@@ -9829,6 +11065,7 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                 read_agents_state,
                 write_agents_state,
             )
+
             projects_dir = root / "projects"
             lock = projects_dir / f"{AGENTS_STATE_FILE}.lock"
             with file_lock(lock):
@@ -9884,9 +11121,15 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                     root=root,
                 )
             elapsed = time.monotonic() - start
-            self.assertEqual(out, {"directiveId": "nonexistent-directive-id", "status": "not_found"})
-            self.assertLess(elapsed, 5.0, f"not_found must be instant, got {elapsed:.2f}s")
-            self.assertNotIn("result", out, "not_found must not synthesize a result payload")
+            self.assertEqual(
+                out, {"directiveId": "nonexistent-directive-id", "status": "not_found"}
+            )
+            self.assertLess(
+                elapsed, 5.0, f"not_found must be instant, got {elapsed:.2f}s"
+            )
+            self.assertNotIn(
+                "result", out, "not_found must not synthesize a result payload"
+            )
 
     # ---- Fix #3: ownership check ------------------------------------------------
 
@@ -9907,7 +11150,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                             "role": "coder",
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(owner_token.encode()).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                owner_token.encode()
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         },
                         {
@@ -9915,7 +11160,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
                             "role": "coder",
                             "status": "launch_pending",
                             "lastSeenAt": "2026-06-06T00:00:00+00:00",
-                            "launchTokenHash": hashlib.sha256(other_token.encode()).hexdigest(),
+                            "launchTokenHash": hashlib.sha256(
+                                other_token.encode()
+                            ).hexdigest(),
                             "launchTokenIssuedAt": "2099-01-01T00:00:00+00:00",
                         },
                     ],
@@ -9954,7 +11201,9 @@ class AsyncMiniCoderResultTests(unittest.TestCase):
         # The directive OWNER (codex) still succeeds.
         with tempfile.TemporaryDirectory() as tmp:
             root = self._project_dir(tmp)
-            owner_token, other_token = self._register_two_coders(root, "codex", "codex2")
+            owner_token, other_token = self._register_two_coders(
+                root, "codex", "codex2"
+            )
             # Owner spawns a mini non-blocking — the directive carries parentAgentId="codex".
             spawn = handle_tool_call(
                 "spawn_mini_coder",
@@ -10015,14 +11264,27 @@ class MiniDirectiveRootClimbTests(unittest.TestCase):
             with file_lock(state_lock):
                 state = read_agents_state(projects)
                 state["miniCoderDirectives"] = [
-                    {"id": "root", "status": "awaiting_retry", "parentAgentId": "codex"},
-                    {"id": "root-r1", "status": "awaiting_retry", "parentDirectiveId": "root"},
-                    {"id": "root-r2", "status": "running", "parentDirectiveId": "root-r1"},
+                    {
+                        "id": "root",
+                        "status": "awaiting_retry",
+                        "parentAgentId": "codex",
+                    },
+                    {
+                        "id": "root-r1",
+                        "status": "awaiting_retry",
+                        "parentDirectiveId": "root",
+                    },
+                    {
+                        "id": "root-r2",
+                        "status": "running",
+                        "parentDirectiveId": "root-r1",
+                    },
                 ]
                 write_agents_state(projects, state)
             # By the deepest child id — must climb two hops to the root's owner.
             self.assertEqual(
-                _mini_directive_parent_agent_id(projects, state_lock, "root-r2"), "codex"
+                _mini_directive_parent_agent_id(projects, state_lock, "root-r2"),
+                "codex",
             )
             # By the root id directly — still the root's owner.
             self.assertEqual(
@@ -10077,20 +11339,28 @@ class OwnershipSteerMiniCoderTests(unittest.TestCase):
             else:
                 os.environ[key] = old
 
-    def _setup_two_coders(
-        self, tmp: str, directives: list[dict]
-    ) -> tuple[Path, Path]:
+    def _setup_two_coders(self, tmp: str, directives: list[dict]) -> tuple[Path, Path]:
         """Register two coders (owner=codex, other=codex2) and seed directives."""
         root = Path(tmp)
         projects = prepare_management_root(root)
         handle_tool_call(
             "agent_register",
-            {"agent_id": "codex", "role": "coder", "model": "codex", "message": "coding"},
+            {
+                "agent_id": "codex",
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+            },
             root=root,
         )
         handle_tool_call(
             "agent_register",
-            {"agent_id": "codex2", "role": "coder", "model": "codex", "message": "coding"},
+            {
+                "agent_id": "codex2",
+                "role": "coder",
+                "model": "codex",
+                "message": "coding",
+            },
             root=root,
         )
         state_lock = projects / f"{AGENTS_STATE_FILE}.lock"
@@ -10319,7 +11589,9 @@ class PigeonFlagOffByteIdenticalTests(unittest.TestCase):
             os.environ.pop("PIGEON_PORT", None)
             self.assertFalse(_pigeon_enabled())
         with patch.dict(
-            os.environ, {"PIGEON_PORT": "12345", "PIGEON_AUTH_TOKEN": "tok"}, clear=False
+            os.environ,
+            {"PIGEON_PORT": "12345", "PIGEON_AUTH_TOKEN": "tok"},
+            clear=False,
         ):
             self.assertTrue(_pigeon_enabled())
 
@@ -10367,7 +11639,10 @@ class PigeonFlagOffByteIdenticalTests(unittest.TestCase):
             self.assertNotIn("pigeonTicket", d)
             # The UI delegation event is recorded (unchanged behaviour).
             self.assertTrue(
-                any(e.get("eventType") == "mini_coder_spawn" for e in state.get("events", []))
+                any(
+                    e.get("eventType") == "mini_coder_spawn"
+                    for e in state.get("events", [])
+                )
             )
 
 
