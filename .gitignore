@@ -62,4 +62,9 @@ aspis.html
 tsconfig.tsbuildinfo
 
 # Pi agent sessions
-.pi/
+# Pi agent sessions / config (ignore contents, keep project agents tracked)
+.pi/*
+# Keep project-level pi agent definitions tracked (they are repo-controlled
+# prompts). The rest of .pi/ (e.g. mcp.json, sessions) stays ignored.
+!.pi/agents/
+!.pi/agents/*.md
