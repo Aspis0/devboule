@@ -844,6 +844,42 @@ pub fn push_question(activity: &mut ConsoleActivity, q: ParsedQuestionLine, time
     activity.empty = None;
 }
 
+/// Append ONE `Banner` timeline entry. Same FIFO cap as [`push_coder_milestone`]. Does NOT
+/// touch `running` or `run_count` — a banner arrives at turn end and must not resurrect a
+/// spinner. DOES clear `empty` so the frontend does not hide the banner behind the EmptyState.
+///
+/// Use this for terminal notices that must not alter the agent's live/stopped status.
+pub fn push_banner(a: &mut ConsoleActivity, text: &str, time: &str) {
+    let entries = a.entries.get_or_insert_with(Vec::new);
+    entries.push(ConsoleEntry::Banner {
+        text: text.to_string(),
+        time: time.to_string(),
+    });
+    if entries.len() > MAX_ENTRIES_PER_AGENT {
+        let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+        entries.drain(0..overflow);
+    }
+    // Clear `empty` so the console does not render EmptyState over a real banner row.
+    a.empty = None;
+}
+
+/// Append ONE `Thinking` timeline entry. Same FIFO cap as [`push_coder_milestone`]. Does NOT
+/// touch `running` or `run_count` — thinking blocks are passive annotations. DOES clear `empty`
+/// so the frontend does not hide the thinking row behind the EmptyState.
+pub fn push_thinking(a: &mut ConsoleActivity, text: &str, time: &str) {
+    let entries = a.entries.get_or_insert_with(Vec::new);
+    entries.push(ConsoleEntry::Thinking {
+        text: text.to_string(),
+        time: time.to_string(),
+    });
+    if entries.len() > MAX_ENTRIES_PER_AGENT {
+        let overflow = entries.len() - MAX_ENTRIES_PER_AGENT;
+        entries.drain(0..overflow);
+    }
+    // Clear `empty` so the console does not render EmptyState over a real thinking row.
+    a.empty = None;
+}
+
 /// Replace the live STREAMING assistant reply tail with the cumulative reply-so-far for turn
 /// `seq` (B14b). This is a SEPARATE slot, NOT a timeline entry: it is immune to FIFO eviction,
 /// to interleaved milestone/websearch events (a cloud turn interleaves text↔tool within one
@@ -1395,6 +1431,22 @@ struct QuestionEvent {
     affects: Vec<String>,
 }
 
+/// The `banner` bridge event wire shape.
+#[derive(Deserialize)]
+struct BannerEvent {
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
+/// The `thinking` bridge event wire shape.
+#[derive(Deserialize)]
+struct ThinkingEvent {
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
 /// A `question` line parsed off the bridge, pre-`time` (the tail adds the host clock stamp).
 /// Same shape as the [`ConsoleEntry::Question`] payload minus `time`.
 pub struct ParsedQuestionLine {
@@ -1489,6 +1541,42 @@ fn parse_question_line(line: &str) -> Option<ParsedQuestionLine> {
         status,
         affects,
     })
+}
+
+/// Parse ONE file line into a banner text, or `None` to SKIP (blank, oversized,
+/// non-JSON, not `kind == "banner"`, or empty/whitespace-only text). Pure + total.
+fn parse_banner_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: BannerEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "banner" {
+        return None;
+    }
+    let text: String = event.text.chars().take(CHAT_TEXT_CAP).collect();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// Parse ONE file line into a thinking text, or `None` to SKIP (blank, oversized,
+/// non-JSON, not `kind == "thinking"`, or empty/whitespace-only text). Pure + total.
+fn parse_thinking_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let event: ThinkingEvent = serde_json::from_str(line).ok()?;
+    if event.kind != "thinking" {
+        return None;
+    }
+    let text: String = event.text.chars().take(CHAT_TEXT_CAP).collect();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
 }
 
 /// Host-side cap on a milestone label (chars). Matches the writer's cap; re-applied here
@@ -1810,6 +1898,20 @@ pub fn start_activity_tail(app: &AppHandle, agent_id: &str, file_path: PathBuf) 
                                 push_question(a, question, &time)
                             });
                         }
+                    } else if let Some(text) = parse_banner_line(&line) {
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            let time = now_clock();
+                            store.update(&app, &agent_id, |a| {
+                                push_banner(a, &text, &time)
+                            });
+                        }
+                    } else if let Some(text) = parse_thinking_line(&line) {
+                        if let Some(store) = app.try_state::<MiniActivityStore>() {
+                            let time = now_clock();
+                            store.update(&app, &agent_id, |a| {
+                                push_thinking(a, &text, &time)
+                            });
+                        }
                     }
                 }
                 // Guard `carry` from unbounded growth if the writer never emits a newline
@@ -1947,6 +2049,10 @@ fn hydrate_from_bridge_file(
             push_chat(&mut activity, &chat.role, &chat.text, "", chat.msg_id.as_deref());
         } else if let Some(question) = parse_question_line(&line) {
             push_question(&mut activity, question, "");
+        } else if let Some(text) = parse_banner_line(&line) {
+            push_banner(&mut activity, &text, "");
+        } else if let Some(text) = parse_thinking_line(&line) {
+            push_thinking(&mut activity, &text, "");
         }
         pos = line_end + 1;
         consumed = pos;
@@ -3467,5 +3573,149 @@ not json\n";
         let activity = ConsoleActivity::default();
         let json = serde_json::to_string(&activity).unwrap();
         assert!(!json.contains("taskCostEstimateUsd"));
+    }
+
+    // ── banner / thinking parsers & pushers ────────────────────────────────────────
+
+    #[test]
+    fn parse_banner_line_accepts_and_rejects() {
+        let text = parse_banner_line(
+            r#"{"kind":"banner","text":"done: 1 file · 3 rounds"}"#
+        ).expect("parses a banner line");
+        assert_eq!(text, "done: 1 file · 3 rounds");
+        // wrong kind -> None
+        assert!(parse_banner_line(r#"{"kind":"milestone","text":"x"}"#).is_none());
+        // blank text -> None
+        assert!(parse_banner_line(r#"{"kind":"banner","text":"   "}"#).is_none());
+        // non-json -> None
+        assert!(parse_banner_line("not json").is_none());
+    }
+
+    #[test]
+    fn parse_banner_line_caps_oversized_text() {
+        let big = format!(
+            r#"{{"kind":"banner","text":"{}"}}"#,
+            "x".repeat(CHAT_TEXT_CAP + 100)
+        );
+        let text = parse_banner_line(&big).expect("parses oversized line");
+        assert_eq!(text.len(), CHAT_TEXT_CAP);
+    }
+
+    #[test]
+    fn parse_thinking_line_accepts_and_rejects() {
+        let text = parse_thinking_line(
+            r#"{"kind":"thinking","text":"Let me reason through this..."}"#
+        ).expect("parses a thinking line");
+        assert_eq!(text, "Let me reason through this...");
+        // wrong kind -> None
+        assert!(parse_thinking_line(r#"{"kind":"chat","role":"assistant","text":"x"}"#).is_none());
+        // blank text -> None
+        assert!(parse_thinking_line(r#"{"kind":"thinking","text":"   "}"#).is_none());
+        // non-json -> None
+        assert!(parse_thinking_line("not json").is_none());
+    }
+
+    #[test]
+    fn parse_thinking_line_caps_oversized_text() {
+        let big = format!(
+            r#"{{"kind":"thinking","text":"{}"}}"#,
+            "x".repeat(CHAT_TEXT_CAP + 100)
+        );
+        let text = parse_thinking_line(&big).expect("parses oversized line");
+        assert_eq!(text.len(), CHAT_TEXT_CAP);
+    }
+
+    #[test]
+    fn push_banner_appends_banner_and_does_not_change_running() {
+        let mut a = ConsoleActivity::empty();
+        // empty() gives empty=Some(true); pushing a banner must clear it.
+        assert_eq!(a.empty, Some(true), "start from empty state");
+        let prior_running = a.running;
+        push_banner(&mut a, "done", "14:01:00");
+        assert_eq!(a.empty, None, "push_banner clears empty so frontend shows the row");
+        assert_eq!(a.running, prior_running, "push_banner must not alter running");
+        assert!(a.entries.as_ref().unwrap().len() == 1, "one entry appended");
+        match &a.entries.as_ref().unwrap()[0] {
+            ConsoleEntry::Banner { text, time } => {
+                assert_eq!(text, "done");
+                assert_eq!(time, "14:01:00");
+            }
+            _ => panic!("expected a Banner entry"),
+        }
+    }
+
+    #[test]
+    fn push_thinking_appends_thinking_and_does_not_change_running() {
+        let mut a = ConsoleActivity::empty();
+        assert_eq!(a.empty, Some(true), "start from empty state");
+        let prior_running = a.running;
+        push_thinking(&mut a, "reasoning...", "14:01:00");
+        assert_eq!(a.empty, None, "push_thinking clears empty so frontend shows the row");
+        assert_eq!(a.running, prior_running, "push_thinking must not alter running");
+        assert!(a.entries.as_ref().unwrap().len() == 1, "one entry appended");
+        match &a.entries.as_ref().unwrap()[0] {
+            ConsoleEntry::Thinking { text, time } => {
+                assert_eq!(text, "reasoning...");
+                assert_eq!(time, "14:01:00");
+            }
+            _ => panic!("expected a Thinking entry"),
+        }
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_replays_banner_and_thinking() {
+        let dir = TestDir::new("hydrate-banner-thinking");
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"thinking\",\"text\":\"Reasoning step 1...\"}\n",
+                "{\"kind\":\"banner\",\"text\":\"done: 1 file\"}\n",
+                "{\"kind\":\"chat\",\"role\":\"user\",\"text\":\"hi\"}\n",
+            ),
+        )
+        .unwrap();
+        let (activity, _) =
+            hydrate_from_bridge_file(&path, 64 * 1024, true).expect("file exists");
+        let entries = activity.entries.as_deref().unwrap_or(&[]);
+        assert_eq!(entries.len(), 3, "thinking + banner + chat replayed");
+        assert!(
+            matches!(&entries[0], ConsoleEntry::Thinking { text, .. } if text == "Reasoning step 1...")
+        );
+        assert!(
+            matches!(&entries[1], ConsoleEntry::Banner { text, .. } if text == "done: 1 file")
+        );
+        assert!(
+            matches!(&entries[2], ConsoleEntry::Chat { role, .. } if role == "user")
+        );
+    }
+
+    #[test]
+    fn hydrate_from_bridge_file_banner_only_clears_empty() {
+        // Regression: when the hydrate window captures ONLY banner/thinking lines
+        // (no chat), the activity must NOT keep empty=Some(true) — that would make
+        // the frontend hide real rows behind EmptyState.
+        let dir = TestDir::new("hydrate-banner-only");
+        let path = dir.path().join("a.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"thinking\",\"text\":\"Thinking in progress...\"}\n",
+                "{\"kind\":\"banner\",\"text\":\"done: 1 file\"}\n",
+            ),
+        )
+        .unwrap();
+        let (activity, _) =
+            hydrate_from_bridge_file(&path, 64 * 1024, true).expect("file exists");
+        let entries = activity.entries.as_deref().unwrap_or(&[]);
+        assert_eq!(entries.len(), 2, "thinking + banner replayed");
+        assert!(
+            matches!(&entries[0], ConsoleEntry::Thinking { text, .. } if text == "Thinking in progress...")
+        );
+        assert!(
+            matches!(&entries[1], ConsoleEntry::Banner { text, .. } if text == "done: 1 file")
+        );
+        // The critical assertion: empty must be None so the frontend does not hide these rows.
+        assert_eq!(activity.empty, None, "hydrate clears empty when entries exist");
     }
 }
