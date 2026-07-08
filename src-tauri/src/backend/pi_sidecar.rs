@@ -758,6 +758,38 @@ fn pi_session_existed(state: &PiSidecarState, session_id: &str) -> bool {
     }
 }
 
+/// Public wrapper around `pi_session_existed` for callers that hold an
+/// `AppHandle` (e.g. `orchestrator_steer`) — grabs the managed state and
+/// delegates.  Returns `false` for any unknown id, so the caller can fall
+/// through to its legacy path.
+pub(crate) fn pi_session_exists(app: &AppHandle, session_id: &str) -> bool {
+    let state = app.state::<PiSidecarState>();
+    pi_session_existed(&state, session_id)
+}
+
+/// Pure routing decision for the pi-sidecar delegation gates.
+/// Returns `Some("orchestrator")` or `Some("coder")` when the launch should
+/// be routed to a pi sidecar session, or `None` when it should proceed to the
+/// existing spawn paths (Claude/Codex/OpenAI or legacy binary).
+///
+/// The local Devboule agent is identified by `client == "orchestrator"` —
+/// Claude/Codex/OpenAI NEVER run inside pi (design doc §11 decision #10).
+pub(crate) fn pi_route_for_launch(
+    launch_terminal: bool,
+    role: &str,
+    client: &str,
+    enabled: bool,
+) -> Option<&'static str> {
+    if !launch_terminal || !enabled || client != "orchestrator" {
+        return None;
+    }
+    match role {
+        "orchestrator" => Some("orchestrator"),
+        "coder" | "mini" => Some("coder"),
+        _ => None,
+    }
+}
+
 pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String> {
     let state = app.state::<PiSidecarState>();
     let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -4067,6 +4099,79 @@ mod tests {
         let (new3, already3) = censor_dedup_in(&mut delivered, &third);
         assert_eq!(already3, 3);
         assert_eq!(new3.len(), 0, "no new findings on third pass");
+    }
+
+    // -- pi_route_for_launch: pure routing decision for the delegation gates --
+
+    #[test]
+    fn pi_route_orchestrator_with_local_client_and_enabled() {
+        assert_eq!(
+            pi_route_for_launch(true, "orchestrator", "orchestrator", true),
+            Some("orchestrator"),
+            "orchestrator + local client + enabled ⇒ pi orchestrator"
+        );
+    }
+
+    #[test]
+    fn pi_route_orchestrator_with_claudient_is_none() {
+        assert_eq!(
+            pi_route_for_launch(true, "orchestrator", "claude", true),
+            None,
+            "orchestrator + claude client ⇒ None (claude runs outside pi)"
+        );
+    }
+
+    #[test]
+    fn pi_route_coder_with_claude_is_none() {
+        assert_eq!(
+            pi_route_for_launch(true, "coder", "claude", true),
+            None,
+            "coder + claude client ⇒ None"
+        );
+    }
+
+    #[test]
+    fn pi_route_coder_with_local_client_and_enabled() {
+        assert_eq!(
+            pi_route_for_launch(true, "coder", "orchestrator", true),
+            Some("coder"),
+            "coder + local client + enabled ⇒ pi coder"
+        );
+    }
+
+    #[test]
+    fn pi_route_mini_with_local_client_and_enabled() {
+        assert_eq!(
+            pi_route_for_launch(true, "mini", "orchestrator", true),
+            Some("coder"),
+            "mini + local client + enabled ⇒ pi coder"
+        );
+    }
+
+    #[test]
+    fn pi_route_disabled_always_none() {
+        assert_eq!(pi_route_for_launch(true, "orchestrator", "orchestrator", false), None);
+        assert_eq!(pi_route_for_launch(true, "coder", "orchestrator", false), None);
+        assert_eq!(pi_route_for_launch(true, "mini", "orchestrator", false), None);
+    }
+
+    #[test]
+    fn pi_route_prepare_only_always_none() {
+        // launch_terminal=false means prepare-only path (Copy prompt) ⇒ no pi route
+        assert_eq!(pi_route_for_launch(false, "orchestrator", "orchestrator", true), None);
+        assert_eq!(pi_route_for_launch(false, "coder", "orchestrator", true), None);
+    }
+
+    #[test]
+    fn pi_route_unknown_role_is_none() {
+        assert_eq!(pi_route_for_launch(true, "verifier", "orchestrator", true), None);
+        assert_eq!(pi_route_for_launch(true, "", "orchestrator", true), None);
+    }
+
+    #[test]
+    fn pi_route_codex_and_openai_clients_are_none() {
+        assert_eq!(pi_route_for_launch(true, "orchestrator", "codex", true), None);
+        assert_eq!(pi_route_for_launch(true, "coder", "openai", true), None);
     }
 }
 

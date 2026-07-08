@@ -1771,40 +1771,36 @@ fn prepare_or_launch_project_agent(
             prompt.push_str(&block);
         }
     }
-    // PHASE 1 — pi-sidecar orchestrator delegation (CONDITIONAL, additive).
-    // When the pi sidecar is enabled AND this is a real orchestrator launch, route
-    // to the pi sidecar session instead of the local devboule-orchestrator binary.
-    // The binary path below is UNCHANGED and remains the fallback — NOT deleted
-    // (Phase 4 cleanup will remove it). `launch_terminal` gates this so the
+    // PHASE 1 — pi-sidecar orchestrator / coder / mini delegation (CONDITIONAL).
+    // When the pi sidecar is enabled AND the client is the local Devboule agent
+    // (client == "orchestrator"), route to the pi sidecar session instead of the
+    // local devboule-orchestrator binary or the external codex/claude CLI.
+    // Claude/Codex/OpenAI NEVER run inside pi — they have their own paths below
+    // (cloud duplex / PTY / external). `launch_terminal` gates this so the
     // prepare-only path (host metadata only) is never intercepted.
-    if launch_terminal && role == "orchestrator" && crate::backend::pi_sidecar::pi_sidecar_enabled()
-    {
-        return spawn_pi_orchestrator_session(
-            &app,
-            &project.metadata.id,
-            &client,
-            &root_path,
-            &prompt,
-        );
-    }
-    // PHASE 1 — pi-sidecar MAIN CODER / MINI delegation (CONDITIONAL, additive).
-    // When the pi sidecar is enabled AND this is a real coder (Main coder) or mini
-    // launch, route to the pi sidecar session instead of the external codex/claude
-    // CLI (or the mini directive executor). The existing spawn paths below stay as
-    // the fallback — NOT deleted (Phase 4 cleanup will remove them). `launch_terminal`
-    // gates this so the prepare-only path (host metadata only) is never intercepted.
-    if launch_terminal
-        && matches!(role.as_str(), "coder" | "mini")
-        && crate::backend::pi_sidecar::pi_sidecar_enabled()
-    {
-        return spawn_pi_coder_session(
-            &app,
-            &project.metadata.id,
-            &client,
-            &root_path,
-            &prompt,
-            &role,
-        );
+    if let Some(pi_role) = crate::backend::pi_sidecar::pi_route_for_launch(
+        launch_terminal,
+        &role,
+        &client,
+        crate::backend::pi_sidecar::pi_sidecar_enabled(),
+    ) {
+        return match pi_role {
+            "orchestrator" => spawn_pi_orchestrator_session(
+                &app,
+                &project.metadata.id,
+                &client,
+                &root_path,
+                &prompt,
+            ),
+            _ => spawn_pi_coder_session(
+                &app,
+                &project.metadata.id,
+                &client,
+                &root_path,
+                &prompt,
+                &role,
+            ),
+        };
     }
     let projects_path = ensure_projects_dir(&app)?;
     // D1 FENCE (called at the three spawn points below, once the launch is committed):
@@ -6006,6 +6002,7 @@ pub fn orchestrator_steer(
     agent_id: String,
     message: String,
 ) -> Result<(), String> {
+    // Newline-flatten + 2000-char cap — applied to BOTH pi and file routes.
     let msg: String = message
         .trim()
         .replace(['\n', '\r'], " ")
@@ -6015,6 +6012,13 @@ pub fn orchestrator_steer(
     if msg.is_empty() {
         return Err("steer message is empty".to_string());
     }
+    // PI ROUTE: if a live pi sidecar session exists for this agent, deliver
+    // the steer message via the sidecar's FIFO prompt queue (mid-turn steer).
+    if crate::backend::pi_sidecar::pi_session_exists(&app, &agent_id) {
+        return crate::backend::pi_sidecar::send_prompt_to_session(&app, &agent_id, &msg);
+    }
+    // LEGACY FILE ROUTE: no live pi session — append to the steer file that
+    // the archived devboule-coder binary drains between rounds.
     let dir = ensure_projects_dir(&app)?;
     let path = crate::backend::mini_activity::steer_file_path(&dir, &agent_id)
         .ok_or_else(|| "could not resolve the steer inbox path".to_string())?;
@@ -16905,5 +16909,49 @@ mod broker_gate_projects {
 
         let _ = fs::remove_dir_all(&folder_base);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // -- orchestrator_steer: message-trim for both pi and file routes ----------
+
+    /// Verify the newline-flatten + 2000-char cap that `orchestrator_steer`
+    /// applies BEFORE either the pi route or the file route.
+    #[test]
+    fn orchestrator_steer_flattens_newlines_and_caps_at_2000() {
+        // Each \r and \n is individually replaced with a space, so \r\n → two
+        // spaces — this matches the live orchestrator_steer behavior.
+        let input = "line one\nline two\r\nline three";
+        let msg: String = input
+            .trim()
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(2000)
+            .collect();
+        assert_eq!(msg, "line one line two  line three");
+        assert!(!msg.contains('\n'), "newlines must be flattened");
+        assert!(!msg.contains('\r'), "carriage returns must be flattened");
+    }
+
+    #[test]
+    fn orchestrator_steer_caps_long_message_at_2000() {
+        let input = "x".repeat(5000);
+        let msg: String = input
+            .trim()
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(2000)
+            .collect();
+        assert_eq!(msg.len(), 2000);
+        assert_eq!(msg.chars().count(), 2000);
+    }
+
+    #[test]
+    fn orchestrator_steer_rejects_empty_after_trim() {
+        let msg: String = "   \n\r  "
+            .trim()
+            .replace(['\n', '\r'], " ")
+            .chars()
+            .take(2000)
+            .collect();
+        assert!(msg.is_empty(), "whitespace-only message should be empty after trim");
     }
 }
