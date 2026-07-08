@@ -334,7 +334,7 @@ export function WorkConsole(props: WorkConsoleProps) {
 	return (
 		<div
 			style={{
-				height: 600,
+				height: "clamp(600px, calc(100vh - 210px), 1400px)",
 				border: "1px solid #E4DDD0",
 				borderRadius: 12,
 				overflow: "hidden",

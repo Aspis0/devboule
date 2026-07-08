@@ -367,7 +367,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 						border: "1px solid #ECE6DB",
 						borderRadius: 12,
 						padding: 13,
-						height: 316,
+						height: "clamp(316px, 58vh, 1100px)",
 						display: "flex",
 						flexDirection: "column",
 					}}

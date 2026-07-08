@@ -1228,7 +1228,7 @@ export function ProjectWorkspace({
               <PanelGroup
                 ref={panelGroupRef}
                 direction="horizontal"
-                className="h-[560px] overflow-hidden rounded-2xl"
+                className="h-[clamp(560px,calc(100vh-260px),1400px)] overflow-hidden rounded-2xl"
               >
                 <Panel
                   id="focus-primary"
