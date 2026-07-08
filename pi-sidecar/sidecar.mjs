@@ -144,6 +144,11 @@ function createJsonlReader(stream, onLine) {
 // Phase 2 Pigeon routing hooks
 // ---------------------------------------------------------------------------
 
+// Module-level handle for the in-flight classification promise. Declared here
+// (not inside main()) so requestClassification() can assign/clear it while the
+// stdin `classified` handler in main() reads the same binding.
+let pendingClassification = null;
+
 /**
  * Emit a `classify_prompt` request to the Rust sidecar and await its `classified`
  * response (delivered on our stdin). Resolves with { tier, provider, model, path }.
@@ -488,7 +493,6 @@ async function main() {
 
 	// ---- read JSONL commands from stdin -----------------------------------
 	let promptInFlight = false;
-	let pendingClassification = null;
 	let stdinClosed = false;
 	let stdinGraceTimer = null;
 
