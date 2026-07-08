@@ -135,7 +135,7 @@ export function MiniCoderBackendCard() {
 		(kind === "ollama" ||
 			kind === "omlx" ||
 			kind === "appleFm" ||
-			(kind === "codex" && model.length > 0)) &&
+			((kind === "codex" || kind === "openai") && model.length > 0)) &&
 		Boolean(validation.errors.model);
 	// M11: the api command is REQUIRED, so surface its error even when empty (mirroring
 	// the required ollama model above) — otherwise an empty command just greys out Save
@@ -248,6 +248,7 @@ export function MiniCoderBackendCard() {
 						className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 					>
 						<option value="codex">Codex (your subscription)</option>
+						<option value="openai">OpenAI (API)</option>
 						<option value="ollama">Ollama (local model)</option>
 						<option value="omlx">oMLX (local MLX server)</option>
 						<option value="appleFm" disabled={isAppleHostMac === false}>
@@ -259,11 +260,14 @@ export function MiniCoderBackendCard() {
 
 				{kind === "ollama" ||
 				kind === "codex" ||
+				kind === "openai" ||
 				kind === "omlx" ||
 				kind === "appleFm" ? (
 					<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
 						Model{" "}
-						{kind === "codex" || kind === "appleFm" ? "(optional)" : "tag"}
+						{kind === "codex" || kind === "openai" || kind === "appleFm"
+							? "(optional)"
+							: "tag"}
 						<input
 							value={model}
 							onChange={(event) => setModel(event.target.value)}
@@ -272,7 +276,9 @@ export function MiniCoderBackendCard() {
 									? "default"
 									: kind === "codex"
 										? "gpt-5-codex"
-										: "qwen2.5-coder"
+										: kind === "openai"
+											? "gpt-4o"
+											: "qwen2.5-coder"
 							}
 							maxLength={MINI_MODEL_MAX_LENGTH}
 							list={

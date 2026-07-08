@@ -166,7 +166,7 @@ export function DesignLlmBackendCard() {
 	const showModelError =
 		(kind === "ollama" ||
 			kind === "omlx" ||
-			(kind === "codex" && model.length > 0)) &&
+			((kind === "codex" || kind === "openai") && model.length > 0)) &&
 		Boolean(validation.errors.model);
 	// The api command is REQUIRED, so surface its error even when empty (mirroring the
 	// required ollama model) — otherwise an empty command just greys Save with no reason.
@@ -348,10 +348,14 @@ export function DesignLlmBackendCard() {
 
 				{kind === "ollama" ||
 				kind === "codex" ||
+				kind === "openai" ||
 				kind === "claude" ||
 				kind === "omlx" ? (
 					<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
-						Model {kind === "codex" || kind === "claude" ? "(optional)" : "tag"}
+						Model{" "}
+						{kind === "codex" || kind === "openai" || kind === "claude"
+							? "(optional)"
+							: "tag"}
 						{/* For ollama/omlx, when detection surfaced live model tags, offer them via a
                 datalist dropdown — but keep the input free-text so an un-listed tag (or a
                 model the user will pull later) is still allowed. */}
@@ -364,11 +368,13 @@ export function DesignLlmBackendCard() {
 									: undefined
 							}
 							placeholder={
-								kind === "codex"
-									? "gpt-5-codex"
-									: kind === "claude"
-										? "claude-sonnet-4-5"
-										: "qwen2.5-coder"
+								kind === "openai"
+									? "gpt-4o"
+									: kind === "codex"
+										? "gpt-5-codex"
+										: kind === "claude"
+											? "claude-sonnet-4-5"
+											: "qwen2.5-coder"
 							}
 							maxLength={DESIGN_MODEL_MAX_LENGTH}
 							className="mt-1 w-full rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
@@ -443,12 +449,17 @@ export function DesignLlmBackendCard() {
 					</p>
 				) : null}
 
-				{kind === "claude" || kind === "codex" ? (
+				{kind === "claude" || kind === "codex" || kind === "openai" ? (
 					<p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
-						{kind === "claude" ? "Claude" : "Codex"} rides your existing local
-						CLI login (one-shot, no API key) — Devboule launches the{" "}
-						<code className="font-mono">{kind}</code> CLI already authenticated
-						on this PC. Leave the model blank to use the CLI default.
+						{kind === "openai"
+							? "OpenAI"
+							: kind === "claude"
+								? "Claude"
+								: "Codex"}{" "}
+						rides your existing local CLI login (one-shot, no API key) —
+						Devboule launches the <code className="font-mono">{kind}</code> CLI
+						already authenticated on this PC. Leave the model blank to use the
+						CLI default.
 					</p>
 				) : null}
 

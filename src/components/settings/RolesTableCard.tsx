@@ -104,6 +104,7 @@ const KIND_LABELS: Record<MiniCoderBackendKind, string> = {
 	// Retained for backward-compat: persisted MiniCoderBackend configs may still carry
 	// the "codex" kind, but the UI no longer offers it as a backend choice.
 	codex: "Codex",
+	openai: "OpenAI (API)",
 	api: "API CLI (your command)",
 };
 
@@ -152,7 +153,7 @@ function localDraftFromBackend(
 
 // The cloud CLIs a role can hand off to. Kept in sync with mainCoderClient's union
 // + the Rust validate_client_id built-ins.
-const CLOUD_CLIENTS = ["claude"] as const;
+const CLOUD_CLIENTS = ["claude", "codex", "openai"] as const;
 
 // The local placement marker per role (what the client id becomes when a row is
 // switched to "Local"): the orchestrator runs as the Devboule binary; the Main
@@ -826,6 +827,8 @@ export function RolesTableCard() {
 							className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 						>
 							<option value="claude">Claude</option>
+							<option value="codex">Codex</option>
+							<option value="openai">OpenAI</option>
 						</select>
 					</label>
 				)}
@@ -1010,6 +1013,8 @@ export function RolesTableCard() {
 												className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 											>
 												<option value="claude">Claude</option>
+												<option value="codex">Codex</option>
+												<option value="openai">OpenAI</option>
 											</select>
 											<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
 												The verifier reviews (never writes). A local verifier
