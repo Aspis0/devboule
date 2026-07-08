@@ -63,6 +63,14 @@ vi.mock("./WebSearchCard", () => ({
   WebSearchCard: () =>
     createElement("div", { "data-testid": "web-search-card" }),
 }));
+vi.mock("./BundledExtensionsCard", () => ({
+  BundledExtensionsCard: () =>
+    createElement("div", { "data-testid": "bundled-extensions-card" }),
+}));
+vi.mock("./UserMcpServersCard", () => ({
+  UserMcpServersCard: () =>
+    createElement("div", { "data-testid": "user-mcp-servers-card" }),
+}));
 
 import { ProvidersModelsTab } from "./ProvidersModelsTab";
 

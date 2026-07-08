@@ -812,6 +812,7 @@ pub fn run() {
             backend::pi_extensions::pi_extension_install,
             backend::pi_extensions::pi_extension_remove,
             backend::pi_extensions::pi_marketplace_search,
+            backend::pi_extensions::pi_agents_list,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

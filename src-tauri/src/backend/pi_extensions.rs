@@ -888,6 +888,111 @@ pub async fn pi_marketplace_search(
 }
 
 // ---------------------------------------------------------------------------
+// pi_agents_list — read agent definitions from <agent dir>/agents/*.md
+// ---------------------------------------------------------------------------
+
+/// One agent definition extracted from a `.md` file's YAML frontmatter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefinition {
+    pub name: String,
+    pub description: String,
+    pub model: String,
+    pub file: String,
+}
+
+/// Parse YAML frontmatter from a markdown file. Returns (name, description, model)
+/// extracted from simple `key: value` lines between `---` delimiters.
+/// Missing fields default to empty string. No serde_yaml dependency.
+fn parse_frontmatter(content: &str) -> (String, String, String) {
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut model = String::new();
+
+    // Find the frontmatter block between first and second `---`.
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_frontmatter = false;
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            if in_frontmatter {
+                break; // End of frontmatter.
+            }
+            in_frontmatter = true;
+            continue;
+        }
+        if !in_frontmatter {
+            continue;
+        }
+        // Parse simple `key: value` lines.
+        if let Some(val) = trimmed.strip_prefix("name:").map(str::trim) {
+            name = unquote(val).to_string();
+        } else if let Some(val) = trimmed.strip_prefix("description:").map(str::trim) {
+            description = unquote(val).to_string();
+        } else if let Some(val) = trimmed.strip_prefix("model:").map(str::trim) {
+            model = unquote(val).to_string();
+        }
+    }
+
+    (name, description, model)
+}
+
+/// Strip surrounding quotes (single or double) from a value.
+fn unquote(s: &str) -> &str {
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Inner impl for reading agent definitions from a directory (testable without AppHandle).
+fn agents_list_inner(agents_dir: &Path) -> Result<Vec<AgentDefinition>, String> {
+    if !agents_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut agents = Vec::new();
+    let entries = std::fs::read_dir(agents_dir)
+        .map_err(|e| format!("Cannot read agents dir: {e}"))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue, // Skip unreadable files.
+        };
+        let (name, description, model) = parse_frontmatter(&content);
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        agents.push(AgentDefinition {
+            name: if name.is_empty() { file_name.clone() } else { name },
+            description,
+            model,
+            file: file_name,
+        });
+    }
+
+    // Sort by name for stable output.
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(agents)
+}
+
+/// List agent definitions from the resolved agent dir's `agents/` subdirectory.
+#[tauri::command]
+pub fn pi_agents_list(app: AppHandle) -> Result<Vec<AgentDefinition>, String> {
+    let resolved = resolve_pi_agent_dir(&app)?;
+    let agents_dir = resolved.path.join("agents");
+    agents_list_inner(&agents_dir)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1418,6 +1523,136 @@ mod tests {
         let path = dir.join("web-search.json");
         let cfg = websearch_set_config_inner(&path, "openai").unwrap();
         assert_eq!(cfg.provider, "openai");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- parse_frontmatter (line-based YAML frontmatter) ----
+
+    #[test]
+    fn parse_frontmatter_extracts_all_fields() {
+        let md = "---\nname: my-agent\ndescription: A test agent\nmodel: gpt-4\n---\nBody content here.";
+        let (name, desc, model) = parse_frontmatter(md);
+        assert_eq!(name, "my-agent");
+        assert_eq!(desc, "A test agent");
+        assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_quoted_values() {
+        let md = "---\nname: \"quoted-name\"\ndescription: 'single quoted'\nmodel: unquoted\n---";
+        let (name, desc, model) = parse_frontmatter(md);
+        assert_eq!(name, "quoted-name");
+        assert_eq!(desc, "single quoted");
+        assert_eq!(model, "unquoted");
+    }
+
+    #[test]
+    fn parse_frontmatter_missing_fields_defaults_to_empty() {
+        let md = "---\nname: only-name\n---";
+        let (name, desc, model) = parse_frontmatter(md);
+        assert_eq!(name, "only-name");
+        assert_eq!(desc, "");
+        assert_eq!(model, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_no_frontmatter_returns_empty() {
+        let md = "Just some markdown content without frontmatter.";
+        let (name, desc, model) = parse_frontmatter(md);
+        assert_eq!(name, "");
+        assert_eq!(desc, "");
+        assert_eq!(model, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_empty_content() {
+        let (name, desc, model) = parse_frontmatter("");
+        assert_eq!(name, "");
+        assert_eq!(desc, "");
+        assert_eq!(model, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_ignores_unknown_keys() {
+        let md = "---\nname: agent\ntools: [read, bash]\nthinking: high\n---";
+        let (name, desc, model) = parse_frontmatter(md);
+        assert_eq!(name, "agent");
+        assert_eq!(desc, "");
+        assert_eq!(model, "");
+    }
+
+    // ---- agents_list_inner ----
+
+    fn agents_test_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pi-agents-{suffix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn agents_list_inner_reads_agent_files() {
+        let dir = agents_test_dir("read");
+        let agents_dir = dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("alpha.md"),
+            "---\nname: alpha\ndescription: First agent\nmodel: gpt-4\n---\nBody.",
+        ).unwrap();
+        std::fs::write(
+            agents_dir.join("beta.md"),
+            "---\nname: beta\ndescription: Second agent\nmodel: claude-sonnet\n---\nBody.",
+        ).unwrap();
+        let agents = agents_list_inner(&agents_dir).unwrap();
+        assert_eq!(agents.len(), 2);
+        // Sorted by name.
+        assert_eq!(agents[0].name, "alpha");
+        assert_eq!(agents[0].model, "gpt-4");
+        assert_eq!(agents[0].file, "alpha.md");
+        assert_eq!(agents[1].name, "beta");
+        assert_eq!(agents[1].model, "claude-sonnet");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_list_inner_missing_dir_returns_empty() {
+        let dir = agents_test_dir("missing");
+        let agents = agents_list_inner(&dir).unwrap();
+        assert!(agents.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_list_inner_skips_non_md_files() {
+        let dir = agents_test_dir("skip-nonmd");
+        let agents_dir = dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("readme.txt"), "not an agent").unwrap();
+        std::fs::write(agents_dir.join("agent.json"), "{}" ).unwrap();
+        let agents = agents_list_inner(&agents_dir).unwrap();
+        assert!(agents.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_list_inner_uses_filename_when_name_missing() {
+        let dir = agents_test_dir("fallback-name");
+        let agents_dir = dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("fallback.md"),
+            "---\ndescription: No name field\n---",
+        ).unwrap();
+        let agents = agents_list_inner(&agents_dir).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "fallback.md");
+        assert_eq!(agents[0].description, "No name field");
+        assert_eq!(agents[0].file, "fallback.md");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

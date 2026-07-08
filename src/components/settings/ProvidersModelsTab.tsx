@@ -26,6 +26,7 @@ import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
 import { CensorLocalAiCard } from "../views/WorkspaceView";
 import { UserMcpServersCard } from "./UserMcpServersCard";
+import { BundledExtensionsCard } from "./BundledExtensionsCard";
 
 // Phase 5 — the "Providers & Models" tab: a single home for everything that picks
 // an AI provider/model. A top "Detected on this machine" strip (one
@@ -367,6 +368,10 @@ export function ProvidersModelsTab() {
         >
           <UserMcpServersCard />
         </RoleSection>
+      </CollapsibleGroup>
+
+      <CollapsibleGroup title="Bundled extensions" defaultOpen={false}>
+        <BundledExtensionsCard />
       </CollapsibleGroup>
     </div>
   );
