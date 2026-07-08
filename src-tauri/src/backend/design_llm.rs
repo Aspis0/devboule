@@ -38,6 +38,9 @@ pub enum DesignLlmBackendKind {
     /// The user's codex subscription via `codex exec` (one-shot, rides local auth — NOT
     /// an API key). `model` OPTIONAL.
     Codex,
+    /// OpenAI via the hosted OpenAI API (rides a local API key from env — NOT local auth).
+    /// `model` OPTIONAL.
+    Openai,
     /// The user's Claude Code subscription via `claude -p --output-format text` (one-shot,
     /// print/non-interactive mode, rides the user's local auth — NOT an API key). `model`
     /// OPTIONAL (like codex). NOTE: this kind is NOT part of the mini-coder backend set, so
@@ -144,9 +147,7 @@ fn validate_design_timeout_secs(timeout_secs: Option<u64>) -> Result<Option<u64>
 /// control/bidi/invisible chars (via the shared `is_forbidden_command_char`) since the
 /// command is embedded verbatim into a launch line. Reviewers should not re-flag the lack
 /// of metachar filtering as an injection bug — see `mini_coder::validate_mini_coder_backend`.
-pub fn validate_design_llm_backend(
-    backend: &DesignLlmBackend,
-) -> Result<DesignLlmBackend, String> {
+pub fn validate_design_llm_backend(backend: &DesignLlmBackend) -> Result<DesignLlmBackend, String> {
     let model = backend
         .model
         .as_deref()
@@ -175,9 +176,7 @@ pub fn validate_design_llm_backend(
                 ));
             }
             if !is_valid_model(&model) {
-                return Err(
-                    "Design model must be a bare tag (letters, digits, . _ : / -).".into(),
-                );
+                return Err("Design model must be a bare tag (letters, digits, . _ : / -).".into());
             }
             Ok(DesignLlmBackend {
                 kind: DesignLlmBackendKind::Ollama,
@@ -204,8 +203,7 @@ pub fn validate_design_llm_backend(
             // control/bidi/invisible blocklist as the mini-coder (shared helper).
             if command.chars().any(is_forbidden_command_char) {
                 return Err(
-                    "Design command must not contain control, bidi or invisible characters."
-                        .into(),
+                    "Design command must not contain control, bidi or invisible characters.".into(),
                 );
             }
             Ok(DesignLlmBackend {
@@ -233,6 +231,29 @@ pub fn validate_design_llm_backend(
             }
             Ok(DesignLlmBackend {
                 kind: DesignLlmBackendKind::Codex,
+                model: if model.is_empty() { None } else { Some(model) },
+                command: None,
+                base_url: None,
+                effort,
+                timeout_secs,
+            })
+        }
+        DesignLlmBackendKind::Openai => {
+            // model is OPTIONAL for openai; validate only if provided.
+            if !model.is_empty() {
+                if model.len() > MINI_MODEL_MAX_LEN {
+                    return Err(format!(
+                        "Design model must be at most {MINI_MODEL_MAX_LEN} characters."
+                    ));
+                }
+                if !is_valid_model(&model) {
+                    return Err(
+                        "Design model must be a bare tag (letters, digits, . _ : / -).".into(),
+                    );
+                }
+            }
+            Ok(DesignLlmBackend {
+                kind: DesignLlmBackendKind::Openai,
                 model: if model.is_empty() { None } else { Some(model) },
                 command: None,
                 base_url: None,
@@ -275,9 +296,7 @@ pub fn validate_design_llm_backend(
                 ));
             }
             if !is_valid_model(&model) {
-                return Err(
-                    "Design model must be a bare tag (letters, digits, . _ : / -).".into(),
-                );
+                return Err("Design model must be a bare tag (letters, digits, . _ : / -).".into());
             }
             let base_url = backend
                 .base_url
@@ -320,12 +339,12 @@ mod tests {
             (DesignLlmBackendKind::Ollama, "ollama"),
             (DesignLlmBackendKind::Api, "api"),
             (DesignLlmBackendKind::Codex, "codex"),
+            (DesignLlmBackendKind::Openai, "openai"),
             (DesignLlmBackendKind::Claude, "claude"),
             (DesignLlmBackendKind::Omlx, "omlx"),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{tok}\""));
-            let back: DesignLlmBackendKind =
-                serde_json::from_str(&format!("\"{tok}\"")).unwrap();
+            let back: DesignLlmBackendKind = serde_json::from_str(&format!("\"{tok}\"")).unwrap();
             assert_eq!(back, kind);
         }
     }
@@ -467,8 +486,8 @@ mod tests {
         assert!(validate_design_llm_backend(&no_cmd).is_err());
 
         for bad in [
-            "mycli chat\nrm -rf /", // newline
-            "mycli chat\u{7f}--x",  // DEL (0x7f)
+            "mycli chat\nrm -rf /",  // newline
+            "mycli chat\u{7f}--x",   // DEL (0x7f)
             "mycli chat\u{202e}--x", // RIGHT-TO-LEFT OVERRIDE (bidi)
         ] {
             let ctrl = DesignLlmBackend {
@@ -590,8 +609,13 @@ mod tests {
 
     #[test]
     fn validate_rejects_model_with_whitespace_or_metachars() {
-        for bad in ["has space", "with;semicolon", "pipe|here", "$(sub)", "-leadingdash"]
-        {
+        for bad in [
+            "has space",
+            "with;semicolon",
+            "pipe|here",
+            "$(sub)",
+            "-leadingdash",
+        ] {
             // -leadingdash actually starts with '-', which is NOT alnum → rejected.
             let b = DesignLlmBackend {
                 kind: DesignLlmBackendKind::Ollama,
@@ -675,12 +699,12 @@ mod tests {
     #[test]
     fn omlx_rejects_https_and_non_loopback_and_userinfo_tricks() {
         for bad in [
-            "https://localhost:8000/v1",      // https rejected
-            "http://evil.com:8000/v1",        // non-loopback host
-            "http://127.0.0.1.evil.com/v1",   // suffix trick
-            "http://127.0.0.1@evil.com/v1",   // userinfo trick
-            "http://[::1]:8000@evil.com/v1",  // ipv6 userinfo trick
-            "ftp://localhost/v1",             // wrong scheme
+            "https://localhost:8000/v1",     // https rejected
+            "http://evil.com:8000/v1",       // non-loopback host
+            "http://127.0.0.1.evil.com/v1",  // suffix trick
+            "http://127.0.0.1@evil.com/v1",  // userinfo trick
+            "http://[::1]:8000@evil.com/v1", // ipv6 userinfo trick
+            "ftp://localhost/v1",            // wrong scheme
         ] {
             let b = DesignLlmBackend {
                 kind: DesignLlmBackendKind::Omlx,
@@ -735,7 +759,10 @@ mod tests {
         };
         assert!(validate_design_llm_backend(&ctrl).is_err());
 
-        let long = format!("http://localhost:8000/{}", "a".repeat(MINI_BASE_URL_MAX_LEN));
+        let long = format!(
+            "http://localhost:8000/{}",
+            "a".repeat(MINI_BASE_URL_MAX_LEN)
+        );
         let overlong = DesignLlmBackend {
             kind: DesignLlmBackendKind::Omlx,
             model: Some("m".into()),
@@ -798,11 +825,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_in_range_timeout_and_rejects_out_of_range() {
-        for ok in [
-            DESIGN_TIMEOUT_SECS_MIN,
-            180,
-            DESIGN_TIMEOUT_SECS_MAX,
-        ] {
+        for ok in [DESIGN_TIMEOUT_SECS_MIN, 180, DESIGN_TIMEOUT_SECS_MAX] {
             let b = DesignLlmBackend {
                 kind: DesignLlmBackendKind::Ollama,
                 model: Some("m".into()),

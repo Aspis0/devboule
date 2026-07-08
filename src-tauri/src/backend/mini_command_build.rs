@@ -12,8 +12,8 @@ use portable_pty::CommandBuilder;
 
 use super::mini_coder::{MiniCoderBackend, MiniCoderBackendKind, DEFAULT_WALL_CLOCK_CAP_SECS};
 use super::mini_coder_executor::{
-    omlx_http_timeout_secs, McpRoots, FORBIDDEN_USER_MCP_ENV, MINI_SCRATCH_DIR,
-    OMLX_KEY_FILE_ENV, OMLX_TIMEOUT_ENV,
+    omlx_http_timeout_secs, McpRoots, FORBIDDEN_USER_MCP_ENV, MINI_SCRATCH_DIR, OMLX_KEY_FILE_ENV,
+    OMLX_TIMEOUT_ENV,
 };
 #[cfg(windows)]
 use super::projects::ps_single_quote;
@@ -483,7 +483,11 @@ if ($resp.choices[0].finish_reason -eq 'length') {{\n\
 ///
 /// B1: nothing sensitive is on argv; the prompt was on stdin.
 #[cfg(windows)]
-pub(crate) fn windows_stdout_to_result_wrapper(run: &str, result_path: &str, raw_path: &str) -> String {
+pub(crate) fn windows_stdout_to_result_wrapper(
+    run: &str,
+    result_path: &str,
+    raw_path: &str,
+) -> String {
     // WARNING 7: read the RAW file with a bounded byte cap so a runaway backend
     // cannot OOM us. Mirrors mini_coder::MAX_RESULT_BYTES (1 MiB).
     // NOTE: `$rawFile` is (re)declared here so the wrapper is self-contained — it is
@@ -780,7 +784,11 @@ python3 - <<'OMLXEOF'\n{py}OMLXEOF\n"
 }
 
 #[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
-pub(crate) fn build_apple_fm_run_macos(prompt_pipe: &str, fm_path: &str, model: Option<&str>) -> String {
+pub(crate) fn build_apple_fm_run_macos(
+    prompt_pipe: &str,
+    fm_path: &str,
+    model: Option<&str>,
+) -> String {
     let mut parts = vec![sh_single_quote_portable(fm_path), "respond".to_string()];
     if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         parts.push("--model".to_string());
@@ -1124,6 +1132,12 @@ pub(crate) fn build_mini_command_impl(
                 );
                 macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
             }
+            MiniCoderBackendKind::Openai => {
+                // OpenAI mini-coder backend is not wired up in this phase (the validator
+                // drops command/base_url, so there is no launch line to build yet). Fail
+                // loudly rather than emitting a wrong command.
+                return Err("OpenAI mini-coder backend is not yet supported.".to_string());
+            }
             MiniCoderBackendKind::AppleFm => {
                 let fm = crate::backend::provider_detect::resolve_program("fm")
                     .ok_or_else(|| "Apple on-device requires macOS 27+.".to_string())?;
@@ -1245,7 +1259,11 @@ with open(os.environ['MINI_RESULT'], 'w', encoding='utf-8') as f:
 "#;
 
 #[cfg(target_os = "macos")]
-pub(crate) fn macos_stdout_to_result_wrapper(run: &str, result_path: &str, raw_path: &str) -> String {
+pub(crate) fn macos_stdout_to_result_wrapper(
+    run: &str,
+    result_path: &str,
+    raw_path: &str,
+) -> String {
     let py = MACOS_RESULT_EXTRACTOR_PY.replace(
         "@MAX_BYTES@",
         &super::mini_coder::MAX_RESULT_BYTES.to_string(),
@@ -1283,4 +1301,3 @@ pub(crate) fn build_mini_command_impl(
     }
     Err("Mini-coder is supported on Windows and macOS only.".into())
 }
-

@@ -92,6 +92,7 @@ export type MiniCoderBackendKind =
 	| "ollama"
 	| "api"
 	| "codex"
+	| "openai"
 	| "omlx"
 	| "appleFm";
 
@@ -121,6 +122,7 @@ export type DesignLlmBackendKind =
 	| "ollama"
 	| "api"
 	| "codex"
+	| "openai"
 	| "claude"
 	| "omlx";
 
@@ -332,7 +334,7 @@ export interface AppConfig {
 	// Providers & Models). Optional; ABSENT means "codex" (today's hardcoded default).
 	// SUPERSEDED by rolesConfig.coderClient (below), which is the unified Roles-table source
 	// of truth; this legacy key is kept for lossless migration (resolve_roles_config reads it).
-	mainCoderClient?: "claude" | "codex";
+	mainCoderClient?: "claude" | "codex" | "openai";
 	// Role untangle (P6b) — the unified per-role CLIENT selectors, source of truth for the
 	// Roles table. camelCase mirror of the Rust RolesConfig. Each is a client id: a cloud CLI
 	// ("claude" | "codex" | a custom id), OR a LOCAL placement marker — "orchestrator" (the

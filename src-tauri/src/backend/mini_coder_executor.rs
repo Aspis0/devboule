@@ -3039,6 +3039,7 @@ fn backend_client_label(backend: &MiniCoderBackend) -> String {
         MiniCoderBackendKind::Ollama => "ollama",
         MiniCoderBackendKind::Api => "api",
         MiniCoderBackendKind::Codex => "codex",
+        MiniCoderBackendKind::Openai => "openai",
         MiniCoderBackendKind::Omlx => "omlx",
         MiniCoderBackendKind::AppleFm => "appleFm",
     }

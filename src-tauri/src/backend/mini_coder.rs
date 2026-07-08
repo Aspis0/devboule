@@ -1311,6 +1311,9 @@ pub enum MiniCoderBackendKind {
     /// The user's codex subscription via `codex exec` (one-shot, rides local
     /// auth — NOT an API key). `model` OPTIONAL; MAY get a bounded oracle grant.
     Codex,
+    /// OpenAI via the hosted OpenAI API (rides a local API key from env — NOT
+    /// local auth). `model` OPTIONAL; `command`/`base_url` are unused.
+    Openai,
     /// A local oMLX (MLX) server exposing an OpenAI-compatible HTTP API. The mini
     /// (P2) POSTs chat-completions to `<baseUrl>/chat/completions`. `model` AND
     /// `base_url` REQUIRED; `command` is unused. The base URL is constrained to a
@@ -1643,6 +1646,28 @@ pub fn validate_mini_coder_backend(backend: &MiniCoderBackend) -> Result<MiniCod
             }
             Ok(MiniCoderBackend {
                 kind: MiniCoderBackendKind::Codex,
+                model: if model.is_empty() { None } else { Some(model) },
+                command: None,
+                base_url: None,
+                max_concurrent: clamp_max_concurrent(backend.max_concurrent),
+            })
+        }
+        MiniCoderBackendKind::Openai => {
+            // model is OPTIONAL for openai; validate only if provided.
+            if !model.is_empty() {
+                if model.len() > MINI_MODEL_MAX_LEN {
+                    return Err(format!(
+                        "Mini-coder model must be at most {MINI_MODEL_MAX_LEN} characters."
+                    ));
+                }
+                if !is_valid_model(&model) {
+                    return Err(
+                        "Mini-coder model must be a bare tag (letters, digits, . _ : / -).".into(),
+                    );
+                }
+            }
+            Ok(MiniCoderBackend {
+                kind: MiniCoderBackendKind::Openai,
                 model: if model.is_empty() { None } else { Some(model) },
                 command: None,
                 base_url: None,
@@ -3274,6 +3299,7 @@ mod tests {
             (MiniCoderBackendKind::Ollama, "ollama"),
             (MiniCoderBackendKind::Api, "api"),
             (MiniCoderBackendKind::Codex, "codex"),
+            (MiniCoderBackendKind::Openai, "openai"),
             (MiniCoderBackendKind::AppleFm, "appleFm"),
         ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{tok}\""));

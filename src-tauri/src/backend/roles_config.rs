@@ -68,7 +68,10 @@ fn validate_client_id(id: &str) -> Result<String, String> {
         return Err("Client id must not be empty.".into());
     }
     // Built-in clients are allowed verbatim.
-    if matches!(trimmed.as_str(), "codex" | "claude" | "powershell" | "orchestrator") {
+    if matches!(
+        trimmed.as_str(),
+        "codex" | "claude" | "openai" | "powershell" | "orchestrator"
+    ) {
         return Ok(trimmed);
     }
     // Custom client ids: [a-z0-9-]{1,32}, lowercase (mirrors
@@ -80,13 +83,11 @@ fn validate_client_id(id: &str) -> Result<String, String> {
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
     {
-        return Err(
-            "Custom client id must be 1-32 chars of a-z, 0-9 or hyphen.".into(),
-        );
+        return Err("Custom client id must be 1-32 chars of a-z, 0-9 or hyphen.".into());
     }
     // Reserved built-in ids cannot be used as custom client ids (mirrors
     // `RESERVED_CLIENT_IDS` in `projects.rs`).
-    let reserved = ["codex", "claude", "powershell", "orchestrator"];
+    let reserved = ["codex", "claude", "openai", "powershell", "orchestrator"];
     if reserved.contains(&trimmed.as_str()) {
         return Err("Client id is reserved by a built-in CLI.".into());
     }
@@ -139,13 +140,9 @@ fn read_config_json(app: &tauri::AppHandle) -> serde_json::Value {
 /// `rolesConfig` and no other module writes to it — the lock is for
 /// cross-key serialization (e.g. `set_mini_coder_backend` + `set_custom_agent_clients`
 /// could race on different keys). Since we only write one key, no lock is needed.
-fn write_config_json(
-    app: &tauri::AppHandle,
-    value: serde_json::Value,
-) -> Result<(), String> {
-    let path = locate_config_path(app).ok_or_else(|| {
-        "config.json could not be located to save roles config.".to_string()
-    })?;
+fn write_config_json(app: &tauri::AppHandle, value: serde_json::Value) -> Result<(), String> {
+    let path = locate_config_path(app)
+        .ok_or_else(|| "config.json could not be located to save roles config.".to_string())?;
     // BUG FIX (review): write the value the CALLER mutated. The first draft
     // re-read the file into a shadowing `value` here, silently discarding the
     // caller's `rolesConfig` edit — the setter would have persisted NOTHING.
@@ -333,9 +330,8 @@ pub fn set_roles_config_cmd(
     let _config_guard = super::projects::config_write_lock()
         .lock()
         .map_err(|_| "Config write lock is poisoned.".to_string())?;
-    let path = locate_config_path(&app).ok_or_else(|| {
-        "config.json could not be located to save roles config.".to_string()
-    })?;
+    let path = locate_config_path(&app)
+        .ok_or_else(|| "config.json could not be located to save roles config.".to_string())?;
     let raw = fs::read_to_string(&path).map_err(|e| format!("Could not read config.json: {e}"))?;
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("config.json is not valid JSON: {e}"))?;
@@ -724,7 +720,8 @@ mod tests {
 
     #[test]
     fn roles_config_deserializes_camel_case() {
-        let json = r#"{"orchestratorClient":"claude","coderClient":"codex","verifierClient":"codex"}"#;
+        let json =
+            r#"{"orchestratorClient":"claude","coderClient":"codex","verifierClient":"codex"}"#;
         let config: RolesConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.orchestrator_client, Some("claude".to_string()));
         assert_eq!(config.coder_client, Some("codex".to_string()));

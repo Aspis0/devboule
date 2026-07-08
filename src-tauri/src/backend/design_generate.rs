@@ -521,6 +521,12 @@ pub async fn design_generate(
             )
             .await
         }
+        DesignLlmBackendKind::Openai => {
+            // OpenAI design backend is not wired up in this phase (the validator drops
+            // command/base_url, so there is no transport to dispatch to yet). Fail loudly
+            // rather than silently routing to the wrong transport.
+            Err("OpenAI design backend is not yet supported.".to_string())
+        }
     };
 
     // Map the internal outcome to exactly one terminal event. (Delta events were already

@@ -4041,6 +4041,7 @@ fn mini_backend_kind_label(kind: super::mini_coder::MiniCoderBackendKind) -> &'s
         K::Ollama => "a local Ollama model",
         K::Api => "a user-configured cheap-API CLI",
         K::Codex => "a Codex CLI backend",
+        K::Openai => "an OpenAI API backend",
         K::Omlx => "a local oMLX (MLX) model",
         K::AppleFm => "an Apple Foundation Models backend",
     }
