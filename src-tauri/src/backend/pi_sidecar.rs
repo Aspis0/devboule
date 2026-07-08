@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::mini_activity::{ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle, PageEntry};
+use super::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
 
 // ---- per-session state (decision #7) --------------------------------------
 
@@ -279,6 +280,45 @@ fn resolve_sidecar_script() -> Result<std::path::PathBuf, String> {
     )
 }
 
+/// Build the macOS Seatbelt sandbox policy for a pi sidecar session (decision #11).
+///
+/// Confines pi's `edit`/`write`/`bash` tools to the project directory: the project
+/// root is both readable and (recursively) writable, plus temp dirs (Node scratch)
+/// and home (for pi's own config). Network is loopback-only — the Oracle MCP
+/// server, oMLX, and Pigeon are all local. rlimits bound a runaway coding agent
+/// (CPU 300s, 8GB address space, 4 procs).
+///
+/// Security boundaries (enforced by `seatbelt::build_profile`):
+/// - `.git` writes are DENIED by a Seatbelt regex (RCE-via-planted-hooks guard)
+///   even though the project root is writable. So `.git` is intentionally NOT in
+///   `writable_paths`.
+/// - `~/.ssh`, `~/.aws`, `/etc`, and other system dirs are NOT writable (absent
+///   from `writable_paths`) — only the project root, temp, and home are.
+fn pi_sandbox_policy(project_root: &Path) -> SandboxPolicy {
+    let tmpdir = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    let mut policy = SandboxPolicy::deny(project_root.to_path_buf())
+        .writable(project_root.to_path_buf())
+        .writable(tmpdir)
+        .net(NetPolicy::Loopback)
+        .rlimits(ResourceLimits {
+            cpu_secs: 300,
+            addr_space_bytes: Some(8 * 1024 * 1024 * 1024),
+            max_procs: 4,
+        });
+
+    // Home is readable + writable so pi can read its own config (keyring caches,
+    // ~/.config). Writes remain confined to the project + tmp; sensitive dirs
+    // (~/.ssh, ~/.aws, /etc) are deliberately NOT in the allowlist.
+    if let Some(h) = home {
+        policy = policy.writable(h);
+    }
+    policy
+}
+
 /// Spawn a new pi sidecar session with the given session id. Reads the coder
 /// backend from the vault/config and passes provider+model+key as env vars.
 /// Starts a stdout JSONL reader thread that emits events on `mini-activity://<sessionId>`.
@@ -300,12 +340,42 @@ fn spawn_pi_session_inner(
 
     let env_vars = resolve_coder_env_for_sidecar(app);
 
-    let mut cmd = Command::new("node");
-    cmd.arg(&script)
+    // --- macOS Seatbelt sandbox (decision #11) -------------------------------
+    // Confine pi's edit/write/bash tools to the project directory. Default ON for
+    // safety; toggle with DEVBOULE_PI_SANDBOX=false for debugging. On non-macOS
+    // wrap/apply_rlimits are no-ops (passthrough), so we only wrap on macOS.
+    let project_root = sidecar_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| sidecar_dir.clone());
+    let sandbox_enabled = std::env::var("DEVBOULE_PI_SANDBOX")
+        .ok()
+        .map(|v| v == "true")
+        .unwrap_or(true);
+    let sandboxed = sandbox_enabled && cfg!(target_os = "macos");
+
+    let policy = pi_sandbox_policy(&project_root);
+    let script_arg = script.to_string_lossy().into_owned();
+    let (program, args): (String, Vec<String>) = if sandboxed {
+        let wrapped =
+            crate::backend::sandbox::wrap(&policy, "node", &[script_arg], &project_root);
+        eprintln!("[pi-sidecar] sandbox: enabled (macOS Seatbelt)");
+        (wrapped.program, wrapped.args)
+    } else {
+        eprintln!("[pi-sidecar] sandbox: disabled (non-macOS or env override)");
+        ("node".to_string(), vec![script_arg])
+    };
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
         .current_dir(&sidecar_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+
+    if sandboxed {
+        crate::backend::sandbox::apply_rlimits(&mut cmd, &policy.rlimits);
+    }
 
     cmd.env("DEVBOULE_PI_PROVIDER", &env_vars.provider);
     cmd.env("DEVBOULE_PI_MODEL", &env_vars.model);
@@ -1599,6 +1669,37 @@ mod tests {
         assert!(
             mapper.entries.is_empty(),
             "no entry should be emitted for a plain message"
+        );
+    }
+
+    // -- sandbox policy (decision #11) ----------------------------------------
+
+    #[test]
+    fn pi_sandbox_policy_denies_git_write() {
+        // `.git` must NOT be in the writable allowlist — writes are denied by the
+        // Seatbelt regex (RCE-via-planted-hooks guard) even though the project
+        // root is writable.
+        let root = PathBuf::from("/tmp/aspis-project-root");
+        let policy = pi_sandbox_policy(&root);
+        assert!(
+            !policy
+                .writable_paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains(".git")),
+            ".git must not be a writable path: {:?}",
+            policy.writable_paths
+        );
+    }
+
+    #[test]
+    fn pi_sandbox_policy_allows_project_write() {
+        // The project root must be writable so pi's edit/write/bash land inside it.
+        let root = PathBuf::from("/tmp/aspis-project-root");
+        let policy = pi_sandbox_policy(&root);
+        assert!(
+            policy.writable_paths.contains(&root),
+            "project root must be in writable_paths: {:?}",
+            policy.writable_paths
         );
     }
 
