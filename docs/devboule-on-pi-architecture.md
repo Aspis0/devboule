@@ -293,6 +293,17 @@ The Rust EventMapper reads `_devboule` and maps enriched events to the correct `
 6. **Phase 4 — Delete:** remove `devboule-coder/` crate and its launcher once all flows are covered. ~22K LOC gone. **IRREVERSIBLE — requires test pass before proceeding.**
 7. **Phase 5 — Polish:** session persistence, error handling, packaging of the Node runtime (`pkg --sea`), self-learning bandit for Pigeon, sandbox wrapping for main-coder sidecar.
 
+### Console Enrichment Pipeline ✅ (69843e9, a8cb886)
+
+Between Phase 3.5 and Phase 4, a complete console-to-pi event mapping pipeline was built and hostile-audited:
+
+- **Task 1** — Sidecar enrichment: `_devboule` metadata on every pi event, `devboule.websearch`/`devboule.plan` custom messages via `session.sendMessage()` (same-turn delivery).
+- **Task 2** — Rust EventMapper: parses `_devboule.agentRole`, maps `devboule.websearch`→`WebSearchEntry`, `devboule.plan`→`Chat{role:"plan"}`, `Banner` fallback for un-extractable results. Tracks agent role across session.
+- **Task 3** — Agent ID namespaces: `generate_agent_id(role, project_id)`→`orchestrator-{id}`/`main-{ms}-{counter}`/`mini-{ms}-{counter}`. Conditional orchestrator launch (`DEVBOULE_PI_ENABLED=true` spawns pi session on `mini-activity://orchestrator-{id}`).
+- **Task 4a** — Coder/mini conditional launch mapped to pi sidecar (same pattern).
+- **Hostile audit (deepseek-algo)** — 13 findings (5 CRITICAL, 4 MAJOR, 4 MINOR). All fixed in 4 coder-free tasks. Fixes verified, zero regressions, 29 tests green.
+- **Result**: all 3 Devboule consoles (PlannerPlanMode, FocusStagePane, AgentTerminalViewer) have conditional pi wiring. Default OFF (`DEVBOULE_PI_ENABLED` unset). Zero React changes. Enrichment is in the sidecar — no pi fork needed.
+
 Each phase is independently shippable and reversible until Phase 4.
 
 ---
