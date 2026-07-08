@@ -739,6 +739,19 @@ fn spawn_pi_session_inner(
 }
 
 /// Stop a specific pi sidecar session: kill the child, join reader, remove from state.
+/// Pure mirror of `stop_pi_session`'s LIVE-existence decision: `true` only when the
+/// slot for `session_id` exists AND holds a live inner session (`PiSession`).
+/// Extracted so the return contract (`Ok(false)` for any non-pi / unknown id) is
+/// unit-testable WITHOUT an AppHandle — `stop_agent_process_only`'s early-return
+/// depends on that `Ok(false)` branch (Fix 5 / audit).
+fn pi_session_existed(state: &PiSidecarState, session_id: &str) -> bool {
+    let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.get(session_id) {
+        Some(slot) => slot.inner.is_some(),
+        None => false,
+    }
+}
+
 pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String> {
     let state = app.state::<PiSidecarState>();
     let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -746,21 +759,26 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
     // Capture the reader handle so we can join AFTER releasing the state lock
     // (#1: avoids a deadlock if the reader thread needs to remove its own
     // crashed session from the map while we hold the lock).
-    let reader_handle = if let Some(mut slot) = guard.remove(session_id) {
-        if let Some(mut session) = slot.inner.take() {
-            // Bump THIS session's generation so the reader detects staleness.
-            session.generation.fetch_add(1, Ordering::SeqCst);
-            // Kill the child process (now behind a Mutex, #1).
-            if let Ok(mut c) = session.child.lock() {
-                let _ = c.kill();
-                let _ = c.wait();
+    // Track whether a LIVE session actually existed so callers can distinguish
+    // "stopped a session" from "no such session". The wiring in
+    // stop_agent_process_only relies on the Ok(false) branch to fall through to
+    // the ledger/external routes when this id is not a live pi session.
+    let (reader_handle, existed) = if let Some(mut slot) = guard.remove(session_id) {
+        match slot.inner.take() {
+            Some(mut session) => {
+                // Bump THIS session's generation so the reader detects staleness.
+                session.generation.fetch_add(1, Ordering::SeqCst);
+                // Kill the child process (now behind a Mutex, #1).
+                if let Ok(mut c) = session.child.lock() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                (session.reader_handle.take(), true)
             }
-            session.reader_handle.take()
-        } else {
-            None
+            None => (None, false),
         }
     } else {
-        None
+        (None, false)
     };
     // #1: release the state lock BEFORE joining the reader thread.
     drop(guard);
@@ -782,7 +800,11 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
     // re-created stable session id starts clean.
     censor_session_state_reset(session_id);
 
-    Ok(true)
+    // Return whether a LIVE session existed (and was killed). Callers rely on the
+    // Ok(false) branch to mean "no such pi session" (e.g. stop_agent_process_only
+    // falls through to its ledger/external routes), so this must NOT always be
+    // true.
+    Ok(existed)
 }
 
 /// Get an existing session or spawn a new one.
@@ -1146,6 +1168,30 @@ struct PiEvent {
     #[allow(dead_code)]
     #[serde(default)]
     diffs: Option<Vec<String>>,
+    /// Compaction / auto-retry / sidecar-error / queue-drop fields (Part C).
+    /// All optional + default so unrelated events deserialize untouched.
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    aborted: Option<bool>,
+    #[serde(rename = "errorMessage", default)]
+    error_message: Option<String>,
+    #[serde(default)]
+    attempt: Option<u32>,
+    #[serde(rename = "maxAttempts", default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(rename = "finalError", default)]
+    final_error: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    count: Option<u32>,
+    /// `tool_execution_update` carries `partialResult` (e.g. streaming child-agent
+    /// progress). Tool-dependent shape; extracted like `tool_execution_end`'s result.
+    #[serde(rename = "partialResult", default)]
+    partial_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1183,12 +1229,108 @@ struct EventMapper {
     running: bool,
     entries: Vec<ConsoleEntry>,
     accumulated_text: String,
+    /// Part A: accumulated thinking content (mirrors `accumulated_text`); flushed
+    /// to a `ConsoleEntry::Thinking` on `thinking_end` / turn boundaries.
+    accumulated_thinking: String,
     tool_names: HashMap<String, String>,
     turn_seq: u64,
     active_content_index: Option<u32>,
+    /// Part B: live tool-progress trackers, keyed by `tool_call_id`. A `HashMap`
+    /// (not a single slot) so PARALLEL tools don't clobber each other: each
+    /// `tool_execution_start` inserts its own id; updates/ends only touch their
+    /// own id. Value = `(entry_index, original_args_text)` for the `  args: ...`
+    /// row pushed at start. Indices are kept in sync with the front-evicting
+    /// sliding window in `push_entry`.
+    active_tool_progress: HashMap<String, (usize, String)>,
+    /// Part B/Fix2: how many entries have been front-evicted from `entries` over
+    /// this mapper's lifetime. Monotonic (never reset) — it is the stable base
+    /// offset the frontend adds to each row index so React keys survive eviction.
+    evicted_count: u64,
     /// A: the persisted `agentRole` from the event stream's `_devboule` field.
     /// Refreshed on every event; survives across events in the same session.
     current_role: Option<String>,
+}
+
+/// Cap a string at `cap` CHARS (not bytes) appending `…` when truncated. UTF-8
+/// safe: no byte-slice panic on a multi-byte char straddling the boundary (Fix 3).
+fn cap_chars(s: &str, cap: usize) -> String {
+    let capped: String = s.chars().take(cap).collect();
+    if s.chars().count() > cap {
+        format!("{capped}…")
+    } else {
+        capped
+    }
+}
+
+/// Part B: extract a single-line, capped snippet from a `tool_execution_update`
+/// `partialResult`. Uses the same `content[0].text` path as `tool_execution_end`'s
+/// result; falls back to a compact JSON string when no text is present. Newlines are
+/// replaced with `␤` and the result is capped at 200 chars (pure, testable).
+fn extract_partial_snippet(partial: &serde_json::Value) -> String {
+    let raw = partial
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| serde_json::to_string(partial).unwrap_or_default());
+    let single = raw.replace(['\n', '\r'], "␤");
+    cap_chars(&single, 200)
+}
+
+/// Part C: compute the banner text for a compaction / auto-retry / sidecar-error /
+/// queue-drop event, or `None` for events that emit no banner (e.g. a successful
+/// `auto_retry_end` — the stream simply resumes). Pure, so it is unit-testable
+/// without an AppHandle.
+fn banner_text_for_event(event: &PiEvent) -> Option<String> {
+    match event.event_type.as_str() {
+        "compaction_start" => {
+            let reason = event.reason.clone().unwrap_or_default();
+            Some(format!("Compacting context ({reason})…"))
+        }
+        "compaction_end" => {
+            if event.aborted == Some(true) {
+                Some("Compaction aborted".to_string())
+            } else if let Some(ref msg) = event.error_message {
+                Some(format!("Compaction failed: {msg}"))
+            } else {
+                Some("Context compacted".to_string())
+            }
+        }
+        "auto_retry_start" => {
+            let attempt = event.attempt.unwrap_or(0);
+            let max = event.max_attempts.unwrap_or(0);
+            let err = event.error_message.clone().unwrap_or_default();
+            let capped: String = err.chars().take(160).collect();
+            Some(format!("Provider error — retry {attempt}/{max}: {capped}"))
+        }
+        "auto_retry_end" => {
+            if event.success == Some(false) {
+                let err = event.final_error.clone().unwrap_or_default();
+                let capped: String = err.chars().take(160).collect();
+                Some(format!("Retries exhausted: {capped}"))
+            } else {
+                None
+            }
+        }
+        "error" => {
+            let context = event.context.clone().unwrap_or_default();
+            let msg = event
+                .message
+                .as_ref()
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let capped: String = msg.chars().take(200).collect();
+            Some(format!("Sidecar error [{context}]: {capped}"))
+        }
+        "queue_dropped" => {
+            let count = event.count.unwrap_or(0);
+            Some(format!("Dropped {count} queued prompt(s) on shutdown"))
+        }
+        _ => None,
+    }
 }
 
 impl EventMapper {
@@ -1198,9 +1340,12 @@ impl EventMapper {
             running: false,
             entries: Vec::new(),
             accumulated_text: String::new(),
+            accumulated_thinking: String::new(),
             tool_names: HashMap::new(),
             turn_seq: 0,
             active_content_index: None,
+            active_tool_progress: HashMap::new(),
+            evicted_count: 0,
             current_role: None,
         }
     }
@@ -1209,10 +1354,32 @@ impl EventMapper {
     /// When the window is full, the oldest entry is dropped to bound memory and
     /// serialization cost (#3). Removes only once the window is exceeded (> cap)
     /// so the window holds exactly MAX_CONSOLE_ENTRIES entries.
+    ///
+    /// Part B: the front-eviction shifts every surviving entry's index down by one,
+    /// which would corrupt `active_tool_progress`'s stored indices. Adjust ALL of
+    /// them here, at the single mutation site, so each tracker stays pointed at the
+    /// right row: when a tracked entry is itself evicted (it was at index 0
+    /// pre-shift) that tracker is removed entirely. This is the only place entries
+    /// are added/removed, so the hazard is fully contained.
     fn push_entry(&mut self, entry: ConsoleEntry) {
         self.entries.push(entry);
         if self.entries.len() > MAX_CONSOLE_ENTRIES {
             self.entries.remove(0);
+            self.evicted_count += 1;
+            // Every surviving entry's index shifted down by one. The tracked
+            // entries' indices were captured pre-removal; the one that was at 0
+            // is the one just removed, so drop its tracker — others decrement.
+            let mut evicted_ids: Vec<String> = Vec::new();
+            for (id, (idx, _)) in self.active_tool_progress.iter_mut() {
+                if *idx == 0 {
+                    evicted_ids.push(id.clone());
+                } else {
+                    *idx -= 1;
+                }
+            }
+            for id in evicted_ids {
+                self.active_tool_progress.remove(&id);
+            }
         }
     }
 
@@ -1240,6 +1407,14 @@ impl EventMapper {
                 None
             } else {
                 Some(self.entries.clone())
+            },
+            // Fix2: stable base offset for the frontend's React keys. Monotonic
+            // (never reset), so (entriesBase + i) is a stable identity across FIFO
+            // eviction. Omitted when there are no entries.
+            entries_base: if self.entries.is_empty() {
+                None
+            } else {
+                Some(self.evicted_count)
             },
             task_cost_estimate_usd: None,
             streaming_chat: if self.running && !self.accumulated_text.is_empty() {
@@ -1277,6 +1452,85 @@ impl EventMapper {
         self.active_content_index = None;
     }
 
+    fn flush_thinking_block(&mut self) {
+        if !self.accumulated_thinking.is_empty() {
+            // Take the text out FIRST so the `push_entry(&mut self)` call does
+            // not conflict with the mutable borrow of `self.accumulated_thinking`.
+            let text = std::mem::take(&mut self.accumulated_thinking);
+            self.push_entry(ConsoleEntry::Thinking {
+                text,
+                time: Self::now_str(),
+            });
+        }
+    }
+
+    /// Pure: ingest one assistant message delta (text or thinking) into the
+    /// accumulators. No AppHandle needed, so it is unit-testable directly (the
+    /// `message_update` arm just calls this then `emit_snapshot`).
+    fn apply_message_delta(&mut self, delta: &AssistantMessageEvent) {
+        match delta.delta_type.as_str() {
+            "text_start" => {
+                self.flush_text_block();
+                self.flush_thinking_block();
+                self.active_content_index = delta.content_index;
+            }
+            "text_delta" => {
+                if let Some(ref d) = delta.delta {
+                    self.accumulated_text.push_str(d);
+                }
+            }
+            "thinking_start" => {
+                // Thinking precedes text in a message; nothing to flush.
+            }
+            "thinking_delta" => {
+                if let Some(ref d) = delta.delta {
+                    self.accumulated_thinking.push_str(d);
+                }
+            }
+            "thinking_end" => {
+                self.flush_thinking_block();
+            }
+            _ => {}
+        }
+    }
+
+    /// Part B: rewrite the tracked args row in place with a live-progress snippet,
+    /// ONLY for the matching `tool_call_id`. No match (parallel / unknown tool) =>
+    /// no-op (the caller still re-emits the snapshot). Other ids are untouched.
+    fn rewrite_tool_progress(&mut self, tool_call_id: &str, partial: &serde_json::Value) {
+        let idx = match self.active_tool_progress.get(tool_call_id) {
+            Some((idx, _)) => *idx,
+            None => return,
+        };
+        if idx < self.entries.len() {
+            let snippet = extract_partial_snippet(partial);
+            self.entries[idx] = ConsoleEntry::Coder {
+                node: None,
+                text: format!("  ⋯ {snippet}"),
+                time: String::new(),
+            };
+        }
+    }
+
+    /// Part B: restore the matching `tool_call_id`'s args row to its original text,
+    /// then REMOVE only that id from the tracker (no unconditional clear — a parallel
+    /// tool's tracker must survive). The final ✅/❌ row below already summarizes the
+    /// result.
+    fn restore_tool_progress(&mut self, tool_call_id: &str) {
+        if let Some((idx, original)) = self.active_tool_progress.get(tool_call_id) {
+            let idx = *idx;
+            let original = original.clone();
+            if idx < self.entries.len() {
+                self.entries[idx] = ConsoleEntry::Coder {
+                    node: None,
+                    text: original,
+                    time: String::new(),
+                };
+            }
+        }
+        self.active_tool_progress.remove(tool_call_id);
+    }
+
     fn handle_event(&mut self, app: &AppHandle, event: &PiEvent) {
         // A: persist `agentRole` from `_devboule` on every event (it survives
         // across events in the same session).
@@ -1286,32 +1540,25 @@ impl EventMapper {
                 // #4: clear the tool_names cache so it doesn't leak entries
                 // across agent runs in the same session.
                 self.tool_names.clear();
+                // Fix 4: a tool aborted mid-flight (retry/compaction/crash) leaves a
+                // stale progress tracker; clear it so it can't leak into the new turn.
+                self.active_tool_progress.clear();
                 self.running = true;
                 self.turn_seq += 1;
                 self.accumulated_text.clear();
+                self.accumulated_thinking.clear();
                 self.active_content_index = None;
                 self.emit_snapshot(app);
             }
             "agent_end" => {
                 self.flush_text_block();
+                self.flush_thinking_block();
                 self.running = false;
                 self.emit_snapshot(app);
             }
             "message_update" => {
                 if let Some(ref delta_event) = event.assistant_message_event {
-                    match delta_event.delta_type.as_str() {
-                        "text_start" => {
-                            self.flush_text_block();
-                            self.active_content_index = delta_event.content_index;
-                        }
-                        "text_delta" => {
-                            if let Some(ref delta) = delta_event.delta {
-                                self.accumulated_text.push_str(delta);
-                            }
-                        }
-                        "text_end" => {}
-                        _ => {}
-                    }
+                    self.apply_message_delta(delta_event);
                 }
                 self.emit_snapshot(app);
             }
@@ -1324,6 +1571,7 @@ impl EventMapper {
                     self.tool_names.insert(id.clone(), tool_name.clone());
                 }
                 self.flush_text_block();
+                self.flush_thinking_block();
                 let args_str = event
                     .args
                     .as_ref()
@@ -1339,12 +1587,35 @@ impl EventMapper {
                     text: format!("  args: {args_str}"),
                     time: String::new(),
                 });
+                // Part B: remember the `  args: ...` row so live progress updates
+                // can rewrite it in place. `index` = last pushed entry. Inserted by
+                // key, so a parallel tool's tracker is preserved (no clobber).
+                if let Some(ref id) = event.tool_call_id {
+                    let args_idx = self.entries.len() - 1;
+                    self.active_tool_progress
+                        .insert(id.clone(), (args_idx, format!("  args: {args_str}")));
+                }
                 self.emit_snapshot(app);
             }
             "tool_execution_update" => {
+                // Part B: live progress. If this update matches the tracked tool and
+                // carries a partial result, rewrite the args row in place (single
+                // line, capped). Parallel/mismatched tools: leave the row alone and
+                // just re-emit the snapshot (no crash, no misattribution).
+                if let Some(ref id) = event.tool_call_id {
+                    if let Some(ref partial) = event.partial_result {
+                        self.rewrite_tool_progress(id, partial);
+                    }
+                }
                 self.emit_snapshot(app);
             }
             "tool_execution_end" => {
+                // Part B: restore the args row we may have overwritten with live
+                // progress (only for the matching tool), then REMOVE only that id
+                // from the tracker (a parallel tool's tracker survives).
+                if let Some(ref id) = event.tool_call_id {
+                    self.restore_tool_progress(id);
+                }
                 let tool_name = event
                     .tool_call_id
                     .as_ref()
@@ -1362,11 +1633,9 @@ impl EventMapper {
                             .and_then(|t| t.as_str())
                     })
                     .map(|text| {
-                        if text.len() > 200 {
-                            format!("{}…", &text[..200])
-                        } else {
-                            text.to_string()
-                        }
+                        // Fix 3: cap by CHARS, not bytes — `&text[..200]` panics on a
+                        // multi-byte char straddling byte 200. `cap_chars` is UTF-8 safe.
+                        cap_chars(text, 200)
                     })
                     .unwrap_or_else(|| "(no result)".to_string());
                 let is_error = event.is_error.unwrap_or(false);
@@ -1407,6 +1676,7 @@ impl EventMapper {
                 // thread (the reader must never block on the heavy LLM pass) and route
                 // any confirmed findings back into the session as a prompt.
                 self.flush_text_block();
+                self.flush_thinking_block();
                 let d = censor_review_dispatch(event, &self.agent_id);
                 self.push_entry(ConsoleEntry::Coder {
                     node: Some(NodeStyle::Sage),
@@ -1464,6 +1734,21 @@ impl EventMapper {
                         );
                     }
                 }
+            }
+            "compaction_start" | "compaction_end" | "auto_retry_start"
+            | "auto_retry_end" | "error" | "queue_dropped" => {
+                // Part C: banners for compaction / retry / sidecar error / queue
+                // drops. These are turn boundaries, so flush pending text + thinking
+                // first, then push the (pure-built) banner text and re-emit.
+                self.flush_text_block();
+                self.flush_thinking_block();
+                if let Some(text) = banner_text_for_event(event) {
+                    self.push_entry(ConsoleEntry::Banner {
+                        text,
+                        time: Self::now_str(),
+                    });
+                }
+                self.emit_snapshot(app);
             }
             _ => {}
         }
@@ -2900,6 +3185,412 @@ mod tests {
             other => panic!("expected Chat entry, got {other:?}"),
         }
     }
+
+    // -- Part A: thinking accumulation (console fidelity) -----------------------
+
+    #[test]
+    fn thinking_accumulates_to_entry_on_thinking_end() {
+        // thinking_start/delta/delta/end must yield exactly one Thinking entry with
+        // the concatenated content (thinking precedes text; nothing to flush first).
+        let mut mapper = EventMapper::new("pi-think");
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("hmm, ".to_string()),
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("let's go".to_string()),
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        assert_eq!(mapper.entries.len(), 1, "exactly one entry");
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Thinking { text, .. }) => {
+                assert_eq!(text, "hmm, let's go");
+            }
+            other => panic!("expected Thinking entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupted_thinking_is_flushed_on_agent_end() {
+        // An unfinished thinking block (no thinking_end) must still be flushed as a
+        // Thinking entry when agent_end fires — it must never be silently dropped.
+        // agent_end needs an AppHandle, so we exercise the exact flush line it calls.
+        let mut mapper = EventMapper::new("pi-think2");
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("partial reasoning".to_string()),
+            content_index: Some(0),
+        });
+        mapper.flush_thinking_block();
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Thinking { text, .. }) => {
+                assert_eq!(text, "partial reasoning");
+            }
+            other => panic!("expected Thinking entry, got {other:?}"),
+        }
+    }
+
+    // -- Part B: partial result snippet extraction -----------------------------
+
+    #[test]
+    fn partial_snippet_prefers_content_text() {
+        let partial = serde_json::json!({
+            "content": [{"type": "text", "text": "child agent: searching files"}]
+        });
+        assert_eq!(extract_partial_snippet(&partial), "child agent: searching files");
+    }
+
+    #[test]
+    fn partial_snippet_falls_back_to_json() {
+        let partial = serde_json::json!({ "progress": 0.5, "step": "compile" });
+        let s = extract_partial_snippet(&partial);
+        assert!(s.contains("compile"), "json fallback must surface the data: {s}");
+    }
+
+    #[test]
+    fn partial_snippet_caps_at_200_chars_and_single_lines() {
+        let long = "a".repeat(300);
+        let partial = serde_json::json!({ "content": [{ "type": "text", "text": long }] });
+        let s = extract_partial_snippet(&partial);
+        assert!(s.chars().count() <= 201, "capped at 200 + ellipsis, got {}", s.chars().count());
+        assert!(!s.contains('\n'), "must be single-line");
+    }
+
+    #[test]
+    fn partial_snippet_replaces_newlines() {
+        let partial = serde_json::json!({
+            "content": [{ "type": "text", "text": "line one\nline two\rline three" }]
+        });
+        let s = extract_partial_snippet(&partial);
+        assert!(!s.contains('\n') && !s.contains('\r'), "newlines replaced: {s}");
+        assert!(s.contains('␤'), "newline symbol present");
+    }
+
+    // -- Part B: live tool progress + eviction index tracking -------------------
+
+    #[test]
+    fn tool_progress_rewrites_args_row_in_place() {
+        let mut mapper = EventMapper::new("pi-prog");
+        mapper.active_tool_progress.insert("t1".to_string(), (0, "  args: {}".to_string()));
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: None,
+            text: "  args: {}".to_string(),
+            time: String::new(),
+        });
+        let partial = serde_json::json!({ "content": [{ "type": "text", "text": "working…" }] });
+        // A different tool must NOT rewrite the row.
+        mapper.rewrite_tool_progress("other", &partial);
+        match mapper.entries[0] {
+            ConsoleEntry::Coder { ref text, .. } => assert_eq!(text, "  args: {}"),
+            _ => panic!("entry 0 must stay a Coder row"),
+        }
+        // The matching tool rewrites it to a progress line.
+        mapper.rewrite_tool_progress("t1", &partial);
+        match mapper.entries[0] {
+            ConsoleEntry::Coder { ref text, .. } => assert_eq!(text, "  ⋯ working…"),
+            _ => panic!("entry 0 must stay a Coder row"),
+        }
+    }
+
+    #[test]
+    fn tool_progress_tracker_survives_front_eviction() {
+        // Fill to cap, set a tracker strictly inside the window, then push past the
+        // cap. Front-eviction must decrement the stored index so it keeps pointing
+        // at the SAME entry, not a stale slot.
+        let mut mapper = EventMapper::new("pi-ev1");
+        for i in 0..MAX_CONSOLE_ENTRIES {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: format!("turn-{i}"),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        // The tracked entry originally sits at index 250.
+        mapper.active_tool_progress.insert("t".to_string(), (250, "turn-250".to_string()));
+        for _ in 0..100 {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: "x".to_string(),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        // 100 front-evictions shift index 250 -> 150 (and the tracked entry with it).
+        match mapper.active_tool_progress.get("t") {
+            Some((idx, _)) => {
+                assert_eq!(*idx, 150, "tracker index must follow the eviction shift")
+            }
+            None => panic!("tracker must survive (entry not yet evicted)"),
+        }
+        match mapper.entries[150] {
+            ConsoleEntry::Chat { ref text, .. } => {
+                assert_eq!(text, "turn-250", "index must point at the original entry")
+            }
+            _ => panic!("entry at 150 must be the tracked Chat row"),
+        }
+    }
+
+    #[test]
+    fn tool_progress_tracker_dropped_when_its_entry_is_evicted() {
+        // A tracker pointing near the front, then enough pushes to evict that very
+        // entry, must be dropped (index 0 -> evicted on the next push).
+        let mut mapper = EventMapper::new("pi-ev2");
+        for i in 0..MAX_CONSOLE_ENTRIES {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: format!("turn-{i}"),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        mapper.active_tool_progress.insert("t".to_string(), (5, "turn-5".to_string()));
+        for _ in 0..6 {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: "x".to_string(),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        assert!(
+            mapper.active_tool_progress.is_empty(),
+            "tracker must drop once its entry is evicted"
+        );
+    }
+
+    #[test]
+    fn tool_progress_restored_on_end() {
+        let mut mapper = EventMapper::new("pi-restore");
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: Some(NodeStyle::Dot),
+            text: "🔧 Calling `subagent`".to_string(),
+            time: String::new(),
+        });
+        let args_text = "  args: {\"q\":\"x\"}".to_string();
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: None,
+            text: args_text.clone(),
+            time: String::new(),
+        });
+        mapper.active_tool_progress.insert("t1".to_string(), (1, args_text.clone()));
+        let partial = serde_json::json!({ "content": [{ "type": "text", "text": "halfway there" }] });
+        mapper.rewrite_tool_progress("t1", &partial);
+        match mapper.entries[1] {
+            ConsoleEntry::Coder { ref text, .. } => assert_eq!(text, "  ⋯ halfway there"),
+            _ => panic!("entry 1 must stay a Coder row"),
+        }
+        mapper.restore_tool_progress("t1");
+        match mapper.entries[1] {
+            ConsoleEntry::Coder { ref text, .. } => {
+                assert_eq!(text, &args_text, "args line restored on end")
+            }
+            _ => panic!("entry 1 must stay a Coder row"),
+        }
+    }
+
+    #[test]
+    fn parallel_tools_do_not_corrupt_each_others_rows() {
+        // Fix 1 / audit: the exact interleaving that broke the single-slot tracker.
+        // A start -> B start (clobbers single slot in the old code) -> B update ->
+        // A end (old code nuked the slot, leaving B's row corrupted) -> B update ->
+        // B end. With a per-id HashMap, B's row must be restored and the map empty.
+        let mut mapper = EventMapper::new("pi-parallel");
+        let args_a = "  args: {\"a\":1}".to_string();
+        let args_b = "  args: {\"b\":2}".to_string();
+        // A start: Calling(A) + args(A), register tracker A at the args index.
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: Some(NodeStyle::Dot),
+            text: "🔧 Calling `A`".to_string(),
+            time: String::new(),
+        });
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: None,
+            text: args_a.clone(),
+            time: String::new(),
+        });
+        mapper
+            .active_tool_progress
+            .insert("A".to_string(), (mapper.entries.len() - 1, args_a.clone()));
+        // B start: Calling(B) + args(B), register tracker B (must NOT clobber A).
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: Some(NodeStyle::Dot),
+            text: "🔧 Calling `B`".to_string(),
+            time: String::new(),
+        });
+        mapper.push_entry(ConsoleEntry::Coder {
+            node: None,
+            text: args_b.clone(),
+            time: String::new(),
+        });
+        mapper
+            .active_tool_progress
+            .insert("B".to_string(), (mapper.entries.len() - 1, args_b.clone()));
+        assert_eq!(mapper.active_tool_progress.len(), 2, "both trackers present");
+
+        let partial = serde_json::json!({ "content": [{ "type": "text", "text": "B progress" }] });
+        // B update rewrites ONLY B's row (index 3).
+        mapper.rewrite_tool_progress("B", &partial);
+        match &mapper.entries[1] {
+            ConsoleEntry::Coder { text, .. } => assert_eq!(text, &args_a, "A row untouched by B update"),
+            _ => panic!("entry 1 must be the A args row"),
+        }
+        match &mapper.entries[3] {
+            ConsoleEntry::Coder { text, .. } => assert!(text.contains("B progress"), "B row shows progress"),
+            _ => panic!("entry 3 must be the B args row"),
+        }
+        // A end: restore A's row, remove A only — B's tracker must survive.
+        mapper.restore_tool_progress("A");
+        match &mapper.entries[1] {
+            ConsoleEntry::Coder { text, .. } => assert_eq!(text, &args_a, "A row restored"),
+            _ => panic!("entry 1 must be the A args row"),
+        }
+        match &mapper.entries[3] {
+            ConsoleEntry::Coder { text, .. } => assert!(text.contains("B progress"), "B row still in progress"),
+            _ => panic!("entry 3 must be the B args row"),
+        }
+        assert_eq!(mapper.active_tool_progress.len(), 1, "A removed, B remains");
+        // B update again (still tracked), then B end -> restore B, map empty.
+        mapper.rewrite_tool_progress("B", &partial);
+        mapper.restore_tool_progress("B");
+        match &mapper.entries[3] {
+            ConsoleEntry::Coder { text, .. } => assert_eq!(text, &args_b, "B row restored to original"),
+            _ => panic!("entry 3 must be the B args row"),
+        }
+        assert!(mapper.active_tool_progress.is_empty(), "all trackers removed");
+    }
+
+    #[test]
+    fn result_summary_caps_multibyte_without_panic() {
+        // Fix 3 / audit: a >200-byte string made of multi-byte chars must cap at
+        // 200 CHARS (the old `&text[..200]` byte-slice would panic). 'α' is 2 bytes.
+        let big = "α".repeat(400); // 800 bytes, 400 chars
+        let capped = cap_chars(&big, 200);
+        assert_eq!(capped.chars().count(), 201, "200 chars + ellipsis");
+        assert!(capped.ends_with('…'), "ellipsis appended");
+        // Same path the console uses for tool result summaries.
+        let partial = serde_json::json!({ "content": [{ "type": "text", "text": big }] });
+        let s = extract_partial_snippet(&partial);
+        assert_eq!(s.chars().count(), 201, "snippet capped at 200 + ellipsis");
+    }
+
+    #[test]
+    fn stop_pi_session_unknown_id_reports_no_live_session() {
+        // Fix 5 / audit: the LIVE-existence decision must be false for any id that is
+        // not a live pi session. `stop_agent_process_only` relies on `Ok(false)` to
+        // fall through to its ledger/external routes. Exercised via the pure seam —
+        // `stop_pi_session` itself needs a real AppHandle, which the test env lacks
+        // (no tauri `test` feature), so we assert the decision it returns.
+        let state = PiSidecarState::default();
+        assert!(
+            !pi_session_existed(&state, "pi-does-not-exist"),
+            "unknown id => no live session"
+        );
+        assert!(!pi_session_existed(&state, ""), "empty id => no live session");
+        // A present slot WITHOUT a live inner session must also report false.
+        state
+            .inner
+            .lock()
+            .unwrap()
+            .insert("pi-empty".to_string(), SessionSlot { inner: None });
+        assert!(
+            !pi_session_existed(&state, "pi-empty"),
+            "slot without live session => false"
+        );
+    }
+
+    // -- Part C: banners for compaction / retry / error / queue drops ----------
+
+    fn pevent(raw: &str) -> PiEvent {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn banner_compaction_start() {
+        let e = pevent(r#"{"type":"compaction_start","reason":"threshold"}"#);
+        assert_eq!(
+            banner_text_for_event(&e),
+            Some("Compacting context (threshold)…".to_string())
+        );
+    }
+
+    #[test]
+    fn banner_compaction_end_variants() {
+        let aborted = pevent(r#"{"type":"compaction_end","aborted":true}"#);
+        assert_eq!(
+            banner_text_for_event(&aborted),
+            Some("Compaction aborted".to_string())
+        );
+        let failed = pevent(r#"{"type":"compaction_end","errorMessage":"oom"}"#);
+        assert_eq!(
+            banner_text_for_event(&failed),
+            Some("Compaction failed: oom".to_string())
+        );
+        let ok = pevent(r#"{"type":"compaction_end"}"#);
+        assert_eq!(
+            banner_text_for_event(&ok),
+            Some("Context compacted".to_string())
+        );
+    }
+
+    #[test]
+    fn banner_auto_retry_start() {
+        let e = pevent(
+            r#"{"type":"auto_retry_start","attempt":2,"maxAttempts":5,"errorMessage":"rate limited"}"#,
+        );
+        assert_eq!(
+            banner_text_for_event(&e),
+            Some("Provider error — retry 2/5: rate limited".to_string())
+        );
+    }
+
+    #[test]
+    fn banner_auto_retry_end_only_on_failure() {
+        let ok = pevent(r#"{"type":"auto_retry_end","success":true}"#);
+        assert_eq!(banner_text_for_event(&ok), None, "success is silent");
+        let fail = pevent(r#"{"type":"auto_retry_end","success":false,"finalError":"exhausted"}"#);
+        assert_eq!(
+            banner_text_for_event(&fail),
+            Some("Retries exhausted: exhausted".to_string())
+        );
+    }
+
+    #[test]
+    fn banner_sidecar_error() {
+        let e = pevent(r#"{"type":"error","context":"spawn","message":"boom"}"#);
+        assert_eq!(
+            banner_text_for_event(&e),
+            Some("Sidecar error [spawn]: boom".to_string())
+        );
+    }
+
+    #[test]
+    fn banner_queue_dropped() {
+        let e = pevent(r#"{"type":"queue_dropped","count":3}"#);
+        assert_eq!(
+            banner_text_for_event(&e),
+            Some("Dropped 3 queued prompt(s) on shutdown".to_string())
+        );
+    }
+
+    #[test]
+    fn banner_unknown_event_is_none() {
+        let e = pevent(r#"{"type":"something_else"}"#);
+        assert_eq!(banner_text_for_event(&e), None);
+    }
+
     // -- session persistence (save / restore / cleanup) ----------------------
 
     #[test]

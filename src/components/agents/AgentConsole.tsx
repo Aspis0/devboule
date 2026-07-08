@@ -36,6 +36,7 @@ import {
 	type DiffLine,
 	type MiniRun,
 	type QuestionEntry,
+	type ThinkingEntry,
 	type Round,
 	type Verdict,
 	actionHasDetail,
@@ -499,8 +500,6 @@ function MiniCard({ mini }: { mini: MiniRun }) {
 	);
 }
 
-// ---- timeline row -----------------------------------------------------------
-
 function nodeRingClass(
 	node: "" | "dot" | "sage" | "terra" | undefined,
 ): string {
@@ -516,6 +515,69 @@ function nodeRingClass(
 	}
 }
 
+/** Part A: a model `thinking` block, rendered COLLAPSED (one muted preview row).
+ *  Per-row `useState` toggle expands to the full thinking text in a pre-wrapped,
+ *  muted block. The gutter node uses the default hollow style; time sits on the right. */
+function ThinkingRow({
+	entry,
+	first,
+	last,
+}: {
+	entry: ThinkingEntry;
+	first: boolean;
+	last: boolean;
+}) {
+	const [open, setOpen] = useState(false);
+	const preview = entry.text.split("\n")[0] ?? "";
+	return (
+		<div className="relative flex gap-2.5 py-[5px]">
+			{/* gutter line + node (default hollow style) */}
+			<div className="relative flex w-[18px] shrink-0 justify-center">
+				{!last ? (
+					<span
+						className={`absolute bottom-[-10px] w-[1.5px] bg-cream-200 ${
+							first ? "top-[11px]" : "top-0"
+						}`}
+						aria-hidden
+					/>
+				) : null}
+				<span
+					className={`relative z-[1] mt-1 h-[9px] w-[9px] rounded-full border-2 ${nodeRingClass(
+						undefined,
+					)}`}
+					aria-hidden
+				/>
+			</div>
+
+			{/* content */}
+			<div className="min-w-0 flex-1 pt-px">
+				<div className="flex flex-wrap items-center gap-2">
+					<button
+						type="button"
+						onClick={() => setOpen((v) => !v)}
+						className="inline-flex h-[19px] items-center gap-1.5 rounded-full border border-cream-300 bg-cream-100 px-2.5 text-[10.5px] font-normal italic text-cream-400"
+						title={open ? "Collapse thinking" : "Expand thinking"}
+					>
+						<span className="h-[5px] w-[5px] rounded-full bg-current" />
+						Thinking
+					</button>
+					<span className="min-w-0 truncate text-[12px] italic text-cream-400">
+						{preview}
+					</span>
+					<span className="ml-auto whitespace-nowrap font-mono text-[10.5px] text-cream-400">
+						{entry.time}
+					</span>
+				</div>
+				{open ? (
+					<pre className="mt-1 whitespace-pre-wrap break-words text-[12px] italic text-cream-500">
+						{entry.text}
+					</pre>
+				) : null}
+			</div>
+		</div>
+	);
+}
+
 function TimelineRow({
 	entry,
 	first,
@@ -527,6 +589,10 @@ function TimelineRow({
 	first: boolean;
 	last: boolean;
 }) {
+	// Part A: a `thinking` entry renders as its own (per-row, expandable) row.
+	if (entry.type === "thinking") {
+		return <ThinkingRow entry={entry} first={first} last={last} />;
+	}
 	return (
 		<div className="relative flex gap-2.5 py-[5px]">
 			{/* gutter line + node */}
@@ -648,7 +714,11 @@ export function AgentConsole({ activity }: AgentConsoleProps) {
 		>
 			{entries.map((entry, i) => (
 				<TimelineRow
-					key={i}
+					// Fix2: stable key across FIFO eviction. `entries` is front-evicted
+					// at MAX_CONSOLE_ENTRIES, so a bare 0-based `i` shifts and bleeds
+					// per-row state (e.g. an expanded ThinkingRow). `entriesBase` is the
+					// live mapper's monotonic eviction count; base + i is a stable id.
+					key={(activity.entriesBase ?? 0) + i}
 					entry={entry}
 					first={i === 0}
 					last={i === entries.length - 1}

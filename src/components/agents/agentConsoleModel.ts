@@ -172,6 +172,14 @@ export interface BannerEntry {
 	time: string;
 }
 
+/** A model thinking block (pi sessions). Rendered collapsed; expands on click.
+ *  Mirrors the backend `ConsoleEntry::Thinking`: `text` is the full thinking content. */
+export interface ThinkingEntry {
+	type: "thinking";
+	text: string;
+	time: string;
+}
+
 /** A conversational chat turn surfaced into the planner chat: the orchestrator's own
  *  words (`assistant`) or a steer echoed back (`user`). Mirrors the backend `Chat` entry. */
 export interface ChatEntry {
@@ -243,6 +251,7 @@ export type ConsoleEntry =
 	| WebSearchEntry
 	| ChatEntry
 	| BannerEntry
+	| ThinkingEntry
 	| QuestionEntry;
 
 /** B14b: the live, in-progress assistant reply tail — a SEPARATE slot from `entries` (so it
@@ -271,6 +280,12 @@ export interface ConsoleActivity {
 	empty?: boolean;
 	/** The timeline, oldest-first (the view marks the first/last for the gutter). */
 	entries?: ConsoleEntry[];
+	/** Fix2: stable base offset = how many timeline entries were front-evicted from
+	 *  the live mapper's history. The view computes a STABLE React key =
+	 *  `entriesBase + i` so a row keeps its identity across FIFO eviction (a plain
+	 *  0-based `i` would shift after eviction and bleed per-row state, e.g. an
+	 *  expanded ThinkingRow adopting a different block). Absent/0 means no eviction. */
+	entriesBase?: number;
 	/** Estimated USD cost for the current task (P2). Null/absent when model is unpriced. */
 	taskCostEstimateUsd?: number | null;
 	/** B14b: the live in-progress assistant reply (token streaming). Absent when no reply is

@@ -4,6 +4,8 @@ import { describe, it, expect } from "vitest";
 import {
   type Action,
   type ConsoleActivity,
+  type ConsoleEntry,
+  type ThinkingEntry,
   actionHasDetail,
   actionStatus,
   consoleRunCount,
@@ -119,5 +121,29 @@ describe("actionStatus", () => {
       kind: "ok",
       label: "ok",
     });
+  });
+});
+
+describe("ThinkingEntry (console fidelity)", () => {
+  it("is part of the ConsoleEntry union and serializes to type 'thinking'", () => {
+    const entry: ThinkingEntry = {
+      type: "thinking",
+      text: "let me reason about this step\nsecond line",
+      time: "10:01:02",
+    };
+    // Narrowing check: a ThinkingEntry must be assignable to the ConsoleEntry union.
+    const asUnion: ConsoleEntry = entry;
+    expect(asUnion.type).toBe("thinking");
+    expect(asUnion).toEqual(entry);
+  });
+
+  it("is preserved when passed through an entries list (not filtered out)", () => {
+    const entries: ConsoleEntry[] = [
+      { type: "coder", text: "claimed", time: "10:00:00" },
+      { type: "thinking", text: "hmm", time: "10:00:01" },
+    ];
+    // The console filters `question` entries out; `thinking` must survive that filter.
+    const kept = entries.filter((e) => e.type !== "question");
+    expect(kept.map((e) => e.type)).toEqual(["coder", "thinking"]);
   });
 });

@@ -269,6 +269,12 @@ pub enum ConsoleEntry {
         text: String,
         time: String,
     },
+    /// A model thinking block (pi sessions). Rendered COLLAPSED (one muted row);
+    /// the UI expands it on click. `text` is the full thinking content.
+    Thinking {
+        text: String,
+        time: String,
+    },
     /// A conversational chat turn (the planner chat): `role` is "assistant" (the
     /// orchestrator talking) or "user" (a steer echoed back) + the message text.
     Chat {
@@ -351,6 +357,13 @@ pub struct ConsoleActivity {
     /// The timeline, oldest-first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<ConsoleEntry>>,
+    /// Fix2: stable base offset = how many timeline entries have been front-evicted
+    /// from the live mapper's history. The frontend computes a STABLE React key =
+    /// `entriesBase + i` so a row keeps its identity across FIFO eviction (a plain
+    /// 0-based `i` would shift after eviction and bleed per-row state, e.g. an
+    /// expanded ThinkingRow adopting a different block). Omitted when 0/absent.
+    #[serde(rename = "entriesBase", default, skip_serializing_if = "Option::is_none")]
+    pub entries_base: Option<u64>,
     /// Estimated USD cost for the current task (P2 cost tracking).
     /// `None` when the model is unpriced/free or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -887,6 +900,7 @@ pub fn build_initial(model: &str, label: &str, scope: &[String], round_n: u32) -
         }]),
         task_cost_estimate_usd: None,
         streaming_chat: None,
+        entries_base: None,
     }
 }
 
@@ -3131,6 +3145,7 @@ not json\n";
                 ConsoleEntry::Chat { text, .. } => text.as_str(),
                 ConsoleEntry::Question { text, .. } => text.as_str(),
                 ConsoleEntry::Banner { text, .. } => text.as_str(),
+                ConsoleEntry::Thinking { text, .. } => text.as_str(),
             })
             .collect();
         assert_eq!(
