@@ -1874,7 +1874,20 @@ fn prepare_or_launch_project_agent(
     // was a conceptual error (the two could never have separate models). A `None`
     // local-coder backend yields empty oMLX env (the binary then runs its safe Mock) —
     // it deliberately does NOT fall back to the mini's value.
-    let orchestrator = if client == "orchestrator" {
+    // GATE: with the pi sidecar ENABLED a real orchestrator launch already returned
+    // early via `spawn_pi_orchestrator_session` (above, gated on `launch_terminal`), so
+    // reaching here with `client == "orchestrator"` means either (a) the prepare-only
+    // path (`launch_terminal == false`, behind the SpawnPanel "Copy prompt" button), or
+    // (b) the legacy fallback when the sidecar is disabled via `DEVBOULE_PI_ENABLED`. The
+    // legacy `devboule-coder` binary was ARCHIVED (moved to `archived/`) and its resolver
+    // always fails now, so resolving it here on the prepare-only path would break
+    // Copy-prompt with a spurious "binary not found" error. The legacy env/binary config
+    // assembled below is only consumed by the legacy launch path, so for (a) `None` is
+    // correct and Copy-prompt returns the built prompt successfully. (b) keeps failing
+    // closed as before.
+    let orchestrator = if client == "orchestrator"
+        && !crate::backend::pi_sidecar::pi_sidecar_enabled()
+    {
         let binary = resolve_orchestrator_binary()?;
         // The orchestrator's OWN dedicated backend (NOT the mini's). For the two LOCAL kinds
         // (ollama/omlx) this resolves to a loopback oMLX endpoint (DEVBOULE_OMLX_*); for the
