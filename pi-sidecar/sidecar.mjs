@@ -21,6 +21,19 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 // ---------------------------------------------------------------------------
+// Devboule enrichment metadata (Task 1: enrichment layer)
+// ---------------------------------------------------------------------------
+
+// Module-level context attached to every forwarded event via the `_devboule`
+// field. Enables PlannerPlanMode (orchestrator) and FocusStagePane (coder/mini)
+// to render pi agent output without React changes. Set from env at startup.
+const devbouleContext = {
+	agentRole: process.env.DEVBOULE_AGENT_ROLE || "main-coder",
+	projectId: process.env.DEVBOULE_PROJECT_ID || null,
+	sessionId: process.env.DEVBOULE_SESSION_ID || null,
+};
+
+// ---------------------------------------------------------------------------
 // JSONL helpers
 // ---------------------------------------------------------------------------
 
@@ -268,8 +281,67 @@ async function main() {
 	let isReviewTurn = false;
 
 	// ---- subscribe to all events and forward as JSONL ---------------------
-	session.subscribe((event) => {
-		emit(event);
+	session.subscribe(async (event) => {
+		const enriched = {
+			...event,
+			_devboule: {
+				agentRole: devbouleContext.agentRole,
+				projectId: devbouleContext.projectId,
+				sessionId: devbouleContext.sessionId || session?.id,
+			},
+		};
+		// Devboule custom messages: web_search + plan tool results are echoed
+		// back as user-role messages so the Rust EventMapper can inject them
+		// into ConsoleActivity for PlannerPlanMode.
+		//
+		// IMPORTANT: queue these BEFORE forwarding the event to Rust (emit
+		// below). sendMessage must precede emit so the custom message is queued
+		// into the SAME turn's event stream, not delayed to the next turn.
+		if (
+			event.type === "tool_execution_end" &&
+			event.toolName === "web_search"
+		) {
+			try {
+				await session.sendMessage({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify({
+								type: "devboule.websearch",
+								query: event.args?.query || "",
+								results: event.result?.details || {},
+								timestamp: Date.now(),
+							}),
+						},
+					],
+				});
+			} catch {
+				/* best-effort, don't break the stream */
+			}
+		}
+
+		if (event.type === "tool_execution_end" && event.toolName === "plan") {
+			try {
+				await session.sendMessage({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify({
+								type: "devboule.plan",
+								plan: event.result?.details || {},
+								timestamp: Date.now(),
+							}),
+						},
+					],
+				});
+			} catch {
+				/* best-effort */
+			}
+		}
+
+		emit(enriched);
 
 		// Censor hook: capture file path from tool_execution_start args
 		// (tool_execution_end does NOT carry args, only result)
@@ -392,6 +464,10 @@ async function main() {
 	});
 
 	emit({ type: "ready" });
+
+	console.error(
+		`[pi-sidecar] enrichment active: role=${devbouleContext.agentRole} session=${devbouleContext.sessionId} project=${devbouleContext.projectId}`,
+	);
 }
 
 // ---------------------------------------------------------------------------

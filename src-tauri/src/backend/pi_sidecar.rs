@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::mini_activity::{ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle};
+use super::mini_activity::{ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle, PageEntry};
 
 // ---- per-session state (decision #7) --------------------------------------
 
@@ -86,6 +86,62 @@ fn generate_session_id(counter: u64) -> String {
 pub struct SessionInfo {
     pub session_id: String,
     pub is_new: bool,
+    /// The agent role this session runs as (orchestrator / main-coder / mini-coder).
+    pub agent_role: String,
+    /// The `mini-activity://<agentId>` channel the console should subscribe to.
+    pub channel: String,
+}
+
+/// Generate a **role-aware** agent id for a sidecar session. The frontend consoles
+/// subscribe to `mini-activity://<agentId>`, so the id namespace must match the
+/// agent role:
+///
+/// - `"orchestrator"`  -> `orchestrator-<sanitized project id>` (stable per project,
+///   so the console channel survives relaunches — matches `stable_orchestrator_agent_id`).
+/// - `"main-coder"` / `"main"` -> `main-<timestamp_ms>`.
+/// - `"mini-coder"` / `"mini"` -> `mini-<timestamp_ms>`.
+/// - anything else    -> legacy auto-generated `pi-<counter>` (safe fallback; keeps
+///   the function pure by using a self-contained monotonic counter).
+///
+/// This is the single source of truth for the sidecar's agent id: the same value
+/// is passed to the sidecar as `DEVBOULE_SESSION_ID` and used as the Rust event
+/// channel, so the two never drift.
+pub fn generate_agent_id(role: &str, project_id: Option<&str>) -> String {
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    };
+    match role {
+        "orchestrator" => {
+            let pid = project_id.unwrap_or("unknown");
+            super::projects::stable_orchestrator_agent_id(pid)
+        }
+        r if r.starts_with("main") => format!("main-{}", now_ms()),
+        r if r.starts_with("mini") => format!("mini-{}", now_ms()),
+        _ => {
+            // Legacy fallback: pi-{counter}. Self-contained counter so the function
+            // stays pure (no PiSidecarState needed).
+            static FALLBACK_COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let c = FALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            generate_session_id(c)
+        }
+    }
+}
+
+/// Whether the pi sidecar should be used for agent launches (Phase 1 wiring).
+///
+/// Opt-in via the `DEVBOULE_PI_ENABLED` env var (set to `1`/`true`). Defaults to
+/// `false` so the legacy devboule-orchestrator binary path remains the fallback
+/// until Phase 4 cleanup. Called from `projects.rs` to decide whether to delegate
+/// an orchestrator launch to the pi sidecar.
+pub fn pi_sidecar_enabled() -> bool {
+    match std::env::var("DEVBOULE_PI_ENABLED") {
+        Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
 }
 
 // ---- vault adapter (decision #9) ------------------------------------------
@@ -212,6 +268,8 @@ fn spawn_pi_session_inner(
     app: &AppHandle,
     session_id: &str,
     prev_generation: Option<Arc<AtomicU64>>,
+    role: Option<&str>,
+    project_id: Option<&str>,
 ) -> Result<PiSession, String> {
     let script = resolve_sidecar_script()?;
     let sidecar_dir = script
@@ -230,6 +288,16 @@ fn spawn_pi_session_inner(
 
     cmd.env("DEVBOULE_PI_PROVIDER", &env_vars.provider);
     cmd.env("DEVBOULE_PI_MODEL", &env_vars.model);
+
+    if let Some(role) = role {
+        // A/B: name the session so the sidecar stamps the correct `_devboule`
+        // metadata and the frontend console subscribes to the right channel.
+        cmd.env("DEVBOULE_AGENT_ROLE", role);
+        cmd.env("DEVBOULE_SESSION_ID", session_id);
+    }
+    if let Some(pid) = project_id {
+        cmd.env("DEVBOULE_PROJECT_ID", pid);
+    }
 
     if let Some((ref key_name, ref key_value)) = env_vars.api_key_env {
         cmd.env(key_name, key_value);
@@ -311,6 +379,8 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
 fn get_or_spawn_session(
     app: &AppHandle,
     session_id_opt: Option<String>,
+    role: Option<&str>,
+    project_id: Option<&str>,
 ) -> Result<(String, bool), String> {
     let state = app.state::<PiSidecarState>();
 
@@ -367,7 +437,7 @@ fn get_or_spawn_session(
     // Lock is now DROPPED — spawn happens without holding the lock.
 
     // Phase 2: spawn outside the lock.
-    let new_session = spawn_pi_session_inner(app, &id, prev_gen)?;
+    let new_session = spawn_pi_session_inner(app, &id, prev_gen, role, project_id)?;
 
     // Phase 3: re-acquire lock and store the real session.
     let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -399,7 +469,7 @@ pub async fn spike_pi_prompt(
     text: String,
     session_id: Option<String>,
 ) -> Result<SessionInfo, String> {
-    let (sid, is_new) = get_or_spawn_session(&app, session_id)?;
+    let (sid, is_new) = get_or_spawn_session(&app, session_id, None, None)?;
 
     // Send the prompt to the session's stdin. If the child is dead, remove it
     // and return an error.
@@ -469,10 +539,60 @@ pub async fn spike_pi_prompt(
         guard.remove(&sid);
     }
 
+    let channel = super::mini_activity::mini_activity_channel(&sid);
     Ok(SessionInfo {
         session_id: sid,
         is_new,
+        // The legacy spike path does not set DEVBOULE_AGENT_ROLE, so the sidecar
+        // defaults to `main-coder` — report that here for consistency.
+        agent_role: "main-coder".to_string(),
+        channel,
     })
+}
+
+/// Spawn a **role-aware** pi sidecar session. Thin wrapper over the existing
+/// session machinery that adds role-aware agent-id generation (A/B) and the
+/// default devboule env vars the sidecar reads in `devbouleContext` (Task 1).
+///
+/// 1. Generates the agent id via [`generate_agent_id`] (orchestrator / main / mini
+///    namespaces, else the legacy `pi-<counter>` fallback).
+/// 2. Spawns the sidecar with `DEVBOULE_AGENT_ROLE=role` and
+///    `DEVBOULE_SESSION_ID=<agent id>` (plus `DEVBOULE_PROJECT_ID` when given).
+/// 3. Returns the session id, role, and the `mini-activity://<agentId>` channel.
+///
+/// The sidecar's reader thread then emits `MiniActivityEvent::Snapshot`s on that
+/// channel (EventMapper uses the same agent id), so the frontend console renders
+/// without any React changes.
+pub fn spawn_sidecar_for_role(
+    app: &AppHandle,
+    role: &str,
+    project_id: Option<&str>,
+) -> Result<SessionInfo, String> {
+    let agent_id = generate_agent_id(role, project_id);
+    let (sid, is_new) = get_or_spawn_session(
+        app,
+        Some(agent_id.clone()),
+        Some(role),
+        project_id,
+    )?;
+    let channel = super::mini_activity::mini_activity_channel(&sid);
+    Ok(SessionInfo {
+        session_id: sid,
+        is_new,
+        agent_role: role.to_string(),
+        channel,
+    })
+}
+
+/// Tauri command: spawn a pi sidecar session for a named agent role
+/// (orchestrator / main-coder / mini-coder). See [`spawn_sidecar_for_role`].
+#[tauri::command]
+pub async fn spawn_agent_session(
+    app: AppHandle,
+    role: String,
+    project_id: Option<String>,
+) -> Result<SessionInfo, String> {
+    spawn_sidecar_for_role(&app, &role, project_id.as_deref())
 }
 
 /// Tauri command: stop a specific pi sidecar session.
@@ -502,6 +622,14 @@ struct PiEvent {
     #[allow(dead_code)]
     #[serde(default)]
     messages: Option<serde_json::Value>,
+    /// The raw `message` object from `message_start`/`message_end` events. Used to
+    /// detect injected `devboule.websearch` / `devboule.plan` custom user messages.
+    #[serde(default)]
+    message: Option<serde_json::Value>,
+    /// The `_devboule` enrichment object the sidecar stamps onto every event
+    /// (Task 1): `{ agentRole, projectId, sessionId }`.
+    #[serde(rename = "_devboule", default)]
+    devboule: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,6 +651,9 @@ struct EventMapper {
     tool_names: HashMap<String, String>,
     turn_seq: u64,
     active_content_index: Option<u32>,
+    /// A: the persisted `agentRole` from the event stream's `_devboule` field.
+    /// Refreshed on every event; survives across events in the same session.
+    current_role: Option<String>,
 }
 
 impl EventMapper {
@@ -535,6 +666,7 @@ impl EventMapper {
             tool_names: HashMap::new(),
             turn_seq: 0,
             active_content_index: None,
+            current_role: None,
         }
     }
 
@@ -597,6 +729,9 @@ impl EventMapper {
     }
 
     fn handle_event(&mut self, app: &AppHandle, event: &PiEvent) {
+        // A: persist `agentRole` from `_devboule` on every event (it survives
+        // across events in the same session).
+        self.apply_devboule_role(event);
         match event.event_type.as_str() {
             "agent_start" => {
                 self.running = true;
@@ -692,6 +827,12 @@ impl EventMapper {
                 self.emit_snapshot(app);
             }
             "turn_start" | "turn_end" | "message_start" | "message_end" => {
+                // B: a `message_start`/`message_end` with a user-role message whose
+                // content[0].text parses as a devboule custom message
+                // (devboule.websearch / devboule.plan) is injected into the activity.
+                if let Some(ref message) = event.message {
+                    self.handle_devboule_custom_message(message);
+                }
                 self.emit_snapshot(app);
             }
             "response" | "ready" => {
@@ -700,6 +841,139 @@ impl EventMapper {
             _ => {}
         }
     }
+
+    // ---- Task 2: _devboule + devboule custom messages --------------------------
+
+    /// A: read `_devboule.agentRole` and persist it on the mapper. The sidecar
+    /// stamps `_devboule` onto every event, so this is an idempotent refresh that
+    /// keeps `current_role` correct for the whole session.
+    fn apply_devboule_role(&mut self, event: &PiEvent) {
+        if let Some(role) = event
+            .devboule
+            .as_ref()
+            .and_then(|d| d.get("agentRole"))
+            .and_then(|v| v.as_str())
+        {
+            self.current_role = Some(role.to_string());
+        }
+    }
+
+    /// B: detect an injected `devboule.websearch` / `devboule.plan` custom message.
+    /// Returns `true` if a devboule custom message was handled (and an entry was
+    /// pushed). A plain user message (or any non-matching shape) returns `false`
+    /// and is ignored — safe to call on every `message_start`/`message_end`.
+    fn handle_devboule_custom_message(&mut self, message: &serde_json::Value) -> bool {
+        // Only the sidecar's injected user-role messages are devboule custom msgs.
+        if message.get("role").and_then(|v| v.as_str()) != Some("user") {
+            return false;
+        }
+        let content = match message.get("content").and_then(|c| c.as_array()) {
+            Some(c) if !c.is_empty() => c,
+            _ => return false,
+        };
+        let text = match content[0].get("text").and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None => return false,
+        };
+        let obj: serde_json::Value = match serde_json::from_str(text) {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        match obj.get("type").and_then(|t| t.as_str()) {
+            Some("devboule.websearch") => {
+                let query = obj.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                let results = obj.get("results").cloned().unwrap_or(serde_json::Value::Null);
+                self.handle_devboule_websearch(query, &results);
+                true
+            }
+            Some("devboule.plan") => {
+                let plan = obj.get("plan").cloned().unwrap_or(serde_json::Value::Null);
+                self.handle_devboule_plan(&plan);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// B: map a `devboule.websearch` custom message to `ConsoleEntry::WebSearch`.
+    /// `results` is the raw web_search tool `details` object; we tolerate several
+    /// shapes and extract url/title/summary per item with graceful fallbacks.
+    fn handle_devboule_websearch(&mut self, query: &str, results: &serde_json::Value) {
+        let pages = extract_pages(results);
+        self.entries.push(ConsoleEntry::WebSearch {
+            query: query.to_string(),
+            pages,
+            time: Self::now_str(),
+        });
+    }
+
+    /// B: map a `devboule.plan` custom message. `ConsoleActivity` has no dedicated
+    /// plan entry type yet, so per the Task-2 fallback we emit a `ConsoleEntry::Chat`
+    /// with `role == "plan"`; PlannerPlanMode can later parse the formatted plan text.
+    fn handle_devboule_plan(&mut self, plan: &serde_json::Value) {
+        let text = match plan {
+            serde_json::Value::Null => "(empty plan)".to_string(),
+            _ => serde_json::to_string_pretty(plan).unwrap_or_default(),
+        };
+        self.entries.push(ConsoleEntry::Chat {
+            role: "plan".to_string(),
+            text,
+            time: Self::now_str(),
+            msg_id: None,
+        });
+    }
+}
+
+/// B helper: extract a list of `PageEntry` from a web_search `details` value,
+/// tolerating several response shapes (a bare array, or an object with a
+/// `results`/`pages`/`items`/`hits`/`data` array, or a single url/title object).
+/// Unknown/empty items are skipped; returns an empty vec if nothing parseable.
+fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
+    let items: Vec<&serde_json::Value> = match results {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        serde_json::Value::Object(map) => {
+            let mut found: Vec<&serde_json::Value> = Vec::new();
+            for key in ["results", "pages", "items", "hits", "data"] {
+                if let Some(arr) = map.get(key).and_then(|v| v.as_array()) {
+                    found = arr.iter().collect();
+                    break;
+                }
+            }
+            if found.is_empty() && (map.contains_key("url") || map.contains_key("title")) {
+                found = vec![results];
+            }
+            found
+        }
+        _ => Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let url = item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let summary = item
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("snippet").and_then(|v| v.as_str()))
+                .or_else(|| item.get("text").and_then(|v| v.as_str()))
+                .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            if title.is_empty() && url.is_empty() {
+                return None;
+            }
+            Some(PageEntry { url, title, summary })
+        })
+        .collect()
 }
 
 // ---- Phase 2 Pigeon control commands ------------------------------------
@@ -838,6 +1112,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
+    // -- pi_sidecar_enabled (Phase 1 opt-in) ------------------------------------
+
+    #[test]
+    fn pi_sidecar_enabled_false_when_env_unset() {
+        std::env::remove_var("DEVBOULE_PI_ENABLED");
+        assert!(!pi_sidecar_enabled());
+    }
+
     // -- session id generation ------------------------------------------------
 
     #[test]
@@ -876,6 +1158,79 @@ mod tests {
         assert_eq!(id3, "pi-3");
     }
 
+    // -- generate_agent_id (role-aware namespaces, Task 3) ---------------------
+
+    #[test]
+    fn agent_id_orchestrator_uses_stable_project_id() {
+        let id = generate_agent_id("orchestrator", Some("my-proj"));
+        assert_eq!(id, "orchestrator-my-proj");
+        assert_eq!(id, super::super::projects::stable_orchestrator_agent_id("my-proj"));
+    }
+
+    #[test]
+    fn agent_id_orchestrator_sanitizes_hostile_project_id() {
+        let id = generate_agent_id("orchestrator", Some("proj/../evil name!"));
+        assert!(id.starts_with("orchestrator-"), "id: {id}");
+        assert!(!id.contains('/'), "id must not contain path separators: {id}");
+        assert!(!id.contains(' '), "id must not contain spaces: {id}");
+    }
+
+    #[test]
+    fn agent_id_orchestrator_falls_back_to_unknown_without_project() {
+        let id = generate_agent_id("orchestrator", None);
+        assert_eq!(id, "orchestrator-unknown");
+    }
+
+    #[test]
+    fn agent_id_main_and_mini_use_timestamp_namespace() {
+        let main = generate_agent_id("main-coder", None);
+        let mini = generate_agent_id("mini-coder", None);
+        assert!(main.starts_with("main-"), "main id: {main}");
+        assert!(mini.starts_with("mini-"), "mini id: {mini}");
+        let main_ts: u128 = main["main-".len()..].parse().unwrap();
+        let mini_ts: u128 = mini["mini-".len()..].parse().unwrap();
+        assert!(main_ts > 0 && mini_ts > 0);
+    }
+
+    #[test]
+    fn agent_id_main_uses_timestamp_pattern() {
+        // A "main-coder" role must produce `main-<numeric timestamp>` (NOT the
+        // legacy `pi-<counter>` fallback), so the frontend console subscribes to
+        // `mini-activity://main-<ts>`.
+        let id = generate_agent_id("main-coder", None);
+        assert!(id.starts_with("main-"), "main id must use main- namespace: {id}");
+        let ts: u128 = id["main-".len()..]
+            .parse()
+            .expect("main- suffix must be a numeric timestamp");
+        assert!(ts > 0, "timestamp must be positive: {id}");
+    }
+
+    #[test]
+    fn agent_id_mini_uses_timestamp_pattern() {
+        // A "mini-coder" role must produce `mini-<numeric timestamp>` (NOT the
+        // legacy `pi-<counter>` fallback).
+        let id = generate_agent_id("mini-coder", None);
+        assert!(id.starts_with("mini-"), "mini id must use mini- namespace: {id}");
+        let ts: u128 = id["mini-".len()..]
+            .parse()
+            .expect("mini- suffix must be a numeric timestamp");
+        assert!(ts > 0, "timestamp must be positive: {id}");
+    }
+
+    #[test]
+    fn agent_id_accepts_bare_main_and_mini_prefixes() {
+        assert!(generate_agent_id("main", None).starts_with("main-"));
+        assert!(generate_agent_id("mini", None).starts_with("mini-"));
+    }
+
+    #[test]
+    fn agent_id_unknown_role_falls_back_to_pi_counter() {
+        let a = generate_agent_id("weird-role", None);
+        let b = generate_agent_id("weird-role", None);
+        assert!(a.starts_with("pi-"), "fallback id: {a}");
+        assert_ne!(a, b, "two fallback ids must be unique");
+    }
+
     // -- session info serialization -------------------------------------------
 
     #[test]
@@ -883,6 +1238,8 @@ mod tests {
         let info = SessionInfo {
             session_id: "pi-7".to_string(),
             is_new: true,
+            agent_role: "main-coder".to_string(),
+            channel: "mini-activity://pi-7".to_string(),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"sessionId\""), "must be camelCase: {json}");
@@ -1050,5 +1407,70 @@ mod tests {
         let slot_none: Option<PiSession> = None;
         let slot = SessionSlot { inner: slot_none };
         assert!(slot.inner.is_none());
+    }
+
+    // -- Task 2: _devboule parsing + devboule custom messages --------------------
+
+    #[test]
+    fn devboule_agent_role_is_parsed() {
+        // A: an event carrying `_devboule.agentRole` must set current_role.
+        let line = r#"{"type":"message_start","_devboule":{"agentRole":"orchestrator","projectId":"my-proj","sessionId":"pi-42"}}"#;
+        let event: PiEvent = serde_json::from_str(line).unwrap();
+        let mut mapper = EventMapper::new("pi-42");
+        mapper.apply_devboule_role(&event);
+        assert_eq!(
+            mapper.current_role.as_deref(),
+            Some("orchestrator"),
+            "agentRole must be parsed from _devboule"
+        );
+    }
+
+    #[test]
+    fn devboule_websearch_emits_websearch_entry() {
+        // B: a `devboule.websearch` custom message must produce a WebSearch entry.
+        let mut mapper = EventMapper::new("pi-1");
+        let results = serde_json::json!([
+            {"url": "https://a.test", "title": "Alpha", "summary": "about alpha"},
+            {"url": "https://b.test", "title": "Beta", "summary": "about beta"}
+        ]);
+        mapper.handle_devboule_websearch("best widgets", &results);
+        match mapper.entries.last() {
+            Some(ConsoleEntry::WebSearch { query, pages, .. }) => {
+                assert_eq!(query, "best widgets");
+                assert_eq!(pages.len(), 2, "both pages must be mapped");
+                assert_eq!(pages[0].url, "https://a.test");
+                assert_eq!(pages[1].title, "Beta");
+            }
+            other => panic!("expected WebSearch entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_event_without_devboule_is_handled_gracefully() {
+        // 1) An event with no `_devboule` must not crash and must leave role unset.
+        let line = r#"{"type":"message_start"}"#;
+        let event: PiEvent = serde_json::from_str(line).unwrap();
+        let mut mapper = EventMapper::new("pi-7");
+        mapper.apply_devboule_role(&event);
+        assert!(
+            mapper.current_role.is_none(),
+            "role must stay unset without _devboule"
+        );
+
+        // 2) A plain user message whose text is NOT a devboule custom message must
+        // be ignored (no panic, no entry emitted).
+        let plain_msg = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "just a normal steering message"}]
+        });
+        let handled = mapper.handle_devboule_custom_message(&plain_msg);
+        assert!(
+            !handled,
+            "non-devboule message must not be handled as custom"
+        );
+        assert!(
+            mapper.entries.is_empty(),
+            "no entry should be emitted for a plain message"
+        );
     }
 }

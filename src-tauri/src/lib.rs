@@ -786,6 +786,8 @@ pub fn run() {
             backend::pi_sidecar::spike_pi_prompt,
             // Phase 1: stop a specific pi sidecar session.
             backend::pi_sidecar::spike_pi_stop,
+            // Phase 1: spawn a role-aware pi sidecar session (orchestrator/main/mini).
+            backend::pi_sidecar::spawn_agent_session,
             // Phase 2: Pigeon heuristic routing — classify a prompt into tier/path.
             backend::prompt_routing::classify_prompt_command,
         ])

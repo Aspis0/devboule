@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 const PROJECTS_DIR: &str = "projects";
 const BLOCK_MARKER: &str = "```aspis-project";
@@ -1502,6 +1502,99 @@ pub fn prepare_project_agent_prompt(
     prepare_or_launch_project_agent(app, state, input, false)
 }
 
+/// PHASE 1: delegate an orchestrator launch to the pi sidecar instead of the
+/// local devboule-orchestrator binary. Additive — the binary path inside
+/// `prepare_or_launch_project_agent` stays as the fallback (NOT deleted).
+///
+/// Spawns an `orchestrator-<projectId>` sidecar session (the SAME stable id and
+/// `mini-activity://orchestrator-<id>` channel the legacy orchestrator uses) and
+/// registers that channel with an initial empty `MiniActivityEvent::Snapshot` so
+/// the frontend console subscribes before the sidecar's first event arrives.
+fn spawn_pi_orchestrator_session(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    client: &str,
+    root_path: &std::path::Path,
+    prompt: &str,
+) -> Result<ProjectAgentLaunchResult, String> {
+    let info =
+        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id))?;
+    // Register the orchestrator channel with an initial empty snapshot — matches
+    // the legacy orchestrator's `mini-activity://orchestrator-<id>` channel so the
+    // frontend console renders without React changes (EventMapper uses the same
+    // agent id on every event).
+    let channel = crate::backend::mini_activity::mini_activity_channel(&info.session_id);
+    let event = crate::backend::mini_activity::MiniActivityEvent::Snapshot {
+        activity: crate::backend::mini_activity::ConsoleActivity::empty(),
+    };
+    let _ = app.emit(&channel, event);
+    // B13: capture the diff baseline the first time an agent launches for this repo.
+    crate::backend::changes::ensure_diff_baseline(root_path);
+    Ok(ProjectAgentLaunchResult {
+        project_id: project_id.to_string(),
+        role: "orchestrator".to_string(),
+        client: client.to_string(),
+        agent_id: info.session_id,
+        root_path: root_path.to_string_lossy().into_owned(),
+        prompt: prompt.to_string(),
+        launched: true,
+        message: "Orchestrator launched via pi sidecar session (DEVBOULE_PI_ENABLED).".into(),
+    })
+}
+
+/// PHASE 1: delegate a MAIN CODER / MINI launch to the pi sidecar instead of the
+/// external codex/claude CLI (or the mini directive executor). Additive — the
+/// existing spawn paths inside `prepare_or_launch_project_agent` stay as the
+/// fallback (NOT deleted). Mirrors `spawn_pi_orchestrator_session` (Task 3).
+///
+/// Spawns a `main-<ts>` (role == "coder", the Main coder) or `mini-<ts>`
+/// (role == "mini") sidecar session — `spawn_sidecar_for_role` resolves the
+/// role to the `main-coder` / `mini-coder` namespace via `generate_agent_id` so
+/// the agent id lands in the channel namespace the frontend console subscribes
+/// to (`mini-activity://main-<ts>` etc) — and registers that channel with an
+/// initial empty `MiniActivityEvent::Snapshot` so the console renders without
+/// any React changes.
+fn spawn_pi_coder_session(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    client: &str,
+    root_path: &std::path::Path,
+    prompt: &str,
+    role: &str,
+) -> Result<ProjectAgentLaunchResult, String> {
+    // Map the launch role to the sidecar's agent-role namespace. The launch role
+    // is "coder" (the Main coder) or "mini"; the sidecar expects "main-coder" /
+    // "mini-coder" so `generate_agent_id` produces the `main-` / `mini-` channel
+    // namespace. Unknown roles pass through verbatim (forward-compatible).
+    let sidecar_role: &str = match role {
+        "coder" => "main-coder",
+        "mini" => "mini-coder",
+        other => other,
+    };
+    let info =
+        crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id))?;
+    // Register the channel with an initial empty snapshot — matches the existing
+    // activity bridge so the frontend console renders without React changes
+    // (EventMapper uses the same agent id on every event).
+    let channel = crate::backend::mini_activity::mini_activity_channel(&info.session_id);
+    let event = crate::backend::mini_activity::MiniActivityEvent::Snapshot {
+        activity: crate::backend::mini_activity::ConsoleActivity::empty(),
+    };
+    let _ = app.emit(&channel, event);
+    // B13: capture the diff baseline the first time an agent launches for this repo.
+    crate::backend::changes::ensure_diff_baseline(root_path);
+    Ok(ProjectAgentLaunchResult {
+        project_id: project_id.to_string(),
+        role: role.to_string(),
+        client: client.to_string(),
+        agent_id: info.session_id,
+        root_path: root_path.to_string_lossy().into_owned(),
+        prompt: prompt.to_string(),
+        launched: true,
+        message: "Main coder launched via pi sidecar session (DEVBOULE_PI_ENABLED).".into(),
+    })
+}
+
 fn prepare_or_launch_project_agent(
     app: tauri::AppHandle,
     state: State<'_, BackendState>,
@@ -1648,6 +1741,41 @@ fn prepare_or_launch_project_agent(
         {
             prompt.push_str(&block);
         }
+    }
+    // PHASE 1 — pi-sidecar orchestrator delegation (CONDITIONAL, additive).
+    // When the pi sidecar is enabled AND this is a real orchestrator launch, route
+    // to the pi sidecar session instead of the local devboule-orchestrator binary.
+    // The binary path below is UNCHANGED and remains the fallback — NOT deleted
+    // (Phase 4 cleanup will remove it). `launch_terminal` gates this so the
+    // prepare-only path (host metadata only) is never intercepted.
+    if launch_terminal && role == "orchestrator" && crate::backend::pi_sidecar::pi_sidecar_enabled()
+    {
+        return spawn_pi_orchestrator_session(
+            &app,
+            &project.metadata.id,
+            &client,
+            &root_path,
+            &prompt,
+        );
+    }
+    // PHASE 1 — pi-sidecar MAIN CODER / MINI delegation (CONDITIONAL, additive).
+    // When the pi sidecar is enabled AND this is a real coder (Main coder) or mini
+    // launch, route to the pi sidecar session instead of the external codex/claude
+    // CLI (or the mini directive executor). The existing spawn paths below stay as
+    // the fallback — NOT deleted (Phase 4 cleanup will remove them). `launch_terminal`
+    // gates this so the prepare-only path (host metadata only) is never intercepted.
+    if launch_terminal
+        && matches!(role.as_str(), "coder" | "mini")
+        && crate::backend::pi_sidecar::pi_sidecar_enabled()
+    {
+        return spawn_pi_coder_session(
+            &app,
+            &project.metadata.id,
+            &client,
+            &root_path,
+            &prompt,
+            &role,
+        );
     }
     let projects_path = ensure_projects_dir(&app)?;
     // D1 FENCE (called at the three spawn points below, once the launch is committed):
