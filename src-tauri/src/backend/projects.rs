@@ -1521,6 +1521,20 @@ fn spawn_pi_orchestrator_session(
 ) -> Result<ProjectAgentLaunchResult, String> {
     let info =
         crate::backend::pi_sidecar::spawn_sidecar_for_role(app, "orchestrator", Some(project_id))?;
+    // Fix 1 (BLOCKER): DELIVER the prompt to the spawned session's stdin. Without
+    // this the agent sits idle forever while the UI reports `launched: true`.
+    // Only send when there is actual text; fail loudly on delivery error rather
+    // than reporting a successful-but-silent launch. On delivery failure stop the
+    // session so the (stable, per-project) orchestrator id is not left leaked/
+    // persisted as Active and reused broken on the next launch.
+    if !prompt.trim().is_empty() {
+        if let Err(e) =
+            crate::backend::pi_sidecar::send_prompt_to_session(app, &info.session_id, prompt)
+        {
+            let _ = crate::backend::pi_sidecar::stop_pi_session(app, &info.session_id);
+            return Err(e);
+        }
+    }
     // Register the orchestrator channel with an initial empty snapshot — matches
     // the legacy orchestrator's `mini-activity://orchestrator-<id>` channel so the
     // frontend console renders without React changes (EventMapper uses the same
@@ -1540,7 +1554,7 @@ fn spawn_pi_orchestrator_session(
         root_path: root_path.to_string_lossy().into_owned(),
         prompt: prompt.to_string(),
         launched: true,
-        message: "Orchestrator launched via pi sidecar session (DEVBOULE_PI_ENABLED).".into(),
+        message: "Orchestrator launched via pi sidecar session.".into(),
     })
 }
 
@@ -1575,6 +1589,19 @@ fn spawn_pi_coder_session(
     };
     let info =
         crate::backend::pi_sidecar::spawn_sidecar_for_role(app, sidecar_role, Some(project_id))?;
+    // Fix 1 (BLOCKER): DELIVER the prompt to the spawned session's stdin. Without
+    // this the agent sits idle forever while the UI reports `launched: true`.
+    // Only send when there is actual text; fail loudly on delivery error rather
+    // than reporting a successful-but-silent launch. On delivery failure stop the
+    // session so the child/entry is not leaked/persisted as Active.
+    if !prompt.trim().is_empty() {
+        if let Err(e) =
+            crate::backend::pi_sidecar::send_prompt_to_session(app, &info.session_id, prompt)
+        {
+            let _ = crate::backend::pi_sidecar::stop_pi_session(app, &info.session_id);
+            return Err(e);
+        }
+    }
     // Register the channel with an initial empty snapshot — matches the existing
     // activity bridge so the frontend console renders without React changes
     // (EventMapper uses the same agent id on every event).
@@ -1593,7 +1620,7 @@ fn spawn_pi_coder_session(
         root_path: root_path.to_string_lossy().into_owned(),
         prompt: prompt.to_string(),
         launched: true,
-        message: "Main coder launched via pi sidecar session (DEVBOULE_PI_ENABLED).".into(),
+        message: "Main coder launched via pi sidecar session.".into(),
     })
 }
 

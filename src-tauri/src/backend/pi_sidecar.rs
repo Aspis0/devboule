@@ -336,17 +336,65 @@ pub fn generate_agent_id(role: &str, project_id: Option<&str>) -> String {
     }
 }
 
-/// Whether the pi sidecar should be used for agent launches (Phase 1 wiring).
+/// Whether the pi sidecar should be used for agent launches.
 ///
-/// Opt-in via the `DEVBOULE_PI_ENABLED` env var (set to `1`/`true`). Defaults to
-/// `false` so the legacy devboule-orchestrator binary path remains the fallback
-/// until Phase 4 cleanup. Called from `projects.rs` to decide whether to delegate
-/// an orchestrator launch to the pi sidecar.
+/// ON by default: post-Phase 4 the legacy `devboule-coder` binary was archived,
+/// so the pi sidecar is now the default path. `DEVBOULE_PI_ENABLED` is an
+/// opt-OUT escape hatch — set it to `0` (or `false`/`no`/`off`, case-insensitive
+/// and trimmed) to disable the sidecar and fall back to the non-sidecar path.
+/// Any other value (including `1`/`true`/`yes`/`on`, an empty string, or
+/// unrecognized garbage) leaves the sidecar enabled. Called from `projects.rs`
+/// to decide whether to delegate an orchestrator launch to the pi sidecar.
 pub fn pi_sidecar_enabled() -> bool {
-    match std::env::var("DEVBOULE_PI_ENABLED") {
-        Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => false,
+    let enabled = env_flag_default_on("DEVBOULE_PI_ENABLED");
+    // Opt-out model: a recognized falsy value disables the sidecar; a recognized
+    // truthy value, an empty string, or an unset var enables it silently. An
+    // UNRECOGNIZED non-empty value ALSO enables (unknown -> enabled) but we WARN,
+    // so a typo'd `disable`/`none`/`disabled` doesn't silently turn the sidecar
+    // on the way a naive opt-out impl would.
+    if enabled {
+        if let Ok(v) = std::env::var("DEVBOULE_PI_ENABLED") {
+            if pi_enabled_unrecognized(&v) {
+                eprintln!(
+                    "[pi-sidecar] DEVBOULE_PI_ENABLED={v:?} is not a recognized value; \
+                     treating as ENABLED (opt-out model). Use `0|false|no|off` to disable, \
+                     `1|true|yes|on` to enable explicitly."
+                );
+            }
+        }
     }
+    enabled
+}
+
+/// Parse a `default-ON` opt-out boolean env flag with the SAME tolerant
+/// semantics as [`pi_sidecar_enabled`]:
+/// - unset                                  -> `true`  (default on)
+/// - `0|false|no|off` (trimmed, case-insensitive) -> `false`
+/// - anything else (including empty string, `1`, `true`, unrecognized garbage)
+///   -> `true`
+///
+/// This fixes the inverted-footgun in `DEVBOULE_PI_SANDBOX`, which previously did
+/// `.map(|v| v == "true").unwrap_or(true)` — anything but the exact string `true`
+/// (e.g. `1`/`TRUE`/`yes`) silently DISABLED the macOS Seatbelt sandbox. The
+/// helper is intentionally pure (no logging); callers that want a warning for
+/// unrecognized-but-enabled values do so at their own call site.
+fn env_flag_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
+/// Pure decision used by [`pi_sidecar_enabled`] to decide whether to WARN about
+/// an unrecognized `DEVBOULE_PI_ENABLED` value. Returns `true` iff `value` is
+/// non-empty, not a recognized falsy, and not a recognized truthy token. (When
+/// it returns `true`, the sidecar is still enabled — the warning is purely
+/// advisory.) Unit-testable without capturing stderr.
+fn pi_enabled_unrecognized(value: &str) -> bool {
+    let t = value.trim().to_lowercase();
+    !t.is_empty()
+        && !matches!(t.as_str(), "0" | "false" | "no" | "off")
+        && !matches!(t.as_str(), "1" | "true" | "yes" | "on")
 }
 
 // ---- vault adapter (decision #9) ------------------------------------------
@@ -544,10 +592,12 @@ fn spawn_pi_session_inner(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| sidecar_dir.clone());
-    let sandbox_enabled = std::env::var("DEVBOULE_PI_SANDBOX")
-        .ok()
-        .map(|v| v == "true")
-        .unwrap_or(true);
+    // Fix 3: use the tolerant opt-out parser (default ON). Previously this did
+    // `.map(|v| v == "true").unwrap_or(true)`, which silently DISABLED the macOS
+    // Seatbelt sandbox for any value other than the exact string `true`
+    // (`1`/`TRUE`/`yes`/garbage). Now unset -> ON; `0|false|no|off` -> OFF;
+    // anything else -> ON.
+    let sandbox_enabled = env_flag_default_on("DEVBOULE_PI_SANDBOX");
     let sandboxed = sandbox_enabled && cfg!(target_os = "macos");
 
     let policy = pi_sandbox_policy(&project_root);
@@ -856,6 +906,50 @@ pub async fn spike_pi_prompt(
 ) -> Result<SessionInfo, String> {
     let (sid, is_new) = get_or_spawn_session(&app, session_id, None, None)?;
 
+    // Deliver the prompt to the freshly spawned session's stdin. The entire
+    // liveness-check + JSONL write + zombie-cleanup block now lives in
+    // `send_prompt_to_session` (shared with the project-side orchestrator/coder
+    // launches). Errors are surfaced — never swallowed — because a launched but
+    // idle session is worse than a loud failure.
+    send_prompt_to_session(&app, &sid, &text)?;
+
+    let channel = super::mini_activity::mini_activity_channel(&sid);
+    Ok(SessionInfo {
+        session_id: sid,
+        is_new,
+        // The legacy spike path does not set DEVBOULE_AGENT_ROLE, so the sidecar
+        // defaults to `main-coder` — report that here for consistency.
+        agent_role: "main-coder".to_string(),
+        channel,
+    })
+}
+
+/// Deliver a prompt to a running pi sidecar session by writing
+/// `{"type":"prompt","message":<text>}` JSONL to the session's shared stdin.
+///
+/// This is the single delivery mechanism for sidecar prompts: it performs the
+/// SAME liveness check + locks the shared `Arc<Mutex<ChildStdin>>` (so the
+/// prompt line never interleaves with the reader thread's `classified` replies)
+/// + zombie-cleanup that the legacy `spike_pi_prompt` path used. It is now the
+/// shared path used by `spike_pi_prompt` AND by the project-side orchestrator /
+/// coder launches, so a spawned agent actually begins running instead of
+/// sitting idle.
+///
+/// Returns `Err` if the child is dead, the JSONL can't be serialized, the stdin
+/// lock is poisoned, or the write/flush fails. Callers MUST NOT report a
+/// successful launch with an undelivered prompt — propagate the error.
+///
+/// The locking order and borrow discipline below (#1, F4, Phase 2) were already
+/// fixed once to avoid deadlocks and double-borrows; do not reorder.
+pub(crate) fn send_prompt_to_session(
+    app: &AppHandle,
+    session_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    // `sid` mirrors the local naming in the legacy `spike_pi_prompt` path so the
+    // error strings stay byte-identical to that proven implementation.
+    let sid = session_id.to_string();
+
     // Send the prompt to the session's stdin. If the child is dead, remove it
     // and return an error.
     let state = app.state::<PiSidecarState>();
@@ -933,15 +1027,7 @@ pub async fn spike_pi_prompt(
         guard.remove(&sid);
     }
 
-    let channel = super::mini_activity::mini_activity_channel(&sid);
-    Ok(SessionInfo {
-        session_id: sid,
-        is_new,
-        // The legacy spike path does not set DEVBOULE_AGENT_ROLE, so the sidecar
-        // defaults to `main-coder` — report that here for consistency.
-        agent_role: "main-coder".to_string(),
-        channel,
-    })
+    Ok(())
 }
 
 /// Spawn a **role-aware** pi sidecar session. Thin wrapper over the existing
@@ -1836,12 +1922,66 @@ mod tests {
         ));
     }
 
-    // -- pi_sidecar_enabled (Phase 1 opt-in) ------------------------------------
+    // -- pi_sidecar_enabled (Phase 4 opt-out) ------------------------------------
+    // Serialize all env-mutating tests so they don't clobber each other's
+    // DEVBOULE_PI_ENABLED value. Mirrors the per-module test Mutex pattern used
+    // elsewhere in the crate (e.g. HOME_ENV_TEST_LOCK in token_usage.rs).
+    static PI_SIDECAR_ENABLED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn pi_sidecar_enabled_false_when_env_unset() {
+    fn pi_sidecar_enabled_true_when_env_unset() {
+        let _guard = PI_SIDECAR_ENABLED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("DEVBOULE_PI_ENABLED");
-        assert!(!pi_sidecar_enabled());
+        assert!(pi_sidecar_enabled());
+    }
+
+    #[test]
+    fn pi_sidecar_enabled_false_for_falsy_values() {
+        let _guard = PI_SIDECAR_ENABLED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in [
+            "0", "false", "no", "off", "FALSE", "No", "OFF", "  no  ", "\tFalse\n",
+        ] {
+            std::env::set_var("DEVBOULE_PI_ENABLED", v);
+            assert!(
+                !pi_sidecar_enabled(),
+                "DEVBOULE_PI_ENABLED={v:?} must disable the pi sidecar"
+            );
+        }
+        std::env::remove_var("DEVBOULE_PI_ENABLED");
+    }
+
+    #[test]
+    fn pi_sidecar_enabled_true_for_truthy_values() {
+        let _guard = PI_SIDECAR_ENABLED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in ["1", "true", "yes", "on", "TRUE", "Yes", "ON", "  yes ", "On"] {
+            std::env::set_var("DEVBOULE_PI_ENABLED", v);
+            assert!(
+                pi_sidecar_enabled(),
+                "DEVBOULE_PI_ENABLED={v:?} must enable the pi sidecar"
+            );
+        }
+        std::env::remove_var("DEVBOULE_PI_ENABLED");
+    }
+
+    #[test]
+    fn pi_sidecar_enabled_true_for_empty_and_garbage() {
+        let _guard = PI_SIDECAR_ENABLED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in ["", "garbage", "2", "enabled", "  ", "DISABLED"] {
+            std::env::set_var("DEVBOULE_PI_ENABLED", v);
+            assert!(
+                pi_sidecar_enabled(),
+                "DEVBOULE_PI_ENABLED={v:?} must default to enabled (opt-out model)"
+            );
+        }
+        std::env::remove_var("DEVBOULE_PI_ENABLED");
     }
 
     // -- session id generation ------------------------------------------------
@@ -2486,6 +2626,87 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- Fix 2: pi_enabled_unrecognized (unrecognized-but-enabled warning) -----
+    // Pure decision used by `pi_sidecar_enabled` to decide whether to WARN (the
+    // sidecar is still enabled). Doesn't read env, so no lock needed; kept
+    // lockless on purpose so it can run in parallel with the env-mutating tests.
+    #[test]
+    fn pi_enabled_unrecognized_false_for_falsy_truthy_and_empty() {
+        for v in [
+            "0", "false", "no", "off", "1", "true", "yes", "on", "", "  ", "\t",
+        ] {
+            assert!(
+                !pi_enabled_unrecognized(v),
+                "DEVBOULE_PI_ENABLED={v:?} must NOT trigger an unrecognized warning"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_enabled_unrecognized_true_for_garbage_values() {
+        // These are the exact typo'd values the audit flagged: `disable`/`none`/
+        // `disabled` would have been silently ENABLED before Fix 2. We now WARN
+        // (and still enable — unknown -> enabled).
+        for v in [
+            "disable", "none", "disabled", "garbage", "2", "ENABLED", "  yesx ",
+        ] {
+            assert!(
+                pi_enabled_unrecognized(v),
+                "DEVBOULE_PI_ENABLED={v:?} should warn (unrecognized but enabled)"
+            );
+        }
+    }
+
+    // -- Fix 3: env_flag_default_on / DEVBOULE_PI_SANDBOX (inverted-footgun) ----
+    // Serialize against anything reading DEVBOULE_PI_SANDBOX. Separate lock from
+    // PI_SIDECAR_ENABLED_ENV_LOCK because they guard DIFFERENT variables; sharing
+    // would needlessly serialize the two suites. (Only these tests read
+    // DEVBOULE_PI_SANDBOX, so the lock is sufficient.)
+    static PI_SIDECAR_SANDBOX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn devboule_pi_sandbox_defaults_on_when_unset() {
+        let _guard = PI_SIDECAR_SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DEVBOULE_PI_SANDBOX");
+        assert!(env_flag_default_on("DEVBOULE_PI_SANDBOX"));
+    }
+
+    #[test]
+    fn devboule_pi_sandbox_disabled_for_falsy_values() {
+        let _guard = PI_SIDECAR_SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in ["0", "false", "no", "off", "FALSE", "Off", "  no  "] {
+            std::env::set_var("DEVBOULE_PI_SANDBOX", v);
+            assert!(
+                !env_flag_default_on("DEVBOULE_PI_SANDBOX"),
+                "DEVBOULE_PI_SANDBOX={v:?} must DISABLE the sandbox"
+            );
+        }
+        std::env::remove_var("DEVBOULE_PI_SANDBOX");
+    }
+
+    #[test]
+    fn devboule_pi_sandbox_enabled_for_true_and_one() {
+        // Fix 3 regression: the OLD code did `.map(|v| v == "true")` which silently
+        // DISABLED the sandbox for `1`/`TRUE`/`yes`/garbage — turning the macOS
+        // Seatbelt OFF. Now any non-falsy value (the tolerant opt-out semantics)
+        // keeps the sandbox ON.
+        let _guard = PI_SIDECAR_SANDBOX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for v in ["true", "1", "yes", "on", "TRUE", "Yes", "  yes ", "garbage", "ENABLED"] {
+            std::env::set_var("DEVBOULE_PI_SANDBOX", v);
+            assert!(
+                env_flag_default_on("DEVBOULE_PI_SANDBOX"),
+                "DEVBOULE_PI_SANDBOX={v:?} must ENABLE the sandbox (opt-out)"
+            );
+        }
+        std::env::remove_var("DEVBOULE_PI_SANDBOX");
     }
 }
 
