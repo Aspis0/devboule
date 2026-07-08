@@ -38,6 +38,7 @@ const baseProps = {
   onRunFinalReview: noop,
   onTrust: noop,
   onDisable: noop,
+  onCoarsePolicyChange: noop,
 };
 
 describe("CensorPanelView states", () => {
@@ -67,17 +68,17 @@ describe("CensorPanelView states", () => {
   });
 
   it("shows the Gemma-offline banner when censor_status reports offline", () => {
-    const status: CensorStatus = { gemmaStatus: "offline", tools: [], trusted: true };
+    const status: CensorStatus = { gemmaStatus: "offline", tools: [], trusted: true, coarsePolicy: "auto", lastCoarseRun: null };
     const html = renderToStaticMarkup(
       <CensorPanelView {...baseProps} findings={[]} status={status} />,
     );
-    expect(html).toContain("Gemma layer offline");
+    expect(html).toContain("Censor LLM: offline");
   });
 
   it("does NOT show the Gemma banner when available or unknown", () => {
     for (const gemmaStatus of ["available", "unknown"] as const) {
       const html = renderToStaticMarkup(
-        <CensorPanelView {...baseProps} findings={[]} status={{ gemmaStatus, tools: [], trusted: true }} />,
+        <CensorPanelView {...baseProps} findings={[]} status={{ gemmaStatus, tools: [], trusted: true, coarsePolicy: "auto", lastCoarseRun: null }} />,
       );
       expect(html).not.toContain("Gemma layer offline");
     }
@@ -91,15 +92,17 @@ describe("CensorPanelView states", () => {
         { name: "gitleaks", available: false },
       ],
       trusted: true,
+      coarsePolicy: "auto",
+      lastCoarseRun: null,
     };
     const html = renderToStaticMarkup(
       <CensorPanelView {...baseProps} findings={[]} status={status} />,
     );
-    expect(html).toContain("gitleaks");
-    expect(html).toContain("layers are skipped");
-    // absent tool → a red chip with the data attribute; an installed tool → no chip
-    expect(html).toContain('data-censor-missing-tool="gitleaks"');
-    expect(html).not.toContain('data-censor-missing-tool="eslint"');
+    // collapsed state shows the count; tool names only appear when expanded
+    expect(html).toContain("1 missing");
+    expect(html).toContain("1 ready");
+    // eslint is available, so it is NOT in the missing list
+    expect(html).not.toContain('eslint');
   });
 
   it("exposes Review now and Run final review actions", () => {
@@ -115,6 +118,8 @@ describe("CensorPanelView states", () => {
       gemmaStatus: "available",
       tools: [],
       trusted: false,
+      coarsePolicy: "auto",
+      lastCoarseRun: null,
     };
     const html = renderToStaticMarkup(
       <CensorPanelView {...baseProps} findings={[finding()]} status={status} />,
@@ -135,6 +140,8 @@ describe("CensorPanelView states", () => {
       gemmaStatus: "available",
       tools: [],
       trusted: true,
+      coarsePolicy: "auto",
+      lastCoarseRun: null,
     };
     const html = renderToStaticMarkup(
       <CensorPanelView {...baseProps} findings={[finding()]} status={status} />,
@@ -149,6 +156,8 @@ describe("CensorPanelView states", () => {
       gemmaStatus: "available",
       tools: [],
       trusted: false,
+      coarsePolicy: "auto",
+      lastCoarseRun: null,
     };
     const html = renderToStaticMarkup(
       <CensorPanelView
