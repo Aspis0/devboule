@@ -1,30 +1,42 @@
-# pi-sidecar — Phase 0 Spike
+# pi-sidecar — Devboule's agent harness
 
-A minimal Node.js sidecar that embeds the pi SDK (`@earendil-works/pi-coding-agent`)
-and bridges it to Devboule's Rust backend via JSONL over stdio.
+The Node.js sidecar that embeds the pi SDK (`@earendil-works/pi-coding-agent`) and
+bridges it to Devboule's Rust backend via JSONL over stdio. This is the DEFAULT agent
+path for orchestrator and coder sessions (Route 2 SDK embed, see
+`docs/devboule-on-pi-architecture.md` — §11 lists the binding design decisions).
 
-## What it proves
+## What it does
 
-1. **Event streaming**: All pi SDK events (`text_delta`, `tool_execution_*`, etc.) are
-   forwarded as JSONL to stdout.
-2. **JSONL protocol**: The Rust backend spawns this process, sends prompts via stdin,
-   and receives streamed events via stdout.
-3. **Console rendering**: The Rust side maps pi events to the existing
-   `MiniActivityEvent` / `ConsoleActivity` schema so `WorkConsole.tsx` renders them
-   WITHOUT any React changes.
-4. **Oracle MCP**: Oracle tools are available via MCP auto-connect (`~/.pi/agent/mcp.json`
-   + `.pi/mcp.json`). The pi agent picks up the Oracle-figlyph MCP server (7 tools) automatically.
-5. **Censor hook**: Optional post-edit Rust code review via pi LLM, gated by
-   `DEVBOULE_CENSOR_REVIEW_ENABLED` env var (default: enabled).
+1. **Event streaming**: ALL pi SDK events (`text_delta`, `thinking_*`,
+   `tool_execution_*`, `compaction_*`, `auto_retry_*`, …) are forwarded verbatim as
+   JSONL to stdout, enriched with a `_devboule: {agentRole, projectId, sessionId}`
+   stamp. The Rust `EventMapper` (`src-tauri/src/backend/pi_sidecar.rs`) maps them to
+   the existing `MiniActivityEvent`/`ConsoleActivity` schema — the React console
+   renders pi sessions with zero frontend forks: chat bubbles, collapsed thinking
+   rows, live tool-progress updates, and lifecycle banners.
+2. **Prompt delivery with a FIFO queue**: prompts arriving while a turn is in flight
+   are queued (up to 5) and drained at turn end — never silently rejected. Queued
+   prompts still pending at `quit` are reported via a `queue_dropped` event.
+3. **Extensions**: the sidecar loads pi extensions via the standard resource loader
+   (`~/.pi/agent` global + `.pi/` project scope) — subagents
+   (`@tintinweb/pi-subagents`), pi-lens, compactor, etc.
+4. **Oracle MCP**: Oracle tools auto-connect via `~/.pi/agent/mcp.json` /
+   `.pi/mcp.json`. The `ready` event carries `oracleMCP: false` when unavailable
+   (surfaced as a console banner).
+5. **Censor hook**: after any turn that edited `.rs` files, the sidecar emits a
+   `devboule_censor_review` event (gated by `DEVBOULE_CENSOR_REVIEW_ENABLED`,
+   default on). The Rust side runs the REAL Censor review (deterministic runners +
+   voted local-LLM tier) on a detached thread and prompts confirmed findings back
+   into the session (max 2 consecutive censor rounds, delivered findings deduped).
 
 ## Prerequisites
 
 + **Node.js** ≥ 20 (tested with v26.3.0)
-+ **An API key** for at least one provider. Set the env var for your provider, e.g.:
-
-  ```bash
-  export OPENAI_API_KEY="sk-..."
-  ```
++ A provider configured for the pi SDK: either an env API key the SDK recognizes
+  (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) or a custom provider in
+  `~/.pi/agent/models.json` (e.g. an OpenRouter-backed provider or a local oMLX
+  endpoint). In the app path, provider/model/keys come from the vault (decision #9)
+  and are passed via env.
 
 ## Setup (one-time)
 
@@ -33,84 +45,66 @@ cd pi-sidecar
 npm install
 ```
 
-This installs `@earendil-works/pi-coding-agent@0.80.3` locally.
-
-## Running the spike (end-to-end)
-
-### Option A: Standalone test (no Tauri)
+## Running standalone (no Tauri)
 
 ```bash
 cd pi-sidecar
-export OPENAI_API_KEY="sk-..."
-echo '{"type":"prompt","message":"What files are in the current directory?"}' | node sidecar.mjs
+printf '{"type":"prompt","message":"What files are in the current directory?"}\n' \
+  | DEVBOULE_PI_PROVIDER=openrouter-curated DEVBOULE_PI_MODEL="tencent/hy3:free" node sidecar.mjs
 ```
 
-You'll see JSONL events stream to stdout.
+JSONL events stream to stdout. Two back-to-back prompt lines exercise the queue
+(the second gets `{"type":"response","command":"prompt","success":true,"queued":true}`).
 
-### Option B: Full end-to-end with Tauri
+## Running inside the app
 
-1. **Start the Tauri dev server** (from the repo root):
+The pi sidecar is ON by default. Launch an orchestrator/coder from the app (Projects →
+Spawn); the Rust backend spawns one sidecar process per session, delivers the prompt,
+and streams the console. Set `DEVBOULE_PI_ENABLED=false` to fall back to the legacy
+launch paths (the legacy `devboule-coder` binary is archived — the fallback fails
+closed by design).
 
-   ```bash
-   npm run tauri dev
-   ```
+## Configuration (env)
 
-2. **Open a project** in the Devboule app and select an agent in the Work Console.
+| Env var                          | Default  | Description                                        |
+|----------------------------------|----------|----------------------------------------------------|
+| `DEVBOULE_PI_ENABLED`            | `true`   | Opt-out kill switch for the whole pi path (Rust)   |
+| `DEVBOULE_PI_PROVIDER`           | `openai` | pi provider id (app passes the vault's choice)     |
+| `DEVBOULE_PI_MODEL`              | `gpt-4o` | Model id (app passes the vault's choice)           |
+| `DEVBOULE_PI_SANDBOX`            | `true`   | macOS Seatbelt sandbox around the sidecar (Rust)   |
+| `DEVBOULE_CENSOR_REVIEW_ENABLED` | `true`   | Post-edit Censor review hook (sidecar)             |
 
-3. **Send a prompt to the pi sidecar** — the spike registers a dev-only Tauri command
-   `spike_pi_prompt`. You can invoke it from the browser devtools console:
-
-   ```js
-   window.__TAURI__.core.invoke("spike_pi_prompt", { text: "List the files in src/" });
-   ```
-
-   Or via the Tauri CLI:
-
-   ```bash
-   npx tauri invoke spike_pi_prompt --text "Use oracle_ask to search for auth code"
-   ```
-
-4. **Watch the Work Console**: pi events stream into the existing Console tab —
-   text appears as `ChatEntry` rows, tool calls as `CoderEntry` rows, and the
-   agent lifecycle as running/stopped state changes.
-
-## Configuration
-
-Pass provider/model via env vars to the Rust launcher (defaults shown):
-
-| Env var                        | Default | Description                     |
-|--------------------------------|---------|----------------------------------|
-| `DEVBOULE_PI_PROVIDER`         | `openai`| pi provider name                 |
-| `DEVBOULE_PI_MODEL`            | `gpt-4o`| Model ID within the provider     |
-| `DEVBOULE_CENSOR_REVIEW_ENABLED` | `true` | Enable post-edit Censor review  |
-
-The API key for the chosen provider must be set as an env var the pi SDK recognizes
-(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) — see pi's `AuthStorage` docs.
+Boolean vars accept `0/false/no/off` (case-insensitive) as false; anything else is
+true with a warning.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Devboule Tauri App                                     │
-│                                                         │
-│  Rust (pi_sidecar.rs)                                   │
-│  ├─ spawns `node pi-sidecar/sidecar.mjs`                │
-│  ├─ writes prompt JSONL to stdin                        │
-│  ├─ reads event JSONL from stdout                       │
-│  └─ maps pi events → MiniActivityEvent → app.emit()     │
-│                                                         │
-│  React (useAgentConsole.ts) — UNCHANGED                 │
-│  └─ subscribes to mini-activity://pi-agent              │
-│     └─ renders via WorkConsole.tsx                      │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Devboule Tauri App                                      │
+│                                                          │
+│  Rust (pi_sidecar.rs)                                    │
+│  ├─ spawns `node pi-sidecar/sidecar.mjs` (≤8 sessions,   │
+│  │  Seatbelt-sandboxed on macOS)                         │
+│  ├─ writes prompt JSONL to stdin                         │
+│  ├─ reads event JSONL from stdout (dedicated reader      │
+│  │  thread — heavy work is detached, never blocks it)    │
+│  ├─ EventMapper: pi events → ConsoleActivity snapshots   │
+│  │  → app.emit("mini-activity://<session>")              │
+│  └─ Censor: devboule_censor_review → voted review →      │
+│     findings prompted back via send_prompt_to_session    │
+│                                                          │
+│  React (useAgentConsole.ts) — UNCHANGED                  │
+└──────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────┐
-│  Node Sidecar (sidecar.mjs)                             │
-│  ├─ createAgentSession()                                │
-│  ├─ session.subscribe() → emit events to stdout         │
-│  ├─ Censor hook: track .rs edits, trigger review        │
-│  └─ reads prompt commands from stdin                    │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Node Sidecar (sidecar.mjs)                              │
+│  ├─ createAgentSession() + extensions + MCP              │
+│  ├─ session.subscribe() → enrich with _devboule → stdout │
+│  ├─ stdin commands: prompt (FIFO-queued mid-turn), quit  │
+│  └─ Censor hook: tracks .rs edits per turn, emits        │
+│     devboule_censor_review at agent_end                  │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Protocol (JSONL over stdio)
@@ -122,24 +116,35 @@ The API key for the chosen provider must be set as an env var the pi SDK recogni
 {"type":"quit"}
 ```
 
-**stdout (events)**:
+**stdout (events, abridged)**:
 
 ```json
-{"type":"ready"}
+{"type":"ready","oracleMCP":true}
 {"type":"response","command":"prompt","success":true}
+{"type":"response","command":"prompt","success":true,"queued":true}
 {"type":"agent_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"…"}}
 {"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hello"}}
-{"type":"tool_execution_start","toolName":"oracle_ask","args":{"question":"..."}}
-{"type":"tool_execution_end","toolName":"oracle_ask","result":{...},"isError":false}
+{"type":"tool_execution_start","toolCallId":"…","toolName":"read","args":{...}}
+{"type":"tool_execution_update","toolCallId":"…","partialResult":{...}}
+{"type":"tool_execution_end","toolCallId":"…","result":{...},"isError":false}
+{"type":"compaction_start","reason":"threshold"}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"errorMessage":"…"}
+{"type":"devboule_censor_review","files":["src/x.rs"],"diffs":["…"]}
 {"type":"agent_end","messages":[...]}
+{"type":"queue_dropped","count":1}
+{"type":"error","context":"…","message":"…"}
 ```
 
-## What's NOT wired (TODO for later phases)
+Every event additionally carries `_devboule: {agentRole, projectId, sessionId}`.
 
-+ **Provider/model from vault**: The spike hardcodes defaults. Decision #9 says the
-  vault is the source of truth; the Rust side will read from
-  `save_oracle_llm_settings` (`vault.rs:927`) and pass via env vars.
-+ **Node binary bundling**: The spike runs `node` directly. Phase 5 will use
-  `@yao-pkg/pkg --sea --compress Zstd` per decision #5.
-+ **Session persistence**: Uses `SessionManager.inMemory()`. No session survives
-  a restart.
+## Known gaps / next phases
+
++ **Node binary bundling** (5c): still runs the system `node`; packaging via
+  `@yao-pkg/pkg --sea --compress Zstd` per decision #5 is pending. Pin of extension
+  versions ships with it.
++ **Sidecar-side session persistence**: the sidecar uses `SessionManager.inMemory()`;
+  the RUST side persists session metadata (status, last-active) across app restarts,
+  but a killed sidecar loses its in-process pi conversation.
++ **In-app extension bootstrap**: planned — app-managed agent dir with a curated
+  extension set installed on first launch (testers won't need a global `~/.pi/agent`).
