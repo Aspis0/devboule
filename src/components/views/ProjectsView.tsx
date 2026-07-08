@@ -33,6 +33,7 @@ import {
 import { useAgentConsole } from "../agents/useAgentConsole";
 import { useDesignRequestWatcher } from "../projects/planner/useDesignRequestWatcher";
 import type { PendingSend } from "../projects/planner/plannerModel";
+import type { SlashResult } from "../../hooks/useSlashCommands";
 import type { DesignProjectEntry } from "../../types/design";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
 import {
@@ -88,6 +89,7 @@ import type {
 } from "../../types/backend";
 import type { EffectiveRolesConfig } from "../../types/config";
 import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
+import { resolveOrchestratorClient } from "../../utils/orchestratorClient";
 import { CollapsibleSection } from "../projects/CollapsibleSection";
 import { formatDateTime } from "../projects/projectFormat";
 import type { SpawnRole } from "../agents/roleDisplay";
@@ -2196,6 +2198,49 @@ export function ProjectsView() {
 		}
 	};
 
+	// Slash-command results from the PlannerChat composer.
+	const onPlannerSlashCommand = useCallback(
+		(result: SlashResult) => {
+			switch (result.action) {
+				case "switchModel": {
+					// Map the parsed provider token to a valid orchestrator backend id.
+					// "openai" is not a real orchestrator id, so it resolves to "codex"
+					// (Codex is the OpenAI-compatible cloud CLI); "codex" passes through,
+					// and any unknown token is a no-op (audit finding #1).
+					const client = resolveOrchestratorClient(result.payload?.provider);
+					if (client) setPlannerOrchestratorClient(client);
+					break;
+				}
+				case "switchAgent": {
+					const role = result.payload?.role;
+					const known =
+						role === "local" ||
+						role === "claude" ||
+						role === "codex" ||
+						(config.customAgentClients ?? []).some((c) => c.id === role);
+					if (role && known) void onMainCoderOverrideChange(role);
+					break;
+				}
+				case "stopSession": {
+					if (orchestratorAgentId) void stopAgent(orchestratorAgentId);
+					else if (cloudOrchestratorAgentId)
+						void stopAgent(cloudOrchestratorAgentId);
+					break;
+				}
+				case "showHelp":
+					break;
+				default:
+					break;
+			}
+		},
+		[
+			onMainCoderOverrideChange,
+			orchestratorAgentId,
+			cloudOrchestratorAgentId,
+			config,
+		],
+	);
+
 	const refreshLiveStatus = async () => {
 		if (!currentProject || busyRef.current) return;
 		const requestedId = currentProject.metadata.id;
@@ -3454,6 +3499,7 @@ export function ProjectsView() {
           Always visible; "Plan it" stays guarded until a project with a working folder is selected
           (the wiring to the existing plan-first flow lands in a follow-up). */}
 					<PlannerPlanMode
+						onSlashCommand={onPlannerSlashCommand}
 						goal={plannerGoal}
 						contextLabel={
 							currentProject?.metadata.rootPath
@@ -3653,6 +3699,8 @@ export function ProjectsView() {
 								label: "Codex",
 								disabled: cloudCliAvailability.codex === false,
 							},
+							// Phase 1 slash command `/model openai` targets this backend id.
+							{ id: "openai", label: "OpenAI" },
 						]}
 						orchestratorId={plannerOrchestratorClient}
 						onOrchestratorChange={setPlannerOrchestratorClient}

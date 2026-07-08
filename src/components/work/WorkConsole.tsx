@@ -17,6 +17,7 @@ import { stripSpoofChars } from "../agents/attentionNotifier";
 import { useAgentConsole } from "../agents/useAgentConsole";
 import { invokeBackendCommand } from "../../context/AppContext";
 import type { AgentSession, ProjectTask } from "../../types/backend";
+import type { SlashResult } from "../../hooks/useSlashCommands";
 import { Bot, Square } from "lucide-react";
 
 const AgentTerminalViewer = lazy(() =>
@@ -96,6 +97,27 @@ export function WorkConsole(props: WorkConsoleProps) {
 	};
 	const onQuickAction = (a: "redo" | "narrow" | "pause") =>
 		dispatch(QUICK[a], "message");
+
+	// Slash-command results from the FocusStage composer. The focused-work composer
+	// only owns one meaningful action here — stopping the focused agent — so stop
+	// maps to stop_agent; model/agent/help switches are Orchestrator concerns
+	// handled in ProjectsView's PlannerChat and are no-ops in this console.
+	const onSlashCommand = useCallback(
+		(result: SlashResult) => {
+			switch (result.action) {
+				case "stopSession":
+					if (selectedNode) {
+						void invokeBackendCommand("stop_agent", {
+							agentId: selectedNode.agentId,
+						}).catch(() => {});
+					}
+					break;
+				default:
+					break;
+			}
+		},
+		[selectedNode],
+	);
 
 	const rawSlot =
 		isPty && selectedNode ? (
@@ -371,6 +393,7 @@ export function WorkConsole(props: WorkConsoleProps) {
 						onAnswer={() => {}}
 						rawSlot={null}
 						disabled={false}
+						onSlashCommand={onSlashCommand}
 					/>
 				) : selectedNode ? (
 					<FocusStage
@@ -384,6 +407,7 @@ export function WorkConsole(props: WorkConsoleProps) {
 						rawSlot={rawSlot}
 						disabled={!!readOnly}
 						onQuickAction={onQuickAction}
+						onSlashCommand={onSlashCommand}
 					/>
 				) : (
 					<div

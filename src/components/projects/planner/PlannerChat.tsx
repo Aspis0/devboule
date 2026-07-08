@@ -3,183 +3,270 @@ import type { KeyboardEvent } from "react";
 import { Send } from "lucide-react";
 import type { PlannerMessage } from "./plannerModel";
 import { ChatThread } from "../../activity/ChatThread";
+import {
+	useSlashCommands,
+	SlashCommandPopup,
+} from "../../../hooks/useSlashCommands";
+import type { SlashResult } from "../../../hooks/useSlashCommands";
 
 interface PlannerChatProps {
-  messages: PlannerMessage[];
-  modelLabel: string;
-  live: boolean;
-  awaitingReply: boolean;
-  /** D4 (planner-chat demolition): composer CHROME for delivery failures, launch
-   *  guidance and the 90s silence watchdog — rendered as an amber strip ABOVE the
-   *  composer, never spliced into the transcript as a fake assistant message.
-   *  While set it also supersedes the "thinking…" pill (the strip explains why
-   *  there is no reply; a spinning pill next to it would contradict it). */
-  banner?: string | null;
-  onSend: (text: string) => void;
-  /** Esc while the orchestrator works: interrupt the IN-FLIGHT turn (the agent
-   *  and its context stay alive). Absent = no interrupt surface (e.g. no live
-   *  cloud orchestrator bound). */
-  onInterrupt?: () => void;
+	messages: PlannerMessage[];
+	modelLabel: string;
+	live: boolean;
+	awaitingReply: boolean;
+	/** D4 (planner-chat demolition): composer CHROME for delivery failures, launch
+	 *  guidance and the 90s silence watchdog — rendered as an amber strip ABOVE the
+	 *  composer, never spliced into the transcript as a fake assistant message.
+	 *  While set it also supersedes the "thinking…" pill (the strip explains why
+	 *  there is no reply; a spinning pill next to it would contradict it). */
+	banner?: string | null;
+	onSend: (text: string) => void;
+	/** Esc while the orchestrator works: interrupt the IN-FLIGHT turn (the agent
+	 *  and its context stay alive). Absent = no interrupt surface (e.g. no live
+	 *  cloud orchestrator bound). */
+	onInterrupt?: () => void;
+	/** Slash-command result (model/agent switch, stop, help). Optional: only
+	 *  invoked when the composer intercepts a matched command on Enter. */
+	onSlashCommand?: (result: SlashResult) => void;
 }
 
 export function PlannerChat({
-  messages,
-  modelLabel,
-  live,
-  awaitingReply,
-  banner,
-  onSend,
-  onInterrupt,
+	messages,
+	modelLabel,
+	live,
+	awaitingReply,
+	banner,
+	onSend,
+	onInterrupt,
+	onSlashCommand,
 }: PlannerChatProps) {
-  const [value, setValue] = useState("");
+	const [value, setValue] = useState("");
+	const slash = useSlashCommands();
 
-  const send = () => {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    onSend(trimmed);
-    setValue("");
-  };
+	const send = () => {
+		const trimmed = value.trim();
+		if (!trimmed) return;
+		onSend(trimmed);
+		setValue("");
+	};
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    }
-    if (e.key === "Escape" && onInterrupt && live) {
-      e.preventDefault();
-      onInterrupt();
-    }
-  };
+	// Resolve a slash command (from Enter OR a popup click) and route it:
+	//   action  -> emit to the parent (model/agent switch, stop, help)
+	//   message -> forward the literal text to the orchestrator (steer)
+	//   none    -> unmatched: caller falls through to a normal text send
+	const runSlash = (result: SlashResult) => {
+		if (result.type === "action") {
+			onSlashCommand?.(result);
+			setValue("");
+			return true;
+		}
+		if (result.type === "message" && result.message) {
+			onSend(result.message);
+			setValue("");
+			return true;
+		}
+		return false;
+	};
 
-  return (
-    <div
-      style={{
-        background: "#fff",
-        border: "1px solid #E4DDD0",
-        borderRadius: 12,
-        overflow: "hidden",
-        display: "flex",
-        flexDirection: "column",
-        minHeight: 340,
-        maxHeight: 460,
-        flex: 1,
-      }}
-    >
-      {/* HEADER */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          padding: "9px 13px",
-          borderBottom: "1px solid #EFE7DA",
-          background: "#FCFAF6",
-        }}
-      >
-        <span className="pp-mono" style={{ fontSize: 9.5, letterSpacing: 0.14, color: "#A89F90" }}>
-          CHAT
-        </span>
-        <span className="pp-mono" style={{ fontSize: 9.5, color: "#9c9488" }}>
-          {modelLabel}
-        </span>
-        <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 5 }}>
-          <span
-            style={{
-              width: 6,
-              height: 6,
-              borderRadius: "50%",
-              background: live ? "#7FA468" : "#CFC6B6",
-            }}
-          />
-          <span
-            style={{
-              fontSize: 10,
-              fontWeight: 600,
-              color: live ? "#5e8a4d" : "#9c9488",
-            }}
-          >
-            {live ? "live" : "idle"}
-          </span>
-        </span>
-      </div>
+	const onPopupSelect = (index: number) => {
+		runSlash(slash.selectIndex(index));
+	};
 
-      <ChatThread messages={messages} live={live && !banner} awaitingReply={awaitingReply} />
+	const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+		if (slash.isSlashActive) {
+			if (e.key === "ArrowDown") {
+				e.preventDefault();
+				slash.moveActive(1);
+				return;
+			}
+			if (e.key === "ArrowUp") {
+				e.preventDefault();
+				slash.moveActive(-1);
+				return;
+			}
+			if (e.key === "Tab") {
+				e.preventDefault();
+				slash.moveActive(1);
+				return;
+			}
+			if (e.key === "Escape") {
+				e.preventDefault();
+				slash.onEscape();
+				return;
+			}
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				// Matched command (action/message) is consumed here; an unmatched slash
+				// falls through to the normal send below (treated as plain text).
+				if (runSlash(slash.onEnter())) return;
+			}
+		}
+		if (e.key === "Enter" && !e.shiftKey) {
+			e.preventDefault();
+			send();
+			return;
+		}
+		if (e.key === "Escape" && onInterrupt && live) {
+			e.preventDefault();
+			onInterrupt();
+		}
+	};
 
-      {/* D4 BANNER: delivery/stall/launch feedback as chrome above the composer. */}
-      {banner ? (
-        <div
-          data-testid="planner-banner"
-          style={{
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 7,
-            padding: "8px 13px",
-            borderTop: "1px solid #EED9B7",
-            background: "#FBF3E2",
-            color: "#8A6B33",
-            fontSize: 12,
-            lineHeight: 1.45,
-          }}
-        >
-          <span aria-hidden style={{ flex: "none", marginTop: 1 }}>
-            ⚠︎
-          </span>
-          <span>{banner}</span>
-        </div>
-      ) : null}
+	return (
+		<div
+			style={{
+				background: "#fff",
+				border: "1px solid #E4DDD0",
+				borderRadius: 12,
+				overflow: "hidden",
+				display: "flex",
+				flexDirection: "column",
+				minHeight: 340,
+				maxHeight: 460,
+				flex: 1,
+			}}
+		>
+			{/* HEADER */}
+			<div
+				style={{
+					display: "flex",
+					alignItems: "center",
+					gap: 8,
+					padding: "9px 13px",
+					borderBottom: "1px solid #EFE7DA",
+					background: "#FCFAF6",
+				}}
+			>
+				<span
+					className="pp-mono"
+					style={{ fontSize: 9.5, letterSpacing: 0.14, color: "#A89F90" }}
+				>
+					CHAT
+				</span>
+				<span className="pp-mono" style={{ fontSize: 9.5, color: "#9c9488" }}>
+					{modelLabel}
+				</span>
+				<span
+					style={{
+						marginLeft: "auto",
+						display: "flex",
+						alignItems: "center",
+						gap: 5,
+					}}
+				>
+					<span
+						style={{
+							width: 6,
+							height: 6,
+							borderRadius: "50%",
+							background: live ? "#7FA468" : "#CFC6B6",
+						}}
+					/>
+					<span
+						style={{
+							fontSize: 10,
+							fontWeight: 600,
+							color: live ? "#5e8a4d" : "#9c9488",
+						}}
+					>
+						{live ? "live" : "idle"}
+					</span>
+				</span>
+			</div>
 
-      {/* COMPOSER */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "flex-end",
-          gap: 8,
-          padding: "9px 10px",
-          borderTop: "1px solid #EFE7DA",
-          background: "#FCFAF6",
-        }}
-      >
-        <textarea
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          rows={1}
-          placeholder="Message the Orchestrator…  (Enter to send)"
-          style={{
-            flex: 1,
-            resize: "none",
-            border: "1px solid #E4DDD0",
-            borderRadius: 10,
-            background: "#fff",
-            padding: "10px 12px",
-            fontSize: 13,
-            color: "#2A2621",
-            outline: "none",
-            lineHeight: 1.4,
-            maxHeight: 80,
-          }}
-        />
-        <button
-          onClick={send}
-          style={{
-            width: 38,
-            height: 38,
-            flex: "none",
-            border: "none",
-            background: "linear-gradient(150deg,#C8945C,#B07D43)",
-            borderRadius: 10,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#FBF6EF",
-            cursor: value.trim() ? "pointer" : "default",
-            opacity: value.trim() ? 1 : 0.5,
-            transition: "opacity 0.15s",
-          }}
-        >
-          <Send size={16} />
-        </button>
-      </div>
-    </div>
-  );
+			<ChatThread
+				messages={messages}
+				live={live && !banner}
+				awaitingReply={awaitingReply}
+			/>
+
+			{/* D4 BANNER: delivery/stall/launch feedback as chrome above the composer. */}
+			{banner ? (
+				<div
+					data-testid="planner-banner"
+					style={{
+						display: "flex",
+						alignItems: "flex-start",
+						gap: 7,
+						padding: "8px 13px",
+						borderTop: "1px solid #EED9B7",
+						background: "#FBF3E2",
+						color: "#8A6B33",
+						fontSize: 12,
+						lineHeight: 1.45,
+					}}
+				>
+					<span aria-hidden style={{ flex: "none", marginTop: 1 }}>
+						⚠︎
+					</span>
+					<span>{banner}</span>
+				</div>
+			) : null}
+
+			{/* COMPOSER */}
+			<div
+				style={{
+					position: "relative",
+					display: "flex",
+					alignItems: "flex-end",
+					gap: 8,
+					padding: "9px 10px",
+					borderTop: "1px solid #EFE7DA",
+					background: "#FCFAF6",
+				}}
+			>
+				{slash.showPopup && (
+					<SlashCommandPopup
+						commands={slash.filteredCommands}
+						activeIndex={slash.activeIndex}
+						onSelect={onPopupSelect}
+						onHover={slash.setActive}
+					/>
+				)}
+				<textarea
+					value={value}
+					onChange={(e) => {
+						setValue(e.target.value);
+						slash.handleInput(e.target.value);
+					}}
+					onKeyDown={handleKeyDown}
+					rows={1}
+					placeholder="Message the Orchestrator…  (Enter to send)"
+					style={{
+						flex: 1,
+						resize: "none",
+						border: "1px solid #E4DDD0",
+						borderRadius: 10,
+						background: "#fff",
+						padding: "10px 12px",
+						fontSize: 13,
+						color: "#2A2621",
+						outline: "none",
+						lineHeight: 1.4,
+						maxHeight: 80,
+					}}
+				/>
+				<button
+					onClick={send}
+					style={{
+						width: 38,
+						height: 38,
+						flex: "none",
+						border: "none",
+						background: "linear-gradient(150deg,#C8945C,#B07D43)",
+						borderRadius: 10,
+						display: "flex",
+						alignItems: "center",
+						justifyContent: "center",
+						color: "#FBF6EF",
+						cursor: value.trim() ? "pointer" : "default",
+						opacity: value.trim() ? 1 : 0.5,
+						transition: "opacity 0.15s",
+					}}
+				>
+					<Send size={16} />
+				</button>
+			</div>
+		</div>
+	);
 }
