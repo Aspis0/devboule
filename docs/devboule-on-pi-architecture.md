@@ -309,6 +309,17 @@ The Rust EventMapper reads `_devboule` and maps enriched events to the correct `
 Each phase is independently shippable and reversible until Phase 4.
 
 
+
+### 5g UX — Devboule Logo + App Icon
+
+Replace the lucide `Shield` placeholder in the sidebar top-left with the actual Devboule logo (`public/assets/devboule-logo.jpeg`). Also update Tauri app icons (`src-tauri/icons/`) for macOS dock, app bundle, and all platform icon sizes.
+
+- Sidebar: `<img src="/assets/devboule-logo.jpeg">` replacing `<Shield>` in the terracotta box
+- App icon: regenerate all `src-tauri/icons/*.png` + `.icns` + `.ico` from the Devboule logo source
+- Tauri `tauri.conf.json` already configured — just the asset files change
+
+**Estimated:** 1 task (coder-free), ~5 LOC change + icon regeneration.
+
 ### 5f UX — Console `/` Command System (planned, not started)
 
 Replace the hardcoded orchestrator tabs (Local/Claude/Codex) and coder selector with a **unified slash-command system** in the console input. Same UX pattern as Claude Code, OpenClaw, and modern coding agents.
