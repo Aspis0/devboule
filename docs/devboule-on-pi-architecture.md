@@ -327,6 +327,14 @@ Replace the hardcoded orchestrator tabs (Local/Claude/Codex) and coder selector 
 | `/stop` | Stop the current agent session. |
 | `/help` | List all available commands. |
 
+**OpenAI-compatible (replaces Codex slot):**
+- Location: Settings → AI Providers, Console `/` menu
+- Backend: connects to pi's provider system (`pi.setProvider()` / `registerProvider()`)
+- UX: add any OpenAI-compatible API endpoint — URL, API key, model list
+- Models appear automatically in console `/` autocomplete after configuration
+- Same UX as pi's own provider system, but managed through Devboule's Rust backend + vault
+
+
 **Implementation:**
 - The console input detects `/` prefix → command mode
 - Commands are resolved client-side (no round-trip to Rust)

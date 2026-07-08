@@ -155,7 +155,10 @@ pub struct ProjectMetadata {
     /// SANDBOX broker Slice 1: per-project autonomy mode governing whether the broker prompts
     /// the user on blocked requests.  Default `Ask` (always prompt).  NO-CHURN: omitted from
     /// the on-disk frontmatter when equal to `Ask` so pre-existing project files stay byte-stable.
-    #[serde(default, skip_serializing_if = "crate::backend::broker::is_default_sandbox_mode")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::backend::broker::is_default_sandbox_mode"
+    )]
     pub sandbox_mode: crate::backend::broker::SandboxMode,
     /// SANDBOX broker Slice 2: per-project working set — extra folders OUTSIDE the project
     /// root that the user has explicitly granted persistent write access to.  Each entry is
@@ -469,7 +472,6 @@ pub enum Role {
     #[default]
     Collaborator,
 }
-
 
 /// A role assignment the admin issues to a collaborator's device identity. The
 /// admin signs the canonical digest of this with their Ed25519 device signing
@@ -949,8 +951,7 @@ where
     Ok(entries
         .into_iter()
         .filter_map(|entry| {
-            serde_json::from_value::<crate::backend::visual_check::VisualCheckDirective>(entry)
-                .ok()
+            serde_json::from_value::<crate::backend::visual_check::VisualCheckDirective>(entry).ok()
         })
         .collect())
 }
@@ -1301,8 +1302,7 @@ pub struct AgentLiveState {
         deserialize_with = "lenient_design_request_directives",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub design_request_directives:
-        Vec<crate::backend::design_request::DesignRequestDirective>,
+    pub design_request_directives: Vec<crate::backend::design_request::DesignRequestDirective>,
     // GH-P4: agent→human git push-approval requests. The agent's MCP
     // `request_git_push` tool appends a `pending_approval` entry; the human's
     // approve/deny Tauri command drives the rest. Additive + skip-if-empty so an
@@ -2448,7 +2448,10 @@ mod tests {
         assert_eq!(state.visual_check_directives[0].html_path, "dist/page.html");
         let back = serde_json::to_string(&state).unwrap();
         assert!(back.contains("\"visualCheckDirectives\""), "json: {back}");
-        assert!(back.contains("\"parentAgentId\":\"coder-1\""), "json: {back}");
+        assert!(
+            back.contains("\"parentAgentId\":\"coder-1\""),
+            "json: {back}"
+        );
         assert!(!back.contains("html_path"), "snake leaked: {back}");
     }
 
@@ -2685,7 +2688,10 @@ mod tests {
             }
         }"#;
         let session: AgentSession = serde_json::from_str(json).expect("session loads");
-        let pq = session.pending_question.as_ref().expect("pendingQuestion kept");
+        let pq = session
+            .pending_question
+            .as_ref()
+            .expect("pendingQuestion kept");
         assert_eq!(pq.id, "q-1");
         assert_eq!(pq.question, "Which schema?");
         let ur = session.user_reply.as_ref().expect("userReply kept");
@@ -2740,7 +2746,10 @@ mod tests {
         assert!(!prefs.auto_watch_on_unlock);
         assert_eq!(prefs.index_mode.as_deref(), Some("commit"));
         let back = serde_json::to_string(&prefs).unwrap();
-        assert!(back.contains(r#""indexMode":"commit""#), "key must survive: {back}");
+        assert!(
+            back.contains(r#""indexMode":"commit""#),
+            "key must survive: {back}"
+        );
     }
 
     #[test]
@@ -2749,6 +2758,9 @@ mod tests {
         let prefs: OracleIndexPreferences = serde_json::from_str(json).unwrap();
         assert_eq!(prefs.index_mode.as_deref(), Some("watch"));
         let back = serde_json::to_string(&prefs).unwrap();
-        assert!(back.contains(r#""indexMode":"watch""#), "key must survive: {back}");
+        assert!(
+            back.contains(r#""indexMode":"watch""#),
+            "key must survive: {back}"
+        );
     }
 }

@@ -1010,7 +1010,6 @@ export function RolesTableCard() {
 												className="mt-1 w-full max-w-xs rounded-md border border-cream-200 bg-white px-3 py-2 text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
 											>
 												<option value="claude">Claude</option>
-												
 											</select>
 											<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
 												The verifier reviews (never writes). A local verifier
