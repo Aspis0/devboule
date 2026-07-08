@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,6 +81,13 @@ fn generate_session_id(counter: u64) -> String {
     format!("pi-{counter}")
 }
 
+/// Process-wide monotonic counter used to disambiguate id stamps that would
+/// otherwise collide on the same millisecond (e.g. `main-{ms}` agent ids).
+fn next_session_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// Info about a newly created or existing session, returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,8 +126,8 @@ pub fn generate_agent_id(role: &str, project_id: Option<&str>) -> String {
             let pid = project_id.unwrap_or("unknown");
             super::projects::stable_orchestrator_agent_id(pid)
         }
-        r if r.starts_with("main") => format!("main-{}", now_ms()),
-        r if r.starts_with("mini") => format!("mini-{}", now_ms()),
+        r if r.starts_with("main") => format!("main-{}-{}", now_ms(), next_session_id()),
+        r if r.starts_with("mini") => format!("mini-{}-{}", now_ms(), next_session_id()),
         _ => {
             // Legacy fallback: pi-{counter}. Self-contained counter so the function
             // stays pure (no PiSidecarState needed).
@@ -245,12 +253,25 @@ pub(crate) fn resolve_coder_env_for_sidecar(app: &AppHandle) -> SidecarEnvVars {
 
 /// Resolve the path to the `pi-sidecar/sidecar.mjs` script relative to the app.
 fn resolve_sidecar_script() -> Result<std::path::PathBuf, String> {
+    // Dev path: repo root. Works in `npm run tauri dev` (current_dir = repo).
     let dev_path = std::env::current_dir()
         .map_err(|e| format!("Cannot resolve CWD: {e}"))?
         .join("pi-sidecar")
         .join("sidecar.mjs");
     if dev_path.exists() {
         return Ok(dev_path);
+    }
+    // Packaged build: Tauri bundles pi-sidecar/ via `bundle.resources` in
+    // tauri.conf.json. The resolver var points at the resource dir.
+    // TODO(Phase 5): verify sidecar script path in packaged release, and
+    // consider full bundling with `pkg` for an offline binary.
+    if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
+        let resource_path = Path::new(&resource_dir)
+            .join("pi-sidecar")
+            .join("sidecar.mjs");
+        if resource_path.exists() {
+            return Ok(resource_path);
+        }
     }
     Err(
         "pi-sidecar/sidecar.mjs not found. Run `npm install` in pi-sidecar/ first."
@@ -289,11 +310,15 @@ fn spawn_pi_session_inner(
     cmd.env("DEVBOULE_PI_PROVIDER", &env_vars.provider);
     cmd.env("DEVBOULE_PI_MODEL", &env_vars.model);
 
+    // #2: always set DEVBOULE_SESSION_ID, even on the legacy `spike_pi_prompt`
+    // path (role == None). The session id is generated before spawn, so the
+    // sidecar's event channel never drifts from Rust's session slot.
+    cmd.env("DEVBOULE_SESSION_ID", session_id);
+
     if let Some(role) = role {
         // A/B: name the session so the sidecar stamps the correct `_devboule`
         // metadata and the frontend console subscribes to the right channel.
         cmd.env("DEVBOULE_AGENT_ROLE", role);
-        cmd.env("DEVBOULE_SESSION_ID", session_id);
     }
     if let Some(pid) = project_id {
         cmd.env("DEVBOULE_PROJECT_ID", pid);
@@ -405,7 +430,7 @@ fn get_or_spawn_session(
                             Err(_) => return Ok((id, false)),     // Assume alive.
                         }
                     } else {
-                        return Err(format!("pi session {id} has empty slot (spawn in progress?)"));
+                        return Err(format!("Session {id} is currently spawning — try again in a moment."));
                     }
                 } else {
                     // F6: session count check (live sessions only).
@@ -630,6 +655,15 @@ struct PiEvent {
     /// (Task 1): `{ agentRole, projectId, sessionId }`.
     #[serde(rename = "_devboule", default)]
     devboule: Option<serde_json::Value>,
+    /// Censor review trigger (#8): the composed review prompt + affected files/diffs,
+    /// emitted by the sidecar to surface a review request in the console without a
+    /// reentrant `session.prompt()`. Deferred to Phase 5 for actual execution.
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<String>>,
+    #[serde(default)]
+    diffs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,6 +675,11 @@ struct AssistantMessageEvent {
     #[serde(rename = "contentIndex", default)]
     content_index: Option<u32>,
 }
+
+/// Sliding-window cap for the console entry history (#3). Prevents unbounded
+/// `Vec<ConsoleEntry>` growth that makes every `emit_snapshot` clone+serialize
+/// the entire history (O(n) serialization, ~200MB/s allocations at 1000 turns).
+const MAX_CONSOLE_ENTRIES: usize = 500;
 
 /// Stateful mapper: converts pi SDK events into `ConsoleActivity` snapshots.
 struct EventMapper {
@@ -667,6 +706,17 @@ impl EventMapper {
             turn_seq: 0,
             active_content_index: None,
             current_role: None,
+        }
+    }
+
+    /// Push a console entry, enforcing the [`MAX_CONSOLE_ENTRIES`] sliding window.
+    /// When the window is full, the oldest entry is dropped to bound memory and
+    /// serialization cost (#3). Removes only once the window is exceeded (> cap)
+    /// so the window holds exactly MAX_CONSOLE_ENTRIES entries.
+    fn push_entry(&mut self, entry: ConsoleEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > MAX_CONSOLE_ENTRIES {
+            self.entries.remove(0);
         }
     }
 
@@ -718,9 +768,12 @@ impl EventMapper {
 
     fn flush_text_block(&mut self) {
         if !self.accumulated_text.is_empty() {
-            self.entries.push(ConsoleEntry::Chat {
+            // Take the text out FIRST so the `push_entry(&mut self)` call does
+            // not conflict with the mutable borrow of `self.accumulated_text`.
+            let text = std::mem::take(&mut self.accumulated_text);
+            self.push_entry(ConsoleEntry::Chat {
                 role: "assistant".to_string(),
-                text: std::mem::take(&mut self.accumulated_text),
+                text,
                 time: Self::now_str(),
                 msg_id: None,
             });
@@ -734,6 +787,9 @@ impl EventMapper {
         self.apply_devboule_role(event);
         match event.event_type.as_str() {
             "agent_start" => {
+                // #4: clear the tool_names cache so it doesn't leak entries
+                // across agent runs in the same session.
+                self.tool_names.clear();
                 self.running = true;
                 self.turn_seq += 1;
                 self.accumulated_text.clear();
@@ -777,12 +833,12 @@ impl EventMapper {
                     .as_ref()
                     .map(|a| serde_json::to_string(a).unwrap_or_default())
                     .unwrap_or_default();
-                self.entries.push(ConsoleEntry::Coder {
+                self.push_entry(ConsoleEntry::Coder {
                     node: Some(NodeStyle::Dot),
                     text: format!("🔧 Calling `{tool_name}`"),
                     time: Self::now_str(),
                 });
-                self.entries.push(ConsoleEntry::Coder {
+                self.push_entry(ConsoleEntry::Coder {
                     node: None,
                     text: format!("  args: {args_str}"),
                     time: String::new(),
@@ -819,7 +875,7 @@ impl EventMapper {
                     .unwrap_or_else(|| "(no result)".to_string());
                 let is_error = event.is_error.unwrap_or(false);
                 let status_icon = if is_error { "❌" } else { "✅" };
-                self.entries.push(ConsoleEntry::Coder {
+                self.push_entry(ConsoleEntry::Coder {
                     node: Some(NodeStyle::Sage),
                     text: format!("{status_icon} `{tool_name}` → {result_summary}"),
                     time: Self::now_str(),
@@ -836,6 +892,35 @@ impl EventMapper {
                 self.emit_snapshot(app);
             }
             "response" | "ready" => {
+                self.emit_snapshot(app);
+            }
+            "devboule_censor_review" => {
+                // #8: surface the Censor review request in the console. The sidecar
+                // emits this (instead of a reentrant session.prompt) after a Rust
+                // edit turn. Actual review execution is deferred to Phase 5.
+                self.flush_text_block();
+                let files = event
+                    .files
+                    .as_ref()
+                    .map(|f| f.join(", "))
+                    .unwrap_or_default();
+                let banner = if files.is_empty() {
+                    "⚑ Censor review requested".to_string()
+                } else {
+                    format!("⚑ Censor review requested for: {files}")
+                };
+                self.push_entry(ConsoleEntry::Coder {
+                    node: Some(NodeStyle::Sage),
+                    text: banner,
+                    time: Self::now_str(),
+                });
+                if let Some(ref prompt) = event.prompt {
+                    self.push_entry(ConsoleEntry::Coder {
+                        node: None,
+                        text: format!("  review: {prompt}"),
+                        time: String::new(),
+                    });
+                }
                 self.emit_snapshot(app);
             }
             _ => {}
@@ -900,11 +985,20 @@ impl EventMapper {
     /// shapes and extract url/title/summary per item with graceful fallbacks.
     fn handle_devboule_websearch(&mut self, query: &str, results: &serde_json::Value) {
         let pages = extract_pages(results);
-        self.entries.push(ConsoleEntry::WebSearch {
-            query: query.to_string(),
-            pages,
-            time: Self::now_str(),
-        });
+        if pages.is_empty() {
+            // Finding #13: unknown SERP shapes yield zero extractable pages. Emitting an
+            // empty WebSearch looks like a bug, so surface a Banner notice instead.
+            self.push_entry(ConsoleEntry::Banner {
+                text: "Web search completed (results not extractable)".to_string(),
+                time: Self::now_str(),
+            });
+        } else {
+            self.push_entry(ConsoleEntry::WebSearch {
+                query: query.to_string(),
+                pages,
+                time: Self::now_str(),
+            });
+        }
     }
 
     /// B: map a `devboule.plan` custom message. `ConsoleActivity` has no dedicated
@@ -915,7 +1009,7 @@ impl EventMapper {
             serde_json::Value::Null => "(empty plan)".to_string(),
             _ => serde_json::to_string_pretty(plan).unwrap_or_default(),
         };
-        self.entries.push(ConsoleEntry::Chat {
+        self.push_entry(ConsoleEntry::Chat {
             role: "plan".to_string(),
             text,
             time: Self::now_str(),
@@ -933,7 +1027,7 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
         serde_json::Value::Array(arr) => arr.iter().collect(),
         serde_json::Value::Object(map) => {
             let mut found: Vec<&serde_json::Value> = Vec::new();
-            for key in ["results", "pages", "items", "hits", "data"] {
+            for key in ["results", "pages", "items", "hits", "data", "entries", "organic_results"] {
                 if let Some(arr) = map.get(key).and_then(|v| v.as_array()) {
                     found = arr.iter().collect();
                     break;
@@ -1043,11 +1137,21 @@ fn handle_control_line(
 
 /// Write a JSONL object to the sidecar's stdin (best-effort; used for the
 /// `classified` response). Locked so it never interleaves with prompt commands.
+///
+/// #7: write failures are logged to stderr instead of being silently discarded
+/// (`let _ =`). A dropped `classified` line would otherwise leave the sidecar's
+/// `requestClassification()` awaiting forever (#7). The sidecar additionally
+/// guards with a 5s timeout, but surfacing the error here aids diagnosis.
 fn write_jsonl_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
     if let Ok(mut s) = stdin.lock() {
         if let Ok(line) = serde_json::to_string(value) {
-            let _ = s.write_all(format!("{line}\n").as_bytes());
-            let _ = s.flush();
+            if let Err(e) = s.write_all(format!("{line}\n").as_bytes()) {
+                eprintln!("[pi_sidecar] failed to write to sidecar stdin: {e}");
+                return;
+            }
+            if let Err(e) = s.flush() {
+                eprintln!("[pi_sidecar] failed to flush sidecar stdin: {e}");
+            }
         }
     }
 }
@@ -1138,6 +1242,24 @@ mod tests {
         assert_eq!(id, "pi-42");
     }
 
+    // -- agent id generation (#6: timestamp+counter uniqueness) ---------------
+
+    #[test]
+    fn agent_ids_are_unique_across_same_millisecond() {
+        // Two launches in the same millisecond must still differ thanks to the
+        // monotonic counter appended after the timestamp.
+        let a = generate_agent_id("main-coder", None);
+        let b = generate_agent_id("main-coder", None);
+        assert_ne!(a, b, "two main-coder agent ids collided");
+        assert!(a.starts_with("main-"), "main id must start with main-: {a}");
+        assert!(b.starts_with("main-"), "main id must start with main-: {b}");
+        assert_ne!(
+            generate_agent_id("mini", None),
+            generate_agent_id("mini", None),
+            "two mini agent ids collided"
+        );
+    }
+
     #[test]
     fn session_id_counter_monotonically_increases() {
         let state = PiSidecarState::default();
@@ -1187,8 +1309,14 @@ mod tests {
         let mini = generate_agent_id("mini-coder", None);
         assert!(main.starts_with("main-"), "main id: {main}");
         assert!(mini.starts_with("mini-"), "mini id: {mini}");
-        let main_ts: u128 = main["main-".len()..].parse().unwrap();
-        let mini_ts: u128 = mini["mini-".len()..].parse().unwrap();
+        // #6: format is `main-<ms>-<counter>`; the timestamp is the part before the
+        // final `-`.
+        let main_ts: u128 = main["main-".len()..main.rfind('-').unwrap()]
+            .parse()
+            .unwrap();
+        let mini_ts: u128 = mini["mini-".len()..mini.rfind('-').unwrap()]
+            .parse()
+            .unwrap();
         assert!(main_ts > 0 && mini_ts > 0);
     }
 
@@ -1199,9 +1327,9 @@ mod tests {
         // `mini-activity://main-<ts>`.
         let id = generate_agent_id("main-coder", None);
         assert!(id.starts_with("main-"), "main id must use main- namespace: {id}");
-        let ts: u128 = id["main-".len()..]
+        let ts: u128 = id["main-".len()..id.rfind('-').unwrap()]
             .parse()
-            .expect("main- suffix must be a numeric timestamp");
+            .expect("main- suffix must start with a numeric timestamp");
         assert!(ts > 0, "timestamp must be positive: {id}");
     }
 
@@ -1211,9 +1339,9 @@ mod tests {
         // legacy `pi-<counter>` fallback).
         let id = generate_agent_id("mini-coder", None);
         assert!(id.starts_with("mini-"), "mini id must use mini- namespace: {id}");
-        let ts: u128 = id["mini-".len()..]
+        let ts: u128 = id["mini-".len()..id.rfind('-').unwrap()]
             .parse()
-            .expect("mini- suffix must be a numeric timestamp");
+            .expect("mini- suffix must start with a numeric timestamp");
         assert!(ts > 0, "timestamp must be positive: {id}");
     }
 
@@ -1472,5 +1600,39 @@ mod tests {
             mapper.entries.is_empty(),
             "no entry should be emitted for a plain message"
         );
+    }
+
+    #[test]
+    fn entries_cap_sliding_window_never_exceeds_max() {
+        // #3: the console entry history must be bounded. Pushing 501 entries
+        // into a 500-cap mapper must leave exactly 500 (oldest dropped).
+        let mut mapper = EventMapper::new("pi-cap");
+        for i in 0..501 {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: format!("turn-{i}"),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        assert_eq!(
+            mapper.entries.len(),
+            MAX_CONSOLE_ENTRIES,
+            "entries must be capped at MAX_CONSOLE_ENTRIES"
+        );
+        // The oldest entry must have been evicted (turn-0 dropped).
+        match mapper.entries.first() {
+            Some(ConsoleEntry::Chat { text, .. }) => {
+                assert_eq!(text, "turn-1", "oldest entry should be evicted");
+            }
+            other => panic!("expected Chat entry, got {other:?}"),
+        }
+        // The newest entry (turn-500) must be retained.
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Chat { text, .. }) => {
+                assert_eq!(text, "turn-500", "newest entry must be retained");
+            }
+            other => panic!("expected Chat entry, got {other:?}"),
+        }
     }
 }

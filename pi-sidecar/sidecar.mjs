@@ -20,18 +20,22 @@ import { writeFileSync, rmSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+// #5: bound the JSONL framer buffer. A single oversized line (e.g. a 500MB
+// JSONL record) would otherwise accumulate unbounded and OOM the process.
+const MAX_BUFFER_LEN = 10 * 1024 * 1024; // 10MB
+
 // ---------------------------------------------------------------------------
 // Devboule enrichment metadata (Task 1: enrichment layer)
 // ---------------------------------------------------------------------------
 
 // Module-level context attached to every forwarded event via the `_devboule`
 // field. Enables PlannerPlanMode (orchestrator) and FocusStagePane (coder/mini)
-// to render pi agent output without React changes. Set from env at startup.
-const devbouleContext = {
-	agentRole: process.env.DEVBOULE_AGENT_ROLE || "main-coder",
-	projectId: process.env.DEVBOULE_PROJECT_ID || null,
-	sessionId: process.env.DEVBOULE_SESSION_ID || null,
-};
+// to render pi agent output without React changes.
+//
+// #9: declared with `let` and assigned inside `main()` so the context is NOT
+// captured at module load time (which would leak stale env if the process were
+// ever reused). It is reset on every `main()` entry.
+let devbouleContext;
 
 // ---------------------------------------------------------------------------
 // JSONL helpers
@@ -64,6 +68,32 @@ function createJsonlReader(stream, onLine) {
 	let buffer = "";
 	stream.on("data", async (chunk) => {
 		buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+		// #5: cap the buffer BEFORE scanning for newlines. If it grows past
+		// MAX_BUFFER_LEN, truncate at the last valid line boundary and warn
+		// (emitError + stderr). The sidecar continues with a clean tail.
+		if (buffer.length > MAX_BUFFER_LEN) {
+			const lastNl = buffer.lastIndexOf("\n");
+			if (lastNl !== -1) {
+				const dropped = buffer.length - lastNl - 1;
+				buffer = buffer.slice(lastNl + 1);
+				emitError(
+					"jsonl",
+					`Buffer exceeded ${MAX_BUFFER_LEN} bytes; dropped ${dropped} bytes before last newline`,
+				);
+				console.error(
+					`[pi-sidecar] JSONL buffer overflow: dropped ${dropped} bytes`,
+				);
+			} else {
+				emitError(
+					"jsonl",
+					`Buffer exceeded ${MAX_BUFFER_LEN} bytes with no newline; clearing`,
+				);
+				console.error(
+					"[pi-sidecar] JSONL buffer overflow: no newline found, clearing buffer",
+				);
+				buffer = "";
+			}
+		}
 		while (true) {
 			const nl = buffer.indexOf("\n");
 			if (nl === -1) break;
@@ -92,7 +122,23 @@ function createJsonlReader(stream, onLine) {
  */
 function requestClassification(text) {
 	return new Promise((resolve, reject) => {
-		pendingClassification = { resolve, reject };
+		// #7: never hang forever if the Rust side never delivers `classified`
+		// (e.g. a write failure in write_jsonl_to_stdin). After 5s, proceed with
+		// a default classification — accept the prompt without Pigeon routing.
+		const defaultClassification = {
+			tier: "default",
+			provider: null,
+			model: null,
+			path: "pi",
+		};
+		const timeout = setTimeout(() => {
+			console.error(
+				"[pi-sidecar] requestClassification timed out (5s) — using default classification",
+			);
+			pendingClassification = null;
+			resolve(defaultClassification);
+		}, 5000);
+		pendingClassification = { resolve, reject, timeout };
 		emit({ type: "classify_prompt", text });
 	});
 }
@@ -216,6 +262,14 @@ function buildCustomModelsJson() {
 let activeSession = null;
 
 async function main() {
+	// #9: (re)build devbouleContext from the current process env at startup so
+	// it never leaks stale values across runs.
+	devbouleContext = {
+		agentRole: process.env.DEVBOULE_AGENT_ROLE || "main-coder",
+		projectId: process.env.DEVBOULE_PROJECT_ID || null,
+		sessionId: process.env.DEVBOULE_SESSION_ID || null,
+	};
+
 	const { createAgentSession, SessionManager, AuthStorage, ModelRegistry } =
 		await import("@earendil-works/pi-coding-agent");
 
@@ -368,6 +422,9 @@ async function main() {
 				// For write: event.result is AgentToolResult<undefined>
 				//   → no patch available
 				const patch = event.result?.details?.patch;
+				if (patch && patch.length > 10_000) {
+					patch = patch.slice(0, 10_000) + "\n... [truncated to 10KB]";
+				}
 				editedRsFiles.set(fp, { patch });
 				console.error("[pi-sidecar] censor: queued", fp);
 			}
@@ -380,13 +437,13 @@ async function main() {
 				editedRsFiles.clear();
 			} else if (editedRsFiles.size > 0 && !stdinClosed && censorEnabled) {
 				// Defer so the outer session.prompt() fully resolves first
-				setTimeout(() => triggerCensorReview(session), 0);
+				setTimeout(() => triggerCensorReview(), 0);
 			}
 		}
 
 		if (stdinClosed && event.type === "agent_end" && !isReviewTurn) {
 			clearTimeout(stdinGraceTimer);
-			cleanup(0);
+			setImmediate(() => cleanup(0));
 		}
 	});
 
@@ -438,6 +495,7 @@ async function main() {
 				// Phase 2 Pigeon: Rust classified the prompt; resolve the pending
 				// promise so the `prompt` handler can apply the routing.
 				if (pendingClassification) {
+					clearTimeout(pendingClassification.timeout);
 					pendingClassification.resolve(cmd);
 					pendingClassification = null;
 				}
@@ -509,7 +567,7 @@ export function composeCensorReviewPrompt(files) {
 	].join("\n");
 }
 
-async function triggerCensorReview(session) {
+async function triggerCensorReview() {
 	const files = [...editedRsFiles.entries()];
 	editedRsFiles.clear();
 
@@ -523,19 +581,28 @@ async function triggerCensorReview(session) {
 	}
 
 	const reviewPrompt = composeCensorReviewPrompt(files);
+	const filePaths = files.map(([fp]) => fp);
+	const diffs = files
+		.filter(([, info]) => info.patch)
+		.map(([fp, info]) => `--- ${fp}\n${info.patch}`);
 
-	try {
-		console.error(
-			"[pi-sidecar] censor: sending review prompt for",
-			files.length,
-			"file(s)",
-		);
-		await session.prompt(reviewPrompt);
-	} catch (err) {
-		console.error("[pi-sidecar] censor review failed:", err);
-	} finally {
-		isReviewTurn = false;
-	}
+	// #8: do NOT call `session.prompt()` from inside the subscribe callback —
+	// the pi SDK may not support reentrant prompts and it deadlocks/panics.
+	// Instead, surface the review request as an OUTGOING JSONL line that Rust
+	// renders in the console. Actual review execution is deferred to Phase 5.
+	// TODO(Phase 5): drive the Censor review from Rust (it owns the prompt).
+	console.error(
+		"[pi-sidecar] censor: emitting review trigger for",
+		files.length,
+		"file(s)",
+	);
+	emit({
+		type: "devboule_censor_review",
+		prompt: reviewPrompt,
+		files: filePaths,
+		diffs,
+	});
+	isReviewTurn = false;
 }
 
 // ---------------------------------------------------------------------------

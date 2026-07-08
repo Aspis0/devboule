@@ -263,6 +263,12 @@ pub enum ConsoleEntry {
         pages: Vec<PageEntry>,
         time: String,
     },
+    /// A standalone notice banner (e.g. a web search that completed but returned
+    /// no extractable results). Rendered as a muted system line in the timeline.
+    Banner {
+        text: String,
+        time: String,
+    },
     /// A conversational chat turn (the planner chat): `role` is "assistant" (the
     /// orchestrator talking) or "user" (a steer echoed back) + the message text.
     Chat {
@@ -3124,6 +3130,7 @@ not json\n";
                 ConsoleEntry::WebSearch { query, .. } => query.as_str(),
                 ConsoleEntry::Chat { text, .. } => text.as_str(),
                 ConsoleEntry::Question { text, .. } => text.as_str(),
+                ConsoleEntry::Banner { text, .. } => text.as_str(),
             })
             .collect();
         assert_eq!(
