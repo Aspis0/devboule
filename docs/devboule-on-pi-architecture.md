@@ -308,6 +308,33 @@ The Rust EventMapper reads `_devboule` and maps enriched events to the correct `
 
 Each phase is independently shippable and reversible until Phase 4.
 
+
+### 5f UX — Console `/` Command System (planned, not started)
+
+Replace the hardcoded orchestrator tabs (Local/Claude/Codex) and coder selector with a **unified slash-command system** in the console input. Same UX pattern as Claude Code, OpenClaw, and modern coding agents.
+
+**Commands:**
+| Command | Action |
+|---|---|
+| `/model local [name]` | Switch to local backend (ollama/omlx). Auto-detects available models. |
+| `/model claude` | Switch to Claude CLI (terminal subprocess per decision #10). |
+| `/model openai [provider/model]` | Switch to OpenAI-compatible API (OpenRouter, custom). |
+| `/agent [name]` | Switch between main-coder, mini-coder, reviewer. |
+| `/websearch [query]` | Trigger manual web search (Orchestrator console). |
+| `/plan [goal]` | Start a new plan with the orchestrator. |
+| `/review` | Trigger reviewer on the current task. |
+| `/stop` | Stop the current agent session. |
+| `/help` | List all available commands. |
+
+**Implementation:**
+- The console input detects `/` prefix → command mode
+- Commands are resolved client-side (no round-trip to Rust)
+- Model/agent switches call `setModel()` on the pi session or spawn a new terminal session for Claude
+- Available models are read from the vault (local backends) + pi config (providers)
+- The orchestrator tabs are replaced by a single unified input with slash-command autocomplete
+
+**Estimated:** 1 task (coder-free), ~200 LOC React. Depends on Phase 2 (Pigeon) for automatic routing — slash commands provide manual override.
+
 ---
 
 ## 10. Risks
