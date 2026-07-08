@@ -171,7 +171,7 @@ pub struct ProjectMetadata {
     pub agent_controls: AgentControls,
     /// P6b (role untangle): per-project OVERRIDE of the Main-coder engine. The global
     /// default lives in `RolesConfig.mainCoder` (config.json); this per-project field lets
-    /// project A run `codex` while project B runs `claude` or a local backend. The value is
+    /// project A run `claude` while project B runs a local backend. The value is
     /// an opaque engine/client id (the same shape as the old hand-off `coderId`), validated
     /// at the launch/consumption layer. Resolution at launch = this override, else the global
     /// RolesConfig default. `None` = use the global default. NO-CHURN: omitted from the
@@ -677,7 +677,7 @@ pub struct ProjectAgentLaunchInput {
     /// orchestrator binary's env so its system prompt biases toward producing a plan
     /// (and submitting it for approval via `plan_submit`) before any other action.
     /// Optional and lenient: `None`/`Some(false)` omits the env entirely, so the default
-    /// launch is byte-identical and every existing caller (codex/claude, the current TS
+    /// launch is byte-identical and every existing caller (claude, the current TS
     /// invokes that send no `planFirst`) is unaffected. Ignored for non-orchestrator
     /// clients (they have no planner / read no such env). camelCase over IPC.
     #[serde(default)]
@@ -714,7 +714,7 @@ pub struct ProjectAgentLaunchInput {
     /// provide arbitrary prompt text.
     #[serde(default)]
     pub workflow_run: Option<ProjectWorkflowRunInput>,
-    /// Phase D: when `Some(true)` AND `client` is `"claude"`/`"codex"`, launch the cloud CLI as a
+    /// Phase D: when `Some(true)` AND `client` is `"claude"`, launch the cloud CLI as a
     /// DUPLEX orchestrator — a piped (non-PTY) child in its structured-streaming mode whose events
     /// are normalized into the activity bridge so it drives the SAME planner Stage as the local
     /// orchestrator (instead of an opaque terminal). Optional + lenient: `None`/`Some(false)` keeps
@@ -1144,7 +1144,7 @@ pub struct AgentSession {
     pub model: Option<String>,
     pub status: String,
     pub message: Option<String>,
-    // Launch CLI for this agent (codex/claude/powershell). The app knows it at
+    // Launch CLI for this agent (claude/powershell). The app knows it at
     // launch time. Additive + skip-if-none so older JSON (and the Python MCP
     // server round-tripping the file without this field) still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2087,7 +2087,7 @@ mod tests {
         let json = r#"{
             "projectId": "p1",
             "role": "coder",
-            "client": "codex",
+            "client": "claude",
             "agentId": null,
             "taskId": null
         }"#;
@@ -2100,7 +2100,7 @@ mod tests {
         let json = r#"{
             "projectId": "p1",
             "role": "coder",
-            "client": "codex",
+            "client": "claude",
             "host": "app"
         }"#;
         let input: ProjectAgentLaunchInput = serde_json::from_str(json).unwrap();

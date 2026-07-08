@@ -323,6 +323,7 @@ Replace the hardcoded orchestrator tabs (Local/Claude/Codex) and coder selector 
 | `/websearch [query]` | Trigger manual web search (Orchestrator console). |
 | `/plan [goal]` | Start a new plan with the orchestrator. |
 | `/review` | Trigger reviewer on the current task. |
+| `/oracle [query]` | Force the AI to query the Oracle RAG. Available in Orchestrator + Main Coder consoles. |
 | `/stop` | Stop the current agent session. |
 | `/help` | List all available commands. |
 
