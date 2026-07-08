@@ -310,6 +310,36 @@ Each phase is independently shippable and reversible until Phase 4.
 
 
 
+
+### 5h — Complete Codex Removal + Cloud (OpenAI-compatible) Replacement
+
+**Status:** ⚠️ MAJOR — partial removal done (settings, UI labels), but ~350 references in ~80 files remain.
+
+The first pass (f91886fa, coder-free) removed Codex from settings pickers only. The actual CLI driver (`cloud_duplex.rs`, ~200 LOC), normalizer (`cloud_codex.rs`), design backend, mini coder executor, broker, spawn panel, ProjectsView tabs, and dozens of type/validation files still carry Codex as a first-class backend.
+
+**Scope (files with Codex references):**
+
+| Area | Files | Lines | Action |
+|---|---|---|---|
+| Cloud driver | `cloud_duplex.rs`, `cloud_codex.rs` | ~250 | Rename CodexClient→CloudClient, repurpose for OpenAI-compatible |
+| Design backend | `design_generate.rs`, `design_llm.rs`, `designLlmBackend.ts/card` | ~50 | Add `openai` kind, drop `codex` from CLI path |
+| Mini coder | `mini_coder.rs`, `mini_coder_executor.rs`, `mini_command_build.rs`, `miniCoderBackend.ts/card` | ~80 | Add `openai` kind, redirect codex→openai |
+| Broker/roles | `broker/mod.rs`, `roles_config.rs`, `agent_role.rs` | ~40 | CodexThreadPolicy→CloudThreadPolicy |
+| Projects UI | `ProjectsView.tsx`, `SpawnPanel.tsx`, `TaskCard.tsx`, `PlannerPlanMode.tsx`, `projectWorkspaceModel.ts` | ~60 | Replace codex tabs/buttons with Cloud/OpenAI |
+| Types/validation | `types/backend.ts`, `types/config.ts`, `designLlmBackend.ts`, `miniCoderBackend.ts`, `designProviderDetection.ts` | ~30 | Add `openai` kind, keep `codex` for backward compat only |
+| Settings cards | `MainCoderClientCard.tsx`, `MiniCoderBackendCard.tsx`, `DesignLlmBackendCard.tsx`, `MiniWriteBehaviorCard.tsx` | ~15 | Replace codex option with openai |
+| Tests | ~25 test files | ~100 | Update fixtures |
+| Other | `workspace.rs`, `project_skill.rs`, `agentRowModel.ts`, `customAgentClients.ts` | ~20 | Comment cleanup, default changes |
+
+**Strategy:**
+- `codex` becomes a legacy/internal-only kind for backward compat with old vault configs
+- New `openai` kind added everywhere `codex` was offered in UI
+- `CodexClient` → `CloudClient` (generic OpenAI-compatible JSON-RPC protocol)
+- `cloud_codex.rs` → `cloud_openai.rs` (or kept generic)
+- Vault schema: `MiniCoderBackendKind` keeps `codex` for deserialization, adds `openai` for new configs
+
+**Estimated:** 3-4 tasks (explorer audit + coder-free refactor + deepseek-algo for Rust protocol). ~500-800 LOC changed across ~80 files. High risk — touches core agent launch paths.
+
 ### 5g UX — Devboule Logo + App Icon
 
 Replace the lucide `Shield` placeholder in the sidebar top-left with the actual Devboule logo (`public/assets/devboule-logo.jpeg`). Also update Tauri app icons (`src-tauri/icons/`) for macOS dock, app bundle, and all platform icon sizes.
