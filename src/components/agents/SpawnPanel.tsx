@@ -125,6 +125,11 @@ export function SpawnPanel({
 	// only THREADED into the launch for the orchestrator (see `selection` below), so
 	// toggling to codex/claude can never carry the flag.
 	const [planFirst, setPlanFirst] = useState<boolean>(true);
+	// PTY opt-out for the Claude duplex default: when ON the in-app launch uses the raw
+	// PTY path instead of the cloud-duplex stream. Only meaningful for client "claude"
+	// + host "app"; hidden for every other client. Reset on client switch so a stale
+	// flag never rides a different client's launch.
+	const [terminalPty, setTerminalPty] = useState<boolean>(false);
 	// Phase 6 — the project's auto-detected primary persona language (from the backend), an optional
 	// per-launch override, and whether the (non-invasive by default) editor row is expanded.
 	const [detectedLang, setDetectedLang] = useState<string>("");
@@ -242,6 +247,10 @@ export function SpawnPanel({
 			nextModel = localModel;
 		}
 		if (nextModel !== model) setModel(nextModel);
+		// Reset the PTY opt-out on client switch: the flag is only meaningful for
+		// client "claude" + host "app" (duplex default), so a stale toggle must never
+		// ride into a different client's launch.
+		if (terminalPty) setTerminalPty(false);
 		setPrevClient(client);
 	}
 
@@ -275,6 +284,9 @@ export function SpawnPanel({
 		planFirst: client === "orchestrator" ? planFirst : undefined,
 		// Phase 6 — the per-launch language-persona override (empty ⇒ the backend auto-detects).
 		languageOverride: langOverride.trim().length > 0 ? langOverride : undefined,
+		// PTY opt-out: only threaded for claude (duplex default for in-app launches).
+		// Undefined for every other client so the launch is byte-identical.
+		terminalPty: client === "claude" && terminalPty ? true : undefined,
 	};
 
 	const roleSummary = ROLE_OPTIONS.find((r) => r.id === role)?.summary ?? "";
@@ -460,6 +472,24 @@ export function SpawnPanel({
 					{orchestratorModelNote(localCoderModel)}
 				</p>
 			)}
+			{/* PTY opt-out toggle — visible ONLY for Claude (duplex default). When ON, the
+			    in-app launch uses the raw PTY path instead of the cloud-duplex stream. */}
+			{client === "claude" && (
+				<label className="mb-3 flex cursor-pointer items-start gap-2">
+					<input
+						type="checkbox"
+						checked={terminalPty}
+						onChange={(e) => setTerminalPty(e.target.checked)}
+						aria-label="Terminal (PTY)"
+						data-testid="terminal-pty-toggle"
+						className="mt-0.5 h-3.5 w-3.5 cursor-pointer accent-terracotta"
+					/>
+					<span className="text-[11px] leading-4 text-cream-600">
+						<span className="font-semibold text-cream-800">Terminal (PTY)</span> —
+						Run in a raw terminal instead of the streamed console (applies to Launch in app only)
+					</span>
+				</label>
+			)}
 			{/* 3b — "Plan first" toggle, orchestrator-only. Default ON: the local coder
           should plan before acting and surface the plan in the Plans tab for
           approval. Hidden for codex/claude (they have no planner entry). */}
@@ -540,10 +570,16 @@ export function SpawnPanel({
 					onClick={() => onLaunch(buildLaunchInput(selection, "app"))}
 					disabled={disabled}
 					title={
-						disabledReason ?? "Launch the agent inside an in-app terminal."
+						disabledReason ?? (client === "claude" && !terminalPty
+							? "Launch the agent inside the app (streamed console)."
+							: "Launch the agent inside an in-app terminal.")
 					}
-					data-help-title="This launches the agent inside the app (PTY)."
-					data-help-lines="The agent runs under an in-app terminal you can watch live and reply to.|Use it when you want to supervise or answer the agent directly.|The terminal is read-only except via the reply bar.|Stop kills the PTY child cleanly."
+					data-help-title={client === "claude" && !terminalPty
+						? "This launches the agent inside the app (streamed console)."
+						: "This launches the agent inside the app (PTY)."}
+					data-help-lines={client === "claude" && !terminalPty
+						? "The agent runs as a streamed console child whose events feed the Activity console.|You can watch and reply to the agent live via the streamed Activity rows.|Stop kills the child cleanly."
+						: "The agent runs under an in-app terminal you can watch live and reply to.|Use it when you want to supervise or answer the agent directly.|The terminal is read-only except via the reply bar.|Stop kills the PTY child cleanly."}
 					className="inline-flex items-center gap-1.5 rounded-md bg-terracotta px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-terracotta/90 disabled:opacity-60"
 				>
 					<SquareTerminal className="h-3.5 w-3.5" aria-hidden />

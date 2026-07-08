@@ -330,6 +330,39 @@ describe("buildLaunchInput", () => {
     ).toBeUndefined();
     expect(buildLaunchInput(sel, "app").languageOverride).toBeUndefined();
   });
+
+  it("claude + app defaults to cloudDuplex true (product decision)", () => {
+    expect(
+      buildLaunchInput({ ...sel, client: "claude" }, "app").cloudDuplex,
+    ).toBe(true);
+  });
+
+  it("claude + app + terminalPty=true yields cloudDuplex undefined (PTY opt-out)", () => {
+    expect(
+      buildLaunchInput(
+        { ...sel, client: "claude", terminalPty: true },
+        "app",
+      ).cloudDuplex,
+    ).toBeUndefined();
+  });
+
+  it("claude + external yields cloudDuplex undefined (duplex is app-only)", () => {
+    expect(
+      buildLaunchInput({ ...sel, client: "claude" }, "external").cloudDuplex,
+    ).toBeUndefined();
+  });
+
+  it("codex + app yields cloudDuplex undefined (Planner-only duplex)", () => {
+    expect(
+      buildLaunchInput({ ...sel, client: "codex" }, "app").cloudDuplex,
+    ).toBeUndefined();
+  });
+
+  it("orchestrator client yields cloudDuplex undefined (local path)", () => {
+    expect(
+      buildLaunchInput({ ...sel, client: "orchestrator" }, "app").cloudDuplex,
+    ).toBeUndefined();
+  });
 });
 
 describe("canRoleLaunchTask / spawnDisabledReason", () => {

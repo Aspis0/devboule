@@ -2148,6 +2148,7 @@ fn prepare_or_launch_project_agent(
             &agent_id,
             &input.project_id,
             &project.metadata.agent_controls,
+            &role,
         )
         .ok_or_else(|| "could not build the cloud duplex launch".to_string())?;
         let activity_file =
@@ -2193,6 +2194,11 @@ fn prepare_or_launch_project_agent(
         // D1 FENCE: launch is committed (every fallible step above passed) — stop the
         // stable id's predecessor so the bridge file has one writer generation.
         fence_stale_orchestrator(&app);
+        // Build the first turn: Planner's typed goal when present; for non-orchestrator
+        // roles fall back to the assembled role prompt so a coder/verifier actually
+        // receives its brief. Orchestrator without a goal → None (the planner chat's
+        // first user message arrives later by design).
+        let first_turn = duplex_first_turn(&role, input.initial_goal.as_deref(), &prompt);
         crate::backend::cloud_duplex::spawn_cloud_duplex(
             &app,
             &sessions,
@@ -2203,7 +2209,7 @@ fn prepare_or_launch_project_agent(
             &envs,
             &root_path,
             activity_file,
-            input.initial_goal.as_deref(),
+            first_turn.as_deref(),
             input.initial_goal_msg_id.as_deref(),
             resume_context.as_deref(),
             &input.project_id,
@@ -6424,6 +6430,38 @@ fn claude_permission_mode(mode: crate::backend::broker::SandboxMode) -> &'static
     }
 }
 
+/// Role-gated KAIRION env vars for the cloud duplex launch. Returns the
+/// `ASPIS_ORCHESTRATOR_THINKING` env pair only for the orchestrator role; an
+/// empty vec for every other role (coder, verifier, etc.) so a coder duplex does
+/// NOT carry orchestrator-only env. Pure + total — safe to unit-test.
+fn kairion_thinking_env(role: &str) -> Vec<(String, String)> {
+    if role == "orchestrator" {
+        vec![(
+            "ASPIS_ORCHESTRATOR_THINKING".to_string(),
+            r#"{"type":"adaptive","display":"summarized"}"#.to_string(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// First turn for a cloud duplex child: the Planner's typed goal when present;
+/// for NON-orchestrator roles fall back to the assembled role prompt (a coder
+/// must receive its brief). Orchestrator behavior is unchanged: goal or WAIT
+/// (the planner chat's first user message arrives later by design).
+fn duplex_first_turn(role: &str, initial_goal: Option<&str>, prompt: &str) -> Option<String> {
+    if let Some(goal) = initial_goal {
+        let trimmed = goal.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if role != "orchestrator" && !prompt.trim().is_empty() {
+        return Some(prompt.to_string());
+    }
+    None
+}
+
 fn build_cloud_duplex_launch(
     client: &str,
     model: Option<&str>,
@@ -6444,6 +6482,10 @@ fn build_cloud_duplex_launch(
     // Slice 5c: per-project agent capability/cost controls → native CLI flags (Claude) /
     // thread/start fields (Codex).
     controls: &crate::backend::model::AgentControls,
+    // The effective role for this launch ("orchestrator", "coder", etc.). Used to
+    // gate role-specific env vars (e.g. KAIRION thinking) so a coder duplex does NOT
+    // carry orchestrator-only env.
+    role: &str,
 ) -> Option<(String, Vec<String>, Vec<(String, String)>)> {
     let provider = crate::backend::cloud_duplex::Provider::from_client(client)?;
     let python = crate::oracle::oracle_setup::resolve_oracle_python();
@@ -6819,17 +6861,15 @@ fn build_cloud_duplex_launch(
         // kills the hook before its own poll deadline.
         envs.push(("ASPIS_CONSENT_TIMEOUT_SECS".to_string(), "300".to_string()));
         // KAIRION (orchestrator-only, always-on): force adaptive SUMMARIZED thinking for the
-        // cloud Claude orchestrator duplex so the doubt sensor has a (summarized) reasoning trace
+        // cloud orchestrator duplex so the doubt sensor has a (summarized) reasoning trace
         // to read. Carried as the FROZEN thinking config object. Delivered via env (NOT an argv
         // flag) deliberately: an unknown env var is ignored by the CLI (degrades gracefully) — an
-        // unknown CLI flag would abort the launch. This is reached ONLY on the orchestrator duplex
-        // (build_cloud_duplex_launch is never called for a coder/mini), so coder PTYs are
-        // byte-identical. ⚠️ The exact mechanism the Claude CLI uses to apply this object is
-        // UNVERIFIED and must be confirmed against a live `claude` (flagged for e2e — the owner's eyes).
-        envs.push((
-            "ASPIS_ORCHESTRATOR_THINKING".to_string(),
-            r#"{"type":"adaptive","display":"summarized"}"#.to_string(),
-        ));
+        // unknown CLI flag would abort the launch. Gated on role == "orchestrator" because
+        // a coder duplex must NOT carry it (the coder is a worker, not a planner — the thinking
+        // trace is only useful for the orchestrator's doubt sensor). ⚠️ The exact mechanism
+        // the Claude CLI uses to apply this object is UNVERIFIED and must be confirmed against
+        // a live `claude` (flagged for e2e — the owner's eyes).
+        envs.extend(kairion_thinking_env(role));
     }
     Some((program.to_string(), args, envs))
 }
@@ -16634,6 +16674,102 @@ Never print provider tokens, launch tokens, session tokens or secrets. Provider 
         );
         assert!(!orch_no_task.contains("Preferred task_id"));
         assert!(orch_no_task.contains("Plan and DELEGATE"));
+    }
+
+    // --- kairion_thinking_env: role-gated env for cloud duplex launches ---
+
+    #[test]
+    fn kairion_thinking_env_orchestrator_returns_env() {
+        let env = kairion_thinking_env("orchestrator");
+        assert_eq!(env.len(), 1, "orchestrator must get exactly one env pair");
+        assert_eq!(env[0].0, "ASPIS_ORCHESTRATOR_THINKING");
+        assert!(
+            env[0].1.contains("adaptive"),
+            "the thinking config must contain the adaptive type"
+        );
+        assert!(
+            env[0].1.contains("summarized"),
+            "the thinking config must request summarized display"
+        );
+    }
+
+    #[test]
+    fn kairion_thinking_env_coder_returns_empty() {
+        let env = kairion_thinking_env("coder");
+        assert!(
+            env.is_empty(),
+            "a coder duplex must NOT carry ASPIS_ORCHESTRATOR_THINKING"
+        );
+    }
+
+    #[test]
+    fn kairion_thinking_env_verifier_returns_empty() {
+        let env = kairion_thinking_env("verifier");
+        assert!(env.is_empty(), "verifier must not get thinking env");
+    }
+
+    // --- duplex_first_turn: first-turn routing for cloud duplex launches ---
+
+    #[test]
+    fn duplex_first_turn_goal_present_wins_for_any_role() {
+        // Orchestrator with a goal → goal.
+        assert_eq!(
+            duplex_first_turn("orchestrator", Some("do the thing"), "some prompt"),
+            Some("do the thing".to_string())
+        );
+        // Coder with a goal → goal.
+        assert_eq!(
+            duplex_first_turn("coder", Some("ship it"), "bigger prompt here"),
+            Some("ship it".to_string())
+        );
+    }
+
+    #[test]
+    fn duplex_first_turn_coder_no_goal_falls_back_to_prompt() {
+        let prompt = "You are a coder. Edit files.";
+        assert_eq!(
+            duplex_first_turn("coder", None, prompt),
+            Some(prompt.to_string())
+        );
+    }
+
+    #[test]
+    fn duplex_first_turn_verifier_no_goal_falls_back_to_prompt() {
+        let prompt = "You are a verifier. Audit read-only.";
+        assert_eq!(
+            duplex_first_turn("verifier", None, prompt),
+            Some(prompt.to_string())
+        );
+    }
+
+    #[test]
+    fn duplex_first_turn_orchestrator_no_goal_returns_none() {
+        // Orchestrator without a goal → None (the planner chat's first user
+        // message arrives later by design).
+        assert_eq!(
+            duplex_first_turn("orchestrator", None, "some prompt"),
+            None
+        );
+    }
+
+    #[test]
+    fn duplex_first_turn_coder_no_goal_empty_prompt_returns_none() {
+        assert_eq!(duplex_first_turn("coder", None, ""), None);
+        assert_eq!(duplex_first_turn("coder", None, "   "), None);
+    }
+
+    #[test]
+    fn duplex_first_turn_whitespace_only_goal_treated_as_absent() {
+        // Whitespace-only goal → absent → fall back to prompt for coder.
+        assert_eq!(
+            duplex_first_turn("coder", Some("   \n  "), "the real prompt"),
+            Some("the real prompt".to_string())
+        );
+        // Whitespace-only goal + orchestrator → None.
+        assert_eq!(
+            duplex_first_turn("orchestrator", Some("  \t\n"), "some prompt"),
+            None
+        );
     }
 }
 

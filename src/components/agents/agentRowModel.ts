@@ -270,6 +270,11 @@ export interface SpawnSelection {
 	// widening at every call site; the Rust boundary re-validates it against
 	// config.json (normalize_agent_client).
 	client: string;
+	// Explicit PTY opt-out: when true the in-app launch for a Claude coder uses the
+	// raw PTY path instead of the cloud-duplex stream. Only meaningful for
+	// client "claude" + host "app"; for every other combination the field is ignored
+	// (duplex never applies). Absent/undefined = duplex is the default (product decision).
+	terminalPty?: boolean;
 	// 3b — "Plan first" bias for the LOCAL orchestrator (client === "orchestrator")
 	// ONLY. When true the launch sets DEVBOULE_PLAN_FIRST=1 so the orchestrator's
 	// system prompt gains a plan-before-acting directive. Meaningless for
@@ -421,6 +426,15 @@ export function buildLaunchInput(
 		languageOverride:
 			selection.languageOverride && selection.languageOverride.trim().length > 0
 				? selection.languageOverride.trim()
+				: undefined,
+		// Duplex is the DEFAULT for in-app Claude launches (product decision). Undefined
+		// (not false) for every other combination so all other launches stay byte-identical.
+		// Codex/openai keep their current behavior (Planner-only duplex, set elsewhere).
+		cloudDuplex:
+			selection.client === "claude" &&
+			host === "app" &&
+			selection.terminalPty !== true
+				? true
 				: undefined,
 	};
 }
