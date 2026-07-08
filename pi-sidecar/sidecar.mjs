@@ -245,6 +245,15 @@ async function handlePromptCommand(cmd, session, modelRegistry) {
 // Track temp dir for cleanup.
 let activeTmpDir = null;
 
+// Fix 1: FIFO queue for prompts that arrive while a turn is in flight. A prompt
+// sent while `promptInFlight` is true is queued (up to MAX_QUEUED_PROMPTS) and
+// run when the current turn ends, so a Censor-findings prompt (or any prompt)
+// sent minutes after a review started is never silently lost — Rust never reads
+// the rejection response, so dropping it would report "found N issues" as if
+// delivered.
+const MAX_QUEUED_PROMPTS = 5;
+let promptQueue = [];
+
 // Censor hook config
 // Delay: give the Rust side time to flush the final MiniActivityEvent snapshot
 // before the review turn begins.
@@ -487,7 +496,13 @@ async function main() {
 
 		if (stdinClosed && event.type === "agent_end" && !isReviewTurn) {
 			clearTimeout(stdinGraceTimer);
-			setImmediate(() => cleanup(0));
+			// Fix 1: if prompts are queued (arrived while a turn was in flight),
+			// the prompt handler's finally will shift + run the next one. Don't exit
+			// here or we'd kill a queued prompt mid-flight. Only exit once the queue
+			// has fully drained. Behavior is identical when nothing is queued.
+			if (promptQueue.length === 0) {
+				setImmediate(() => cleanup(0));
+			}
 		}
 	});
 
@@ -495,6 +510,31 @@ async function main() {
 	let promptInFlight = false;
 	let stdinClosed = false;
 	let stdinGraceTimer = null;
+
+	// Fix 1: drain the FIFO queue of prompts that arrived while a turn was in
+	// flight. Called after each turn ends (promptInFlight is set back to false in
+	// the prompt handler's finally). Re-runs each queued command through the SAME
+	// handlePromptCommand path (classification, routing, prompt). All queued
+	// prompts run sequentially; the while loop plus the re-entrant call from the
+	// next turn's finally cover every case.
+	async function drainPromptQueue() {
+		while (promptQueue.length > 0) {
+			const nextCmd = promptQueue.shift();
+			promptInFlight = true;
+			try {
+				await handlePromptCommand(nextCmd, session, modelRegistry);
+			} catch (err) {
+				emit({
+					type: "response",
+					command: "prompt",
+					success: false,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			} finally {
+				promptInFlight = false;
+			}
+		}
+	}
 
 	createJsonlReader(process.stdin, async (line) => {
 		let cmd;
@@ -515,12 +555,32 @@ async function main() {
 		switch (cmd.type) {
 			case "prompt": {
 				if (promptInFlight) {
-					emit({
-						type: "response",
-						command: "prompt",
-						success: false,
-						error: "A prompt is already in flight. Wait for agent_end.",
-					});
+					// Fix 1: queue the command instead of dropping it. A prompt sent
+					// while a turn is in flight would otherwise be silently lost
+					// (Rust's send_prompt_to_session only checks the stdin WRITE and
+					// never reads the rejection response). Keep the rejection only
+					// when the queue is ALSO full.
+					const { accepted, queue: nextQueue } = enqueuePrompt(
+						promptQueue,
+						cmd,
+						MAX_QUEUED_PROMPTS,
+					);
+					promptQueue = nextQueue;
+					if (!accepted) {
+						emit({
+							type: "response",
+							command: "prompt",
+							success: false,
+							error: "prompt queue full",
+						});
+					} else {
+						emit({
+							type: "response",
+							command: "prompt",
+							success: true,
+							queued: true,
+						});
+					}
 					break;
 				}
 				// #3: guard against an oversized prompt (e.g. a 10MB paste) that
@@ -549,6 +609,8 @@ async function main() {
 					});
 				} finally {
 					promptInFlight = false;
+					// Fix 1: process any prompts that queued while this turn ran.
+					await drainPromptQueue();
 				}
 				break;
 			}
@@ -565,6 +627,10 @@ async function main() {
 			}
 
 			case "quit": {
+				// Fix 1: don't lose queued prompts silently on quit.
+				if (promptQueue.length > 0) {
+					emit({ type: "queue_dropped", count: promptQueue.length });
+				}
 				cleanup(0);
 				break;
 			}
@@ -627,6 +693,19 @@ export function composeCensorReviewPrompt(files) {
 		"",
 		...(diffLines.length > 0 ? ["### Diffs:", ...diffLines, ""] : []),
 	].join("\n");
+}
+
+/**
+ * Pure helper: attempt to enqueue a prompt command onto the queue (immutable
+ * update). Returns `{ accepted, queue }`. Rejected (`accepted: false`) when the
+ * queue is already at `max`, in which case `queue` is returned unchanged.
+ * Exported for testing the queue push/shift logic without running the sidecar.
+ */
+export function enqueuePrompt(queue, cmd, max) {
+	if (queue.length >= max) {
+		return { accepted: false, queue };
+	}
+	return { accepted: true, queue: [...queue, cmd] };
 }
 
 async function triggerCensorReview() {

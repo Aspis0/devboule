@@ -65,11 +65,72 @@ static CENSOR_REVIEW_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII: decrements the in-flight counter when the review thread ends — including on panic unwind,
 /// so a panicking review can never permanently leak a slot.
-struct InflightGuard;
+pub(crate) struct InflightGuard;
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         CENSOR_REVIEW_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Reserve an in-flight slot for a Censor review, enforcing the
+/// [`CENSOR_REVIEW_MAX_INFLIGHT`] cap AND the free-RAM gate that
+/// `ingest_pigeon_censor_reviews` applies before spawning a review thread.
+/// Returns `Some(guard)` on success (the guard releases the slot on drop,
+/// including on panic); `None` when the cap is saturated or free RAM is too low.
+///
+/// Reused by the pi sidecar's `devboule_censor_review` hook so its one-shot
+/// review thread shares the SAME back-pressure as the Pigeon ingest path instead
+/// of duplicating the cap/RAM logic.
+pub(crate) fn try_begin_censor_review() -> Option<InflightGuard> {
+    // RAM gate (unchanged): never start a review below the free-RAM floor.
+    if crate::backend::hardware::available_ram_bytes() < CENSOR_REVIEW_MIN_FREE_RAM {
+        return None;
+    }
+    // CAS loop: increment the in-flight counter only while still below the cap.
+    // Replaces the previous load()+fetch_add() pair, which let two concurrent
+    // callers transiently exceed CENSOR_REVIEW_MAX_INFLIGHT (TOCTOU on the cap).
+    let acquired = CENSOR_REVIEW_INFLIGHT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            if v >= CENSOR_REVIEW_MAX_INFLIGHT {
+                None
+            } else {
+                Some(v + 1)
+            }
+        })
+        .is_ok();
+    if acquired {
+        Some(InflightGuard)
+    } else {
+        None
+    }
+}
+
+/// Whether a Censor review can actually run for `project_id` right now: the
+/// project passes the anti-RCE trust gate, a Censor LLM client can be built from
+/// the `censorLocalAi` config, and the model probes available. Returns
+/// `Err(reason)` with a human-readable message when it cannot — used by callers
+/// (e.g. the pi sidecar hook) that must surface a VISIBLE console note instead
+/// of silently no-op'ing. Does NOT run a review and does NOT touch the shard.
+///
+/// This reuses the SAME building blocks as `process_censor_review` (trust gate +
+/// `build_censor_client` + `probe_available`) so the gating lives in exactly one
+/// place; it deliberately does not re-run the voted Gemma tier.
+pub(crate) fn censor_review_runnable(
+    app: &tauri::AppHandle,
+    project_id: &str,
+) -> Result<(), String> {
+    if !crate::backend::projects::project_censor_trusted(app, project_id).unwrap_or(false) {
+        return Err("project is not Censor-trusted (anti-RCE gate)".into());
+    }
+    let cfg = crate::backend::projects::read_censor_local_ai(app);
+    let client = match build_censor_client(&cfg) {
+        Ok(c) => c,
+        Err(e) => return Err(format!("no Censor LLM client configured: {e}")),
+    };
+    if !crate::backend::censor::gemma::probe_available(client.as_ref()) {
+        return Err("Censor model is not available (probe failed)".into());
+    }
+    Ok(())
 }
 
 /// Build the Censor LLM client for `cfg`, reading the cloud API key from the vault ONLY when

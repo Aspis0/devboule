@@ -19,19 +19,19 @@
 //! Design doc: `docs/devboule-on-pi-architecture.md` §7 (bridge), §11 (decisions #7, #9).
 //! Mirror pattern: `oracle/python_oracle.rs` (Command spawn + env injection).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::mini_activity::{ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle, PageEntry};
+use super::mini_activity::{push_coder_note, ConsoleActivity, ConsoleEntry, MiniActivityEvent, NodeStyle, PageEntry};
 use super::sandbox::{NetPolicy, ResourceLimits, SandboxPolicy};
 
 // ---- per-session state (decision #7) --------------------------------------
@@ -776,6 +776,12 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
         }
     }
     save_pi_sessions(&state, &pi_project_root());
+
+    // Fix 6: evict per-session Censor state (anti-loop counter + delivered-ids
+    // set) after a successful stop, so the statics don't grow forever and a
+    // re-created stable session id starts clean.
+    censor_session_state_reset(session_id);
+
     Ok(true)
 }
 
@@ -853,6 +859,14 @@ fn get_or_spawn_session(
     // Phase 2: spawn outside the lock.
     let new_session = spawn_pi_session_inner(app, &id, prev_gen, role, project_id)?;
 
+    // Fix 2: a fresh child process = a fresh generation. Reset this session's
+    // anti-loop cap AND delivered-finding set (censor_session_state_reset) so a
+    // cap reached in generation N never suppresses Censor delivery forever after
+    // a relaunch. This covers EVERY spawn path (spike_pi_prompt, orchestrator,
+    // coder) without touching projects.rs — the loop counter alone was only
+    // reset from spike_pi_prompt, leaving the stable orchestrator session id
+    // capped across relaunches.
+
     // Phase 3: re-acquire lock and store the real session.
     let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
     // Reconcile: if the slot was removed (e.g. concurrent stop), clean up.
@@ -905,6 +919,10 @@ pub async fn spike_pi_prompt(
     session_id: Option<String>,
 ) -> Result<SessionInfo, String> {
     let (sid, is_new) = get_or_spawn_session(&app, session_id, None, None)?;
+
+    // 3e: a fresh (non-censor) user prompt breaks any in-flight review→fix→review
+    // loop, so reset this session's consecutive censor-triggered round counter.
+    censor_loop_reset(&sid);
 
     // Deliver the prompt to the freshly spawned session's stdin. The entire
     // liveness-check + JSONL write + zombie-cleanup block now lives in
@@ -1114,14 +1132,18 @@ struct PiEvent {
     /// The `_devboule` enrichment object the sidecar stamps onto every event
     /// (Task 1): `{ agentRole, projectId, sessionId }`.
     #[serde(rename = "_devboule", default)]
-    devboule: Option<serde_json::Value>,
+    devboule: Option<DevbouleContext>,
     /// Censor review trigger (#8): the composed review prompt + affected files/diffs,
     /// emitted by the sidecar to surface a review request in the console without a
-    /// reentrant `session.prompt()`. Deferred to Phase 5 for actual execution.
+    /// reentrant `session.prompt()`. The real review runs in Rust now (we don't
+    /// re-dump the raw prompt — it's noise), but the sidecar still sends these,
+    /// so keep them parsed for the event contract.
+    #[allow(dead_code)]
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     files: Option<Vec<String>>,
+    #[allow(dead_code)]
     #[serde(default)]
     diffs: Option<Vec<String>>,
 }
@@ -1134,6 +1156,20 @@ struct AssistantMessageEvent {
     delta: Option<String>,
     #[serde(rename = "contentIndex", default)]
     content_index: Option<u32>,
+}
+
+/// Typed mirror of the sidecar's `_devboule` enrichment object (Task 1):
+/// `{ agentRole, projectId, sessionId }`. Parsed directly off the event so the
+/// censor-review hook can read `projectId`/`sessionId` without `serde_json`
+/// lookups.
+#[derive(Debug, Default, Deserialize)]
+struct DevbouleContext {
+    #[serde(rename = "agentRole", default)]
+    agent_role: Option<String>,
+    #[serde(rename = "projectId", default)]
+    project_id: Option<String>,
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
 }
 
 /// Sliding-window cap for the console entry history (#3). Prevents unbounded
@@ -1366,33 +1402,68 @@ impl EventMapper {
                 self.emit_snapshot(app);
             }
             "devboule_censor_review" => {
-                // #8: surface the Censor review request in the console. The sidecar
-                // emits this (instead of a reentrant session.prompt) after a Rust
-                // edit turn. Actual review execution is deferred to Phase 5.
+                // #8: a real Censor review was just requested by the sidecar after a
+                // Rust-edit turn. Surface a banner, then run the review on a detached
+                // thread (the reader must never block on the heavy LLM pass) and route
+                // any confirmed findings back into the session as a prompt.
                 self.flush_text_block();
-                let files = event
-                    .files
-                    .as_ref()
-                    .map(|f| f.join(", "))
-                    .unwrap_or_default();
-                let banner = if files.is_empty() {
-                    "⚑ Censor review requested".to_string()
-                } else {
-                    format!("⚑ Censor review requested for: {files}")
-                };
+                let d = censor_review_dispatch(event, &self.agent_id);
                 self.push_entry(ConsoleEntry::Coder {
                     node: Some(NodeStyle::Sage),
-                    text: banner,
+                    text: d.banner.clone(),
                     time: Self::now_str(),
                 });
-                if let Some(ref prompt) = event.prompt {
-                    self.push_entry(ConsoleEntry::Coder {
-                        node: None,
-                        text: format!("  review: {prompt}"),
-                        time: String::new(),
-                    });
-                }
                 self.emit_snapshot(app);
+
+                // Without a project id we cannot resolve the root or trust gate, so
+                // skip loudly (no silent degradation — a hard project rule).
+                let Some(project_id) = d.project_id.clone() else {
+                    self.push_entry(ConsoleEntry::Banner {
+                        text: "Censor review skipped (no project id)".to_string(),
+                        time: Self::now_str(),
+                    });
+                    self.emit_snapshot(app);
+                    return;
+                };
+
+                // Capture everything the detached thread needs (AppHandle is Clone;
+                // the mapper outlives the spawned thread).
+                let app_for_thread = app.clone();
+                let agent_id = self.agent_id.clone();
+                let project_id_t = project_id.clone();
+                let session_id_t = d.session_id.clone();
+                let files_t = d.files.clone();
+
+                // Spawn ONE detached thread named for the work. The reader thread
+                // returns immediately; the review (incl. the voted Gemma tier) runs
+                // here so the stdout reader is never blocked.
+                //
+                // Fix 3: a spawn failure (e.g. the OS refuses a thread) must not be
+                // swallowed — otherwise the "⚑ Censor review started" banner dangles
+                // forever. On Err, surface a visible console note via the SAME
+                // store/push_censor_note mechanism the thread body uses.
+                let agent_id_for_thread = agent_id.clone();
+                match std::thread::Builder::new()
+                    .name("pi-censor-review".to_string())
+                    .spawn(move || {
+                        run_pi_censor_review(
+                            &app_for_thread,
+                            &agent_id_for_thread,
+                            &project_id_t,
+                            &session_id_t,
+                            &files_t,
+                        );
+                    }) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        push_censor_note(
+                            app,
+                            &agent_id,
+                            &format!("Censor review failed to start: {e}"),
+                            Some(NodeStyle::Sage),
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -1407,10 +1478,9 @@ impl EventMapper {
         if let Some(role) = event
             .devboule
             .as_ref()
-            .and_then(|d| d.get("agentRole"))
-            .and_then(|v| v.as_str())
+            .and_then(|d| d.agent_role.clone())
         {
-            self.current_role = Some(role.to_string());
+            self.current_role = Some(role);
         }
     }
 
@@ -1486,6 +1556,410 @@ impl EventMapper {
             time: Self::now_str(),
             msg_id: None,
         });
+    }
+}
+
+// ---- pi sidecar Censor review hook (#8, real Rust Censor) ------------------
+//
+// When the sidecar reports a `devboule_censor_review` event (after a Rust-edit
+// turn), `handle_event` spawns ONE detached thread (`run_pi_censor_review`) so the
+// stdout reader is never blocked on the heavy LLM pass. The thread reuses the real
+// Censor entry point (`censor_review::process_censor_review`) — which runs the
+// deterministic FINE runners + the voted Gemma tier and writes the shard — reads
+// the confirmed findings back, and routes them into the session as a prompt.
+
+/// Timeout for `wait_for_censor_findings` after a review pass. `process_censor_review`
+/// writes the shard synchronously (incl. the voted Gemma tier), so findings are present
+/// by the time it returns; this is just a small grace window for the shard write to settle.
+const CENSOR_REVIEW_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max length of the findings message delivered back into the session, to avoid
+/// flooding the agent's context with a chatty review.
+const CENSOR_REVIEW_MSG_MAX_CHARS: usize = 4000;
+/// Max consecutive censor-triggered rounds per session before we stop auto-sending
+/// prompts back into the session (anti-loop guard, spec 3e).
+const CENSOR_LOOP_MAX_CONSECUTIVE: u8 = 2;
+
+/// Per-session count of consecutive censor-triggered rounds (auto-sent prompts).
+/// Bumped every time the hook auto-delivers a findings prompt; reset to 0 whenever
+/// the user sends a fresh prompt (`spike_pi_prompt`), breaking any
+/// review→fix→review loop. Lazily initialized so the module stays free of a const
+/// initializer for a non-const `Mutex`.
+static CENSOR_LOOP_COUNTERS: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
+
+fn censor_loop_counters() -> &'static Mutex<HashMap<String, u8>> {
+    CENSOR_LOOP_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Result of parsing a `devboule_censor_review` event: the resolved inputs the
+/// detached review thread needs, plus the console banner text (so the dispatch
+/// logic is unit-testable without an `AppHandle`).
+struct CensorReviewDispatch {
+    /// Banner text to show immediately ("⚑ Censor review started for: ...").
+    banner: String,
+    /// Resolved project id, or `None` if the event carried none (=> skip).
+    project_id: Option<String>,
+    /// Session id to deliver any findings prompt to (falls back to `agent_id`).
+    session_id: String,
+    /// Edited file paths (as the sidecar sent them).
+    files: Vec<String>,
+}
+
+/// Pure parse + dispatch for a `devboule_censor_review` event: extract the banner
+/// text, project id, session id (falling back to `agent_id`), and edited files.
+/// `project_id` is `None` when the event has none, signalling the caller to emit
+/// the "no project id" skip note and bail. Factored out of `handle_event` so the
+/// parse + dispatch decision is unit-testable without an `AppHandle`.
+fn censor_review_dispatch(event: &PiEvent, agent_id: &str) -> CensorReviewDispatch {
+    let files = event.files.clone().unwrap_or_default();
+    let banner = if files.is_empty() {
+        "⚑ Censor review started".to_string()
+    } else {
+        format!("⚑ Censor review started for: {}", files.join(", "))
+    };
+    let project_id = event.devboule.as_ref().and_then(|d| d.project_id.clone());
+    let session_id = event
+        .devboule
+        .as_ref()
+        .and_then(|d| d.session_id.clone())
+        .unwrap_or_else(|| agent_id.to_string());
+    CensorReviewDispatch {
+        banner,
+        project_id,
+        session_id,
+        files,
+    }
+}
+
+/// Pure: would a fresh censor-triggered round for `session_id` be allowed, given
+/// `map` holding the running consecutive-round counts? True while the count is
+/// below `max` (the cap is on consecutive *sent* rounds).
+fn censor_loop_allow_in(map: &HashMap<String, u8>, session_id: &str, max: u8) -> bool {
+    map.get(session_id).copied().unwrap_or(0) < max
+}
+
+/// Pure: bump the consecutive-round count for `session_id` (called after a round
+/// is actually delivered).
+fn censor_loop_bump_in(map: &mut HashMap<String, u8>, session_id: &str) {
+    *map.entry(session_id.to_string()).or_insert(0) += 1;
+}
+
+/// Pure: reset the consecutive-round count for `session_id` to 0.
+fn censor_loop_reset_in(map: &mut HashMap<String, u8>, session_id: &str) {
+    map.insert(session_id.to_string(), 0);
+}
+
+/// Whether the hook may auto-deliver another findings prompt to `session_id`.
+fn censor_loop_allow(session_id: &str) -> bool {
+    let map = censor_loop_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    censor_loop_allow_in(&map, session_id, CENSOR_LOOP_MAX_CONSECUTIVE)
+}
+
+/// Record that a findings prompt was delivered for `session_id`.
+fn censor_loop_bump(session_id: &str) {
+    let mut map = censor_loop_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    censor_loop_bump_in(&mut map, session_id);
+}
+
+/// Reset the consecutive-round counter — called on a fresh (non-censor) user prompt.
+fn censor_loop_reset(session_id: &str) {
+    let mut map = censor_loop_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    censor_loop_reset_in(&mut map, session_id);
+}
+
+// ---- Fix 4: per-session delivered-finding ids (dedup across rounds) -------
+//
+// `wait_for_censor_findings` returns ALL Open findings in the shard, not just
+// new ones, so a finding already delivered to the agent would be re-sent every
+// 2 rounds forever. We keep, per session, the set of finding ids we have already
+// delivered and drop them before re-prompting. Lazily initialized like the loop
+// counters above.
+static CENSOR_DELIVERED_IDS: OnceLock<Mutex<HashMap<String, HashSet<String>>>> =
+    OnceLock::new();
+
+fn censor_delivered_ids() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    CENSOR_DELIVERED_IDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pure: keep only the findings whose id has NOT yet been delivered to the agent
+/// for this session. `delivered` (the per-session set) is mutated in place: ids of
+/// the findings we are about to (re-)send are added so a later round won't repeat
+/// them. Returns the surviving findings plus the count already delivered.
+fn censor_dedup_in(
+    delivered: &mut HashSet<String>,
+    findings: &[crate::backend::censor::schema::Finding],
+) -> (Vec<crate::backend::censor::schema::Finding>, usize) {
+    let mut new_findings = Vec::new();
+    let mut already = 0usize;
+    for f in findings {
+        if delivered.contains(&f.id) {
+            already += 1;
+        } else {
+            delivered.insert(f.id.clone());
+            new_findings.push(f.clone());
+        }
+    }
+    (new_findings, already)
+}
+
+/// Drop findings already delivered to `session_id`, recording the survivors in
+/// the per-session delivered-id set. Returns (new_findings, already_delivered_count).
+fn censor_dedup(
+    session_id: &str,
+    findings: &[crate::backend::censor::schema::Finding],
+) -> (Vec<crate::backend::censor::schema::Finding>, usize) {
+    let mut map = censor_delivered_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let delivered = map.entry(session_id.to_string()).or_default();
+    censor_dedup_in(delivered, findings)
+}
+
+/// Reset/evict ALL per-session Censor state (anti-loop counter + delivered-id
+/// set) for `session_id`. Used on a fresh (new-generation) spawn — Fix 2 reset —
+/// and on session stop — Fix 6 eviction — so stable session ids (e.g. the
+/// orchestrator) never carry a stale cap or delivered-ids across relaunches, and
+/// the per-session statics don't grow forever.
+fn censor_session_state_reset(session_id: &str) {
+    {
+        let mut map = censor_loop_counters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(session_id);
+    }
+    {
+        let mut map = censor_delivered_ids()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(session_id);
+    }
+}
+
+/// Pure, testable core of [`relativize_censor_path`]: if `file` is absolute and
+/// begins with `root` (a directory path), return the remainder without the leading
+/// separator; otherwise return `file` unchanged.
+fn relativize_censor_path_in(root: &str, file: &str) -> String {
+    let root = root.trim_end_matches('/');
+    if file.starts_with(root) && file[root.len()..].starts_with('/') {
+        return file[root.len() + 1..].to_string();
+    }
+    file.to_string()
+}
+
+/// Convert a file path to a project-relative path (what `process_censor_review` /
+/// `wait_for_censor_findings` expect). The sidecar forwards the path the agent
+/// handed to its write/edit tool, which may be absolute — strip the root prefix
+/// when present, otherwise pass through.
+fn relativize_censor_path(root: &Path, file: &str) -> String {
+    relativize_censor_path_in(&root.to_string_lossy(), file)
+}
+
+/// Truncate `s` to at most `max` chars (the ellipsis counts toward `max`),
+/// appending an ellipsis when cut. Small and local (no shared truncation helper
+/// was reusable); keeps the findings message bounded to a sane length.
+fn truncate_to_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let take = max.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
+/// Compose the compact message delivered back into the session when the Censor
+/// review surfaces confirmed findings. Capped to [`CENSOR_REVIEW_MSG_MAX_CHARS`]
+/// so a chatty review can't flood the agent's context.
+fn compose_censor_review_message(
+    findings: &[crate::backend::censor::schema::Finding],
+) -> String {
+    let n = findings.len();
+    let mut body = format!("Automated Censor review found {n} issue(s):\n");
+    for f in findings {
+        let line = f
+            .line
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let sev = match f.severity {
+            crate::backend::censor::schema::Severity::High => "HIGH",
+            crate::backend::censor::schema::Severity::Medium => "MEDIUM",
+            crate::backend::censor::schema::Severity::Low => "LOW",
+        };
+        let snippet = truncate_to_chars(&f.body, 120);
+        body.push_str(&format!(
+            "- {}:{} [{}] {} — {}\n",
+            f.file, line, sev, f.title, snippet
+        ));
+    }
+    body.push_str("Fix the confirmed issues above, then continue.");
+    truncate_to_chars(&body, CENSOR_REVIEW_MSG_MAX_CHARS)
+}
+
+/// Emit a passive console note on the session's mini-activity channel. Used by the
+/// detached censor-review thread — which cannot mutate the `EventMapper`'s own
+/// entry vec — to surface VISIBLE notes (busy / cap / clean / error paths) without
+/// touching the agent's live/stopped status.
+fn push_censor_note(app: &AppHandle, agent_id: &str, text: &str, style: Option<NodeStyle>) {
+    let ts = EventMapper::now_str();
+    let store = app.state::<crate::backend::mini_activity::MiniActivityStore>();
+    store.update(app, agent_id, |a| {
+        push_coder_note(a, text, style, &ts);
+    });
+}
+
+/// Detached-thread body for the pi sidecar's `devboule_censor_review` hook. Runs
+/// the real Censor review (reusing `censor_review::process_censor_review`, which
+/// runs the deterministic FINE runners + the voted Gemma tier and writes the
+/// shard) sequentially per file, then routes any confirmed findings back into the
+/// session as a prompt. Every failure path emits a VISIBLE console note — no
+/// silent degradation (hard project rule).
+fn run_pi_censor_review(
+    app: &AppHandle,
+    agent_id: &str,
+    project_id: &str,
+    session_id: &str,
+    files: &[String],
+) {
+    use crate::backend::censor::schema::{Finding, Verdict};
+
+    // 3a: in-flight cap + free-RAM gate, shared with the Pigeon ingest path.
+    let _guard = match crate::backend::censor_review::try_begin_censor_review() {
+        Some(g) => g,
+        None => {
+            push_censor_note(app, agent_id, "Censor review skipped (busy)", Some(NodeStyle::Sage));
+            return;
+        }
+    };
+
+    // 4: failure paths must be VISIBLE. Gate on trust + config + probe up front so
+    // we can name the reason instead of silently no-op'ing (process_censor_review
+    // would otherwise swallow these).
+    if let Err(reason) = crate::backend::censor_review::censor_review_runnable(app, project_id) {
+        push_censor_note(
+            app,
+            agent_id,
+            &format!("Censor review skipped ({reason})"),
+            Some(NodeStyle::Sage),
+        );
+        return;
+    }
+
+    // Resolve the canonical root once (single source of truth).
+    let root = match crate::backend::projects::resolve_project_root_by_id(app, project_id) {
+        Ok(r) => r,
+        Err(e) => {
+            push_censor_note(
+                app,
+                agent_id,
+                &format!("Censor review skipped (cannot resolve project root: {e})"),
+                Some(NodeStyle::Sage),
+            );
+            return;
+        }
+    };
+
+    // 3b: relativize absolute paths to project-relative, then run ONE review per
+    // file sequentially in this thread (the k-vote runs are heavy on the local
+    // model — sequential is deliberate, not one-thread-per-file).
+    let rel_files: Vec<String> = files
+        .iter()
+        .map(|f| relativize_censor_path(&root, f))
+        .collect();
+    for f in &rel_files {
+        let _ = crate::backend::censor_review::process_censor_review(
+            app,
+            &crate::backend::censor_review::CensorReviewRequest {
+                project_id: project_id.to_string(),
+                root: String::new(),
+                file: f.clone(),
+                known_findings: vec![],
+            },
+        );
+    }
+
+    // 3c: read the findings back from the shard, keep only confirmed-tier ones
+    // (the voted Gemma promotion) for the edited files.
+    let findings: Vec<Finding> = crate::backend::censor::commands::wait_for_censor_findings(
+        &root,
+        &rel_files,
+        CENSOR_REVIEW_WAIT_TIMEOUT,
+    );
+    let confirmed: Vec<Finding> = findings
+        .iter()
+        .filter(|f| f.verdict == Verdict::Confirmed)
+        .cloned()
+        .collect();
+
+    // 3d / 3e: deliver findings as a prompt unless the anti-loop cap is hit.
+    if confirmed.is_empty() {
+        push_censor_note(
+            app,
+            agent_id,
+            &format!("Censor review clean ({} files)", rel_files.len()),
+            Some(NodeStyle::Sage),
+        );
+        return;
+    }
+
+    // Fix 4: `wait_for_censor_findings` returns ALL Open findings — not just new
+    // ones — so a previously delivered finding would nag the agent every 2 rounds
+    // forever. Drop already-delivered ids (recording the survivors in the
+    // per-session set) before any re-prompt.
+    let (new_findings, already_delivered) = censor_dedup(session_id, &confirmed);
+    if new_findings.is_empty() {
+        // Everything was already reported — don't re-send and don't bump the
+        // anti-loop counter (otherwise a single stale finding could pin the cap).
+        push_censor_note(
+            app,
+            agent_id,
+            &format!(
+                "Censor: no new findings ({} previously reported)",
+                already_delivered
+            ),
+            Some(NodeStyle::Sage),
+        );
+        return;
+    }
+
+    let msg = compose_censor_review_message(&new_findings);
+    if !censor_loop_allow(session_id) {
+        push_censor_note(
+            app,
+            agent_id,
+            &format!(
+                "Censor review found {} issue(s) (loop cap reached — not re-prompting)",
+                new_findings.len()
+            ),
+            Some(NodeStyle::Sage),
+        );
+        return;
+    }
+    match send_prompt_to_session(app, session_id, &msg) {
+        Ok(()) => {
+            censor_loop_bump(session_id);
+            push_censor_note(
+                app,
+                agent_id,
+                &format!("Censor review found {} issue(s)", new_findings.len()),
+                Some(NodeStyle::Sage),
+            );
+        }
+        Err(e) => {
+            push_censor_note(
+                app,
+                agent_id,
+                &format!(
+                    "Censor review found {} issue(s) but delivery failed: {e}",
+                    new_findings.len()
+                ),
+                Some(NodeStyle::Sage),
+            );
+        }
     }
 }
 
@@ -2707,6 +3181,195 @@ mod tests {
             );
         }
         std::env::remove_var("DEVBOULE_PI_SANDBOX");
+    }
+
+    // -- #8: devboule_censor_review parse + dispatch (pure) --------------------
+
+    #[test]
+    fn censor_dispatch_parses_files_project_and_session() {
+        let line = r#"{"type":"devboule_censor_review","files":["src/a.rs","src/b.rs"],"_devboule":{"projectId":"my-proj","sessionId":"pi-42"}}"#;
+        let event: PiEvent = serde_json::from_str(line).unwrap();
+        let d = censor_review_dispatch(&event, "pi-42");
+        assert_eq!(d.banner, "⚑ Censor review started for: src/a.rs, src/b.rs");
+        assert_eq!(d.project_id.as_deref(), Some("my-proj"));
+        assert_eq!(d.session_id, "pi-42");
+        assert_eq!(d.files, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn censor_dispatch_no_project_id_signals_skip() {
+        let line = r#"{"type":"devboule_censor_review","files":["src/a.rs"],"_devboule":{"sessionId":"pi-7"}}"#;
+        let event: PiEvent = serde_json::from_str(line).unwrap();
+        let d = censor_review_dispatch(&event, "pi-7");
+        // Banner still announces the start...
+        assert_eq!(d.banner, "⚑ Censor review started for: src/a.rs");
+        // ...but a missing project id must signal the caller to skip loudly.
+        assert!(
+            d.project_id.is_none(),
+            "missing project id must signal the skip path"
+        );
+    }
+
+    #[test]
+    fn censor_dispatch_session_id_falls_back_to_agent() {
+        // No sessionId in _devboule: must fall back to the mapper's agent id so the
+        // findings prompt is delivered to the correct session.
+        let line = r#"{"type":"devboule_censor_review","files":["src/a.rs"],"_devboule":{"projectId":"p1"}}"#;
+        let event: PiEvent = serde_json::from_str(line).unwrap();
+        let d = censor_review_dispatch(&event, "pi-agent-xyz");
+        assert_eq!(d.session_id, "pi-agent-xyz");
+        assert_eq!(d.project_id.as_deref(), Some("p1"));
+    }
+
+    // -- #8: path relativization (pure) ---------------------------------------
+
+    #[test]
+    fn relativize_strips_root_prefix() {
+        assert_eq!(
+            relativize_censor_path_in("/proj", "/proj/src/main.rs"),
+            "src/main.rs"
+        );
+        assert_eq!(
+            relativize_censor_path_in("/proj/", "/proj/src/main.rs"),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn relativize_keeps_relative_and_unrelated_absolute() {
+        // Already relative: unchanged.
+        assert_eq!(
+            relativize_censor_path_in("/proj", "src/main.rs"),
+            "src/main.rs"
+        );
+        // Absolute but not under root: unchanged (process_censor_review will simply
+        // find no shard for it — never panics).
+        assert_eq!(
+            relativize_censor_path_in("/proj", "/elsewhere/main.rs"),
+            "/elsewhere/main.rs"
+        );
+    }
+
+    // -- #8: findings message composition (pure) ------------------------------
+
+    #[test]
+    fn compose_message_formats_file_line_and_caps() {
+        use crate::backend::censor::schema::{Finding, Severity, Verdict};
+        let findings = vec![Finding {
+            file: "src/main.rs".to_string(),
+            line: Some(42),
+            severity: Severity::High,
+            title: "Use of unsafe".to_string(),
+            body: "Prefer safe API here.".to_string(),
+            verdict: Verdict::Confirmed,
+            ..Default::default()
+        }];
+        let msg = compose_censor_review_message(&findings);
+        assert!(msg.contains("Automated Censor review found 1 issue(s):"));
+        assert!(msg.contains("- src/main.rs:42 [HIGH] Use of unsafe — Prefer safe API here."));
+        assert!(msg.contains("Fix the confirmed issues above, then continue."));
+        // Short message must NOT be truncated.
+        assert!(!msg.contains('…'), "short message must not be truncated");
+    }
+
+    #[test]
+    fn compose_message_caps_length_and_empty_count() {
+        use crate::backend::censor::schema::{Finding, Severity, Verdict};
+        // Empty findings still composes a well-formed (clean) message.
+        let empty = compose_censor_review_message(&[]);
+        assert!(empty.contains("found 0 issue(s)"));
+        assert!(empty.contains("Fix the confirmed issues above, then continue."));
+
+        // Many long findings must be capped (no overflow past the cap).
+        let mut many = Vec::new();
+        for i in 0..50 {
+            many.push(Finding {
+                file: format!("src/mod{i}/file.rs"),
+                line: Some(i),
+                severity: Severity::Low,
+                title: format!("Finding number {i} with a very long title that keeps going"),
+                body: "x".repeat(500),
+                verdict: Verdict::Confirmed,
+                ..Default::default()
+            });
+        }
+        let msg = compose_censor_review_message(&many);
+        assert!(
+            msg.chars().count() <= CENSOR_REVIEW_MSG_MAX_CHARS,
+            "message must be capped at CENSOR_REVIEW_MSG_MAX_CHARS"
+        );
+        assert!(msg.contains('…'), "overlong message must be truncated");
+    }
+
+    // -- #8: anti-loop counter (pure) ----------------------------------------
+
+    #[test]
+    fn censor_loop_allows_up_to_cap_then_blocks() {
+        let mut map: HashMap<String, u8> = HashMap::new();
+        // Rounds 1 and 2 are allowed (cap = 2 consecutive sent rounds).
+        assert!(censor_loop_allow_in(&map, "pi-1", CENSOR_LOOP_MAX_CONSECUTIVE));
+        censor_loop_bump_in(&mut map, "pi-1");
+        assert!(censor_loop_allow_in(&map, "pi-1", CENSOR_LOOP_MAX_CONSECUTIVE));
+        censor_loop_bump_in(&mut map, "pi-1");
+        // Round 3 must be blocked.
+        assert!(!censor_loop_allow_in(&map, "pi-1", CENSOR_LOOP_MAX_CONSECUTIVE));
+    }
+
+    #[test]
+    fn censor_loop_reset_clears_counter() {
+        let mut map: HashMap<String, u8> = HashMap::new();
+        censor_loop_bump_in(&mut map, "pi-9");
+        censor_loop_bump_in(&mut map, "pi-9");
+        assert!(!censor_loop_allow_in(&map, "pi-9", CENSOR_LOOP_MAX_CONSECUTIVE));
+        censor_loop_reset_in(&mut map, "pi-9");
+        assert!(censor_loop_allow_in(&map, "pi-9", CENSOR_LOOP_MAX_CONSECUTIVE));
+    }
+
+    // -- Fix 4: delivered-id dedup (pure) ------------------------------------
+
+    /// Build a Confirmed finding with a deterministic id (mirrors how the shard
+    /// ids findings; we only need the `id` field for dedup).
+    fn finding_with_id(id: &str) -> crate::backend::censor::schema::Finding {
+        use crate::backend::censor::schema::Verdict;
+        let mut f = crate::backend::censor::schema::Finding::default();
+        f.id = id.to_string();
+        f.verdict = Verdict::Confirmed;
+        f
+    }
+
+    #[test]
+    fn censor_dedup_in_accepts_new_findings() {
+        use crate::backend::censor::schema::{Finding, Verdict};
+        use std::collections::HashSet;
+        let _ = (Finding::default(), Verdict::Confirmed); // ensure schema types in scope
+        let mut delivered: HashSet<String> = HashSet::new();
+        let findings = vec![finding_with_id("a"), finding_with_id("b"), finding_with_id("c")];
+        let (new_findings, already) = censor_dedup_in(&mut delivered, &findings);
+        assert_eq!(already, 0, "first pass: nothing previously delivered");
+        assert_eq!(new_findings.len(), 3, "first pass: all three are new");
+        assert_eq!(delivered.len(), 3, "ids recorded as delivered");
+    }
+
+    #[test]
+    fn censor_dedup_in_drops_already_delivered() {
+        use std::collections::HashSet;
+        let mut delivered: HashSet<String> = HashSet::new();
+        let first = vec![finding_with_id("a"), finding_with_id("b")];
+        let (new1, already1) = censor_dedup_in(&mut delivered, &first);
+        assert_eq!(already1, 0);
+        assert_eq!(new1.len(), 2);
+        // A later review of the SAME files returns both findings again — dedup
+        // must suppress them so the agent isn't nagged every 2 rounds.
+        let second = vec![finding_with_id("a"), finding_with_id("b"), finding_with_id("c")];
+        let (new2, already2) = censor_dedup_in(&mut delivered, &second);
+        assert_eq!(already2, 2, "two were already delivered");
+        assert_eq!(new2.len(), 1, "only the new id (c) survives");
+        assert_eq!(new2[0].id, "c");
+        // A third pass with nothing new reports all-already and zero new.
+        let third = vec![finding_with_id("a"), finding_with_id("b"), finding_with_id("c")];
+        let (new3, already3) = censor_dedup_in(&mut delivered, &third);
+        assert_eq!(already3, 3);
+        assert_eq!(new3.len(), 0, "no new findings on third pass");
     }
 }
 

@@ -3,7 +3,7 @@
  * Run: node pi-sidecar/censor-hook.test.mjs
  */
 
-import { composeCensorReviewPrompt } from "./sidecar.mjs";
+import { composeCensorReviewPrompt, enqueuePrompt } from "./sidecar.mjs";
 import { strict as assert } from "node:assert";
 
 let passed = 0;
@@ -90,13 +90,27 @@ test("prompt has reviewable structure", () => {
 	assert.ok(prompt.includes("LOW (consider fixing)"), "lists all severities");
 });
 
+// --- Test 6: enqueuePrompt pure helper (Fix 1 FIFO queue) ---
+test("enqueuePrompt accepts when below max", () => {
+	const { accepted, queue } = enqueuePrompt([], { type: "prompt", message: "a" }, 5);
+	assert.ok(accepted, "should accept");
+	assert.equal(queue.length, 1);
+});
+
+test("enqueuePrompt rejects when full", () => {
+	const full = Array.from({ length: 5 }, (_, i) => ({ type: "prompt", message: String(i) }));
+	const { accepted, queue } = enqueuePrompt(full, { type: "prompt", message: "x" }, 5);
+	assert.ok(!accepted, "should reject when full");
+	assert.equal(queue.length, 5);
+	assert.deepEqual(queue, full, "queue unchanged on reject");
+});
+
+test("enqueuePrompt is immutable", () => {
+	const orig = [{ type: "prompt", message: "a" }];
+	const { queue } = enqueuePrompt(orig, { type: "prompt", message: "b" }, 5);
+	assert.equal(orig.length, 1, "original not mutated");
+	assert.equal(queue.length, 2, "new array returned");
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
-
-// TODO: Critical-path coverage gaps for future test passes:
-// - Event handler: verify tool_execution_start captures args.path into pendingToolPaths
-// - Event handler: verify tool_execution_end correlates by toolCallId and extracts result.details.patch
-// - Queue lifecycle: verify editedRsFiles populated on .rs edit, cleared on review turn end
-// - isReviewTurn guard: verify stale queue cleared, no re-review on next turn
-// - session.prompt() call: verify triggerCensorReview fires via setTimeout(0), not synchronously
-// - Disable toggle: verify DEVBOULE_CENSOR_REVIEW_ENABLED=false skips queuing and review
