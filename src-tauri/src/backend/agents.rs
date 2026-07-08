@@ -1730,6 +1730,17 @@ pub(crate) fn stop_agent_process_only(
     app: &tauri::AppHandle,
     agent_id: &str,
 ) -> Result<(Option<KillOutcome>, Option<&'static str>), String> {
+    // PI SIDECAR ROUTE: pi-hosted agents have no ledger entry (their launch path
+    // returns before `record_launch_pending`), so they can never match the routes
+    // below. `stop_pi_session` is idempotent and returns Ok(true) ONLY when a live
+    // pi session with this id existed and was killed. This early return does NOT
+    // touch the ledger (no `remove_agent_ledger_entry` runs on this path), so the
+    // D1-fence contract — that this function must never close a ledger row — holds
+    // for the pi route exactly as it does for the app/cloud/external routes.
+    if crate::backend::pi_sidecar::stop_pi_session(app, agent_id).unwrap_or(false) {
+        return Ok((None, Some(HOST_APP)));
+    }
+
     let entry = read_agent_ledger_entry(app, agent_id)?;
 
     // ROUTE BY HOST. App-hosted agents (host == "app") run under our in-app PTY,
