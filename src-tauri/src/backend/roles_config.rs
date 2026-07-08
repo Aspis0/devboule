@@ -230,6 +230,7 @@ pub(crate) fn resolve_roles_config(config: &serde_json::Value) -> EffectiveRoles
         .and_then(|r| r.orchestrator_client.clone())
         .unwrap_or_else(|| "orchestrator".to_string());
 
+    // Fallback to "codex" for backward compat with pre-OpenAI vault configs.
     let coder_client = roles_config
         .as_ref()
         .and_then(|r| r.coder_client.clone())

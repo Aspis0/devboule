@@ -1491,7 +1491,10 @@ fn claim_and_launch(
     // the mini cannot self-promote to coder). Mint the token HERE: the RAW token
     // rides only inside the 0600 prompt file; only its HASH lands in the session
     // ledger below. CSPRNG failure is fail-closed (FIX 5): refuse the launch.
-    let oracle_grant = if backend.kind == MiniCoderBackendKind::Codex && mcp_roots.is_some() {
+    let oracle_grant = if (backend.kind == MiniCoderBackendKind::Codex
+        || backend.kind == MiniCoderBackendKind::Openai)
+        && mcp_roots.is_some()
+    {
         match super::projects::generate_launch_token() {
             Ok(token) => {
                 let hash = super::projects::hash_launch_token(&token);

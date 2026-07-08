@@ -9,8 +9,8 @@ use std::path::Path;
 
 use super::mini_coder::{MiniCoderBackend, MiniCoderBackendKind, MiniCoderDirective};
 use super::project_skill::{
-    active_language_profile_skill_or_legacy, active_profile_skill_or_legacy, fenced_lang_skill_block,
-    fenced_skill_block,
+    active_language_profile_skill_or_legacy, active_profile_skill_or_legacy,
+    fenced_lang_skill_block, fenced_skill_block,
 };
 
 /// Hard cap on the bytes of each named file we front-load into the mini prompt.
@@ -116,7 +116,6 @@ pub(crate) fn censor_phase_a_summary(
     (high, medium, low, findings.len())
 }
 
-
 pub(crate) fn build_mini_prompt(
     backend: &MiniCoderBackend,
     directive: &MiniCoderDirective,
@@ -124,7 +123,10 @@ pub(crate) fn build_mini_prompt(
     result_target: &Path,
     oracle_access: Option<&MiniOracleAccess>,
 ) -> String {
-    let backend_can_write_file = matches!(backend.kind, MiniCoderBackendKind::Codex);
+    let backend_can_write_file = matches!(
+        backend.kind,
+        MiniCoderBackendKind::Codex | MiniCoderBackendKind::Openai
+    );
     // MINOR 9 → P3: `directive.allow_oracle` is consumed UPSTREAM (it gates
     // resolve_mcp_roots, which gates the token mint, which gates `oracle_access`
     // here) — this function only branches on the resolved access. One-time
@@ -169,9 +171,7 @@ follow-up questions interactively.\n\n",
     // a tier skill gets the tier's. Absent both ⇒ nothing added.
     // Advisory: the HARD CONSTRAINTS / RESULT CONTRACT below always win over it.
     let mini_skill_profile = super::model_registry::mini_tier_profile(backend.model.as_deref());
-    if let Some(skill) =
-        active_profile_skill_or_legacy(project_root, mini_skill_profile, "mini")
-    {
+    if let Some(skill) = active_profile_skill_or_legacy(project_root, mini_skill_profile, "mini") {
         // Sentinel-fenced via the shared helper, with the mini's priority RE-STATED
         // AFTER the block (later context wins, so the override must come last). The
         // firewall invariant — priority note AFTER the skill — is internal to
@@ -190,7 +190,9 @@ follow-up questions interactively.\n\n",
     // propagates FORWARD to everything after it (the file-scope block included), not just this
     // block. Accepted: the persona should track what the mini is actually editing, and the retry
     // loop is bounded, so an occasional cross-language retry re-priming the prefix is a fair cost.
-    if let Some(lang_block) = mini_language_block(project_root, mini_skill_profile, &directive.files) {
+    if let Some(lang_block) =
+        mini_language_block(project_root, mini_skill_profile, &directive.files)
+    {
         prompt.push_str(&lang_block);
     }
 
@@ -260,7 +262,12 @@ follow-up questions interactively.\n\n",
     // launch-token-bound "mini" role the server enforces (every other tool is
     // rejected at the MCP role gate, so this text is a usage manual, not a wall).
     match oracle_access {
-        Some(access) if matches!(backend.kind, MiniCoderBackendKind::Codex) => {
+        Some(access)
+            if matches!(
+                backend.kind,
+                MiniCoderBackendKind::Codex | MiniCoderBackendKind::Openai
+            ) =>
+        {
             prompt.push_str(&format!(
                 "CONTEXT TOOL (read-only): you have exactly ONE MCP tool: `oracle_context` on the `aspis-management` server.\n\
 FIRST call `agent_register` with {{\"agent_id\": \"{id}\", \"role\": \"mini\", \"model\": \"<your model name>\", \"message\": \"mini reading context\", \"launch_token\": \"{token}\"}}; it returns a `session_token`.\n\

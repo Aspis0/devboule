@@ -1133,10 +1133,51 @@ pub(crate) fn build_mini_command_impl(
                 macos_stdout_to_result_wrapper(&run, &result_path, &raw_path)
             }
             MiniCoderBackendKind::Openai => {
-                // OpenAI mini-coder backend is not wired up in this phase (the validator
-                // drops command/base_url, so there is no launch line to build yet). Fail
-                // loudly rather than emitting a wrong command.
-                return Err("OpenAI mini-coder backend is not yet supported.".to_string());
+                // OpenAI mini-coder backend: CLI invocation mirroring the Codex arm.
+                // The prompt is piped over STDIN (never argv). The API key rides in the
+                // user's `OPENAI_API_KEY` env — we never inject it, never put it on argv.
+                // The `openai` CLI binary is installed by the user. Like codex, the agent
+                // writes its own result file, so we do NOT wrap stdout to the result target.
+                // With the read-only oracle grant the mini's openai gets the SAME
+                // aspis-management server as full coders via the shared token builder (no
+                // drift); narrowing is SERVER-side (role "mini"). No grant ⇒ no `-c` flags
+                // ⇒ plain invocation.
+                let mut args: Vec<String> =
+                    vec!["exec".to_string(), "--skip-git-repo-check".to_string()];
+                // P3 (Openai): same Oracle-only MCP wiring as the Codex arm — the mini
+                // reuses the shared builder with an EMPTY user-MCP slice so its `-c` flags
+                // stay Oracle-only (narrowed server-side by role "mini").
+                if let Some(roots) = mcp_roots {
+                    let app_bin = super::projects::resolve_app_binary();
+                    let app_bin = app_bin.as_ref().map(|p| p.to_string_lossy().into_owned());
+                    args.extend(super::projects::codex_mcp_config_args(
+                        &crate::oracle::oracle_setup::resolve_oracle_python(),
+                        &roots.management_root,
+                        &roots.projects_dir,
+                        app_bin.as_deref(),
+                        // MINI-EXCLUSION (design §6, HARD): the mini NEVER receives user MCP
+                        // servers. It reuses this shared Oracle-only builder and passes an
+                        // EMPTY slice, so its openai `-c` flags stay Oracle-only (narrowed
+                        // server-side by role "mini"). This bare empty literal names no
+                        // user-MCP type, so this file keeps ZERO references to the user-MCP
+                        // config code.
+                        &[],
+                    ));
+                }
+                if let Some(model) = backend.model.as_deref() {
+                    if !model.trim().is_empty() {
+                        args.push("-m".to_string());
+                        args.push(model.trim().to_string());
+                    }
+                }
+                let arg_line = args
+                    .iter()
+                    .map(|a| sh_single_quote_local(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // prompt on STDIN (piped from the file), never argv. `arg_line` already
+                // leads with `exec` (so this is `openai exec [--skip-git-repo-check] [-m model]`).
+                format!("{prompt_pipe} | openai {arg_line}\n")
             }
             MiniCoderBackendKind::AppleFm => {
                 let fm = crate::backend::provider_detect::resolve_program("fm")
