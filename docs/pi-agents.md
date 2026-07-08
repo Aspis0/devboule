@@ -2,7 +2,7 @@
 
 Pi agent definitions for the Devboule coding workflow. These are pure config
 files (YAML frontmatter + system prompt); they live in `.pi/agents/` and are
-picked up by pi's `subagent` tool.
+picked up by the `Agent` tool from the `@tintinweb/pi-subagents` extension.
 
 ## The two agents
 
@@ -16,7 +16,7 @@ picked up by pi's `subagent` tool.
 ```
 User / Pigeon
   └─ spawns a pi session ............................. = main-coder
-       └─ uses subagent(agent: "mini-coder", task) ... = mini-coder (child pi process)
+       └─ uses Agent(agent: "mini-coder", task) ......... = mini-coder (child pi process)
 ```
 
 - **Pigeon / Orchestrator (Rust console)** does NOT spawn subagents. It builds
@@ -61,54 +61,67 @@ System prompt body.
 - The body (after the frontmatter) becomes the agent's system prompt, passed to
   the child pi process via `--append-system-prompt`.
 
+## The `Agent` tool (from `@tintinweb/pi-subagents`)
+
+The `Agent` tool is provided by the **`@tintinweb/pi-subagents`** extension
+(v0.13.0, MIT, github.com/tintinweb/pi-subagents), installed via pi's package
+system into the developer's user-global `~/.pi/agent/npm`. It is not a built-in
+and not the old `examples/extensions/subagent/` example. It registers three
+tools:
+
+- **`Agent`** — spawn a subagent (agent type = the file's `name`).
+- **`Get Agent Result`** — fetch a spawned agent's result.
+- **`Steer Agent`** — steer a running agent.
+
+Its discovery logic loads agent definitions from:
+
+- `<cwd>/.pi/agents/*.md` — **project-level** (auto-discovered).
+- `~/.pi/agent/agents/*.md` — **global-level** (auto-discovered).
+
+No `agentScope` parameter is needed: both locations are discovered
+automatically, project agents override global ones, and a `.md` with the same
+name as a default agent overrides that default. Agent files are reloaded on
+every `Agent` invocation, so edits apply without restarting pi.
+
+The extension ships its own model resolver (`src/model-resolver.ts`). Whether
+it resolves `model: auto` via Pigeon-style routing is **not verified** — see
+Open items below.
+
 ## Adding more agents
 
 1. Drop a new `your-agent.md` into `.pi/agents/` following the schema above.
-   Discovery walks up from the project root, so `<repo>/.pi/agents/` is the
-   convention.
-2. The main coder invokes it with
-   `subagent(agent: "your-agent", task: "...", agentScope: "both")`.
-3. Agents are discovered fresh on every invocation, so you can edit them
+   Both `<repo>/.pi/agents/` and `~/.pi/agent/agents/` are discovered
+   automatically (project agents override global ones); no `agentScope` needed.
+2. The main coder invokes it with the `Agent` tool, passing the agent type equal
+   to the file's `name`: `Agent(agent: "your-agent", task: "...")`.
+3. Agent files are reloaded on every `Agent` invocation, so you can edit them
    mid-session without restarting pi.
 
-## The `subagent` tool
-
-The `subagent` tool is an opt-in pi extension, not a built-in. Its discovery
-logic (`examples/extensions/subagent/agents.ts`) loads agent definitions from:
-
-- `~/.pi/agent/agents/*.md` — **user-level** (always loaded by default)
-- `.pi/agents/*.md` — **project-level** (only when `agentScope` includes project)
-
-## Gaps to close (verified)
+## Open items (current)
 
 These are documented, not fixed, by this change (no Rust / sidecar edits).
 
-1. **Subagent extension not installed.** `~/.pi/agent/extensions/` currently
-   contains only `rust-reviewer.ts`; the `subagent` extension must be symlinked
-   in for the `subagent` tool to exist at all:
+1. **Frontmatter YAML was broken (now fixed).** The `reviewer` agent's
+   `description` contained an unquoted `Pattern:` segment, which made the YAML
+   parser fail ("Nested mappings are not allowed in compact mappings") and
+   crashed the subagent extension at load time for every pi session in this repo.
+   Any frontmatter value containing a `:` must be wrapped in double quotes (and
+   inner `"` escaped) — this change quotes the `reviewer` description.
 
-   ```bash
-   mkdir -p ~/.pi/agent/extensions/subagent
-   ln -sf /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent/index.ts ~/.pi/agent/extensions/subagent/index.ts
-   ln -sf /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent/agents.ts ~/.pi/agent/extensions/subagent/agents.ts
-   ```
+2. **`model: auto` = parent inheritance, NOT Pigeon routing (verified e2e
+   2026-07-08).** A live `Agent(agent: "mini-coder", ...)` spawn resolved
+   `model: auto` to the PARENT session's model (confirmed via the child's
+   session file in `~/.pi/agent/sessions/` — same provider/model as the main
+   session). The design intent (mini-coder → local/Cheap) therefore does NOT
+   happen automatically: either set an explicit local model id in the
+   frontmatter, or extend Pigeon routing to the subagent spawn path.
 
-2. **Project agents need `agentScope: "both"`.** The loader defaults to
-   `agentScope: "user"`, so `.pi/agents/*.md` is NOT discovered unless the main
-   coder passes `agentScope: "both"` (or `"project"`) when calling `subagent(...)`.
-   Without this, only `~/.pi/agent/agents/*.md` loads and `mini-coder` is "Unknown".
-   (Project agents also prompt for confirmation in interactive UI unless
-   `confirmProjectAgents: false`.)
+3. **`tools: all` passthrough still unverified.** For `main-coder`,
+   `tools: all` becomes `--tools all` on a child process. Confirm pi accepts
+   `all` as a wildcard, or switch to an explicit allowlist / omit the field,
+   before relying on it.
 
-3. **`model: auto` is not resolved by subagent children.** The loader passes
-   `model` straight through to the child pi process as `--model auto`. Pigeon
-   routing (`classify_prompt` → `setModel`) only runs on the main sidecar
-   session, not on subagent child processes. Until Pigeon routing is extended to
-   the subagent spawn path (Phase 3+), set an explicit model id in the frontmatter
-   (or confirm pi resolves `auto` from the spawn-time models.json) so the child
-   can actually launch.
-
-4. **`tools: all` passthrough.** For `main-coder`, `tools: all` becomes
-   `--tools all` on a child process. The example `worker` agent instead omits
-   `tools` to get full capabilities. Confirm pi accepts `all` as a wildcard, or
-   switch to an explicit allowlist / omit the field, before relying on it.
+4. **Ship packaging (5c).** For the shipped product the extension must be pinned
+   as a dependency of `pi-sidecar/` and bundled. Today it exists only in the
+   developer's user-global pi setup (`~/.pi/agent/npm`) and is not part of the
+   repo's deliverable.

@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Devboule's task-level reviewer + verifier — mandatory post-task, orchestrates deterministic tests. Pattern: 3-layer verification (Claude Code hooks / Looper).
+description: "Devboule's task-level reviewer + verifier — mandatory post-task, orchestrates deterministic tests. Pattern: 3-layer verification (Claude Code hooks / Looper)."
 tools: read, grep, find, ls, bash, run
 model: auto   # Pigeon → Moderate tier
 ---
