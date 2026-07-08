@@ -3575,6 +3575,39 @@ export function ProjectsView() {
 									}
 								: undefined
 						}
+						onResetChat={
+							(orchestratorAgentId || cloudOrchestratorAgentId)
+								? () => {
+									if (
+										!window.confirm(
+											"Reset the orchestrator chat? This stops the current session and clears the transcript."
+										)
+									)
+										return;
+									const targetId =
+										orchestratorAgentId || cloudOrchestratorAgentId;
+									if (!targetId) return;
+									void (async () => {
+										try {
+											await invokeBackendCommand("planner_reset_chat", {
+												agentId: targetId,
+											});
+											setPlannerPending([]);
+											setPlannerBanner(null);
+											setError(null);
+											await loadAgentState();
+										} catch (e) {
+											setError(
+												e instanceof Error
+													? e.message
+													: "Chat reset failed."
+											);
+										}
+									})();
+								}
+								: undefined
+						}
+
 						onSend={(text) => {
 							const msg = text.trim();
 							if (!msg) return;

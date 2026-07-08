@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { KeyboardEvent } from "react";
-import { Send } from "lucide-react";
+import { Send, RotateCcw } from "lucide-react";
 import type { PlannerMessage } from "./plannerModel";
 import { ChatThread } from "../../activity/ChatThread";
 import {
@@ -28,6 +28,9 @@ interface PlannerChatProps {
 	/** Slash-command result (model/agent switch, stop, help). Optional: only
 	 *  invoked when the composer intercepts a matched command on Enter. */
 	onSlashCommand?: (result: SlashResult) => void;
+	/** Reset the orchestrator chat: stop the session, wipe the transcript, start
+	 *  clean. Absent when no orchestrator agent id is bound. */
+	onResetChat?: () => void;
 }
 
 export function PlannerChat({
@@ -39,6 +42,7 @@ export function PlannerChat({
 	onSend,
 	onInterrupt,
 	onSlashCommand,
+	onResetChat,
 }: PlannerChatProps) {
 	const [value, setValue] = useState("");
 	const slash = useSlashCommands();
@@ -122,7 +126,7 @@ export function PlannerChat({
 				display: "flex",
 				flexDirection: "column",
 				minHeight: 340,
-				maxHeight: 460,
+				maxHeight: "clamp(460px, 62vh, 1200px)",
 				flex: 1,
 			}}
 		>
@@ -171,6 +175,27 @@ export function PlannerChat({
 					>
 						{live ? "live" : "idle"}
 					</span>
+					<button
+						onClick={() => onResetChat?.()}
+						disabled={!onResetChat}
+						title={onResetChat ? "Reset chat" : "No orchestrator bound"}
+						style={{
+							width: 22,
+							height: 22,
+							border: "none",
+							background: "transparent",
+							borderRadius: 6,
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "center",
+							cursor: onResetChat ? "pointer" : "default",
+							opacity: onResetChat ? 0.45 : 0.25,
+							transition: "opacity 0.15s",
+							padding: 0,
+						}}
+					>
+						<RotateCcw size={12} />
+					</button>
 				</span>
 			</div>
 

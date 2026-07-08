@@ -67,6 +67,8 @@ interface PlannerPlanModeProps {
 	onInterrupt?: () => void;
 	/** Slash-command result (model/agent switch, stop, help), forwarded to PlannerChat. */
 	onSlashCommand?: (result: SlashResult) => void;
+	/** Reset the orchestrator chat: stop session, wipe transcript, start clean. */
+	onResetChat?: () => void;
 	// Orchestrator backend selector — who you TALK TO (the planner). Replaces the redundant
 	// status strip (searching/planning/designing duplicated the view tabs). The active one
 	// pulses. Local = our Stage/TUI; Claude/Codex/OpenAI run their own CLI (their terminal is shown).
@@ -112,6 +114,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 		onSend,
 		onInterrupt,
 		onSlashCommand,
+	onResetChat,
 		orchestrators,
 		orchestratorId,
 		onOrchestratorChange,
@@ -367,7 +370,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 						border: "1px solid #ECE6DB",
 						borderRadius: 12,
 						padding: 13,
-						height: "clamp(316px, 58vh, 1100px)",
+						height: 316,
 						display: "flex",
 						flexDirection: "column",
 					}}
@@ -526,6 +529,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 					onSend={onSend}
 					onInterrupt={onInterrupt}
 					onSlashCommand={onSlashCommand}
+						onResetChat={onResetChat}
 				/>
 
 				{/* 5) Hand-off + auto-create controls (preserved choices) */}

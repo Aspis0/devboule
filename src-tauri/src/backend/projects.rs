@@ -6033,6 +6033,58 @@ pub fn orchestrator_steer(
     Ok(())
 }
 
+/// Best-effort wipe of an agent's bridge + steer files so a "reset chat"
+/// starts clean. Truncates the activity bridge file to 0 bytes (the live tail's
+/// `read_new_chunk` detects truncation via `was_reset` and drops its carry) and
+/// deletes the steer inbox. Neither file's absence is an error.
+///
+/// Pure over its inputs — directly unit-testable without an `AppHandle`.
+pub(crate) fn wipe_planner_files(
+    projects_dir: &Path,
+    agent_id: &str,
+) -> Result<(), String> {
+    // Truncate the bridge activity file to 0 bytes. `File::create` opens (or
+    // creates) the file and truncates it atomically. A missing file is normal
+    // (the agent may never have been launched).
+    if let Some(path) = crate::backend::mini_activity::activity_file_path(projects_dir, agent_id) {
+        if path.exists() {
+            File::create(&path)
+                .map_err(|e| format!("truncate bridge file: {e}"))?;
+        }
+    }
+    // Delete the steer inbox — the next steer would just land in a fresh file.
+    if let Some(path) = crate::backend::mini_activity::steer_file_path(projects_dir, agent_id) {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
+/// Stop the orchestrator, wipe its bridge + steer files, and reset the in-memory
+/// console — the full "reset chat" flow. Every step that fails soft (missing
+/// file, nothing to stop) is NOT an error: resetting an idle chat is legal.
+#[tauri::command]
+pub fn planner_reset_chat(
+    app: tauri::AppHandle,
+    agent_id: String,
+) -> Result<(), String> {
+    // 1. Stop whatever process holds this agent id. `stop_agent_process_only`
+    //    routes pi sessions, cloud duplex and PTYs; a "nothing to stop" result
+    //    is fine — we still wipe the files.
+    let _ = super::agents::stop_agent_process_only(&app, &agent_id);
+
+    // 2. Truncate the bridge activity file and delete the steer file.
+    let projects_dir = ensure_projects_dir(&app)?;
+    wipe_planner_files(&projects_dir, &agent_id)?;
+
+    // 3. Clear the in-memory console: replace the agent's entry with the empty
+    //    resting state and emit the snapshot so the frontend updates immediately.
+    if let Some(store) = app.try_state::<crate::backend::mini_activity::MiniActivityStore>() {
+        store.update(&app, &agent_id, |a| *a = crate::backend::mini_activity::ConsoleActivity::empty());
+    }
+
+    Ok(())
+}
+
 fn orchestrator_env_pairs(config: &OrchestratorLaunchConfig) -> Vec<(&'static str, String)> {
     let mut pairs: Vec<(&'static str, String)> = vec![
         ("DEVBOULE_OMLX_BASE_URL", config.omlx_base_url.to_string()),
@@ -16953,5 +17005,137 @@ mod broker_gate_projects {
             .take(2000)
             .collect();
         assert!(msg.is_empty(), "whitespace-only message should be empty after trim");
+    }
+}
+
+// ------------------------------------------------------------------
+// wipe_planner_files tests
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+mod wipe_planner_files_tests {
+    use super::*;
+
+    /// Helper: create a temp dir with a fake bridge activity file and steer file.
+    /// Resolve both the bridge and steer file paths the way the real code does,
+    /// so tests use the same (possibly sanitized) filenames.
+    fn resolve_files(dir: &Path, agent_id: &str) -> (Option<PathBuf>, Option<PathBuf>) {
+        (
+            crate::backend::mini_activity::activity_file_path(dir, agent_id),
+            crate::backend::mini_activity::steer_file_path(dir, agent_id),
+        )
+    }
+
+    fn setup(agent_id: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-wipe-{}-{}-{}",
+            agent_id,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create the bridge file via the real resolver (sanitized name)
+        if let Some(bridge) = crate::backend::mini_activity::activity_file_path(&dir, agent_id) {
+            fs::write(&bridge, "some prior chat\n").unwrap();
+            assert!(bridge.exists());
+            assert!(fs::metadata(&bridge).unwrap().len() > 0);
+        }
+
+        // Create the steer file via the real resolver
+        if let Some(steer) = crate::backend::mini_activity::steer_file_path(&dir, agent_id) {
+            fs::write(&steer, "some steer\n").unwrap();
+            assert!(steer.exists());
+        }
+
+        dir
+    }
+
+    #[test]
+    fn wipe_truncates_bridge_and_deletes_steer() {
+        let agent = "orch-test-agent";
+        let dir = setup(agent);
+
+        let result = wipe_planner_files(&dir, agent);
+        assert!(result.is_ok(), "wipe should succeed: {result:?}");
+
+        // Bridge file exists but is 0 bytes
+        let (bridge, steer) = resolve_files(&dir, agent);
+        if let Some(bridge) = bridge {
+            assert!(bridge.exists(), "bridge file should still exist after truncate");
+            assert_eq!(
+                fs::metadata(&bridge).unwrap().len(),
+                0,
+                "bridge file should be truncated to 0 bytes"
+            );
+        }
+
+        // Steer file is gone
+        if let Some(steer) = steer {
+            assert!(!steer.exists(), "steer file should be deleted");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_is_ok_when_neither_file_exists() {
+        let agent = "orch-no-files-agent";
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-wipe-absent-{}-{}",
+            agent,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // No bridge file, no steer file — just the bare dir.
+        let result = wipe_planner_files(&dir, agent);
+        assert!(result.is_ok(), "missing files should not be an error: {result:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_preserves_other_agents_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "aspis-wipe-isolated-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let victim = "orch-victim";
+        let bystander = "orch-bystander";
+
+        // Seed both agents' files via the real resolvers
+        let (victim_bridge, victim_steer) = resolve_files(&dir, victim);
+        let (bystander_bridge, bystander_steer) = resolve_files(&dir, bystander);
+        if let Some(ref p) = victim_bridge { fs::write(p, "victim chat\n").unwrap(); }
+        if let Some(ref p) = victim_steer { fs::write(p, "victim steer\n").unwrap(); }
+        if let Some(ref p) = bystander_bridge { fs::write(p, "bystander chat\n").unwrap(); }
+        if let Some(ref p) = bystander_steer { fs::write(p, "bystander steer\n").unwrap(); }
+
+        // Wipe only the victim
+        let result = wipe_planner_files(&dir, victim);
+        assert!(result.is_ok(), "wipe should succeed: {result:?}");
+
+        // Victim: truncated bridge, no steer
+        if let Some(ref p) = victim_bridge {
+            assert_eq!(fs::metadata(p).unwrap().len(), 0);
+        }
+        if let Some(ref p) = victim_steer {
+            assert!(!p.exists());
+        }
+
+        // Bystander: untouched
+        if let Some(ref p) = bystander_bridge {
+            assert_eq!(fs::metadata(p).unwrap().len(), 15); // "bystander chat\n"
+        }
+        if let Some(ref p) = bystander_steer {
+            assert!(p.exists());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
