@@ -28,6 +28,8 @@ pub struct ClaudeNormalizer {
     cur_text: String,
     /// tool_use_id -> the web-search query, pending its tool_result.
     pending_ws: HashMap<String, String>,
+    /// tool_use_id -> tool name, for non-websearch tool_result echo.
+    pending_tools: HashMap<String, String>,
     /// Kairion: the (summarized) reasoning trace accumulated from `thinking_delta`s since the
     /// last `message_start`. Fed to the text doubt sensor when an assistant question turn fires.
     trace: String,
@@ -39,6 +41,7 @@ impl ClaudeNormalizer {
             seq: base_seq,
             cur_text: String::new(),
             pending_ws: HashMap::new(),
+            pending_tools: HashMap::new(),
             trace: String::new(),
         }
     }
@@ -67,6 +70,8 @@ impl ClaudeNormalizer {
                             // A new turn: drop any web-search queries from the prior turn that never
                             // got a tool_result, so `pending_ws` can't leak across the session.
                             self.pending_ws.clear();
+                            // Same for non-websearch tool results.
+                            self.pending_tools.clear();
                             // Kairion: the reasoning trace is per-turn — start fresh so this turn's
                             // doubt is computed only from THIS turn's thinking.
                             self.trace.clear();
@@ -132,6 +137,15 @@ impl ClaudeNormalizer {
                                     }
                                 }
                             }
+                        } else if bt == "thinking" {
+                            // Emit a collapsed thinking row for the activity tail.
+                            if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                                if !thinking.is_empty() {
+                                    // Cap at 2000 chars so the tail's MAX_LINE_BYTES=8192 gate
+                                    // doesn't drop the line before its own visual truncation.
+                                    lines.push(serde_json::json!({"kind":"thinking","text":truncate_summary(thinking, 2000)}).to_string());
+                                }
+                            }
                         } else if bt == "tool_use" {
                             let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -159,6 +173,10 @@ impl ClaudeNormalizer {
                                     }
                                 }
                                 lines.push(serde_json::json!({"kind":"milestone","text":label,"node":"dot"}).to_string());
+                                // Track for tool_result echo (skip empty ids — some tools produce none).
+                                if !id.is_empty() {
+                                    self.pending_tools.insert(id.to_string(), name.to_string());
+                                }
                             }
                         }
                     }
@@ -173,39 +191,121 @@ impl ClaudeNormalizer {
                     for block in content_arr {
                         if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
                             let id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                            // 1) Websearch path — already handled by pending_ws.
                             if let Some(query) = self.pending_ws.remove(id) {
-                                let content_str = match block.get("content") {
-                                    Some(serde_json::Value::String(s)) => s.clone(),
-                                    // Future API shape: an array of content blocks — accept bare
-                                    // strings OR `{"type":"text","text":"…"}` objects.
-                                    Some(serde_json::Value::Array(arr)) => arr
-                                        .iter()
-                                        .filter_map(|v| {
-                                            v.as_str().map(str::to_string).or_else(|| {
-                                                v.get("text")
-                                                    .and_then(|t| t.as_str())
-                                                    .map(str::to_string)
-                                            })
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(""),
-                                    _ => String::new(),
-                                };
+                                let content_str = tool_result_text(block);
                                 let pages: Vec<serde_json::Value> = extract_links(&content_str)
                                     .into_iter()
                                     .map(|(u, t)| serde_json::json!({"url":u,"title":t,"summary":""}))
                                     .collect();
                                 lines.push(serde_json::json!({"kind":"websearch","query":query,"pages":pages}).to_string());
+                            // 2) Non-websearch tool_result echo — check pending_tools.
+                            } else if let Some(tool_name) = self.pending_tools.remove(id) {
+                                let content_str = tool_result_text(block);
+                                let is_error = block
+                                    .get("is_error")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let emoji = if is_error { "❌" } else { "✅" };
+                                // Cap tool name at 60 chars (the dot-milestone already does this).
+                                let safe_name = truncate_summary(&tool_name, 60);
+                                let summary = if content_str.is_empty() {
+                                    "(no result)".to_string()
+                                } else {
+                                    truncate_summary(&content_str, 200)
+                                };
+                                lines.push(serde_json::json!({
+                                    "kind": "milestone",
+                                    "text": format!("{} {} → {}", emoji, safe_name, summary),
+                                    "node": "sage",
+                                }).to_string());
                             }
                         }
                     }
                 }
                 lines
             }
+            "result" => {
+                // Final turn-summary banner: {"type":"result","subtype":"success",...}
+                let subtype = value
+                    .get("subtype")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("error")
+                    .to_string();
+                let is_error = value.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                // A result is "failed" if is_error is true OR subtype is present but not "success"
+                // (e.g. subtype="error_max_turns" with no is_error flag).
+                let failed = is_error || (!subtype.is_empty() && subtype != "success");
+                if failed {
+                    // Error banner.
+                    let reason = value
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .map(|s| truncate_summary(s, 160))
+                        .unwrap_or_default();
+                    let safe_subtype = truncate_summary(&subtype, 40);
+                    let text = if reason.is_empty() {
+                        format!("Turn failed ({safe_subtype})")
+                    } else {
+                        format!("Turn failed ({safe_subtype}) — {reason}")
+                    };
+                    vec![serde_json::json!({"kind":"banner","text":text}).to_string()]
+                } else {
+                    // Success banner.
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(num_turns) = value.get("num_turns").and_then(|v| v.as_u64()) {
+                        parts.push(format!("{num_turns} turns"));
+                    }
+                    if let Some(duration_ms) = value.get("duration_ms").and_then(|v| v.as_u64()) {
+                        let secs = duration_ms as f64 / 1000.0;
+                        parts.push(format!("{secs:.1}s"));
+                    }
+                    if let Some(cost) = value.get("total_cost_usd").and_then(|v| v.as_f64()) {
+                        parts.push(format!("${cost:.4}"));
+                    }
+                    let text = if parts.is_empty() {
+                        "Turn done".to_string()
+                    } else {
+                        format!("Turn done — {}", parts.join(" · "))
+                    };
+                    vec![serde_json::json!({"kind":"banner","text":text}).to_string()]
+                }
+            }
             _ => vec![],
         }
     }
 }
+
+/// Extract the result text from a tool_result block (string content or array of
+/// `{"type":"text","text":"…"}` objects). Used by both websearch and non-websearch
+/// tool_result paths.
+fn tool_result_text(block: &serde_json::Value) -> String {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        // Future API shape: an array of content blocks — accept bare strings OR
+        // `{"type":"text","text":"…"}` objects.
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                v.as_str().map(str::to_string).or_else(|| {
+                    v.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Char-cap a string to `max` chars, appending '…' only when truncated.
+fn truncate_summary(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
 
 /// Parse the `Links: [{"title":…,"url":…}, …]` JSON array embedded in a Claude WebSearch
 /// tool_result's text content into `(url, title)` pairs (capped to 6). Tolerant: any failure
@@ -419,11 +519,209 @@ mod tests {
     }
 
     #[test]
-    fn system_result_and_ratelimit_lines_are_ignored() {
+    fn system_and_ratelimit_lines_are_ignored() {
         let mut n = ClaudeNormalizer::new(0);
         assert!(n.feed_line(r#"{"type":"system","subtype":"init","session_id":"x"}"#).is_empty());
-        assert!(n.feed_line(r#"{"type":"result","subtype":"success","result":"done"}"#).is_empty());
         assert!(n.feed_line(r#"{"type":"rate_limit_event","rate_limit_info":{}}"#).is_empty());
         assert!(n.feed_line("not json at all").is_empty());
+    }
+
+    // --- Part 1: tool-result echo ---
+
+    #[test]
+    fn non_websearch_tool_result_echoes_checkmark_milestone() {
+        let mut n = ClaudeNormalizer::new(0);
+        // tool_use for a non-websearch tool
+        n.feed_line(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/x/README.md"}}]}}"#);
+        // matching tool_result → ✅ Read → (no result)
+        let line = r#"{"type":"user","message":{"content":[{"tool_use_id":"toolu_2","type":"tool_result","content":"File not found"}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["kind"], "milestone");
+        assert_eq!(v["node"], "sage");
+        assert!(v["text"].as_str().unwrap().starts_with("✅ Read →"));
+        assert_eq!(v["text"], "✅ Read → File not found");
+    }
+
+    #[test]
+    fn non_websearch_tool_result_with_is_error_emits_cross() {
+        let mut n = ClaudeNormalizer::new(0);
+        n.feed_line(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"false"}}]}}"#);
+        let line = r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":"exit 1","is_error":true}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["kind"], "milestone");
+        assert_eq!(v["text"].as_str().unwrap(), "❌ Bash → exit 1");
+    }
+
+    #[test]
+    fn non_websearch_tool_result_array_content_is_extracted() {
+        let mut n = ClaudeNormalizer::new(0);
+        n.feed_line(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"path":"/x/f.py"}}]}}"#);
+        // content as array of text objects (same path used by websearch factoring)
+        let line = r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":[{"type":"text","text":"File edited"}]}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["text"], "✅ Edit → File edited");
+    }
+
+    #[test]
+    fn non_websearch_tool_result_empty_content_yields_no_result() {
+        let mut n = ClaudeNormalizer::new(0);
+        n.feed_line(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x/f.txt"}}]}}"#);
+        let line = r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":""}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["text"], "✅ Read → (no result)");
+    }
+
+    #[test]
+    fn non_websearch_tool_summary_multibyte_truncated() {
+        let mut n = ClaudeNormalizer::new(0);
+        n.feed_line(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo hello"}}]}}"#);
+        // 210 chars of content — char-capped at 200 + '…'
+        let long_result: String = "🦀".repeat(210);
+        let line = format!(r#"{{"type":"user","message":{{"content":[{{"tool_use_id":"t1","type":"tool_result","content":"{}"}}]}}}}"#, long_result);
+        let out = n.feed_line(&line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        // char-capped at 200 + '…'
+        let text = v["text"].as_str().unwrap();
+        assert!(text.starts_with("✅ Bash → 🦀"));
+        assert!(text.ends_with('…'));
+        // '✅ Bash → ' (9 chars) + 200 truncated + '…' (1 char) = 210
+        assert!(text.chars().count() == 210);
+    }
+
+    // --- Part 2: result summary banner ---
+
+    #[test]
+    fn result_success_emits_banner_with_turns_duration_cost() {
+        let mut n = ClaudeNormalizer::new(0);
+        // REAL captured line from claude_stream_text.jsonl
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":5860,"num_turns":1,"result":"Ciao, sto pianificando.","total_cost_usd":0.1512285}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["kind"], "banner");
+        assert_eq!(v["text"], "Turn done — 1 turns · 5.9s · $0.1512");
+    }
+
+    #[test]
+    fn result_error_emits_banner_with_subtype_and_reason() {
+        let mut n = ClaudeNormalizer::new(0);
+        let line = r#"{"type":"result","subtype":"api_error","is_error":true,"result":"Rate limit exceeded"}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["kind"], "banner");
+        assert_eq!(v["text"], "Turn failed (api_error) — Rate limit exceeded");
+    }
+
+    #[test]
+    fn result_error_missing_subtype_defaults_to_error() {
+        let mut n = ClaudeNormalizer::new(0);
+        let line = r#"{"type":"result","is_error":true,"result":"boom"}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["text"], "Turn failed (error) — boom");
+    }
+
+    #[test]
+    fn result_subtype_error_max_turns_emits_failure_without_is_error() {
+        let mut n = ClaudeNormalizer::new(0);
+        // No is_error flag, but subtype="error_max_turns" → still a failure.
+        let line = r#"{"type":"result","subtype":"error_max_turns","duration_ms":90000,"num_turns":10,"result":"Maximum turns reached"}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["kind"], "banner");
+        assert_eq!(v["text"], "Turn failed (error_max_turns) — Maximum turns reached");
+    }
+
+    #[test]
+    fn result_error_reason_truncated_at_160_chars() {
+        let mut n = ClaudeNormalizer::new(0);
+        let long_reason: String = "x".repeat(200);
+        let line = format!(r#"{{"type":"result","is_error":true,"result":"{}"}}"#, long_reason);
+        let out = n.feed_line(&line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        let text = v["text"].as_str().unwrap();
+        assert!(text.starts_with("Turn failed (error) — "));
+        // the reason part is capped at 160 chars + '…'
+        let reason_part = &text["Turn failed (error) — ".len()..];
+        assert!(reason_part.ends_with('…'));
+        assert!(reason_part.chars().count() <= 161);
+    }
+
+    #[test]
+    fn result_success_without_cost_omits_cost_segment() {
+        let mut n = ClaudeNormalizer::new(0);
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":3000,"num_turns":2}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["text"], "Turn done — 2 turns · 3.0s");
+    }
+
+    // --- Part 3: thinking rows ---
+
+    #[test]
+    fn assistant_with_thinking_block_emits_thinking_then_chat() {
+        let mut n = ClaudeNormalizer::new(0);
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Let me think about this."},{"type":"text","text":"Here is the answer."}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 2, "got {out:?}");
+        let thinking = serde_json::from_str::<Value>(&out[0]).unwrap();
+        let chat = serde_json::from_str::<Value>(&out[1]).unwrap();
+        assert_eq!(thinking["kind"], "thinking");
+        assert_eq!(thinking["text"], "Let me think about this.");
+        assert_eq!(chat["kind"], "chat");
+        assert_eq!(chat["text"], "Here is the answer.");
+    }
+
+    #[test]
+    fn thinking_trace_accumulation_still_works() {
+        // Existing test must stay green — thinking_delta still accumulates into trace
+        let mut n = ClaudeNormalizer::new(0);
+        assert!(n
+            .feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm, maybe "}}}"#)
+            .is_empty());
+        assert!(n
+            .feed_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Postgres"}}}"#)
+            .is_empty());
+        assert_eq!(n.trace(), "hmm, maybe Postgres");
+    }
+
+    #[test]
+    fn thinking_block_empty_string_is_skipped() {
+        let mut n = ClaudeNormalizer::new(0);
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":""},{"type":"text","text":"Hello"}]}}"#;
+        let out = n.feed_line(line);
+        assert_eq!(out.len(), 1, "got {out:?}");
+        let v = one(&out);
+        assert_eq!(v["kind"], "chat");
+    }
+
+    #[test]
+    fn thinking_block_capped_at_2000_chars_in_normalizer() {
+        let mut n = ClaudeNormalizer::new(0);
+        let long_thinking: String = "x".repeat(3000);
+        let line = format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"thinking","thinking":"{}"}},{{"type":"text","text":"Hi"}}]}}}}"#, long_thinking);
+        let out = n.feed_line(&line);
+        assert_eq!(out.len(), 2, "got {out:?}");
+        let v = serde_json::from_str::<Value>(&out[0]).unwrap();
+        assert_eq!(v["kind"], "thinking");
+        // Normalizer caps at 2000 chars + '…' so the tail's MAX_LINE_BYTES=8192 gate
+        // doesn't drop the line.
+        let text = v["text"].as_str().unwrap();
+        assert!(text.ends_with('…'));
+        assert_eq!(text.chars().count(), 2001); // 2000 + '…'
     }
 }
