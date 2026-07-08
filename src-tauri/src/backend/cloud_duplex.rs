@@ -37,6 +37,7 @@ use super::cloud_codex::CodexNormalizer;
 pub enum Provider {
     Claude,
     Codex,
+    OpenAi,
 }
 
 impl Provider {
@@ -45,6 +46,7 @@ impl Provider {
         match client {
             "claude" => Some(Provider::Claude),
             "codex" => Some(Provider::Codex),
+            "openai" => Some(Provider::OpenAi),
             _ => None,
         }
     }
@@ -90,7 +92,7 @@ impl Normalizer {
 /// - Codex app-server: a JSON-RPC `sendUserMessage` notification (best-effort; see module note).
 pub fn encode_user_turn(provider: Provider, msg: &str) -> String {
     let mut line = match provider {
-        Provider::Claude => serde_json::json!({
+        Provider::Claude | Provider::OpenAi => serde_json::json!({
             "type": "user",
             "message": { "role": "user", "content": [{ "type": "text", "text": msg }] }
         })
@@ -275,13 +277,14 @@ pub fn spawn_cloud_duplex(
     // dispatcher, and the steering path. Claude sessions keep `None` (NDJSON, no correlation).
     let codex: Option<Arc<CodexClient>> = match provider {
         Provider::Codex => Some(Arc::new(CodexClient::new())),
-        Provider::Claude => None,
+        Provider::Claude | Provider::OpenAi => None,
     };
 
     match provider {
-        // Claude: send the opening goal as the first user turn inline (byte-identical to before
-        // when there is no resume context).
-        Provider::Claude => {
+        // Claude / OpenAi: send the opening goal as the first user turn inline (byte-identical
+        // to before when there is no resume context). OpenAi reuses the Claude stream-json
+        // encoding for now; the actual OpenAI protocol will be filled in later (Phase 6+).
+        Provider::Claude | Provider::OpenAi => {
             if let Some(goal) = initial_goal.filter(|g| !g.trim().is_empty()) {
                 // D-resume: deliver history + goal; echo the GOAL alone (see the
                 // `resume_context` param doc).
@@ -302,7 +305,9 @@ pub fn spawn_cloud_duplex(
         // `turn/start` only AFTER the thread id is known.
         Provider::Codex => {
             // Build all owned clones BEFORE spawning so the driver borrows nothing transient.
-            let codex_driver = codex.clone().expect("codex client is Some for Codex provider");
+            let codex_driver = codex
+                .clone()
+                .expect("codex client is Some for Codex provider");
             let stdin_driver = stdin.clone();
             let activity_file_driver = activity_file.clone();
             let cwd_string = cwd.to_string_lossy().to_string();
@@ -320,8 +325,7 @@ pub fn spawn_cloud_duplex(
             let initial_goal_owned: Option<String> = initial_goal
                 .filter(|g| !g.trim().is_empty())
                 .map(str::to_string);
-            let initial_goal_msg_id_owned: Option<String> =
-                initial_goal_msg_id.map(str::to_string);
+            let initial_goal_msg_id_owned: Option<String> = initial_goal_msg_id.map(str::to_string);
             let resume_context_owned: Option<String> = resume_context.map(str::to_string);
 
             let _ = std::thread::Builder::new()
@@ -361,9 +365,11 @@ pub fn spawn_cloud_duplex(
                     if t.is_empty() || surfaced {
                         continue;
                     }
-                    let label: String = format!("⚠ CLI: {}", t.chars().take(160).collect::<String>());
+                    let label: String =
+                        format!("⚠ CLI: {}", t.chars().take(160).collect::<String>());
                     let bridge =
-                        serde_json::json!({"kind":"milestone","text":label,"node":"terra"}).to_string();
+                        serde_json::json!({"kind":"milestone","text":label,"node":"terra"})
+                            .to_string();
                     append_bridge_line(&activity_file, &bridge);
                     surfaced = true; // one error line is enough; keep draining to EOF
                 }
@@ -384,7 +390,9 @@ pub fn spawn_cloud_duplex(
         let reader_stdin = stdin.clone();
         let reader_project_id = project_id.to_string();
         let mut normalizer = match provider {
-            Provider::Claude => Normalizer::Claude(ClaudeNormalizer::new(0)),
+            // OpenAi: reuse Claude's normalizer for now (stream-json is closest to OpenAI's
+            // format); the actual OpenAI normalizer will be filled in later (Phase 6+).
+            Provider::Claude | Provider::OpenAi => Normalizer::Claude(ClaudeNormalizer::new(0)),
             Provider::Codex => Normalizer::Codex(CodexNormalizer::new(0)),
         };
         std::thread::Builder::new()
@@ -395,7 +403,11 @@ pub fn spawn_cloud_duplex(
                 let mut sink = if activity_file.as_os_str().is_empty() {
                     None
                 } else {
-                    OpenOptions::new().create(true).append(true).open(&activity_file).ok()
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&activity_file)
+                        .ok()
                 };
                 // Liveness heartbeat: cloud CLIs have no agent_register/heartbeat of
                 // their own, so stamp the session's last_seen_at from the OUTPUT
@@ -437,9 +449,7 @@ pub fn spawn_cloud_duplex(
                                         &activity_file,
                                         &v,
                                     );
-                                } else if let Some(id_val) =
-                                    v.get("id").filter(|i| !i.is_null())
-                                {
+                                } else if let Some(id_val) = v.get("id").filter(|i| !i.is_null()) {
                                     // EVERY server-request needs a reply or the Codex turn hangs
                                     // until its internal timeout. We only implement approvals;
                                     // answer anything else with method-not-found (JSON-RPC -32601).
@@ -536,7 +546,10 @@ pub fn cloud_duplex_send(
     // Clone the stdin handle + provider + Codex correlator under the map lock, then DROP the lock
     // BEFORE the (blocking) pipe write so it can never deadlock against `kill_cloud_duplex`.
     let (stdin, provider, codex, activity_file) = {
-        let map = sessions.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+        let map = sessions
+            .inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
         let session = map
             .get(agent_id)
             .ok_or_else(|| "no live cloud orchestrator for this agent".to_string())?;
@@ -551,7 +564,8 @@ pub fn cloud_duplex_send(
         )
     };
     let encoded = match provider {
-        Provider::Claude => encode_user_turn(provider, message),
+        // OpenAi: reuse Claude's encoding for now (Phase 6+ will add the real protocol).
+        Provider::Claude | Provider::OpenAi => encode_user_turn(provider, message),
         Provider::Codex => {
             // Codex turns are `turn/start` into the open thread. If the handshake has not yet
             // produced a thread id, the thread is not ready — fail clearly instead of writing a
@@ -564,7 +578,9 @@ pub fn cloud_duplex_send(
             encode_turn_start(id, &tid, message)
         }
     };
-    let mut w = stdin.lock().map_err(|_| "stdin lock poisoned".to_string())?;
+    let mut w = stdin
+        .lock()
+        .map_err(|_| "stdin lock poisoned".to_string())?;
     w.write_all(encoded.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     w.flush().map_err(|e| format!("flush failed: {e}"))?;
@@ -586,7 +602,10 @@ pub fn cloud_duplex_interrupt(
 ) -> Result<(), String> {
     static INTERRUPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let (stdin, provider, codex, activity_file) = {
-        let map = sessions.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+        let map = sessions
+            .inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
         let session = map
             .get(agent_id)
             .ok_or_else(|| "no live cloud orchestrator for this agent".to_string())?;
@@ -601,9 +620,10 @@ pub fn cloud_duplex_interrupt(
         )
     };
     let encoded = match provider {
-        Provider::Claude => {
-            encode_claude_interrupt(INTERRUPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-        }
+        // OpenAi: reuse Claude's interrupt encoding for now (Phase 6+ will add the real protocol).
+        Provider::Claude | Provider::OpenAi => encode_claude_interrupt(
+            INTERRUPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ),
         Provider::Codex => {
             let codex = codex.ok_or_else(|| "the Codex session has no client".to_string())?;
             let tid = codex
@@ -612,7 +632,9 @@ pub fn cloud_duplex_interrupt(
             encode_turn_interrupt(codex.alloc_id(), &tid)
         }
     };
-    let mut w = stdin.lock().map_err(|_| "stdin lock poisoned".to_string())?;
+    let mut w = stdin
+        .lock()
+        .map_err(|_| "stdin lock poisoned".to_string())?;
     w.write_all(encoded.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     w.flush().map_err(|e| format!("flush failed: {e}"))?;
@@ -639,7 +661,11 @@ pub fn project_cloud_orchestrator_interrupt(
 /// Kill + reap a duplex child (idempotent; no-op if absent). The child handle is shared with the
 /// reader thread, so whichever runs first reaps it exactly once.
 pub fn kill_cloud_duplex(app: &tauri::AppHandle, sessions: &CloudDuplexSessions, agent_id: &str) {
-    let session = sessions.inner.lock().ok().and_then(|mut m| m.remove(agent_id));
+    let session = sessions
+        .inner
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(agent_id));
     let had_session = session.is_some();
     if let Some(mut session) = session {
         session.exited.store(true, Ordering::SeqCst);
@@ -721,7 +747,10 @@ pub fn project_cloud_orchestrator_send(
 /// before the (blocking) pipe write, mirroring `cloud_duplex_send`.
 pub fn cloud_duplex_compact(sessions: &CloudDuplexSessions, agent_id: &str) -> Result<(), String> {
     let (stdin, codex) = {
-        let map = sessions.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+        let map = sessions
+            .inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?;
         let session = map
             .get(agent_id)
             .ok_or_else(|| "no live cloud orchestrator for this agent".to_string())?;
@@ -736,7 +765,9 @@ pub fn cloud_duplex_compact(sessions: &CloudDuplexSessions, agent_id: &str) -> R
         .ok_or_else(|| "the Codex thread is not ready yet".to_string())?;
     let id = codex.alloc_id();
     let encoded = encode_compact(id, &tid);
-    let mut w = stdin.lock().map_err(|_| "stdin lock poisoned".to_string())?;
+    let mut w = stdin
+        .lock()
+        .map_err(|_| "stdin lock poisoned".to_string())?;
     w.write_all(encoded.as_bytes())
         .map_err(|e| format!("write failed: {e}"))?;
     w.flush().map_err(|e| format!("flush failed: {e}"))?;
@@ -766,7 +797,8 @@ pub fn has_live_duplex(sessions: &CloudDuplexSessions, agent_id: &str) -> bool {
 
 /// Append a milestone bridge line to the activity file (operator-visible Stage note).
 fn append_codex_milestone(activity_file: &std::path::Path, text: &str) {
-    let json = serde_json::json!({ "kind": "milestone", "text": text, "node": "terra" }).to_string();
+    let json =
+        serde_json::json!({ "kind": "milestone", "text": text, "node": "terra" }).to_string();
     append_bridge_line(activity_file, &json);
 }
 
@@ -806,7 +838,10 @@ fn codex_handshake_driver(
     if !write_codex_line(&stdin, &encode_initialize(id1)) {
         // stdin lock poisoned — fail fast instead of waiting the full 30s for a reply that
         // can never come (nothing was written).
-        append_codex_milestone(&activity_file, "⚠ Codex handshake failed: could not write initialize");
+        append_codex_milestone(
+            &activity_file,
+            "⚠ Codex handshake failed: could not write initialize",
+        );
         return;
     }
     if rx1.recv_timeout(CODEX_HANDSHAKE_TIMEOUT).is_err() {
@@ -821,7 +856,10 @@ fn codex_handshake_driver(
         &stdin,
         &encode_thread_start(id2, &cwd, model.as_deref(), &policy),
     ) {
-        append_codex_milestone(&activity_file, "⚠ Codex handshake failed: could not write thread/start");
+        append_codex_milestone(
+            &activity_file,
+            "⚠ Codex handshake failed: could not write thread/start",
+        );
         return;
     }
     let resp = match rx2.recv_timeout(CODEX_HANDSHAKE_TIMEOUT) {
@@ -938,7 +976,9 @@ fn handle_codex_approval(
 ) {
     // Capture the RAW JSON-RPC id (string OR number per JSON-RPC 2.0). We must echo it verbatim in
     // the response; coercing it to a `u64` here would drop string ids and emit a non-matching id.
-    let Some(id_val) = v.get("id").filter(|i| !i.is_null()) else { return };
+    let Some(id_val) = v.get("id").filter(|i| !i.is_null()) else {
+        return;
+    };
     let id_owned = id_val.clone(); // serde_json::Value: Clone — moved into the waiter closure.
     let id_str = jsonrpc_id_str(id_val);
     let method = msg_method(v).unwrap_or("");
@@ -966,9 +1006,7 @@ fn handle_codex_approval(
     }
 
     // No broker → we cannot prompt → decline immediately so the turn does not hang.
-    let Some(cloud_consent) =
-        app.try_state::<crate::backend::broker::CloudConsentState>()
-    else {
+    let Some(cloud_consent) = app.try_state::<crate::backend::broker::CloudConsentState>() else {
         write_codex_line(
             stdin,
             &encode_approval_result(&id_owned, CodexApprovalReply::Decline.as_wire()),
@@ -1011,8 +1049,8 @@ fn handle_codex_approval(
                 Err(_) => {
                     // Timed out (or the sender was dropped on session kill). Clean up the pending
                     // entry and fail-closed: decline so the Codex turn is never left hanging.
-                    if let Some(cc) = app_waiter
-                        .try_state::<crate::backend::broker::CloudConsentState>()
+                    if let Some(cc) =
+                        app_waiter.try_state::<crate::backend::broker::CloudConsentState>()
                     {
                         cc.cancel(&approval_id);
                     }
@@ -1306,7 +1344,10 @@ impl CodexClient {
     }
 
     pub fn thread_id(&self) -> Option<String> {
-        self.thread_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.thread_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -1370,13 +1411,18 @@ mod tests {
     fn provider_from_client_maps_known_clients() {
         assert_eq!(Provider::from_client("claude"), Some(Provider::Claude));
         assert_eq!(Provider::from_client("codex"), Some(Provider::Codex));
+        assert_eq!(Provider::from_client("openai"), Some(Provider::OpenAi));
         assert_eq!(Provider::from_client("orchestrator"), None);
     }
 
     #[test]
     fn user_turn_escapes_newlines_and_quotes_to_one_line() {
         let line = encode_user_turn(Provider::Claude, "a\"b\nc");
-        assert_eq!(line.matches('\n').count(), 1, "exactly the trailing newline");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly the trailing newline"
+        );
         let v: Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(v["message"]["content"][0]["text"], "a\"b\nc");
     }
@@ -1441,7 +1487,10 @@ mod tests {
         let s = encode_approval_result(&serde_json::json!("req-abc"), "decline");
         let v: Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(v["id"], "req-abc");
-        assert!(v["id"].is_string(), "string id must NOT be coerced to a number");
+        assert!(
+            v["id"].is_string(),
+            "string id must NOT be coerced to a number"
+        );
         assert_eq!(v["result"]["decision"], "decline");
     }
 
@@ -1546,7 +1595,10 @@ mod tests {
             CodexApprovalReply::Decline
         );
         assert_eq!(CodexApprovalReply::Accept.as_wire(), "accept");
-        assert_eq!(CodexApprovalReply::AcceptForSession.as_wire(), "acceptForSession");
+        assert_eq!(
+            CodexApprovalReply::AcceptForSession.as_wire(),
+            "acceptForSession"
+        );
         assert_eq!(CodexApprovalReply::Decline.as_wire(), "decline");
     }
 
@@ -1613,7 +1665,10 @@ mod tests {
 
     #[test]
     fn command_to_string_handles_shapes() {
-        assert_eq!(command_to_string(&serde_json::json!("a b")).as_deref(), Some("a b"));
+        assert_eq!(
+            command_to_string(&serde_json::json!("a b")).as_deref(),
+            Some("a b")
+        );
         assert_eq!(
             command_to_string(&serde_json::json!(["a", "b"])).as_deref(),
             Some("a b")

@@ -2090,7 +2090,7 @@ fn prepare_or_launch_project_agent(
     let cloud_duplex = input.cloud_duplex == Some(true)
         && launch_terminal
         && host == HOST_APP
-        && (client == "claude" || client == "codex");
+        && (client == "claude" || client == "codex" || client == "openai");
     if cloud_duplex {
         let provider = crate::backend::cloud_duplex::Provider::from_client(&client)
             .ok_or_else(|| "unsupported cloud duplex client".to_string())?;
@@ -6570,6 +6570,167 @@ fn build_cloud_duplex_launch(
             args.push("app-server".to_string());
             "codex"
         }
+        // OpenAi: placeholder that reuses Claude's launch flags + consent hook (Phase 6+ will
+        // replace this with the real OpenAI protocol encoding). Because it reuses Claude's argv /
+        // settings shape, we mirror the Claude arm EXACTLY here: forward the per-project agent
+        // controls AND select the permission mode dynamically — the old arm hardcoded "default"
+        // and silently dropped both the project's sandbox intent and its agent guardrails.
+        crate::backend::cloud_duplex::Provider::OpenAi => {
+            // Slice 5b: locate the sibling `claude_consent_hook` binary (the consent bridge is
+            // shared with Claude — see the env gating below). When resolvable, register it as a
+            // PreToolUse hook via --settings so every Patch/Exec tool call round-trips through
+            // OUR consent UI. If it cannot be resolved, fall back to launching WITHOUT the hook
+            // and log a milestone — never block the launch.
+            let hook_bin = resolve_app_binary().map(|mut p| {
+                p.set_file_name(if cfg!(windows) {
+                    "claude_consent_hook.exe"
+                } else {
+                    "claude_consent_hook"
+                });
+                p
+            });
+            let hook_path: Option<String> = hook_bin
+                .as_ref()
+                .filter(|p| p.is_file())
+                .map(|p| p.to_string_lossy().into_owned());
+            if hook_path.is_none() {
+                eprintln!(
+                    "cloud openai: claude_consent_hook binary not found next to the app binary; \
+                     launching OpenAI WITHOUT the PreToolUse consent hook (net deny rules still \
+                     applied; tool edits are not gated, so the permission mode stays 'default')."
+                );
+            }
+            // Build the settings (with the hook when available, deny-only — net rules only —
+            // when not: max-recall F11). hook timeout 600s must exceed the hook's own poll cap.
+            let settings = crate::backend::cloud_claude_config::build_claude_settings(
+                mode,
+                net_enabled,
+                hook_path.as_deref(),
+                600,
+            );
+            let settings_json = serde_json::to_string(&settings).unwrap_or_default();
+            // max-recall A: write the settings to a FILE and pass the PATH to --settings (the
+            // canonical settings.json form) instead of inline JSON. Skip entirely when there is
+            // nothing to configure (net enabled + no hook → `{}`).
+            //
+            // adversarial-verify A2 (path traversal): `agent_id` is a frontend-supplied IPC arg,
+            // so it MUST be sanitized before it touches a filesystem path.
+            let settings_path: Option<String> = if settings_json == "{}" {
+                None
+            } else {
+                let safe_agent: String = agent_id
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let file =
+                    std::env::temp_dir().join(format!("aspis-openai-settings-{safe_agent}.json"));
+                match std::fs::write(&file, &settings_json) {
+                    Ok(()) => Some(file.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        eprintln!(
+                            "cloud openai: could not write the settings file ({e}); launching \
+                             without --settings."
+                        );
+                        None
+                    }
+                }
+            };
+            // SECURITY (5b F1 + max-recall): only widen the permission mode (acceptEdits /
+            // bypassPermissions) when the consent hook is ACTUALLY registered — i.e. the hook
+            // binary exists AND its settings file was written. Otherwise nothing gates tool
+            // edits, so we MUST stay on `default` (OpenAI prompts interactively) and never run
+            // an Unattended project unrestricted.
+            let hook_active = hook_path.is_some() && settings_path.is_some();
+            let perm_mode = if hook_active {
+                claude_permission_mode(mode)
+            } else {
+                "default"
+            };
+            for a in [
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "--verbose",
+                "--permission-mode",
+                perm_mode,
+                "--mcp-config",
+            ] {
+                args.push(a.to_string());
+            }
+            args.push(mcp);
+            // --settings <path> AFTER --mcp-config (per the plan's argv order).
+            if let Some(path) = settings_path {
+                args.push("--settings".to_string());
+                args.push(path);
+            }
+            if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+                args.push("--model".to_string());
+                args.push(m.to_string());
+            }
+            // Slice 5c: per-project agent controls → Claude-compatible flags (the OpenAI
+            // placeholder reuses Claude's argv shape; Phase 6+ will re-encode these for the real
+            // OpenAI CLI). Forward EVERY set control so the project's guardrails are NOT silently
+            // dropped. Each is operator-visible via the eprintln! below in case the eventual
+            // OpenAI CLI does not honor the Claude-shaped flag.
+            if let Some(effort) = controls
+                .effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args.push("--effort".to_string());
+                args.push(effort.to_string());
+                eprintln!(
+                    "cloud openai: forwarding per-project effort control '{effort}' (Claude-compatible \
+                     --effort flag; verify the OpenAI CLI honors it — guardrail was previously dropped)."
+                );
+            }
+            if let Some(sp) = controls
+                .system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args.push("--append-system-prompt".to_string());
+                args.push(sp.to_string());
+                eprintln!(
+                    "cloud openai: forwarding per-project system_prompt control (Claude-compatible \
+                     --append-system-prompt flag; verify the OpenAI CLI honors it — guardrail was \
+                     previously dropped)."
+                );
+            }
+            // 5c reviewer W2: guard > 0 at the emission layer (independent of frontend
+            // validation) so a stored `Some(0)` never becomes `--max-turns 0` ("zero turns").
+            if let Some(n) = controls.max_turns.filter(|&n| n > 0) {
+                args.push("--max-turns".to_string());
+                args.push(n.to_string());
+                eprintln!(
+                    "cloud openai: forwarding per-project max_turns control '{n}' (Claude-compatible \
+                     --max-turns flag; verify the OpenAI CLI honors it — guardrail was previously dropped)."
+                );
+            }
+            if let Some(b) = controls
+                .max_budget_usd
+                .filter(|&b| b > 0.0 && b.is_finite())
+            {
+                args.push("--max-budget-usd".to_string());
+                args.push(b.to_string());
+                eprintln!(
+                    "cloud openai: forwarding per-project max_budget_usd control '{b}' (Claude-compatible \
+                     --max-budget-usd flag; verify the OpenAI CLI honors it — guardrail was previously dropped)."
+                );
+            }
+            "openai"
+        }
     };
 
     let mut envs: Vec<(String, String)> = provider_env
@@ -6601,7 +6762,9 @@ fn build_cloud_duplex_launch(
     // Slice 5b: the consent file-bridge context the Claude PreToolUse hook reads. Only
     // meaningful for Claude (Codex hosts approvals in-process via the app-server stream),
     // so we gate it to the Claude provider to keep the Codex launch env byte-identical.
-    if provider == crate::backend::cloud_duplex::Provider::Claude {
+    if provider == crate::backend::cloud_duplex::Provider::Claude
+        || provider == crate::backend::cloud_duplex::Provider::OpenAi
+    {
         envs.push((
             "ASPIS_CONSENT_BRIDGE".to_string(),
             projects_dir.to_string_lossy().into_owned(),
