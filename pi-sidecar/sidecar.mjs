@@ -16,9 +16,15 @@
  *   ANTHROPIC_API_KEY     — for anthropic provider (NOT used; Claude blocked per #10)
  */
 
-import { writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import {
+	writeFileSync,
+	rmSync,
+	mkdtempSync,
+	existsSync,
+	readFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 
 // #5: bound the JSONL framer buffer. A single oversized line (e.g. a 500MB
 // JSONL record) would otherwise accumulate unbounded and OOM the process.
@@ -58,6 +64,28 @@ function emitError(context, err) {
 		context,
 		message: err instanceof Error ? err.message : String(err),
 	});
+}
+
+// #2: check whether the Oracle MCP server (`oracle-figlyph`) is configured in
+// either `~/.pi/agent/mcp.json` or `~/.pi/mcp.json`. If not, `oracle_ask`
+// (which the Rust side surfaces via the Oracle MCP) will not work. We only
+// check config presence here — actual reachability is the MCP client's concern.
+function isOracleMcpConfigured() {
+	try {
+		const candidates = [
+			join(homedir(), ".pi", "agent", "mcp.json"),
+			join(homedir(), ".pi", "mcp.json"),
+		];
+		for (const p of candidates) {
+			if (!existsSync(p)) continue;
+			const cfg = JSON.parse(readFileSync(p, "utf8"));
+			if (cfg?.mcpServers?.["oracle-figlyph"]) return true;
+			if (Object.hasOwn(cfg, "oracle-figlyph")) return true;
+		}
+	} catch (e) {
+		console.error("[pi-sidecar] Oracle MCP config check failed:", e);
+	}
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +352,17 @@ async function main() {
 		);
 	}
 
+	// #2: report Oracle MCP availability so the Rust side can warn the user
+	// (via a console banner) that `oracle_ask` will not work without it.
+	const oracleMcpAvailable = isOracleMcpConfigured();
+	if (!oracleMcpAvailable) {
+		console.error(
+			"[pi-sidecar] Oracle MCP (oracle-figlyph) NOT configured — oracle_ask will not work.",
+		);
+	} else {
+		console.error("[pi-sidecar] Oracle MCP (oracle-figlyph) configured.");
+	}
+
 	// ---- Censor hook state -------------------------------------------------
 	const censorEnabled =
 		(process.env.DEVBOULE_CENSOR_REVIEW_ENABLED ?? "true") !== "false";
@@ -462,6 +501,13 @@ async function main() {
 			return;
 		}
 
+		// #4: JSON.parse("null") yields `null` (no throw). `cmd.type` would then
+		// throw TypeError and crash the sidecar. Guard non-object values.
+		if (cmd === null || typeof cmd !== "object") {
+			emitError("parse", "Invalid JSON value: expected object");
+			return;
+		}
+
 		switch (cmd.type) {
 			case "prompt": {
 				if (promptInFlight) {
@@ -470,6 +516,18 @@ async function main() {
 						command: "prompt",
 						success: false,
 						error: "A prompt is already in flight. Wait for agent_end.",
+					});
+					break;
+				}
+				// #3: guard against an oversized prompt (e.g. a 10MB paste) that
+				// would blow the JSONL buffer / sidecar memory. Truncate-and-error
+				// instead of forwarding to pi.
+				if (typeof cmd.message === "string" && cmd.message.length > 100_000) {
+					emit({
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: "Prompt exceeds 100KB limit",
 					});
 					break;
 				}
@@ -521,7 +579,7 @@ async function main() {
 		}
 	});
 
-	emit({ type: "ready" });
+	emit({ type: "ready", oracleMCP: oracleMcpAvailable });
 
 	console.error(
 		`[pi-sidecar] enrichment active: role=${devbouleContext.agentRole} session=${devbouleContext.sessionId} project=${devbouleContext.projectId}`,

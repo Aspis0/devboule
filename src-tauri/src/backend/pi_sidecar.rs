@@ -23,9 +23,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -47,7 +48,11 @@ struct SessionSlot {
 /// A single active pi sidecar session. Each session gets its own Node child process,
 /// stdin writer, per-session generation counter, and reader thread handle.
 struct PiSession {
-    child: Child,
+    /// Shared child process handle. Wrapped in `Arc<Mutex<>>` so BOTH the reader
+    /// thread (which calls `try_wait()` on EOF) and the control path
+    /// (`stop_pi_session`, `spike_pi_prompt`) can inspect/kill the child without
+    /// a second exclusive owner.
+    child: Arc<Mutex<Child>>,
     /// Shared stdin writer. Also written by the reader thread (which sends
     /// `classified` responses back to the sidecar), so it is reference-counted
     /// and mutex-guarded to keep JSONL lines from interleaving.
@@ -55,6 +60,12 @@ struct PiSession {
     /// Per-session generation counter — bumped ONLY when THIS session respawns.
     /// The reader thread compares against this, NOT a global counter.
     generation: Arc<AtomicU64>,
+    /// Set by the session-timeout watchdog (#5) just before it kills a hung
+    /// child, so the reader thread emits the timeout banner (not the crash banner).
+    timed_out: Arc<AtomicBool>,
+    /// When this session was spawned (#5) — the watchdog measures elapsed time
+    /// against `DEVBOULE_PI_SESSION_TIMEOUT_SECS` from this instant.
+    spawned_at: Instant,
     /// Handle to the stdout reader thread. Joined on stop to ensure clean teardown.
     reader_handle: Option<JoinHandle<()>>,
 }
@@ -65,14 +76,43 @@ pub struct PiSidecarState {
     inner: Mutex<HashMap<String, SessionSlot>>,
     /// Monotonically incremented to generate unique session ids.
     session_counter: AtomicU64,
+    /// Serializable session records persisted to `.devboule/pi-sessions.json`
+    /// so sessions survive app restarts. Decoupled from the live `inner` map,
+    /// which holds process handles that cannot be serialized.
+    persisted: Mutex<HashMap<String, PersistedSession>>,
+    /// Sessions restored from disk at init (active, informational — their
+    /// processes are gone after a restart). Surfaced by the frontend banner.
+    restored: Mutex<Vec<SessionInfo>>,
 }
 
 impl Default for PiSidecarState {
     fn default() -> Self {
+        let restored = restore_pi_sessions(&pi_project_root());
         Self {
             inner: Mutex::new(HashMap::new()),
             // Note: HashMap<String, SessionSlot> — each entry holds Option<PiSession>.
             session_counter: AtomicU64::new(0),
+            persisted: Mutex::new(HashMap::new()),
+            restored: Mutex::new(restored),
+        }
+    }
+}
+
+impl PiSidecarState {
+    /// Sessions restored from the previous run (informational — their processes
+    /// are gone after a restart). Consumed by the frontend "restored sessions"
+    /// banner.
+    pub fn take_restored_pi_sessions(&self) -> Vec<SessionInfo> {
+        std::mem::take(&mut *self.restored.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Frontend banner text for restored sessions, if any were restored.
+    pub fn restored_session_banner(&self) -> Option<String> {
+        let n = self.restored.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if n > 0 {
+            Some(format!("Restored {n} active pi sessions from previous session."))
+        } else {
+            None
         }
     }
 }
@@ -99,6 +139,162 @@ pub struct SessionInfo {
     pub agent_role: String,
     /// The `mini-activity://<agentId>` channel the console should subscribe to.
     pub channel: String,
+}
+
+// ---- session persistence (Phase 1: survive app restarts) -----------------
+
+/// Status of a persisted pi session. Mirrors the JSON `status` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum SessionStatus {
+    #[default]
+    Active,
+    Stopped,
+    Crashed,
+}
+
+
+/// A serializable record of a single pi sidecar session, persisted to
+/// `{project_root}/.devboule/pi-sessions.json` so sessions survive app restarts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedSession {
+    pub id: String,
+    pub agent_role: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    pub created_at: u64,
+    pub last_active_at: u64,
+    pub status: SessionStatus,
+}
+
+/// On-disk shape of `.devboule/pi-sessions.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SessionFile {
+    sessions: Vec<PersistedSession>,
+}
+
+/// Current unix epoch in milliseconds (used for `createdAt` / `lastActiveAt`).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether session persistence is enabled. Gate via `DEVBOULE_PI_PERSIST`
+/// (default: `true`). Set to `0`/`false`/`no`/`off` to disable file writes.
+fn persist_enabled() -> bool {
+    match std::env::var("DEVBOULE_PI_PERSIST") {
+        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
+/// Resolve the project root used for `.devboule/` persistence. Mirrors the
+/// dev-path resolution in `spawn_pi_session_inner` (repo root = cwd in dev).
+fn pi_project_root() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Apply lifecycle cleanup rules before writing:
+/// - an `active` session whose `lastActiveAt` is > 24h ago is assumed dead after
+///   the restart and marked `crashed`.
+/// - a `stopped`/`crashed` session whose `lastActiveAt` is > 7 days old is
+///   purged entirely.
+fn apply_cleanup(mut file: SessionFile) -> SessionFile {
+    let now = now_ms();
+    let day_ms = 24 * 3600 * 1000;
+    let week_ms = 7 * day_ms;
+    for s in &mut file.sessions {
+        if s.status == SessionStatus::Active && now.saturating_sub(s.last_active_at) > day_ms {
+            s.status = SessionStatus::Crashed;
+        }
+    }
+    file.sessions.retain(|s| match s.status {
+        SessionStatus::Stopped | SessionStatus::Crashed => {
+            now.saturating_sub(s.last_active_at) <= week_ms
+        }
+        SessionStatus::Active => true,
+    });
+    file
+}
+
+/// Persist the current in-memory session set to
+/// `{project_root}/.devboule/pi-sessions.json`. No-op when persistence is gated
+/// off via `DEVBOULE_PI_PERSIST`.
+pub fn save_pi_sessions(state: &PiSidecarState, project_root: &Path) {
+    if !persist_enabled() {
+        return;
+    }
+    // Hold the `persisted` lock across the ENTIRE read -> clean -> write ->
+    // reflect cycle (#2). Releasing it between read and write let concurrent
+    // callers interleave and lose each other's writes (and corrupt the file).
+    let mut g = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
+    let collected: Vec<PersistedSession> = g.values().cloned().collect();
+    let file = apply_cleanup(SessionFile { sessions: collected });
+
+    let dir = project_root.join(".devboule");
+    let path = dir.join("pi-sessions.json");
+    // Atomic temp-file-then-rename: never write the final path directly, so a
+    // crash mid-write can't leave a truncated/garbage file. On failure we keep
+    // the old file and still reflect the cleanup in memory.
+    match serde_json::to_string_pretty(&file) {
+        Ok(json) => {
+            let written = if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
+                let tmp = dir.join("pi-sessions.json.tmp");
+                std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, &path).is_ok()
+            } else {
+                false
+            };
+            if !written {
+                eprintln!(
+                    "[pi-sidecar] failed to persist pi sessions to {}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("[pi-sidecar] failed to serialize pi sessions: {e}");
+        }
+    }
+
+    // Reflect any purge / status-marking back into the in-memory set under the
+    // same lock so it stays consistent with what we just wrote.
+    *g = file
+        .sessions
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+    // `g` is dropped here, releasing the lock.
+}
+
+/// Load `.devboule/pi-sessions.json` and return the sessions that should be
+/// considered alive (`active` and not stale). Stopped/crashed sessions are
+/// informational only and are NOT returned (their processes are long gone).
+pub fn restore_pi_sessions(project_root: &Path) -> Vec<SessionInfo> {
+    let path = project_root.join(".devboule").join("pi-sessions.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_str::<SessionFile>(&data) else {
+        return Vec::new();
+    };
+    let file = apply_cleanup(file);
+    file.sessions
+        .into_iter()
+        .filter(|s| s.status == SessionStatus::Active)
+        .map(|s| {
+            let id = s.id.clone();
+            SessionInfo {
+                session_id: s.id,
+                is_new: false,
+                agent_role: s.agent_role,
+                channel: super::mini_activity::mini_activity_channel(&id),
+            }
+        })
+        .collect()
 }
 
 /// Generate a **role-aware** agent id for a sidecar session. The frontend consoles
@@ -370,8 +566,21 @@ fn spawn_pi_session_inner(
     cmd.args(&args)
         .current_dir(&sidecar_dir)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped());
+
+    // #4: in a packaged (release) build there is no visible terminal, so pipe
+    // the sidecar's stderr and forward it via a reader thread to `eprintln!`
+    // (Tauri's logger). In debug, inherit so logs go straight to the Tauri
+    // terminal. Force inheritance with `DEVBOULE_PI_STDERR_ECHO=0`.
+    let stderr_piped = cfg!(not(debug_assertions))
+        && std::env::var("DEVBOULE_PI_STDERR_ECHO")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    if stderr_piped {
+        cmd.stderr(Stdio::piped());
+    } else {
+        cmd.stderr(Stdio::inherit());
+    }
 
     if sandboxed {
         crate::backend::sandbox::apply_rlimits(&mut cmd, &policy.rlimits);
@@ -414,6 +623,9 @@ fn spawn_pi_session_inner(
         .stdout
         .take()
         .ok_or_else(|| "pi sidecar stdout not captured".to_string())?;
+    // #4: capture stderr only when we piped it (release build), so the forwarder
+    // thread has a stream to read.
+    let stderr = if stderr_piped { child.stderr.take() } else { None };
 
     // Shared, mutex-guarded stdin: both `spike_pi_prompt` (prompt commands) and
     // the reader thread (`classified` responses) write here. The Arc lets the
@@ -426,18 +638,52 @@ fn spawn_pi_session_inner(
     // Bump THIS session's generation so any old reader for this session exits.
     let _gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
 
+    // Wrap the child so the reader thread can call `try_wait()` on EOF without
+    // owning the only handle (#1).
+    let child = Arc::new(Mutex::new(child));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let spawned_at = Instant::now();
+
     let app_clone = app.clone();
     let sid = session_id.to_string();
     let gen_clone = generation.clone();
     let stdin_clone = stdin.clone();
+    let child_clone = child.clone();
+    let timed_out_clone = timed_out.clone();
     let reader_handle = std::thread::spawn(move || {
-        read_sidecar_events(app_clone, stdout, stdin_clone, gen_clone, &sid);
+        read_sidecar_events(
+            app_clone,
+            stdout,
+            stdin_clone,
+            gen_clone,
+            child_clone,
+            timed_out_clone,
+            &sid,
+        );
     });
+
+    // #4: release-build stderr forwarder (terminal-less packaged app).
+    if let Some(stderr_stream) = stderr {
+        spawn_stderr_forwarder(stderr_stream);
+    }
+
+    // #5: session-timeout watchdog (DEVBOULE_PI_SESSION_TIMEOUT_SECS; 0 disables).
+    spawn_session_timeout_watchdog(
+        app.clone(),
+        session_id.to_string(),
+        generation.clone(),
+        child.clone(),
+        timed_out.clone(),
+        spawned_at,
+        read_session_timeout_secs(),
+    );
 
     Ok(PiSession {
         child,
         stdin,
         generation,
+        timed_out,
+        spawned_at,
         reader_handle: Some(reader_handle),
     })
 }
@@ -447,22 +693,40 @@ pub fn stop_pi_session(app: &AppHandle, session_id: &str) -> Result<bool, String
     let state = app.state::<PiSidecarState>();
     let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-    if let Some(mut slot) = guard.remove(session_id) {
+    // Capture the reader handle so we can join AFTER releasing the state lock
+    // (#1: avoids a deadlock if the reader thread needs to remove its own
+    // crashed session from the map while we hold the lock).
+    let reader_handle = if let Some(mut slot) = guard.remove(session_id) {
         if let Some(mut session) = slot.inner.take() {
             // Bump THIS session's generation so the reader detects staleness.
             session.generation.fetch_add(1, Ordering::SeqCst);
-            // Kill the child process.
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-            // Join the reader thread. It should exit quickly once stdout closes (EOF).
-            if let Some(handle) = session.reader_handle.take() {
-                let _ = handle.join();
+            // Kill the child process (now behind a Mutex, #1).
+            if let Ok(mut c) = session.child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
             }
+            session.reader_handle.take()
+        } else {
+            None
         }
-        Ok(true)
     } else {
-        Ok(false)
+        None
+    };
+    // #1: release the state lock BEFORE joining the reader thread.
+    drop(guard);
+    if let Some(handle) = reader_handle {
+        let _ = handle.join();
     }
+    // Persist: mark this session stopped and rewrite the sessions file.
+    {
+        let mut pg = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = pg.get_mut(session_id) {
+            s.status = SessionStatus::Stopped;
+            s.last_active_at = now_ms();
+        }
+    }
+    save_pi_sessions(&state, &pi_project_root());
+    Ok(true)
 }
 
 /// Get an existing session or spawn a new one.
@@ -487,17 +751,22 @@ fn get_or_spawn_session(
             Some(id) => {
                 if let Some(slot) = guard.get_mut(&id) {
                     if let Some(ref mut session) = slot.inner {
-                        match session.child.try_wait() {
-                            Ok(Some(_)) => {
-                                // Dead — grab generation for reuse, will respawn below.
-                                let old_gen = session.generation.clone();
-                                guard.remove(&id);
-                                // Reserve the slot with a placeholder.
-                                guard.insert(id.clone(), SessionSlot { inner: None });
-                                (id, false, Some(old_gen))
-                            }
-                            Ok(None) => return Ok((id, false)), // Alive.
-                            Err(_) => return Ok((id, false)),     // Assume alive.
+                        // Inspect the child's exit status WITHOUT holding a borrow
+                        // on `session`/`guard` (the child lock must be dropped before
+                        // we mutate `guard` below, #1).
+                        let dead = match session.child.lock() {
+                            Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+                            Err(_) => false, // lock poisoned — assume alive.
+                        };
+                        if dead {
+                            // Dead — grab generation for reuse, will respawn below.
+                            let old_gen = session.generation.clone();
+                            guard.remove(&id);
+                            // Reserve the slot with a placeholder.
+                            guard.insert(id.clone(), SessionSlot { inner: None });
+                            (id, false, Some(old_gen))
+                        } else {
+                            return Ok((id, false)) // Alive (or assume alive on error).
                         }
                     } else {
                         return Err(format!("Session {id} is currently spawning — try again in a moment."));
@@ -544,11 +813,32 @@ fn get_or_spawn_session(
         // Kill the newly spawned child and return error.
         let mut s = new_session;
         s.generation.fetch_add(1, Ordering::SeqCst);
-        let _ = s.child.kill();
-        let _ = s.child.wait();
+        if let Ok(mut c) = s.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
         if let Some(h) = s.reader_handle.take() { let _ = h.join(); }
         return Err(format!("pi session {id} was stopped during spawn"));
     }
+    drop(guard);
+
+    // Persist: record this session (active) and rewrite the sessions file so it
+    // survives an app restart. Decoupled from the live `inner` map.
+    {
+        let mut pg = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        pg.insert(
+            id.clone(),
+            PersistedSession {
+                id: id.clone(),
+                agent_role: role.unwrap_or("main-coder").to_string(),
+                project_id: project_id.map(|s| s.to_string()),
+                created_at: now_ms(),
+                last_active_at: now_ms(),
+                status: SessionStatus::Active,
+            },
+        );
+    }
+    save_pi_sessions(&state, &pi_project_root());
 
     Ok((id, is_new))
 }
@@ -580,7 +870,14 @@ pub async fn spike_pi_prompt(
             .inner
             .as_mut()
             .ok_or_else(|| format!("pi session {sid} has empty slot (spawn in progress?)"))?;
-        match session.child.try_wait() {
+        // Inspect the child's exit status WITHOUT holding a borrow on
+        // `session`/`guard` — the child lock must be dropped before we mutate
+        // `guard` below (#1).
+        let exit_status = match session.child.lock() {
+            Ok(mut c) => c.try_wait(),
+            Err(_) => return Err(format!("pi session {sid} child lock poisoned")),
+        };
+        match exit_status {
             Ok(Some(status)) => {
                 guard.remove(&sid);
                 return Err(format!(
@@ -619,7 +916,9 @@ pub async fn spike_pi_prompt(
             .write_all(format!("{line}\n").as_bytes())
             .map_err(|e| {
                 // F4: on write failure, flag for zombie cleanup after we release session borrow.
-                if let Ok(Some(_)) = session.child.try_wait() {
+                if let Some(Some(_)) =
+                    session.child.lock().ok().and_then(|mut c| c.try_wait().ok())
+                {
                     write_failed_zombie = true;
                 }
                 format!("Failed to write to pi sidecar stdin: {e}")
@@ -702,6 +1001,11 @@ pub async fn spike_pi_stop(app: AppHandle, session_id: String) -> Result<bool, S
 struct PiEvent {
     #[serde(rename = "type")]
     event_type: String,
+    /// #2: whether the Oracle MCP server was reachable at startup. The sidecar
+    /// stamps this onto the `ready` event's `oracleMCP` field; `Some(false)`
+    /// means `oracle_ask` will not work (surfaced as a banner in the console).
+    #[serde(rename = "oracleMCP", default)]
+    oracle_mcp: Option<bool>,
     #[serde(default)]
     assistant_message_event: Option<AssistantMessageEvent>,
     #[serde(rename = "toolCallId", default)]
@@ -962,6 +1266,17 @@ impl EventMapper {
                 self.emit_snapshot(app);
             }
             "response" | "ready" => {
+                // #2: the `ready` event carries whether the Oracle MCP was reachable
+                // at startup. If not, surface a banner so the user knows
+                // `oracle_ask` will silently fail.
+                if event.event_type == "ready"
+                    && event.oracle_mcp == Some(false) {
+                        self.push_entry(ConsoleEntry::Banner {
+                            text: "Oracle MCP not available — oracle_ask will not work."
+                                .to_string(),
+                            time: Self::now_str(),
+                        });
+                    }
                 self.emit_snapshot(app);
             }
             "devboule_censor_review" => {
@@ -1226,6 +1541,151 @@ fn write_jsonl_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Valu
     }
 }
 
+// ---- sidecar lifecycle helpers (crash recovery / timeout / stderr) -------
+
+/// #1/#5: classify how a sidecar terminated, given its exit status and whether
+/// the timeout watchdog killed it. Pure + unit-testable (mock exit codes).
+enum SidecarTermination {
+    Crash(i32),
+    Timeout,
+    Clean,
+}
+
+fn classify_sidecar_termination(
+    exit_status: Option<std::process::ExitStatus>,
+    timed_out: bool,
+) -> SidecarTermination {
+    if timed_out {
+        return SidecarTermination::Timeout;
+    }
+    match exit_status {
+        Some(status) if !status.success() => SidecarTermination::Crash(status.code().unwrap_or(-1)),
+        _ => SidecarTermination::Clean,
+    }
+}
+
+/// #1: detect the zombie-leak scenario in the reader EOF handler. Fires when the
+/// sidecar's stdout has closed (EOF) but the child process is STILL alive
+/// (`try_wait` returned `Ok(None)`). `classify_sidecar_termination(None, ..)`
+/// would otherwise report `Clean` and leave the session in the map forever —
+/// an orphaned child with no stdin/stdout that never gets reaped.
+fn is_zombie_stdout_close(
+    exit_status: Option<std::process::ExitStatus>,
+    child_alive: bool,
+) -> bool {
+    child_alive && exit_status.is_none()
+}
+
+/// #1/#5: remove a dead/timeout-killed session from the live state map, but ONLY
+/// if the slot still belongs to THIS generation. A concurrent respawn
+/// (`get_or_spawn_session` detected the dead child and replaced it) or
+/// `stop_pi_session` would own a different generation, and we must not clobber it.
+fn remove_session_if_same_generation(
+    app: &AppHandle,
+    session_id: &str,
+    gen: u64,
+    generation: &Arc<AtomicU64>,
+) {
+    let state = app.state::<PiSidecarState>();
+    let mut guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if generation.load(Ordering::SeqCst) != gen {
+        return; // superseded — leave the slot to its new owner.
+    }
+    if let Some(slot) = guard.get_mut(session_id) {
+        if let Some(ref session) = slot.inner {
+            if session.generation.load(Ordering::SeqCst) == gen {
+                guard.remove(session_id);
+            }
+        }
+    }
+}
+
+/// Persist a terminal session status (crashed/stopped) and rewrite the sessions file.
+fn persist_session_status(app: &AppHandle, agent_id: &str, status: SessionStatus) {
+    let state = app.state::<PiSidecarState>();
+    {
+        let mut pg = state.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = pg.get_mut(agent_id) {
+            s.status = status;
+            s.last_active_at = now_ms();
+        }
+    }
+    save_pi_sessions(&state, &pi_project_root());
+}
+
+/// #4: release-build stderr forwarder. Reads the sidecar's stderr and re-emits
+/// each line via `eprintln!` so packaged (terminal-less) builds still surface
+/// logs through Tauri's logger. (The release-build gate is applied at the spawn
+/// site; this function is always callable but only wired up there.)
+fn spawn_stderr_forwarder(stderr: std::process::ChildStderr) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.is_empty() => eprintln!("[pi-sidecar] {l}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// #5: session lifetime cap in seconds. `DEVBOULE_PI_SESSION_TIMEOUT_SECS`
+/// (default 3600). Set to 0 to disable the watchdog entirely.
+fn read_session_timeout_secs() -> u64 {
+    match std::env::var("DEVBOULE_PI_SESSION_TIMEOUT_SECS") {
+        Ok(v) => v.trim().parse().unwrap_or(3600),
+        Err(_) => 3600,
+    }
+}
+
+/// #5: per-session watchdog. Sleeps until `timeout_secs` have elapsed since
+/// `spawned_at`, then — if this session's generation is still current AND the
+/// child is still alive — sets `timed_out` and kills the child. The kill closes
+/// stdout, so the reader thread detects EOF and emits the timeout banner
+/// (preserving the existing console history). The `timed_out` flag tells the
+/// reader to emit the timeout banner rather than the crash banner.
+fn spawn_session_timeout_watchdog(
+    app: AppHandle,
+    session_id: String,
+    generation: Arc<AtomicU64>,
+    child: Arc<Mutex<Child>>,
+    timed_out: Arc<AtomicBool>,
+    spawned_at: Instant,
+    timeout_secs: u64,
+) {
+    if timeout_secs == 0 {
+        return; // disabled.
+    }
+    let gen = generation.load(Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let elapsed = spawned_at.elapsed().as_secs();
+        let remaining = timeout_secs.saturating_sub(elapsed);
+        if remaining > 0 {
+            std::thread::sleep(Duration::from_secs(remaining));
+        }
+        if generation.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        let still_alive = child
+            .lock()
+            .ok()
+            .and_then(|mut c| c.try_wait().ok().flatten())
+            .is_none();
+        if still_alive {
+            timed_out.store(true, Ordering::SeqCst);
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
+            // Self-sufficient cleanup (#3): even if the reader thread is
+            // dead/stuck when the timeout fires, evict the session and persist
+            // it as Crashed so it doesn't linger as a zombie after restart.
+            remove_session_if_same_generation(&app, &session_id, gen, &generation);
+            persist_session_status(&app, &session_id, SessionStatus::Crashed);
+        }
+    });
+}
+
 // ---- stdout reader ---------------------------------------------------------
 
 /// Blocking reader thread: reads JSONL from the sidecar's stdout. Uses a
@@ -1236,6 +1696,8 @@ fn read_sidecar_events(
     stdout: std::process::ChildStdout,
     stdin: Arc<Mutex<ChildStdin>>,
     generation: Arc<AtomicU64>,
+    child: Arc<Mutex<Child>>,
+    timed_out: Arc<AtomicBool>,
     agent_id: &str,
 ) {
     let gen = generation.load(Ordering::SeqCst);
@@ -1272,10 +1734,63 @@ fn read_sidecar_events(
         }
     }
 
-    // Sidecar exited — mark as stopped (only if still our generation).
+    // #1/#5: reader EOF — the sidecar's stdout closed (crash / clean exit /
+    // killed by the timeout watchdog). Only act if THIS session's generation is
+    // still current (a respawn or stop would have bumped it and owns the channel).
     if generation.load(Ordering::SeqCst) == gen {
-        mapper.running = false;
-        mapper.emit_snapshot(&app);
+        // Inspect the child's exit status (now behind a Mutex so the reader can
+        // own a clone without a second exclusive handle).
+        let try_wait = child
+            .lock()
+            .ok()
+            .and_then(|mut c| c.try_wait().ok());
+        let exit_status = try_wait.flatten();
+        // Zombie-leak guard (#1): stdout closed but the child is still alive
+        // (`try_wait` returned `Ok(None)`) — otherwise classified as `Clean`
+        // and the session leaks in the map forever.
+        let child_alive = try_wait.map(|s| s.is_none()).unwrap_or(false);
+        match classify_sidecar_termination(exit_status, timed_out.load(Ordering::SeqCst)) {
+            SidecarTermination::Timeout => {
+                mapper.running = false;
+                mapper.push_entry(ConsoleEntry::Banner {
+                    text: "pi session timed out (1h limit)".to_string(),
+                    time: EventMapper::now_str(),
+                });
+                mapper.emit_snapshot(&app);
+                persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                remove_session_if_same_generation(&app, agent_id, gen, &generation);
+            }
+            SidecarTermination::Crash(code) => {
+                mapper.running = false;
+                mapper.push_entry(ConsoleEntry::Banner {
+                    text: format!(
+                        "pi sidecar crashed (exit code {code}). Spawn a new session."
+                    ),
+                    time: EventMapper::now_str(),
+                });
+                mapper.emit_snapshot(&app);
+                persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                remove_session_if_same_generation(&app, agent_id, gen, &generation);
+            }
+            SidecarTermination::Clean => {
+                if is_zombie_stdout_close(exit_status, child_alive) {
+                    // Child orphaned (no stdin/stdout) → kill it and evict the
+                    // session so it cannot become a zombie after restart.
+                    if let Ok(mut c) = child.lock() {
+                        let _ = c.kill();
+                    }
+                    eprintln!(
+                        "[pi-sidecar] pi sidecar stdout closed but child still alive — removing session {agent_id}"
+                    );
+                    remove_session_if_same_generation(&app, agent_id, gen, &generation);
+                    persist_session_status(&app, agent_id, SessionStatus::Crashed);
+                } else {
+                    mapper.running = false;
+                    mapper.emit_snapshot(&app);
+                    persist_session_status(&app, agent_id, SessionStatus::Stopped);
+                }
+            }
+        }
     }
 }
 
@@ -1285,6 +1800,41 @@ fn read_sidecar_events(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    // -- crash recovery (#1): mock child exit codes --------------------------
+    // `classify_sidecar_termination` is pure, so we can drive it with mocked
+    // exit statuses (unix `ExitStatus::from_raw`) without spawning a process.
+    #[cfg(unix)]
+    #[test]
+    fn crash_recovery_classifies_exit_codes() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        // Non-zero exit code -> Crash(code).
+        assert!(matches!(
+            classify_sidecar_termination(Some(ExitStatus::from_raw(42 << 8)), false),
+            SidecarTermination::Crash(42)
+        ));
+        // Signal death (no code) -> Crash(-1).
+        assert!(matches!(
+            classify_sidecar_termination(Some(ExitStatus::from_raw(9)), false),
+            SidecarTermination::Crash(-1)
+        ));
+        // Clean zero exit -> Clean.
+        assert!(matches!(
+            classify_sidecar_termination(Some(ExitStatus::from_raw(0)), false),
+            SidecarTermination::Clean
+        ));
+        // try_wait errored (None) -> Clean (conservative).
+        assert!(matches!(
+            classify_sidecar_termination(None, false),
+            SidecarTermination::Clean
+        ));
+        // timed_out wins over exit status.
+        assert!(matches!(
+            classify_sidecar_termination(Some(ExitStatus::from_raw(0)), true),
+            SidecarTermination::Timeout
+        ));
+    }
 
     // -- pi_sidecar_enabled (Phase 1 opt-in) ------------------------------------
 
@@ -1736,4 +2286,206 @@ mod tests {
             other => panic!("expected Chat entry, got {other:?}"),
         }
     }
+    // -- session persistence (save / restore / cleanup) ----------------------
+
+    #[test]
+    fn save_and_restore_roundtrips() {
+        std::env::set_var("DEVBOULE_PI_PERSIST", "true");
+        let state = PiSidecarState::default();
+        let now = super::now_ms();
+        {
+            let mut g = state.persisted.lock().unwrap();
+            g.insert(
+                "pi-1".to_string(),
+                PersistedSession {
+                    id: "pi-1".to_string(),
+                    agent_role: "main-coder".to_string(),
+                    project_id: Some("my-project".to_string()),
+                    created_at: now,
+                    last_active_at: now,
+                    status: SessionStatus::Active,
+                },
+            );
+            g.insert(
+                "pi-2".to_string(),
+                PersistedSession {
+                    id: "pi-2".to_string(),
+                    agent_role: "orchestrator".to_string(),
+                    project_id: Some("my-project".to_string()),
+                    created_at: now,
+                    last_active_at: now,
+                    status: SessionStatus::Active,
+                },
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "pi-sessions-rt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        save_pi_sessions(&state, &root);
+
+        let restored = restore_pi_sessions(&root);
+        assert_eq!(restored.len(), 2, "both active sessions must roundtrip");
+        let ids: std::collections::HashSet<String> =
+            restored.iter().map(|s| s.session_id.clone()).collect();
+        assert!(ids.contains("pi-1"));
+        assert!(ids.contains("pi-2"));
+        let roles: std::collections::HashSet<String> =
+            restored.iter().map(|s| s.agent_role.clone()).collect();
+        assert!(roles.contains("main-coder"));
+        assert!(roles.contains("orchestrator"));
+
+        // File on disk must contain both sessions.
+        let data = std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
+        assert!(data.contains("pi-1") && data.contains("pi-2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn old_sessions_purged() {
+        std::env::set_var("DEVBOULE_PI_PERSIST", "true");
+        let state = PiSidecarState::default();
+        let now = super::now_ms();
+        let old = now - 8 * 24 * 3600 * 1000;
+        {
+            let mut g = state.persisted.lock().unwrap();
+            g.insert(
+                "old-stopped".to_string(),
+                PersistedSession {
+                    id: "old-stopped".to_string(),
+                    agent_role: "mini-coder".to_string(),
+                    project_id: None,
+                    created_at: old,
+                    last_active_at: old,
+                    status: SessionStatus::Stopped,
+                },
+            );
+            g.insert(
+                "fresh-stopped".to_string(),
+                PersistedSession {
+                    id: "fresh-stopped".to_string(),
+                    agent_role: "mini-coder".to_string(),
+                    project_id: None,
+                    created_at: now,
+                    last_active_at: now,
+                    status: SessionStatus::Stopped,
+                },
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "pi-sessions-purge-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        save_pi_sessions(&state, &root);
+
+        let data = std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
+        let file: SessionFile = serde_json::from_str(&data).unwrap();
+        let ids: Vec<String> = file.sessions.iter().map(|s| s.id.clone()).collect();
+        assert!(
+            !ids.contains(&"old-stopped".to_string()),
+            "8-day-old stopped session must be purged"
+        );
+        assert!(
+            ids.contains(&"fresh-stopped".to_string()),
+            "fresh stopped session must remain"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- #1: zombie session eviction on stdout-close-while-child-alive -------
+
+    #[test]
+    fn zombie_session_detected_on_stdout_close_with_child_alive() {
+        // Scenario: reader EOF with the child STILL alive (try_wait returned
+        // Ok(None)) and no exit status. classify_sidecar_termination(None, ..)
+        // returns Clean, which would leak the session — the zombie guard must
+        // flag it for forced kill + eviction.
+        assert!(
+            is_zombie_stdout_close(None, true),
+            "Ok(None) from try_wait + closed stdout must be a zombie"
+        );
+        // Not a zombie when the child has already exited cleanly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                !is_zombie_stdout_close(Some(std::process::ExitStatus::from_raw(0)), true),
+                "exited child is not a zombie"
+            );
+        }
+        // Not a zombie when liveness is unknown (try_wait errored).
+        assert!(
+            !is_zombie_stdout_close(None, false),
+            "unknown liveness must not be treated as a zombie"
+        );
+    }
+
+    // -- #2: concurrent save_pi_sessions must not lose writes ----------------
+
+    #[test]
+    fn save_pi_sessions_concurrent_no_data_loss() {
+        std::env::set_var("DEVBOULE_PI_PERSIST", "true");
+        let state = std::sync::Arc::new(PiSidecarState::default());
+        let n: usize = 16;
+        let root = std::env::temp_dir().join(format!(
+            "pi-sessions-conc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let now = super::now_ms();
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let state = std::sync::Arc::clone(&state);
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                let id = format!("pi-conc-{i}");
+                {
+                    let mut g = state.persisted.lock().unwrap();
+                    g.insert(
+                        id.clone(),
+                        PersistedSession {
+                            id: id.clone(),
+                            agent_role: "main-coder".to_string(),
+                            project_id: None,
+                            created_at: now,
+                            last_active_at: now,
+                            status: SessionStatus::Active,
+                        },
+                    );
+                }
+                save_pi_sessions(&state, &root);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every thread's session must survive — no lost writes under the race.
+        let data = std::fs::read_to_string(root.join(".devboule").join("pi-sessions.json")).unwrap();
+        let file: SessionFile = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            file.sessions.len(),
+            n,
+            "all {n} concurrent sessions must be persisted (no data loss)"
+        );
+        for i in 0..n {
+            assert!(
+                file.sessions.iter().any(|s| s.id == format!("pi-conc-{i}")),
+                "session pi-conc-{i} lost under concurrent save"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
+
