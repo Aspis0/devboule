@@ -258,6 +258,7 @@ export function ProjectsView() {
 				const stored = localStorage.getItem(PLANNER_CLIENT_KEY);
 				return stored === "claude" ||
 					stored === "codex" ||
+					stored === "openai" ||
 					stored === "orchestrator"
 					? stored
 					: "orchestrator";
@@ -299,6 +300,7 @@ export function ProjectsView() {
 	const [cloudCliAvailability, setCloudCliAvailability] = useState<{
 		claude?: boolean;
 		codex?: boolean;
+		openai?: boolean;
 	}>({});
 	// D4: planner chrome — delivery failures, launch guidance ("pick a folder"),
 	// and the silence watchdog live HERE, as a banner/pill NEXT TO the composer.
@@ -1617,16 +1619,20 @@ export function ProjectsView() {
 	// Which cloud CLIs exist on this machine (augmented-PATH scan, one shot).
 	// Failure leaves everything enabled — see the state comment.
 	useEffect(() => {
-		void invokeBackendCommand<{ claude: boolean; codex: boolean }>(
-			"get_cloud_cli_availability",
-		)
+		void invokeBackendCommand<{
+			claude: boolean;
+			codex: boolean;
+			openai: boolean;
+		}>("get_cloud_cli_availability")
 			.then((a) => {
 				setCloudCliAvailability(a);
 				// A selection persisted/defaulted onto a missing CLI would dead-end at
 				// launch — snap it back to the always-present local orchestrator.
 				// (The setter wrapper persists the outcome to localStorage.)
 				setPlannerOrchestratorClient((cur) =>
-					(cur === "claude" && !a.claude) || (cur === "codex" && !a.codex)
+					(cur === "claude" && !a.claude) ||
+					(cur === "codex" && !a.codex) ||
+					(cur === "openai" && !a.openai)
 						? "orchestrator"
 						: cur,
 				);
@@ -2217,6 +2223,7 @@ export function ProjectsView() {
 						role === "local" ||
 						role === "claude" ||
 						role === "codex" ||
+						role === "openai" ||
 						(config.customAgentClients ?? []).some((c) => c.id === role);
 					if (role && known) void onMainCoderOverrideChange(role);
 					break;
@@ -3699,8 +3706,11 @@ export function ProjectsView() {
 								label: "Codex",
 								disabled: cloudCliAvailability.codex === false,
 							},
-							// Phase 1 slash command `/model openai` targets this backend id.
-							{ id: "openai", label: "OpenAI" },
+							{
+								id: "openai",
+								label: "OpenAI",
+								disabled: cloudCliAvailability.openai === false,
+							},
 						]}
 						orchestratorId={plannerOrchestratorClient}
 						onOrchestratorChange={setPlannerOrchestratorClient}
@@ -3710,6 +3720,7 @@ export function ProjectsView() {
 							{ id: "local", label: "Local (Devboule)" },
 							{ id: "claude", label: "Claude" },
 							{ id: "codex", label: "Codex" },
+							{ id: "openai", label: "OpenAI" },
 							...(config.customAgentClients ?? []).map((c) => ({
 								id: c.id,
 								label: c.label,

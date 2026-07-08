@@ -69,7 +69,7 @@ interface PlannerPlanModeProps {
 	onSlashCommand?: (result: SlashResult) => void;
 	// Orchestrator backend selector — who you TALK TO (the planner). Replaces the redundant
 	// status strip (searching/planning/designing duplicated the view tabs). The active one
-	// pulses. Local = our Stage/TUI; Claude/Codex run their own CLI (their terminal is shown).
+	// pulses. Local = our Stage/TUI; Claude/Codex/OpenAI run their own CLI (their terminal is shown).
 	orchestrators: { id: string; label: string; disabled?: boolean }[];
 	orchestratorId: string;
 	onOrchestratorChange: (id: string) => void;
@@ -306,7 +306,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 							cursor: "help",
 						}}
 						data-help-title="The orchestrator is the agent you talk to here to shape the plan."
-						data-help-lines="A project is a plan: you discuss the goal with the orchestrator, and it drafts the tasks.|Local (Devboule) keeps this rich Stage (chat + websearch + plan + design); Claude/Codex run in their own embedded terminal.|Once the plan is ready you hand it off to a main coder, which writes the code.|It is the create-time conversation — not a permanent agent of the project."
+						data-help-lines="A project is a plan: you discuss the goal with the orchestrator, and it drafts the tasks.|Local (Devboule) keeps this rich Stage (chat + websearch + plan + design); Claude/Codex/OpenAI run in their own embedded terminal.|Once the plan is ready you hand it off to a main coder, which writes the code.|It is the create-time conversation — not a permanent agent of the project."
 					>
 						orchestrator
 					</span>

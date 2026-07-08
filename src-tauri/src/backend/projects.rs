@@ -1292,6 +1292,7 @@ pub fn get_main_coder_client(
 pub struct CloudCliAvailability {
     pub claude: bool,
     pub codex: bool,
+    pub openai: bool,
 }
 
 #[tauri::command]
@@ -1302,6 +1303,7 @@ pub fn get_cloud_cli_availability(
     Ok(CloudCliAvailability {
         claude: command_exists("claude"),
         codex: command_exists("codex"),
+        openai: command_exists("openai"),
     })
 }
 
@@ -1314,8 +1316,8 @@ pub fn set_main_coder_client(
     client: String,
 ) -> Result<String, String> {
     state.ensure_unlocked()?;
-    if client != "claude" && client != "codex" {
-        return Err("main coder client must be 'claude' or 'codex'.".to_string());
+    if client != "claude" && client != "codex" && client != "openai" {
+        return Err("main coder client must be 'claude', 'codex', or 'openai'.".to_string());
     }
     let path = locate_config_path(&app).ok_or_else(|| {
         "config.json could not be located to save the main coder client.".to_string()
@@ -2055,7 +2057,7 @@ fn prepare_or_launch_project_agent(
     // launches ignore the slice, so we only pay the (fail-open) config read for them.
     // The MINI never reaches this path — design §6 mini-exclusion holds by construction.
     let user_servers: Vec<user_mcp_config::UserMcpServer> =
-        if client == "codex" || client == "claude" {
+        if client == "codex" || client == "claude" || client == "openai" {
             let merged = user_mcp_config::merged_servers(&app, &root_path);
             // P5 (Work Console per-role tools): when this launch is the MAIN coder (role "coder";
             // the owner's "main = coder" resolution of the open item), NARROW the merged catalog to
@@ -3665,8 +3667,8 @@ fn normalize_agent_client(value: &str) -> Result<String, String> {
         // L2.4: "orchestrator" selects the local Devboule main-coder binary as the
         // launched coder (alongside the external codex/claude CLIs and bare
         // powershell). It is a built-in client id, reserved like the others.
-        "codex" | "claude" | "powershell" | "orchestrator" => Ok(client),
-        _ => Err("Agent client must be codex, claude, powershell or orchestrator.".into()),
+        "codex" | "claude" | "openai" | "powershell" | "orchestrator" => Ok(client),
+        _ => Err("Agent client must be codex, claude, openai, powershell or orchestrator.".into()),
     }
 }
 
@@ -3687,7 +3689,14 @@ const CUSTOM_CLIENT_LABEL_MAX_LEN: usize = 40;
 const CUSTOM_CLIENT_COMMAND_MAX_LEN: usize = 400;
 // "local" is reserved (P6b): it is the Roles-table / hand-off placement marker for the
 // in-process agentic engine, so a user-registered custom client can never collide with it.
-const RESERVED_CLIENT_IDS: [&str; 5] = ["codex", "claude", "powershell", "orchestrator", "local"];
+const RESERVED_CLIENT_IDS: [&str; 6] = [
+    "codex",
+    "claude",
+    "openai",
+    "powershell",
+    "orchestrator",
+    "local",
+];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

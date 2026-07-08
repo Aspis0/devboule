@@ -1249,7 +1249,7 @@ fn build_generation_log_line(entry: &GenerationLogEntry) -> Result<String, Strin
     // frontend uses when the backend is unconfigured/unavailable.
     if !matches!(
         entry.backend_kind.as_str(),
-        "ollama" | "omlx" | "api" | "codex" | "claude" | "unknown"
+        "ollama" | "omlx" | "api" | "codex" | "claude" | "openai" | "unknown"
     ) {
         return Err("invalid generation log backendKind".to_string());
     }
@@ -2979,12 +2979,12 @@ mod tests {
     #[test]
     fn generation_log_line_allowlists_backend_kind() {
         // WARNING 4: only the known kinds + the "unknown" sentinel are accepted.
-        for ok in ["ollama", "omlx", "api", "codex", "claude", "unknown"] {
+        for ok in ["ollama", "omlx", "api", "codex", "claude", "openai", "unknown"] {
             let mut e = log_entry();
             e.backend_kind = ok.to_string();
             assert!(build_generation_log_line(&e).is_ok(), "should accept {ok}");
         }
-        for bad in ["", "evil", "OLLAMA", "ollama; rm -rf", "openai"] {
+        for bad in ["", "evil", "OLLAMA", "ollama; rm -rf"] {
             let mut e = log_entry();
             e.backend_kind = bad.to_string();
             assert!(
