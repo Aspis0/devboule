@@ -21,6 +21,7 @@ import { DevicesView } from "./DevicesView";
 import { WorkspaceView } from "./WorkspaceView";
 import { ProvidersModelsTab } from "../settings/ProvidersModelsTab";
 import { mapLegacySettingsTab, type SettingsTabId } from "./settingsTabs";
+import { PiExtensionsCard } from "./PiExtensionsCard";
 import type { CliAgentsStatus } from "../../types/backend";
 
 interface SettingsTabDef {
@@ -133,6 +134,8 @@ export function SettingsView() {
           </button>
 
           <CliAgentsCard />
+
+          <PiExtensionsCard />
         </section>
       )}
 

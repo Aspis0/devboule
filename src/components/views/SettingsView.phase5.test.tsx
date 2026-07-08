@@ -9,6 +9,9 @@ import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
+// Suppress act() warnings for child components with async mount effects.
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
 // ---- AppContext mock ------------------------------------------------------
 const consumePendingTab = vi.fn(() => null as string | null);
 let roleStatus: { role: string; isAdmin: boolean } | null = {
@@ -16,6 +19,13 @@ let roleStatus: { role: string; isAdmin: boolean } | null = {
   isAdmin: true,
 };
 vi.mock("../../context/AppContext", () => ({
+  invokeBackendCommand: vi.fn(async (cmd: string) => {
+    if (cmd === "pi_extensions_status")
+      return { agentDir: "/mock", mode: "global", bootstrap: "idle", bootstrapError: null };
+    if (cmd === "pi_extensions_list") return [];
+    if (cmd === "pi_marketplace_search") return [];
+    return null;
+  }),
   useAppContext: () => ({ roleStatus, pendingTab: 0 }),
   useAppActions: () => ({
     consumePendingTab,
@@ -35,6 +45,10 @@ vi.mock("./SecretsView", () => ({
 vi.mock("./DevicesView", () => ({
   DevicesView: () =>
     createElement("div", { "data-testid": "devices-view" }, "devices"),
+}));
+vi.mock("./PiExtensionsCard", () => ({
+  PiExtensionsCard: () =>
+    createElement("div", { "data-testid": "pi-extensions-card" }, "extensions"),
 }));
 vi.mock("./WorkspaceView", () => ({
   WorkspaceView: () =>
