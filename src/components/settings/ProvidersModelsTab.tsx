@@ -16,28 +16,30 @@ import {
   type ProviderStatusMap,
 } from "../design/designProviderDetection";
 import type { DetectedProvider } from "../../types/config";
-import { LocalCoderBackendCard } from "./LocalCoderBackendCard";
 import { RolesTableCard } from "./RolesTableCard";
 import { RecommendedConfigCard } from "./RecommendedConfigCard";
 import { ModelRegistryCard } from "./ModelRegistryCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
 import { WebSearchCard } from "./WebSearchCard";
-import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
 import { CensorLocalAiCard } from "../views/WorkspaceView";
 import { UserMcpServersCard } from "./UserMcpServersCard";
 import { BundledExtensionsCard } from "./BundledExtensionsCard";
+import { PiExtensionsCard } from "../views/PiExtensionsCard";
 
 // Phase 5 — the "Providers & Models" tab: a single home for everything that picks
-// an AI provider/model. A top "Detected on this machine" strip (one
-// detect_providers call, reusing the pure designProviderDetection helpers) plus
-// four per-role sections, each composing the EXISTING (moved) card components so
-// their persistence is unchanged:
-//   - Censor model      → <CensorModelCard /> (Ollama model override)
-//   - Local main coder  → <LocalCoderBackendCard /> (the orchestrator's own model)
-//   - Mini-coder backend→ <MiniCoderBackendCard />
-//   - Oracle LLM        → <OracleAnswerSettingsCard />
-//   - Design LLM        → <DesignLlmBackendCard />
+// an AI provider/model. Layout:
+//   - Detected strip   — one detect_providers call, reusing pure designProviderDetection
+//   - Roles table      — <RolesTableCard /> (orchestrator / coder / verifier per-role config)
+//   - Models group     — <RecommendedConfigCard />, <ModelRegistryCard />
+//   - Gates & helpers  — <CensorLocalAiCard />, <DesignLlmBackendCard />,
+//                        <MiniWriteBehaviorCard />, <WebSearchCard />
+//   - Extensions group — <BundledExtensionsCard />, <UserMcpServersCard />,
+//                        <PiExtensionsCard />
+//
+// NOTE: Oracle LLM config and LocalCoderBackendCard are NOT here — Oracle LLM lives
+// inside OracleAdminPanel on the Oracle page, and LocalCoderBackendCard was replaced
+// by the RolesTableCard's per-role config.
 //
 // PRIVACY (W2): the detection strip shows availability + live model COUNT only. The
 // resolved CLI path is deliberately NOT shown — the engine never sends it over IPC
@@ -304,22 +306,6 @@ export function ProvidersModelsTab() {
 
       <RolesTableCard />
 
-      <CollapsibleGroup title="Coders (advanced)" defaultOpen={false}>
-        <RoleSection
-          title="Local orchestrator model"
-          description="The model the local Devboule orchestrator binary runs on (the Orchestrator row's Local placement in the Roles table above points here). Who runs each role now lives in Roles; this is just its model."
-        >
-          <LocalCoderBackendCard />
-        </RoleSection>
-
-        <RoleSection
-          title="Mini write behavior"
-          description="The ceiling for how your coders delegate file writes to the local mini."
-        >
-          <MiniWriteBehaviorCard />
-        </RoleSection>
-      </CollapsibleGroup>
-
       <CollapsibleGroup title="Models">
         <RoleSection
           title="Model registry"
@@ -327,10 +313,6 @@ export function ProvidersModelsTab() {
         >
           <ModelRegistryCard />
         </RoleSection>
-      </CollapsibleGroup>
-
-      <CollapsibleGroup title="Web search" defaultOpen={false}>
-        <WebSearchCard />
       </CollapsibleGroup>
 
       {/* Role untangle (P6b): Censor and the Design LLM are NOT agent roles — Censor is a
@@ -350,28 +332,20 @@ export function ProvidersModelsTab() {
         >
           <DesignLlmBackendCard />
         </RoleSection>
-      </CollapsibleGroup>
 
-      <CollapsibleGroup title="Oracle" defaultOpen={false}>
         <RoleSection
-          title="Oracle LLM"
-          description="The remote provider that writes Oracle answers from retrieved context."
+          title="Mini write behavior"
+          description="The ceiling for how your coders delegate file writes to the local mini."
         >
-          <OracleAnswerSettingsCard />
+          <MiniWriteBehaviorCard />
         </RoleSection>
       </CollapsibleGroup>
 
-      <CollapsibleGroup title="MCP servers" defaultOpen={false}>
-        <RoleSection
-          title="User MCP servers"
-          description="External MCP servers available in every project. These run as your user account and may reach external networks."
-        >
-          <UserMcpServersCard />
-        </RoleSection>
-      </CollapsibleGroup>
-
-      <CollapsibleGroup title="Bundled extensions" defaultOpen={false}>
+      <CollapsibleGroup title="Extensions" defaultOpen={false}>
+        <WebSearchCard />
         <BundledExtensionsCard />
+        <UserMcpServersCard />
+        <PiExtensionsCard />
       </CollapsibleGroup>
     </div>
   );

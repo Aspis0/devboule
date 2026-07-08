@@ -16,8 +16,8 @@ import type {
   OracleRuntime,
   OracleRuntimeSetup,
 } from "../../types/backend";
-// First-open onboarding banner (exported for this UX test).
-import { OracleRuntimeSetupBanner } from "./OracleAdminPanel";
+// First-open onboarding banner and feature toggle (both exported for testing).
+import { OracleRuntimeSetupBanner, OracleFeatureToggle } from "./OracleAdminPanel";
 
 // ---- AppContext mock ------------------------------------------------------
 // A single mutable bag of context values; each test sets the slice it needs
@@ -50,11 +50,41 @@ function baseCtx(): Ctx {
   };
 }
 
+// Track the invokeBackendCommand mock so tests can control specific commands.
+let oracleEnabled = true;
+let setOracleEnabledShouldFail = false;
+const invokeBackendCommandMock = vi.fn(async (...callArgs: unknown[]) => {
+  const cmd = callArgs[0] as string;
+  const args = callArgs[1] as Record<string, unknown> | undefined;
+  if (cmd === "get_oracle_enabled") return oracleEnabled;
+  if (cmd === "set_oracle_enabled") {
+    if (setOracleEnabledShouldFail) throw new Error("backend error");
+    oracleEnabled = (args as { enabled?: boolean })?.enabled ?? oracleEnabled;
+    return true;
+  }
+  throw new Error("no runtime setup");
+});
+
 vi.mock("../../context/AppContext", () => ({
-  invokeBackendCommand: vi.fn(async () => {
-    throw new Error("no runtime setup");
-  }),
+  invokeBackendCommand: (...args: unknown[]) => invokeBackendCommandMock(...(args as [])),
   useAppContext: () => ctx,
+  useAppActions: () => ({
+    configureCliAgents: vi.fn(async () => ({})),
+    unconfigureCliAgents: vi.fn(async () => ({})),
+    cliAgentsStatus: vi.fn(async () => ({ runtimeReady: false })),
+  }),
+}));
+
+// ---- OracleAnswerSettingsCard mock (mounted inside the panel) -------------
+vi.mock("../settings/OracleAnswerSettingsCard", () => ({
+  OracleAnswerSettingsCard: () =>
+    createElement("div", { "data-testid": "oracle-llm-card" }),
+}));
+
+// ---- CliAgentsCard mock (mounted inside the panel) -----------------------
+vi.mock("./CliAgentsCard", () => ({
+  CliAgentsCard: () =>
+    createElement("div", { "data-testid": "cli-agents-card" }),
 }));
 
 // ---- OracleDoctorPanel mock ----------------------------------------------
@@ -88,6 +118,9 @@ const liveRoots: Root[] = [];
 beforeEach(async () => {
   ctx = baseCtx();
   doctorCtl.report = null;
+  oracleEnabled = true;
+  setOracleEnabledShouldFail = false;
+  invokeBackendCommandMock.mockClear();
   refreshOracleIndexStatus.mockClear();
   getOracleIndexedFiles.mockClear();
   getOracleIndexedFiles.mockImplementation(async () => ({
@@ -515,5 +548,120 @@ describe("OracleRuntimeSetupBanner — first-open onboarding", () => {
     });
     expect(onInstall).toHaveBeenCalledTimes(1);
     act(() => root.unmount());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OracleFeatureToggle
+// ---------------------------------------------------------------------------
+describe("OracleFeatureToggle", () => {
+  // Render OracleFeatureToggle directly (it now lives in OracleView, not OracleAdminPanel).
+  async function renderToggle(): Promise<{ container: HTMLElement; root: Root }> {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    let root!: Root;
+    await act(async () => {
+      root = createRoot(container);
+      root.render(createElement(OracleFeatureToggle));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    liveRoots.push(root);
+    return { container, root };
+  }
+
+  it("renders with the initial enabled state loaded from backend", async () => {
+    oracleEnabled = true;
+    const { container } = await renderToggle();
+    const toggle = container.querySelector('[role="switch"]') as HTMLButtonElement;
+    expect(toggle).not.toBeNull();
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("renders disabled when backend reports false", async () => {
+    oracleEnabled = false;
+    const { container } = await renderToggle();
+    const toggle = container.querySelector('[role="switch"]') as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("toggles from enabled to disabled on click", async () => {
+    oracleEnabled = true;
+    const { container, root } = await renderToggle();
+    const toggle = container.querySelector('[role="switch"]') as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    await act(async () => {
+      toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // Re-render to pick up the state change.
+    act(() => root.render(createElement(OracleFeatureToggle)));
+    const toggleAfter = container.querySelector('[role="switch"]') as HTMLButtonElement;
+    expect(toggleAfter.getAttribute("aria-checked")).toBe("false");
+    expect(invokeBackendCommandMock).toHaveBeenCalledWith("set_oracle_enabled", { enabled: false });
+  });
+
+  it("reverts to the previous state when set_oracle_enabled fails", async () => {
+    oracleEnabled = true;
+    setOracleEnabledShouldFail = true;
+    const { container, root } = await renderToggle();
+    const toggle = container.querySelector('[role="switch"]') as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    await act(async () => {
+      toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // Re-render to pick up the state change.
+    act(() => root.render(createElement(OracleFeatureToggle)));
+    const toggleAfter = container.querySelector('[role="switch"]') as HTMLButtonElement;
+    // On error, the toggle should revert to its previous state.
+    expect(toggleAfter.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CollapsibleSection rendering (Oracle LLM + CLI Agents)
+// ---------------------------------------------------------------------------
+describe("OracleAdminPanel — CollapsibleSections", () => {
+  it("renders Oracle LLM and CLI Agents sections collapsed by default", async () => {
+    const { container } = await render();
+    // Both section headers should be present.
+    expect(container.textContent).toContain("Oracle LLM");
+    expect(container.textContent).toContain("CLI Agents");
+    // By default, their children (the mocked cards) should NOT be in the DOM
+    // because defaultOpen is false.
+    expect(container.querySelector('[data-testid="oracle-llm-card"]')).toBeNull();
+    expect(container.querySelector('[data-testid="cli-agents-card"]')).toBeNull();
+  });
+
+  it("expands Oracle LLM section when its header is clicked", async () => {
+    const { container, root } = await render();
+    const llmButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Oracle LLM"),
+    );
+    expect(llmButton).toBeTruthy();
+    await act(async () => {
+      llmButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    rerender(root);
+    // The OracleAnswerSettingsCard mock should now be visible.
+    expect(container.querySelector('[data-testid="oracle-llm-card"]')).not.toBeNull();
+  });
+
+  it("expands CLI Agents section when its header is clicked", async () => {
+    const { container, root } = await render();
+    const cliButton = Array.from(container.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("CLI Agents"),
+    );
+    expect(cliButton).toBeTruthy();
+    await act(async () => {
+      cliButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    rerender(root);
+    // The CliAgentsCard mock should now be visible.
+    expect(container.querySelector('[data-testid="cli-agents-card"]')).not.toBeNull();
   });
 });

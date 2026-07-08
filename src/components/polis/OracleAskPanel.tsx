@@ -112,8 +112,10 @@ export function OracleAskPanel({ onFocusFile, onClose }: OracleAskPanelProps) {
     requestView("oracle");
   }, [requestView]);
 
+  // The Oracle LLM settings now live on the Oracle page (inside OracleAdminPanel),
+  // not in Settings. Navigate to the Oracle page directly.
   const goToProviderSettings = useCallback(() => {
-    requestView("settings", "oracle");
+    requestView("oracle");
   }, [requestView]);
 
   // -------------------------------------------------------------------------

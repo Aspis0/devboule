@@ -29,6 +29,8 @@ vi.mock("../../context/AppContext", () => ({
 vi.mock("../oracle/OracleAdminPanel", () => ({
   OracleAdminPanel: () =>
     createElement("div", { "data-testid": "oracle-admin-panel" }, "admin"),
+  OracleFeatureToggle: () =>
+    createElement("div", { "data-testid": "oracle-feature-toggle" }, "toggle"),
 }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =

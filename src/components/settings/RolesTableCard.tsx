@@ -4,6 +4,7 @@ import {
 	CheckCircle2,
 	Cpu,
 	ShieldCheck,
+	Trash2,
 	UserCog,
 	Wrench,
 } from "lucide-react";
@@ -36,6 +37,7 @@ import {
 	buildProviderStatusMap,
 	type ProviderStatusMap,
 } from "../design/designProviderDetection";
+import type { AuxCredentialStatus } from "../../types/backend";
 import type {
 	DetectedProvider,
 	EffectiveRolesConfig,
@@ -351,16 +353,16 @@ const LOCAL_KIND_LABELS: Record<LocalCoderBackendKind, string> = {
 // the LOCAL MAIN-CODER tier (ollama/omlx/cloud), reusing the SAME shared validator
 // (`validateLocalBackend`) the advanced "Local main coder" card (LocalCoderBackendCard)
 // and the Rust `validate_local_coder_backend` boundary use — the two surfaces that edit
-// `localCoderBackend` never disagree on what's valid. The Cloud API key + consent
-// disclosure stay ONLY on the advanced card (out of scope for this compact row); Cloud is
-// still selectable here, with a pointer to where the key lives.
+// `localCoderBackend` never disagree on what's valid. The Cloud API key management and
+// consent gate are rendered inline when the Cloud kind is selected.
 function LocalBackendFields(props: {
 	idPrefix: string;
 	draft: LocalBackendRowDraft;
 	onChange: (next: LocalBackendRowDraft) => void;
 	statusMap: ProviderStatusMap;
+	onCloudConsentChange?: (consented: boolean) => void;
 }) {
-	const { idPrefix, draft, onChange, statusMap } = props;
+	const { idPrefix, draft, onChange, statusMap, onCloudConsentChange } = props;
 	const validation = useMemo(
 		() =>
 			validateLocalBackend({
@@ -441,12 +443,7 @@ function LocalBackendFields(props: {
 			) : null}
 
 			{draft.kind === "cloud" ? (
-				<p className="md:col-span-2 text-[11px] leading-4 text-cream-400">
-					This keeps the LOCAL Devboule binary as the agent and only sources its
-					model from a remote API — it is not the Claude/Codex CLI (that is the
-					row&apos;s Cloud placement). It needs an API key — set it in the{" "}
-					<span className="font-semibold">Local main coder</span> card below.
-				</p>
+				<LocalCloudKeyFields onConsentChange={onCloudConsentChange} />
 			) : null}
 
 			{firstError ? (
@@ -454,6 +451,158 @@ function LocalBackendFields(props: {
 					{firstError}
 				</p>
 			) : null}
+		</div>
+	);
+}
+
+// Cloud API key management for the Orchestrator row's inline Local editor.
+// Ported from the deleted LocalCoderBackendCard: write-only key surface (status/
+// save/delete) + active consent gate. The key lives in the OS vault; `get_cloud_llm_key_status`
+// reports present/absent ONLY. Saves through `save_cloud_llm_key` / `delete_cloud_llm_key`.
+function LocalCloudKeyFields({ onConsentChange }: { onConsentChange?: (consented: boolean) => void }) {
+	const [cloudKeyStatus, setCloudKeyStatus] = useState<AuxCredentialStatus | null>(null);
+	const [cloudKeyDraft, setCloudKeyDraft] = useState("");
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const [cloudConsentAck, setCloudConsentAck] = useState(false);
+	const inflightRef = useRef(false);
+	const mountedRef = useRef(true);
+
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => { mountedRef.current = false; };
+	}, []);
+
+	useEffect(() => {
+		onConsentChange?.(cloudConsentAck);
+	}, [cloudConsentAck, onConsentChange]);
+
+	const refreshCloudKey = useCallback(async () => {
+		try {
+			const next = await invokeBackendCommand<AuxCredentialStatus>("get_cloud_llm_key_status");
+			if (mountedRef.current) setCloudKeyStatus(next);
+		} catch {
+			// Degrade silently.
+		}
+	}, []);
+
+	useEffect(() => { void refreshCloudKey(); }, [refreshCloudKey]);
+
+	const hasKey = cloudKeyStatus?.configured === true;
+
+	const saveCloudKey = useCallback(async () => {
+		const key = cloudKeyDraft.trim();
+		if (!key || inflightRef.current) return;
+		inflightRef.current = true;
+		setBusy(true);
+		setError(null);
+		try {
+			const next = await invokeBackendCommand<AuxCredentialStatus>("save_cloud_llm_key", { key });
+			if (!mountedRef.current) return;
+			setCloudKeyStatus(next);
+			setCloudKeyDraft("");
+			if (!next.configured) setError(next.message ?? "The Cloud API key was not accepted.");
+		} catch (e) {
+			if (mountedRef.current) setError(e instanceof Error ? e.message : "Saving the Cloud API key failed.");
+		} finally {
+			inflightRef.current = false;
+			if (mountedRef.current) setBusy(false);
+		}
+	}, [cloudKeyDraft]);
+
+	const clearCloudKey = useCallback(async () => {
+		if (inflightRef.current) return;
+		inflightRef.current = true;
+		setBusy(true);
+		setError(null);
+		try {
+			const next = await invokeBackendCommand<AuxCredentialStatus>("delete_cloud_llm_key");
+			if (mountedRef.current) {
+				setCloudKeyStatus(next);
+				setCloudKeyDraft("");
+			}
+		} catch (e) {
+			if (mountedRef.current) setError(e instanceof Error ? e.message : "Removing the Cloud API key failed.");
+		} finally {
+			inflightRef.current = false;
+			if (mountedRef.current) setBusy(false);
+		}
+	}, []);
+
+	return (
+		<div className="md:col-span-2 space-y-2">
+			<p className="text-[11px] leading-4 text-cream-400">
+				This keeps the LOCAL Devboule binary as the agent and only sources its
+				model from a remote API — it is not the Claude/Codex CLI (that is the
+				row&apos;s Cloud placement).
+			</p>
+			<label className="text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+				Cloud API key
+				<div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-center">
+					<input
+						type="password"
+						value={cloudKeyDraft}
+						onChange={(event) => { setError(null); setCloudKeyDraft(event.target.value); }}
+						placeholder={hasKey ? "Paste a new key to rotate" : "Paste your provider API key"}
+						autoComplete="off"
+						spellCheck={false}
+						className="min-w-0 flex-1 rounded-md border border-cream-200 bg-white px-3 py-2 font-mono text-[12px] normal-case tracking-normal text-cream-700 outline-none focus:border-teal/30"
+					/>
+					<button
+						type="button"
+						onClick={() => void saveCloudKey()}
+						disabled={busy || cloudKeyDraft.trim().length === 0}
+						className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal px-3 py-2 text-[12px] font-semibold normal-case tracking-normal text-white hover:bg-teal/90 disabled:cursor-not-allowed disabled:opacity-60"
+					>
+						<CheckCircle2 className="h-3.5 w-3.5" />
+						{hasKey ? "Rotate key" : "Save key"}
+					</button>
+					{hasKey ? (
+						<button
+							type="button"
+							onClick={() => void clearCloudKey()}
+							disabled={busy}
+							className="inline-flex items-center justify-center gap-1 rounded-md border border-cream-200 bg-white px-3 py-2 text-[11px] font-semibold normal-case tracking-normal text-cream-500 hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
+						>
+							<Trash2 className="h-3.5 w-3.5" />
+							Clear key
+						</button>
+					) : null}
+				</div>
+				<span className="mt-1 block text-[10px] normal-case tracking-normal text-cream-400">
+					{hasKey
+						? "A key is saved (hidden). Required for Cloud mode."
+						: "No key saved — Cloud mode needs a key before the orchestrator can run."}
+				</span>
+			</label>
+			<p className="flex items-start gap-2 rounded-2xl border border-coral/40 bg-coral/[0.07] px-3 py-2 text-[11px] leading-4 text-coral-dark">
+				<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-coral-dark" />
+				<span>
+					<strong>Cloud mode sends your code off this machine.</strong> The
+					orchestrator POSTs your prompts and file content to the configured
+					cloud provider over the internet. Only enable Cloud if you accept
+					sending this project&apos;s content to that third-party provider.
+				</span>
+			</p>
+			<label className="flex items-start gap-2 text-[11px] leading-4 normal-case tracking-normal text-cream-700">
+				<input
+					type="checkbox"
+					data-testid="cloud-consent-ack"
+					checked={cloudConsentAck}
+					onChange={(event) => setCloudConsentAck(event.target.checked)}
+					className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-coral-dark"
+				/>
+				<span>
+					I understand that my code and prompts will be sent over the internet to the
+					cloud provider I configure.
+				</span>
+			</label>
+			{error && (
+				<p className="flex items-start gap-2 rounded-2xl border border-coral/30 bg-coral/[0.05] px-3 py-2 text-[11px] leading-4 text-coral-dark">
+					<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+					<span>{error}</span>
+				</p>
+			)}
 		</div>
 	);
 }
@@ -491,6 +640,7 @@ export function RolesTableCard() {
 	// Pending per-role client dropdown edits (Orchestrator/Coder/Verifier), staged separately
 	// from the persisted `clients` so a row's Save sends ONLY that row's change onto the
 	// persisted baseline — not another row's unsaved dropdown edit (review finding #7).
+	const [orchestratorCloudConsent, setOrchestratorCloudConsent] = useState(false);
 	const [pendingClients, setPendingClients] = useState<
 		Partial<Record<RoleKey, string>>
 	>({});
@@ -676,6 +826,17 @@ export function RolesTableCard() {
 						pendingClients.orchestrator ??
 						clients?.orchestratorClient ??
 						"orchestrator";
+					// Cloud consent gate: prevent saving a Cloud backend without acknowledging
+					// that code leaves the machine. Without a key the backend runs its safe mock.
+					if (
+						isLocalClient("orchestrator", client) &&
+						orchestratorDraft.kind === "cloud" &&
+						!orchestratorCloudConsent
+					) {
+						throw new Error(
+							"Please acknowledge the Cloud consent checkbox before saving.",
+						);
+					}
 					if (isLocalClient("orchestrator", client)) {
 						await saveLocalCoderBackend(orchestratorDraft);
 					}
@@ -733,6 +894,7 @@ export function RolesTableCard() {
 			mainDraft,
 			miniDraft,
 			orchestratorDraft,
+			orchestratorCloudConsent,
 			verifierSameAsMain,
 			saveClients,
 			saveMiniBackend,
@@ -804,6 +966,7 @@ export function RolesTableCard() {
 							draft={orchestratorDraft}
 							onChange={setOrchestratorDraft}
 							statusMap={statusMap}
+							onCloudConsentChange={setOrchestratorCloudConsent}
 						/>
 					) : (
 						<MiniBackendFields

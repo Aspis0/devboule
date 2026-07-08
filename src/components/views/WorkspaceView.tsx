@@ -888,13 +888,10 @@ function CustomAgentClientsCard() {
   );
 }
 
-// Phase 5: MiniCoderBackendCard and DesignLlmBackendCard were extracted to
-// src/components/settings/. They are re-exported here ONLY so the existing
-// isolation tests (which import the __test_* aliases from this module) keep
-// passing; the cards now render inside Settings -> Providers & Models.
-export {
-  __test_MiniCoderBackendCard,
-} from "../settings/MiniCoderBackendCard";
+// Phase 5: DesignLlmBackendCard was extracted to src/components/settings/.
+// It is re-exported here ONLY so the existing isolation tests (which import the
+// __test_* alias from this module) keep passing; the card now renders inside
+// Settings -> Providers & Models.
 export {
   __test_DesignLlmBackendCard,
 } from "../settings/DesignLlmBackendCard";

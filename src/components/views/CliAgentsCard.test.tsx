@@ -33,7 +33,7 @@ vi.mock("../../context/AppContext", () => ({
   }),
 }));
 
-import { __test_CliAgentsCard as CliAgentsCard } from "./SettingsView";
+import { __test_CliAgentsCard as CliAgentsCard } from "../oracle/CliAgentsCard";
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -77,11 +77,11 @@ const modelHints: Record<string, string> = {
 };
 
 // The Oracle answer-model / API-key form, relocated here from the Oracle page in
-// Step 6c, then extracted from SettingsView into its own file in Phase 5 (now one
-// section of the Providers & Models tab). The Oracle page's "Configure provider →"
-// link deep-links to the providers tab (settings#oracle → mapLegacySettingsTab →
-// providers). All handlers and JSX are the originals moved verbatim; retrieval stays
-// local on the Oracle page, only the remote-answer provider configuration lives here.
+// Step 6c, then extracted from SettingsView into its own file in Phase 5. This card
+// now lives inside OracleAdminPanel on the Oracle page (inside a CollapsibleSection
+// titled "Oracle LLM"). The OracleView "Configure provider" action scrolls the user
+// to that section directly instead of navigating to Settings. All handlers and JSX are
+// the originals moved verbatim; retrieval stays local on the Oracle page.
 export function OracleAnswerSettingsCard() {
 	const {
 		oracleLlmSettings,

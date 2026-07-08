@@ -1,9 +1,13 @@
 // @vitest-environment jsdom
 //
-// Phase 5: the Providers & Models tab. We mock the four child cards to lightweight
+// Phase 5: the Providers & Models tab. We mock the child cards to lightweight
 // markers (their own persistence is tested in their own files) and provide a
 // detect_providers IPC mock, so this test proves the WIRING: the detection strip
-// renders the detected providers, and all four per-role sections mount in order.
+// renders the detected providers, and all sections mount in order.
+//
+// Oracle LLM card was moved to OracleAdminPanel; OracleAnswerSettingsCard is no
+// longer mounted here. LocalCoderBackendCard was deleted (redundant with
+// RolesTableCard's Orchestrator row). PiExtensionsCard was added to Extensions.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { act, createElement } from "react";
@@ -33,10 +37,6 @@ vi.mock("../views/WorkspaceView", () => ({
   CensorLocalAiCard: () =>
     createElement("div", { "data-testid": "censor-model-card" }),
 }));
-vi.mock("./LocalCoderBackendCard", () => ({
-  LocalCoderBackendCard: () =>
-    createElement("div", { "data-testid": "local-coder-card" }),
-}));
 vi.mock("./ModelRegistryCard", () => ({
   ModelRegistryCard: () =>
     createElement("div", { "data-testid": "model-registry-card" }),
@@ -50,10 +50,6 @@ vi.mock("./RolesTableCard", () => ({
 vi.mock("./MiniWriteBehaviorCard", () => ({
   MiniWriteBehaviorCard: () =>
     createElement("div", { "data-testid": "mini-write-behavior-card" }),
-}));
-vi.mock("./OracleAnswerSettingsCard", () => ({
-  OracleAnswerSettingsCard: () =>
-    createElement("div", { "data-testid": "oracle-llm-card" }),
 }));
 vi.mock("./DesignLlmBackendCard", () => ({
   DesignLlmBackendCard: () =>
@@ -70,6 +66,10 @@ vi.mock("./BundledExtensionsCard", () => ({
 vi.mock("./UserMcpServersCard", () => ({
   UserMcpServersCard: () =>
     createElement("div", { "data-testid": "user-mcp-servers-card" }),
+}));
+vi.mock("../views/PiExtensionsCard", () => ({
+  PiExtensionsCard: () =>
+    createElement("div", { "data-testid": "pi-extensions-card" }),
 }));
 
 import { ProvidersModelsTab } from "./ProvidersModelsTab";
@@ -170,7 +170,7 @@ describe("ProvidersModelsTab", () => {
   it("renders all per-role card sections", async () => {
     await mount();
     // Default-open surfaces render immediately: the unified Roles table, the Models group
-    // (Model registry), and the Gates & helpers group (Censor + Design LLM).
+    // (Model registry), and the Gates & helpers group (Censor + Design LLM + Mini write behavior).
     expect(
       container.querySelector('[data-testid="roles-table-card"]'),
     ).not.toBeNull();
@@ -183,34 +183,34 @@ describe("ProvidersModelsTab", () => {
     expect(
       container.querySelector('[data-testid="design-llm-card"]'),
     ).not.toBeNull();
-
-    // "Coders (advanced)" is collapsed by default (the Roles table supersedes it) — expand it.
-    const codersBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      (b.textContent ?? "").includes("Coders (advanced)"),
-    );
-    await act(async () => {
-      codersBtn?.click();
-    });
-    expect(
-      container.querySelector('[data-testid="local-coder-card"]'),
-    ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="mini-write-behavior-card"]'),
     ).not.toBeNull();
+
+    // The "Extensions" group is collapsed by default — expand it, then assert.
+    const extBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+      (b.textContent ?? "").includes("Extensions"),
+    );
+    await act(async () => {
+      extBtn?.click();
+    });
     expect(
       container.querySelector('[data-testid="web-search-card"]'),
     ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="bundled-extensions-card"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="user-mcp-servers-card"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="pi-extensions-card"]'),
+    ).not.toBeNull();
 
-    // The "Oracle" group is collapsed by default — expand it, then assert.
-    const oracleBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      (b.textContent ?? "").includes("Oracle"),
-    );
-    await act(async () => {
-      oracleBtn?.click();
-    });
+    // Oracle LLM card is NOT here — it moved to OracleAdminPanel.
     expect(
       container.querySelector('[data-testid="oracle-llm-card"]'),
-    ).not.toBeNull();
+    ).toBeNull();
   });
 
   it("shows an empty-state note when nothing is detected", async () => {

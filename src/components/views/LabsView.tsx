@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FlaskConical, Bird, BrainCircuit, Sparkles, Moon, Lock, AlertTriangle } from "lucide-react";
+import { FlaskConical, Bird, Sparkles, Moon, Lock, AlertTriangle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { invokeBackendCommand } from "../../context/AppContext";
 
@@ -173,17 +173,6 @@ export function LabsView() {
           setCommand="set_pigeon_enabled"
           defaultEnabled={false}
           Icon={Bird}
-        />
-        <FeatureToggleCard
-          title="Oracle"
-          subtitle="RAG retrieval server"
-          description="The resident embeddings/RAG server agents query for project context. On by default."
-          switchLabel="Toggle Oracle"
-          getCommand="get_oracle_enabled"
-          setCommand="set_oracle_enabled"
-          defaultEnabled={true}
-          Icon={BrainCircuit}
-          warning="Core dependency. Switching Oracle off stops the RAG/embeddings server, so agents lose semantic project context and the auto-reindex on commit. The app keeps running and the Kanban/plan tools still work, but agents get much weaker. Switch off only to debug."
         />
       </div>
 

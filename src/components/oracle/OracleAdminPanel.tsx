@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CollapsibleSection } from "../views/CollapsibleSection";
 import {
+  AlertTriangle,
   BrainCircuit,
   Clock,
   Eye,
@@ -17,6 +19,8 @@ import { toOracleError } from "../../utils/oracleError";
 import { oracleIndexPhaseHint } from "../../utils/oracleIndexPhase";
 import { classifyRuntimeStage } from "../../utils/oracleRuntimeState";
 import { OracleDoctorPanel } from "../views/OracleDoctorPanel";
+import { OracleAnswerSettingsCard } from "../settings/OracleAnswerSettingsCard";
+import { CliAgentsCard } from "./CliAgentsCard";
 import { deriveProviderConfigured } from "./oracleProviderState";
 import type {
   OracleDoctorReport,
@@ -798,6 +802,88 @@ export function OracleAdminPanel() {
           )}
         </div>
       </div>
+
+      {/* Oracle LLM settings — the remote provider that writes answers */}
+      <CollapsibleSection title="Oracle LLM" defaultOpen={false}>
+        <OracleAnswerSettingsCard />
+      </CollapsibleSection>
+
+      {/* CLI Agents — register Oracle MCP in local Claude/Codex config */}
+      <CollapsibleSection title="CLI Agents" defaultOpen={false}>
+        <CliAgentsCard />
+      </CollapsibleSection>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Oracle feature toggle — enable/disable the RAG server
+// ---------------------------------------------------------------------------
+export function OracleFeatureToggle() {
+  const [enabled, setEnabled] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const mountedRef = useRef(true);
+
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+
+  useEffect(() => {
+    invokeBackendCommand<boolean>("get_oracle_enabled")
+      .then((v) => { if (mountedRef.current) setEnabled(Boolean(v)); })
+      .catch(() => {})
+      .finally(() => { if (mountedRef.current) setLoading(false); });
+  }, []);
+
+  const onToggle = () => {
+    if (busy || loading) return;
+    const next = !enabled;
+    setEnabled(next);
+    setBusy(true);
+    invokeBackendCommand<boolean>("set_oracle_enabled", { enabled: next })
+      .catch(() => { if (mountedRef.current) setEnabled(!next); })
+      .finally(() => { if (mountedRef.current) setBusy(false); });
+  };
+
+  return (
+    <div className="rounded-2xl border border-cream-200 bg-white p-5">
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber/10">
+            <BrainCircuit className="h-4 w-4 text-amber-dark" />
+          </div>
+          <div className="mt-3 flex flex-col">
+            <span className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+              Oracle
+            </span>
+            <span className="text-[11px] text-cream-400">RAG retrieval server</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          aria-label="Toggle Oracle"
+          disabled={busy || loading}
+          onClick={() => void onToggle()}
+          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+            enabled ? "bg-teal" : "bg-cream-300"
+          }`}
+        >
+          <span
+            aria-hidden="true"
+            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+              enabled ? "translate-x-4" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
+      <div className="mt-4 flex gap-2 rounded-xl border border-amber/40 bg-amber/10 p-3">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-dark" />
+        <p className="text-[12px] leading-5 text-amber-dark">
+          Core dependency. Switching Oracle off stops the RAG/embeddings server, so agents lose semantic project context and the auto-reindex on commit. The app keeps running and the Kanban/plan tools still work, but agents get much weaker. Switch off only to debug.
+        </p>
+      </div>
+      <p className="mt-2 text-[11px] text-cream-400">Applies on app restart.</p>
     </div>
   );
 }

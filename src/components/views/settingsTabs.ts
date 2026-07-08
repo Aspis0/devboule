@@ -6,9 +6,13 @@
 //
 //   - "secrets"  → "security"   (Secrets moved under the Security tab)
 //   - "devices"  → "security"   (Devices moved under the Security tab, admin-only)
-//   - "oracle"   → "providers"  (Oracle LLM config is now one section of the
-//                                 Providers & Models tab — this is the
-//                                 AskErrorCard "Configure provider →" link)
+//   - "oracle"   → "providers"  (FALLBACK for stale deep-links. Oracle LLM config
+//                                 now lives on the standalone Oracle page inside
+//                                 OracleAdminPanel. Direct callers like AskErrorCard
+//                                 navigate to requestView("oracle") instead of
+//                                 going through Settings; this mapping only handles
+//                                 legacy persisted links that still target
+//                                 settings#oracle.)
 //   - "workspace"→ "workspace"  (workspace settings tab — unchanged)
 //   - "account"  → "account"    (unchanged)
 //

@@ -20,13 +20,13 @@ import { BrainCircuit, Sparkles } from "lucide-react";
 import { useAppContext } from "../../context/AppContext";
 import { toOracleError } from "../../utils/oracleError";
 import { AnswerCard, AskErrorCard } from "../oracle/OracleAnswerCards";
-import { OracleAdminPanel } from "../oracle/OracleAdminPanel";
+import { OracleAdminPanel, OracleFeatureToggle } from "../oracle/OracleAdminPanel";
 import { deriveProviderConfigured } from "../oracle/oracleProviderState";
 import { seedQuestions } from "../polis/oracleSuggestions";
 import type { OracleAnswer, OracleError } from "../../types/backend";
 
 export function OracleView() {
-  const { askOracle, requestView, oracleLlmSettings, secretStatuses } =
+  const { askOracle, oracleLlmSettings, secretStatuses } =
     useAppContext();
 
   // All hooks declared unconditionally and BEFORE any early return so the hook
@@ -81,12 +81,12 @@ export function OracleView() {
     [askOracle, providerConfigured],
   );
 
-  // The Oracle answer-provider config now lives in Settings → Providers & Models
-  // (Phase 5: settings tab id "providers"). The AskErrorCard "Configure provider"
-  // action and the inline gate hint both deep-link there.
+  // The Oracle LLM settings now live on THIS page inside the OracleAdminPanel
+  // (inside a CollapsibleSection titled "Oracle LLM"). Instead of navigating away,
+  // scroll the user to the admin section which contains those settings.
   const goToProviderSettings = useCallback(() => {
-    requestView("settings", "providers");
-  }, [requestView]);
+    adminRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   // "Choose folder" / "Run doctor" land the user on the admin section of THIS
   // page, which owns the workspace picker and the doctor.
@@ -110,6 +110,9 @@ export function OracleView() {
           </p>
         </div>
       </div>
+
+      {/* Oracle on/off toggle — always visible at the top */}
+      <OracleFeatureToggle />
 
       {/* ASK SECTION */}
       <section className="rounded-2xl border border-cream-200 bg-white p-5">

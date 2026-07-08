@@ -30,14 +30,11 @@ vi.mock("../../context/AppContext", () => ({
   useAppActions: () => ({
     consumePendingTab,
     lock: vi.fn(),
-    // CliAgentsCard reads these (Account tab); harmless no-ops.
-    configureCliAgents: vi.fn(async () => ({})),
-    unconfigureCliAgents: vi.fn(async () => ({})),
-    cliAgentsStatus: vi.fn(async () => ({ runtimeReady: false })),
   }),
 }));
 
-// ---- Child views + tab mocked to markers ----------------------------------
+// ---- Child views + tab mocked to markers (PiExtensionsCard is no longer
+// imported by SettingsView, so no mock needed) --------------------------------
 vi.mock("./SecretsView", () => ({
   SecretsView: () =>
     createElement("div", { "data-testid": "secrets-view" }, "secrets"),
@@ -46,17 +43,14 @@ vi.mock("./DevicesView", () => ({
   DevicesView: () =>
     createElement("div", { "data-testid": "devices-view" }, "devices"),
 }));
-vi.mock("./PiExtensionsCard", () => ({
-  PiExtensionsCard: () =>
-    createElement("div", { "data-testid": "pi-extensions-card" }, "extensions"),
-}));
+
 vi.mock("./WorkspaceView", () => ({
   WorkspaceView: () =>
     createElement("div", { "data-testid": "workspace-view" }, "workspace"),
 }));
-// The Oracle admin panel moved OFF Settings onto the standalone OracleView, so
-// SettingsView no longer imports it. The mock is kept ONLY so the absence
-// assertion below has a stable test-id to look for (it never mounts).
+// The Oracle admin panel is on the standalone OracleView, not in Settings.
+// The mock is kept ONLY so the absence assertion below has a stable test-id
+// to look for (it never mounts).
 vi.mock("../oracle/OracleAdminPanel", () => ({
   OracleAdminPanel: () =>
     createElement("div", { "data-testid": "oracle-admin-panel" }, "admin"),
@@ -74,9 +68,8 @@ beforeEach(async () => {
   ({ SettingsView } = await import("./SettingsView"));
 });
 
-// Track every mounted root so afterEach can unmount it — the Account tab's
-// CliAgentsCard runs an async status fetch whose finally-setState would otherwise
-// fire after teardown and surface as an unhandled rejection.
+// Track every mounted root so afterEach can unmount it — child components with
+// async mount effects would otherwise fire setState after teardown.
 let mountedRoots: Root[] = [];
 
 function render(): { container: HTMLElement; root: Root } {
@@ -92,9 +85,8 @@ function render(): { container: HTMLElement; root: Root } {
 }
 
 afterEach(() => {
-  // Unmount synchronously BEFORE the async CliAgentsCard status fetch resolves:
-  // unmount sets the card's mountedRef to false, so its finally-setState guard
-  // (`if (mountedRef.current ...)`) no-ops and nothing lands after teardown.
+  // Unmount synchronously so async effects from child components are guarded
+  // by their mountedRef and don't fire setState after teardown.
   act(() => {
     for (const root of mountedRoots) root.unmount();
   });

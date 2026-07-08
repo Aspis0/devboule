@@ -94,6 +94,69 @@ afterEach(() => {
 	container.remove();
 });
 
+describe("RolesTableCard — Orchestrator cloud consent gate", () => {
+	it("blocks saving when kind=cloud and consent is unchecked, then allows after consent", async () => {
+		currentConfig = { localCoderBackend: undefined };
+		await mount();
+		const row = orchestratorRow();
+		const fields = row.querySelector(
+			'[data-testid="roles-orchestrator-fields"]',
+		) as HTMLElement;
+		expect(fields).toBeTruthy();
+
+		const nativeSelectSetter = Object.getOwnPropertyDescriptor(
+			window.HTMLSelectElement.prototype,
+			"value",
+		)!.set!;
+
+		// Switch kind to cloud — this should reveal the consent checkbox.
+		const select = fields.querySelector("select") as HTMLSelectElement;
+		expect(select).toBeTruthy();
+		await act(async () => {
+			nativeSelectSetter.call(select, "cloud");
+			select.dispatchEvent(new Event("change", { bubbles: true }));
+		});
+
+		// The consent checkbox should be present.
+		const consentCheckbox = fields.querySelector(
+			'[data-testid="cloud-consent-ack"]',
+		) as HTMLInputElement;
+		expect(consentCheckbox).toBeTruthy();
+		expect(consentCheckbox.checked).toBe(false);
+
+		// Try to save without consent — should show an error.
+		const saveBtn = Array.from(row.querySelectorAll("button")).find((b) =>
+			b.textContent?.includes("Save"),
+		);
+		expect(saveBtn).toBeTruthy();
+		await act(async () => {
+			saveBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+		await flush();
+		// The error message should appear.
+		expect(container.textContent).toContain(
+			"Please acknowledge the Cloud consent checkbox",
+		);
+
+		// Check the consent checkbox.
+		await act(async () => {
+			consentCheckbox.click();
+		});
+		await flush();
+
+		// Now save should succeed (no error thrown).
+		invokeMock.mockClear();
+		await act(async () => {
+			saveBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+		await flush();
+		// The error should be gone.
+		expect(container.textContent).not.toContain(
+			"Please acknowledge the Cloud consent checkbox",
+		);
+	});
+});
+
 describe("RolesTableCard — Orchestrator inline local-model editor", () => {
 	it("renders the inline editor (not the old pointer text) when placement is Local and no backend is configured", async () => {
 		currentConfig = { localCoderBackend: undefined };
