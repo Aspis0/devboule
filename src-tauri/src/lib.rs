@@ -472,6 +472,16 @@ pub fn run() {
             if let Some(state) = app.try_state::<MiniCoderState>() {
                 state.install(app.handle().clone());
             }
+            // pi extensions bootstrap: install curated extensions on first launch
+            // (app-managed mode only). Runs on a detached thread so setup() is not blocked.
+            {
+                let app_handle = app.handle().clone();
+                let _ = std::thread::Builder::new()
+                    .name("pi-ext-bootstrap".to_string())
+                    .spawn(move || {
+                        backend::pi_extensions::bootstrap_extensions_if_needed(&app_handle);
+                    });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -790,6 +800,12 @@ pub fn run() {
             backend::pi_sidecar::spawn_agent_session,
             // Phase 2: Pigeon heuristic routing — classify a prompt into tier/path.
             backend::prompt_routing::classify_prompt_command,
+            // pi extensions: status, list, install, remove, marketplace search.
+            backend::pi_extensions::pi_extensions_status,
+            backend::pi_extensions::pi_extensions_list,
+            backend::pi_extensions::pi_extension_install,
+            backend::pi_extensions::pi_extension_remove,
+            backend::pi_extensions::pi_marketplace_search,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

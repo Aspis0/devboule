@@ -661,6 +661,12 @@ fn spawn_pi_session_inner(
         cmd.env("DEVBOULE_PI_BASE_URL", base_url);
     }
 
+    // pi extensions: pass the resolved agent dir so pi reads/writes the correct
+    // settings.json and npm/ dir. On resolution failure, pi falls back to ~/.pi/agent.
+    if let Ok(dir) = crate::backend::pi_extensions::resolve_pi_agent_dir(app) {
+        cmd.env("PI_CODING_AGENT_DIR", &dir.path);
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn pi sidecar (is Node.js installed?): {e}"))?;

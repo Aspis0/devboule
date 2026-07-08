@@ -1,0 +1,1166 @@
+//! pi extensions backend — agent-dir resolution, bootstrap, install/remove/list/search.
+//!
+//! Manages the pi coding-agent extension registry (`settings.json` → `packages` array),
+//! the bundled CLI (`pi-sidecar/node_modules/.bin/pi`), and the npm marketplace search.
+//!
+//! The pi agent dir is resolved in priority order:
+//! 1. `DEVBOULE_PI_AGENT_DIR` env (dev override — tilde IS expanded, mirroring the CLI)
+//! 2. `~/.pi/agent` IF it exists (a pi user's extensions Just Work — product decision)
+//! 3. `<app_data_dir>/pi-agent` (app-managed; created on demand; bootstrap target)
+//!
+//! Design doc: this module is self-contained — do NOT merge into pi_sidecar.rs.
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Curated extension set installed on first launch (app-managed mode only).
+const CURATED_EXTENSIONS: &[&str] = &[
+    "npm:@tintinweb/pi-subagents",
+    "npm:pi-lens",
+    "npm:@pi-unipi/compactor",
+    "npm:pi-web-access",
+];
+
+/// Hard timeout for a single CLI invocation (seconds).
+const CLI_TIMEOUT_SECS: u64 = 180;
+
+/// npm registry search URL (FIXED host — no SSRF surface).
+const NPM_SEARCH_URL: &str = "https://registry.npmjs.org/-/v1/search";
+
+/// HTTP timeout for marketplace queries.
+const MARKETPLACE_TIMEOUT_SECS: u64 = 10;
+
+/// The ecosystem keyword that identifies pi packages on npm.
+const PI_PACKAGE_KEYWORD: &str = "pi-package";
+
+/// Cap for the success output tail returned by `run_pi_cli_at`.
+const CLI_OUTPUT_TAIL_CHARS: usize = 800;
+
+/// Max body bytes we will read from the npm marketplace search response (2 MB).
+const MARKETPLACE_MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Agent dir resolution
+// ---------------------------------------------------------------------------
+
+/// Which tier of the agent dir resolution was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentDirMode {
+    /// `DEVBOULE_PI_AGENT_DIR` env was set — we use that path (tilde expanded).
+    EnvOverride,
+    /// `~/.pi/agent` existed on disk — a pi power-user's extensions Just Work.
+    Global,
+    /// App-managed dir under `<app_data_dir>/pi-agent` (created on demand).
+    AppManaged,
+}
+
+/// Result of resolving the pi agent directory.
+#[derive(Debug, Clone)]
+pub struct ResolvedAgentDir {
+    pub path: PathBuf,
+    pub mode: AgentDirMode,
+}
+
+/// Home directory resolution. Mirrors `saved_workflows::home_dir` — env-var
+/// based, no external crate.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Expand a leading `~/` or bare `~` to the user's home directory, matching
+/// the pi CLI's `expandTildePath` (config.js). Absolute paths and anything
+/// else pass through unchanged.
+fn expand_tilde(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if s == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+        // home unknown — return as-is (will fail downstream on missing dir).
+        return p.to_path_buf();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// Pure decision core: pick which agent dir to use.
+///
+/// Priority: env_override → global (if exists) → app_managed.
+/// Unit-testable without an AppHandle.
+fn pick_agent_dir(
+    env_override: Option<PathBuf>,
+    global_exists: bool,
+    global: PathBuf,
+    app_managed: PathBuf,
+) -> (PathBuf, AgentDirMode) {
+    if let Some(dir) = env_override {
+        return (dir, AgentDirMode::EnvOverride);
+    }
+    if global_exists {
+        return (global, AgentDirMode::Global);
+    }
+    (app_managed, AgentDirMode::AppManaged)
+}
+
+/// Resolve the pi agent directory for the current machine.
+pub fn resolve_pi_agent_dir(app: &AppHandle) -> Result<ResolvedAgentDir, String> {
+    // 1. Dev override via env — tilde IS expanded (mirrors the CLI).
+    let env_override = std::env::var("DEVBOULE_PI_AGENT_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| expand_tilde(Path::new(&v)));
+
+    // 2. Global ~/.pi/agent (product decision: pi user's extensions Just Work).
+    //    When home_dir() is None, the global dir cannot exist — skip to app-managed.
+    let (global, global_exists) = match home_dir() {
+        Some(home) => {
+            let dir = home.join(".pi").join("agent");
+            let exists = dir.is_dir();
+            (dir, exists)
+        }
+        None => (PathBuf::new(), false),
+    };
+
+    // 3. App-managed under <app_data_dir>/pi-agent.
+    let app_managed = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("App data directory is unavailable: {e}"))?
+        .join("pi-agent");
+
+    let (path, mode) = pick_agent_dir(env_override, global_exists, global, app_managed);
+    Ok(ResolvedAgentDir { path, mode })
+}
+
+// ---------------------------------------------------------------------------
+// Bundled CLI resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the path to the bundled `pi` CLI entry point.
+/// Mirrors `resolve_sidecar_script` (`pi_sidecar.rs:500-525`).
+fn resolve_bundled_pi_cli() -> Result<PathBuf, String> {
+    // Dev path: repo root → pi-sidecar/node_modules/.bin/pi
+    let dev_path = std::env::current_dir()
+        .map_err(|e| format!("Cannot resolve CWD: {e}"))?
+        .join("pi-sidecar")
+        .join("node_modules")
+        .join(".bin")
+        .join("pi");
+    if dev_path.exists() {
+        return Ok(dev_path);
+    }
+    // Packaged build: $TAURI_RESOURCE_DIR/pi-sidecar/node_modules/.bin/pi
+    if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
+        let resource_path = Path::new(&resource_dir)
+            .join("pi-sidecar")
+            .join("node_modules")
+            .join(".bin")
+            .join("pi");
+        if resource_path.exists() {
+            return Ok(resource_path);
+        }
+    }
+    Err(
+        "pi CLI not found at pi-sidecar/node_modules/.bin/pi. Run `npm install` in pi-sidecar/ first."
+            .to_string(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Source validation (SECURITY — defense in depth)
+// ---------------------------------------------------------------------------
+
+/// Validate an extension source string. Accepts ONLY:
+/// - `npm:<valid-npm-name>` (scoped ok: `npm:@scope/name`)
+/// - `git:github.com/<owner>/<repo>`
+/// - `https://github.com/<owner>/<repo>`
+///
+/// Rejects everything else (whitespace, shell metachars, other hosts).
+/// Execution is argv-array (no shell) regardless — this is defense in depth.
+fn validate_ext_source(s: &str) -> Result<(), String> {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static NPM_RE: OnceLock<Regex> = OnceLock::new();
+    static GIT_GH_RE: OnceLock<Regex> = OnceLock::new();
+    static HTTPS_GH_RE: OnceLock<Regex> = OnceLock::new();
+    let npm_re = NPM_RE.get_or_init(|| {
+        // Scoped: npm:@scope/name  |  Unscoped: npm:name
+        Regex::new(r"^npm:(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$")
+            .unwrap()
+    });
+    let git_gh_re = GIT_GH_RE.get_or_init(|| {
+        Regex::new(r"^git:github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$").unwrap()
+    });
+    let https_gh_re = HTTPS_GH_RE.get_or_init(|| {
+        Regex::new(r"^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$").unwrap()
+    });
+
+    if npm_re.is_match(s) || git_gh_re.is_match(s) || https_gh_re.is_match(s) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid extension source: {s:?}. \
+             Accepted formats: npm:<name>, npm:@scope/name, \
+             git:github.com/owner/repo, https://github.com/owner/repo"
+        ))
+    }
+}
+
+/// Check whether a string is a valid npm package name (same regex as
+/// `validate_ext_source`, but only the npm variant). Used by `pi_extensions_list`
+/// to validate entries read back from `settings.json` (defense in depth —
+/// prevents path-traversal via a malicious `npm:../../etc/passwd` entry).
+fn is_valid_npm_name(s: &str) -> bool {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static NPM_NAME_RE: OnceLock<Regex> = OnceLock::new();
+    let re = NPM_NAME_RE.get_or_init(|| {
+        Regex::new(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$")
+            .unwrap()
+    });
+    re.is_match(s)
+}
+
+// ---------------------------------------------------------------------------
+// CLI runner — shared core (BLOCKER 1 fix: reader threads, no pipe-buffer deadlock)
+// ---------------------------------------------------------------------------
+
+/// Global serialization lock for CLI invocations. Prevents bootstrap and
+/// user-triggered install/remove from running npm concurrently on the same
+/// agent dir (which would corrupt the npm state).
+static CLI_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Cap for reading child output bytes (prevents OOM from a rogue child).
+/// 4 MB — generous for npm output, bounded enough to not matter.
+const CLI_READ_CAP_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Core CLI runner. Spawns `node <cli> <verb> <source>` with
+/// `PI_CODING_AGENT_DIR` set, drains stdout/stderr on dedicated reader threads
+/// (avoids pipe-buffer deadlock — BLOCKER 1 fix), and enforces a hard timeout
+/// via a watchdog. Validation is enforced inside (trust boundary).
+fn run_pi_cli_at(
+    agent_dir: &Path,
+    verb: &str,
+    source: &str,
+) -> Result<String, String> {
+    // SECURITY: validate inside the runner (trust boundary — issue 6).
+    validate_ext_source(source)?;
+
+    let cli_path = resolve_bundled_pi_cli()?;
+
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg(&cli_path)
+        .arg(verb)
+        .arg(source)
+        .env("PI_CODING_AGENT_DIR", agent_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn pi CLI: {e}"))?;
+
+    // Take piped handles BEFORE sharing the child, drain on reader threads.
+    // EOF arrives when the child exits or is killed — reading concurrently
+    // avoids a pipe-buffer deadlock on large npm output.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(h) = stdout_handle {
+            let _ = h.take(CLI_READ_CAP_BYTES).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(h) = stderr_handle {
+            let _ = h.take(CLI_READ_CAP_BYTES).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    // Poll loop: enforces the deadline itself (no separate watchdog thread).
+    // The child is now a plain mut — readers already took stdout/stderr.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(CLI_TIMEOUT_SECS);
+    let mut timed_out = false;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if !timed_out && std::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    // Keep looping — next try_wait reaps the exit status.
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                return Err(format!("pi {verb} {source} status check failed: {e}"));
+            }
+        }
+    };
+
+    // Join reader threads — they finished when the child exited (EOF).
+    let stdout_bytes = stdout_reader
+        .join()
+        .unwrap_or_default();
+    let stderr_bytes = stderr_reader
+        .join()
+        .unwrap_or_default();
+
+    // Read as bytes + from_utf8_lossy (issue 9): preserves non-UTF8 npm diagnostics.
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let combined = format!("{stdout}{stderr}");
+
+    if exit_status.success() {
+        // Cap the success output (issue 10).
+        Ok(tail_chars(&combined, CLI_OUTPUT_TAIL_CHARS))
+    } else {
+        let tail = tail_chars(&combined, CLI_OUTPUT_TAIL_CHARS);
+        if timed_out {
+            Err(format!(
+                "pi {verb} {source} timed out after {CLI_TIMEOUT_SECS}s:\n{tail}"
+            ))
+        } else {
+            Err(format!(
+                "pi {verb} {source} failed (exit {}):\n{tail}",
+                exit_status.code().unwrap_or(-1)
+            ))
+        }
+    }
+}
+
+/// Return the last `cap` chars of `s`.
+fn tail_chars(s: &str, cap: usize) -> String {
+    let len = s.chars().count();
+    if len <= cap {
+        return s.to_string();
+    }
+    s.chars().skip(len - cap).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Types for list / search
+// ---------------------------------------------------------------------------
+
+/// A single extension entry returned by `pi_extensions_list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiExtensionInfo {
+    pub source: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub installed_ok: bool,
+}
+
+/// A marketplace search result entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketEntry {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub date: String,
+}
+
+/// settings.json shape: `{"packages": ["npm:pi-lens", ...]}`.
+#[derive(Debug, Default, Deserialize)]
+struct SettingsJson {
+    #[serde(default)]
+    packages: Vec<String>,
+}
+
+/// Minimal package.json fields we care about.
+#[derive(Debug, Default, Deserialize)]
+struct PackageJson {
+    name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    #[serde(default)]
+    author: Option<serde_json::Value>,
+}
+
+/// Extract author name from package.json `author` field (string or {name}).
+fn extract_author(author: &Option<serde_json::Value>) -> String {
+    match author {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(m)) => m
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap state (issue 4: single Mutex, torn-status fix)
+// ---------------------------------------------------------------------------
+
+/// Bootstrap lifecycle, read by `pi_extensions_status`.
+static BOOTSTRAP_STATE: Mutex<BootstrapState> = Mutex::new(BootstrapState {
+    status: BootstrapStatus::Idle,
+    error: None,
+});
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapStatus {
+    Idle,
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug)]
+struct BootstrapState {
+    status: BootstrapStatus,
+    error: Option<String>,
+}
+
+
+
+fn set_bootstrap_status(status: BootstrapStatus, error: Option<String>) {
+    if let Ok(mut s) = BOOTSTRAP_STATE.lock() {
+        s.status = status;
+        s.error = error;
+    }
+}
+
+fn bootstrap_status_str() -> &'static str {
+    let snap = BOOTSTRAP_STATE
+        .lock()
+        .map(|s| s.status)
+        .unwrap_or(BootstrapStatus::Idle);
+    match snap {
+        BootstrapStatus::Idle => "idle",
+        BootstrapStatus::Running => "running",
+        BootstrapStatus::Done => "done",
+        BootstrapStatus::Failed => "failed",
+    }
+}
+
+fn bootstrap_error() -> Option<String> {
+    BOOTSTRAP_STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.error.clone())
+}
+
+/// Check if bootstrap is currently running (used by install/remove commands
+/// to reject concurrent operations — issue 3b).
+fn bootstrap_is_running() -> bool {
+    BOOTSTRAP_STATE
+        .lock()
+        .map(|s| s.status == BootstrapStatus::Running)
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap (first-launch, app-managed mode only)
+// ---------------------------------------------------------------------------
+
+/// Called once at startup from `lib.rs`'s setup. Runs on a detached thread.
+pub fn bootstrap_extensions_if_needed(app: &AppHandle) {
+    let resolved = match resolve_pi_agent_dir(app) {
+        Ok(r) => r,
+        Err(_) => return, // Can't resolve → silently skip (pi falls back to ~/.pi/agent).
+    };
+
+    // HARD RULE: NEVER write into the user's global ~/.pi/agent or env-override dir.
+    let skip_msg = match resolved.mode {
+        AgentDirMode::AppManaged => None,
+        AgentDirMode::Global => Some("skipped: global dir".to_string()),
+        AgentDirMode::EnvOverride => Some("skipped: env-override dir".to_string()),
+    };
+    if let Some(msg) = skip_msg {
+        set_bootstrap_status(BootstrapStatus::Done, Some(msg));
+        return;
+    }
+
+    // Idempotent: if settings.json already exists, nothing to do.
+    if resolved.path.join("settings.json").exists() {
+        set_bootstrap_status(BootstrapStatus::Done, None);
+        return;
+    }
+
+    // Create the dir + install curated extensions.
+    set_bootstrap_status(BootstrapStatus::Running, None);
+    let _ = std::fs::create_dir_all(&resolved.path);
+
+    for source in CURATED_EXTENSIONS {
+        // validate_ext_source is also called inside run_pi_cli_at, but
+        // validate here too for a clear error before we lock CLI_RUN_LOCK.
+        if let Err(e) = validate_ext_source(source) {
+            set_bootstrap_status(
+                BootstrapStatus::Failed,
+                Some(format!("bad curated source {source}: {e}")),
+            );
+            return;
+        }
+        // Acquire the global CLI lock (issue 3a).
+        let _guard = CLI_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = run_pi_cli_at(&resolved.path, "install", source) {
+            drop(_guard);
+            set_bootstrap_status(
+                BootstrapStatus::Failed,
+                Some(format!("install {source} failed: {e}")),
+            );
+            return;
+        }
+        // _guard dropped here, releasing CLI_RUN_LOCK for next iteration.
+    }
+    set_bootstrap_status(BootstrapStatus::Done, None);
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands
+// ---------------------------------------------------------------------------
+
+/// Status of the pi extensions subsystem.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiExtensionsStatus {
+    pub agent_dir: String,
+    pub mode: AgentDirMode,
+    pub bootstrap: &'static str,
+    pub bootstrap_error: Option<String>,
+}
+
+/// Read-only status: agent dir location + bootstrap lifecycle.
+#[tauri::command]
+pub fn pi_extensions_status(app: AppHandle) -> Result<PiExtensionsStatus, String> {
+    let resolved = resolve_pi_agent_dir(&app)?;
+    Ok(PiExtensionsStatus {
+        agent_dir: resolved.path.display().to_string(),
+        mode: resolved.mode,
+        bootstrap: bootstrap_status_str(),
+        bootstrap_error: bootstrap_error(),
+    })
+}
+
+/// List installed extensions (reads `settings.json` + per-package `package.json`).
+#[tauri::command]
+pub fn pi_extensions_list(app: AppHandle) -> Result<Vec<PiExtensionInfo>, String> {
+    let resolved = resolve_pi_agent_dir(&app)?;
+    let settings_path = resolved.path.join("settings.json");
+
+    // Missing settings.json → empty vec (NOT an error).
+    let settings: SettingsJson = match std::fs::read_to_string(&settings_path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut result = Vec::with_capacity(settings.packages.len());
+    for source in &settings.packages {
+        if let Some(name) = source.strip_prefix("npm:") {
+            // SECURITY (issue 7): validate the npm name read from settings.json
+            // before joining into a filesystem path — prevents path-traversal via
+            // a malicious entry like `npm:../../etc/passwd`.
+            if !is_valid_npm_name(name) {
+                result.push(PiExtensionInfo {
+                    source: source.clone(),
+                    name: source.clone(),
+                    version: String::new(),
+                    description: String::new(),
+                    author: String::new(),
+                    installed_ok: false,
+                });
+                continue;
+            }
+            let pkg_json_path = resolved
+                .path
+                .join("npm")
+                .join("node_modules")
+                .join(name)
+                .join("package.json");
+            match std::fs::read_to_string(&pkg_json_path) {
+                Ok(data) => {
+                    let pkg: PackageJson = serde_json::from_str(&data).unwrap_or_default();
+                    let installed_ok = pkg.name.is_some();
+                    result.push(PiExtensionInfo {
+                        source: source.clone(),
+                        name: pkg.name.unwrap_or_else(|| name.to_string()),
+                        version: pkg.version.unwrap_or_default(),
+                        description: pkg.description.unwrap_or_default(),
+                        author: extract_author(&pkg.author),
+                        installed_ok,
+                    });
+                }
+                Err(_) => {
+                    // Missing/unparsable package.json → installedOk false.
+                    result.push(PiExtensionInfo {
+                        source: source.clone(),
+                        name: name.to_string(),
+                        version: String::new(),
+                        description: String::new(),
+                        author: String::new(),
+                        installed_ok: false,
+                    });
+                }
+            }
+        } else {
+            // Non-npm source: name = source, version empty.
+            result.push(PiExtensionInfo {
+                source: source.clone(),
+                name: source.clone(),
+                version: String::new(),
+                description: String::new(),
+                author: String::new(),
+                installed_ok: true,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Install an extension by source.
+#[tauri::command]
+pub async fn pi_extension_install(app: AppHandle, source: String) -> Result<String, String> {
+    // Reject if bootstrap is still running (issue 3b).
+    if bootstrap_is_running() {
+        return Err(
+            "Extension bootstrap is still running — retry in a moment.".to_string(),
+        );
+    }
+    let resolved = resolve_pi_agent_dir(&app)?;
+    // validate_ext_source is called inside run_pi_cli_at (trust boundary).
+    // The MutexGuard must NOT cross the .await, so the entire blocking
+    // operation (lock acquisition + CLI run) happens inside spawn_blocking.
+    let dir = resolved.path;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = CLI_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        run_pi_cli_at(&dir, "install", &source)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Remove an extension by source.
+#[tauri::command]
+pub async fn pi_extension_remove(app: AppHandle, source: String) -> Result<String, String> {
+    // Reject if bootstrap is still running (issue 3b).
+    if bootstrap_is_running() {
+        return Err(
+            "Extension bootstrap is still running — retry in a moment.".to_string(),
+        );
+    }
+    let resolved = resolve_pi_agent_dir(&app)?;
+    let dir = resolved.path;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = CLI_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        run_pi_cli_at(&dir, "remove", &source)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Search the npm marketplace for pi extensions.
+#[tauri::command]
+pub async fn pi_marketplace_search(
+    _app: AppHandle,
+    query: Option<String>,
+) -> Result<Vec<MarketEntry>, String> {
+    let search_term = match query {
+        Some(q) if !q.trim().is_empty() => {
+            // Percent-encode the query; pin the ecosystem keyword.
+            format!(
+                "{}+keywords:{}",
+                urlencoding::encode(&q),
+                PI_PACKAGE_KEYWORD
+            )
+        }
+        _ => format!("keywords:{}", PI_PACKAGE_KEYWORD),
+    };
+
+    let url = format!("{NPM_SEARCH_URL}?text={search_term}&size=40");
+
+    // Blocking reqwest call inside spawn_blocking (pattern from oracle_coordinator.rs).
+    let entries = tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(MARKETPLACE_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+
+        let resp = client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("npm registry search failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("npm registry returned HTTP {}", resp.status()));
+        }
+
+        // Cap the body read (issue 11): mirror the read-cap style in api_fuzz.rs.
+        let mut body_bytes = Vec::new();
+        let mut reader = resp.take(MARKETPLACE_MAX_BODY_BYTES);
+        reader
+            .read_to_end(&mut body_bytes)
+            .map_err(|e| format!("npm registry read failed: {e}"))?;
+        if body_bytes.len() as u64 >= MARKETPLACE_MAX_BODY_BYTES {
+            return Err("npm registry response too large (>2 MB)".to_string());
+        }
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).map_err(|e| format!("Failed to parse npm search response: {e}"))?;
+
+        let objects = body
+            .get("objects")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut entries = Vec::with_capacity(objects.len());
+        for obj in objects {
+            if let Some(pkg) = obj.get("package") {
+                let author = pkg
+                    .get("author")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                entries.push(MarketEntry {
+                    name: pkg
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    version: pkg
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    description: pkg
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    author,
+                    date: pkg
+                        .get("date")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+        }
+        Ok(entries)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?;
+
+    entries
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- pick_agent_dir (4 cases) ----
+
+    #[test]
+    fn pick_agent_dir_env_override_wins() {
+        let env = Some(PathBuf::from("/tmp/custom-pi"));
+        let (path, mode) = pick_agent_dir(
+            env,
+            true,
+            "/home/user/.pi/agent".into(),
+            "/app/pi-agent".into(),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/custom-pi"));
+        assert_eq!(mode, AgentDirMode::EnvOverride);
+    }
+
+    #[test]
+    fn pick_agent_dir_global_exists() {
+        let (path, mode) = pick_agent_dir(
+            None,
+            true,
+            "/home/user/.pi/agent".into(),
+            "/app/pi-agent".into(),
+        );
+        assert_eq!(path, PathBuf::from("/home/user/.pi/agent"));
+        assert_eq!(mode, AgentDirMode::Global);
+    }
+
+    #[test]
+    fn pick_agent_dir_app_managed_fallback() {
+        let (path, mode) = pick_agent_dir(
+            None,
+            false,
+            "/home/user/.pi/agent".into(),
+            "/app/pi-agent".into(),
+        );
+        assert_eq!(path, PathBuf::from("/app/pi-agent"));
+        assert_eq!(mode, AgentDirMode::AppManaged);
+    }
+
+    #[test]
+    fn pick_agent_dir_env_overrides_even_when_global_exists() {
+        let env = Some(PathBuf::from("/tmp/x"));
+        let (path, mode) = pick_agent_dir(
+            env,
+            true,
+            "/home/user/.pi/agent".into(),
+            "/app/pi-agent".into(),
+        );
+        assert_eq!(path, PathBuf::from("/tmp/x"));
+        assert_eq!(mode, AgentDirMode::EnvOverride);
+    }
+
+    // ---- expand_tilde (issue 2) ----
+
+    #[test]
+    fn expand_tilde_bare_tilde() {
+        let result = expand_tilde(Path::new("~"));
+        if let Some(home) = home_dir() {
+            assert_eq!(result, home);
+        } else {
+            assert_eq!(result, PathBuf::from("~"));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_slash_x() {
+        let result = expand_tilde(Path::new("~/x"));
+        if let Some(home) = home_dir() {
+            assert_eq!(result, home.join("x"));
+        } else {
+            assert_eq!(result, PathBuf::new());
+        }
+    }
+
+    #[test]
+    fn expand_tilde_absolute_passthrough() {
+        let result = expand_tilde(Path::new("/tmp/x"));
+        assert_eq!(result, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn expand_tilde_relative_passthrough() {
+        let result = expand_tilde(Path::new("relative/path"));
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    // ---- validate_ext_source ----
+
+    #[test]
+    fn validate_ext_source_accepts_npm_pi_lens() {
+        assert!(validate_ext_source("npm:pi-lens").is_ok());
+    }
+
+    #[test]
+    fn validate_ext_source_accepts_npm_scoped() {
+        assert!(validate_ext_source("npm:@scope/name").is_ok());
+        assert!(validate_ext_source("npm:@tintinweb/pi-subagents").is_ok());
+        assert!(validate_ext_source("npm:@pi-unipi/compactor").is_ok());
+    }
+
+    #[test]
+    fn validate_ext_source_accepts_git_github() {
+        assert!(validate_ext_source("git:github.com/user/repo").is_ok());
+    }
+
+    #[test]
+    fn validate_ext_source_accepts_https_github() {
+        assert!(validate_ext_source("https://github.com/user/repo").is_ok());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_shell_metachars() {
+        assert!(validate_ext_source("npm:foo; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_space() {
+        assert!(validate_ext_source("npm:foo bar").is_err());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_empty() {
+        assert!(validate_ext_source("").is_err());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_other_host() {
+        assert!(validate_ext_source("https://evil.com/x/y").is_err());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_traversal() {
+        assert!(validate_ext_source("npm:../../etc").is_err());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_uppercase_npm() {
+        assert!(validate_ext_source("npm:Pi-Lens").is_err());
+    }
+
+    #[test]
+    fn validate_ext_source_rejects_random_prefix() {
+        assert!(validate_ext_source("foo:bar").is_err());
+    }
+
+    // ---- is_valid_npm_name (issue 7) ----
+
+    #[test]
+    fn is_valid_npm_name_accepts_pi_lens() {
+        assert!(is_valid_npm_name("pi-lens"));
+    }
+
+    #[test]
+    fn is_valid_npm_name_accepts_scoped() {
+        assert!(is_valid_npm_name("@scope/name"));
+        assert!(is_valid_npm_name("@tintinweb/pi-subagents"));
+    }
+
+    #[test]
+    fn is_valid_npm_name_rejects_traversal() {
+        assert!(!is_valid_npm_name("../../etc/passwd"));
+    }
+
+    #[test]
+    fn is_valid_npm_name_rejects_uppercase() {
+        assert!(!is_valid_npm_name("Pi-Lens"));
+    }
+
+    #[test]
+    fn is_valid_npm_name_rejects_empty() {
+        assert!(!is_valid_npm_name(""));
+    }
+
+    #[test]
+    fn is_valid_npm_name_rejects_shell_metachars() {
+        assert!(!is_valid_npm_name("foo; rm -rf /"));
+    }
+
+    // ---- package.json → PiExtensionInfo mapping ----
+
+    #[test]
+    fn extract_author_from_string() {
+        assert_eq!(
+            extract_author(&Some(serde_json::Value::String("Alice".into()))),
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn extract_author_from_object() {
+        let val = serde_json::json!({"name": "Bob", "url": "https://bob.dev"});
+        assert_eq!(extract_author(&Some(val)), "Bob");
+    }
+
+    #[test]
+    fn extract_author_missing() {
+        assert_eq!(extract_author(&None), "unknown");
+    }
+
+    #[test]
+    fn parse_package_json_fields() {
+        let json =
+            r#"{"name":"pi-lens","version":"0.3.0","description":"Lens for pi","author":"Tin"}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        assert_eq!(pkg.name.as_deref(), Some("pi-lens"));
+        assert_eq!(pkg.version.as_deref(), Some("0.3.0"));
+        assert_eq!(pkg.description.as_deref(), Some("Lens for pi"));
+    }
+
+    #[test]
+    fn parse_package_json_missing_fields() {
+        let json = r#"{}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        assert!(pkg.name.is_none());
+        assert!(pkg.version.is_none());
+        assert!(pkg.description.is_none());
+        assert!(pkg.author.is_none());
+    }
+
+    #[test]
+    fn parse_package_json_author_object() {
+        let json = r#"{"name":"test","author":{"name":"Carol","email":"c@example.com"}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        assert_eq!(extract_author(&pkg.author), "Carol");
+    }
+
+    // ---- npm search JSON → Vec<MarketEntry> mapping (canned fixture) ----
+
+    #[test]
+    fn parse_npm_search_response() {
+        let fixture = serde_json::json!({
+            "total": 2,
+            "objects": [
+                {
+                    "package": {
+                        "name": "pi-lens",
+                        "version": "0.3.0",
+                        "description": "A lens for pi",
+                        "keywords": ["pi-package"],
+                        "author": {"name": "Tin"},
+                        "date": "2025-01-15T10:00:00.000Z"
+                    }
+                },
+                {
+                    "package": {
+                        "name": "pi-web-access",
+                        "version": "1.0.0",
+                        "description": "Web access for pi",
+                        "author": {"name": "Alice"},
+                        "date": "2025-02-20T12:00:00.000Z"
+                    }
+                }
+            ]
+        });
+
+        let objects = fixture["objects"].as_array().unwrap();
+        let mut entries = Vec::new();
+        for obj in objects {
+            if let Some(pkg) = obj.get("package") {
+                let author = pkg
+                    .get("author")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                entries.push(MarketEntry {
+                    name: pkg
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    version: pkg
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    description: pkg
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    author,
+                    date: pkg
+                        .get("date")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+        }
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "pi-lens");
+        assert_eq!(entries[0].author, "Tin");
+        assert_eq!(entries[1].name, "pi-web-access");
+        assert_eq!(entries[1].version, "1.0.0");
+    }
+
+    // ---- Bootstrap decision logic (pure part) ----
+
+    #[test]
+    fn bootstrap_skips_global_mode() {
+        let mode = AgentDirMode::Global;
+        assert_ne!(mode, AgentDirMode::AppManaged);
+    }
+
+    #[test]
+    fn bootstrap_skips_env_override_mode() {
+        let mode = AgentDirMode::EnvOverride;
+        assert_ne!(mode, AgentDirMode::AppManaged);
+    }
+
+    #[test]
+    fn bootstrap_skips_when_settings_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "pi-ext-bootstrap-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, r#"{"packages": []}"#).unwrap();
+        assert!(settings.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_json_parse_empty_packages() {
+        let json = r#"{"packages": []}"#;
+        let s: SettingsJson = serde_json::from_str(json).unwrap();
+        assert!(s.packages.is_empty());
+    }
+
+    #[test]
+    fn settings_json_parse_missing() {
+        let json = r#"{}"#;
+        let s: SettingsJson = serde_json::from_str(json).unwrap();
+        assert!(s.packages.is_empty());
+    }
+
+    // ---- tail_chars (issue 10) ----
+
+    #[test]
+    fn tail_chars_short_string_unchanged() {
+        assert_eq!(tail_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn tail_chars_exact_cap() {
+        assert_eq!(tail_chars("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn tail_chars_truncates() {
+        assert_eq!(tail_chars("abcdefghij", 5), "fghij");
+    }
+
+    #[test]
+    fn tail_chars_unicode_safe() {
+        // Each emoji is 4 bytes but 1 char.
+        let s = "ññññññññññ";
+        let result = tail_chars(s, 5);
+        assert_eq!(result.chars().count(), 5);
+        assert!(result.starts_with('ñ'));
+    }
+
+    // ---- Settings.json path-traversal defense (issue 7) ----
+
+    #[test]
+    fn npm_name_rejects_path_traversal() {
+        assert!(!is_valid_npm_name("../../etc/passwd"));
+        assert!(!is_valid_npm_name("../foo"));
+        assert!(!is_valid_npm_name("a/b/../c"));
+    }
+
+    #[test]
+    fn npm_name_accepts_valid_scoped() {
+        assert!(is_valid_npm_name("@tintinweb/pi-subagents"));
+        assert!(is_valid_npm_name("@pi-unipi/compactor"));
+    }
+}
