@@ -182,6 +182,120 @@ fn resolve_bundled_pi_cli() -> Result<PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Web-search config (web-search.json)
+// ---------------------------------------------------------------------------
+
+/// pi-web-access reads `<PI_CODING_AGENT_DIR>/web-search.json` for its
+/// default-provider setting. The `provider` field there sets which search
+/// engine is used when the user does not specify one in the prompt.
+///
+/// Since we ALWAYS set `PI_CODING_AGENT_DIR` at spawn time (pi_sidecar.rs),
+/// the file the extension reads is `<resolved agent dir>/web-search.json`.
+///
+/// Allowlist mirrors the pi-web-access extension's own accepted values.
+/// Unified allowlist for the `provider` field in `web-search.json`.
+/// Covers both read (pass-through) and write (set) paths.
+const WEBSEARCH_CONFIG_ALLOWLIST: &[&str] = &[
+    "auto", "exa", "brave", "tavily", "perplexity", "gemini",
+    "openai", "parallel",
+];
+
+/// Reject unknown provider ids. Pure — safe in tests.
+fn validate_websearch_config_provider(provider: &str) -> Result<(), String> {
+    if WEBSEARCH_CONFIG_ALLOWLIST.contains(&provider) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unknown websearch config provider: {provider:?}. \
+             Allowed: {}.",
+            WEBSEARCH_CONFIG_ALLOWLIST.join(", ")
+        ))
+    }
+}
+
+/// Resolve the path to `web-search.json` inside the resolved agent dir.
+fn websearch_config_path_for_dir(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("web-search.json")
+}
+
+/// Read the `provider` field from `web-search.json` at the given path.
+/// - Missing file → returns `"auto"` (the extension's real default).
+/// - Missing field → returns `"auto"`.
+/// - Non-object JSON → hard error (never destroy unknown content).
+/// - Invalid JSON → hard error.
+fn websearch_get_config_inner(path: &Path) -> Result<WebsearchConfig, String> {
+    if !path.exists() {
+        return Ok(WebsearchConfig {
+            provider: "auto".into(),
+        });
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read web-search.json: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("web-search.json is not valid JSON: {e}"))?;
+    if !parsed.is_object() {
+        return Err("web-search.json is not valid JSON: expected an object, got non-object".into());
+    }
+    let provider = parsed
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .trim()
+        .to_string();
+    Ok(WebsearchConfig { provider })
+}
+
+/// Merge-write the `provider` field into `web-search.json` at the given path.
+/// Existing fields are preserved. File created when absent.
+/// - Corrupt / non-object JSON → hard error (never silently wipe).
+/// - Unknown provider on a SET → hard error.
+fn websearch_set_config_inner(path: &Path, provider: &str) -> Result<WebsearchConfig, String> {
+    validate_websearch_config_provider(provider)?;
+    let mut root: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read web-search.json: {e}"))?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("web-search.json is not valid JSON: {e}"))?;
+        if !parsed.is_object() {
+            return Err("web-search.json is not valid JSON: expected an object, got non-object".into());
+        }
+        parsed
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    root["provider"] = serde_json::Value::String(provider.into());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create agent dir: {e}"))?;
+    }
+    let pretty = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("Cannot serialize web-search.json: {e}"))?;
+    std::fs::write(path, pretty)
+        .map_err(|e| format!("Cannot write web-search.json: {e}"))?;
+    websearch_get_config_inner(path)
+}
+
+/// Thin AppHandle wrapper for the read path.
+pub fn websearch_get_config(app: &AppHandle) -> Result<WebsearchConfig, String> {
+    let resolved = resolve_pi_agent_dir(app)?;
+    let path = websearch_config_path_for_dir(&resolved.path);
+    websearch_get_config_inner(&path)
+}
+
+/// Thin AppHandle wrapper for the write path.
+pub fn websearch_set_config(app: &AppHandle, provider: &str) -> Result<WebsearchConfig, String> {
+    let resolved = resolve_pi_agent_dir(app)?;
+    let path = websearch_config_path_for_dir(&resolved.path);
+    websearch_set_config_inner(&path, provider)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebsearchConfig {
+    pub provider: String,
+}
+
+// ---------------------------------------------------------------------------
 // Source validation (SECURITY — defense in depth)
 // ---------------------------------------------------------------------------
 
@@ -1162,5 +1276,148 @@ mod tests {
     fn npm_name_accepts_valid_scoped() {
         assert!(is_valid_npm_name("@tintinweb/pi-subagents"));
         assert!(is_valid_npm_name("@pi-unipi/compactor"));
+    }
+
+    // ---- Websearch config (fix 4: real inner-fn tests) -----------------------
+
+    use super::websearch_get_config_inner;
+    use super::websearch_set_config_inner;
+    use super::validate_websearch_config_provider;
+
+    /// RAII temp dir for websearch config tests.
+    fn websearch_test_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pi-websearch-{suffix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn websearch_config_provider_accepts_all_8() {
+        for id in ["auto", "exa", "brave", "tavily", "perplexity", "gemini", "openai", "parallel"] {
+            assert!(validate_websearch_config_provider(id).is_ok(), "must accept {id}");
+        }
+    }
+
+    #[test]
+    fn websearch_config_provider_rejects_unknown() {
+        assert!(validate_websearch_config_provider("bing").is_err());
+        assert!(validate_websearch_config_provider("gemini_search").is_err());
+        assert!(validate_websearch_config_provider("").is_err());
+        assert!(validate_websearch_config_provider("EXA").is_err());
+    }
+
+    #[test]
+    fn websearch_get_config_missing_file_returns_auto() {
+        let dir = websearch_test_dir("get-missing");
+        let path = dir.join("web-search.json");
+        let cfg = websearch_get_config_inner(&path).unwrap();
+        assert_eq!(cfg.provider, "auto");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_get_config_missing_field_returns_auto() {
+        let dir = websearch_test_dir("get-nofield");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, r#"{"other": 42}"#).unwrap();
+        let cfg = websearch_get_config_inner(&path).unwrap();
+        assert_eq!(cfg.provider, "auto");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_get_config_passes_through_openai_parallel() {
+        let dir = websearch_test_dir("get-pass");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, r#"{"provider": "openai"}"#).unwrap();
+        let cfg = websearch_get_config_inner(&path).unwrap();
+        assert_eq!(cfg.provider, "openai");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_get_config_corrupt_file_is_hard_error() {
+        let dir = websearch_test_dir("get-corrupt");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, "not json at all").unwrap();
+        let err = websearch_get_config_inner(&path).unwrap_err();
+        assert!(err.contains("not valid JSON"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_get_config_non_object_is_hard_error() {
+        let dir = websearch_test_dir("get-nonobj");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, r#"[1, 2, 3]"#).unwrap();
+        let err = websearch_get_config_inner(&path).unwrap_err();
+        assert!(err.contains("expected an object"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_set_config_preserves_existing_fields() {
+        let dir = websearch_test_dir("set-preserve");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, r#"{"provider": "exa", "extra": "kept"}"#).unwrap();
+        let cfg = websearch_set_config_inner(&path, "brave").unwrap();
+        assert_eq!(cfg.provider, "brave");
+        let read_back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read_back["provider"], "brave");
+        assert_eq!(read_back["extra"], "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_set_config_creates_file_when_missing() {
+        let dir = websearch_test_dir("set-missing");
+        let path = dir.join("web-search.json");
+        assert!(!path.exists());
+        let cfg = websearch_set_config_inner(&path, "tavily").unwrap();
+        assert_eq!(cfg.provider, "tavily");
+        let read_back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read_back["provider"], "tavily");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_set_config_corrupt_file_is_hard_error() {
+        let dir = websearch_test_dir("set-corrupt");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, "not json").unwrap();
+        let err = websearch_set_config_inner(&path, "brave").unwrap_err();
+        assert!(err.contains("not valid JSON"));
+        // Original corrupt file must be preserved (not wiped).
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_set_config_non_object_file_is_hard_error() {
+        let dir = websearch_test_dir("set-nonobj");
+        let path = dir.join("web-search.json");
+        std::fs::write(&path, r#"[1, 2, 3]"#).unwrap();
+        let err = websearch_set_config_inner(&path, "brave").unwrap_err();
+        assert!(err.contains("expected an object"));
+        // Original file must be preserved (not wiped).
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"[1, 2, 3]"#);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websearch_set_config_accepts_openai_parallel() {
+        let dir = websearch_test_dir("set-accept");
+        let path = dir.join("web-search.json");
+        let cfg = websearch_set_config_inner(&path, "openai").unwrap();
+        assert_eq!(cfg.provider, "openai");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

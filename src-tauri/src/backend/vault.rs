@@ -546,6 +546,138 @@ pub fn cloud_llm_key_status() -> Result<AuxCredentialStatus, String> {
     }
 }
 
+// --- Parameterized web-search API keys (5 providers) -----------------------------
+//
+// Stored under `provider:<websearch_id>` (the same `provider:*` convention as
+// `provider:exa`). The parameterized set mirrors the per-provider blocks above
+// (save → validate → set_password → status) but with a SINGLE allowlist + entry
+// function. The EXISTING `provider:exa` entry is reused for Exa — no duplicate.
+
+/// Strict allowlist of websearch provider ids the extension accepts for vault
+/// keys. `gemini_search` maps to the env var `GEMINI_API_KEY` (the "gemini"
+/// id is the DEFAULT PROVIDER value for the config file — a separate concern).
+const WEBSEARCH_PROVIDER_ALLOWLIST: &[&str] = &[
+    "exa",
+    "brave",
+    "tavily",
+    "perplexity",
+    "gemini_search",
+    "openai_search",
+    "parallel",
+];
+
+/// Label shown in the vault UI for a given websearch provider.
+fn websearch_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "exa" => "Exa",
+        "brave" => "Brave",
+        "tavily" => "Tavily",
+        "perplexity" => "Perplexity",
+        "gemini_search" => "Gemini",
+        "openai_search" => "OpenAI",
+        "parallel" => "Parallel",
+        _ => "Unknown",
+    }
+}
+
+/// Vault keyring account for the given websearch provider.
+/// `"provider:exa"` is kept identical to the legacy `exa_key_entry()` so
+/// existing keys are NOT orphaned by the refactor.
+fn websearch_key_entry_name(provider: &str) -> String {
+    format!("provider:{provider}")
+}
+
+fn websearch_keyring_entry(provider: &str) -> Result<Entry, String> {
+    Entry::new(SERVICE, &websearch_key_entry_name(provider))
+        .map_err(|_| vault_error("open"))
+}
+
+/// Reject unknown provider ids before any keyring I/O. Pure — safe in tests.
+fn validate_websearch_provider(provider: &str) -> Result<(), String> {
+    if WEBSEARCH_PROVIDER_ALLOWLIST.contains(&provider) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unknown websearch provider: {provider:?}. \
+             Allowed: {}.",
+            WEBSEARCH_PROVIDER_ALLOWLIST.join(", ")
+        ))
+    }
+}
+
+/// Backend-INTERNAL reader: returns the raw key (or `None`). Used by the
+/// sidecar spawn to set the matching env var. NOT exposed to the frontend.
+pub fn read_websearch_key(provider: &str) -> Result<Option<String>, String> {
+    validate_websearch_provider(provider)?;
+    match websearch_keyring_entry(provider)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(_) => Err(vault_error("read")),
+    }
+}
+
+/// Present/absent status ONLY — never the value.
+pub fn websearch_key_status(provider: &str) -> Result<AuxCredentialStatus, String> {
+    validate_websearch_provider(provider)?;
+    let label = websearch_provider_label(provider);
+    let id = format!("{provider}_api_key");
+    match websearch_keyring_entry(provider)?.get_password() {
+        Ok(_) => Ok(AuxCredentialStatus {
+            id,
+            label: format!("{label} web-search API key"),
+            configured: true,
+            status: "configured".into(),
+            last_checked_at: Some(now()),
+            message: None,
+        }),
+        Err(KeyringError::NoEntry) => Ok(AuxCredentialStatus {
+            id,
+            label: format!("{label} web-search API key"),
+            configured: false,
+            status: "missing".into(),
+            last_checked_at: Some(now()),
+            message: Some(format!("{label} API key is not configured.")),
+        }),
+        Err(e) => Ok(AuxCredentialStatus {
+            id,
+            label: format!("{label} web-search API key"),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(format!("{label} API key vault error: {e}")),
+        }),
+    }
+}
+
+pub fn save_websearch_key(provider: &str, key: &str) -> Result<AuxCredentialStatus, String> {
+    validate_websearch_provider(provider)?;
+    let cleaned = key.trim();
+    let label = websearch_provider_label(provider);
+    if cleaned.len() < 8 || cleaned.contains(char::is_whitespace) {
+        return Ok(AuxCredentialStatus {
+            id: format!("{provider}_api_key"),
+            label: format!("{label} web-search API key"),
+            configured: false,
+            status: "error".into(),
+            last_checked_at: Some(now()),
+            message: Some(format!("{label} API key is too short or contains whitespace.")),
+        });
+    }
+    websearch_keyring_entry(provider)?
+        .set_password(cleaned)
+        .map_err(|_| vault_error("save"))?;
+    websearch_key_status(provider)
+}
+
+pub fn delete_websearch_key(provider: &str) -> Result<AuxCredentialStatus, String> {
+    validate_websearch_provider(provider)?;
+    match websearch_keyring_entry(provider)?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err(vault_error("delete")),
+    }
+    websearch_key_status(provider)
+}
+
 pub fn save_device_private_key_hex(private_key_hex: &str) -> Result<(), String> {
     let cleaned = private_key_hex.trim();
     if cleaned.len() != 64 || !cleaned.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -2183,5 +2315,73 @@ mod tests {
         assert_eq!(after_clear.status, "missing");
         assert!(!cloud_llm_key_status().unwrap().configured);
         assert_eq!(read_cloud_llm_key().unwrap(), None);
+    }
+
+    // ---- Websearch parameterized key tests ------------------------------------
+
+    #[test]
+    fn websearch_key_status_rejects_unknown_provider() {
+        let result = websearch_key_status("not_a_real_provider");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("not_a_real_provider"));
+        assert!(msg.contains("Allowed"));
+    }
+
+    #[test]
+    fn websearch_save_key_rejects_unknown_provider() {
+        let result = save_websearch_key("not_a_real_provider", "some-long-key-12345678");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn websearch_delete_key_rejects_unknown_provider() {
+        let result = delete_websearch_key("not_a_real_provider");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn websearch_save_rejects_too_short_or_whitespace_without_leaking() {
+        let short = save_websearch_key("brave", "abc").expect("save returns a status");
+        assert!(!short.configured);
+        assert_eq!(short.status, "error");
+        assert!(short.message.as_ref().unwrap().contains("Brave"));
+        let whitespace = save_websearch_key("brave", "has space inside").expect("status");
+        assert!(!whitespace.configured);
+        assert_eq!(whitespace.status, "error");
+        for s in [&short, &whitespace] {
+            let json = serde_json::to_string(s).unwrap();
+            assert!(!json.contains("has space inside"));
+        }
+    }
+
+    #[test]
+    fn websearch_key_status_returns_present_absent_only() {
+        // Exa reuses the legacy `provider:exa` entry. Present/absent status
+        // must never carry a value field.
+        let status = websearch_key_status("exa").expect("status");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("configured"));
+        assert!(!json.contains("\"value\""));
+        assert!(!json.contains("\"key\""));
+    }
+
+    #[test]
+    fn websearch_key_status_all_7_providers_accepted() {
+        for provider in ["exa", "brave", "tavily", "perplexity", "gemini_search", "openai_search", "parallel"] {
+            let status = websearch_key_status(provider).expect("status");
+            assert!(status.id.contains(provider));
+        }
+    }
+
+    #[test]
+    fn websearch_config_provider_allowlist_covers_all_vault_ids() {
+        assert!(validate_websearch_provider("exa").is_ok());
+        assert!(validate_websearch_provider("brave").is_ok());
+        assert!(validate_websearch_provider("tavily").is_ok());
+        assert!(validate_websearch_provider("perplexity").is_ok());
+        assert!(validate_websearch_provider("gemini_search").is_ok());
+        assert!(validate_websearch_provider("openai_search").is_ok());
+        assert!(validate_websearch_provider("parallel").is_ok());
     }
 }

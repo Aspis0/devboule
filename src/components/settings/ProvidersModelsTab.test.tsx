@@ -59,9 +59,9 @@ vi.mock("./DesignLlmBackendCard", () => ({
   DesignLlmBackendCard: () =>
     createElement("div", { "data-testid": "design-llm-card" }),
 }));
-vi.mock("./ExaSearchKeyCard", () => ({
-  ExaSearchKeyCard: () =>
-    createElement("div", { "data-testid": "exa-search-key-card" }),
+vi.mock("./WebSearchCard", () => ({
+  WebSearchCard: () =>
+    createElement("div", { "data-testid": "web-search-card" }),
 }));
 
 import { ProvidersModelsTab } from "./ProvidersModelsTab";
@@ -190,7 +190,7 @@ describe("ProvidersModelsTab", () => {
       container.querySelector('[data-testid="mini-write-behavior-card"]'),
     ).not.toBeNull();
     expect(
-      container.querySelector('[data-testid="exa-search-key-card"]'),
+      container.querySelector('[data-testid="web-search-card"]'),
     ).not.toBeNull();
 
     // The "Oracle" group is collapsed by default — expand it, then assert.

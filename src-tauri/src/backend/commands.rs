@@ -51,7 +51,7 @@ use super::vault;
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 fn now() -> String {
     Utc::now().to_rfc3339()
@@ -1653,6 +1653,61 @@ pub fn save_cloud_llm_key(
 pub fn delete_cloud_llm_key(state: State<'_, BackendState>) -> Result<AuxCredentialStatus, String> {
     state.ensure_unlocked()?;
     vault::delete_cloud_llm_key()
+}
+
+// --- Web-search key commands (parameterized, 5 providers) ---------------------
+//
+// Three-parameterized set replaces the per-provider triples. The vault layer
+// enforces the allowlist and reuses `provider:<id>` entries — Exa reuses the
+// EXISTING `provider:exa` so no key is orphaned by this refactor.
+
+#[tauri::command]
+pub fn websearch_key_status(
+    state: State<'_, BackendState>,
+    provider: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::websearch_key_status(&provider)
+}
+
+#[tauri::command]
+pub fn websearch_save_key(
+    state: State<'_, BackendState>,
+    provider: String,
+    key: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::save_websearch_key(&provider, &key)
+}
+
+#[tauri::command]
+pub fn websearch_delete_key(
+    state: State<'_, BackendState>,
+    provider: String,
+) -> Result<AuxCredentialStatus, String> {
+    state.ensure_unlocked()?;
+    vault::delete_websearch_key(&provider)
+}
+
+// Web-search default-provider config (web-search.json) ----------------------
+
+#[tauri::command]
+pub fn websearch_get_config(
+    state: State<'_, BackendState>,
+    app: AppHandle,
+) -> Result<crate::backend::pi_extensions::WebsearchConfig, String> {
+    state.ensure_unlocked()?;
+    crate::backend::pi_extensions::websearch_get_config(&app)
+}
+
+#[tauri::command]
+pub fn websearch_set_config(
+    state: State<'_, BackendState>,
+    app: AppHandle,
+    provider: String,
+) -> Result<crate::backend::pi_extensions::WebsearchConfig, String> {
+    state.ensure_unlocked()?;
+    crate::backend::pi_extensions::websearch_set_config(&app, &provider)
 }
 
 #[tauri::command]

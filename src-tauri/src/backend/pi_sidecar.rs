@@ -408,6 +408,44 @@ pub(crate) struct SidecarEnvVars {
     base_url: Option<String>,
 }
 
+/// Web-search provider → env var name mapping. The 7 vault keys that the
+/// web-search settings card manages. A present key → set the env var on the
+/// sidecar; absent key → env NOT set (extension falls back to zero-config).
+///
+/// OPENAI_API_KEY note: local oMLX/Ollama roles already set this env var to a
+/// placeholder ("ollama" / "mlx") in `resolve_coder_env_for_sidecar` for the
+/// local LLM API. The pi-web-access extension reads OPENAI_API_KEY for its
+/// OpenAI search provider. We inject AFTER the coder env vars, so the user's
+/// real key wins when saved — the local oMLX/Ollama servers ignore the bearer
+/// value entirely (they use their own auth), so overriding is safe.
+const WEBSEARCH_ENV_MAP: &[(&str, &str)] = &[
+    ("exa", "EXA_API_KEY"),
+    ("brave", "BRAVE_API_KEY"),
+    ("tavily", "TAVILY_API_KEY"),
+    ("perplexity", "PERPLEXITY_API_KEY"),
+    ("gemini_search", "GEMINI_API_KEY"),
+    ("openai_search", "OPENAI_API_KEY"),
+    ("parallel", "PARALLEL_API_KEY"),
+];
+
+/// Resolve web-search vault keys to env-var pairs for sidecar injection.
+/// Each present key becomes `("ENV_VAR", key_value)`. Missing keys are
+/// skipped — the extension falls back to zero-config defaults.
+///
+/// Pure (no AppHandle) for unit-testability: the vault read is done by the
+/// caller, but this function maps provider→env_var and filters present keys.
+pub(crate) fn websearch_env_pairs(
+    vault_reader: impl Fn(&str) -> Result<Option<String>, String>,
+) -> Vec<(&'static str, String)> {
+    WEBSEARCH_ENV_MAP
+        .iter()
+        .filter_map(|&(provider, env_var)| match vault_reader(provider) {
+            Ok(Some(key)) => Some((env_var, key)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Read the coder role's provider+model+key+baseUrl from the vault/config and
 /// resolve them into env vars for the sidecar. Decision #9: the Devboule vault
 /// is the single source of truth; Rust reads it and passes to the sidecar.
@@ -665,6 +703,18 @@ fn spawn_pi_session_inner(
     // settings.json and npm/ dir. On resolution failure, pi falls back to ~/.pi/agent.
     if let Ok(dir) = crate::backend::pi_extensions::resolve_pi_agent_dir(app) {
         cmd.env("PI_CODING_AGENT_DIR", &dir.path);
+    }
+
+    // Web-search provider API keys: each present vault key is injected as its
+    // matching env var so the pi-web-access extension can authenticate. Missing
+    // keys are skipped (extension falls back to zero-config).
+    // IMPORTANT: this runs AFTER the coder env vars (which may set OPENAI_API_KEY
+    // to a placeholder like "ollama"/"mlx" for local LLM backends). When the
+    // user has saved a real OpenAI search key, this injection overwrites the
+    // placeholder. Local oMLX/Ollama servers ignore the bearer value entirely
+    // (they use their own auth), so overriding is safe.
+    for (env_var, key_value) in websearch_env_pairs(super::vault::read_websearch_key) {
+        cmd.env(env_var, key_value);
     }
 
     let mut child = cmd
@@ -4172,6 +4222,58 @@ mod tests {
     fn pi_route_codex_and_openai_clients_are_none() {
         assert_eq!(pi_route_for_launch(true, "orchestrator", "codex", true), None);
         assert_eq!(pi_route_for_launch(true, "coder", "openai", true), None);
+    }
+
+    // -- websearch_env_pairs (pure helper) ------------------------------------
+
+    #[test]
+    fn websearch_env_pairs_skips_missing_keys() {
+        let pairs = websearch_env_pairs(|_provider| Ok(None));
+        assert!(pairs.is_empty(), "missing keys should produce no env pairs");
+    }
+
+    #[test]
+    fn websearch_env_pairs_returns_present_keys() {
+        let pairs = websearch_env_pairs(|provider| match provider {
+            "exa" => Ok(Some("test-exa-key-12345678".into())),
+            _ => Ok(None),
+        });
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "EXA_API_KEY");
+        assert_eq!(pairs[0].1, "test-exa-key-12345678");
+    }
+
+    #[test]
+    fn websearch_env_pairs_multiple_keys() {
+        let pairs = websearch_env_pairs(|provider| match provider {
+            "exa" => Ok(Some("exa-key-12345678".into())),
+            "brave" => Ok(Some("brave-key-12345678".into())),
+            _ => Ok(None),
+        });
+        assert_eq!(pairs.len(), 2);
+        let env_names: Vec<&str> = pairs.iter().map(|(name, _)| *name).collect();
+        assert!(env_names.contains(&"EXA_API_KEY"));
+        assert!(env_names.contains(&"BRAVE_API_KEY"));
+    }
+
+    #[test]
+    fn websearch_env_pairs_skips_on_vault_error() {
+        let pairs = websearch_env_pairs(|_provider| Err("keyring error".into()));
+        assert!(pairs.is_empty(), "vault errors must be silently skipped");
+    }
+
+    #[test]
+    fn websearch_env_pairs_all_7_providers_have_env_var() {
+        for provider in ["exa", "brave", "tavily", "perplexity", "gemini_search", "openai_search", "parallel"] {
+            let pairs = websearch_env_pairs(|p| {
+                if p == provider {
+                    Ok(Some("test-key-12345678".into()))
+                } else {
+                    Ok(None)
+                }
+            });
+            assert_eq!(pairs.len(), 1, "provider {provider} must produce exactly one env pair");
+        }
     }
 }
 

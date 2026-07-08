@@ -21,7 +21,7 @@ import { RolesTableCard } from "./RolesTableCard";
 import { RecommendedConfigCard } from "./RecommendedConfigCard";
 import { ModelRegistryCard } from "./ModelRegistryCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
-import { ExaSearchKeyCard } from "./ExaSearchKeyCard";
+import { WebSearchCard } from "./WebSearchCard";
 import { OracleAnswerSettingsCard } from "./OracleAnswerSettingsCard";
 import { DesignLlmBackendCard } from "./DesignLlmBackendCard";
 import { CensorLocalAiCard } from "../views/WorkspaceView";
@@ -317,13 +317,6 @@ export function ProvidersModelsTab() {
         >
           <MiniWriteBehaviorCard />
         </RoleSection>
-
-        <RoleSection
-          title="Local coder web search"
-          description="The Exa key the local Devboule coder uses for web search + fetch. Optional and opt-in — no key keeps web tools off (Oracle-only, on-device)."
-        >
-          <ExaSearchKeyCard />
-        </RoleSection>
       </CollapsibleGroup>
 
       <CollapsibleGroup title="Models">
@@ -333,6 +326,10 @@ export function ProvidersModelsTab() {
         >
           <ModelRegistryCard />
         </RoleSection>
+      </CollapsibleGroup>
+
+      <CollapsibleGroup title="Web search" defaultOpen={false}>
+        <WebSearchCard />
       </CollapsibleGroup>
 
       {/* Role untangle (P6b): Censor and the Design LLM are NOT agent roles — Censor is a
