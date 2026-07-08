@@ -8,6 +8,8 @@ interface Props {
   defaultOpen?: boolean;
   /** When true, force the section open regardless of the toggle (e.g. an active search). */
   forceOpen?: boolean;
+  /** Fires when the section transitions from collapsed → expanded. */
+  onExpand?: () => void;
   children: ReactNode;
 }
 
@@ -22,6 +24,7 @@ export function CollapsibleSection({
   badge,
   defaultOpen = false,
   forceOpen = false,
+  onExpand,
   children,
 }: Props) {
   const [open, setOpen] = useState(defaultOpen);
@@ -31,7 +34,13 @@ export function CollapsibleSection({
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          setOpen((o) => {
+            const next = !o;
+            if (next) onExpand?.();
+            return next;
+          });
+        }}
         className="flex w-full items-center gap-2 rounded-2xl px-2 py-2 text-left transition-colors hover:bg-cream-50"
       >
         <ChevronRight

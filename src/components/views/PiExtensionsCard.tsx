@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Puzzle, AlertTriangle, Search, Trash2, Download } from "lucide-react";
 import { invokeBackendCommand } from "../../context/AppContext";
+import { CollapsibleSection } from "./CollapsibleSection";
 
 interface ExtensionStatus {
   agentDir: string;
@@ -58,6 +59,9 @@ export function PiExtensionsCard() {
   const [searchBusy, setSearchBusy] = useState(false);
   const [marketplaceError, setMarketplaceError] = useState<string | null>(null);
   const [installingMarketplaceSource, setInstallingMarketplaceSource] = useState<string | null>(null);
+  // Deferred search: track whether the marketplace section has been expanded at
+  // least once so the auto-search only fires on first expand, not on mount.
+  const marketplaceSearchedRef = useRef(false);
 
   // ── Fix 1: mount/unmount lifecycle ─────────────────────────────────────
 
@@ -166,12 +170,13 @@ export function PiExtensionsCard() {
     }
   }, [searchText]);
 
-  // Auto-run default search on mount
-  useEffect(() => {
-    void handleSearch();
-    // Only on mount — intentionally not re-triggered on searchText changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Deferred marketplace search: fire only on first expand, not on mount.
+  const handleMarketplaceExpand = useCallback(() => {
+    if (!marketplaceSearchedRef.current) {
+      marketplaceSearchedRef.current = true;
+      void handleSearch();
+    }
+  }, [handleSearch]);
 
   // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -184,262 +189,270 @@ export function PiExtensionsCard() {
   const isBootstrapFailed = status?.bootstrap === "failed";
 
   return (
-    <section className="rounded-2xl border border-cream-200 bg-white p-5">
-      {/* ── Header + status line ── */}
-      <div className="mb-3 flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-teal/10">
-          <Puzzle className="h-4 w-4 text-teal" />
+    <CollapsibleSection
+      title="pi Extensions"
+      badge={installed.length || undefined}
+      defaultOpen={false}
+    >
+      <div className="rounded-2xl border border-cream-200 bg-white p-5">
+        {/* ── Header + status line ── */}
+        <div className="mb-3 flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-teal/10">
+            <Puzzle className="h-4 w-4 text-teal" />
+          </div>
+          <div>
+            <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+              pi Extensions
+            </h3>
+          </div>
         </div>
-        <div>
-          <h3 className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
-            pi Extensions
-          </h3>
-        </div>
-      </div>
 
-      {loading && !status ? (
-        <p className="text-[11px] text-cream-400">Loading extension info…</p>
-      ) : status ? (
-        <>
-          <p className="text-[11px] text-cream-400">
-            Agent dir:{" "}
-            <span className="font-mono text-cream-600">{status.agentDir}</span>{" "}
-            ({MODE_LABEL[status.mode]})
-          </p>
-
-          {isBootstrapRunning && (
-            <p className="mt-2 flex items-center gap-1.5 text-[11px] text-teal">
-              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-teal border-t-transparent" />
-              Installing the starter extension set…
+        {loading && !status ? (
+          <p className="text-[11px] text-cream-400">Loading extension info…</p>
+        ) : status ? (
+          <>
+            <p className="text-[11px] text-cream-400">
+              Agent dir:{" "}
+              <span className="font-mono text-cream-600">{status.agentDir}</span>{" "}
+              ({MODE_LABEL[status.mode]})
             </p>
-          )}
 
-          {/* Fix 6: show generic message when bootstrap failed but error is null */}
-          {isBootstrapFailed && (
-            <p className="mt-2 flex items-start gap-2 rounded-xl border border-coral/30 bg-coral/5 px-3 py-2 text-[11px] leading-4 text-coral-dark">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>
-                {status.bootstrapError ??
-                  "Extension bootstrap failed."}{" "}
-                Retry happens on next app launch.
-              </span>
-            </p>
-          )}
-
-          {/* ── Installed list ── */}
-          <div className="mt-4">
-            <h4 className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">
-              Installed
-            </h4>
-            {installed.length === 0 ? (
-              <p className="mt-2 text-[12px] text-cream-400">
-                No extensions installed yet.
+            {isBootstrapRunning && (
+              <p className="mt-2 flex items-center gap-1.5 text-[11px] text-teal">
+                <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-teal border-t-transparent" />
+                Installing the starter extension set…
               </p>
-            ) : (
-              <ul className="mt-2 space-y-2">
-                {installed.map((ext) => (
-                  <li
-                    key={ext.source}
-                    className="flex flex-col gap-1 rounded-xl bg-cream-50 px-3 py-2"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[12px] font-semibold text-cream-800">
-                            {ext.name}
-                          </span>
-                          <span className="rounded-full bg-cream-200 px-1.5 py-0.5 text-[10px] text-cream-600">
-                            {ext.version}
-                          </span>
-                          {!ext.installedOk && (
-                            <span className="rounded-full bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-dark">
-                              broken install
+            )}
+
+            {/* Fix 6: show generic message when bootstrap failed but error is null */}
+            {isBootstrapFailed && (
+              <p className="mt-2 flex items-start gap-2 rounded-xl border border-coral/30 bg-coral/5 px-3 py-2 text-[11px] leading-4 text-coral-dark">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  {status.bootstrapError ??
+                    "Extension bootstrap failed."}{" "}
+                  Retry happens on next app launch.
+                </span>
+              </p>
+            )}
+
+            {/* ── Installed list (collapsible sub-section, open by default) ── */}
+            <CollapsibleSection
+              title="Installed"
+              badge={installed.length || undefined}
+              defaultOpen={true}
+            >
+              {installed.length === 0 ? (
+                <p className="text-[12px] text-cream-400">
+                  No extensions installed yet.
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {installed.map((ext) => (
+                    <li
+                      key={ext.source}
+                      className="flex flex-col gap-1 rounded-xl bg-cream-50 px-3 py-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[12px] font-semibold text-cream-800">
+                              {ext.name}
                             </span>
+                            <span className="rounded-full bg-cream-200 px-1.5 py-0.5 text-[10px] text-cream-600">
+                              {ext.version}
+                            </span>
+                            {!ext.installedOk && (
+                              <span className="rounded-full bg-amber/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-dark">
+                                broken install
+                              </span>
+                            )}
+                          </div>
+                          {ext.description && (
+                            <p className="mt-0.5 line-clamp-2 text-[11px] text-cream-500">
+                              {ext.description}
+                            </p>
+                          )}
+                          {ext.author && (
+                            <p className="mt-0.5 text-[10px] text-cream-400">
+                              {ext.author}
+                            </p>
                           )}
                         </div>
-                        {ext.description && (
-                          <p className="mt-0.5 line-clamp-2 text-[11px] text-cream-500">
-                            {ext.description}
-                          </p>
-                        )}
-                        {ext.author && (
-                          <p className="mt-0.5 text-[10px] text-cream-400">
-                            {ext.author}
-                          </p>
-                        )}
+                        {/* Fix 7: per-row visual — only the active row shows spinner+disabled */}
+                        <button
+                          onClick={() => void handleRemove(ext.source)}
+                          disabled={removingSource === ext.source}
+                          data-testid={`remove-${ext.source}`}
+                          className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-cream-600 transition-colors hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {removingSource === ext.source ? (
+                            <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-400 border-t-transparent" />
+                          ) : (
+                            <Trash2 className="h-3 w-3" />
+                          )}
+                          Remove
+                        </button>
                       </div>
-                      {/* Fix 7: per-row visual — only the active row shows spinner+disabled */}
-                      <button
-                        onClick={() => void handleRemove(ext.source)}
-                        disabled={removingSource === ext.source}
-                        data-testid={`remove-${ext.source}`}
-                        className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-cream-600 transition-colors hover:border-coral/30 hover:text-coral-dark disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {removingSource === ext.source ? (
-                          <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-400 border-t-transparent" />
-                        ) : (
-                          <Trash2 className="h-3 w-3" />
-                        )}
-                        Remove
-                      </button>
-                    </div>
-                    {removeErrors[ext.source] && (
-                      <p className="text-[11px] text-coral-dark">
-                        {removeErrors[ext.source]}
+                      {removeErrors[ext.source] && (
+                        <p className="text-[11px] text-coral-dark">
+                          {removeErrors[ext.source]}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </CollapsibleSection>
+
+            {/* ── Install by source ── */}
+            <div className="mt-4">
+              <h4 className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">
+                Install by source
+              </h4>
+              <div className="mt-2 flex gap-2">
+                <input
+                  placeholder="npm:pi-lens · git:github.com/o/r"
+                  value={installSource}
+                  onChange={(e) => setInstallSource(e.target.value)}
+                  /* Fix 5: Enter-key checks busy flag */
+                  onKeyDown={(e) => {
+                    if (
+                      e.key === "Enter" &&
+                      installSource.trim() &&
+                      !installBusy
+                    ) {
+                      void doInstall(installSource.trim(), true);
+                    }
+                  }}
+                  className="flex-1 rounded-xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 placeholder:text-cream-300 focus:border-teal/40 focus:outline-none"
+                />
+                <button
+                  onClick={() => void doInstall(installSource.trim(), true)}
+                  disabled={!installSource.trim() || installBusy}
+                  data-testid="install-source-btn"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-cream-800 px-3 py-1.5 text-[12px] font-semibold text-cream-50 transition-colors hover:bg-cream-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {installBusy ? (
+                    <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-300 border-t-transparent" />
+                  ) : (
+                    <Download className="h-3 w-3" />
+                  )}
+                  Install
+                </button>
+              </div>
+              {installError && (
+                <p className="mt-2 text-[11px] text-coral-dark">{installError}</p>
+              )}
+            </div>
+          </>
+        ) : null}
+
+        {/* ── Marketplace (collapsible sub-section, collapsed by default, deferred search) ── */}
+        <CollapsibleSection
+          title="Marketplace"
+          defaultOpen={false}
+          onExpand={handleMarketplaceExpand}
+        >
+          <div className="flex gap-2">
+            <input
+              placeholder="Search extensions…"
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              /* Fix 5: Enter-key checks busy flag */
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !searchBusy) void handleSearch();
+              }}
+              className="flex-1 rounded-xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 placeholder:text-cream-300 focus:border-teal/40 focus:outline-none"
+            />
+            <button
+              onClick={() => void handleSearch()}
+              disabled={searchBusy}
+              data-testid="marketplace-search-btn"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-700 transition-colors hover:bg-cream-100 disabled:opacity-40"
+            >
+              {searchBusy ? (
+                <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-400 border-t-transparent" />
+              ) : (
+                <Search className="h-3 w-3" />
+              )}
+              Search
+            </button>
+          </div>
+
+          {marketplaceError && (
+            <p className="mt-2 rounded-xl border border-coral/30 bg-coral/5 px-3 py-2 text-[11px] text-coral-dark">
+              {marketplaceError}
+            </p>
+          )}
+
+          {marketplaceResults.length > 0 && (
+            <ul className="mt-3 space-y-1.5">
+              {marketplaceResults.map((ext) => {
+                const npmSrc = npmSourceFor(ext.name);
+                const alreadyInstalled = isInstalledNpm(ext.name);
+                const isInstallingThis = installingMarketplaceSource === npmSrc;
+                return (
+                  <li
+                    key={ext.name}
+                    className="flex items-center justify-between gap-2 rounded-xl bg-cream-50 px-3 py-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[12px] font-semibold text-cream-800">
+                          {ext.name}
+                        </span>
+                        <span className="rounded-full bg-cream-200 px-1.5 py-0.5 text-[10px] text-cream-600">
+                          {ext.version}
+                        </span>
+                      </div>
+                      {ext.description && (
+                        <p className="mt-0.5 line-clamp-1 text-[11px] text-cream-500">
+                          {ext.description}
+                        </p>
+                      )}
+                      <p className="mt-0.5 text-[10px] text-cream-400">
+                        {ext.author}
+                        {ext.date ? ` · ${ext.date}` : ""}
                       </p>
+                    </div>
+                    {alreadyInstalled ? (
+                      <span className="shrink-0 rounded-xl bg-sage/10 px-2.5 py-1.5 text-[11px] font-semibold text-sage-dark">
+                        Installed
+                      </span>
+                    ) : (
+                      /* Fix 4: marketplace rows use shared doInstall (clearInput=false) */
+                      <button
+                        onClick={() => {
+                          setInstallingMarketplaceSource(npmSrc);
+                          void doInstall(npmSrc, false).finally(() => {
+                            if (mountedRef.current) setInstallingMarketplaceSource(null);
+                          });
+                        }}
+                        disabled={installBusy}
+                        data-testid={`install-marketplace-${ext.name}`}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-cream-800 px-2.5 py-1.5 text-[11px] font-semibold text-cream-50 transition-colors hover:bg-cream-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {isInstallingThis ? (
+                          <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-300 border-t-transparent" />
+                        ) : (
+                          <Download className="h-3 w-3" />
+                        )}
+                        Install
+                      </button>
                     )}
                   </li>
-                ))}
-              </ul>
-            )}
-          </div>
+                );
+              })}
+            </ul>
+          )}
+        </CollapsibleSection>
 
-          {/* ── Install by source ── */}
-          <div className="mt-4">
-            <h4 className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">
-              Install by source
-            </h4>
-            <div className="mt-2 flex gap-2">
-              <input
-                placeholder="npm:pi-lens · git:github.com/o/r"
-                value={installSource}
-                onChange={(e) => setInstallSource(e.target.value)}
-                /* Fix 5: Enter-key checks busy flag */
-                onKeyDown={(e) => {
-                  if (
-                    e.key === "Enter" &&
-                    installSource.trim() &&
-                    !installBusy
-                  ) {
-                    void doInstall(installSource.trim(), true);
-                  }
-                }}
-                className="flex-1 rounded-xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 placeholder:text-cream-300 focus:border-teal/40 focus:outline-none"
-              />
-              <button
-                onClick={() => void doInstall(installSource.trim(), true)}
-                disabled={!installSource.trim() || installBusy}
-                data-testid="install-source-btn"
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-cream-800 px-3 py-1.5 text-[12px] font-semibold text-cream-50 transition-colors hover:bg-cream-700 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {installBusy ? (
-                  <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-300 border-t-transparent" />
-                ) : (
-                  <Download className="h-3 w-3" />
-                )}
-                Install
-              </button>
-            </div>
-            {installError && (
-              <p className="mt-2 text-[11px] text-coral-dark">{installError}</p>
-            )}
-          </div>
-        </>
-      ) : null}
-
-      {/* ── Marketplace ── */}
-      <div className="mt-5">
-        <h4 className="text-[10px] font-semibold uppercase tracking-widest text-cream-400">
-          Browse the pi marketplace (npm)
-        </h4>
-        <div className="mt-2 flex gap-2">
-          <input
-            placeholder="Search extensions…"
-            value={searchText}
-            onChange={(e) => setSearchText(e.target.value)}
-            /* Fix 5: Enter-key checks busy flag */
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !searchBusy) void handleSearch();
-            }}
-            className="flex-1 rounded-xl border border-cream-200 bg-white px-3 py-1.5 text-[12px] text-cream-800 placeholder:text-cream-300 focus:border-teal/40 focus:outline-none"
-          />
-          <button
-            onClick={() => void handleSearch()}
-            disabled={searchBusy}
-            data-testid="marketplace-search-btn"
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-cream-200 bg-cream-50 px-3 py-1.5 text-[12px] font-semibold text-cream-700 transition-colors hover:bg-cream-100 disabled:opacity-40"
-          >
-            {searchBusy ? (
-              <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-400 border-t-transparent" />
-            ) : (
-              <Search className="h-3 w-3" />
-            )}
-            Search
-          </button>
-        </div>
-
-        {marketplaceError && (
-          <p className="mt-2 rounded-xl border border-coral/30 bg-coral/5 px-3 py-2 text-[11px] text-coral-dark">
-            {marketplaceError}
-          </p>
-        )}
-
-        {marketplaceResults.length > 0 && (
-          <ul className="mt-3 space-y-1.5">
-            {marketplaceResults.map((ext) => {
-              const npmSrc = npmSourceFor(ext.name);
-              const alreadyInstalled = isInstalledNpm(ext.name);
-              const isInstallingThis = installingMarketplaceSource === npmSrc;
-              return (
-                <li
-                  key={ext.name}
-                  className="flex items-center justify-between gap-2 rounded-xl bg-cream-50 px-3 py-2"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[12px] font-semibold text-cream-800">
-                        {ext.name}
-                      </span>
-                      <span className="rounded-full bg-cream-200 px-1.5 py-0.5 text-[10px] text-cream-600">
-                        {ext.version}
-                      </span>
-                    </div>
-                    {ext.description && (
-                      <p className="mt-0.5 line-clamp-1 text-[11px] text-cream-500">
-                        {ext.description}
-                      </p>
-                    )}
-                    <p className="mt-0.5 text-[10px] text-cream-400">
-                      {ext.author}
-                      {ext.date ? ` · ${ext.date}` : ""}
-                    </p>
-                  </div>
-                  {alreadyInstalled ? (
-                    <span className="shrink-0 rounded-xl bg-sage/10 px-2.5 py-1.5 text-[11px] font-semibold text-sage-dark">
-                      Installed
-                    </span>
-                  ) : (
-                    /* Fix 4: marketplace rows use shared doInstall (clearInput=false) */
-                    <button
-                      onClick={() => {
-                        setInstallingMarketplaceSource(npmSrc);
-                        void doInstall(npmSrc, false).finally(() => {
-                          if (mountedRef.current) setInstallingMarketplaceSource(null);
-                        });
-                      }}
-                      disabled={installBusy}
-                      data-testid={`install-marketplace-${ext.name}`}
-                      className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-cream-800 px-2.5 py-1.5 text-[11px] font-semibold text-cream-50 transition-colors hover:bg-cream-700 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {isInstallingThis ? (
-                        <span className="animate-spin h-3 w-3 rounded-full border-2 border-cream-300 border-t-transparent" />
-                      ) : (
-                        <Download className="h-3 w-3" />
-                      )}
-                      Install
-                    </button>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
+        <p className="mt-4 text-[10px] text-cream-400">
+          Marketplace search failures are non-fatal — the installed extensions list
+          above is always shown.
+        </p>
       </div>
-
-      <p className="mt-4 text-[10px] text-cream-400">
-        Marketplace search failures are non-fatal — the installed extensions list
-        above is always shown.
-      </p>
-    </section>
+    </CollapsibleSection>
   );
 }

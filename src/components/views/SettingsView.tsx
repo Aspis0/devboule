@@ -22,6 +22,7 @@ import { WorkspaceView } from "./WorkspaceView";
 import { ProvidersModelsTab } from "../settings/ProvidersModelsTab";
 import { mapLegacySettingsTab, type SettingsTabId } from "./settingsTabs";
 import { PiExtensionsCard } from "./PiExtensionsCard";
+import { CollapsibleSection } from "./CollapsibleSection";
 import type { CliAgentsStatus } from "../../types/backend";
 
 interface SettingsTabDef {
@@ -100,41 +101,49 @@ export function SettingsView() {
 
       {activeTab === "account" && (
         <section className="max-w-2xl space-y-4">
-          <div className="rounded-2xl border border-cream-200 bg-white p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-terracotta-100">
-                <span className="text-[15px] font-semibold text-terracotta-500">
-                  MG
-                </span>
+          {/* Profile + Lock — always open (most-used) */}
+          <CollapsibleSection title="Profile" defaultOpen={true}>
+            <div className="rounded-2xl border border-cream-200 bg-white p-5">
+              <div className="flex items-center gap-3">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-terracotta-100">
+                  <span className="text-[15px] font-semibold text-terracotta-500">
+                    MG
+                  </span>
+                </div>
+                <div>
+                  <p className="text-[14px] font-semibold text-cream-800">
+                    {roleStatus?.isAdmin ? "Administrator" : "Collaborator"}
+                  </p>
+                  <p className="text-[12px] text-cream-400">
+                    {roleStatus?.provisioned === false
+                      ? "Onboarding not complete"
+                      : "Devboule workspace"}
+                  </p>
+                </div>
               </div>
-              <div>
-                <p className="text-[14px] font-semibold text-cream-800">
-                  {roleStatus?.isAdmin ? "Administrator" : "Collaborator"}
-                </p>
-                <p className="text-[12px] text-cream-400">
-                  {roleStatus?.provisioned === false
-                    ? "Onboarding not complete"
-                    : "Devboule workspace"}
-                </p>
-              </div>
+              <p className="mt-4 text-[12px] leading-5 text-cream-500">
+                Your role decides which admin surfaces are visible. The real cloud
+                boundary is the scoped token you hold, enforced by the provider —
+                not by hiding pages here.
+              </p>
             </div>
-            <p className="mt-4 text-[12px] leading-5 text-cream-500">
-              Your role decides which admin surfaces are visible. The real cloud
-              boundary is the scoped token you hold, enforced by the provider —
-              not by hiding pages here.
-            </p>
-          </div>
 
-          <button
-            onClick={() => void lock()}
-            className="flex items-center gap-2 rounded-xl border border-cream-200 bg-white px-4 py-2.5 text-[13px] font-semibold text-cream-700 transition-colors hover:border-terracotta-200 hover:text-terracotta"
-          >
-            <Lock className="h-4 w-4" />
-            Lock app
-          </button>
+            <button
+              onClick={() => void lock()}
+              className="flex items-center gap-2 rounded-xl border border-cream-200 bg-white px-4 py-2.5 text-[13px] font-semibold text-cream-700 transition-colors hover:border-terracotta-200 hover:text-terracotta"
+            >
+              <Lock className="h-4 w-4" />
+              Lock app
+            </button>
+          </CollapsibleSection>
 
-          <CliAgentsCard />
+          {/* CLI Agents — collapsed by default */}
+          <CollapsibleSection title="CLI Agents" defaultOpen={false}>
+            <CliAgentsCard />
+          </CollapsibleSection>
 
+          {/* pi Extensions — collapsed by default; PiExtensionsCard renders
+              its own outer CollapsibleSection with a live installed-count badge */}
           <PiExtensionsCard />
         </section>
       )}

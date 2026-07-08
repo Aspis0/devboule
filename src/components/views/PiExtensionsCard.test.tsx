@@ -3,6 +3,12 @@
 // PiExtensionsCard — settings card for managing pi extensions. Mirrors the
 // jsdom + createRoot + act pattern of CliAgentsCard.test.tsx and
 // DesignLlmBackendCard.test.tsx. `invokeBackendCommand` is module-mocked.
+//
+// Update (collapsible): the card is now wrapped in a CollapsibleSection that
+// starts collapsed. Tests expand the outer "pi Extensions" section first (via
+// expandSection) so the content is in the DOM. Marketplace tests also expand
+// the inner "Marketplace" sub-section, which triggers the deferred auto-search
+// (no more search-on-mount).
 
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, createElement } from "react";
@@ -64,12 +70,14 @@ function textContent(): string {
   return container.textContent ?? "";
 }
 
-function findButton(label: string): HTMLButtonElement | null {
-  return (
-    Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
-      (b) => b.textContent?.includes(label),
-    ) ?? null
-  );
+/** Click the toggle button of a CollapsibleSection by its title text. */
+async function expandSection(title: string): Promise<void> {
+  const btn = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+    .find((b) => b.textContent?.includes(title) && b.getAttribute("aria-expanded") !== null);
+  expect(btn).not.toBeNull();
+  await act(async () => {
+    btn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
 }
 
 let container: HTMLDivElement;
@@ -99,19 +107,29 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+/**
+ * Mount the card and expand the outer "pi Extensions" section so its content
+ * is in the DOM. The outer section starts collapsed (defaultOpen={false}).
+ * After expanding, we wait for loadAll to resolve so status/installed data
+ * is available.
+ */
 async function mount(): Promise<void> {
   await act(async () => {
     root.render(createElement(PiExtensionsCard));
   });
-  // Flush mount effects + marketplace auto-search microtasks.
-  await act(async () => {
-    await Promise.resolve();
+  // Expand the outer CollapsibleSection so all content is rendered.
+  await expandSection("pi Extensions");
+  // Wait for loadAll to complete — the status line with "Agent dir" or the
+  // empty-state text appears once loading finishes and data is available.
+  await waitFor(() => {
+    const text = textContent();
+    return text.includes("Agent dir") || text.includes("No extensions installed");
   });
 }
 
 async function waitFor(
   predicate: () => boolean,
-  timeoutMs = 2000,
+  timeoutMs = 4000,
 ): Promise<void> {
   const step = 50;
   let elapsed = 0;
@@ -162,7 +180,11 @@ describe("PiExtensionsCard", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
-    const btn = findButton("Install")!;
+    // Use data-testid to avoid matching the "Installed" CollapsibleSection header.
+    const btn = container.querySelector(
+      '[data-testid="install-source-btn"]',
+    ) as HTMLButtonElement;
+    expect(btn).not.toBeNull();
     await act(async () => {
       btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -212,7 +234,10 @@ describe("PiExtensionsCard", () => {
     });
     await mount();
 
-    // Wait for the auto-search to populate the marketplace results.
+    // Expand the Marketplace sub-section — this triggers the deferred auto-search.
+    await expandSection("Marketplace");
+
+    // Wait for the deferred search to populate the marketplace results.
     await waitFor(() => textContent().includes("pi-utils"));
     expect(textContent()).toContain("pi-utils");
 
@@ -243,7 +268,11 @@ describe("PiExtensionsCard", () => {
     invokeMock.mockImplementationOnce(async () => {
       throw new Error("package not found");
     });
-    const btn = findButton("Install")!;
+    // Use data-testid to avoid matching the "Installed" CollapsibleSection header.
+    const btn = container.querySelector(
+      '[data-testid="install-source-btn"]',
+    ) as HTMLButtonElement;
+    expect(btn).not.toBeNull();
     await act(async () => {
       btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -322,6 +351,10 @@ describe("PiExtensionsCard", () => {
       return undefined;
     });
     await mount();
+
+    // Expand the Marketplace sub-section — this triggers the deferred auto-search.
+    await expandSection("Marketplace");
+
     await waitFor(() => textContent().includes("Network unreachable"));
     // Installed list is still visible.
     expect(textContent()).toContain("pi-lens");
@@ -356,6 +389,9 @@ describe("PiExtensionsCard", () => {
     });
     await mount();
 
+    // Expand the Marketplace sub-section — this triggers the deferred auto-search.
+    await expandSection("Marketplace");
+
     await waitFor(() => textContent().includes("pi-utils"));
 
     const installBtn = container.querySelector(
@@ -375,6 +411,34 @@ describe("PiExtensionsCard", () => {
     );
     expect(call).toBeTruthy();
     expect(call![1]).toEqual({ source: "npm:pi-utils" });
+  });
+
+  it("does not auto-search marketplace on mount — search deferred to first expand", async () => {
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      const cmd = args[0] as string;
+      if (cmd === "pi_extensions_status") return STATUS_IDLE;
+      if (cmd === "pi_extensions_list") return [INSTALLED_ROW];
+      if (cmd === "pi_marketplace_search") return MARKETPLACE_ROWS;
+      return undefined;
+    });
+    await mount();
+
+    // At this point the Marketplace section has NOT been expanded.
+    // The mock should not have been called for marketplace search yet.
+    const searchCallsBefore = invokeMock.mock.calls.filter(
+      (c) => c[0] === "pi_marketplace_search",
+    ).length;
+    expect(searchCallsBefore).toBe(0);
+
+    // Expand the Marketplace sub-section — now the deferred search fires.
+    await expandSection("Marketplace");
+
+    await waitFor(() => textContent().includes("pi-utils"));
+
+    const searchCallsAfter = invokeMock.mock.calls.filter(
+      (c) => c[0] === "pi_marketplace_search",
+    ).length;
+    expect(searchCallsAfter).toBe(1);
   });
 
   // Fix 8: fake-timers poll test
