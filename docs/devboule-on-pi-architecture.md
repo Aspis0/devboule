@@ -282,27 +282,29 @@ The Rust EventMapper reads `_devboule` and maps enriched events to the correct `
 
 ## 9. Migration phases
 
-1. **Phase 0 — Spike ✅ (bfd11bb):** minimal Node sidecar embeds pi SDK, registers `oracle_ask` tool, streams to React via Tauri IPC. Bridge proven end-to-end with `openrouter/tencent/hy3:free`.
-2. **Phase 1 — Tool surface + infra ✅ (ea015be→c7c58e7):** per-session IDs, real vault→env adapter, UI trigger in WorkConsole. Oracle: removed canned `oracle_ask` (MCP already configured via `~/.pi/agent/mcp.json`). Censor LLM hook: `tool_execution_start`→`tool_execution_end`→`agent_end`, `DEVBOULE_CENSOR_REVIEW_ENABLED` toggle, uses correct pi SDK event fields.
-3. **Phase 2 — Pigeon routing ✅ (8f8ade7):** multi-factor heuristic classifier (`classify_capability_needed()`, adapted from Puppetmaster MIT) in Rust: role base score, hard/easy/UI signal patterns, clamp 5→100 → `PromptTier` (`Cheap|Moderate|Expensive`). `AgentPath` (`Pi|Terminal`) for Claude. Vault-aware tier table. Sidecar JSONL protocol: `classify_prompt`→`classified`→`setModel()`. Self-learning bandit = TODO (Phase 5).
-4. **Phase 3 — Subagents ✅ (096ec2a):** `main-coder.md` (full tools, cloud) + `mini-coder.md` (budget worker, local). Pi agent `.md` definitions in `.pi/agents/`. User/Pigeon spawns main-coder session; main-coder spawns mini subagents.
-5. **Phase 3.5 — Reviewer/Verifier ✅ (now):** task-level mandatory reviewer subagent (`.pi/agents/reviewer.md`). Architecture per M:
-   - **During writes**: Censor A (pi-lens, deterministic, instant) + Censor B (LLM, optional) fire after EACH file write.
-   - **After task complete**: Reviewer (NOT optional) verifies the ENTIRE task: `git diff` → read files → construct targeted tests → execute (test/lint/type-check) → report (Critical/Warnings/Suggestions) + verdict (✅ VERIFIED / ⚠️ NEEDS FIX / ❌ FAILED). The deterministic slow tests run INSIDE the reviewer's verification pass — the reviewer orchestrates them, it doesn't just review code passively.
-   - Model: `auto` (Pigeon → Moderate tier). Tools: `read, grep, find, ls, bash, run`.
-6. **Phase 4 — Delete:** remove `devboule-coder/` crate and its launcher once all flows are covered. ~22K LOC gone. **IRREVERSIBLE — requires test pass before proceeding.**
-7. **Phase 5 — Polish:** session persistence, error handling, packaging of the Node runtime (`pkg --sea`), self-learning bandit for Pigeon, sandbox wrapping for main-coder sidecar.
+### Completed ✅
 
-### Console Enrichment Pipeline ✅ (69843e9, a8cb886)
+1. **Phase 0 — Spike (bfd11bb):** Node sidecar embeds pi SDK, bridge proven end-to-end.
+2. **Phase 1 — Infra+Tools (ea015be→c7c58e7):** per-session IDs, vault adapter, UI trigger, Censor hook, Oracle MCP cleanup.
+3. **Phase 2 — Pigeon routing (8f8ade7):** multi-factor classifier (Puppetmaster MIT), PromptTier/AgentPath, tier table.
+4. **Phase 3 — Subagents (096ec2a→b5b69c5):** main-coder, mini-coder, reviewer/verifier .md definitions. 3-layer verification.
+5. **Console pipeline (69843e9→a8cb886):** `_devboule` enrichment, EventMapper, agent ID namespaces, all 3 consoles conditional pi wiring. Hostile-audited, 13 findings fixed.
+6. **Phase 4 — Archive (e244a60):** `devboule-coder/` → `archived/`. ~22K LOC removed. Build clean.
 
-Between Phase 3.5 and Phase 4, a complete console-to-pi event mapping pipeline was built and hostile-audited:
+### Phase 5 — Polish (in progress)
 
-- **Task 1** — Sidecar enrichment: `_devboule` metadata on every pi event, `devboule.websearch`/`devboule.plan` custom messages via `session.sendMessage()` (same-turn delivery).
-- **Task 2** — Rust EventMapper: parses `_devboule.agentRole`, maps `devboule.websearch`→`WebSearchEntry`, `devboule.plan`→`Chat{role:"plan"}`, `Banner` fallback for un-extractable results. Tracks agent role across session.
-- **Task 3** — Agent ID namespaces: `generate_agent_id(role, project_id)`→`orchestrator-{id}`/`main-{ms}-{counter}`/`mini-{ms}-{counter}`. Conditional orchestrator launch (`DEVBOULE_PI_ENABLED=true` spawns pi session on `mini-activity://orchestrator-{id}`).
-- **Task 4a** — Coder/mini conditional launch mapped to pi sidecar (same pattern).
-- **Hostile audit (deepseek-algo)** — 13 findings (5 CRITICAL, 4 MAJOR, 4 MINOR). All fixed in 4 coder-free tasks. Fixes verified, zero regressions, 29 tests green.
-- **Result**: all 3 Devboule consoles (PlannerPlanMode, FocusStagePane, AgentTerminalViewer) have conditional pi wiring. Default OFF (`DEVBOULE_PI_ENABLED` unset). Zero React changes. Enrichment is in the sidecar — no pi fork needed.
+| Task | Status | Commit | What |
+|---|---|---|---|
+| 5a Sandbox | ✅ | `0c51ce1` | macOS Seatbelt wrap for pi sidecar (decision #11). Default ON. |
+| 5b Error hardening | ✅ | `e6f46bd` | Crash detection, zombie cleanup, timeout, prompt cap, stderr. |
+| 5e Persistence | ✅ | `e6f46bd` | Save/restore pi sessions (`.devboule/pi-sessions.json`). Purge >7d. |
+| 5c Packaging | ⏳ | — | `pkg --sea` binary bundling for release. |
+| 5d Self-learning | ⏳ | — | Bandit threshold-finding for Pigeon (TODO from Phase 2). |
+| 5f UX polish | 🔜 | — | Console `/` commands, rich events in coder console, session UI. |
+
+### Settings (2026-07-07)
+
+- **Codex CLI removed.** Kept: Orchestrator, Local (ollama/omlx/appleFm), Claude, OpenAI-compatible (api). Rationale: Codex works externally in pi as a provider; Claude stays as CLI (decision #10: MCP blocked, terminal subprocess path).
 
 Each phase is independently shippable and reversible until Phase 4.
 
