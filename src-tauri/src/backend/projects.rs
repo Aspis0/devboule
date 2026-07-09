@@ -49,11 +49,17 @@ pub(crate) use super::agent_prompt::{cloud_goal_addendum, design_handoff_relativ
 pub(crate) use super::agent_spawn::build_windows_agent_script;
 #[cfg(target_os = "macos")]
 pub(crate) use super::agent_spawn::build_macos_agent_script;
+// `macos_codex_launch_line`, `macos_orchestrator_launch_line` and `macos_claude_launch_line`
+// are likewise `#[cfg(target_os = "macos")]`-gated in agent_spawn.rs — same reasoning.
+#[cfg(target_os = "macos")]
+pub(crate) use super::agent_spawn::{
+    macos_codex_launch_line, macos_orchestrator_launch_line, macos_claude_launch_line,
+};
 pub(crate) use super::agent_spawn::{
     kill_spawned_agent_on_record_failure,
     spawn_agent_terminal, spawn_agent_terminal_app, write_session_gitconfig,
-    macos_codex_launch_line, orchestrator_env_pairs, macos_orchestrator_launch_line,
-    orchestrator_launch_script, macos_claude_launch_line, codex_mcp_config_args,
+    orchestrator_env_pairs,
+    orchestrator_launch_script, codex_mcp_config_args,
     codex_launch_script, claude_launch_script,
 };
 
