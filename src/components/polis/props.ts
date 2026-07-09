@@ -23,7 +23,10 @@ import { DERIVED } from "./palette";
 import { rngFromCoords, type Rng } from "./rng";
 import type { TerrainExtent } from "./terrain";
 
-const MAX_PROPS = 1500;
+const MAX_PROPS = 2800;
+
+// Interleaved lattice passes (see drawProps): spreads a cap hit uniformly.
+const SCAN_PHASES = 16;
 
 // Max props per Graphics chunk. Pixi v8 marks Graphics with ≥400 vertices as
 // non-batchable (each shape primitive → a separate GL draw call). With ~4
@@ -165,8 +168,16 @@ export function drawProps(
   let chunkCount = 0;
   let placed = 0;
 
-  for (let ty = ext.minY; ty <= ext.maxY && placed < MAX_PROPS; ty++) {
-    for (let tx = ext.minX; tx <= ext.maxX && placed < MAX_PROPS; tx++) {
+  // Interleaved passes over the tile lattice: a MAX_PROPS cap hit thins
+  // density uniformly across the whole map instead of stripping the south
+  // (row-major left everything below the first ~1500 candidates bare).
+  const cols = ext.maxX - ext.minX + 1;
+  const rows = ext.maxY - ext.minY + 1;
+  const n = cols * rows;
+  for (let phase = 0; phase < SCAN_PHASES && placed < MAX_PROPS; phase++) {
+    for (let i = phase; i < n && placed < MAX_PROPS; i += SCAN_PHASES) {
+      const tx = ext.minX + (i % cols);
+      const ty = ext.minY + Math.floor(i / cols);
       if (occupied.has(`${tx},${ty}`)) continue;
       const rng = rngFromCoords(tx, ty);
       const roll = rng.float();

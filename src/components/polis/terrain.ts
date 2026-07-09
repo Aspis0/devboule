@@ -17,7 +17,7 @@
 
 import { Container, Graphics } from "pixi.js";
 import { cartToIso } from "./iso";
-import { DERIVED, ALPHA } from "./palette";
+import { DERIVED } from "./palette";
 import { valueNoise } from "./rng";
 import type { TerrainData } from "../../types/city";
 
@@ -65,8 +65,20 @@ export function computeExtent(
 const HW = 48;
 const HH = 24;
 
-// Hard cap on terrain tiles so a pathological extent can't explode the draw.
-const MAX_TILES = 6000;
+// Hard cap on ACCENT patches (meadow tone variation on top of the full-extent
+// base fill) so a pathological extent can't explode the draw. The base ground
+// itself is a single 4-vertex polygon, so coverage is always 100% regardless
+// of this cap — the cap only bounds decoration density.
+const MAX_ACCENTS = 1600;
+
+// Accent sampling lattice step (tiles). Coarser than 1 so accents read as
+// meadow patches, not per-tile noise.
+const ACCENT_STEP = 2;
+
+// The lattice is visited in PHASES interleaved passes (i, i+PHASES, ...) so a
+// cap hit truncates density uniformly across the WHOLE map instead of filling
+// the north corner row-major and leaving the south bare.
+const PHASES = 16;
 
 // Max fills per Graphics chunk. Pixi v8 marks Graphics with ≥400 vertices as
 // non-batchable (each shape primitive → a separate GL draw call). A 4-point
@@ -78,152 +90,134 @@ const CHUNK_FILLS = 80;
 // Hard cap on dirt/sand patches so a pathological extent can't explode the draw.
 const MAX_DIRT = 500;
 
-/** Push the 4 corner coords of tile (tx, ty)'s iso diamond into `out`. */
-function tileDiamond(tx: number, ty: number): number[] {
-  // Center of the tile in iso space.
-  const c = cartToIso(tx, ty);
-  return [
-    c.x,
-    c.y - HH, // top
-    c.x + HW,
-    c.y, // right
-    c.x,
-    c.y + HH, // bottom
-    c.x - HW,
-    c.y, // left
-  ];
-}
 
 /**
- * Draw the mottled ground into a FLAT array of Graphics.
- * Returns the Graphics (caller owns destruction) + tile count.
+ * Draw the ground into a FLAT array of Graphics.
+ * Returns the Graphics (caller owns destruction) + painted shape count.
  *
- * PERFORMANCE FIX (T6a): Pixi v8 marks Graphics with ≥400 vertices as
- * non-batchable — each shape primitive becomes a separate GL draw call.
- * A 4-point polygon fill = 4 vertices. The old code put ALL tiles into 3
- * band Graphics (one per shade), producing ~24,000 vertices each → 3
- * standalone draw calls of ~2000 batches EACH. We now chunk fills into
- * ≤CHUNK_FILLS (80) per Graphics, keeping each under 320 vertices so the
- * batcher merges them into O(10) draw calls instead of O(7000).
+ * ARCHITECTURE (T6b, replaces the per-tile fill approach):
+ *  1. BASE — ONE 4-vertex polygon covering the entire extent, painted
+ *     groundMid. Coverage is 100% at O(1) cost no matter how large the map
+ *     is (the old per-tile loop capped at 6,000 of ~69,000 tiles, leaving
+ *     91% of the map as raw page background — the "empty white map" bug).
+ *  2. ACCENTS — bounded meadow tone patches (dark/light) + dirt patches on
+ *     top, sampled on a coarse lattice visited in PHASES interleaved passes
+ *     so cap hits thin density uniformly instead of clustering north.
  *
- * Grid lines are capped to the actually-filled tile extent (not the full
- * 69k-tile extent) and gated to zoom ≥ 0.5 (the seam is sub-pixel below
- * that). Dirt patches are hard-capped at MAX_DIRT.
+ * PERFORMANCE (T6a rules kept): fills chunked at ≤CHUNK_FILLS per Graphics
+ * so everything stays batchable. No tile grid is drawn at all — Caesar III
+ * ground has no grid, and the old full-extent line pass was both ugly and
+ * the main unbatchable GPU load.
  */
 export function drawTerrain(
   ext: TerrainExtent,
 ): { graphics: Graphics[]; gridGraphics: Graphics | null; tileCount: number } {
-  // Per-shade colour lookup.
-  const bandColors = [DERIVED.groundDark, DERIVED.groundMid, DERIVED.groundLight];
+  const out: Graphics[] = [];
 
-  // Current chunk per band (rotated when full).
-  const bandG: Graphics[] = [
-    new Graphics(), new Graphics(), new Graphics(),
-  ];
-  const bandFillCount = [0, 0, 0];
-  const allBands: Graphics[] = [];
+  // --- 1. Full-coverage base: the extent rectangle projected to iso. Tile
+  // (t) is centred on cartToIso(t), so the rect spans ±0.5 beyond the ends.
+  const a = cartToIso(ext.minX - 0.5, ext.minY - 0.5);
+  const b = cartToIso(ext.maxX + 0.5, ext.minY - 0.5);
+  const c = cartToIso(ext.maxX + 0.5, ext.maxY + 0.5);
+  const d = cartToIso(ext.minX - 0.5, ext.maxY + 0.5);
+  const base = new Graphics();
+  base.poly([a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y]).fill({
+    color: DERIVED.groundMid,
+    alpha: 1,
+  });
+  out.push(base);
 
-  // Dirt chunk pool.
+  // --- 2. Accent + dirt patches on an interleaved coarse lattice.
+  const cols = Math.max(1, Math.floor((ext.maxX - ext.minX + 1) / ACCENT_STEP));
+  const rows = Math.max(1, Math.floor((ext.maxY - ext.minY + 1) / ACCENT_STEP));
+  const latticeN = cols * rows;
+
+  let accentG = new Graphics();
+  let accentFills = 0;
+  let accentTotal = 0;
   let dirtG = new Graphics();
-  let dirtCount = 0;
-  const allDirt: Graphics[] = [];
-
-  // Track the actual filled row/col range so the grid only covers that area.
-  let filledMinY = Infinity, filledMaxY = -Infinity;
-  let filledMinX = Infinity, filledMaxX = -Infinity;
-
-  // Single pass over the tile grid (capped at MAX_TILES).
-  let count = 0;
+  let dirtFills = 0;
   let dirtTotal = 0;
-  for (let ty = ext.minY; ty <= ext.maxY && count < MAX_TILES; ty++) {
-    for (let tx = ext.minX; tx <= ext.maxX && count < MAX_TILES; tx++) {
-      count++;
-      // Track filled extent for grid capping.
-      if (ty < filledMinY) filledMinY = ty;
-      if (ty > filledMaxY) filledMaxY = ty;
-      if (tx < filledMinX) filledMinX = tx;
-      if (tx > filledMaxX) filledMaxX = tx;
+  let count = 1; // the base polygon
 
-      // Two-octave value noise: low-frequency field + per-tile detail.
+  for (
+    let phase = 0;
+    phase < PHASES && (accentTotal < MAX_ACCENTS || dirtTotal < MAX_DIRT);
+    phase++
+  ) {
+    for (
+      let i = phase;
+      i < latticeN && (accentTotal < MAX_ACCENTS || dirtTotal < MAX_DIRT);
+      i += PHASES
+    ) {
+      const tx = ext.minX + (i % cols) * ACCENT_STEP;
+      const ty = ext.minY + Math.floor(i / cols) * ACCENT_STEP;
+
+      // Two-octave value noise picks the meadow tone band.
       const lo = valueNoise(Math.floor(tx / 3), Math.floor(ty / 3));
       const hi = valueNoise(tx, ty);
       const n = lo * 0.62 + hi * 0.38;
-      const band = n < 0.36 ? 0 : n < 0.68 ? 1 : 2;
-      const poly = tileDiamond(tx, ty);
 
-      // Rotate to a fresh chunk when the current one is full.
-      if (bandFillCount[band] >= CHUNK_FILLS) {
-        allBands.push(bandG[band]);
-        bandG[band] = new Graphics();
-        bandFillCount[band] = 0;
+      // Meadow tone patch (dark or light band only — mid IS the base).
+      if ((n < 0.36 || n > 0.68) && accentTotal < MAX_ACCENTS) {
+        accentTotal++;
+        const cc = cartToIso(tx, ty);
+        // Patch radius 1.2..2.4 tiles — reads as a meadow, not tile noise.
+        const s = 1.2 + valueNoise(tx ^ 0x51ed, ty ^ 0x2b9c) * 1.2;
+        if (accentFills >= CHUNK_FILLS) {
+          out.push(accentG);
+          accentG = new Graphics();
+          accentFills = 0;
+        }
+        accentG
+          .poly([
+            cc.x, cc.y - HH * s,
+            cc.x + HW * s, cc.y,
+            cc.x, cc.y + HH * s,
+            cc.x - HW * s, cc.y,
+          ])
+          .fill({
+            color: n < 0.36 ? DERIVED.groundDark : DERIVED.groundLight,
+            alpha: 0.55,
+          });
+        accentFills++;
+        count++;
       }
-      bandG[band].poly(poly).fill({ color: bandColors[band], alpha: 1 });
-      bandFillCount[band]++;
 
-      // Dirt patch — capped at MAX_DIRT.
+      // Dirt patch — sparse, warm contrast on the green.
       const rRoll = valueNoise(tx ^ 0x5bd1, ty ^ 0x9e37);
-      if (rRoll >= 0.13 || dirtTotal >= MAX_DIRT) continue;
-      dirtTotal++;
-      const c = cartToIso(tx, ty);
-      const s = 0.45 + valueNoise(tx ^ 0x1234, ty ^ 0xabcd) * (0.8 - 0.45);
-      const worn = valueNoise(tx ^ 0x7777, ty ^ 0x3333) < 0.4;
-
-      if (dirtCount >= CHUNK_FILLS) {
-        allDirt.push(dirtG);
-        dirtG = new Graphics();
-        dirtCount = 0;
+      if (rRoll < 0.1 && dirtTotal < MAX_DIRT) {
+        dirtTotal++;
+        const cc = cartToIso(tx, ty);
+        const s = 0.45 + valueNoise(tx ^ 0x1234, ty ^ 0xabcd) * (0.8 - 0.45);
+        const worn = valueNoise(tx ^ 0x7777, ty ^ 0x3333) < 0.4;
+        if (dirtFills >= CHUNK_FILLS) {
+          out.push(dirtG);
+          dirtG = new Graphics();
+          dirtFills = 0;
+        }
+        dirtG
+          .poly([
+            cc.x, cc.y - HH * s,
+            cc.x + HW * s, cc.y,
+            cc.x, cc.y + HH * s,
+            cc.x - HW * s, cc.y,
+          ])
+          .fill({
+            color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
+            alpha: 0.7,
+          });
+        dirtFills++;
+        count++;
       }
-      dirtG
-        .poly([
-          c.x,
-          c.y - HH * s,
-          c.x + HW * s,
-          c.y,
-          c.x,
-          c.y + HH * s,
-          c.x - HW * s,
-          c.y,
-        ])
-        .fill({
-          color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
-          alpha: 0.7,
-        });
-      dirtCount++;
     }
   }
+  if (accentFills > 0) out.push(accentG);
+  if (dirtFills > 0) out.push(dirtG);
 
-  // Flush the last partial chunks.
-  for (let b = 0; b < 3; b++) {
-    if (bandFillCount[b] > 0) allBands.push(bandG[b]);
-  }
-  if (dirtCount > 0) allDirt.push(dirtG);
-
-  // Grid lines — capped to the filled tile extent (not the full 69k-tile
-  // extent). This bounds line count to ~√MAX_TILES instead of the full bbox.
-  // The seam is sub-pixel below zoom 0.5, so the caller should gate the
-  // returned grid Graphics at zoom >= 0.5.
-  const gridG = new Graphics();
-  let hasGrid = false;
-  if (Number.isFinite(filledMinY)) {
-    for (let ty = filledMinY; ty <= filledMaxY; ty += 1) {
-      const a = cartToIso(filledMinX, ty);
-      const b = cartToIso(filledMaxX, ty);
-      gridG.moveTo(a.x, a.y).lineTo(b.x, b.y);
-      hasGrid = true;
-    }
-    for (let tx = filledMinX; tx <= filledMaxX; tx += 1) {
-      const a = cartToIso(tx, filledMinY);
-      const b = cartToIso(tx, filledMaxY);
-      gridG.moveTo(a.x, a.y).lineTo(b.x, b.y);
-    }
-    gridG.stroke({ color: DERIVED.seam, alpha: ALPHA.seam, width: 1 });
-  }
-
-  return {
-    graphics: [...allBands, ...allDirt],
-    gridGraphics: hasGrid ? gridG : null,
-    tileCount: count,
-  };
+  // No tile grid: Caesar III ground has none, and the full-extent line pass
+  // was the dominant unbatchable GPU cost. Callers already handle null.
+  return { graphics: out, gridGraphics: null, tileCount: count };
 }
 
 // ===========================================================================

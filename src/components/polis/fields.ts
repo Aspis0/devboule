@@ -28,7 +28,11 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_PARCELS = 160;
+const MAX_PARCELS = 560;
+
+// Interleaved lattice passes: a cap hit thins parcel density uniformly across
+// the map instead of clustering in the first-scanned corner.
+const SCAN_PHASES = 16;
 const PARCEL_SIZES: [number, number][] = [
   [8, 6],
   [7, 5],
@@ -170,9 +174,17 @@ export function planFields(input: {
 
   const parcels: FieldParcel[] = [];
 
-  // Scan candidate origins in row-major order (deterministic).
-  for (let gy = ext.minY; gy <= ext.maxY && parcels.length < MAX_PARCELS; gy += LATTICE_STEP) {
-    for (let gx = ext.minX; gx <= ext.maxX && parcels.length < MAX_PARCELS; gx += LATTICE_STEP) {
+  // Scan candidate origins on the lattice in PHASES interleaved passes
+  // (deterministic). Row-major with a cap filled ONLY the north corner of a
+  // big map and left the rest bare (seen live); interleaving spreads a cap
+  // hit uniformly across the whole extent.
+  const latCols = Math.max(1, Math.ceil((ext.maxX - ext.minX + 1) / LATTICE_STEP));
+  const latRows = Math.max(1, Math.ceil((ext.maxY - ext.minY + 1) / LATTICE_STEP));
+  const latticeN = latCols * latRows;
+  for (let phase = 0; phase < SCAN_PHASES && parcels.length < MAX_PARCELS; phase++) {
+    for (let i = phase; i < latticeN && parcels.length < MAX_PARCELS; i += SCAN_PHASES) {
+      const gx = ext.minX + (i % latCols) * LATTICE_STEP;
+      const gy = ext.minY + Math.floor(i / latCols) * LATTICE_STEP;
       // Try parcel sizes largest-first.
       for (const [pw, ph] of PARCEL_SIZES) {
         // Check if the parcel fits entirely within the extent.

@@ -353,7 +353,28 @@ describe("planFields cap", () => {
       blocked: new Set<string>(),
       centre: { x: 250, y: 250 },
     });
-    expect(parcels.length).toBeLessThanOrEqual(160);
+    expect(parcels.length).toBeLessThanOrEqual(560);
+  });
+
+  it("cap hits spread across the whole extent, not just the first rows", () => {
+    // On a huge empty extent the cap truncates; the interleaved scan must
+    // leave parcels in every quadrant instead of only the north band.
+    const ext = mkExtent(0, 0, 500, 500);
+    const parcels = planFields({
+      ext,
+      districts: [],
+      blocked: new Set<string>(),
+      centre: { x: 250, y: 250 },
+    });
+    const inQuadrant = [0, 0, 0, 0];
+    for (const p of parcels) {
+      const qx = p.x + p.w / 2 < 250 ? 0 : 1;
+      const qy = p.y + p.h / 2 < 250 ? 0 : 2;
+      inQuadrant[qx + qy]++;
+    }
+    for (let q = 0; q < 4; q++) {
+      expect(inQuadrant[q]).toBeGreaterThan(0);
+    }
   });
 });
 
