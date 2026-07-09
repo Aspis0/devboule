@@ -26,6 +26,7 @@ const viewTitles: Record<string, string> = {
   oracle: "Oracle",
   design: "Design",
   skills: "Skills",
+  help: "Help",
   // Re-homed views still resolve a title for any lingering deep-link.
   secrets: "Secrets & API Keys",
   compute: "Infrastructure & Compute",

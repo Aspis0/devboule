@@ -15,6 +15,7 @@ import {
 	Palette,
 	GraduationCap,
 	FlaskConical,
+	LifeBuoy,
 	Settings,
 	type LucideIcon,
 } from "lucide-react";
@@ -39,6 +40,7 @@ const iconMap: Record<string, LucideIcon> = {
 	Palette,
 	GraduationCap,
 	FlaskConical,
+	LifeBuoy,
 };
 
 // The Polis isometric map nav entry. Injected by the Sidebar so it appears
@@ -61,6 +63,11 @@ const SKILLS_NAV: NavItem = {
 // The Labs view nav entry (experimental feature toggles: Pigeon, Oracle).
 // Injected the same way as Skills; not in the ADMIN_ONLY_VIEWS denylist.
 const LABS_NAV: NavItem = { id: "labs", label: "Labs", icon: "FlaskConical" };
+
+// The Help view nav entry (the getting-started / how-it-works page). Injected the
+// same way as Labs so it appears regardless of whether the backend config lists
+// it yet; not in the ADMIN_ONLY_VIEWS denylist.
+const HELP_NAV: NavItem = { id: "help", label: "Help", icon: "LifeBuoy" };
 
 // Nav ids that must never render in the sidebar, even if a stored/loaded
 // config still lists them (e.g. a stale persisted "providers" entry from an
@@ -87,9 +94,13 @@ export function Sidebar() {
 	const withLabs = withSkills.some((n) => n.id === LABS_NAV.id)
 		? withSkills
 		: [...withSkills, LABS_NAV];
+	// Help sits LAST, after Labs, at the bottom of the nav.
+	const withHelp = withLabs.some((n) => n.id === HELP_NAV.id)
+		? withLabs
+		: [...withLabs, HELP_NAV];
 	// Drop any hidden nav ids (e.g. a stale "providers" entry from a stored
 	// config) so they never reach the role filter and never render.
-	const baseNavigation = withLabs.filter((n) => !HIDDEN_NAV_IDS.has(n.id));
+	const baseNavigation = withHelp.filter((n) => !HIDDEN_NAV_IDS.has(n.id));
 	// Filter by role (cosmetic — the backend enforces privileged commands). A
 	// null/loading role defaults to the restricted collaborator set.
 	const allowedIds = new Set(

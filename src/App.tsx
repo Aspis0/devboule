@@ -47,6 +47,14 @@ const SkillsView = lazy(() =>
   })),
 );
 
+// Lazy-load the Help (getting-started / how-it-works) view. Kept its own async
+// chunk to match the Skills/Design/Polis pattern and keep it off the initial bundle.
+const HelpView = lazy(() =>
+  import("./components/views/HelpView").then((m) => ({
+    default: m.HelpView,
+  })),
+);
+
 function ViewFallback() {
   return (
     <div className="flex items-center gap-2 text-[12px] font-medium text-cream-500">
@@ -220,6 +228,15 @@ function AppShell() {
           <ErrorBoundary label="Skills">
             <Suspense fallback={<ViewFallback />}>
               <SkillsView />
+            </Suspense>
+          </ErrorBoundary>
+        );
+      case "help":
+        // Lazy Help view in its own error boundary + Suspense (mirrors Skills).
+        return (
+          <ErrorBoundary label="Help">
+            <Suspense fallback={<ViewFallback />}>
+              <HelpView />
             </Suspense>
           </ErrorBoundary>
         );

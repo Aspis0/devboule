@@ -121,4 +121,18 @@ describe("Sidebar hides the cloud Providers area (S1)", () => {
     );
     expect(providersBtn).toBeFalsy();
   });
+
+  it("nav ends with the injected Help entry (last item)", async () => {
+    const { Sidebar } = await import("./Sidebar");
+    await act(async () => {
+      createRoot(container).render(createElement(Sidebar));
+    });
+
+    const nav = container.querySelector("nav");
+    expect(nav).toBeTruthy();
+    const navButtons = Array.from(nav?.querySelectorAll("button") ?? []);
+    expect(navButtons.length).toBeGreaterThan(0);
+    // Help is injected LAST, after Labs, at the bottom of the nav.
+    expect(navButtons[navButtons.length - 1].textContent?.trim()).toBe("Help");
+  });
 });
