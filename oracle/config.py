@@ -5,6 +5,7 @@ import os
 ORACLE_DIR = Path(os.getenv("ORACLE_DIR", "oracle-data"))
 LANCE_DB_PATH = Path(os.getenv("LANCE_DB_PATH", ORACLE_DIR / "vectors.lancedb"))
 CHUNK_DB_PATH = Path(os.getenv("CHUNK_DB_PATH", ORACLE_DIR / "chunks.lancedb"))
+FILE_VECTORS_DB_PATH = Path(os.getenv("FILE_VECTORS_DB_PATH", ORACLE_DIR / "file_vectors.lancedb"))
 CHUNK_MANIFEST_PATH = Path(os.getenv("CHUNK_MANIFEST_PATH", ORACLE_DIR / "chunk-index-manifest.json"))
 SQLITE_PATH = Path(os.getenv("SQLITE_PATH", ORACLE_DIR / "metadata.sqlite"))
 CKG_DB_PATH = Path(os.getenv("CKG_DB_PATH", ORACLE_DIR / "ckg.sqlite"))

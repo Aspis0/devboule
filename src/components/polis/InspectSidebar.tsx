@@ -84,6 +84,7 @@ import type {
   ExternalService,
 } from "../../types/city";
 const AnomalySection = React.lazy(() => import("./AnomalySection"));
+const KinSection = React.lazy(() => import("./KinSection"));
 import type { OracleAnswer } from "../../types/backend";
 import { purposeLabel, agentTypeLabel } from "../../types/city";
 import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
@@ -640,6 +641,15 @@ function BuildingPopup({
         </div>
       </section>
 
+
+      {/* KIN BUILDINGS (P6.3 — semantic similarity, lazy-loaded) */}
+      <Suspense fallback={null}>
+        <KinSection
+          building={building}
+          city={city}
+          onSelectBuilding={onSelectBuilding}
+        />
+      </Suspense>
       {/* UNDER INVESTIGATION (bug-investigation P3) — Oracle SUSPECTS this file for
           an open bug card. HONEST framing: a suspect is a GUESS, not a confirmed
           problem, so this sits in its OWN section, ABOVE and visually separate from

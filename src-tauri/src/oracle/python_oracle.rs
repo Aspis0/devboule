@@ -2411,6 +2411,129 @@ fn join_pipe_output(
     }
 }
 
+// ---------------------------------------------------------------------------
+// P6.2 — Semantic similarity Oracle wrappers.
+// ---------------------------------------------------------------------------
+
+/// A single similar-file result from the Oracle `/similar` endpoint.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarFile {
+    /// file_id of the similar file (project-relative path).
+    pub id: String,
+    #[serde(default)]
+    pub score: f64,
+}
+
+/// Envelope returned by `GET /clusters`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClustersResponse {
+    #[serde(default)]
+    epoch: String,
+    #[serde(default)]
+    clusters: Vec<serde_json::Value>,
+}
+
+/// PRIVACY: fixed body-free error for semantic Oracle calls. Never carries the
+/// response body (which could include file paths).
+fn semantic_http_error(status: reqwest::StatusCode) -> String {
+    format!("Oracle HTTP command failed ({status}).")
+}
+
+/// Retrieve top-K similar files from the Oracle `/similar/{node_id}` endpoint.
+///
+/// `node_id` is the project-relative file path (the same `id` used in the Oracle
+/// node_cards table, populated by `learn_files`). Returns a list of `SimilarFile`
+/// sorted by cosine similarity desc. Fail-closed: a not-ready server returns
+/// [`ORACLE_SERVER_STARTING_ERROR`]; an empty index yields an empty list.
+///
+/// Mirrors [`oracle_context_chunks`] exactly: same resident server, same operator
+/// auth header, same NON-spawning readiness gate, same per-request timeout,
+/// same PRIVACY posture (fixed error strings, `.without_url()`).
+pub fn oracle_similar(
+    root: &Path,
+    node_id: &str,
+    limit: usize,
+) -> Result<Vec<SimilarFile>, String> {
+    require_oracle_server_ready(root)?;
+    let session = oracle_http_session();
+    let client = oracle_http_client();
+    let encoded = urlencoding_hack(node_id);
+    let url = format!("{}/similar/{encoded}", session.base_url);
+    let response = client
+        .get(url)
+        .query(&[("limit", limit.to_string())])
+        .timeout(PYTHON_ORACLE_TIMEOUT)
+        .header("x-oracle-auth-token", &session.auth_token)
+        .send()
+        .map_err(|e| format!("Oracle HTTP request failed: {}", e.without_url()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|e| format!("Oracle HTTP response read failed: {}", e.without_url()))?;
+    if !status.is_success() {
+        return Err(semantic_http_error(status));
+    }
+    let parsed: Vec<SimilarFile> = serde_json::from_str(&text)
+        .map_err(|_| "Oracle returned an unparseable /similar response.".to_string())?;
+    Ok(parsed)
+}
+
+/// Minimal percent-encode for file paths used as URL path segments. The Oracle
+/// `/similar/{node_id:path}` route uses FastAPI's `:path` converter which handles
+/// URL-decoding; we only need to encode characters that would break the URL
+/// (primarily `#` and `?`). This avoids pulling in a full URL-encoding crate.
+fn urlencoding_hack(path: &str) -> String {
+    path.replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3F")
+        .replace(' ', "%20")
+}
+
+/// Retrieve the current Oracle clusters epoch from `GET /clusters`.
+///
+/// Returns the epoch string (ISO 8601 timestamp) from the clusters endpoint.
+/// Used for cache-staleness checks: if the Oracle epoch is newer than the cache
+/// epoch, the cache is stale. Fail-open: if the Oracle is down or the response
+/// is unparseable, returns an empty string (which makes the cache appear stale,
+/// triggering a refresh — safe degradation).
+///
+/// Mirrors the same privacy posture as [`oracle_context_chunks`]: loopback
+/// session, operator auth, NON-spawning readiness gate, fixed body-free errors.
+pub fn oracle_clusters_epoch(root: &Path) -> String {
+    // Best-effort: if the server is not ready, return empty (cache stale → refresh
+    // will be attempted when the server comes up).
+    if require_oracle_server_ready(root).is_err() {
+        return String::new();
+    }
+    let session = oracle_http_session();
+    let client = oracle_http_client();
+    let url = format!("{}/clusters", session.base_url);
+    let response = match client
+        .get(url)
+        .timeout(PYTHON_ORACLE_TIMEOUT)
+        .header("x-oracle-auth-token", &session.auth_token)
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    if !response.status().is_success() {
+        return String::new();
+    }
+    let text = match response.text() {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let parsed: ClustersResponse = match serde_json::from_str(&text) {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    parsed.epoch
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

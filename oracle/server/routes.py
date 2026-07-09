@@ -14,6 +14,7 @@ def make_engine() -> QueryEngine:
         SQLiteStore(config.SQLITE_PATH),
         LanceStore(config.LANCE_DB_PATH),
         LanceStore(config.CHUNK_DB_PATH),
+        file_vectors=LanceStore(config.FILE_VECTORS_DB_PATH),
     )
 
 
@@ -273,6 +274,16 @@ def create_router():
     @router.get("/similar/{node_id:path}")
     def similar(node_id: str, limit: int = 5):
         return make_engine().similar(node_id, limit)
+
+    @router.get("/clusters")
+    def clusters():
+        from oracle.server.query_engine import _clusters_response
+        return _clusters_response(make_engine().sqlite)
+
+    @router.get("/cluster/{cluster_id}/members")
+    def cluster_members(cluster_id: int):
+        from oracle.server.query_engine import _cluster_members_response
+        return _cluster_members_response(make_engine().sqlite, cluster_id)
 
     @router.get("/cluster/{name}")
     def cluster(name: str):

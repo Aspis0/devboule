@@ -25,6 +25,10 @@ const LAST_FOLDER_KEY = "polis:lastFolder";
  *  match `CITY_UPDATED_EVENT` in `src-tauri/src/polis/watcher.rs`. */
 const CITY_UPDATED_EVENT = "polis://city-updated";
 
+/** Tauri event the backend emits AFTER the semantic cache is refreshed. The
+ *  listener triggers a re-fetch so semantic similarity roads appear. */
+const SEMANTIC_UPDATED_EVENT = "polis://semantic-updated";
+
 function readLastFolder(): string | null {
   try {
     const v = window.localStorage.getItem(LAST_FOLDER_KEY);
@@ -181,6 +185,7 @@ interface CityStoreState {
 
 /** The active event-unlisten fn, or null when not listening. */
 let cityUpdatedUnlisten: UnlistenFn | null = null;
+let semanticUpdatedUnlisten: UnlistenFn | null = null;
 /** The folder the watcher is CLAIMED/started on (so a re-load of the same folder
  *  doesn't re-subscribe redundantly; the backend start is itself idempotent).
  *  FIX 2: `startWatchFor` CLAIMS this synchronously (before any await) so a
@@ -274,6 +279,24 @@ async function subscribeCityUpdated(
   });
 }
 
+/** Subscribe to ``polis://semantic-updated`` exactly once.
+ *  When the background semantic-cache refresh completes, this listener triggers a
+ *  re-fetch so the newly-populated similarity roads appear in the city. */
+async function subscribeSemanticUpdated(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  if (semanticUpdatedUnlisten) {
+    semanticUpdatedUnlisten();
+    semanticUpdatedUnlisten = null;
+  }
+  const { listen } = await import("@tauri-apps/api/event");
+  semanticUpdatedUnlisten = await listen<boolean>(SEMANTIC_UPDATED_EVENT, (event) => {
+    if (event.payload) {
+      // Lazily reference useCityStore (defined below) — safe at runtime.
+      void useCityStore.getState().refresh(true);
+    }
+  });
+}
+
 /** Tear down the live watch PLUMBING (drop the event listener + stop the backend
  *  watcher) WITHOUT touching `watchedFolder`. Shared by `stopWatch` (which then
  *  clears the claim) and `startWatchFor` (which must NOT clear the freshly-claimed
@@ -282,6 +305,10 @@ async function teardownWatchPlumbing(): Promise<void> {
   if (cityUpdatedUnlisten) {
     cityUpdatedUnlisten();
     cityUpdatedUnlisten = null;
+  }
+  if (semanticUpdatedUnlisten) {
+    semanticUpdatedUnlisten();
+    semanticUpdatedUnlisten = null;
   }
   if (!isTauriRuntime()) return;
   try {
@@ -336,12 +363,17 @@ async function startWatchFor(
     if (epoch !== watchEpoch) return;
     // Subscribe BEFORE starting so we can't miss an immediate emit.
     await subscribeCityUpdated(onCity);
+    await subscribeSemanticUpdated();
     if (epoch !== watchEpoch) {
-      // Superseded mid-subscribe: drop the listener we just attached so a newer
+      // Superseded mid-subscribe: drop the listeners we just attached so a newer
       // start owns the single listener, and bow out.
       if (cityUpdatedUnlisten) {
         cityUpdatedUnlisten();
         cityUpdatedUnlisten = null;
+      }
+      if (semanticUpdatedUnlisten) {
+        semanticUpdatedUnlisten();
+        semanticUpdatedUnlisten = null;
       }
       return;
     }

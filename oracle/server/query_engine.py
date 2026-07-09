@@ -37,10 +37,12 @@ class QueryEngine:
         sqlite: SQLiteStore,
         vectors: LanceStore,
         chunk_vectors: LanceStore | None = None,
+        file_vectors: LanceStore | None = None,
     ):
         self.sqlite = sqlite
         self.vectors = vectors
         self.chunk_vectors = chunk_vectors
+        self.file_vectors = file_vectors
 
     def health(self) -> dict:
         nodes = self.sqlite.all_nodes()
@@ -385,7 +387,17 @@ class QueryEngine:
         return card
 
     def similar(self, node_id: str, limit: int = 5) -> list[dict]:
-        return [self._result(row) for row in self.vectors.similar(node_id, limit)]
+        # Try the node-card store first (populated by learn_files CLI).
+        # Fall back to file_vectors (populated by the automatic pipeline's
+        # clustering hook) when the node-card lookup misses.  This avoids
+        # creating vectors.lancedb from the pipeline path, which would
+        # falsely activate python_oracle_available() on bare deployments.
+        results = self.vectors.similar(node_id, limit)
+        if results:
+            return [self._result(row) for row in results]
+        if self.file_vectors is not None:
+            return [self._result(row) for row in self.file_vectors.similar(node_id, limit)]
+        return []
 
     def cluster(self, name: str) -> list[dict]:
         return self.sqlite.by_cluster(name)
@@ -1287,6 +1299,156 @@ def parse_cluster(value: object) -> int:
     except (TypeError, ValueError):
         return 0
 
+
+
+
+# ── P6.1: file-level embedding clusters ──
+
+def _refresh_clusters(index_root) -> None:
+    """Mean-pool per-chunk vectors → one vector per file, cluster with HDBSCAN
+    (fallback sklearn KMeans), persist to sqlite file_clusters table, AND
+    upsert per-file vectors into the DEDICATED ``file_vectors.lancedb`` store
+    so /similar queries (kin + semantic roads) return results.
+
+    DESIGN CHOICE (B1): per-file vectors are written to ``FILE_VECTORS_DB_PATH``
+    (``oracle-data/file_vectors.lancedb``), NOT to ``LANCE_DB_PATH``
+    (``vectors.lancedb``).  The node-card store at ``vectors.lancedb`` is
+    populated ONLY by the ``learn_files`` CLI and must never be created by
+    the automatic pipeline — creating it would make ``python_oracle_available()``
+    return true on deployments that never ran ``learn_files``, activating
+    live-integration paths against an empty table (snapshot node_count 0).
+
+    ``QueryEngine.similar()`` tries the node-card store first (preserving the
+    original semantics when ``learn_files`` populated it) and falls back to
+    ``file_vectors`` when the node-card lookup misses.
+
+    Files that no longer appear in the chunk index are pruned automatically
+    (they have no pooled vector and are not in the replacement set), matching
+    the prune_excluded_chunks policy.
+
+    RACE: this function reads sqlite chunks and lance chunk vectors in two
+    snapshots.  A concurrent index run could insert new chunks between the two
+    reads, producing a pooled vector computed from a SUBSET of a file's chunks.
+    Accepted — self-healing next round (the next index run re-triggers this hook
+    and the pooling picks up the full set).
+
+    Called from a best-effort daemon thread after index runs complete.
+    Any exception → logged, propagate up to the best-effort wrapper (which swallows).
+    """
+    import numpy as np
+    from datetime import datetime, timezone
+    from oracle.config import SQLITE_PATH, CHUNK_DB_PATH, FILE_VECTORS_DB_PATH
+    from oracle.store.sqlite_store import SQLiteStore
+    from oracle.store.lance_store import LanceStore
+
+    sqlite = SQLiteStore(SQLITE_PATH)
+    chunk_vectors = LanceStore(CHUNK_DB_PATH)
+    file_vectors = LanceStore(FILE_VECTORS_DB_PATH)
+
+    all_chunks = sqlite.all_chunks()
+    epoch = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    if not all_chunks:
+        sqlite.replace_file_clusters([], epoch=epoch)
+        file_vectors.replace_all([])
+        return
+
+    # Group chunk vectors by file_id
+    all_vec_records = chunk_vectors._read()
+    vec_by_id: dict[str, list[float]] = {r["id"]: r["vector"] for r in all_vec_records}
+
+    per_file_vecs: dict[str, list[list[float]]] = {}
+    for chunk in all_chunks:
+        fid = chunk["file_id"]
+        vec = vec_by_id.get(chunk["id"])
+        if vec is not None:
+            per_file_vecs.setdefault(fid, []).append(vec)
+
+    file_ids = sorted(per_file_vecs.keys())
+    n = len(file_ids)
+
+    # Mean-pool: one vector per file (ALWAYS, so /similar works for any n).
+    pooled = np.array([np.mean(per_file_vecs[fid], axis=0) for fid in file_ids])
+
+    # B1: populate per-file vectors into the DEDICATED file_vectors.lancedb
+    # store (NEVER into vectors.lancedb — see docstring).
+    node_records: list[dict] = []
+    for i, fid in enumerate(file_ids):
+        node_records.append({
+            "id": fid,
+            "label": fid,
+            "area": "file",
+            "cluster_semantic": "0",
+            "vector": pooled[i].tolist(),
+        })
+    file_vectors.replace_all(node_records)
+
+    # Clustering requires a minimum number of files to produce meaningful
+    # groups; below the threshold we only write per-file vectors above.
+    if n < 8:
+        sqlite.replace_file_clusters([], epoch=epoch)
+        return
+
+    # Cluster
+    try:
+        import hdbscan
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=3)
+        labels = clusterer.fit_predict(pooled)
+        scores = clusterer.probabilities_
+    except ImportError:
+        from sklearn.cluster import KMeans
+        k = max(2, min(24, round(np.sqrt(n / 2))))
+        clusterer = KMeans(n_clusters=k, random_state=0, n_init="auto")
+        labels = clusterer.fit_predict(pooled)
+        centroids = clusterer.cluster_centers_
+        distances = np.linalg.norm(pooled - centroids[labels], axis=1)
+        max_dist = float(distances.max()) if distances.size else 0.0
+        if max_dist == 0.0:
+            max_dist = 1.0
+        scores = 1.0 - distances / max_dist
+
+    # Build cluster rows, omit noise (label -1)
+    rows: list[dict] = []
+    for i, fid in enumerate(file_ids):
+        lbl = int(labels[i])
+        if lbl == -1:
+            continue
+        s = float(scores[i]) if scores[i] is not None else 0.0
+        rows.append({"file_id": fid, "cluster_id": lbl, "score": s})
+
+    sqlite.replace_file_clusters(rows, epoch=epoch)
+
+
+def _clusters_response(sqlite) -> dict:
+    """Build the GET /clusters response from the sqlite store."""
+    rows = sqlite.get_file_clusters()
+    epoch = sqlite.get_clusters_epoch() or ""
+
+    by_cluster: dict[int, list[dict]] = {}
+    for row in rows:
+        cid = row["cluster_id"]
+        by_cluster.setdefault(cid, []).append(row)
+
+    clusters_list = []
+    for cid in sorted(by_cluster.keys()):
+        members = by_cluster[cid]
+        sample = [m["file_id"] for m in members[:3]]
+        clusters_list.append({
+            "clusterId": cid,
+            "size": len(members),
+            "sampleFiles": sample,
+        })
+
+    return {"epoch": epoch, "clusters": clusters_list}
+
+
+def _cluster_members_response(sqlite, cluster_id: int) -> dict:
+    """Build the GET /cluster/{id}/members response."""
+    members = sqlite.get_cluster_members(cluster_id)
+    return {
+        "clusterId": cluster_id,
+        "members": [{"fileId": m["file_id"], "score": m["score"]} for m in members],
+    }
 
 def _is_provider_backend_query(terms: set[str]) -> bool:
     provider_terms = {

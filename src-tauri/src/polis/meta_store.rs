@@ -200,6 +200,13 @@ pub struct MetaStore {
     /// which never matches a real version, forcing exactly one clean repack.
     #[serde(default)]
     pub layout_version: u32,
+    /// P6.2 — Oracle embedding-cluster semantic cache. Persisted so similarity
+    /// roads survive restarts and are only refreshed when the Oracle index
+    /// changes (epoch-based staleness).  so a pre-P6.2 meta
+    /// file loads with an empty cache (fail-open).
+    #[serde(default)]
+    pub semantic: crate::polis::semantic::SemanticCache,
+
 }
 
 fn default_version() -> u32 {
@@ -222,6 +229,7 @@ impl Default for MetaStore {
             feature_label_overrides: BTreeMap::new(),
             feature_merges: BTreeMap::new(),
             layout_version: 0,
+            semantic: crate::polis::semantic::SemanticCache::default(),
         }
     }
 }
@@ -511,8 +519,9 @@ impl MetaStore {
         disk.features = self.features.clone();
         // Layout-algorithm version is scanner-owned (stamped by `layout()`).
         disk.layout_version = self.layout_version;
-        // `era`, `enabled_extensions`, `feature_label_overrides`, `feature_merges`
-        // are left as loaded from disk — owned by their respective commands.
+        // `era`, `enabled_extensions`, `feature_label_overrides`, `feature_merges`,
+        // and `semantic` are left as loaded from disk — owned by their respective
+        // commands / background refresh tasks.
     }
 
     /// The persisted Polis F1 feature registry (id/label/color/kind).

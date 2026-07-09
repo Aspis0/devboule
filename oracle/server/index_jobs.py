@@ -239,6 +239,7 @@ class OracleIndexJobManager:
                 "finished_at": utc_now(),
             }
             self._finish_job(result)
+            self._refresh_clusters_best_effort(index_root)
             return result
         except Exception:
             # Full detail (paths/torch internals) goes to the log only. The
@@ -308,6 +309,24 @@ class OracleIndexJobManager:
                 pass
 
         threading.Thread(target=_run, daemon=True, name="ckg-refresh").start()
+
+    def _refresh_clusters_best_effort(self, index_root) -> None:
+        """Best-effort file-level clustering after a vector index run completes.
+        CPU-only (mean-pool + sklearn), run on a daemon thread so it never blocks
+        the watcher, and fully exception-swallowing — clusters are auxiliary and
+        must NEVER break the vector index."""
+        import threading
+        from pathlib import Path
+
+        def _run() -> None:
+            try:
+                from oracle.server.query_engine import _refresh_clusters
+                _refresh_clusters(Path(str(index_root)))
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True, name="cluster-refresh").start()
+
 
     def start_watcher(self, *, root: str | None = None, mode: str | None = None) -> dict:
         """Arm the auto-reindex watcher.

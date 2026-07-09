@@ -18,7 +18,120 @@ use crate::polis::watcher::{self, AttachAgents, WatchHandle};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+
+/// P6.2 — single-instance guard for the background semantic-cache refresh task.
+/// Swapped to true before spawn, reset to false when the task completes.
+static SEMANTIC_REFRESH_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// P6.2 — background semantic-cache refresh.
+///
+/// Called from a daemon thread after a successful scan. Checks the Oracle
+/// clusters epoch; if newer than the persisted cache epoch, fetches similar
+/// files for up to 200 buildings (oldest-first by cache-entry age) and persists
+/// the updated cache. Returns `Ok(true)` if the cache was updated (caller should
+/// re-emit the city), `Ok(false)` if the cache was already fresh, or `Err` on
+/// failure (cache untouched — fail-open).
+fn refresh_semantic_cache(project_root: &std::path::Path) -> Result<bool, String> {
+    use crate::oracle::python_oracle::{oracle_clusters_epoch, oracle_similar};
+    use crate::polis::meta_store::MetaStore;
+    use crate::polis::semantic::{SemanticCache, SemanticPerFile, SimilarEntry};
+
+    // Check the Oracle epoch. Oracle down -> empty string -> stale -> but we can't
+    // fetch -> skip the refresh gracefully.
+    let oracle_epoch = oracle_clusters_epoch(project_root);
+    if oracle_epoch.is_empty() {
+        return Ok(false); // Oracle unavailable, no refresh possible
+    }
+
+    // Load the current cache from disk.
+    let meta = MetaStore::load(project_root);
+    let cache = &meta.semantic;
+    if !cache.stale(&oracle_epoch) {
+        return Ok(false); // Cache is fresh
+    }
+
+    // Collect building file paths (project-relative keys, aka rel_path in Polis
+    // terminology).  Each key IS the rel_path — the semantics ARE rel-path.
+    let mut all_rel_paths: Vec<String> = meta.files.keys().cloned().collect();
+    all_rel_paths.sort(); // deterministic
+
+    // ROTATION: uncached files first, then stalest-by-updated_at.
+    // Separates into two lists for capped selection.
+    let mut uncached: Vec<String> = Vec::new();
+    let mut cached: Vec<(&String, &SemanticPerFile)> = Vec::new();
+    for rel_path in &all_rel_paths {
+        if let Some(entry) = cache.per_file.get(rel_path) {
+            cached.push((rel_path, entry));
+        } else {
+            uncached.push(rel_path.clone());
+        }
+    }
+    // Stalest first: entries with older (or empty) updated_at come first.
+    cached.sort_by(|a, b| a.1.updated_at.cmp(&b.1.updated_at));
+
+    // Build the selection: uncached first, then stalest cached, cap 200.
+    let cap = 200usize;
+    let mut selected: Vec<String> = Vec::with_capacity(cap);
+    // Move all uncached into selection (they're already sorted alphabetically,
+    // which is deterministic and acceptable).
+    selected.extend(uncached);
+    // Fill remaining slots with stalest cached entries.
+    for (rel_path, _) in &cached {
+        if selected.len() >= cap {
+            break;
+        }
+        selected.push((*rel_path).clone());
+    }
+    selected.truncate(cap);
+
+    // MERGE: start from the existing per_file map, replace only fetched entries.
+    let mut merged = cache.per_file.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // For each selected rel_path, call /similar (up to 5 results).
+    for rel_path in &selected {
+        let similar_result = match oracle_similar(project_root, rel_path, 5) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("polis semantic refresh: oracle_similar({rel_path}): {e}");
+                continue; // skip this file, keep existing cache entry (if any)
+            },
+        };
+        let entries: Vec<SimilarEntry> = similar_result
+            .into_iter()
+            .map(|sf| SimilarEntry {
+                file_id: sf.id,
+                score: sf.score as f32,
+            })
+            .collect();
+        if !entries.is_empty() {
+            merged.insert(
+                rel_path.clone(),
+                SemanticPerFile {
+                    similar: entries,
+                    cluster_id: None, // cluster ids from /clusters deferred to later
+                    updated_at: now.clone(),
+                },
+            );
+        }
+        // When entries is empty we leave the existing cache entry (if any)
+        // untouched — a file with no similar results is not an error.
+    }
+
+    let new_cache = SemanticCache {
+        epoch: oracle_epoch,
+        per_file: merged,
+    };
+
+    // Persist via with_write_lock (reloads fresh disk, mutates only semantic field).
+    MetaStore::with_write_lock(project_root, |disk| {
+        disk.semantic = new_cache;
+    })?;
+
+    Ok(true)
+}
 
 /// Shared Polis map state. Cloneable `Arc` handle to the current `CityState`,
 /// plus the project path of the last scan (used by era reset to locate the
@@ -178,6 +291,39 @@ fn scan_and_store(
         let mut guard = polis.lock_city()?;
         *guard = city.clone();
     }
+
+    // P6.2 — background semantic-cache refresh. Spawn ONCE per scan (guarded by
+    // AtomicBool); best-effort (failures logged, never fail the scan). Runs on a
+    // blocking thread because the Oracle HTTP wrappers are reqwest::blocking.
+    // After the cache is written, re-emit the city so semantic roads appear.
+    let app_clone = app.clone();
+    let path_clone = path.to_path_buf();
+    let refresh_running = SEMANTIC_REFRESH_RUNNING.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if !refresh_running {
+        std::thread::spawn(move || {
+            match refresh_semantic_cache(&path_clone) {
+                Ok(true) => {
+                    // Cache was updated: emit a dedicated event so the
+                    // frontend re-fetches the city with new semantic roads.
+                    // We use a separate ``polis://semantic-updated`` event (with
+                    // a truthy payload) instead of ``polis://city-updated``
+                    // because the frontend cityStore listener guards on
+                    // ``if (event.payload)`` — a bare ``()`` would be dropped.
+                    if let Err(e) = app_clone.emit("polis://semantic-updated", &true) {
+                        eprintln!("polis semantic refresh: emit failed: {e}");
+                    }
+                }
+                Ok(false) => {
+                    // Cache was fresh — no update needed.
+                }
+                Err(e) => {
+                    eprintln!("polis semantic refresh: {e}");
+                }
+            }
+            SEMANTIC_REFRESH_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
     Ok(city)
 }
 
@@ -1965,6 +2111,80 @@ fn build_file_uri(scheme: &str, abs_path: &Path) -> String {
     format!("{scheme}://file/{p}")
 }
 
+
+// ---------------------------------------------------------------------------
+// P6.2 — polis_get_kin
+// ---------------------------------------------------------------------------
+
+/// CACHE-ONLY kin lookup (no HTTP). Returns the top-K similar files for a given
+/// building from the persisted semantic cache.
+///
+/// PRIVACY: this reads ONLY the local `.aspis-meta.json` cache; it never contacts
+/// the Oracle. The response carries only project-relative file paths and scores.
+/// `rel_path` is a project-relative, forward-slash file path (the same key used
+/// throughout Polis — see `normalize_rel_path`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KinWire {
+    /// Project-relative file path of the similar file.
+    #[serde(rename = "relPath")]
+    pub rel_path: String,
+    /// Cosine similarity score [0, 1].
+    pub score: f32,
+}
+
+/// Return the top-K semantically-similar files (kin) for a building FROM THE
+/// PERSISTED CACHE ONLY. No HTTP, no Oracle contact — the cache is populated by
+/// the background refresh task after scans.
+///
+/// `project_path` mirrors `generate_city_state`: empty/None = this repo.
+/// `rel_path` is a project-relative path to a scanned building.
+///
+/// Returns an empty list (never an error) when the file has no cache entry or
+/// the cache is empty — fail-open contract.
+#[tauri::command]
+pub fn polis_get_kin(
+    project_path: Option<String>,
+    rel_path: String,
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+) -> Result<Vec<KinWire>, String> {
+    // Gated like generate_city_state (reads local files).
+    backend_state.ensure_unlocked()?;
+
+    // Resolve the project root the same way the scan command does.
+    let live =
+        crate::backend::agents::get_agent_live_state(app.clone(), backend_state.clone()).ok();
+    let path = resolve_scan_path(project_path, &app, &live);
+    if !path.is_dir() {
+        return Err(format!(
+            "Project path is not a directory: {}",
+            path.display()
+        ));
+    }
+
+    // Read from the persisted cache only.
+    use crate::polis::meta_store::MetaStore;
+    let meta = MetaStore::load(&path);
+    let normalized = crate::polis::meta_store::normalize_rel_path(&rel_path);
+
+    let Some(per_file) = meta.semantic.per_file.get(&normalized) else {
+        return Ok(Vec::new()); // fail-open: no cache entry -> empty
+    };
+
+    let kin: Vec<KinWire> = per_file
+        .similar
+        .iter()
+        .map(|e| KinWire {
+            rel_path: e.file_id.clone(),
+            score: e.score,
+        })
+        .collect();
+
+    Ok(kin)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2721,6 +2941,126 @@ mod tests {
             !prompt.contains(" \n"),
             "prompt contains trailing space on a line: {prompt:?}"
         );
+    }
+
+    // ── P6.2 polis_get_kin happy-path (no HTTP, seeded cache) ──
+
+    #[test]
+    fn polis_get_kin_from_seeded_cache() {
+        use crate::polis::meta_store::MetaStore;
+        use crate::polis::semantic::*;
+
+        // Build a temp dir with a seeded .aspis-meta.json carrying a semantic cache.
+        let dir = std::env::temp_dir().join(format!(
+            "polis_kin_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut per_file = std::collections::BTreeMap::new();
+        per_file.insert(
+            "src/a.rs".to_string(),
+            SemanticPerFile {
+                similar: vec![
+                    SimilarEntry { file_id: "src/b.rs".to_string(), score: 0.92 },
+                    SimilarEntry { file_id: "src/c.rs".to_string(), score: 0.85 },
+                ],
+                cluster_id: Some(0),
+                updated_at: "2025-07-09T12:00:00Z".to_string(),
+            },
+        );
+        let cache = SemanticCache {
+            epoch: "2025-07-09T12:00:00Z".to_string(),
+            per_file,
+        };
+
+        let mut meta = MetaStore::default();
+        meta.semantic = cache;
+        meta.save(&dir).unwrap();
+
+        // Reload and verify.
+        let loaded = MetaStore::load(&dir);
+        let kin = loaded
+            .semantic
+            .per_file
+            .get("src/a.rs")
+            .expect("a.rs must have a cache entry");
+        assert_eq!(kin.similar.len(), 2);
+        assert_eq!(kin.similar[0].file_id, "src/b.rs");
+        assert!((kin.similar[0].score - 0.92).abs() < 0.001);
+
+        // File without cache entry -> None (fail-open).
+        assert!(loaded.semantic.per_file.get("src/unknown.rs").is_none());
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_selection_picks_uncached_then_stalest() {
+        // Pure selection helper test: given a set of cached/uncached entries,
+        // verify that uncached files are picked first, then stalest by updated_at.
+        use crate::polis::semantic::{SemanticCache, SemanticPerFile};
+        use std::collections::BTreeMap;
+
+        let mut per_file = BTreeMap::new();
+        // Stale cached entry
+        per_file.insert(
+            "src/stale.rs".to_string(),
+            SemanticPerFile {
+                similar: vec![],
+                cluster_id: None,
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+        );
+        // Fresh cached entry
+        per_file.insert(
+            "src/fresh.rs".to_string(),
+            SemanticPerFile {
+                similar: vec![],
+                cluster_id: None,
+                updated_at: "2025-07-09T12:00:00Z".to_string(),
+            },
+        );
+        let cache = SemanticCache {
+            epoch: "2025-07-09T12:00:00Z".to_string(),
+            per_file,
+        };
+
+        let all = vec![
+            "src/fresh.rs".to_string(),
+            "src/stale.rs".to_string(),
+            "src/uncached.rs".to_string(),
+        ];
+
+        // Separate uncached vs cached, sort cached by updated_at.
+        let mut uncached: Vec<String> = Vec::new();
+        let mut cached: Vec<(String, String)> = Vec::new(); // (rel_path, updated_at)
+        for rp in &all {
+            if let Some(e) = cache.per_file.get(rp) {
+                cached.push((rp.clone(), e.updated_at.clone()));
+            } else {
+                uncached.push(rp.clone());
+            }
+        }
+        cached.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // Selection: uncached first, then stalest cached.
+        let mut selected: Vec<String> = Vec::new();
+        selected.extend(uncached.clone());
+        for (rp, _) in &cached {
+            selected.push(rp.clone());
+        }
+
+        // uncached first
+        assert_eq!(selected[0], "src/uncached.rs");
+        // then stalest (older updated_at) before fresher
+        assert_eq!(selected[1], "src/stale.rs");
+        assert_eq!(selected[2], "src/fresh.rs");
     }
 
 }

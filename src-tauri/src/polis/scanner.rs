@@ -337,8 +337,41 @@ pub(crate) fn generate_city_state_with_metrics(
         }
     }
 
-    // POLIS FOLLOW-UP: add `semantic` roads (Oracle embedding similarity > 0.82)
-    // and `infrastructure` roads (wrangler.toml bindings / env URLs) here.
+    // P6.2 — SEMANTIC roads from the persisted embedding-similarity cache.
+    // Emitted ONLY when the cache has entries; the cache is populated by a
+    // best-effort background refresh task after a successful scan, never during
+    // the scan itself (no HTTP on the scan path). Road weight 1, minor
+    //  style like clone roads. Only emit when BOTH endpoints
+    // are existing buildings (same guard as clone roads). The LEAN/MINIMAL
+    // render profile already gates non-import roads in the frontend; backend
+    // emits all available roads and the renderer decides.
+    //
+    // POLIS FOLLOW-UP: add `infrastructure` roads (wrangler.toml bindings / env URLs) here.
+    {
+        let semantic_pairs = meta.semantic.road_pairs(0.80, 2);
+        if !semantic_pairs.is_empty() {
+            let path_to_fid: std::collections::HashMap<&str, &str> =
+                file_id_by_path.iter().map(|(p, id)| (p.as_str(), id.as_str())).collect();
+            for (fa, fb, _score) in &semantic_pairs {
+                let Some(&fid_a) = path_to_fid.get(fa.as_str()) else {
+                    continue;
+                };
+                let Some(&fid_b) = path_to_fid.get(fb.as_str()) else {
+                    continue;
+                };
+                roads.push(Road {
+                    road_id: road_id(fid_a, fid_b, road_type::SEMANTIC),
+                    from: fid_a.to_string(),
+                    to: fid_b.to_string(),
+                    road_type: road_type::SEMANTIC.to_string(),
+                    style: road_style::TERRA_BATTUTA.to_string(),
+                    weight: 1,
+                    path: None,
+                    provenance: Some("semantic".to_string()),
+                });
+            }
+        }
+    }
 
     // Import-graph degree per file_id (real, computed signal for classification).
     let degrees = GraphDegrees::from_roads(&roads);

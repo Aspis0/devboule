@@ -94,6 +94,24 @@ class SQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chunk_file ON file_chunks(file_id)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_clusters (
+                  file_id TEXT PRIMARY KEY,
+                  cluster_id INTEGER NOT NULL,
+                  score REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clusters_meta (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL
+                )
+                """
+            )
+
 
     def upsert_many(self, cards: list[dict]) -> None:
         with self._connect() as conn:
@@ -261,6 +279,68 @@ class SQLiteStore:
         elif not isinstance(syms, list):
             chunk["symbols_used"] = []
         return chunk
+
+    # ── file_clusters accessors ──
+
+    def replace_file_clusters(self, rows: list[dict], *, epoch: str | None = None) -> None:
+        """Replace all file_clusters rows and optionally update the clusters epoch
+        in a SINGLE transaction (DELETE + INSERT + epoch UPDATE, one commit).
+        When ``epoch`` is ``None`` the clusters_meta table is left untouched
+        (backward-compatible for callers that do their own epoch write)."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM file_clusters")
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO file_clusters (file_id, cluster_id, score)
+                    VALUES (:file_id, :cluster_id, :score)
+                    """,
+                    rows,
+                )
+            if epoch is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO clusters_meta (key, value) VALUES ('epoch', ?)",
+                    (epoch,),
+                )
+
+    def set_clusters_epoch(self, epoch: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO clusters_meta (key, value) VALUES ('epoch', ?)",
+                (epoch,),
+            )
+
+    def get_clusters_epoch(self) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM clusters_meta WHERE key = 'epoch'"
+            ).fetchone()
+        return row[0] if row else None
+
+    def get_file_clusters(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT file_id, cluster_id, score FROM file_clusters ORDER BY cluster_id, file_id"
+            ).fetchall()
+        return [
+            {"file_id": row[0], "cluster_id": row[1], "score": row[2]}
+            for row in rows
+        ]
+
+    def get_cluster_members(self, cluster_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT file_id, cluster_id, score FROM file_clusters
+                WHERE cluster_id = ? ORDER BY score DESC, file_id
+                """,
+                (cluster_id,),
+            ).fetchall()
+        return [
+            {"file_id": row[0], "cluster_id": row[1], "score": row[2]}
+            for row in rows
+        ]
+
 
     def chunk_count(self) -> int:
         with self._connect() as conn:

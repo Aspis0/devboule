@@ -31,6 +31,7 @@ pub mod meta_store;
 pub mod model;
 pub mod nav;
 pub mod scanner;
+pub mod semantic;
 pub mod sins;
 pub mod terrain;
 pub mod watcher;
