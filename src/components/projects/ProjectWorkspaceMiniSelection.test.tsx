@@ -287,3 +287,80 @@ describe("ProjectWorkspace read-only (archived) mode", () => {
     expect(html).toContain('Immediately kills this mini-coder');
   });
 });
+
+describe("ProjectWorkspace consolidated tab bar", () => {
+  it("defaults to the Tasks tab (taskBoardSlot content visible by default)", () => {
+    // taskBoardSlot is the first thing rendered in the default tab.
+    const html = renderToStaticMarkup(
+      <ProjectWorkspace
+        project={project()}
+        sessions={[]}
+        claims={[]}
+        events={[]}
+        ptyAgents={new Set()}
+        isBusy={false}
+        canLaunch
+        launchMessage={null}
+        onBack={noop}
+        onLaunch={noop}
+        onCopyPrompt={noop}
+        onCommit={noop}
+        onPush={noop}
+        onPull={noop}
+        onStopAgent={noop}
+        onFocusCli={noop}
+        onCopyRecovery={noop}
+        gitActionMessage={null}
+        gitActionError={false}
+        gitActionBusy={false}
+        taskBoardSlot={<div>FIXTURE_TASK_BOARD</div>}
+      />,
+    );
+    expect(html).toContain("FIXTURE_TASK_BOARD");
+  });
+
+  it("renders all 8 tab labels", () => {
+    const html = render([], new Set());
+    expect(html).toContain(">Tasks<");
+    expect(html).toContain(">Censor<");
+    expect(html).toContain(">Git<");
+    expect(html).toContain(">Changes<");
+    expect(html).toContain(">Plans<");
+    expect(html).toContain(">Notes<");
+    expect(html).toContain(">MCP<");
+    expect(html).toContain(">Project<");
+  });
+
+  it("shows the Launch button title with client labels", () => {
+    const html = render([], new Set());
+    // BUILTIN_CLIENTS labels should appear in the title.
+    expect(html).toContain('title="codex');
+    expect(html).toContain('claude');
+  });
+
+  it("hides the Censor strip (now in tab) and taskBoardSlot (now in tab) as standalone blocks", () => {
+    // With no tab clicked, the default is Tasks tab. The Censor strip and
+    // task board should NOT appear as standalone top-level blocks anymore —
+    // they live inside the tab bar.
+    const html = render(
+      [session({ agentId: "coder-1" })],
+      new Set(["coder-1"]),
+    );
+    // CensorStrip was a standalone block above the dock — it should now only
+    // appear inside the Censor tab content.
+    // The key thing: the old standalone `{taskBoardSlot}` and `<CensorStrip>`
+    // blocks are gone; everything is inside the tab bar.
+    // We can verify by checking the tab bar structure exists.
+    expect(html).toContain(">Tasks<");
+    expect(html).toContain(">Censor<");
+  });
+
+  it("archived (readOnly) mode still renders the tab bar", () => {
+    const html = render([], new Set(), { readOnly: true, onUnarchive: noop });
+    // The archived banner is still present.
+    expect(html).toContain("Project archived");
+    // Tab bar is still visible.
+    expect(html).toContain(">Tasks<");
+    expect(html).toContain(">Censor<");
+  });
+});

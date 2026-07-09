@@ -93,7 +93,6 @@ import type {
 import type { EffectiveRolesConfig } from "../../types/config";
 import { isOpenClaim, isRecentProjectSession } from "../../utils/agentClaims";
 import { resolveOrchestratorClient } from "../../utils/orchestratorClient";
-import { CollapsibleSection } from "../projects/CollapsibleSection";
 import { formatDateTime } from "../projects/projectFormat";
 import type { SpawnRole } from "../agents/roleDisplay";
 
@@ -3042,15 +3041,7 @@ export function ProjectsView() {
 
 	const taskBoardNode =
 		workMode && currentProject ? (
-			<CollapsibleSection
-				icon={FolderKanban}
-				title="Tasks"
-				purpose="Tasks for this project"
-				summary={`${tasksByColumn.done.length} done · ${tasksByColumn.wip.length} in progress · ${tasksByColumn.review.length} in review`}
-				defaultOpen
-				helpTitle="Board is for tasks and quick coder/verifier launches."
-				helpLines="Task columns are the project-level Kanban workflow.|For Devboule, coders should move tasks toward Review and verifiers decide when Done is justified.|Manual moves are blocked when an agent has an open claim to avoid conflicting writes.|The Markdown project file is the durable state behind this UI."
-			>
+			<div>
 				{/* Create-task form: hidden when the project is archived (read-only). The
           task COLUMNS below stay visible so archived tasks remain inspectable. */}
 				{!isArchived && (
@@ -3308,7 +3299,7 @@ export function ProjectsView() {
 						})}
 					</div>
 				</div>
-			</CollapsibleSection>
+			</div>
 		) : null;
 
 	return (

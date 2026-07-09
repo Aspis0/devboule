@@ -8,8 +8,10 @@
 //     launcher are replaced: launch is now a top-bar "+ Launch" → SpawnPanel.)
 //   - Center: the FocusStage — Activity (structured) / Raw (the lazy AgentTerminalViewer,
 //     KEYED by agentId) + a two-way composer + inline question card.
-//   - Task board (taskBoardSlot) above the dock; bottom dock: Censor (default)
-//     / Git / Plans / Console / MCP; Notes (notesSlot) below the dock.
+//   - ONE consolidated tab bar below the console: Tasks (default) / Censor / Git /
+//     Changes / Plans / Notes / MCP / Project. The task board, notes, project detail,
+//     censor strip + panel, git detail, changes, plans (history + approval), and MCP
+//     servers all live in their respective tabs.
 //
 // CRITICAL: this component adds NO agent-state poller. It consumes the sessions /
 // claims / events ProjectsView already polls (passed as props). Each focus pane mounts the
@@ -65,7 +67,7 @@ import {
   type ImperativePanelGroupHandle,
 } from "react-resizable-panels";
 import { LivingPlan } from "../work/LivingPlan";
-import { SpawnPanel } from "../agents/SpawnPanel";
+import { BUILTIN_CLIENTS, SpawnPanel } from "../agents/SpawnPanel";
 import { SkillsToolsModal } from "../work/SkillsToolsModal";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
@@ -101,6 +103,7 @@ import {
   shouldShowCompact,
   workspaceGitLine,
 } from "./projectWorkspaceModel";
+import { readActiveTabPref, writeActiveTabPref } from "./activeTabPref";
 import {
   useWorkSelectionStore,
   taskIdForAgent,
@@ -265,8 +268,39 @@ export function ProjectWorkspace({
   useEffect(() => {
     panelGroupRef.current?.setLayout(splitAgentId ? [50, 50] : [100]);
   }, [splitAgentId]);
-  const [dockTab, setDockTab] = useState<DockTab>(DEFAULT_DOCK_TAB);
+  const [dockTab, setDockTabState] = useState<DockTab>(() =>
+    readActiveTabPref(project.metadata.id),
+  );
+  const setDockTab = useCallback(
+    (next: DockTab) => {
+      setDockTabState(next);
+      writeActiveTabPref(project.metadata.id, next);
+    },
+    [project.metadata.id],
+  );
   const [launcherOpen, setLauncherOpen] = useState(false);
+  // Plan pending count: fed by PlanApprovalCard's onPendingCountChange callback.
+  const [planPendingCount, setPlanPendingCount] = useState(0);
+
+  // Client labels for the Launch button tooltip.
+  const clientLabels = useMemo(() => {
+    const builtins = BUILTIN_CLIENTS.map((c) => c.label);
+    const customs = customClients.map((c) => c.label);
+    return [...builtins, ...customs];
+  }, [customClients]);
+  const clientLabelStr = useMemo(
+    () => clientLabels.join(" \u{00b7} "),
+    [clientLabels],
+  );
+
+  // Tasks badge: count of wip + review tasks.
+  const tasksBadgeCount = useMemo(
+    () =>
+      project.state.tasks.filter(
+        (t) => t.status === "wip" || t.status === "review",
+      ).length,
+    [project.state.tasks],
+  );
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
 
@@ -863,6 +897,7 @@ export function ProjectWorkspace({
               type="button"
               onClick={() => setLauncherOpen((open) => !open)}
               disabled={!canLaunch}
+              title={clientLabelStr}
               data-help-title="Launch a coder or verifier for this project."
               data-help-lines="Opens the spawn panel to start a new agent on this project.|Pick a coder (writes code) or a verifier (reviews) and a task.|Only active projects can launch agents.|The new agent appears in the Living Plan on the file it claims."
               className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-semibold disabled:opacity-60 ${
@@ -958,10 +993,6 @@ export function ProjectWorkspace({
         </p>
       )}
 
-      {/* B8: the per-project detail (status header + root editor + saved workflows),
-          relocated here from the create landing. */}
-      {detailSlot}
-
       {/* GH-P4: agent push-approval gate — agents commit freely, the human approves
           every push. Surfaces this project's pending request(s) with Approve/Deny.
           Hidden when archived (read-only): an archived project has no live agents to
@@ -976,12 +1007,6 @@ export function ProjectWorkspace({
           onPending={handleBridgePending}
         />
       )}
-
-      {/* Plan approval gate — surfaces pending plan-approval requests for the current
-          project. Rendered beside the push card; always visible when pending requests
-          exist, regardless of the active dock tab. Hidden when archived for the same
-          reason as the push card (approve/reject are mutations). */}
-      {!readOnly && <PlanApprovalCard projectId={project.metadata.id} />}
 
       {/* Permission-broker consent gate — surfaces the head of the FIFO queue when
           a mini-coder is blocked. Handles Net (Slice 0) and FolderWrite (Slice 2).
@@ -1025,10 +1050,12 @@ export function ProjectWorkspace({
           );
         })()}
 
-      {/* ---- Launcher (moved from the rail to a top-bar "+ Launch" toggle) ---- */}
+      {/* ---- Skills & Tools modal ---- */}
       {skillsOpen && (
         <SkillsToolsModal projectRoot={censorRoot} onClose={closeSkills} />
       )}
+
+      {/* ---- Launcher (anchored above the console grid) ---- */}
       {launcherOpen && !readOnly && (
         <SpawnPanel
           projects={[
@@ -1049,7 +1076,7 @@ export function ProjectWorkspace({
       )}
 
       {/* ---- Main: Living Plan (left nav, replaces the rail) + Focus stage (center) ---- */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
+      <div className="grid grid-cols-1 gap-4 min-h-[60vh] lg:grid-cols-[300px_minmax(0,1fr)]">
         <div className="overflow-hidden rounded-2xl border border-cream-200 bg-white">
           <LivingPlan
             model={workConsoleModel}
@@ -1290,19 +1317,16 @@ export function ProjectWorkspace({
         </section>
       </div>
 
-      {/* ---- Censor strip: project-wide inspection summary (sober, always-visible) ---- */}
-      <div className="overflow-hidden rounded-2xl border border-cream-200 bg-white">
-        <CensorStrip model={censorStrip} />
-      </div>
-
-      {/* ---- Task board (relocated from the board-mode panel), above the dock ---- */}
-      {taskBoardSlot}
-
-      {/* ---- Bottom dock ---- */}
+      {/* ---- Consolidated tab bar: 8 tabs in one row ---- */}
       <div className="rounded-2xl border border-cream-200 bg-white">
         <div className="flex w-fit gap-1 border-b border-cream-200 p-1">
           {DOCK_TABS.map((tab) => {
             const active = dockTab === tab.id;
+            // Badge counts for specific tabs.
+            let badge: number | null = null;
+            if (tab.id === "tasks") badge = tasksBadgeCount || null;
+            else if (tab.id === "censor") badge = censorStrip.openFindings || null;
+            else if (tab.id === "plans" && !readOnly) badge = planPendingCount || null;
             return (
               <button
                 key={tab.id}
@@ -1315,14 +1339,42 @@ export function ProjectWorkspace({
                 }`}
               >
                 {tab.label}
+                {badge != null && (
+                  <span
+                    className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold leading-none ${
+                      active
+                        ? "bg-white/20 text-white"
+                        : "bg-cream-100 text-cream-600"
+                    }`}
+                  >
+                    {badge}
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
 
         <div className="p-4">
+          {/* Plan approval card: mounted ALWAYS (hidden when not on Plans tab) so its
+              poll keeps the badge count fed. Renders at the TOP of the Plans tab. */}
+          {!readOnly && (
+            <PlanApprovalCard
+              projectId={project.metadata.id}
+              onPendingCountChange={setPlanPendingCount}
+              hidden={dockTab !== "plans"}
+            />
+          )}
+
+          {/* ---- Tasks tab ---- */}
+          {dockTab === "tasks" && taskBoardSlot}
+
+          {/* ---- Censor tab ---- */}
           {dockTab === "censor" && (
             <div className="space-y-5">
+              <div className="overflow-hidden rounded-2xl">
+                <CensorStrip model={censorStrip} />
+              </div>
               {!readOnly && (
                 <SandboxModeSelector
                   projectId={project.metadata.id}
@@ -1355,12 +1407,21 @@ export function ProjectWorkspace({
             </div>
           )}
 
+          {/* ---- Git tab ---- */}
           {dockTab === "git" && <DockGit project={project} />}
 
+          {/* ---- Changes tab ---- */}
+          {dockTab === "changes" && <ChangesDockTab project={project} />}
+
+          {/* ---- Plans tab ---- */}
           {dockTab === "plans" && (
             <PlansDockTab projectId={project.metadata.id} />
           )}
 
+          {/* ---- Notes tab ---- */}
+          {dockTab === "notes" && notesSlot}
+
+          {/* ---- MCP tab ---- */}
           {dockTab === "mcp" &&
             (project.metadata.rootPath ? (
               <ProjectMcpServersCard projectRoot={project.metadata.rootPath} />
@@ -1370,12 +1431,10 @@ export function ProjectWorkspace({
               </p>
             ))}
 
-          {dockTab === "changes" && <ChangesDockTab project={project} />}
+          {/* ---- Project tab ---- */}
+          {dockTab === "project" && detailSlot}
         </div>
       </div>
-
-      {/* ---- Notes (relocated from the board-mode panel), below the dock ---- */}
-      {notesSlot}
     </div>
   );
 }

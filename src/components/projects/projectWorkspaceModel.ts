@@ -474,23 +474,25 @@ export function miniKillCall(session: AgentSession): IpcCall | null {
 
 // ---- bottom dock ------------------------------------------------------------
 
-export type DockTab = "censor" | "git" | "plans" | "mcp" | "changes";
+export type DockTab = "tasks" | "censor" | "git" | "plans" | "mcp" | "changes" | "notes" | "project";
 
-/** The dock's default-selected tab. Censor is the star of the Work-mode dock
- *  (the placeholder this phase, real UI in Phase E). */
-export const DEFAULT_DOCK_TAB: DockTab = "censor";
+/** The dock's default-selected tab. Tasks is the star of the Work-mode dock —
+ *  the project's Kanban board is the first thing the user sees. */
+export const DEFAULT_DOCK_TAB: DockTab = "tasks";
 
 export const DOCK_TABS: { id: DockTab; label: string }[] = [
+	{ id: "tasks", label: "Tasks" },
 	{ id: "censor", label: "Censor" },
 	{ id: "git", label: "Git" },
+	{ id: "changes", label: "Changes" },
 	{ id: "plans", label: "Plans" },
+	{ id: "notes", label: "Notes" },
 	// NOTE: the standalone "Console" dock tab was merged into the unified Work Console
 	// (FocusStage Activity view) and removed — no duplicate structured-console surface.
 	// Project-scoped user MCP servers (Phase A.3).
 	{ id: "mcp", label: "MCP" },
-	// Read-only working-tree diff + "Open in <editor>" / Open-PR launchers (open the
-	// change in an external reviewer; we do not embed one). Fase 2.
-	{ id: "changes", label: "Changes" },
+	// Project detail (status header + root editor + saved workflows).
+	{ id: "project", label: "Project" },
 ];
 
 // ---- plan approval model ---------------------------------------------------

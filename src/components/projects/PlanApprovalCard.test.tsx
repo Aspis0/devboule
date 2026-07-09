@@ -102,6 +102,115 @@ describe("PlanApprovalCard note textarea", () => {
   });
 });
 
+describe("PlanApprovalCard onPendingCountChange", () => {
+  it("fires with the correct count on mount with pending requests", async () => {
+    const cb = vi.fn();
+    const { createRoot } = await import("react-dom/client");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        createElement(PlanApprovalCard, {
+          projectId: "p1",
+          requests: [req(), req({ id: "req-2" })],
+          onPendingCountChange: cb,
+        }),
+      );
+    });
+    expect(cb).toHaveBeenCalledWith(2);
+    root.unmount();
+    container.remove();
+  });
+
+  it("fires with 0 when there are no matching requests", async () => {
+    const cb = vi.fn();
+    const { createRoot } = await import("react-dom/client");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        createElement(PlanApprovalCard, {
+          projectId: "other",
+          requests: [req()],
+          onPendingCountChange: cb,
+        }),
+      );
+    });
+    expect(cb).toHaveBeenCalledWith(0);
+    root.unmount();
+    container.remove();
+  });
+
+  it("fires with 0 when requests list is empty", async () => {
+    const cb = vi.fn();
+    const { createRoot } = await import("react-dom/client");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        createElement(PlanApprovalCard, {
+          projectId: "p1",
+          requests: [],
+          onPendingCountChange: cb,
+        }),
+      );
+    });
+    expect(cb).toHaveBeenCalledWith(0);
+    root.unmount();
+    container.remove();
+  });
+});
+
+describe("PlanApprovalCard hidden prop", () => {
+  it("renders nothing when hidden=true even with pending requests", () => {
+    const html = renderToStaticMarkup(
+      <PlanApprovalCard
+        projectId="p1"
+        requests={[req()]}
+        hidden
+      />,
+    );
+    expect(html).toBe("");
+  });
+
+  it("still fires onPendingCountChange when hidden", async () => {
+    const cb = vi.fn();
+    const { createRoot } = await import("react-dom/client");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        createElement(PlanApprovalCard, {
+          projectId: "p1",
+          requests: [req()],
+          hidden: true,
+          onPendingCountChange: cb,
+        }),
+      );
+    });
+    expect(cb).toHaveBeenCalledWith(1);
+    // Should render nothing (hidden).
+    expect(container.innerHTML).toBe("");
+    root.unmount();
+    container.remove();
+  });
+
+  it("renders normally when hidden=false (default)", () => {
+    const html = renderToStaticMarkup(
+      <PlanApprovalCard
+        projectId="p1"
+        requests={[req()]}
+        hidden={false}
+      />,
+    );
+    expect(html).toContain("Approve");
+  });
+});
+
 // ---- WARNING #3: no concurrent-load race after a resolve --------------------
 //
 // The bug: `resolve()` manually set `inFlightRef.current = false` right before

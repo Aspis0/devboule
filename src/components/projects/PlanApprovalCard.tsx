@@ -24,6 +24,12 @@ export interface PlanApprovalCardProps {
    *  The parent passes the full requests list; the card filters by projectId.
    *  When omitted the card polls independently (self-contained mode). */
   requests?: PlanApprovalRequest[];
+  /** Optional: fires whenever the pending request count changes. Used by the
+   *  parent to feed the Plans tab badge count without polling itself. */
+  onPendingCountChange?: (count: number) => void;
+  /** Optional: when true, the component still runs its full poll/derive/callback
+   *  logic (so the count keeps updating) but renders nothing. Default false. */
+  hidden?: boolean;
 }
 
 interface ExpandedPlan {
@@ -38,7 +44,7 @@ interface ResolvedEntry {
   status: string;
 }
 
-export function PlanApprovalCard({ projectId, requests: externalRequests }: PlanApprovalCardProps) {
+export function PlanApprovalCard({ projectId, requests: externalRequests, onPendingCountChange, hidden = false }: PlanApprovalCardProps) {
   const [polledRequests, setPolledRequests] = useState<PlanApprovalRequest[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -96,6 +102,12 @@ export function PlanApprovalCard({ projectId, requests: externalRequests }: Plan
   const requests = isControlled
     ? pendingPlanRequestsForProject(externalRequests, projectId)
     : polledRequests;
+
+  // Notify the parent of the pending count whenever it changes.
+  // MUST be before the early return below (Rules of Hooks).
+  useEffect(() => {
+    onPendingCountChange?.(requests.length);
+  }, [requests.length, onPendingCountChange]);
 
   const fetchMarkdown = useCallback(
     async (request: PlanApprovalRequest) => {
@@ -162,7 +174,7 @@ export function PlanApprovalCard({ projectId, requests: externalRequests }: Plan
     [load, clearResolvedTimer, noteById, expanded],
   );
 
-  if (requests.length === 0 && !lastResolved && !actionError) {
+  if (hidden || (requests.length === 0 && !lastResolved && !actionError)) {
     return null;
   }
 

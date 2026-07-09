@@ -60,7 +60,7 @@ export const ROLE_OPTIONS: { id: SpawnRole; label: string; summary: string }[] =
 // L2.4: "orchestrator" selects the LOCAL Devboule main coder (oMLX) — the backend
 // dispatches its own binary instead of an external CLI when client ===
 // "orchestrator" (normalize_agent_client + RESERVED_CLIENT_IDS in projects.rs).
-const BUILTIN_CLIENTS: { id: string; label: string }[] = [
+export const BUILTIN_CLIENTS: { id: string; label: string }[] = [
 	{ id: "codex", label: "codex" },
 	{ id: "claude", label: "claude" },
 	{ id: "openai", label: "openai" },

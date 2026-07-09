@@ -782,20 +782,21 @@ describe("runGitActionGuarded", () => {
 // ---- dock -------------------------------------------------------------------
 
 describe("dock", () => {
-	it("defaults to Censor", () => {
-		expect(DEFAULT_DOCK_TAB).toBe("censor");
-		expect(DOCK_TABS[0].id).toBe("censor");
+	it("defaults to Tasks", () => {
+		expect(DEFAULT_DOCK_TAB).toBe("tasks");
+		expect(DOCK_TABS[0].id).toBe("tasks");
 	});
 
-	it("exposes the five tabs in order (Console merged into the unified Work Console)", () => {
-		// The standalone "Console" dock tab was merged into the FocusStage Activity view
-		// and removed — no duplicate structured-console surface.
+	it("exposes the eight tabs in order", () => {
 		expect(DOCK_TABS.map((t) => t.id)).toEqual([
+			"tasks",
 			"censor",
 			"git",
-			"plans",
-			"mcp",
 			"changes",
+			"plans",
+			"notes",
+			"mcp",
+			"project",
 		]);
 		// "console" is no longer even a valid DockTab (removed from the union).
 		expect(
@@ -803,6 +804,9 @@ describe("dock", () => {
 		).toBeUndefined();
 		expect(DOCK_TABS.find((t) => t.id === "mcp")!.label).toBe("MCP");
 		expect(DOCK_TABS.find((t) => t.id === "changes")!.label).toBe("Changes");
+		expect(DOCK_TABS.find((t) => t.id === "tasks")!.label).toBe("Tasks");
+		expect(DOCK_TABS.find((t) => t.id === "notes")!.label).toBe("Notes");
+		expect(DOCK_TABS.find((t) => t.id === "project")!.label).toBe("Project");
 	});
 });
 
