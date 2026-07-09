@@ -1336,7 +1336,6 @@ def _refresh_clusters(index_root) -> None:
     Any exception → logged, propagate up to the best-effort wrapper (which swallows).
     """
     import numpy as np
-    from datetime import datetime, timezone
     from oracle.config import SQLITE_PATH, CHUNK_DB_PATH, FILE_VECTORS_DB_PATH
     from oracle.store.sqlite_store import SQLiteStore
     from oracle.store.lance_store import LanceStore
@@ -1345,11 +1344,17 @@ def _refresh_clusters(index_root) -> None:
     chunk_vectors = LanceStore(CHUNK_DB_PATH)
     file_vectors = LanceStore(FILE_VECTORS_DB_PATH)
 
+    import hashlib
+
     all_chunks = sqlite.all_chunks()
-    epoch = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     if not all_chunks:
-        sqlite.replace_file_clusters([], epoch=epoch)
+        # Empty chunk set: epoch = sha256 of empty rows + empty file_ids.
+        empty_epoch = hashlib.sha256(b"").hexdigest()[:16]
+        current = sqlite.get_clusters_epoch() or ""
+        if empty_epoch == current:
+            return  # unchanged — skip write
+        sqlite.replace_file_clusters([], epoch=empty_epoch)
         file_vectors.replace_all([])
         return
 
@@ -1386,7 +1391,11 @@ def _refresh_clusters(index_root) -> None:
     # Clustering requires a minimum number of files to produce meaningful
     # groups; below the threshold we only write per-file vectors above.
     if n < 8:
-        sqlite.replace_file_clusters([], epoch=epoch)
+        # Content-based epoch for the "no clusters" case.
+        min_epoch = hashlib.sha256(("\n".join(file_ids)).encode()).hexdigest()[:16]
+        current = sqlite.get_clusters_epoch() or ""
+        if min_epoch != current:
+            sqlite.replace_file_clusters([], epoch=min_epoch)
         return
 
     # Cluster
@@ -1416,6 +1425,21 @@ def _refresh_clusters(index_root) -> None:
         s = float(scores[i]) if scores[i] is not None else 0.0
         rows.append({"file_id": fid, "cluster_id": lbl, "score": s})
 
+    # Compute content-based epoch: sha256 of the sorted (file_id, cluster_id,
+    # round(score,4)) rows + the pooled file ids. Deterministic — identical
+    # clustering produces the same epoch, so we skip the DB write entirely when
+    # nothing changed (prevents unnecessary purges/rewrites of the sqlite table).
+    sig_rows: list[str] = []
+    for r in rows:
+        sig_rows.append(f"{r['file_id']}	{r['cluster_id']}	{round(r['score'], 4)}")
+    sig_rows.sort()
+    sig_body = "\n".join(sig_rows) + "\n" + "\n".join(file_ids)
+    epoch = hashlib.sha256(sig_body.encode()).hexdigest()[:16]
+
+    # Read current epoch; skip write if identical (stable across identical re-runs).
+    current = sqlite.get_clusters_epoch() or ""
+    if epoch == current:
+        return  # unchanged — skip write
     sqlite.replace_file_clusters(rows, epoch=epoch)
 
 

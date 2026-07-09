@@ -3462,10 +3462,9 @@ fn road_cap_for(building_count: usize) -> usize {
 ///                           survivors are a stable lexicographic prefix, so the same
 ///                           input yields the same survivors every scan (no churn).
 ///
-/// Roads are NOT distinguished by `road_type` here: today only `import` roads exist
-/// (semantic/infrastructure are documented future work), and the ranking signals
-/// (`weight`, endpoint degree) are universal, so any future road kind is ranked on
-/// the same footing rather than silently bypassing the budget.
+/// Non-import roads (clone, semantic) are excluded from the ranking set and always
+/// retained — they are bounded at source (max 20 clones, 2/file semantic) so they
+/// never need the proportional cap. Only import roads are capped.
 ///
 /// KNOWN INTERACTION (deferred): the cap is NOT meta-graph-aware. At cap-firing
 /// scale (very large cities) the ranking keys above — weight DESC, endpoint-degree
@@ -3477,24 +3476,38 @@ fn road_cap_for(building_count: usize) -> usize {
 /// coupling graph degrades gracefully today; this only bites at extreme scale).
 fn cap_roads(roads: &mut Vec<Road>, building_count: usize) -> usize {
     let original = roads.len();
-    let cap = road_cap_for(building_count);
-    if original <= cap {
-        return original; // under budget — leave the set untouched (zero cost).
+
+    // Separate non-import roads (clone, semantic): they are bounded at source
+    // (20 clones max, 2/file semantic) and must never be dropped by the import
+    // budget cap. Split, cap only imports, rejoin.
+    let mut non_import: Vec<Road> = Vec::new();
+    let mut imports: Vec<Road> = Vec::new();
+    for r in roads.drain(..) {
+        if r.road_type == road_type::IMPORT {
+            imports.push(r);
+        } else {
+            non_import.push(r);
+        }
     }
 
-    // Endpoint road-degree over the FULL pre-cap set: how many roads touch each
-    // file_id (as `from` OR `to`). BTreeMap: ordered, hash-seed-free determinism.
+    let import_original = imports.len();
+    let cap = road_cap_for(building_count);
+    if import_original <= cap {
+        // Under budget — rejoin untouched (zero cost).
+        *roads = imports;
+        roads.extend(non_import);
+        return original;
+    }
+
+    // Endpoint road-degree over the FULL pre-cap IMPORT set: how many import
+    // roads touch each file_id (as `from` OR `to`).
     let mut degree: BTreeMap<&str, u32> = BTreeMap::new();
-    for r in roads.iter() {
+    for r in imports.iter() {
         *degree.entry(r.from.as_str()).or_insert(0) += 1;
         *degree.entry(r.to.as_str()).or_insert(0) += 1;
     }
 
-    // Precompute the endpoint-degree SCORE for each road ONCE into a parallel Vec
-    // (indexed like `roads`), so the comparator does O(1) Vec lookups instead of two
-    // BTreeMap lookups per call (a comparator runs O(N log N) times). Same observable
-    // ranking — only the per-comparison cost drops.
-    let score: Vec<u32> = roads
+    let score: Vec<u32> = imports
         .iter()
         .map(|r| {
             degree.get(r.from.as_str()).copied().unwrap_or(0)
@@ -3502,12 +3515,9 @@ fn cap_roads(roads: &mut Vec<Road>, building_count: usize) -> usize {
         })
         .collect();
 
-    // Rank by the documented key. We sort INDICES (score/roads borrowed), then
-    // materialize the survivors so we never clone a road just to rank it.
-    let mut order: Vec<usize> = (0..original).collect();
+    let mut order: Vec<usize> = (0..import_original).collect();
     order.sort_by(|&a, &b| {
-        let (ra, rb) = (&roads[a], &roads[b]);
-        // weight DESC, endpoint-degree DESC, (from, to) ASC.
+        let (ra, rb) = (&imports[a], &imports[b]);
         rb.weight
             .cmp(&ra.weight)
             .then_with(|| score[b].cmp(&score[a]))
@@ -3515,16 +3525,17 @@ fn cap_roads(roads: &mut Vec<Road>, building_count: usize) -> usize {
     });
     order.truncate(cap);
 
-    // Materialize survivors by index. `mem::take` lets us move the kept roads out
-    // of the original vec (the dropped ones are freed when `roads` is overwritten).
-    let mut taken: Vec<Option<Road>> = roads.drain(..).map(Some).collect();
+    let mut taken: Vec<Option<Road>> = imports.drain(..).map(Some).collect();
     let mut survivors: Vec<Road> = Vec::with_capacity(cap);
     for idx in order {
         if let Some(r) = taken[idx].take() {
             survivors.push(r);
         }
     }
+
+    // Rejoin: capped imports + all non-imports (always retained).
     *roads = survivors;
+    roads.extend(non_import);
     original
 }
 
@@ -4043,8 +4054,13 @@ pub fn layout(
     // Unordered district pair -> summed road weight (CROSS-district roads only;
     // intra-district roads contribute nothing). BTreeMap keyed on an ordered
     // (min,max) String pair for hash-seed-free determinism.
+    // Only IMPORT roads measure structural coupling; clone and semantic roads
+    // are orthogonal signals and must not inflate coupling/district-order.
     let mut coupling: BTreeMap<(String, String), u64> = BTreeMap::new();
     for r in roads {
+        if r.road_type != road_type::IMPORT {
+            continue;
+        }
         let (Some(&da), Some(&db)) = (
             district_by_file_id.get(r.from.as_str()),
             district_by_file_id.get(r.to.as_str()),
@@ -11048,6 +11064,98 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         // No road FROM id-a (AST-covered, authoritative even at zero imports).
         let from_a = roads.iter().filter(|r| r.from == "id-a").count();
         assert_eq!(from_a, 0, "AST-covered file must not get regex roads, got {:?}", roads);
+    }
+
+    // =========================================================================
+    // F3: cap_roads keeps all non-import roads, caps only imports
+    // =========================================================================
+
+    fn mk_typed_road(from: &str, to: &str, road_type: &str, weight: u32) -> Road {
+        Road {
+            road_id: format!("road-{from}-{to}-{road_type}"),
+            from: from.to_string(),
+            to: to.to_string(),
+            road_type: road_type.to_string(),
+            style: "via".to_string(),
+            weight,
+            path: None,
+            provenance: Some("ast".to_string()),
+        }
+    }
+
+    #[test]
+    fn cap_roads_retains_all_clone_and_semantic_roads() {
+        let mut roads: Vec<Road> = Vec::new();
+        // 50 import roads (over cap for small building count) + 3 clone + 2 semantic
+        for i in 0..50u32 {
+            roads.push(mk_typed_road(&format!("a{i}"), &format!("b{i}"), road_type::IMPORT, 1));
+        }
+        roads.push(mk_typed_road("c1", "c2", road_type::CLONE, 1));
+        roads.push(mk_typed_road("c3", "c4", road_type::CLONE, 1));
+        roads.push(mk_typed_road("c5", "c6", road_type::CLONE, 1));
+        roads.push(mk_typed_road("s1", "s2", road_type::SEMANTIC, 1));
+        roads.push(mk_typed_road("s3", "s4", road_type::SEMANTIC, 1));
+
+        let building_count = 10; // cap ≈ floor(min(10*0.15, 8), 15) = 8
+        cap_roads(&mut roads, building_count);
+
+        let clone_count = roads.iter().filter(|r| r.road_type == road_type::CLONE).count();
+        let semantic_count = roads.iter().filter(|r| r.road_type == road_type::SEMANTIC).count();
+        let import_count = roads.iter().filter(|r| r.road_type == road_type::IMPORT).count();
+
+        assert_eq!(clone_count, 3, "all clone roads must survive the cap");
+        assert_eq!(semantic_count, 2, "all semantic roads must survive the cap");
+        assert!(import_count <= road_cap_for(building_count), "import roads must be capped");
+    }
+
+    #[test]
+    fn cap_roads_under_budget_keeps_everything() {
+        let mut roads: Vec<Road> = Vec::new();
+        roads.push(mk_typed_road("a", "b", road_type::IMPORT, 3));
+        roads.push(mk_typed_road("c", "d", road_type::CLONE, 1));
+        roads.push(mk_typed_road("e", "f", road_type::SEMANTIC, 1));
+
+        cap_roads(&mut roads, 300); // huge budget
+        assert_eq!(roads.len(), 3, "under cap must keep all roads");
+    }
+
+    #[test]
+    fn clone_road_does_not_change_coupling_weight() {
+        // Simulate the coupling loop: clone/semantic roads are skipped.
+        // Only IMPORT roads accumulate inter-district coupling.
+        use std::collections::BTreeMap;
+
+        // district_by_file_id: two files in different districts
+        let mut district_by_file_id: BTreeMap<&str, &str> = BTreeMap::new();
+        district_by_file_id.insert("fid-a", "d1");
+        district_by_file_id.insert("fid-b", "d2");
+
+        let roads = vec![
+            mk_typed_road("fid-a", "fid-b", road_type::IMPORT, 3),
+            mk_typed_road("fid-a", "fid-b", road_type::CLONE, 10),
+        ];
+
+        let mut coupling: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for r in &roads {
+            if r.road_type != road_type::IMPORT {
+                continue;
+            }
+            let da = district_by_file_id[r.from.as_str()];
+            let db = district_by_file_id[r.to.as_str()];
+            if da == db {
+                continue;
+            }
+            let key = if da <= db {
+                (da.to_string(), db.to_string())
+            } else {
+                (db.to_string(), da.to_string())
+            };
+            *coupling.entry(key).or_insert(0) += r.weight as u64;
+        }
+
+        // Only the import road (weight 3) contributes; clone road (weight 10) is skipped.
+        let pair = coupling.get(&("d1".to_string(), "d2".to_string()));
+        assert_eq!(pair, Some(&3), "only IMPORT roads must contribute to coupling");
     }
 
 }

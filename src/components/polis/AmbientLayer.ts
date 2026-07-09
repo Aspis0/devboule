@@ -215,8 +215,8 @@ export class AmbientLayer {
   // while P4 owns it; `adopt` decrements it when the agent's omino returns to the
   // crowd. Single-owner invariant: a walker is owned by EITHER this layer OR
   // AgentLayer, never both — the claimedCount tracks how many we've handed away.
-  // P5.2 — per-building entry-slot allocator (presentation, NOT CityState).
-  private slotAllocator = new SlotAllocator();
+  // P5.2 — shared per-building entry-slot allocator (presentation, NOT CityState).
+  private slotAllocator: SlotAllocator;
   private claimedCount = 0;
   // Monotonic counter feeding a DETERMINISTIC seed for each `adopt`ed walker, so a
   // re-inserted omino roams reproducibly without Math.random/Date.now. Combined
@@ -237,8 +237,9 @@ export class AmbientLayer {
   // prefer. A subset of `nodeIds`; empty when the city has none. Scenery only.
   private forumNodeIds: string[] = [];
 
-  constructor(root: Container) {
+  constructor(root: Container, slotAllocator?: SlotAllocator) {
     this.root = root;
+    this.slotAllocator = slotAllocator ?? new SlotAllocator();
   }
 
   /**

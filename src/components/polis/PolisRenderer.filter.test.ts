@@ -71,4 +71,59 @@ describe("nodeFilterVerdict", () => {
     const v = nodeFilterVerdict("b", sets);
     expect(v.ghosted).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // F6 — Membership-vs-render decoupling.
+  // `nodeFilterVerdict` is a PURE RENDER decision (filter/LOD) and is
+  // independent of sin STATE — a building with a fire sin is still "burning"
+  // regardless of filter; the filter only gates whether the fire sprites are
+  // visible. These tests verify the verdict shape never confuses "hidden by
+  // filter" with "not burning."
+  // -------------------------------------------------------------------------
+
+  it("F6: ghosted verdict is a render decision, orthogonal to sin state", () => {
+    // A ghosted building may or may not have a fire sin; the verdict only
+    // tells us about filter rendering, not about burning membership.
+    const sets = mkSets({ ghostedFileIds: new Set(["burning-bld"]) });
+    const v = nodeFilterVerdict("burning-bld", sets);
+    // ghosted = true → render at 0.15 alpha (or hide entirely)
+    // This does NOT mean "the fire pool should be destroyed."
+    expect(v.ghosted).toBe(true);
+    // effectsHidden=false → this building IS in the ghosted set, not the
+    // effects-hidden set; the two are orthogonal.
+    expect(v.effectsHidden).toBe(false);
+  });
+
+  it("F6: effectsHidden verdict gates effect overlay rendering only", () => {
+    // effects-hidden is a RENDER decision for the sin-effect overlay;
+    // it does NOT imply the building has no sin.
+    const sets = mkSets({ effectsHiddenFileIds: new Set(["smoky-bld"]) });
+    const v = nodeFilterVerdict("smoky-bld", sets);
+    expect(v.effectsHidden).toBe(true);
+    // This building IS in the effects-hidden set → crowd fire sprites
+    // should be hidden, but the pool stays intact.
+  });
+
+  it("F6: ghosted + effects-hidden combo is a double-render-gate", () => {
+    const sets = mkSets({
+      ghostedFileIds: new Set(["b"]),
+      effectsHiddenFileIds: new Set(["b"]),
+    });
+    const v = nodeFilterVerdict("b", sets);
+    // Both render gates active — fire sprites invisible, building ghosted.
+    // Pool membership is unaffected: if worstSinSeverity != null, the pool
+    // still exists and will render normally when the filter is cleared.
+    expect(v.ghosted).toBe(true);
+    expect(v.effectsHidden).toBe(true);
+  });
+
+  it("F6: null sets → full render, membership decisions come from sin data", () => {
+    // When no filter is active, every building renders at full opacity.
+    // Burning membership is determined separately (worstSinSeverity != null).
+    const v = nodeFilterVerdict("any", null);
+    expect(v.ghosted).toBe(false);
+    expect(v.hide).toBe(false);
+    expect(v.effectsHidden).toBe(false);
+  });
+
 });

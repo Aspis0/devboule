@@ -74,6 +74,10 @@ pub(crate) fn validate_main_coder_request(
                 Err(format!(
                     "files entry {i} must not contain backslashes: '{trimmed}'"
                 ))
+            } else if trimmed.chars().any(|c| c.is_control()) {
+                Err(format!(
+                    "files entry {i} contains control characters"
+                ))
             } else {
                 Ok(trimmed.to_string())
             }
@@ -291,5 +295,19 @@ mod tests {
         let (task, files) = validate_main_coder_request("task", &files).unwrap();
         assert_eq!(task, "task");
         assert_eq!(files.len(), 10);
+    }
+
+    #[test]
+    fn validate_filename_with_newline_rejected() {
+        let files = vec![String::from("src/good.rs"), String::from("src/bad\nfile.rs")];
+        let err = validate_main_coder_request("task", &files).unwrap_err();
+        assert!(err.contains("control characters"), "must reject \n in filename");
+    }
+
+    #[test]
+    fn validate_filename_with_tab_rejected() {
+        let files = vec![String::from("src/bad\tfile.rs")];
+        let err = validate_main_coder_request("task", &files).unwrap_err();
+        assert!(err.contains("control characters"), "must reject tab in filename");
     }
 }

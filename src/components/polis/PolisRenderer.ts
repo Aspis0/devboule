@@ -85,6 +85,7 @@ import { buildBuildingParts, type BuiltParts } from "./buildings";
 import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
 import { buildingChanged, worstSinSeverity } from "./diffCity";
+import { SlotAllocator } from "./locomotion";
 import { StepClock } from "./effects";
 import type { FilterSets } from "./filterModel";
 import { GrowthFx, Scaffold, Disaster, Investigation } from "./growthEffects";
@@ -700,16 +701,19 @@ export class PolisRenderer {
     };
     this.viewport.on("pointertap", this.onBackgroundTap);
 
+    // F5 — shared slot allocator so agent + ambient walkers never collide at the same building door.
+    const sharedSlotAllocator = new SlotAllocator();
+
     this.agentLayer = new AgentLayer(this.layers.agents, (agent) => {
       this.callbacks.onSelectAgent?.(agent);
-    });
+    }, sharedSlotAllocator);
 
     // Decorative ambient crowd in its own sub-container, added to the agents
     // layer BEFORE any agent omino so it renders behind the real, arrow-marked
     // agents. PURE-DATA NOTE: scenery only — never part of city.agents.
     const ambientContainer = new Container();
     this.layers.agents.addChild(ambientContainer);
-    this.ambientLayer = new AmbientLayer(ambientContainer);
+    this.ambientLayer = new AmbientLayer(ambientContainer, sharedSlotAllocator);
 
     // Trade-route porters: built directly on their dedicated `tradeRoutes`
     // layer (above road cobble, below buildings — see the layer declaration for
@@ -1289,6 +1293,18 @@ export class PolisRenderer {
 
     // Force a cull pass so LOD restores correct alpha/labels on unfiltered nodes
     this.cullDirty = true;
+
+    // F7 — reconcile selection ring against active filter.
+    // If the selected building is HIDDEN (mode hide), clear the renderer-side
+    // selection AND notify the view so the sidebar closes.
+    if (this.selectedId && sets) {
+      const selVerdict = nodeFilterVerdict(this.selectedId, sets);
+      if (selVerdict.hide) {
+        this.selectedId = null;
+        this.callbacks.onSelectBuilding?.(null);
+      }
+    }
+    this.drawSelectionRing();
   }
 
   // -------------------------------------------------------------------------
@@ -2133,7 +2149,10 @@ export class PolisRenderer {
     const halfRate = rung >= 3; // rung 3+ → crowd at 15fps
 
     // Tier F2 promotion/demotion (reconcile only when rung < 1).
+    // F8 — re-arm heroPromoDirty when budget recovers from >=1 back to <1,
+    // so reconcileHeroFires doesn't bail out with a stale false flag.
     if (rung < 1 && this.fireAtlas) {
+      if (prevRung >= 1) this.heroPromoDirty = true;
       this.reconcileHeroFires();
     }
     // Transition INTO rung >= 1: mass-demote all active heroes.
@@ -2149,14 +2168,27 @@ export class PolisRenderer {
         if (hf.targetFileId !== null || hf.crossfading) {
           stepHeroFire(hf, dt);
         }
+        // F6 — gate hero fire container visibility via filter/LOD
+        if (hf.targetFileId !== null) {
+          const hnode = this.buildingNodes.get(hf.targetFileId);
+          if (hnode) {
+            hf.container.visible = this.effectVisible(hnode, hf.targetFileId, true);
+          }
+        }
       }
     }
     // Tier F1: crowd fires (always active unless rung 5 pauses everything).
     // Sync crowd fires from current burning buildings (no alloc in steady state).
     if (this.fireAtlas) {
       this.syncCrowdFires();
-      for (const [, cf] of this.crowdFires) {
+      for (const [fileId, cf] of this.crowdFires) {
         stepCrowdFire(cf, this.fireAtlas, frame, halfRate || rung >= 3);
+        // F6 — gate crowd fire visibility via filter/LOD (no pool teardown)
+        const vis = this.effectVisible(
+          this.buildingNodes.get(fileId)!, fileId, true,
+        );
+        cf.fireSprite.visible = vis;
+        cf.smokeSprite.visible = vis;
       }
     }
 
@@ -3188,14 +3220,18 @@ export class PolisRenderer {
       this.selectionRing.visible = false;
       return;
     }
+    // F7 — ghosted buildings get a faded ring (0.15 alpha) instead of full.
+    const verdict = nodeFilterVerdict(this.selectedId, this.filterSets);
+    const ringAlpha = verdict.ghosted ? 0.15 : 0.95;
+    const goldAlpha = verdict.ghosted ? 0.09 : 0.6;
     const r = node.hitRadius * 0.85;
     this.selectionRing
       .ellipse(node.iso.x, node.iso.y + 4, r, r * 0.5)
-      .stroke({ color: PALETTE.terracotta, alpha: 0.95, width: 3 });
+      .stroke({ color: PALETTE.terracotta, alpha: ringAlpha, width: 3 });
     // Inner gold accent ring for a richer selection read.
     this.selectionRing
       .ellipse(node.iso.x, node.iso.y + 4, r * 0.78, r * 0.39)
-      .stroke({ color: PALETTE.goldAccent, alpha: 0.6, width: 1.5 });
+      .stroke({ color: PALETTE.goldAccent, alpha: goldAlpha, width: 1.5 });
     this.selectionRing.visible = true;
   }
 
@@ -3357,10 +3393,11 @@ export class PolisRenderer {
    *  steady state (creates/destroys only when sins change, which is rare). */
   private syncCrowdFires(): void {
     if (!this.fireAtlas) return;
-    // Track which buildings currently have a visible disaster.
+    // F6 — Track which buildings have a sin (STATE, not visibility).
+    // Decoupled from node.disaster.node.visible so filters never tear down pools.
     const currentBurning = new Set<string>();
     for (const [fileId, node] of this.buildingNodes) {
-      if (node.disaster && node.disaster.node.visible) {
+      if (node.disaster && worstSinSeverity(node.building) != null) {
         currentBurning.add(fileId);
       }
     }
@@ -3426,12 +3463,13 @@ export class PolisRenderer {
     if (!this.heroPromoDirty) return;
     this.heroPromoDirty = false;
 
-    // Defensive sweep: park heroes whose target building is no longer burning.
+    // F6 — Defensive sweep: park heroes whose target building is no longer
+    // burning (sin STATE, not visibility — filters don't demote heroes).
     for (let i = 0; i < this.heroFirePool.length; i++) {
       const hf = this.heroFirePool[i];
       if (!hf.targetFileId) continue;
       const node = this.buildingNodes.get(hf.targetFileId);
-      if (!node || !node.disaster || !node.disaster.node.visible) {
+      if (!node || !node.disaster || worstSinSeverity(node.building) == null) {
         beginDemotionCrossfade(hf);
       }
     }
@@ -3441,9 +3479,10 @@ export class PolisRenderer {
     const cx = this.viewport.center.x;
     const cy = this.viewport.center.y;
 
+    // F6 — Collect on-screen burning buildings by sin STATE (not visibility).
     for (const [fileId, node] of this.buildingNodes) {
       const disaster = node.disaster;
-      if (!disaster || !disaster.node.visible) continue;
+      if (!disaster || worstSinSeverity(node.building) == null) continue;
       const chunk = this.chunks.get(node.chunkKey);
       if (!(chunk?.visible ?? false)) continue;
 

@@ -322,11 +322,12 @@ export class AgentLayer {
   /** P3.2 — Last step frame for ghost-filter glow recompute. */
   private _lastFrame = 0;
   // P5.2 — per-building entry-slot allocator (presentation state, NOT CityState).
-  private slotAllocator = new SlotAllocator();
+  private slotAllocator: SlotAllocator;
   private onSelectAgent?: (agent: Agent | null) => void;
 
-  constructor(root: Container, onSelectAgent?: (agent: Agent | null) => void) {
+  constructor(root: Container, onSelectAgent?: (agent: Agent | null) => void, slotAllocator?: SlotAllocator) {
     this.root = root;
+    this.slotAllocator = slotAllocator ?? new SlotAllocator();
     this.onSelectAgent = onSelectAgent;
   }
 

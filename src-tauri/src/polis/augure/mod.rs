@@ -106,13 +106,30 @@ pub enum Disposition {
 ///
 /// `evidence_key(evidence)` is used in place of raw evidence so cosmetic
 /// re-phrasings (capitalization, extra whitespace) don't mint new ids.
+///
+/// **Identity policy:** callers that produce sins from rules where the line
+/// number is an unstable anchor (edits above the item shift it) SHOULD pass
+/// `line: None` and keep the real line only on the `SinRecord` for display.
+/// `to_records` applies this for `"complexity"` and `"clone"` — the evidence
+/// already carries the stable anchor (fn name / partner path).
 pub fn compute_sin_id(
     rel_path: &str,
     rule_id: &str,
     line: Option<u32>,
     evidence: &str,
 ) -> String {
-    let line_token = match line {
+    // IDENTITY POLICY (F1): for "complexity" and "clone" the line is decorative
+    // — any edit above the flagged item would shift it and mint a new id,
+    // silently dropping Ignored dispositions and in-flight fix tracking. The
+    // evidence already carries the stable anchor (fn name / partner path).
+    // Enforced HERE, the single choke point, so every id computation (records,
+    // suppression, tests) agrees.
+    let effective_line = if rule_id == "complexity" || rule_id == "clone" {
+        None
+    } else {
+        line
+    };
+    let line_token = match effective_line {
         Some(n) => n.to_string(),
         None => String::new(),
     };
@@ -206,6 +223,9 @@ pub fn to_records(
                 .and_then(|fid| content_hash_by_file_id.get(fid))
                 .cloned()
                 .unwrap_or_default();
+            // Identity policy for "complexity"/"clone" (line excluded from the
+            // id) is enforced inside compute_sin_id — the single choke point —
+            // so records, suppression, and tests can never disagree.
             let id = compute_sin_id(&rel_path, ds.rule_id, ds.line, &ds.evidence);
             SinRecord {
                 id,
@@ -369,5 +389,68 @@ mod tests {
         let r1 = to_records(&sins, &rels, &hashes);
         let r2 = to_records(&sins, &rels, &hashes);
         assert_eq!(r1[0].id, r2[0].id, "id must be deterministic across calls");
+    }
+
+    // =========================================================================
+    // F1: complexity + clone identity ignores line (stable across edits above)
+    // =========================================================================
+
+    #[test]
+    fn complexity_id_ignores_line() {
+        // Same fn name at line 10 vs line 50 → SAME id (line is decorative only).
+        let id_at_10 = compute_sin_id("src/a.rs", "complexity", Some(10), "fn foo exceeds the cyclomatic threshold");
+        let id_at_50 = compute_sin_id("src/a.rs", "complexity", Some(50), "fn foo exceeds the cyclomatic threshold");
+        assert_eq!(id_at_10, id_at_50, "complexity id must ignore line number");
+
+        // Different fn name → DIFFERENT id.
+        let id_bar = compute_sin_id("src/a.rs", "complexity", Some(10), "fn bar exceeds the cyclomatic threshold");
+        assert_ne!(id_at_10, id_bar, "different fn name must produce different id");
+    }
+
+    #[test]
+    fn clone_id_ignores_line() {
+        // Same partner path at line 10 vs line 50 → SAME id.
+        let id_a = compute_sin_id("src/a.rs", "clone", Some(10), "duplicated block shared with src/b.rs");
+        let id_b = compute_sin_id("src/a.rs", "clone", Some(50), "duplicated block shared with src/b.rs");
+        assert_eq!(id_a, id_b, "clone id must ignore line number");
+
+        // Different partner → DIFFERENT id.
+        let id_other = compute_sin_id("src/a.rs", "clone", Some(10), "duplicated block shared with src/c.rs");
+        assert_ne!(id_a, id_other, "different partner must produce different id");
+    }
+
+    #[test]
+    fn to_records_excludes_line_from_complexity_and_clone_ids() {
+        let sins = vec![
+            mk_detected("sin-complexity-1", "inferno", "High cyclomatic complexity in foo", Some("fid1"), "complexity", "fn foo exceeds the cyclomatic threshold", Some(42)),
+            mk_detected("sin-clone-1", "fire", "Duplicated block with b.rs", Some("fid1"), "clone", "duplicated block shared with src/b.rs", Some(17)),
+            mk_detected("sin-secret-1", "inferno", "Secret at line 1", Some("fid1"), "secret", "secret at line 1", Some(1)),
+        ];
+        let mut rels = HashMap::new();
+        rels.insert("fid1".to_string(), "src/a.rs".to_string());
+        let mut hashes = HashMap::new();
+        hashes.insert("fid1".to_string(), "hash1".to_string());
+
+        let records = to_records(&sins, &rels, &hashes);
+        assert_eq!(records.len(), 3);
+
+        // Complexity: line kept on the record but excluded from id.
+        let complexity = records.iter().find(|r| r.rule_id == "complexity").unwrap();
+        assert_eq!(complexity.line, Some(42), "line must be on the record for display");
+        // Verify id doesn't depend on line by re-computing with line=None.
+        let expected_id = compute_sin_id("src/a.rs", "complexity", None, "fn foo exceeds the cyclomatic threshold");
+        assert_eq!(complexity.id, expected_id, "complexity id must exclude line");
+
+        // Clone: line kept on the record but excluded from id.
+        let clone = records.iter().find(|r| r.rule_id == "clone").unwrap();
+        assert_eq!(clone.line, Some(17), "line must be on the record for display");
+        let expected_clone_id = compute_sin_id("src/a.rs", "clone", None, "duplicated block shared with src/b.rs");
+        assert_eq!(clone.id, expected_clone_id, "clone id must exclude line");
+
+        // Secret: line IS part of the id (non-decorative rules).
+        let secret = records.iter().find(|r| r.rule_id == "secret").unwrap();
+        assert_eq!(secret.line, Some(1));
+        let expected_secret_id = compute_sin_id("src/a.rs", "secret", Some(1), "secret at line 1");
+        assert_eq!(secret.id, expected_secret_id, "secret id must include line");
     }
 }

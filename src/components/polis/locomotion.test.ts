@@ -315,4 +315,39 @@ describe("SlotAllocator", () => {
     // Now slot 0 is free at dest
     expect(sa.acquire(destId, "agent-4")).toBe(0);
   });
+
+  // F5 — shared allocator: two different id namespaces at the SAME building
+  // get DIFFERENT slots (no collision even though each namespace uses its
+  // own id format: agentId vs ambient wid).
+  it("shared allocator: distinct namespaces get distinct slots at same building", () => {
+    const sa = new SlotAllocator();
+    const buildingId = "bld-shared";
+
+    // Agent namespace (e.g., UUID-like "agent:uuid-1")
+    expect(sa.acquire(buildingId, "agent:alpha-1")).toBe(0);
+
+    // Ambient namespace (e.g., "ambient-w1") — must get slot 1, not 0
+    expect(sa.acquire(buildingId, "ambient-w1")).toBe(1);
+
+    // Second agent — slot 2
+    expect(sa.acquire(buildingId, "agent:beta-2")).toBe(2);
+
+    // Third agent — overflow (-1), all 3 slots occupied
+    expect(sa.acquire(buildingId, "agent:gamma-3")).toBe(-1);
+
+    // Release an ambient walker — frees slot 1
+    sa.release(buildingId, "ambient-w1");
+    // Next arrival reuses slot 1
+    expect(sa.acquire(buildingId, "ambient-w2")).toBe(1);
+
+    // Sweep all agent slots, verify ambient slot survived
+    sa.sweep("agent:alpha-1");
+    sa.sweep("agent:beta-2");
+    // ambient-w2 still holds slot 1
+    expect(sa.acquire(buildingId, "agent:delta-4")).toBe(0); // reuses freed slot 0
+    expect(sa.acquire(buildingId, "agent:epsilon-5")).toBe(2); // reuses freed slot 2
+    // slot 1 still occupied by ambient-w2
+    expect(sa.acquire(buildingId, "agent:zeta-6")).toBe(-1);
+  });
+
 });

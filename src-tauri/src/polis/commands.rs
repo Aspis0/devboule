@@ -518,6 +518,14 @@ pub fn polis_dispose_sin(
 }
 
 
+/// Sanitize a string for prompt interpolation: replace control characters
+/// with spaces so a filename or evidence value containing \n / \r / \t / \0
+/// cannot inject prompt instruction lines. Defense-in-depth companion to
+/// `validate_main_coder_request` in main_coder.rs.
+fn sanitize_for_prompt(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 /// Raw (uncapped) prompt renderer for the D8 fix-sin directive. Unit-testable, no IO.
 ///
 /// Builds the prompt with exactly the information the main coder needs to fix
@@ -527,6 +535,11 @@ pub fn polis_dispose_sin(
 fn build_fix_sin_prompt(record: &crate::polis::augure::SinRecord, oracle_excerpts: &[String]) -> String {
     use std::fmt::Write;
 
+    // Defense-in-depth: sanitize rel_path and evidence against control-char
+    // prompt injection (filenames containing \n could inject instruction lines).
+    let safe_rel_path = sanitize_for_prompt(&record.rel_path);
+    let safe_evidence = sanitize_for_prompt(&record.evidence);
+
     let line_info = record
         .line
         .map(|l| format!(" (line {l})"))
@@ -534,14 +547,14 @@ fn build_fix_sin_prompt(record: &crate::polis::augure::SinRecord, oracle_excerpt
 
     // Evidence line: when evidence is empty, omit the "Evidence: " line entirely
     // so the rendered prompt never contains "Evidence: \n" (trailing space).
-    let evidence_line = if record.evidence.is_empty() {
+    let evidence_line = if safe_evidence.is_empty() {
         String::new()
     } else {
-        format!("Evidence: {}\n", record.evidence)
+        format!("Evidence: {}\n", safe_evidence)
     };
     let mut prompt = format!(
         "Fix a single, precisely-scoped issue detected by deterministic analysis.\nFile: {}{}\nRule: {}\n{}Severity: {}\n",
-        record.rel_path,
+        safe_rel_path,
         line_info,
         record.rule_id,
         evidence_line,
@@ -734,11 +747,23 @@ pub fn polis_fix_sin(
         ));
     }
 
-    // 4. Double-dispatch guard: if fix_directive_id is Some(prev), look up
-    //    directive prev in the agent live state. If it exists AND is non-terminal
-    //    → reject. If terminal or missing → allowed (re-dispatch overwrites).
+    // 4. Double-dispatch guard: two layers of defense against spawning
+    //    duplicate fix directives for the same file.
+    //
+    //    (a) If fix_directive_id is Some(prev), look up directive prev in the
+    //        agent live state. If it exists AND is non-terminal → reject. If
+    //        terminal or missing → allowed (re-dispatch overwrites).
+    //
+    //    (b) Regardless of fix_directive_id, scan live state for ANY
+    //        non-terminal directive whose files list is exactly [this rel_path]
+    //        AND whose task starts with the fix-prompt header. This catches the
+    //        case where a different-hash reset wiped fix_directive_id but the
+    //        old directive is still in-flight. Fix directives are single-file by
+    //        construction, so `files == vec![rel_path]` is precise enough.
+    const FIX_PROMPT_HEADER: &str =
+        "Fix a single, precisely-scoped issue detected by deterministic analysis.";
+    let live = crate::backend::agents::read_agent_live_state_snapshot(&app)?;
     if let Some(ref prev_id) = record.fix_directive_id {
-        let live = crate::backend::agents::read_agent_live_state_snapshot(&app)?;
         if let Some(prev_directive) = live
             .mini_coder_directives
             .iter()
@@ -751,6 +776,21 @@ pub fn polis_fix_sin(
             }
         }
         // Terminal or missing: allowed, re-dispatch overwrites.
+    }
+    // Layer (b): live-state scan for any in-flight fix targeting this file.
+    if live
+        .mini_coder_directives
+        .iter()
+        .any(|d| {
+            !d.status.is_terminal()
+                && d.files.len() == 1
+                && d.files[0] == rel_path
+                && d.task.starts_with(FIX_PROMPT_HEADER)
+        })
+    {
+        return Err(
+            "a fix directive for this file is already in flight".to_string(),
+        );
     }
 
     // 5. Best-effort Oracle context (optional enrichment, never a base dependency).
@@ -3062,6 +3102,129 @@ mod tests {
         // then stalest (older updated_at) before fresher
         assert_eq!(selected[1], "src/stale.rs");
         assert_eq!(selected[2], "src/fresh.rs");
+    }
+
+    // =========================================================================
+    // F10b: sanitize_for_prompt squashes control characters
+    // =========================================================================
+
+    #[test]
+    fn sanitize_for_prompt_replaces_control_chars_with_spaces() {
+        assert_eq!(sanitize_for_prompt("hello"), "hello");
+        assert_eq!(sanitize_for_prompt("hello\nworld"), "hello world");
+        assert_eq!(sanitize_for_prompt("hello\r\nworld"), "hello  world");
+        assert_eq!(sanitize_for_prompt("tab\there"), "tab here");
+        assert_eq!(sanitize_for_prompt("null\0char"), "null char");
+    }
+
+    #[test]
+    fn build_fix_sin_prompt_sanitizes_evidence_control_chars() {
+        let rec = crate::polis::augure::SinRecord {
+            id: "sin-1".to_string(),
+            rel_path: "src/file.rs".to_string(),
+            rule_id: "secret".to_string(),
+            line: Some(1),
+            severity: "inferno".to_string(),
+            description: "desc".to_string(),
+            evidence: "secret\nat line 1".to_string(),
+            content_hash: "hash".to_string(),
+            disposition: crate::polis::augure::Disposition::Open,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            fix_directive_id: None,
+        };
+        let prompt = build_fix_sin_prompt(&rec, &[]);
+        // The evidence had "secret\nat line 1" — after sanitization, the \n
+        // becomes a space, so the evidence line reads "Evidence: secret at line 1".
+        // Verify the sanitized evidence content appears (no embedded newline in evidence).
+        assert!(prompt.contains("secret at line 1"), "evidence content must survive");
+        // Verify the oldline is NOT in the evidence position (it would be "Evidence: secret\nat")
+        assert!(!prompt.contains("secret\nat"), "embedded \n in evidence must be sanitized");
+    }
+
+    #[test]
+    fn build_fix_sin_prompt_sanitizes_rel_path_newline() {
+        let rec = crate::polis::augure::SinRecord {
+            id: "sin-2".to_string(),
+            rel_path: "src/file\nwith-newline.rs".to_string(),
+            rule_id: "secret".to_string(),
+            line: None,
+            severity: "smoke".to_string(),
+            description: "desc".to_string(),
+            evidence: "x".to_string(),
+            content_hash: "hash".to_string(),
+            disposition: crate::polis::augure::Disposition::Open,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            fix_directive_id: None,
+        };
+        let prompt = build_fix_sin_prompt(&rec, &[]);
+        // The rel_path had "src/file\nwith-newline.rs" — after sanitization the
+        // \n becomes a space, so the injected text can never start a new prompt
+        // LINE: the whole path stays on the "File:" line.
+        assert!(
+            prompt.contains("File: src/file with-newline.rs"),
+            "\\n in rel_path must be squashed to a space on the File: line"
+        );
+        assert!(
+            !prompt.contains("src/file\nwith-newline.rs"),
+            "raw newline must never survive into the prompt"
+        );
+    }
+
+    // =========================================================================
+    // F2b: polis_fix_sin guard — in-flight directive for same file → reject
+    // =========================================================================
+
+    #[test]
+    fn fix_sin_guard_rejects_in_flight_single_file_fix() {
+        use crate::backend::mini_coder::{MiniCoderDirective, MiniCoderStatus, DirectiveTier, WriteMode};
+
+        // A non-terminal directive whose files == vec!["src/bad.rs"] and whose
+        // task starts with the fix-prompt header must trigger rejection.
+        let directives = vec![MiniCoderDirective {
+            id: "d-1".to_string(),
+            parent_agent_id: "ag-1".to_string(),
+            status: MiniCoderStatus::Pending,
+            task: "Fix a single, precisely-scoped issue detected by deterministic analysis.\nFile: src/bad.rs".to_string(),
+            files: vec!["src/bad.rs".to_string()],
+            write: true,
+            write_mode: WriteMode::AgenticIterative,
+            tier: DirectiveTier::Main,
+            project_id: None,
+            backend: None,
+            allow_oracle: false,
+            kill_requested: false,
+            steer_queue: vec![],
+            result_path: "d-1.json".to_string(),
+            agent_id: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            scratch_path: None,
+            started_at: None,
+            result: None,
+            attempt: 0,
+            parent_directive_id: None,
+            pigeon_ticket: None,
+            collected: None,
+        }];
+
+        let in_flight = directives.iter().any(|d| {
+            !d.status.is_terminal()
+                && d.files.len() == 1
+                && d.files[0] == "src/bad.rs"
+                && d.task.starts_with("Fix a single, precisely-scoped issue detected by deterministic analysis.")
+        });
+        assert!(in_flight, "guard must detect the in-flight directive");
+
+        // A terminal directive for the same file must NOT trigger rejection.
+        let terminal = directives.iter().any(|d| {
+            !d.status.is_terminal()
+                && d.files.len() == 1
+                && d.files[0] == "src/ok.rs"
+                && d.task.starts_with("Fix a single, precisely-scoped issue detected by deterministic analysis.")
+        });
+        assert!(!terminal, "terminal/mismatch must not trigger the guard");
     }
 
 }

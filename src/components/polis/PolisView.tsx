@@ -418,6 +418,16 @@ export function PolisView() {
   useEffect(() => {
     if (!ready) return;
     handleRef.current?.setFilter(filterSets);
+    // F7 — reconcile React-side selection against the active filter.
+    // If the selected building is HIDDEN (mode hide), close the sidebar.
+    if (filterSets && filterSets.mode === "hide") {
+      setSelected((prev) => {
+        if (prev?.kind === "building") {
+          return filterSets.ghostedFileIds.has(prev.building.fileId) ? null : prev;
+        }
+        return prev;
+      });
+    }
   }, [ready, filterSets]);
 
   const handleRefresh = useCallback(() => {

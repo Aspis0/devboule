@@ -114,9 +114,11 @@ fn sins_dir(root: &Path) -> PathBuf {
 /// forms of the same logical path.
 fn normalize_rel_path(file_rel_path: &str) -> String {
     let slashed = file_rel_path.replace('\\', "/");
-    let mut out = String::with_capacity(slashed.len());
+    // Strip a leading "./" so the ledger and meta_store agree on canonical form.
+    let trimmed = slashed.strip_prefix("./").unwrap_or(&slashed);
+    let mut out = String::with_capacity(trimmed.len());
     let mut prev_slash = false;
-    for ch in slashed.chars() {
+    for ch in trimmed.chars() {
         if ch == '/' {
             if prev_slash {
                 continue;
@@ -340,11 +342,15 @@ pub fn upsert_scan_results(
         let existing = match read_shard_at(&path) {
             Ok(s) => s,
             Err(e) => {
+                // Corrupt shard: skip-and-continue (treat as absent).
+                // The fresh sins for this file re-enter as new Open records
+                // and the shard is rewritten clean. One corrupt shard must
+                // not block ALL ledger writes forever.
                 eprintln!(
-                    "polis augure: refusing to overwrite unreadable shard: {}",
+                    "polis augure: corrupt shard skipped (will be rewritten): {}",
                     path.display()
                 );
-                return Err(e);
+                None
             }
         };
 
@@ -366,16 +372,22 @@ fn merge_sins(
     now: &chrono::DateTime<chrono::Utc>,
 ) -> PolisSinShard {
     // Build a map of old sins by id (only those at the SAME content hash).
-    // Sins at a different hash are dropped entirely.
-    // DIFFERENT-HASH RESET: when old hash != new hash, old_by_id stays empty so all
-    // fresh sins enter via the "new sin" branch — fix_directive_id resets to None
-    // because SinRecord::fix_directive_id defaults to None in fresh records (built
-    // from DetectedSins which have no dispatch-tracking field).
+    // Dispositions are only carried over at the SAME content hash; a different hash
+    // resets disposition to Open (content-hash contract).
     let mut old_by_id: HashMap<String, SinRecord> = HashMap::new();
+    let mut old_fix_dir_by_id: HashMap<String, Option<String>> = HashMap::new();
     if let Some(ref old_shard) = existing {
         if old_shard.content_hash == new_hash {
             for sin in &old_shard.sins {
                 old_by_id.insert(sin.id.clone(), sin.clone());
+            }
+        } else {
+            // Different hash: carry over ONLY fix_directive_id for sins whose id
+            // matches a fresh sin exactly (same finding survived the edit).
+            // Dispositions reset per the content-hash contract, but in-flight
+            // dispatch tracking survives so the D8 polis_fix_sin guard works.
+            for sin in &old_shard.sins {
+                old_fix_dir_by_id.insert(sin.id.clone(), sin.fix_directive_id.clone());
             }
         }
     }
@@ -415,6 +427,11 @@ fn merge_sins(
             sin.disposition = Disposition::Open;
             sin.created_at = now_str.to_string();
             sin.updated_at = now_str.to_string();
+            // Carry over fix_directive_id from an old record at a different hash
+            // (same finding survived the edit → in-flight dispatch tracking survives).
+            if let Some(old_fix) = old_fix_dir_by_id.get(fresh.id.as_str()) {
+                sin.fix_directive_id = old_fix.clone();
+            }
         }
         // Stamp content_hash to the current hash.
         sin.content_hash = new_hash.to_string();
@@ -976,6 +993,64 @@ mod tests {
     }
 
     // =========================================================================
+    // F11: corrupt shard does not block other files — skip + rewrite clean
+    // =========================================================================
+
+    #[test]
+    fn corrupt_shard_skipped_on_upsert_and_rewritten_clean() {
+        let dir = unique_temp_root("corrupt-skip-upsert");
+        let root = dir.as_path();
+
+        // Write a healthy shard.
+        let s_good = mk_sin_det("id-good", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/good.rs".to_string(), "hash1".to_string(), vec![s_good])],
+        )
+        .unwrap();
+
+        // Manually write a corrupt shard.
+        let corrupt_path = shard_path(root, "src/corrupt.rs").unwrap();
+        fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        fs::write(&corrupt_path, "{ not valid json !!! ").unwrap();
+
+        // Upsert both files: the healthy one merges, the corrupt one is
+        // treated as absent and rewritten clean with the fresh sins.
+        let s_corrupt_new = mk_sin_det("id-corrupt-new", "hash2");
+        let result = upsert_scan_results(
+            root,
+            &[
+                (
+                    "src/good.rs".to_string(),
+                    "hash1".to_string(),
+                    vec![mk_sin_det("id-good", "hash1")],
+                ),
+                (
+                    "src/corrupt.rs".to_string(),
+                    "hash2".to_string(),
+                    vec![s_corrupt_new],
+                ),
+            ],
+        );
+        assert!(
+            result.is_ok(),
+            "upsert must succeed even with a corrupt peer shard"
+        );
+
+        let all = load_all_sins(root);
+        assert!(
+            all.iter().any(|s| s.id == "id-good"),
+            "healthy shard must survive"
+        );
+        assert!(
+            all.iter().any(|s| s.id == "id-corrupt-new"),
+            "corrupt shard must be rewritten with fresh sins"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
     // Test 1: Round-trip — upsert → load_open_sins returns them
     // =========================================================================
 
@@ -1268,6 +1343,15 @@ mod tests {
         assert!(shard_path(root, "../escape").is_err());
         assert!(shard_path(root, "/abs").is_err());
         assert!(shard_path(root, "-leading.rs").is_err());
+    }
+
+    #[test]
+    fn normalize_rel_path_strips_leading_dot_slash() {
+        // The ledger normalize_rel_path must strip "./" so it matches
+        // meta_store::normalize_rel_path (F12 alignment).
+        let a = shard_path(Path::new("/proj"), "./src/main.rs").unwrap();
+        let b = shard_path(Path::new("/proj"), "src/main.rs").unwrap();
+        assert_eq!(a, b, "ledger normalize_rel_path must strip leading ./");
     }
 
     // =========================================================================
@@ -1737,8 +1821,11 @@ mod tests {
     }
 
     #[test]
-    fn different_hash_upsert_resets_fix_directive_id() {
-        let dir = unique_temp_root("upsert-reset-fix");
+    fn different_hash_upsert_preserves_fix_directive_id_for_same_id() {
+        // F2: same id at different hash = same finding survived the edit.
+        // fix_directive_id MUST survive so in-flight dispatch tracking works
+        // across content changes. Disposition still resets to Open.
+        let dir = unique_temp_root("upsert-preserve-fix-across-hash");
         let root = dir.as_path();
 
         let s1 = mk_sin_det("id-reset-fix", "hash1");
@@ -1761,10 +1848,13 @@ mod tests {
 
         let all = load_all_sins(root);
         let sin = all.iter().find(|s| s.id == "id-reset-fix").unwrap();
-        assert!(
-            sin.fix_directive_id.is_none(),
-            "different-hash upsert must reset fix_directive_id to None"
+        assert_eq!(
+            sin.fix_directive_id.as_deref(),
+            Some("d-999"),
+            "same-id different-hash upsert must preserve fix_directive_id"
         );
+        // Disposition still resets to Open (content-hash contract).
+        assert_eq!(sin.disposition, SDisposition::Open);
 
         let _ = fs::remove_dir_all(&dir);
     }

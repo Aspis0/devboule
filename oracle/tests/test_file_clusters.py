@@ -133,7 +133,9 @@ class RefreshClustersSkipTest(unittest.TestCase):
 
             self.assertEqual(rows, [])
             self.assertIsNotNone(epoch)
-            self.assertIn("T", epoch)
+            # Epoch is a content-signature hash (16 hex chars), not a timestamp.
+            self.assertEqual(len(epoch), 16)
+            int(epoch, 16)  # must be valid hex
 
     def test_zero_files_sets_epoch_and_empty(self):
         from oracle.server.query_engine import _refresh_clusters

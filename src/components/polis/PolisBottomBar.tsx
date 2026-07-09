@@ -337,6 +337,7 @@ function PolisBottomBarInner({
           onSelectBuilding={onSelectBuilding}
           handleRef={handleRef}
           onClose={() => setOpen(null)}
+          filterSets={filterSets}
         />
       )}
       {open === "filters" && (
@@ -456,10 +457,12 @@ function AnomaliesPanel({
   onSelectBuilding,
   handleRef,
   onClose,
+  filterSets,
 }: {
   onSelectBuilding?: (b: Building) => void;
   handleRef: React.RefObject<PolisHandle | null>;
   onClose: () => void;
+  filterSets: import("./filterModel").FilterSets | null;
 }) {
   const [tab, setTab] = useState<"open" | "ignored">("open");
   const sinRecords = useCityStore((s) => s.sinRecords);
@@ -467,6 +470,8 @@ function AnomaliesPanel({
   const disposeSin = useCityStore((s) => s.disposeSin);
   const buildings = useCityStore((s) => s.cityState?.buildings);
   const [now] = useState(() => Date.now());
+  // F9 — inline feedback when a row click is blocked by the active filter.
+  const [blockedFileId, setBlockedFileId] = useState<string | null>(null);
 
   const buildingFileIds = useMemo(() => {
     if (!buildings) return new Map<string, string>();
@@ -491,10 +496,17 @@ function AnomaliesPanel({
         (b) => b.fileId === row.fileId,
       );
       if (!building) return;
+      // F9 — if the target is hidden by the active filter, skip flyTo+select
+      // and show a transient inline note on the row.
+      if (filterSets?.mode === "hide" && filterSets.ghostedFileIds.has(row.fileId)) {
+        setBlockedFileId(row.fileId);
+        return;
+      }
+      setBlockedFileId(null);
       handleRef.current?.flyTo(row.fileId);
       onSelectBuilding?.(building);
     },
-    [buildings, handleRef, onSelectBuilding],
+    [buildings, handleRef, onSelectBuilding, filterSets],
   );
 
   const handleUnignore = useCallback(
@@ -566,6 +578,7 @@ function AnomaliesPanel({
                 onClick={handleClick}
                 onUnignore={handleUnignore}
                 pending={sinActionPending.includes(row.sin.id)}
+                filterBlocked={row.fileId !== null && row.fileId === blockedFileId}
               />
             ))}
           </ul>
@@ -581,12 +594,14 @@ const AnomalyRowItem = memo(function AnomalyRowItem({
   onClick,
   onUnignore,
   pending,
+  filterBlocked,
 }: {
   row: AnomalyRow;
   tab: "open" | "ignored";
   onClick: (row: AnomalyRow) => void;
   onUnignore: (row: AnomalyRow) => void;
   pending: boolean;
+  filterBlocked?: boolean;
 }) {
   const SinIcon = row.sin.severity === "smoke" ? AlertTriangle : Flame;
   const glyph = SEVERITY_GLYPH[row.sin.severity] ?? "💨";
@@ -644,6 +659,12 @@ const AnomalyRowItem = memo(function AnomalyRowItem({
           </button>
         )}
       </div>
+      {/* F9 — inline note when filter blocks navigation */}
+      {filterBlocked && (
+        <p className="mt-1 pl-6 text-[10px] italic text-amber-dark">
+          hidden by the active filter
+        </p>
+      )}
     </li>
   );
 });
