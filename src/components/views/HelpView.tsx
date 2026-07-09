@@ -12,8 +12,8 @@ export interface HelpSectionLink {
 export interface HelpSection {
   id: string;
   title: string;
-  /** One or more plain-text paragraphs (no markdown). */
-  body: string[];
+  /** One or more plain-text paragraphs (no markdown). Optional when `steps` is used. */
+  body?: string[];
   /** An optional ordered list (used by the Quick start section). */
   steps?: string[];
   /** An optional cross-link button that jumps to another view. */

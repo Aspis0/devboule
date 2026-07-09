@@ -207,7 +207,7 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 	const prevArtifact = useRef(artifactActive);
 	const prevQuestionsLen = useRef(questions.length);
 	useEffect(() => {
-		if (questions.length > 0 && prevQuestionsLen.current === 0) {
+		if (questions.length > prevQuestionsLen.current) {
 			setStageExpanded(true);
 		} else if (!userToggled.current) {
 			if (live && !prevLive.current) setStageExpanded(true);

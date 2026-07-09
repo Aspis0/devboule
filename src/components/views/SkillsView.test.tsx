@@ -12,7 +12,7 @@ const invokeMock = vi.fn(async (...args: unknown[]): Promise<unknown> => {
   const cmd = args[0] as string;
   if (cmd === "global_skills_list") return [];
   if (cmd === "skills_library_catalog") return [];
-  if (cmd === "user_mcp_list" || cmd === "user_mcp_allowed_commands_list") return [];
+  if (cmd === "user_mcp_list") return [];
   return undefined;
 });
 

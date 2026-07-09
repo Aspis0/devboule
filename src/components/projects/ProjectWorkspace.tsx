@@ -93,7 +93,6 @@ import { PushApprovalCard } from "./PushApprovalCard";
 import { ProjectMcpServersCard } from "./ProjectMcpServersCard";
 import { ChangesDockTab } from "./ChangesDockTab";
 import {
-  DEFAULT_DOCK_TAB,
   DOCK_TABS,
   type DockTab,
   compactWriteCall,
@@ -1319,7 +1318,7 @@ export function ProjectWorkspace({
 
       {/* ---- Consolidated tab bar: 8 tabs in one row ---- */}
       <div className="rounded-2xl border border-cream-200 bg-white">
-        <div className="flex w-fit gap-1 border-b border-cream-200 p-1">
+        <div className="flex w-fit gap-1 border-b border-cream-200 p-1" role="tablist" aria-label="Work console tabs">
           {DOCK_TABS.map((tab) => {
             const active = dockTab === tab.id;
             // Badge counts for specific tabs.
@@ -1331,6 +1330,10 @@ export function ProjectWorkspace({
               <button
                 key={tab.id}
                 type="button"
+                role="tab"
+                id={`worktab-${tab.id}`}
+                aria-controls={`workpanel-${tab.id}`}
+                aria-selected={active}
                 onClick={() => setDockTab(tab.id)}
                 className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-colors ${
                   active
@@ -1355,7 +1358,7 @@ export function ProjectWorkspace({
           })}
         </div>
 
-        <div className="p-4">
+        <div className="p-4" role="tabpanel" id={`workpanel-${dockTab}`} aria-labelledby={`worktab-${dockTab}`}>
           {/* Plan approval card: mounted ALWAYS (hidden when not on Plans tab) so its
               poll keeps the badge count fed. Renders at the TOP of the Plans tab. */}
           {!readOnly && (

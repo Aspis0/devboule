@@ -68,7 +68,7 @@ export interface LangEntry {
 
 /**
  * One installable bundled language persona (Discover tab) — role-agnostic, installed into a chosen
- * role via `skills_save_lang`. Mirrors the Rust `LangCatalogEntry`. The set is DATA-DRIVEN (the
+ * role via `skills_save_lang_profile`. Mirrors the Rust `LangCatalogEntry`. The set is DATA-DRIVEN (the
  * backend derives it from the persona bundle), so the UI must render whatever languages it returns
  * — NEVER hardcode the language list (it grows as personas are added to the bundle).
  */

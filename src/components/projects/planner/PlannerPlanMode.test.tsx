@@ -125,6 +125,55 @@ describe("PlannerPlanMode layout (S4)", () => {
 		container.remove();
 	});
 
+	it("force-expands the drawer on a second doubt even after a manual collapse", () => {
+		// Render with one doubt: the drawer auto-expands (hard invariant) and a manual
+		// collapse sets userToggled = true.
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		const root = createRoot(container);
+		act(() => {
+			root.render(
+				createElement(
+					PlannerPlanMode,
+					baseProps({
+						questions: [{ id: "q1", affects: [], text: "d" }],
+					}) as any,
+				),
+			);
+		});
+		// One doubt => drawer is open.
+		expect(container.innerHTML).toContain("316");
+		// User collapses it by hand (userToggled becomes true).
+		const chevron = container.querySelector(
+			'[title="Collapse stage panels"]',
+		) as HTMLButtonElement | null;
+		expect(chevron).not.toBeNull();
+		act(() => {
+			Simulate.click(chevron!);
+		});
+		expect(container.innerHTML).not.toContain("316"); // now collapsed by the user
+		// A second doubt arrives (1 -> 2) while the user had collapsed the drawer.
+		act(() => {
+			root.render(
+				createElement(
+					PlannerPlanMode,
+					baseProps({
+						questions: [
+							{ id: "q1", affects: [], text: "d" },
+							{ id: "q2", affects: [], text: "d" },
+						],
+					}) as any,
+				),
+			);
+		});
+		// The incoming doubt MUST surface — the drawer force-expands again.
+		expect(container.innerHTML).toContain("316");
+		act(() => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
 	it("shows the doubt count inside the Plan badge when doubts exist", () => {
 		const props = baseProps({
 			planCards: [1, 2, 3].map((n) => ({ n, title: `T${n}`, state: "todo" })),

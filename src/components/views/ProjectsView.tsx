@@ -3994,24 +3994,7 @@ export function ProjectsView() {
 									))}
 								</div>
 							</main>
-						) : currentProject ? // B8: the per-project detail moved to the single-project Work page
-						// (ProjectWorkspace detailSlot ← projectDetailNode). The landing is now
-						// create + Kanban(history); a selected project opens its own page.
-						null : projects.length === 0 || activeProjects.length === 0 ? null : (
-							<main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
-								<FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />
-								<p className="text-sm font-semibold text-cream-700">
-									{error && projects.length === 0
-										? "Project list unavailable."
-										: "Create a project to start."}
-								</p>
-								<p className="mt-1 text-[12px] text-cream-400">
-									{error && projects.length === 0
-										? "Fix the load error above or reload the project folder."
-										: "Files are stored as local Markdown with a structured Devboule project block."}
-								</p>
-							</main>
-						)}
+						) : null}
 					</div>
 				</div>
 			)}
