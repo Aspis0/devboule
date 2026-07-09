@@ -562,6 +562,7 @@ mod tests {
             style: road_style::LASTRICATA.into(),
             weight: 1,
             path: None,
+            provenance: None,
         }
     }
 

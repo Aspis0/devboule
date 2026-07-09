@@ -19,7 +19,7 @@
 //!   - IAM key expiry within 30 days         (Scaleway API)
 
 use crate::polis::augure::DetectedSin;
-use crate::polis::model::{purpose, severity, Building, UrbanSin};
+use crate::polis::model::{purpose, severity, Building, Road, UrbanSin};
 use crate::polis::scanner::{RoadGraph, ScannedFile};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -64,10 +64,28 @@ pub fn detect_content_sins(content: &str, env_example: Option<&HashSet<String>>)
 /// Add the GRAPH-derived sins (cycles, orphan-export) and merge in the
 /// already-detected per-file content sins. Keys everything by file_id and fills
 /// in each sin's `file_id`. Pure: no file IO, no content needed.
+
+/// Build Tarjan SCCs from the combined road edge set (ast + regex).
+/// Thin adapter: maps Road edges to graph::ImportEdge and delegates to the
+/// production iterative implementation in `crate::backend::graph::tarjan_scc`.
+fn tarjan_scc_from_roads(roads: &[Road]) -> Vec<Vec<String>> {
+    use crate::backend::graph;
+    let edges: Vec<graph::ImportEdge> = roads
+        .iter()
+        .map(|r| graph::ImportEdge {
+            from: r.from.clone(),
+            to: r.to.clone(),
+            weight: 1,
+        })
+        .collect();
+    graph::tarjan_scc(&edges)
+}
+
 pub fn detect_graph_sins(
     scanned: &[ScannedFile],
     buildings: &[Building],
     graph: &RoadGraph,
+    roads: &[Road],
 ) -> SinReport {
     let mut by_file: HashMap<String, Vec<DetectedSin>> = HashMap::new();
     let city_wide: Vec<DetectedSin> = Vec::new();
@@ -100,21 +118,53 @@ pub fn detect_graph_sins(
         }
     }
 
-    // Cyclic import -> fire. Attributed to each participating building.
-    let cyclic = graph.cyclic_nodes();
-    for file_id in &cyclic {
-        by_file.entry(file_id.clone()).or_default().push(DetectedSin {
-            sin: UrbanSin {
-                sin_id: deterministic_sin_id("cycle", file_id),
-                severity: severity::FIRE.to_string(),
-                description: "Cyclic import detected in the road graph".to_string(),
-                auto_detectable: true,
-                file_id: Some(file_id.clone()),
-            },
-            rule_id: "dep-cycle",
-            evidence: "cyclic import detected".to_string(),
-            line: None,
-        });
+    // P2.2 — Cyclic import via Tarjan SCC over the COMBINED road edge set
+    // (ast + regex fallback edges).  Each SCC of size >= 2 produces ONE
+    // DetectedSin per member file.  Evidence string lists cycle MEMBER PATHS
+    // (not file_ids) in sorted order.  Severity: 2-member SCC → fire, >=3 → inferno.
+    let sccs = tarjan_scc_from_roads(roads);
+
+    // Build file_id -> file_path map from buildings for evidence paths.
+    let id_to_path: HashMap<&str, &str> = buildings
+        .iter()
+        .map(|b| (b.file_id.as_str(), b.file_path.as_str()))
+        .collect();
+
+    for scc in &sccs {
+        if scc.len() < 2 {
+            continue;
+        }
+        let severity = if scc.len() >= 3 {
+            severity::INFERNO.to_string()
+        } else {
+            severity::FIRE.to_string()
+        };
+        // Translate file_ids to paths, sort by path for readable evidence.
+        let mut members: Vec<&str> = scc
+            .iter()
+            .filter_map(|id| id_to_path.get(id.as_str()).copied())
+            .collect();
+        members.sort();
+        let evidence = if members.len() <= 5 {
+            format!("cycle: {}", members.join(" -> "))
+        } else {
+            format!("cycle: {} -> ...", members[..5].join(" -> "))
+        };
+        // Emit sin per file_id (not path) — the sin attaches to the building.
+        for file_id in scc {
+            by_file.entry(file_id.clone()).or_default().push(DetectedSin {
+                sin: UrbanSin {
+                    sin_id: deterministic_sin_id("cycle", file_id),
+                    severity: severity.clone(),
+                    description: "Cyclic import detected in the road graph".to_string(),
+                    auto_detectable: true,
+                    file_id: Some(file_id.clone()),
+                },
+                rule_id: "dep-cycle",
+                evidence: evidence.clone(),
+                line: None,
+            });
+        }
     }
 
     // Exported-but-never-imported symbol -> smoke.
@@ -906,6 +956,7 @@ env::var_os("E_VAR");
                 style: "lastricata".into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             },
             Road {
                 road_id: "r2".into(),
@@ -915,6 +966,7 @@ env::var_os("E_VAR");
                 style: "lastricata".into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             },
         ];
         let graph = RoadGraph::build(&buildings, &roads);
@@ -922,7 +974,7 @@ env::var_os("E_VAR");
             mk_scanned("a.ts", "import './b';\n"),
             mk_scanned("b.ts", "import './a';\n"),
         ];
-        let report = detect_graph_sins(&scanned, &buildings, &graph);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
         let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
         assert!(a_sins
             .iter()
@@ -941,7 +993,7 @@ env::var_os("E_VAR");
             mk_scanned("lib.ts", "export const orphan = 1;\n"),
             mk_scanned("user.ts", "const x = 1;\n"),
         ];
-        let report = detect_graph_sins(&scanned, &buildings, &graph);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
         let lib_sins = report.by_file.get("lib").cloned().unwrap_or_default();
         assert!(lib_sins
             .iter()
@@ -964,7 +1016,7 @@ env::var_os("E_VAR");
             "src/main.tsx",
             "export default function App() {}\n",
         )];
-        let report = detect_graph_sins(&scanned, &buildings, &graph);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
         let main_sins = report.by_file.get("main").cloned().unwrap_or_default();
         assert!(
             !main_sins.iter().any(|s| s.sin.description.contains("Exported")),
@@ -1001,7 +1053,7 @@ env::var_os("E_VAR");
             "s.ts",
             "api_key = \"AbCdEfGhIjKlMnOpQrStUvWx\"\n",
         )];
-        let report = detect_graph_sins(&scanned, &buildings, &graph);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
         let s = report
             .by_file
             .get("fid-secret")
@@ -1012,4 +1064,132 @@ env::var_os("E_VAR");
             .any(|sin| sin.sin.severity == severity::INFERNO
                 && sin.sin.file_id.as_deref() == Some("fid-secret")));
     }
+
+    // =========================================================================
+    // P2.2 -- Tarjan SCC dep-cycle sin tests
+    // =========================================================================
+
+    #[test]
+    fn dep_cycle_scc_of_two_produces_fire_with_evidence_string() {
+        let buildings = vec![mk_building("a", "a.ts"), mk_building("b", "b.ts")];
+        let roads = vec![
+            Road {
+                road_id: "r1".into(),
+                from: "a".into(),
+                to: "b".into(),
+                road_type: "import".into(),
+                style: "lastricata".into(),
+                weight: 1,
+                path: None,
+                provenance: Some("ast".into()),
+            },
+            Road {
+                road_id: "r2".into(),
+                from: "b".into(),
+                to: "a".into(),
+                road_type: "import".into(),
+                style: "lastricata".into(),
+                weight: 1,
+                path: None,
+                provenance: Some("ast".into()),
+            },
+        ];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("a.ts", "import './b';\n"),
+            mk_scanned("b.ts", "import './a';\n"),
+        ];
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
+        let cycle_sin = a_sins.iter().find(|s| s.rule_id == "dep-cycle").expect("dep-cycle sin expected");
+        assert_eq!(cycle_sin.sin.severity, severity::FIRE, "2-member SCC must be fire");
+        assert!(cycle_sin.evidence.starts_with("cycle: "), "evidence must describe the cycle");
+        // Evidence should show file PATHS, not file_ids.
+        assert!(cycle_sin.evidence.contains("a.ts") && cycle_sin.evidence.contains("b.ts"),
+            "evidence must mention both cycle member paths: {}", cycle_sin.evidence);
+        // file_ids (a, b) should NOT leak into evidence.
+        assert!(!cycle_sin.evidence.contains("cycle: a -> b"),
+            "evidence must use paths not ids: {}", cycle_sin.evidence);
+    }
+
+    #[test]
+    fn dep_cycle_scc_of_three_produces_inferno() {
+        let buildings = vec![
+            mk_building("a", "a.ts"),
+            mk_building("b", "b.ts"),
+            mk_building("c", "c.ts"),
+        ];
+        let roads = vec![
+            Road {
+                road_id: "r1".into(), from: "a".into(), to: "b".into(),
+                road_type: "import".into(), style: "lastricata".into(),
+                weight: 1, path: None, provenance: Some("ast".into()),
+            },
+            Road {
+                road_id: "r2".into(), from: "b".into(), to: "c".into(),
+                road_type: "import".into(), style: "lastricata".into(),
+                weight: 1, path: None, provenance: Some("ast".into()),
+            },
+            Road {
+                road_id: "r3".into(), from: "c".into(), to: "a".into(),
+                road_type: "import".into(), style: "lastricata".into(),
+                weight: 1, path: None, provenance: Some("ast".into()),
+            },
+        ];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("a.ts", "import './b';\n"),
+            mk_scanned("b.ts", "import './c';\n"),
+            mk_scanned("c.ts", "import './a';\n"),
+        ];
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
+        let cycle_sin = a_sins.iter().find(|s| s.rule_id == "dep-cycle").expect("dep-cycle sin expected");
+        assert_eq!(cycle_sin.sin.severity, severity::INFERNO, ">=3 SCC must be inferno");
+    }
+
+    #[test]
+    fn dep_cycle_large_scc_evidence_truncated() {
+        // Build a 6-member cycle -- evidence must truncate to 5 members + " -> ...".
+        let ids: Vec<String> = (0..6).map(|i| {
+            let ch = char::from_u32(97 + i as u32).unwrap();
+            ch.to_string()
+        }).collect();
+        let mut buildings = Vec::new();
+        let mut roads = Vec::new();
+        let mut scanned = Vec::new();
+        for i in 0..6 {
+            let id = &ids[i];
+            let path = format!("{}.ts", id);
+            buildings.push(mk_building(id, &path));
+            scanned.push(mk_scanned(&path, &format!("import './{}';\n", ids[(i+1)%6])));
+        }
+        for i in 0..6 {
+            roads.push(Road {
+                road_id: format!("r{}", i),
+                from: ids[i].clone(),
+                to: ids[(i+1)%6].clone(),
+                road_type: "import".into(),
+                style: "lastricata".into(),
+                weight: 1,
+                path: None,
+                provenance: Some("ast".into()),
+            });
+        }
+        let graph = RoadGraph::build(&buildings, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        // Every member gets a dep-cycle sin.
+        let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
+        let cycle_sin = a_sins.iter().find(|s| s.rule_id == "dep-cycle").expect("dep-cycle sin expected");
+        // Evidence for 6-member cycle: first 5 sorted, then " -> ..."
+        assert!(cycle_sin.evidence.ends_with(" -> ..."),
+            "large SCC evidence must be truncated: {}", cycle_sin.evidence);
+        let prefix = cycle_sin.evidence.strip_suffix(" -> ...").unwrap();
+        let members = prefix.strip_prefix("cycle: ").unwrap();
+        assert_eq!(members.split(" -> ").count(), 5, "must list exactly 5 members");
+        // Evidence should use file paths (.ts), not file_ids (single letters).
+        assert!(cycle_sin.evidence.contains(".ts"),
+            "evidence must contain paths, got: {}", cycle_sin.evidence);
+    }
+
 }

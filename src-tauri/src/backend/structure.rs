@@ -116,7 +116,21 @@ const TOP_REFERENCED_SYMBOLS: usize = 5;
 /// artifacts / dependency trees that are never part of the project's own architecture
 /// and would blow the file cap with vendored code. `.git` is already skipped as a
 /// hidden dir; the rest are NOT hidden so we must name them.
-pub(crate) const SKIP_DIRS: [&str; 6] = ["target", "node_modules", "dist", "build", "out", ".git"];
+// Keep in sync with polis::scanner::EXCLUDED_DIRS static entries.
+// (scanner adds content-sniffing for vendored dirs; those are NOT copied here.)
+pub(crate) const SKIP_DIRS: [&str; 42] = [
+    "target", "node_modules", "dist", "build", "out",
+    "coverage", ".next", ".nuxt", ".svelte-kit", ".turbo",
+    ".cache", ".parcel-cache", "vendor",
+    ".venv", "venv", "env", "__pycache__", "site-packages",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".eggs",
+    ".git", ".svn", ".hg", ".idea", ".vscode",
+    "docs",
+    "oracle-data", "legacy-graph-out", "codex-runs", "codex-sessions",
+    "cleanup-backups", "storage-audit",
+    ".wrangler", ".playwright-mcp", ".agents", ".codex", ".deepseek",
+    ".aspis-polis", ".aspis-censor",
+];
 
 /// One node in the structure graph: a single source file and its degree in the
 /// cross-file reference graph. Serialized camelCase for the later MCP/JSON exposure +
@@ -199,6 +213,8 @@ pub(crate) struct FileFacts {
     pub(crate) identifiers: BTreeSet<String>,
     /// Total source lines (for the CKG FILE node's end_line).
     pub(crate) total_lines: u32,
+    /// Raw import references from the grammar (the same parse as identifiers/items).
+    pub(crate) imports: Vec<extract::RawImport>,
     /// The full parsed top-level items (kind/name/start_line/end_line) — the CKG's symbol nodes.
     /// Carried so the CKG reuses THIS parse instead of re-walking + re-parsing the tree.
     pub(crate) items: Vec<ReviewItem>,
@@ -459,6 +475,30 @@ pub(crate) struct ScanResult {
 /// non-UTF-8 path segment (a node key MUST be lossless) in `skipped_unreadable`. None of
 /// these is fatal — they are dropped from the graph but always counted, so every walk
 /// entry that reached the per-file stage is accounted for.
+/// Build the shared walker used by both `collect_files` and the
+/// import-graph signature cache.  Deterministic sorted traversal with
+/// standard gitignore filters and SKIP_DIRS.  Keep in sync with
+/// `polis::scanner::EXCLUDED_DIRS` for the static entries.
+pub(crate) fn make_walker(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .standard_filters(true)
+        .parents(true)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|entry| {
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            if is_dir {
+                if let Some(name) = entry.file_name().to_str() {
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .build()
+}
+
 pub(crate) fn collect_files(project_root: &Path) -> ScanResult {
     collect_files_bounded(project_root, MAX_FILES, MAX_WALK_ENTRIES)
 }
@@ -482,26 +522,7 @@ fn collect_files_bounded(
     let mut visited: usize = 0;
     let mut capped = false;
 
-    let walker = WalkBuilder::new(project_root)
-        .standard_filters(true) // hidden files + .gitignore/.ignore/global-gitignore
-        .parents(true)
-        .require_git(false) // honor .gitignore even outside a git repo
-        .sort_by_file_name(|a, b| a.cmp(b)) // deterministic traversal order
-        .filter_entry(|entry| {
-            // Skip our hard-blocked directories regardless of `.gitignore` state. We only
-            // apply the name filter to directories so a FILE that happens to be named
-            // e.g. `build` is still considered.
-            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-            if is_dir {
-                if let Some(name) = entry.file_name().to_str() {
-                    if SKIP_DIRS.contains(&name) {
-                        return false;
-                    }
-                }
-            }
-            true
-        })
-        .build();
+    let walker = make_walker(project_root);
 
     for result in walker {
         // Hard upper bound on the parse budget: stop once we have max_files parsed files.
@@ -573,6 +594,7 @@ fn collect_files_bounded(
         let total_lines = parsed.total_lines;
         // Move the grammar's identifier set into a BTreeSet for deterministic iteration.
         let identifiers: BTreeSet<String> = parsed.identifiers.into_iter().collect();
+        let imports = parsed.imports;
 
         facts.push(FileFacts {
             path: rel,
@@ -580,6 +602,7 @@ fn collect_files_bounded(
             defined,
             identifiers,
             total_lines,
+            imports,
             items: parsed.items,
         });
     }

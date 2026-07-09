@@ -327,6 +327,11 @@ export interface Road {
    * when absent it falls back to a straight `from`->`to` line.
    */
   path?: { x: number; y: number }[];
+  /**
+   * Provenance of this road: "ast" (tree-sitter parse) | "regex" (regex
+   * extract from the scanner) | "semantic" (Oracle embedding similarity).
+   */
+  provenance?: "ast" | "regex" | "semantic";
 }
 
 /**

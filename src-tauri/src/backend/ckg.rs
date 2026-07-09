@@ -3,13 +3,14 @@
 //! REUSES the Censor's tree-sitter parse (`censor::extract::parse_file`) and the
 //! `structure` module's walk helpers (SKIP_DIRS / is_parseable / MAX_FILE_BYTES /
 //! relative_path_string / parse_root_flag) so the CKG and the structure graph share ONE
-//! source of truth for what gets walked and parsed. This first slice emits FILE + symbol
-//! nodes and CONTAIN edges; IMPORT/CALL edges + the Python store/index land in later slices.
+//! source of truth for what gets walked and parsed. This slice emits FILE + symbol
+//! nodes, CONTAIN edges, and IMPORT edges (resolved via `graph::resolve_import_edges`
+//! from the real tree-sitter import capture in `censor::extract`).
 //! The wire shape mirrors `structure`'s bridge: the Python side shells `<app_bin> ckg --root`.
 
 use std::path::Path;
 
-use crate::backend::structure;
+use crate::backend::{graph, structure};
 
 /// A node in the Code Knowledge Graph.
 #[derive(serde::Serialize)]
@@ -25,7 +26,7 @@ pub struct CkgNode {
 }
 
 /// An edge in the Code Knowledge Graph.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CkgEdge {
     pub src: String,
@@ -105,6 +106,16 @@ pub fn build_ckg_graph(project_root: &Path) -> Result<CkgGraph, String> {
                 kind: "CONTAIN".to_string(),
             });
         }
+    }
+
+    // ---- IMPORT edges: resolve real import references from the parse substrate.
+    let import_edges = graph::resolve_import_edges(&scan.facts);
+    for e in &import_edges {
+        edges.push(CkgEdge {
+            src: e.from.clone(),
+            dst: e.to.clone(),
+            kind: "IMPORT".to_string(),
+        });
     }
 
     // Deterministic order so the Python ingester can diff two dumps stably.
@@ -217,4 +228,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn import_edges_from_a_to_b() {
+        let dir = unique_temp_root("import");
+        // A imports symbols from B
+        write(
+            &dir,
+            "src/a.rs",
+            "use crate::b::Thing;\npub fn caller() -> Thing { Thing { x: 1 } }\n",
+        );
+        write(
+            &dir,
+            "src/b.rs",
+            "pub struct Thing { pub x: u32 }\n",
+        );
+        let g = super::build_ckg_graph(&dir).unwrap();
+
+        // Both files have FILE nodes
+        let a_file = g.nodes.iter().find(|n| n.id == "src/a.rs").expect("FILE node for a.rs");
+        let b_file = g.nodes.iter().find(|n| n.id == "src/b.rs").expect("FILE node for b.rs");
+        assert_eq!(a_file.kind, "FILE");
+        assert_eq!(b_file.kind, "FILE");
+
+        // CONTAIN edges exist
+        let contain_a = g.edges.iter().any(|e| e.kind == "CONTAIN" && e.src == "src/a.rs");
+        assert!(contain_a, "CONTAIN edges must be present");
+
+        // IMPORT edge from a.rs -> b.rs
+        let import_edge = g.edges.iter().find(|e| {
+            e.kind == "IMPORT" && e.src == "src/a.rs" && e.dst == "src/b.rs"
+        });
+        assert!(
+            import_edge.is_some(),
+            "Expected IMPORT edge src/a.rs -> src/b.rs, got edges: {:?}",
+            g.edges.iter().filter(|e| e.kind == "IMPORT").collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

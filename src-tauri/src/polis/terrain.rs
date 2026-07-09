@@ -566,6 +566,7 @@ mod tests {
                     .map(|(x, y)| Coords::new(x as f64, y as f64))
                     .collect(),
             ),
+            provenance: None,
         }
     }
 

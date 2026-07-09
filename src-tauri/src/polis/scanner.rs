@@ -65,6 +65,7 @@ const HINT_LINES: usize = 40;
 ///   - vendored deps: `vendor`,
 ///   - editor / VCS metadata: `.git`/`.idea`/`.vscode`/`.svn`/`.hg`,
 ///   - docs (kept from the original set).
+// Keep in sync with backend::structure::SKIP_DIRS for static entries.
 pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     // JS / Rust build + deps
     "node_modules",
@@ -283,7 +284,27 @@ pub(crate) fn generate_city_state_with_metrics(
     // BEFORE classification so the classifier can use real import-graph degree.
     // `roads` is mutable: their world-grid `path` is filled in phase 4b once the
     // buildings have coords (see `grid::route_roads`).
-    let mut roads = build_import_roads(&scanned, &file_id_by_path, project_path, &alias);
+    //
+    // P2.2 — DUAL PROVENANCE: AST (tree-sitter) edges are authoritative for
+    // covered files; regex extraction is the fallback for files the structure
+    // walk didn't parse (no grammar / walk skipped / capped). Both feeds
+    // produce the same Road shape; provenance tags them.
+    let ast_graph = match crate::backend::graph::import_graph_cached(project_path) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            crate::polis::commands::polis_debug_append(&format!(
+                "IMPORT_GRAPH FAILED (falling back to all-regex): {e}"
+            ));
+            None
+        }
+    };
+    let mut roads = build_import_roads_dual(
+        &scanned,
+        &file_id_by_path,
+        project_path,
+        &alias,
+        ast_graph.as_ref(),
+    );
     // POLIS FOLLOW-UP: add `semantic` roads (Oracle embedding similarity > 0.82)
     // and `infrastructure` roads (wrangler.toml bindings / env URLs) here.
 
@@ -459,7 +480,7 @@ pub(crate) fn generate_city_state_with_metrics(
     // Augure — urban sins. Content sins were already detected per-file during
     // the scan (with content dropped); here we add the graph-derived sins
     // (cycles, orphan-export) and key everything by file_id.
-    let sin_result = sins::detect_graph_sins(&scanned, &buildings, &graph);
+    let sin_result = sins::detect_graph_sins(&scanned, &buildings, &graph, &roads);
 
     // Build (rel_path, content_hash, Vec<SinRecord>) per file and upsert to
     // the persisted sin ledger. Failures are logged but never fail the scan.
@@ -3150,6 +3171,132 @@ fn road_id(from: &str, to: &str, road_type: &str) -> String {
     format!("road-{road_type}-{}", &full[..12])
 }
 
+
+/// P2.2 — Build import roads with dual provenance (AST + regex fallback).
+///
+/// AST edges from `ast_graph` are authoritative for files in `graph.files`;
+/// regex extraction is used ONLY for files NOT covered by the AST graph.
+/// Both feeds produce the same `Road` shape with `provenance` tagged.
+/// Weight banding: AST edge weight → `clamp(1 + log2(weight) as u32, 1, 5)`;
+/// regex keeps its existing incoming-count banding.
+pub fn build_import_roads_dual(
+    scanned: &[ScannedFile],
+    file_id_by_path: &HashMap<String, String>,
+    project_root: &Path,
+    alias: &TsAlias,
+    ast_graph: Option<&crate::backend::graph::ImportGraph>,
+) -> Vec<Road> {
+    let mut roads: Vec<Road> = Vec::new();
+
+    // Build regex roads normally (existing behaviour). We filter out
+    // AST-covered edges AFTER the build so the degree computation is correct
+    // and road_ids stay stable.
+    let ast_covered: HashSet<&str> = ast_graph
+        .map(|g| g.files.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    // 1. Regex roads — build as usual, then keep only those where the
+    //    IMPORTER is NOT AST-covered (the importer drives the extraction).
+    let mut regex_roads = build_import_roads(
+        scanned,
+        file_id_by_path,
+        project_root,
+        alias,
+    );
+    // Build reverse map: file_id -> file_path for the retain filter.
+    let path_by_id: HashMap<&str, &str> = file_id_by_path
+        .iter()
+        .map(|(p, id)| (id.as_str(), p.as_str()))
+        .collect();
+    regex_roads.retain(|r| {
+        // Keep regex road only if the importer (from) is NOT AST-covered.
+        match path_by_id.get(r.from.as_str()) {
+            Some(p) => !ast_covered.contains(p),
+            None => true, // keep if we can't determine
+        }
+    });
+    // Remove roads where TO is also not AST-covered? No — the edge should
+    // only be produced when BOTH endpoints are in the regex set. Actually the
+    // importer check is sufficient because build_import_roads only resolves
+    // to files the import resolver knows about (all scanned files). So an
+    // AST-covered importer should never produce regex roads; keep only
+    // regex-imported edges.
+    for r in &mut regex_roads {
+        r.provenance = Some("regex".to_string());
+    }
+    roads.append(&mut regex_roads);
+
+    // 2. AST roads for covered files (authoritative, even at zero imports).
+    if let Some(graph) = ast_graph {
+        let resolver = ImportResolver::new(scanned, file_id_by_path);
+        // Index covered file_ids for quick lookup.
+        let covered_ids: HashSet<&str> = ast_covered
+            .iter()
+            .filter_map(|p| file_id_by_path.get(*p).map(|id| id.as_str()))
+            .collect();
+
+        let mut incoming: HashMap<String, u32> = HashMap::new();
+        let mut ast_pairs: Vec<(String, String, u32)> = Vec::new();
+
+        for edge in &graph.edges {
+            let from_id = match file_id_by_path.get(edge.from.as_str()) {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+            let to_id = match file_id_by_path.get(edge.to.as_str()) {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+            // Only emit AST roads where BOTH endpoints are covered files with
+            // existing buildings (edge to file outside building set → NO road).
+            if !covered_ids.contains(from_id.as_str()) || !covered_ids.contains(to_id.as_str()) {
+                continue;
+            }
+            if from_id == to_id {
+                continue;
+            }
+            // Also resolve via the existing resolver so alias handling etc. is
+            // consistent (the AST graph already resolved, but this gives us the
+            // canonical file_id).
+            let weight = edge.weight;
+            ast_pairs.push((from_id.clone(), to_id.clone(), weight));
+            *incoming.entry(to_id).or_insert(0) += weight;
+        }
+
+        // Dedup by (from, to) — sum weights for duplicate AST edges.
+        let mut deduped: HashMap<(String, String), u32> = HashMap::new();
+        for (from, to, w) in ast_pairs {
+            *deduped.entry((from, to)).or_default() += w;
+        }
+
+        let mut ordered: Vec<(String, String)> = deduped.keys().cloned().collect();
+        ordered.sort();
+
+        for (from, to) in ordered {
+            let raw_weight = deduped.get(&(from.clone(), to.clone())).copied().unwrap_or(1);
+            // AST weight banding: clamp(1 + log2(weight), 1, 5)
+            let weight = if raw_weight <= 1 {
+                1u32
+            } else {
+                let log2 = (raw_weight as f64).log2().floor() as u32;
+                (1 + log2).clamp(1, 5)
+            };
+            roads.push(Road {
+                road_id: road_id(&from, &to, road_type::IMPORT),
+                from,
+                to,
+                road_type: road_type::IMPORT.to_string(),
+                style: road_style::LASTRICATA.to_string(),
+                weight,
+                path: None,
+                provenance: Some("ast".to_string()),
+            });
+        }
+    }
+
+    roads
+}
+
 /// Build `import` roads from resolved imports. `weight` is 1..=5, proportional
 /// to how many times the *target* file is imported (clamped).
 pub fn build_import_roads(
@@ -3202,6 +3349,7 @@ pub fn build_import_roads(
                 weight,
                 // Filled in phase 4b by `grid::route_roads` (needs coords).
                 path: None,
+                provenance: None,
             }
         })
         .collect()
@@ -7522,6 +7670,7 @@ const y = await import('@/lazy');
             style: road_style::LASTRICATA.into(),
             weight,
             path: None,
+            provenance: None,
         }
     }
 
@@ -7847,6 +7996,7 @@ const y = await import('@/lazy');
                         style: road_style::LASTRICATA.into(),
                         weight: w,
                         path: None,
+                        provenance: None,
                     });
                     remaining -= w;
                     k += 1;
@@ -7893,6 +8043,7 @@ const y = await import('@/lazy');
                 style: road_style::LASTRICATA.into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             },
             Road {
                 road_id: "r2".into(),
@@ -7902,6 +8053,7 @@ const y = await import('@/lazy');
                 style: road_style::LASTRICATA.into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             },
         ];
         let g = RoadGraph::build(&buildings, &roads);
@@ -7937,6 +8089,7 @@ const y = await import('@/lazy');
                 style: road_style::LASTRICATA.into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             })
             .collect();
         let g = RoadGraph::build(&buildings, &roads);
@@ -7960,6 +8113,7 @@ const y = await import('@/lazy');
                 style: road_style::LASTRICATA.into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             })
             .collect();
         // Close the loop: last -> first.
@@ -7971,6 +8125,7 @@ const y = await import('@/lazy');
             style: road_style::LASTRICATA.into(),
             weight: 1,
             path: None,
+            provenance: None,
         });
         let g = RoadGraph::build(&buildings, &roads);
         let cyc = g.cyclic_nodes();
@@ -8009,6 +8164,7 @@ import { cdn } from 'https://cdn.example.com/x';
                 style: road_style::LASTRICATA.into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             },
             Road {
                 road_id: "r2".into(),
@@ -8018,6 +8174,7 @@ import { cdn } from 'https://cdn.example.com/x';
                 style: road_style::LASTRICATA.into(),
                 weight: 1,
                 path: None,
+                provenance: None,
             },
         ];
         let g = RoadGraph::build(&buildings, &roads);
@@ -10322,6 +10479,7 @@ import { cdn } from 'https://cdn.example.com/x';
             style: road_style::LASTRICATA.to_string(),
             weight,
             path: None,
+            provenance: None,
         }
     }
 
@@ -10695,4 +10853,124 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
             "hex part '{hex_part}' must be lowercase hex digits"
         );
     }
+
+    // =========================================================================
+    // P2.2 — Dual-provenance road tests (AST + regex)
+    // =========================================================================
+
+    /// AST-covered file with an edge → road has provenance "ast".
+    #[test]
+    fn ast_covered_file_produces_ast_provenance_road() {
+        // Simulate an AST graph with one edge from a.ts -> b.ts.
+        use crate::backend::graph::{ImportEdge, ImportGraph};
+        let ast_graph = ImportGraph {
+            edges: vec![ImportEdge {
+                from: "a.ts".into(),
+                to: "b.ts".into(),
+                weight: 3,
+            }],
+            capped: false,
+            files: ["a.ts".into(), "b.ts".into()].into_iter().collect(),
+        };
+        let scanned = vec![
+            sf("a.ts", &["./b"]),
+            sf("b.ts", &[]),
+        ];
+        let mut ids = HashMap::new();
+        ids.insert("a.ts".into(), "id-a".into());
+        ids.insert("b.ts".into(), "id-b".into());
+        let roads = build_import_roads_dual(
+            &scanned, &ids, Path::new("/proj"), &TsAlias::default(),
+            Some(&ast_graph),
+        );
+        // a.ts is AST-covered → expect an AST-provenance road from a to b.
+        let ast_road = roads.iter().find(|r| r.from == "id-a" && r.to == "id-b");
+        assert!(ast_road.is_some(), "expected AST road from a to b, got {:?}", roads);
+        assert_eq!(ast_road.unwrap().provenance.as_deref(), Some("ast"));
+    }
+
+    /// File NOT in AST coverage → regex road has provenance "regex".
+    #[test]
+    fn file_not_in_ast_coverage_produces_regex_provenance() {
+        use crate::backend::graph::{ImportEdge, ImportGraph};
+        // AST covers only c.ts (no edges), so a.ts falls back to regex.
+        let ast_graph = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["c.ts".into()].into_iter().collect(),
+        };
+        let scanned = vec![
+            sf("a.ts", &["./b"]),
+            sf("b.ts", &[]),
+        ];
+        let mut ids = HashMap::new();
+        ids.insert("a.ts".into(), "id-a".into());
+        ids.insert("b.ts".into(), "id-b".into());
+        let roads = build_import_roads_dual(
+            &scanned, &ids, Path::new("/proj"), &TsAlias::default(),
+            Some(&ast_graph),
+        );
+        // "a.ts" is not in ast_graph.files → regex provenance.
+        let regex_road = roads.iter().find(|r| r.from == "id-a");
+        assert!(regex_road.is_some(), "expected regex road from a, got {:?}", roads);
+        assert_eq!(regex_road.unwrap().provenance.as_deref(), Some("regex"));
+    }
+
+    /// AST edge to a file outside the building set → NO road.
+    #[test]
+    fn ast_edge_to_non_building_file_produces_no_road() {
+        use crate::backend::graph::{ImportEdge, ImportGraph};
+        // AST has an edge from a.ts to external.ts, but external.ts has no
+        // building (not in file_id_by_path).
+        let ast_graph = ImportGraph {
+            edges: vec![ImportEdge {
+                from: "a.ts".into(),
+                to: "external.ts".into(),
+                weight: 1,
+            }],
+            capped: false,
+            files: ["a.ts".into(), "external.ts".into()].into_iter().collect(),
+        };
+        let scanned = vec![
+            sf("a.ts", &["./external"]),
+        ];
+        let mut ids = HashMap::new();
+        ids.insert("a.ts".into(), "id-a".into());
+        // external.ts NOT in ids.
+        let roads = build_import_roads_dual(
+            &scanned, &ids, Path::new("/proj"), &TsAlias::default(),
+            Some(&ast_graph),
+        );
+        // No road should exist FROM a (the edge's target has no building).
+        let from_a = roads.iter().filter(|r| r.from == "id-a").count();
+        assert_eq!(from_a, 0, "no road should exist for edge to non-building file, got {:?}", roads);
+    }
+
+    /// AST-covered file with zero imports gets no regex roads.
+    #[test]
+    fn ast_covered_file_zero_imports_no_regex_roads() {
+        use crate::backend::graph::ImportGraph;
+        // a.ts is AST-covered (in graph.files) but has no AST edges.
+        // Regex extraction should NOT produce roads for it.
+        let ast_graph = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["a.ts".into()].into_iter().collect(),
+        };
+        let scanned = vec![
+            sf("a.ts", &["./b"]), // regex would find this
+            sf("b.ts", &[]),
+        ];
+        let mut ids = HashMap::new();
+        ids.insert("a.ts".into(), "id-a".into());
+        ids.insert("b.ts".into(), "id-b".into());
+        let roads = build_import_roads_dual(
+            &scanned, &ids, Path::new("/proj"), &TsAlias::default(),
+            Some(&ast_graph),
+        );
+        // No road FROM id-a (AST-covered, authoritative even at zero imports).
+        let from_a = roads.iter().filter(|r| r.from == "id-a").count();
+        assert_eq!(from_a, 0, "AST-covered file must not get regex roads, got {:?}", roads);
+    }
+
 }

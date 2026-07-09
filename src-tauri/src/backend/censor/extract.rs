@@ -73,6 +73,20 @@ pub struct ReviewItem {
 /// from the finding struct ON PURPOSE so C4 can ground findings without this module
 /// depending on `gemma.rs` (the shared-file coordination boundary).
 ///
+
+/// A single import statement extracted from source code.
+///
+/// `specifier` is the module/path being imported (quotes and wrapping
+/// stripped). `symbol_count` is the number of named symbols imported
+/// (0 for wildcard/bare imports).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawImport {
+    /// The module/path specifier (quotes stripped).
+    pub specifier: String,
+    /// Number of named symbols (0 for wildcard/bare).
+    pub symbol_count: u32,
+}
+
 /// `identifiers` is EMPTY when there is no grammar for the language. An empty set
 /// means "we cannot vouch for any symbol", which DISABLES symbol grounding for that
 /// file (unknown != contradicted) — see [`grounds`].
@@ -87,6 +101,9 @@ pub struct ParsedFile {
     /// Every identifier the grammar observed in the file. Used for symbol
     /// grounding. EMPTY ⇒ symbol grounding disabled for this file.
     pub identifiers: HashSet<String>,
+    /// Import statements extracted from the file (module specifiers + symbol counts).
+    /// EMPTY when the language has no import grammar wired.
+    pub imports: Vec<RawImport>,
 }
 
 /// The verdict of grounding one finding against a [`ParsedFile`]. `Kept` means the
@@ -176,59 +193,66 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
     let total_lines = count_lines(source);
     match lang {
         FileLang::Rust => {
-            let (items, identifiers) = parse_rust(source);
+            let (items, identifiers, imports) = parse_rust(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         FileLang::Ts => {
-            let (items, identifiers) = parse_ts(source);
+            let (items, identifiers, imports) = parse_ts(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         FileLang::Py => {
-            let (items, identifiers) = parse_py(source);
+            let (items, identifiers, imports) = parse_py(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         FileLang::Go => {
-            let (items, identifiers) = parse_go(source);
+            let (items, identifiers, imports) = parse_go(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         FileLang::Cpp => {
-            let (items, identifiers) = parse_cpp(source);
+            let (items, identifiers, imports) = parse_cpp(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         FileLang::Html => {
-            let (items, identifiers) = parse_html(source);
+            let (items, identifiers, imports) = parse_html(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         FileLang::Kotlin => {
-            let (items, identifiers) = parse_kotlin(source);
+            let (items, identifiers, imports) = parse_kotlin(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
+                imports,
             }
         }
         // No grammar wired for these (lint-runner-only quick wins) — they degrade
@@ -244,6 +268,7 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
             total_lines,
             items: Vec::new(),
             identifiers: HashSet::new(),
+            imports: Vec::new(),
         },
     }
 }
@@ -435,10 +460,10 @@ fn rust_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewI
 /// legitimately cite a local variable, a called function, a field, or a lifetime, not
 /// only a top-level item. A parse failure yields empty `items` + empty `identifiers`
 /// (symbol grounding then disabled — fail-open, never a false drop).
-fn parse_rust(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_rust(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_rust_tree(source) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -485,7 +510,8 @@ fn parse_rust(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
         }
     }
 
-    (items, identifiers)
+    let imports = extract_rust_imports(&tree.root_node(), &bytes);
+    (items, identifiers, imports)
 }
 
 /// Strip a Rust raw-identifier prefix (`r#`) so `r#type` and `type` compare equal.
@@ -675,10 +701,10 @@ fn is_ts_identifier_kind(kind: &str) -> bool {
 /// declaration). The identifier set is every identifier-like leaf in the whole tree
 /// (see [`is_ts_identifier_kind`]). A parse failure yields empty + empty (symbol
 /// grounding then disabled — fail-open, never a false drop).
-fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_with(source, tree_sitter_typescript::LANGUAGE_TSX.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -703,7 +729,8 @@ fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, is_ts_identifier_kind);
-    (items, identifiers)
+    let imports = extract_ts_imports(&tree.root_node(), &bytes);
+    (items, identifiers, imports)
 }
 
 // ===========================================================================
@@ -743,10 +770,10 @@ fn py_review_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> 
 /// `function_definition`, named `f`; the line range is taken from that inner node, i.e.
 /// the `def`/`class` line through the body). The identifier set is every `identifier`
 /// leaf in the whole tree. A parse failure yields empty + empty (fail-open).
-fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_with(source, tree_sitter_python::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -769,7 +796,8 @@ fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, |k| k == "identifier");
-    (items, identifiers)
+    let imports = extract_py_imports(&tree.root_node(), &bytes);
+    (items, identifiers, imports)
 }
 
 // ===========================================================================
@@ -862,10 +890,10 @@ fn is_go_identifier_kind(kind: &str) -> bool {
 /// identifier set is every identifier-like leaf in the whole tree (see
 /// [`is_go_identifier_kind`]). A parse failure yields empty + empty (symbol grounding
 /// then disabled — fail-open, never a false drop).
-fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_with(source, tree_sitter_go::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -879,7 +907,8 @@ fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, is_go_identifier_kind);
-    (items, identifiers)
+    let imports = extract_go_imports(&tree.root_node(), &bytes);
+    (items, identifiers, imports)
 }
 
 // ===========================================================================
@@ -1074,10 +1103,10 @@ fn is_cpp_identifier_kind(kind: &str) -> bool {
 /// see [`CPP_ITEM_KINDS`]); the identifier set is every identifier-like leaf in the
 /// whole tree (see [`is_cpp_identifier_kind`]). A parse failure yields empty + empty
 /// (symbol grounding then disabled — fail-open, never a false drop).
-fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_with(source, tree_sitter_cpp::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -1091,7 +1120,8 @@ fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, is_cpp_identifier_kind);
-    (items, identifiers)
+    let imports = extract_cpp_imports(&tree.root_node(), &bytes);
+    (items, identifiers, imports)
 }
 
 // ===========================================================================
@@ -1272,10 +1302,10 @@ fn collect_html_attribute(
 /// see [`html_top_level_item`]); the identifier set is every `tag_name` plus the values of
 /// `id`/`class`/`name` attributes (see [`collect_html_identifiers`]). A parse failure
 /// yields empty + empty (symbol grounding then disabled — fail-open, never a false drop).
-fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_with(source, tree_sitter_html::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -1289,7 +1319,8 @@ fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_html_identifiers(root, bytes);
-    (items, identifiers)
+    let imports = Vec::new();
+    (items, identifiers, imports)
 }
 
 // ===========================================================================
@@ -1388,10 +1419,10 @@ fn is_kotlin_identifier_kind(kind: &str) -> bool {
 /// the identifier set is every identifier-like leaf in the whole tree (see
 /// [`is_kotlin_identifier_kind`]). A parse failure yields empty + empty (symbol grounding
 /// then disabled — fail-open, never a false drop).
-fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
+fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
     let tree = match parse_with(source, tree_sitter_kotlin_ng::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -1405,7 +1436,8 @@ fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>) {
     }
 
     let identifiers = collect_identifiers(root, bytes, is_kotlin_identifier_kind);
-    (items, identifiers)
+    let imports = extract_kotlin_imports(&tree.root_node(), &bytes);
+    (items, identifiers, imports)
 }
 
 // ===========================================================================
@@ -1450,6 +1482,460 @@ fn collect_identifiers(
     }
     identifiers
 }
+
+// ===========================================================================
+// Import extraction
+// ===========================================================================
+
+/// Extract rust `use` imports from a source_file node.
+fn extract_rust_imports(root: &tree_sitter::Node, bytes: &[u8]) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "use_declaration" {
+            continue;
+        }
+        // The use_declaration has an `argument` field which is either:
+        // - scoped_identifier (for `use a::b::c;`)
+        // - scoped_use_list (for `use a::b::{x, y};`)
+        if let Some(arg) = child.child_by_field_name("argument") {
+            let (spec, count) = rust_use_arg_path_and_count(&arg, bytes);
+            if !spec.is_empty() {
+                imports.push(RawImport { specifier: spec, symbol_count: count });
+            }
+        }
+    }
+    imports
+}
+
+/// Walk a `scoped_identifier` or `scoped_use_list` recursively to collect the
+/// path segments and (for scoped_use_list) the brace-group symbol count.
+fn rust_use_arg_path_and_count(node: &tree_sitter::Node, bytes: &[u8]) -> (String, u32) {
+    match node.kind() {
+        "scoped_use_list" => {
+            // Path segment(s) before the brace: the `path` field.
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(path) = node.child_by_field_name("path") {
+                // Recursively walk scoped_identifier chain
+                rust_collect_scoped_path(&path, bytes, &mut parts);
+            }
+            // Count identifiers inside the brace group
+            let count = if let Some(list) = node.child_by_field_name("list") {
+                count_use_list_identifiers(&list, bytes)
+            } else {
+                0
+            };
+            (parts.join("::"), count)
+        }
+        "scoped_identifier" => {
+            let mut parts: Vec<String> = Vec::new();
+            rust_collect_scoped_path(node, bytes, &mut parts);
+            (parts.join("::"), 0)
+        }
+        // Fallback for other node kinds (macro, etc.)
+        _ => {
+            let text = node.utf8_text(bytes).ok().map(|t| t.trim().to_string()).unwrap_or_default();
+            (text, 0)
+        }
+    }
+}
+
+/// Recursively collect path segments from a chain of `scoped_identifier` nodes.
+/// Each scoped_identifier has: `path` (the left side, optionally another scoped_identifier)
+/// and `name` (a terminal identifier, crate, self, super, or Self).
+fn rust_collect_scoped_path(node: &tree_sitter::Node, bytes: &[u8], parts: &mut Vec<String>) {
+    // Recurse into path first (left-to-right order)
+    if let Some(path) = node.child_by_field_name("path") {
+        rust_collect_scoped_path(&path, bytes, parts);
+    }
+    // Then collect the name
+    if let Some(name) = node.child_by_field_name("name") {
+        if let Ok(text) = name.utf8_text(bytes) {
+            let t = text.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+    } else {
+        // Terminal level: the node itself is an identifier/crate/super/self/Self
+        match node.kind() {
+            "identifier" | "crate" | "super" | "self" | "Self" => {
+                if let Ok(text) = node.utf8_text(bytes) {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Count identifiers inside a `use_list` (brace group like `{self, Display, Debug}`).
+fn count_use_list_identifiers(node: &tree_sitter::Node, _bytes: &[u8]) -> u32 {
+    let mut count: u32 = 0;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "self" | "super" | "crate" | "Self" => {
+                count += 1;
+            }
+            // Nested use in `use foo::{bar, baz::{a, b}}` — recurse
+            "use_list" => {
+                count += count_use_list_identifiers(&child, _bytes);
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+/// Extract TS/JS imports: import_statement, export_statement (re-exports), and
+/// require()/import() call expressions.
+fn extract_ts_imports(root: &tree_sitter::Node, bytes: &[u8]) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "import_statement" => {
+                if let Some(source) = child.child_by_field_name("source") {
+                    if let Ok(src_text) = source.utf8_text(bytes) {
+                        let spec = strip_quotes(src_text.trim());
+                        if !spec.is_empty() {
+                            let count = count_ts_named_imports(&child);
+                            imports.push(RawImport { specifier: spec, symbol_count: count });
+                        }
+                    }
+                }
+            }
+            "export_statement" => {
+                if let Some(source) = child.child_by_field_name("source") {
+                    if let Ok(src_text) = source.utf8_text(bytes) {
+                        let spec = strip_quotes(src_text.trim());
+                        if !spec.is_empty() {
+                            let count = count_ts_named_exports(&child);
+                            imports.push(RawImport { specifier: spec, symbol_count: count });
+                        }
+                    }
+                }
+            }
+            "expression_statement" | "lexical_declaration" | "variable_declaration" => {
+                // require("x") or import("x") may appear directly as a top-level
+                // lexical_declaration (e.g. `const fs = require("fs");`) or nested
+                // under expression_statement. Drill down to find the call_expression.
+                if let Some(call) = find_ts_require_call(&child) {
+                    if let Some(imp) = ts_require_call_import(&call, bytes) {
+                        imports.push(imp);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // P2.2 item 3 — FULL-TREE walk for nested require()/import() calls
+    // (e.g. React.lazy(() => import('./Foo')) inside arrow functions, JSX, etc.).
+    // Top-level pass above already caught expression/literal-level calls; this
+    // second pass catches any call_expression anywhere in the tree whose callee
+    // is `require` or the `import` keyword with a string first argument.
+    // De-duplicated by specifier within the file.
+    let mut seen: std::collections::BTreeSet<String> = imports
+        .iter()
+        .map(|r| r.specifier.clone())
+        .collect();
+    let mut stack: Vec<tree_sitter::Node> = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        stack.push(child);
+    }
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let Some(imp) = ts_require_call_import(&node, bytes) {
+                if seen.insert(imp.specifier.clone()) {
+                    imports.push(imp);
+                }
+            }
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    imports
+}
+
+/// Find a require()/import() call_expression under any nesting of
+/// lexical_declaration/variable_declaration/expression_statement.
+fn find_ts_require_call<'t>(node: &tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "call_expression" => return Some(child),
+            "lexical_declaration" | "variable_declaration" | "expression_statement" => {
+                if let Some(call) = find_ts_require_call(&child) {
+                    return Some(call);
+                }
+            }
+            "variable_declarator" => {
+                // `const fs = require("fs")` → variable_declarator → value: call_expression
+                if let Some(value) = child.child_by_field_name("value") {
+                    if value.kind() == "call_expression" {
+                        return Some(value);
+                    }
+                    if let Some(call) = find_ts_require_call(&value) {
+                        return Some(call);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// If a call_expression has function `require` or `import` with a string literal
+/// argument, return a RawImport (symbol_count 0).
+fn ts_require_call_import(call: &tree_sitter::Node, bytes: &[u8]) -> Option<RawImport> {
+    let func = call.child_by_field_name("function")?;
+    let func_name = func.utf8_text(bytes).ok()?;
+    if func_name != "require" && func_name != "import" {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if child.kind() == "string" || child.kind() == "string_fragment" || child.kind() == "template_string" {
+            if let Ok(text) = child.utf8_text(bytes) {
+                let spec = strip_quotes(text.trim());
+                if !spec.is_empty() {
+                    return Some(RawImport { specifier: spec, symbol_count: 0 });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Count named imports in an import_statement (import_specifier nodes).
+fn count_ts_named_imports(node: &tree_sitter::Node) -> u32 {
+    let mut count = 0u32;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "import_clause" {
+            let mut cc = child.walk();
+            for c in child.children(&mut cc) {
+                if c.kind() == "named_imports" {
+                    let mut nc = c.walk();
+                    for n in c.children(&mut nc) {
+                        if n.kind() == "import_specifier" {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Count named exports in an export_statement (export_specifier nodes).
+fn count_ts_named_exports(node: &tree_sitter::Node) -> u32 {
+    let mut count = 0u32;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "export_clause" {
+            let mut ec = child.walk();
+            for c in child.children(&mut ec) {
+                if c.kind() == "export_specifier" {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Strip surrounding single/double quotes from a string literal text.
+fn strip_quotes(s: &str) -> String {
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        s[1..s.len()-1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Extract Python imports:
+/// - `import_statement`: each dotted_name -> one RawImport, symbol_count 0
+/// - `import_from_statement`: specifier = module_name (incl. leading dots),
+///   symbol_count = imported names count (excluding the module_name itself);
+///   `*` wildcard -> 0.
+fn extract_py_imports(root: &tree_sitter::Node, bytes: &[u8]) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "import_statement" => {
+                let mut ic = child.walk();
+                for c in child.children(&mut ic) {
+                    if c.kind() == "dotted_name" {
+                        if let Ok(text) = c.utf8_text(bytes) {
+                            let spec = text.trim().to_string();
+                            if !spec.is_empty() {
+                                imports.push(RawImport { specifier: spec, symbol_count: 0 });
+                            }
+                        }
+                    }
+                }
+            }
+            "import_from_statement" => {
+                let specifier = child
+                    .child_by_field_name("module_name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+                    .map(|t| t.trim().to_string())
+                    .unwrap_or_default();
+                if specifier.is_empty() {
+                    continue;
+                }
+                // Count imported names: look for `dotted_name` or `aliased_import`
+                // children, BUT skip the module_name itself (it's also a dotted_name).
+                // `*` wildcard -> 0.
+                let module_node = child.child_by_field_name("module_name");
+                let module_id = module_node.as_ref().map(|n| n.id());
+
+                let mut symbol_count = 0u32;
+                let mut has_star = false;
+                let mut ic = child.walk();
+                for c in child.children(&mut ic) {
+                    if c.kind() == "wildcard_import" {
+                        has_star = true;
+                    } else if c.kind() == "dotted_name" || c.kind() == "aliased_import" {
+                        // Skip the module_name child — it's not an imported symbol.
+                        if module_id == Some(c.id()) {
+                            continue;
+                        }
+                        symbol_count += 1;
+                    }
+                }
+                if has_star {
+                    symbol_count = 0;
+                }
+                imports.push(RawImport { specifier, symbol_count });
+            }
+            _ => {}
+        }
+    }
+    imports
+}
+
+/// Extract Go imports: each `import_spec`'s path string -> one RawImport (symbol_count 0).
+/// Handle both single `import "fmt"` and grouped `import ( "os" "strings" )`.
+fn extract_go_imports(root: &tree_sitter::Node, bytes: &[u8]) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "import_declaration" {
+            continue;
+        }
+        // Walk the import_declaration. In tree-sitter-go:
+        // - Single import: import_declaration -> import_spec (direct child)
+        // - Grouped import: import_declaration -> import_spec_list -> import_spec*
+        collect_go_import_specs(&child, bytes, &mut imports);
+    }
+    imports
+}
+
+/// Recursively collect `import_spec` nodes from an import_declaration,
+/// handling both flat and import_spec_list nesting.
+fn collect_go_import_specs(node: &tree_sitter::Node, bytes: &[u8], out: &mut Vec<RawImport>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "import_spec" => {
+                if let Some(path) = child.child_by_field_name("path") {
+                    if let Ok(text) = path.utf8_text(bytes) {
+                        let spec = strip_quotes(text.trim());
+                        if !spec.is_empty() {
+                            out.push(RawImport { specifier: spec, symbol_count: 0 });
+                        }
+                    }
+                }
+            }
+            "import_spec_list" => {
+                collect_go_import_specs(&child, bytes, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract Kotlin imports: each `import` node's dotted path -> one RawImport
+/// (symbol_count 0). The `import` node contains a `qualified_identifier` whose
+/// nested `identifier` children form the dotted path.
+fn extract_kotlin_imports(root: &tree_sitter::Node, bytes: &[u8]) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "import" {
+            continue;
+        }
+        // Drill into qualified_identifier and collect identifier leaf nodes
+        let mut parts: Vec<String> = Vec::new();
+        collect_kt_identifiers(&child, bytes, &mut parts);
+        let specifier = parts.join(".");
+        if !specifier.is_empty() {
+            imports.push(RawImport { specifier, symbol_count: 0 });
+        }
+    }
+    imports
+}
+
+/// Recursively collect `identifier` leaf texts from a Kotlin import subtree.
+fn collect_kt_identifiers(node: &tree_sitter::Node, bytes: &[u8], out: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "simple_identifier" => {
+                if let Ok(text) = child.utf8_text(bytes) {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        out.push(t.to_string());
+                    }
+                }
+            }
+            "qualified_identifier" => {
+                collect_kt_identifiers(&child, bytes, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extract C/C++ imports: only `preproc_include` with `"quoted"` path form.
+/// `<system>` includes are skipped.
+fn extract_cpp_imports(root: &tree_sitter::Node, bytes: &[u8]) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "preproc_include" {
+            continue;
+        }
+        if let Some(path) = child.child_by_field_name("path") {
+            if let Ok(text) = path.utf8_text(bytes) {
+                let trimmed = text.trim();
+                if trimmed.starts_with('"') {
+                    let spec = strip_quotes(trimmed);
+                    if !spec.is_empty() {
+                        imports.push(RawImport { specifier: spec, symbol_count: 0 });
+                    }
+                }
+            }
+        }
+    }
+    imports
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1920,7 +2406,6 @@ macro_rules! noop { () => {}; }
         let via_parse = parse_file(SNIPPET, FileLang::Rust).items;
         assert_eq!(via_extract, via_parse);
     }
-
     // =======================================================================
     // TS/JS (TSX grammar)
     // =======================================================================
@@ -2687,4 +3172,193 @@ val greeting = \"hi\"
         let _ = extract_items("fun broken( {", FileLang::Kotlin);
         let _ = extract_items("}}}{{{ not kotlin 流", FileLang::Kotlin);
     }
+
+    // =========================================================================
+    // Import extraction tests
+    // =========================================================================
+
+    #[test]
+    fn rust_imports_single_and_self() {
+        let src = "use std::collections::HashMap;\nuse self::inner;\n";
+        let parsed = parse_file(src, FileLang::Rust);
+        assert_eq!(parsed.imports.len(), 2);
+        assert_eq!(parsed.imports[0].specifier, "std::collections::HashMap");
+        assert_eq!(parsed.imports[1].specifier, "self::inner");
+    }
+
+    #[test]
+    fn rust_imports_brace_group() {
+        let src = "use std::fmt::{self, Display, Debug};\n";
+        let parsed = parse_file(src, FileLang::Rust);
+        assert_eq!(parsed.imports.len(), 1);
+        let imp = &parsed.imports[0];
+        assert_eq!(imp.specifier, "std::fmt");
+        assert!(imp.symbol_count >= 2, "expected >=2 leaf names, got {}", imp.symbol_count);
+    }
+
+    #[test]
+    fn rust_imports_crate_path() {
+        let src = "use crate::polis::augure::ledger;\n";
+        let parsed = parse_file(src, FileLang::Rust);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "crate::polis::augure::ledger");
+        assert_eq!(parsed.imports[0].symbol_count, 0);
+    }
+
+    #[test]
+    fn rust_imports_super_self() {
+        let src = "use super::util;\nuse self::inner::Thing;\n";
+        let parsed = parse_file(src, FileLang::Rust);
+        assert_eq!(parsed.imports.len(), 2);
+        assert_eq!(parsed.imports[0].specifier, "super::util");
+        assert_eq!(parsed.imports[1].specifier, "self::inner::Thing");
+    }
+
+    #[test]
+    fn rust_imports_no_use_is_empty() {
+        let src = "fn main() {}\n";
+        let parsed = parse_file(src, FileLang::Rust);
+        assert!(parsed.imports.is_empty());
+    }
+
+    #[test]
+    fn ts_imports_default_and_named() {
+        let src = "import React, { useState, useEffect } from \"react\";\n";
+        let parsed = parse_file(src, FileLang::Ts);
+        assert_eq!(parsed.imports.len(), 1);
+        let imp = &parsed.imports[0];
+        assert_eq!(imp.specifier, "react");
+        assert_eq!(imp.symbol_count, 2, "two named imports: useState, useEffect");
+    }
+
+    #[test]
+    fn ts_imports_bare_module() {
+        let src = "import \"../styles.css\";\n";
+        let parsed = parse_file(src, FileLang::Ts);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "../styles.css");
+        assert_eq!(parsed.imports[0].symbol_count, 0);
+    }
+
+    #[test]
+    fn ts_imports_require_call() {
+        let src = "const fs = require(\"fs\");\n";
+        let parsed = parse_file(src, FileLang::Ts);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "fs");
+        assert_eq!(parsed.imports[0].symbol_count, 0);
+    }
+
+    #[test]
+    fn ts_imports_nested_dynamic_import_in_function_body() {
+        // Top-level import + a nested dynamic import() inside an arrow
+        // function body — both must be found.
+        let src = "import React from \"react\";\nconst Lazy = React.lazy(() => import(\"./lazy\"));\n";
+        let parsed = parse_file(src, FileLang::Ts);
+        assert_eq!(parsed.imports.len(), 2, "top-level + nested dynamic import");
+        let specs: Vec<&str> = parsed.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specs.contains(&"react"));
+        assert!(specs.contains(&"./lazy"));
+    }
+
+    #[test]
+    fn ts_imports_reexport() {
+        let src = "export { foo, bar } from \"./utils\";\n";
+        let parsed = parse_file(src, FileLang::Ts);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "./utils");
+        assert_eq!(parsed.imports[0].symbol_count, 2);
+    }
+
+    #[test]
+    fn py_imports_import_statement() {
+        let src = "import os\nimport sys, json\n";
+        let parsed = parse_file(src, FileLang::Py);
+        assert_eq!(parsed.imports.len(), 3, "os, sys, json");
+        let specs: Vec<&str> = parsed.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specs.contains(&"os"));
+        assert!(specs.contains(&"sys"));
+        assert!(specs.contains(&"json"));
+        for imp in &parsed.imports {
+            assert_eq!(imp.symbol_count, 0);
+        }
+    }
+
+    #[test]
+    fn py_imports_from_statement() {
+        let src = "from collections import defaultdict, OrderedDict\n";
+        let parsed = parse_file(src, FileLang::Py);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "collections");
+        assert_eq!(parsed.imports[0].symbol_count, 2);
+    }
+
+    #[test]
+    fn py_imports_from_relative() {
+        let src = "from ..utils import helper\n";
+        let parsed = parse_file(src, FileLang::Py);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "..utils");
+        assert_eq!(parsed.imports[0].symbol_count, 1);
+    }
+
+    #[test]
+    fn py_imports_star_zero_count() {
+        let src = "from os.path import *\n";
+        let parsed = parse_file(src, FileLang::Py);
+        assert_eq!(parsed.imports.len(), 1);
+        assert_eq!(parsed.imports[0].specifier, "os.path");
+        assert_eq!(parsed.imports[0].symbol_count, 0);
+    }
+
+    #[test]
+    fn go_imports_single_and_grouped() {
+        let src = "package main\nimport \"fmt\"\nimport (\n\t\"os\"\n\t\"strings\"\n)\n";
+        let parsed = parse_file(src, FileLang::Go);
+        let specs: Vec<&str> = parsed.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specs.contains(&"fmt"));
+        assert!(specs.contains(&"os"));
+        assert!(specs.contains(&"strings"));
+        assert_eq!(parsed.imports.len(), 3);
+        for imp in &parsed.imports {
+            assert_eq!(imp.symbol_count, 0);
+        }
+    }
+
+    #[test]
+    fn kotlin_imports() {
+        let src = "package com.example\nimport kotlin.collections.List\nimport java.io.File\n";
+        let parsed = parse_file(src, FileLang::Kotlin);
+        let specs: Vec<&str> = parsed.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specs.contains(&"kotlin.collections.List"));
+        assert!(specs.contains(&"java.io.File"));
+        assert_eq!(parsed.imports.len(), 2);
+        for imp in &parsed.imports {
+            assert_eq!(imp.symbol_count, 0);
+        }
+    }
+
+    #[test]
+    fn cpp_imports_quoted_includes_only() {
+        let src = "#include <stdio.h>\n#include \"myheader.h\"\n#include \"util/helpers.h\"\n";
+        let parsed = parse_file(src, FileLang::Cpp);
+        assert_eq!(parsed.imports.len(), 2, "only quoted includes");
+        let specs: Vec<&str> = parsed.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specs.contains(&"myheader.h"));
+        assert!(specs.contains(&"util/helpers.h"));
+        for imp in &parsed.imports {
+            assert_eq!(imp.symbol_count, 0);
+        }
+    }
+
+    #[test]
+    fn other_lang_imports_empty() {
+        assert!(parse_file("whatever", FileLang::Other).imports.is_empty());
+        assert!(parse_file("whatever", FileLang::Shell).imports.is_empty());
+    }
+
+
+
+
+
 }

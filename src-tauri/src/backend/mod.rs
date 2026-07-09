@@ -40,6 +40,7 @@ pub mod fs_replace;
 pub mod fs_watch;
 pub mod git_push;
 pub mod github;
+pub mod graph;
 pub mod hardware;
 pub mod local_coder;
 pub mod main_coder;

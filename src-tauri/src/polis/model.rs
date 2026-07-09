@@ -442,6 +442,11 @@ pub struct Road {
     /// untouched, so old consumers keep working.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<Vec<Coords>>,
+    /// Provenance of this road edge: "ast" (tree-sitter parse) | "regex" (scanner
+    /// regex extract) | "semantic" (Oracle embedding similarity). `None` for
+    /// infrastructure/semantic roads whose provenance is implicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
 }
 
 /// Known road kinds.
@@ -784,6 +789,7 @@ mod tests {
             style: road_style::LASTRICATA.into(),
             weight: 3,
             path: None,
+            provenance: None,
         };
         let json = serde_json::to_string(&road).unwrap();
         assert!(json.contains("\"type\":\"import\""));
@@ -818,6 +824,7 @@ mod tests {
             style: road_style::LASTRICATA.into(),
             weight: 1,
             path: Some(vec![Coords::new(1.0, 2.0), Coords::new(3.0, 2.0)]),
+            provenance: None,
         };
         let json = serde_json::to_string(&road).unwrap();
         // serde camelCase: the field is `path`, with Coords as {x,y}.
