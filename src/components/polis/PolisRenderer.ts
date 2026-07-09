@@ -81,6 +81,7 @@ import {
   type TerrainChunk,
 } from "./terrain";
 import { occupiedTiles, drawProps } from "./props";
+import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fields";
 import { buildBuildingParts, type BuiltParts } from "./buildings";
 import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
@@ -127,6 +128,8 @@ const CHUNK_SIZE = 8; // tiles per chunk side
 // field of tiny flames and the per-step fire redraw is skipped when off. When
 // hidden, `Disaster.update` early-returns on `node.visible === false`.
 const LOD_DISASTER = 0.35;
+// Farmland parcels: too fine at the far overview; hidden below this zoom.
+const LOD_FIELDS = 0.3;
 // External cloud outposts (harbour nodes) at the map margin: small procedural
 // structures, legible once the city itself is readable. Hidden in the far view
 // (same band as agents) so the margin doesn't speckle the zoomed-out overview.
@@ -505,6 +508,8 @@ export class PolisRenderer {
     bounds: Rectangle;
     visible: boolean;
   }[] = [];
+  // Fields (farmland parcels) — one Graphics, LOD-gated at zoom >= 0.3.
+  private fieldsGraphics: Graphics | null = null;
   private animatedNodes: BuildingNode[] = []; // nodes with >=1 kit anim instance
   // The last CityState rendered (full build OR live diff). Diff input for the
   // next live update; null until the first setCityState. We snapshot the
@@ -912,7 +917,7 @@ export class PolisRenderer {
     );
 
     // Synchronous prelude — bounded cost (a handful of batched Graphics each).
-    this.redrawTerrainProps(city.buildings, city.gridSize, city.terrain);
+    this.redrawTerrainProps(city.buildings, city.gridSize, city.terrain, city.districts, city.roads);
     this.debugLog("prelude: terrain done");
     this.drawDistricts(city.districts);
     this.debugLog("prelude: districts done");
@@ -1525,7 +1530,7 @@ export class PolisRenderer {
     //    sin/agent/provider/status diff (terrain identical) still skips the redraw.
     //    (`terrainSig`/`terrainChanged` computed above for the nav-graph guard.)
     if (addedOrRemoved || roadsChanged || terrainChanged) {
-      this.redrawTerrainProps(next.buildings, next.gridSize, next.terrain);
+      this.redrawTerrainProps(next.buildings, next.gridSize, next.terrain, next.districts, next.roads);
       this.lastTerrainSig = terrainSig;
     }
 
@@ -2290,6 +2295,8 @@ export class PolisRenderer {
     buildings: Building[],
     gridSize: GridSize,
     terrain?: TerrainData,
+    districts?: District[],
+    roads?: Road[],
   ): void {
     // `removeChildren().destroy({children:true})` tears down BOTH the ground/props
     // Graphics and any previous terrain-frame chunk containers (whose own child
@@ -2299,6 +2306,10 @@ export class PolisRenderer {
       .removeChildren()
       .forEach((c) => c.destroy({ children: true }));
     this.terrainChunks = [];
+    if (this.fieldsGraphics) {
+      this.fieldsGraphics.destroy();
+      this.fieldsGraphics = null;
+    }
     const ext = computeExtent(
       buildings.map((b) => b.coords),
       gridSize.w,
@@ -2306,7 +2317,38 @@ export class PolisRenderer {
       4,
     );
     this.drawTerrainLayer(ext);
-    this.drawPropsLayer(ext, buildings);
+
+    // Fields (farmland parcels) — drawn between terrain and props.
+    let fieldTileSet: Set<string> | null = null;
+    if (districts && roads) {
+      const blocked = buildFieldBlockedSet(
+        buildings.map((b) => ({ coords: [b.coords] })),
+        roads,
+        terrain,
+      );
+      const centre = {
+        x: (ext.minX + ext.maxX) / 2,
+        y: (ext.minY + ext.maxY) / 2,
+      };
+      const parcels = planFields({
+        ext,
+        districts: districts.map((d) => d.bounds),
+        blocked,
+        centre,
+      });
+      if (parcels.length > 0) {
+        const { graphics } = drawFields(ext, parcels);
+        this.fieldsGraphics = graphics;
+        // Apply LOD immediately so a live-diff rebuild at low zoom doesn't
+        // leave the fresh Graphics visible=true (PixiJS default) until the
+        // next zoom change re-enters the LOD block in updateCulling().
+        graphics.visible = this.viewport.scale.x >= LOD_FIELDS;
+        this.layers.terrain.addChild(graphics);
+        fieldTileSet = parcelTiles(parcels);
+      }
+    }
+
+    this.drawPropsLayer(ext, buildings, fieldTileSet);
     // Water frame on top of the grass ground but BELOW everything else (it lives
     // in the terrain layer). Chunked so the cull pass can hide off-screen water.
     this.drawWaterFrame(terrain);
@@ -2334,8 +2376,13 @@ export class PolisRenderer {
   private drawPropsLayer(
     ext: ReturnType<typeof computeExtent>,
     buildings: Building[],
+    fieldTiles?: Set<string> | null,
   ): void {
     const occupied = occupiedTiles(buildings.map((b) => b.coords));
+    // Union field parcel tiles into occupied so props never spawn inside parcels.
+    if (fieldTiles) {
+      for (const key of fieldTiles) occupied.add(key);
+    }
     const { graphics } = drawProps(ext, occupied);
     this.layers.terrain.addChild(graphics);
   }
@@ -3238,6 +3285,8 @@ export class PolisRenderer {
       // External cloud outposts: hidden in the far view (same band as agents) so
       // the seaward margin doesn't speckle the zoomed-out overview.
       this.externalLayer.setLodVisible(scale >= LOD_EXTERNAL);
+      // Fields (farmland): hidden below LOD_FIELDS so the far view is clean.
+      if (this.fieldsGraphics) this.fieldsGraphics.visible = scale >= LOD_FIELDS;
     }
   }
 
@@ -3715,6 +3764,7 @@ export class PolisRenderer {
       .removeChildren()
       .forEach((c) => c.destroy({ children: true }));
     this.terrainChunks = [];
+    this.fieldsGraphics = null;
     this.layers.districts.removeChildren().forEach((c) => c.destroy());
     // Roads are now sub-containers (minor/trunk) each wrapping a Graphics, so
     // destroy children too. Drop the LOD handle.
