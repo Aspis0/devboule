@@ -25,12 +25,14 @@
 //!   - Scaleway live services.
 
 use crate::backend::model::AgentLiveState;
+use crate::polis::augure::DetectedSin;
 use crate::polis::grid;
 use crate::polis::meta_store::{normalize_rel_path, FeatureLabelOverride, MetaStore};
 use crate::polis::model::*;
 use crate::polis::sins;
 use crate::polis::terrain;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,6 +113,11 @@ pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     ".agents",
     ".codex",
     ".deepseek",
+    // Aspis subsystem state dirs — NEVER source. A ledger write MUST NOT trigger
+    // a re-scan loop; these are excluded here AND covered by the watcher's
+    // `is_excluded_path` via the same EXCLUDED_DIRS constant.
+    ".aspis-polis",
+    ".aspis-censor",
 ];
 
 /// File extensions we keep (plus `.json` handled specially — critical only).
@@ -190,7 +197,10 @@ pub struct ScannedFile {
     /// after, so we never retain every file's full content for the whole tree
     /// (bounded memory). Graph-based sins (cycles, orphan-export) are added
     /// later from the road graph. `file_id` on each sin is set in a later phase.
-    pub content_sins: Vec<UrbanSin>,
+    pub content_sins: Vec<DetectedSin>,
+    /// SHA-256 of the file content at scan time. Computed while the body is
+    /// still in memory so we don't need a second read. Empty for unreadable files.
+    pub content_hash: String,
     /// Per-file diagnostic note surfaced on the building (WARNING 2). Set when
     /// the file could not be read as UTF-8 (binary / non-UTF-8 encoding): the
     /// building still EXISTS, but its LOC is 0 and it has no imports/sins because
@@ -450,7 +460,81 @@ pub(crate) fn generate_city_state_with_metrics(
     // the scan (with content dropped); here we add the graph-derived sins
     // (cycles, orphan-export) and key everything by file_id.
     let sin_result = sins::detect_graph_sins(&scanned, &buildings, &graph);
-    apply_sins(&mut buildings, &sin_result.by_file);
+
+    // Build (rel_path, content_hash, Vec<SinRecord>) per file and upsert to
+    // the persisted sin ledger. Failures are logged but never fail the scan.
+    let suppressed_ids = {
+        let mut per_file: Vec<(String, String, Vec<crate::polis::augure::SinRecord>)> = Vec::new();
+        let rel_by_file_id: std::collections::HashMap<String, String> = buildings
+            .iter()
+            .map(|b| (b.file_id.clone(), b.file_path.clone()))
+            .collect();
+        let hash_by_file_id: std::collections::HashMap<String, String> = scanned
+            .iter()
+            .filter_map(|f| {
+                file_id_by_path
+                    .get(&f.rel_path)
+                    .map(|id| (id.clone(), f.content_hash.clone()))
+            })
+            .collect();
+
+        // Collect all detected sins across all files.
+        let all_detected: Vec<DetectedSin> =
+            sin_result.by_file.values().flatten().cloned().collect();
+        let records =
+            crate::polis::augure::to_records(&all_detected, &rel_by_file_id, &hash_by_file_id);
+
+        // Group records by rel_path.
+        let mut by_rel: std::collections::HashMap<String, Vec<crate::polis::augure::SinRecord>> =
+            std::collections::HashMap::new();
+        for r in records {
+            by_rel.entry(r.rel_path.clone()).or_default().push(r);
+        }
+
+        // Also include files that have zero sins but an existing shard
+        // (so absent sins get marked Fixed).
+        for f in &scanned {
+            let rel = &f.rel_path;
+            if !by_rel.contains_key(rel) {
+                if crate::polis::augure::ledger::has_shard(project_path, rel) {
+                    by_rel.entry(rel.clone()).or_default();
+                }
+            }
+        }
+
+        for (rel, sins) in by_rel {
+            let hash = scanned
+                .iter()
+                .find(|f| f.rel_path == rel)
+                .map(|f| f.content_hash.as_str())
+                .unwrap_or("");
+            per_file.push((rel, hash.to_string(), sins));
+        }
+
+        match crate::polis::augure::ledger::upsert_scan_results(project_path, &per_file) {
+            Ok(merged) => merged
+                .into_iter()
+                .filter(|r| r.disposition != crate::polis::augure::Disposition::Open)
+                .map(|r| r.id)
+                .collect::<HashSet<String>>(),
+            Err(e) => {
+                crate::polis::commands::polis_debug_append(&format!(
+                    "AUGURE UPSERT FAILED: {e}"
+                ));
+                HashSet::new()
+            }
+        }
+    };
+
+    // Sweep orphan shards (files deleted/renamed since last scan).
+    if let Err(e) =
+        crate::polis::augure::ledger::sweep_orphans(project_path, &present_paths)
+    {
+        crate::polis::commands::polis_debug_append(&format!("AUGURE SWEEP FAILED: {e}"));
+    }
+
+    // Apply sins to buildings, filtering out suppressed (Ignored/Fixed) ones.
+    apply_sins_filtered(&mut buildings, &sin_result.by_file, &suppressed_ids);
 
     // Persist learned coords/ids; prune deleted paths to bound file growth.
     meta.retain_paths(&present_paths);
@@ -494,7 +578,7 @@ pub(crate) fn generate_city_state_with_metrics(
         external_services: Vec::new(),
         features: feature_result.features,
         notes: Vec::new(),
-        sins: sin_result.city_wide,
+        sins: sin_result.city_wide.iter().map(|ds| ds.sin.clone()).collect(),
         scan_note,
         terrain,
     };
@@ -774,6 +858,15 @@ pub fn scan_files_with(
             // Detect content-based sins NOW (file_id filled in later) and drop
             // the body — bounded retained memory regardless of tree size.
             let content_sins = sins::detect_content_sins(&content, env_example.as_ref());
+            // Compute content hash while the body is still in memory.
+            // CAVEAT: for non-UTF-8 files content is "" → all unreadable
+            // files share the same hash (sha256("")). A future byte-level
+            // read would distinguish them, but that requires a second IO.
+            let content_hash = {
+                let mut h = Sha256::new();
+                h.update(content.as_bytes());
+                hex::encode(h.finalize())
+            };
             drop(content);
 
             out.push(ScannedFile {
@@ -784,6 +877,7 @@ pub fn scan_files_with(
                 head,
                 has_exported_symbol,
                 content_sins,
+                content_hash,
                 scan_note,
             });
         }
@@ -3031,6 +3125,31 @@ Features:\n",
 // Phase 3 — import roads
 // ---------------------------------------------------------------------------
 
+/// Derive a content-stable road id from the edge identity tuple.
+///
+/// The id is a pure function of the edge itself (the two building `file_id`s and
+/// the road type), hashed with sha256 so it is stable across scans AND across
+/// edge-set changes: adding/removing other imports never shifts this id.
+/// Consumers that benefit: `TradeRouteLayer` seeds per-edge porter RNG from the
+/// road id (`rngFromString("trade:" + roadId + …)`) and uses it as a sort
+/// tie-break — under the old position-derived id every unrelated import change
+/// silently reshuffled/rerolled all porters.
+///
+/// Truncation note: 12 hex chars = 48 bits; at ~20k edges the birthday-bound
+/// collision probability is ~7e-7, and no code path uses `road_id` as a
+/// correctness key (nav routes by coords) — truncation is a deliberate
+/// trade-off, not an oversight.
+fn road_id(from: &str, to: &str, road_type: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(from.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(to.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(road_type.as_bytes());
+    let full = hex::encode(hasher.finalize());
+    format!("road-{road_type}-{}", &full[..12])
+}
+
 /// Build `import` roads from resolved imports. `weight` is 1..=5, proportional
 /// to how many times the *target* file is imported (clamped).
 pub fn build_import_roads(
@@ -3071,12 +3190,11 @@ pub fn build_import_roads(
 
     ordered
         .into_iter()
-        .enumerate()
-        .map(|(i, (from, to))| {
+        .map(|(from, to)| {
             let count = *incoming.get(&to).unwrap_or(&1);
             let weight = count.clamp(1, 5);
             Road {
-                road_id: format!("road-import-{i}"),
+                road_id: road_id(&from, &to, road_type::IMPORT),
                 from,
                 to,
                 road_type: road_type::IMPORT.to_string(),
@@ -4397,14 +4515,145 @@ impl RoadGraph {
 // Sin application
 // ---------------------------------------------------------------------------
 
-fn apply_sins(buildings: &mut [Building], by_file: &HashMap<String, Vec<UrbanSin>>) {
+/// Apply sins to buildings, filtering out any whose computed SinRecord id
+/// appears in `suppressed_ids` (Ignored/Fixed dispositions from the ledger).
+/// Uses `b.file_path` directly (the same normalized rel_path that `to_records`
+/// used when persisting) to compute the record id for suppression lookup.
+fn apply_sins_filtered(
+    buildings: &mut [Building],
+    by_file: &HashMap<String, Vec<DetectedSin>>,
+    suppressed_ids: &HashSet<String>,
+) {
     for b in buildings.iter_mut() {
         if let Some(sins) = by_file.get(&b.file_id) {
-            if !sins.is_empty() {
-                b.sins = sins.clone();
+            let rel_path = &b.file_path;
+            let visible: Vec<UrbanSin> = sins
+                .iter()
+                .filter(|ds| {
+                    let record_id = crate::polis::augure::compute_sin_id(
+                        rel_path,
+                        ds.rule_id,
+                        ds.line,
+                        &ds.evidence,
+                    );
+                    !suppressed_ids.contains(&record_id)
+                })
+                .map(|ds| ds.sin.clone())
+                .collect();
+            if !visible.is_empty() {
+                b.sins = visible;
                 b.status = building_status::BURNING.to_string();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod apply_sins_filtered_tests {
+    use super::*;
+    use crate::polis::augure::{compute_sin_id, DetectedSin};
+    use crate::polis::model::{building_status, Coords, purpose, purpose_source, visual_tier, UrbanSin};
+
+    fn mk_b(id: &str, path: &str) -> Building {
+        Building {
+            file_id: id.into(),
+            file_path: path.into(),
+            district_id: "d".into(),
+            purpose: purpose::HOUSE.into(),
+            purpose_source: purpose_source::DEFAULT.into(),
+            feature_id: String::new(),
+            feature_source: String::new(),
+            provider: None,
+            lines_of_code: 10,
+            visual_tier: visual_tier::KALYBE.into(),
+            coords: Coords::new(0.0, 0.0),
+            status: building_status::NORMAL.into(),
+            label: path.into(),
+            description: String::new(),
+            last_modified: String::new(),
+            agent_present: None,
+            suspect_of_card_id: None,
+            kanban_card_id: None,
+            untracked_change: None,
+            sins: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn mk_ds(file_id: &str, rule_id: &'static str, evidence: &str, line: Option<u32>) -> DetectedSin {
+        DetectedSin {
+            sin: UrbanSin {
+                sin_id: "sin-test".into(),
+                severity: "fire".into(),
+                description: "test".into(),
+                auto_detectable: true,
+                file_id: Some(file_id.into()),
+            },
+            rule_id,
+            evidence: evidence.into(),
+            line,
+        }
+    }
+
+    #[test]
+    fn suppressed_sin_is_filtered_out() {
+        let mut buildings = vec![mk_b("fid-a", "src/a.rs")];
+        let ds = mk_ds("fid-a", "secret", "secret at line 1", Some(1));
+        let record_id = compute_sin_id("src/a.rs", "secret", Some(1), "secret at line 1");
+
+        let mut by_file: HashMap<String, Vec<DetectedSin>> = HashMap::new();
+        by_file.insert("fid-a".into(), vec![ds]);
+
+        let mut suppressed: HashSet<String> = HashSet::new();
+        suppressed.insert(record_id);
+
+        apply_sins_filtered(&mut buildings, &by_file, &suppressed);
+
+        assert!(
+            buildings[0].sins.is_empty(),
+            "suppressed sin must not appear on the building"
+        );
+        assert_ne!(buildings[0].status, building_status::BURNING);
+    }
+
+    #[test]
+    fn unsuppressed_sin_appears_on_building() {
+        let mut buildings = vec![mk_b("fid-a", "src/a.rs")];
+        let ds = mk_ds("fid-a", "secret", "secret at line 1", Some(1));
+
+        let mut by_file: HashMap<String, Vec<DetectedSin>> = HashMap::new();
+        by_file.insert("fid-a".into(), vec![ds]);
+
+        let suppressed: HashSet<String> = HashSet::new();
+
+        apply_sins_filtered(&mut buildings, &by_file, &suppressed);
+
+        assert_eq!(buildings[0].sins.len(), 1, "unsuppressed sin must appear");
+        assert_eq!(buildings[0].status, building_status::BURNING);
+    }
+
+    #[test]
+    fn wrong_file_id_suppression_does_not_match() {
+        // A suppressed sin for file B must not suppress file A's sin, even
+        // if they happen to share the same computed record id via different
+        // rel_paths (id includes rel_path). This guards against the bug where
+        // the wrong map was used for suppression lookup.
+        let mut buildings = vec![mk_b("fid-a", "src/a.rs"), mk_b("fid-b", "src/b.rs")];
+        let ds_a = mk_ds("fid-a", "secret", "secret at line 1", Some(1));
+        let id_a = compute_sin_id("src/a.rs", "secret", Some(1), "secret at line 1");
+        let id_b = compute_sin_id("src/b.rs", "secret", Some(1), "secret at line 1");
+        assert_ne!(id_a, id_b, "different rel_paths must produce different ids");
+
+        let mut by_file: HashMap<String, Vec<DetectedSin>> = HashMap::new();
+        by_file.insert("fid-a".into(), vec![ds_a]);
+
+        // Suppress B's id only — A's sin must still appear.
+        let mut suppressed: HashSet<String> = HashSet::new();
+        suppressed.insert(id_b);
+
+        apply_sins_filtered(&mut buildings, &by_file, &suppressed);
+
+        assert_eq!(buildings[0].sins.len(), 1, "file A's sin must NOT be suppressed");
     }
 }
 
@@ -5156,6 +5405,7 @@ mod tests {
             head: String::new(),
             has_exported_symbol: true,
             content_sins: Vec::new(),
+            content_hash: String::new(),
             scan_note: None,
         }
     }
@@ -6374,6 +6624,7 @@ const y = await import('@/lazy');
             head: String::new(),
             has_exported_symbol: false,
             content_sins: Vec::new(),
+            content_hash: String::new(),
             scan_note: None,
         };
         let scanned = vec![
@@ -6408,6 +6659,7 @@ const y = await import('@/lazy');
             head: String::new(),
             has_exported_symbol: false,
             content_sins: Vec::new(),
+            content_hash: String::new(),
             scan_note: None,
         };
         // Root wrangler.toml alongside a subdirectory wrangler.json.
@@ -10356,5 +10608,91 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         assert_eq!(connected_building_count(&roads), 3);
         // Empty road set -> no connected buildings.
         assert_eq!(connected_building_count(&[]), 0);
+    }
+
+    // ---- road_id content-stable hashing ----
+
+    #[test]
+    fn road_id_is_deterministic() {
+        let a = road_id("file-a", "file-b", road_type::IMPORT);
+        let b = road_id("file-a", "file-b", road_type::IMPORT);
+        assert_eq!(a, b, "same inputs produce the same id");
+    }
+
+    #[test]
+    fn road_id_is_stable_under_insertion() {
+        let alias = TsAlias::default();
+
+        // Build roads from edges {A→B, C→D} and record the A→B road id.
+        let (scanned1, ids1) = feature_inputs(&[
+            ("importer_a.ts", &["target_b"]),
+            ("target_b.ts", &[]),
+            ("importer_c.ts", &["target_d"]),
+            ("target_d.ts", &[]),
+        ]);
+        let roads1 = build_import_roads(&scanned1, &ids1, Path::new("/proj"), &alias);
+        let id_a_b = roads1
+            .iter()
+            .find(|r| r.from == ids1["importer_a.ts"] && r.to == ids1["target_b.ts"])
+            .map(|r| r.road_id.clone())
+            .expect("A→B road must exist");
+
+        // Rebuild with an added import that sorts before A→B:
+        // {A→A0, A→B, C→D} where A→A0 sorts first lexicographically.
+        let (scanned2, ids2) = feature_inputs(&[
+            ("importer_a.ts", &["target_b", "target_a0"]),
+            ("target_a0.ts", &[]),
+            ("target_b.ts", &[]),
+            ("importer_c.ts", &["target_d"]),
+            ("target_d.ts", &[]),
+        ]);
+        let roads2 = build_import_roads(&scanned2, &ids2, Path::new("/proj"), &alias);
+
+        // A→B must keep the SAME id.
+        let id_a_b2 = roads2
+            .iter()
+            .find(|r| r.from == ids2["importer_a.ts"] && r.to == ids2["target_b.ts"])
+            .map(|r| r.road_id.clone())
+            .expect("A→B road must exist in second build");
+        assert_eq!(id_a_b, id_a_b2, "A→B id must be stable under insertion");
+
+        // The new A→A0 road gets a distinct id.
+        let id_a_a0 = roads2
+            .iter()
+            .find(|r| r.from == ids2["importer_a.ts"] && r.to == ids2["target_a0.ts"])
+            .map(|r| r.road_id.clone())
+            .expect("A→A0 road must exist");
+        assert_ne!(id_a_a0, id_a_b2, "new A→A0 id must be distinct from A→B");
+
+        // C→D still exists (sanity).
+        assert!(
+            roads2.iter().any(|r| r.from == ids2["importer_c.ts"] && r.to == ids2["target_d.ts"]),
+            "C→D road must still exist"
+        );
+    }
+
+    #[test]
+    fn road_id_is_unique_per_direction() {
+        let a_b = road_id("A", "B", road_type::IMPORT);
+        let b_a = road_id("B", "A", road_type::IMPORT);
+        assert_ne!(a_b, b_a, "A→B ≠ B→A");
+        let c_d = road_id("C", "D", road_type::IMPORT);
+        assert_ne!(a_b, c_d, "distinct (from,to) pairs produce distinct ids");
+    }
+
+    #[test]
+    fn road_id_matches_expected_format() {
+        let id = road_id("file-x", "file-y", road_type::IMPORT);
+        // Must match `^road-import-[0-9a-f]{12}$`.
+        assert!(
+            id.starts_with("road-import-"),
+            "id '{id}' must start with 'road-import-'"
+        );
+        let hex_part = &id[12..]; // after "road-import-"
+        assert_eq!(hex_part.len(), 12, "hex part must be 12 chars, got {hex_part:?}");
+        assert!(
+            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex part '{hex_part}' must be lowercase hex digits"
+        );
     }
 }

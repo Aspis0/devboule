@@ -700,6 +700,8 @@ pub fn run() {
             polis::commands::polis_reclassify_features,
             polis::commands::polis_get_dossier,
             polis::commands::polis_generate_dossier,
+            polis::commands::polis_dispose_sin,
+            polis::commands::polis_list_sins,
             polis::commands::polis_debug_log,
             backend::censor::commands::censor_review_now,
             backend::censor::commands::censor_get_findings,

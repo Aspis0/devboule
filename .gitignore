@@ -58,6 +58,7 @@ polis-dev-city.json
 .aspis-training/
 .aspis-mini/
 .aspis-censor/
+.aspis-polis/
 aspis.html
 tsconfig.tsbuildinfo
 

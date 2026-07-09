@@ -22,6 +22,7 @@
 // code. Allow dead_code at the module root rather than peppering attributes.
 #![allow(dead_code)]
 
+pub mod augure;
 pub mod cloud;
 pub mod commands;
 pub mod footprint;

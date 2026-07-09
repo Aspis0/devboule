@@ -18,6 +18,7 @@
 //!   - Scaleway endpoint without IAM header  (provider-specific)
 //!   - IAM key expiry within 30 days         (Scaleway API)
 
+use crate::polis::augure::DetectedSin;
 use crate::polis::model::{purpose, severity, Building, UrbanSin};
 use crate::polis::scanner::{RoadGraph, ScannedFile};
 use std::collections::{HashMap, HashSet};
@@ -27,10 +28,10 @@ use uuid::Uuid;
 /// Result of a full sin sweep.
 pub struct SinReport {
     /// file_id -> sins attributable to that building.
-    pub by_file: HashMap<String, Vec<UrbanSin>>,
+    pub by_file: HashMap<String, Vec<DetectedSin>>,
     /// Sins not tied to a single building (currently unused; cycles are
     /// attributed per-file so the offending buildings burn).
-    pub city_wide: Vec<UrbanSin>,
+    pub city_wide: Vec<DetectedSin>,
 }
 
 /// Detect the CONTENT-based sins for a single file while its body is still in
@@ -40,28 +41,22 @@ pub struct SinReport {
 /// what lets the scanner avoid retaining every file's full content.
 ///
 /// `env_example` is the (optional) set of keys declared in `.env.example`.
-pub fn detect_content_sins(content: &str, env_example: Option<&HashSet<String>>) -> Vec<UrbanSin> {
+pub fn detect_content_sins(content: &str, env_example: Option<&HashSet<String>>) -> Vec<DetectedSin> {
     let mut sins = Vec::new();
     // 1) Hardcoded secret -> inferno (REDACTED — never includes the value).
-    //    Scanned on the FULL content, including comments: a real secret sitting
-    //    in a committed comment is still a real leak. (We deliberately do NOT
-    //    strip comments here — doing so would hide a genuine sin.)
     sins.extend(detect_secrets(content, ""));
-    // 2) TODO/FIXME/HACK > 3 -> smoke. These live in comments by definition, so
-    //    they are also scanned on the full content.
+    // 2) TODO/FIXME/HACK > 3 -> smoke.
     if let Some(sin) = detect_todo_smoke(content, "") {
         sins.push(sin);
     }
-    // 3) env var used but absent from .env.example -> fire. Scanned on the
-    //    comment-stripped content so a commented-out `process.env.X` does not
-    //    raise a phantom missing-env fire.
+    // 3) env var used but absent from .env.example -> fire.
     if let Some(allowed) = env_example {
         let code_only = crate::polis::scanner::strip_comments(content);
         sins.extend(detect_missing_env(&code_only, allowed, ""));
     }
     // Detected before the file_id is known; stamp later.
     for s in &mut sins {
-        s.file_id = None;
+        s.sin.file_id = None;
     }
     sins
 }
@@ -74,8 +69,8 @@ pub fn detect_graph_sins(
     buildings: &[Building],
     graph: &RoadGraph,
 ) -> SinReport {
-    let mut by_file: HashMap<String, Vec<UrbanSin>> = HashMap::new();
-    let city_wide: Vec<UrbanSin> = Vec::new();
+    let mut by_file: HashMap<String, Vec<DetectedSin>> = HashMap::new();
+    let city_wide: Vec<DetectedSin> = Vec::new();
 
     // file_path -> file_id, and file_path -> purpose (buildings carry both).
     let id_by_path: HashMap<&str, &str> = buildings
@@ -97,9 +92,10 @@ pub fn detect_graph_sins(
             continue;
         }
         let entry = by_file.entry(file_id.to_string()).or_default();
-        for mut sin in f.content_sins.iter().cloned() {
-            sin.file_id = Some(file_id.to_string());
-            sin.sin_id = stamp_sin_id(&sin.sin_id, file_id);
+        for ds in &f.content_sins {
+            let mut sin = ds.clone();
+            sin.sin.file_id = Some(file_id.to_string());
+            sin.sin.sin_id = stamp_sin_id(&sin.sin.sin_id, file_id);
             entry.push(sin);
         }
     }
@@ -107,21 +103,21 @@ pub fn detect_graph_sins(
     // Cyclic import -> fire. Attributed to each participating building.
     let cyclic = graph.cyclic_nodes();
     for file_id in &cyclic {
-        by_file.entry(file_id.clone()).or_default().push(UrbanSin {
-            sin_id: deterministic_sin_id("cycle", file_id),
-            severity: severity::FIRE.to_string(),
-            description: "Cyclic import detected in the road graph".to_string(),
-            auto_detectable: true,
-            file_id: Some(file_id.clone()),
+        by_file.entry(file_id.clone()).or_default().push(DetectedSin {
+            sin: UrbanSin {
+                sin_id: deterministic_sin_id("cycle", file_id),
+                severity: severity::FIRE.to_string(),
+                description: "Cyclic import detected in the road graph".to_string(),
+                auto_detectable: true,
+                file_id: Some(file_id.clone()),
+            },
+            rule_id: "dep-cycle",
+            evidence: "cyclic import detected".to_string(),
+            line: None,
         });
     }
 
-    // Exported-but-never-imported symbol -> smoke. A building that exports at
-    // least one symbol and has zero incoming import edges.
-    //
-    // EXCLUDE `lighthouse` (real entry points): an entry point legitimately has
-    // no incoming import edges, so flagging it as "possibly dead" is a false
-    // positive. We skip entry points entirely here.
+    // Exported-but-never-imported symbol -> smoke.
     let imported_targets: HashSet<&str> = graph.directed_targets();
     for f in scanned {
         let Some(&file_id) = id_by_path.get(f.rel_path.as_str()) else {
@@ -129,20 +125,23 @@ pub fn detect_graph_sins(
         };
         let is_entry_point = purpose_by_id.get(file_id).copied() == Some(purpose::LIGHTHOUSE);
         if is_entry_point {
-            continue; // entry points have no incoming imports BY DESIGN.
+            continue;
         }
         if f.has_exported_symbol && !imported_targets.contains(file_id) {
             by_file
                 .entry(file_id.to_string())
                 .or_default()
-                .push(UrbanSin {
-                    sin_id: deterministic_sin_id("orphan-export", file_id),
-                    severity: severity::SMOKE.to_string(),
-                    // Softened, accurate wording: we observed no incoming import
-                    // edges — not proof of deadness, just an absence of signal.
-                    description: "Exported symbol with no incoming imports detected".to_string(),
-                    auto_detectable: true,
-                    file_id: Some(file_id.to_string()),
+                .push(DetectedSin {
+                    sin: UrbanSin {
+                        sin_id: deterministic_sin_id("orphan-export", file_id),
+                        severity: severity::SMOKE.to_string(),
+                        description: "Exported symbol with no incoming imports detected".to_string(),
+                        auto_detectable: true,
+                        file_id: Some(file_id.to_string()),
+                    },
+                    rule_id: "dead-export",
+                    evidence: "no incoming imports detected".to_string(),
+                    line: None,
                 });
         }
     }
@@ -157,7 +156,7 @@ pub fn detect_graph_sins(
 /// Detect hardcoded secret-like values. Returns one `inferno` sin per offending
 /// LINE. The description ONLY references the line number — never the matched
 /// value, so the secret is not leaked into the CityState / sidebar.
-pub fn detect_secrets(content: &str, file_id: &str) -> Vec<UrbanSin> {
+pub fn detect_secrets(content: &str, file_id: &str) -> Vec<DetectedSin> {
     let mut out = Vec::new();
     let mut flagged_lines: HashSet<usize> = HashSet::new();
 
@@ -168,13 +167,17 @@ pub fn detect_secrets(content: &str, file_id: &str) -> Vec<UrbanSin> {
         }
         if line_looks_secret(line) {
             flagged_lines.insert(line_no);
-            out.push(UrbanSin {
-                sin_id: deterministic_sin_id(&format!("secret-{line_no}"), file_id),
-                severity: severity::INFERNO.to_string(),
-                // REDACTION: never include the matched value.
-                description: format!("Hardcoded secret-like value at line {line_no}"),
-                auto_detectable: true,
-                file_id: Some(file_id.to_string()),
+            out.push(DetectedSin {
+                sin: UrbanSin {
+                    sin_id: deterministic_sin_id(&format!("secret-{line_no}"), file_id),
+                    severity: severity::INFERNO.to_string(),
+                    description: format!("Hardcoded secret-like value at line {line_no}"),
+                    auto_detectable: true,
+                    file_id: Some(file_id.to_string()),
+                },
+                rule_id: "secret",
+                evidence: format!("secret at line {line_no}"),
+                line: Some(line_no as u32),
             });
         }
     }
@@ -469,7 +472,7 @@ fn value_is_opaque(value: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// > 3 TODO/FIXME/HACK markers -> a single `smoke` sin.
-pub fn detect_todo_smoke(content: &str, file_id: &str) -> Option<UrbanSin> {
+pub fn detect_todo_smoke(content: &str, file_id: &str) -> Option<DetectedSin> {
     let mut count = 0usize;
     for line in content.lines() {
         let upper = line.to_ascii_uppercase();
@@ -478,12 +481,18 @@ pub fn detect_todo_smoke(content: &str, file_id: &str) -> Option<UrbanSin> {
         }
     }
     if count > 3 {
-        Some(UrbanSin {
-            sin_id: deterministic_sin_id("todo", file_id),
-            severity: severity::SMOKE.to_string(),
-            description: format!("{count} TODO/FIXME/HACK comments accumulated"),
-            auto_detectable: true,
-            file_id: Some(file_id.to_string()),
+        let evidence = format!("{count} todo/fixme/hack markers");
+        Some(DetectedSin {
+            sin: UrbanSin {
+                sin_id: deterministic_sin_id("todo", file_id),
+                severity: severity::SMOKE.to_string(),
+                description: format!("{count} TODO/FIXME/HACK comments accumulated"),
+                auto_detectable: true,
+                file_id: Some(file_id.to_string()),
+            },
+            rule_id: "todo-density",
+            evidence,
+            line: None,
         })
     } else {
         None
@@ -520,7 +529,7 @@ pub fn detect_missing_env(
     content: &str,
     allowed: &HashSet<String>,
     file_id: &str,
-) -> Vec<UrbanSin> {
+) -> Vec<DetectedSin> {
     let mut missing: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -532,12 +541,20 @@ pub fn detect_missing_env(
     missing.sort();
     missing
         .into_iter()
-        .map(|var| UrbanSin {
-            sin_id: deterministic_sin_id(&format!("env-{var}"), file_id),
-            severity: severity::FIRE.to_string(),
-            description: format!("Env var `{var}` used in code but missing from .env.example"),
-            auto_detectable: true,
-            file_id: Some(file_id.to_string()),
+        .map(|var| {
+            let evidence = format!("env var {var} not in example");
+            DetectedSin {
+                sin: UrbanSin {
+                    sin_id: deterministic_sin_id(&format!("env-{var}"), file_id),
+                    severity: severity::FIRE.to_string(),
+                    description: format!("Env var `{var}` used in code but missing from .env.example"),
+                    auto_detectable: true,
+                    file_id: Some(file_id.to_string()),
+                },
+                rule_id: "env-missing",
+                evidence,
+                line: None,
+            }
         })
         .collect()
 }
@@ -697,6 +714,12 @@ mod tests {
     /// detected up front from `content` (which is then dropped), and the
     /// exported-symbol bool is precomputed. No `content` field is retained.
     fn mk_scanned(rel: &str, content: &str) -> ScannedFile {
+        let content_hash = {
+            let mut h = sha2::Sha256::new();
+            use sha2::Digest;
+            h.update(content.as_bytes());
+            hex::encode(h.finalize())
+        };
         ScannedFile {
             rel_path: rel.into(),
             abs_path: Path::new(rel).to_path_buf(),
@@ -705,6 +728,7 @@ mod tests {
             head: String::new(),
             has_exported_symbol: has_exported_symbol(content),
             content_sins: detect_content_sins(content, None),
+            content_hash,
             scan_note: None,
         }
     }
@@ -720,15 +744,15 @@ mod tests {
         let content = format!("const key = \"{secret}\";\n");
         let sins = detect_secrets(&content, "fid");
         assert_eq!(sins.len(), 1);
-        assert_eq!(sins[0].severity, severity::INFERNO);
+        assert_eq!(sins[0].sin.severity, severity::INFERNO);
         // CRITICAL: the secret value must NOT appear in the description.
         assert!(
-            !sins[0].description.contains(secret),
+            !sins[0].sin.description.contains(secret),
             "secret value leaked into description: {}",
-            sins[0].description
+            sins[0].sin.description
         );
-        assert!(!sins[0].description.contains("sk-abc"));
-        assert!(sins[0].description.contains("line 1"));
+        assert!(!sins[0].sin.description.contains("sk-abc"));
+        assert!(sins[0].sin.description.contains("line 1"));
         // Also ensure the redaction holds when serialized to JSON.
         let json = serde_json::to_string(&sins[0]).unwrap();
         assert!(!json.contains(secret), "secret leaked through JSON");
@@ -745,7 +769,7 @@ mod tests {
         let api = "api_key = \"9f8e7d6c5b4a3f2e1d0c9b8a7\"\n";
         let sins = detect_secrets(api, "f");
         assert_eq!(sins.len(), 1);
-        assert!(!sins[0].description.contains("9f8e7d6c"));
+        assert!(!sins[0].sin.description.contains("9f8e7d6c"));
     }
 
     #[test]
@@ -768,8 +792,8 @@ mod tests {
         assert!(detect_todo_smoke(three, "f").is_none());
         let four = "// TODO a\n// FIXME b\n// HACK c\n// TODO d\n";
         let sin = detect_todo_smoke(four, "f").unwrap();
-        assert_eq!(sin.severity, severity::SMOKE);
-        assert!(sin.description.contains('4'));
+        assert_eq!(sin.sin.severity, severity::SMOKE);
+        assert!(sin.sin.description.contains('4'));
     }
 
     // ---- missing env ----
@@ -779,13 +803,13 @@ mod tests {
         let content =
             "const a = process.env.KNOWN_VAR;\nconst b = process.env.SECRET_TOKEN_X;\nstd::env::var(\"RUST_VAR\");\n";
         let sins = detect_missing_env(content, &allowed, "f");
-        let descs: Vec<&str> = sins.iter().map(|s| s.description.as_str()).collect();
+        let descs: Vec<&str> = sins.iter().map(|s| s.sin.description.as_str()).collect();
         // KNOWN_VAR is allowed -> no sin.
         assert!(!descs.iter().any(|d| d.contains("KNOWN_VAR")));
         // The two unknown vars -> fire sins.
         assert!(descs.iter().any(|d| d.contains("SECRET_TOKEN_X")));
         assert!(descs.iter().any(|d| d.contains("RUST_VAR")));
-        assert!(sins.iter().all(|s| s.severity == severity::FIRE));
+        assert!(sins.iter().all(|s| s.sin.severity == severity::FIRE));
     }
 
     #[test]
@@ -811,9 +835,9 @@ env::var_os("E_VAR");
         let content = format!("api_key = \"{secret}\"\n");
         let sins = detect_secrets(&content, "fid");
         assert_eq!(sins.len(), 1, "digit-less opaque token should be detected");
-        assert_eq!(sins[0].severity, severity::INFERNO);
+        assert_eq!(sins[0].sin.severity, severity::INFERNO);
         // Redaction must still hold.
-        assert!(!sins[0].description.contains(secret));
+        assert!(!sins[0].sin.description.contains(secret));
         let json = serde_json::to_string(&sins[0]).unwrap();
         assert!(!json.contains(secret), "secret leaked through JSON");
     }
@@ -902,7 +926,7 @@ env::var_os("E_VAR");
         let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
         assert!(a_sins
             .iter()
-            .any(|s| s.severity == severity::FIRE && s.description.contains("Cyclic")));
+            .any(|s| s.sin.severity == severity::FIRE && s.sin.description.contains("Cyclic")));
     }
 
     // ---- exported-but-never-imported smoke ----
@@ -921,7 +945,7 @@ env::var_os("E_VAR");
         let lib_sins = report.by_file.get("lib").cloned().unwrap_or_default();
         assert!(lib_sins
             .iter()
-            .any(|s| s.severity == severity::SMOKE && s.description.contains("Exported")));
+            .any(|s| s.sin.severity == severity::SMOKE && s.sin.description.contains("Exported")));
     }
 
     // ---- lighthouse entry points are NOT orphan-export false positives (issue #12) ----
@@ -943,7 +967,7 @@ env::var_os("E_VAR");
         let report = detect_graph_sins(&scanned, &buildings, &graph);
         let main_sins = report.by_file.get("main").cloned().unwrap_or_default();
         assert!(
-            !main_sins.iter().any(|s| s.description.contains("Exported")),
+            !main_sins.iter().any(|s| s.sin.description.contains("Exported")),
             "lighthouse entry point must not be flagged as a dead export"
         );
     }
@@ -954,14 +978,14 @@ env::var_os("E_VAR");
         let allowed: HashSet<String> = HashSet::new();
         // A live env ref fires; a commented-out one must not (content-stripped).
         let live = detect_content_sins("const a = process.env.LIVE_VAR;\n", Some(&allowed));
-        assert!(live.iter().any(|s| s.description.contains("LIVE_VAR")));
+        assert!(live.iter().any(|s| s.sin.description.contains("LIVE_VAR")));
 
         let commented =
             detect_content_sins("// const a = process.env.GHOST_VAR;\n", Some(&allowed));
         assert!(
             !commented
                 .iter()
-                .any(|s| s.description.contains("GHOST_VAR")),
+                .any(|s| s.sin.description.contains("GHOST_VAR")),
             "commented-out env reference must not raise a phantom fire"
         );
     }
@@ -985,7 +1009,7 @@ env::var_os("E_VAR");
             .unwrap_or_default();
         assert!(s
             .iter()
-            .any(|sin| sin.severity == severity::INFERNO
-                && sin.file_id.as_deref() == Some("fid-secret")));
+            .any(|sin| sin.sin.severity == severity::INFERNO
+                && sin.sin.file_id.as_deref() == Some("fid-secret")));
     }
 }

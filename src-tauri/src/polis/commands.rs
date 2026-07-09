@@ -279,6 +279,95 @@ pub struct ScanExtensions {
 /// even when DevTools are unavailable (release) or the webview OOM-crashes before
 /// the console is readable (dev). Fire-and-forget, no auth: only operator-supplied
 /// diagnostic strings (counts, heap sizes, fileIds) are written, local-only.
+// ---------------------------------------------------------------------------
+// Augure sin ledger commands (P1.2)
+// ---------------------------------------------------------------------------
+
+/// Wire shape for `polis_list_sins`. Mirrors `SinRecord` fields serialized
+/// camelCase for the frontend.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SinRecordWire {
+    pub id: String,
+    pub rel_path: String,
+    pub rule_id: String,
+    pub line: Option<u32>,
+    pub severity: String,
+    pub description: String,
+    pub evidence: String,
+    pub disposition: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// List all sins from the persisted augure ledger.
+/// The frontend re-invokes this after `polis_dispose_sin` to refresh the panel.
+#[tauri::command]
+pub fn polis_list_sins(
+    project_path: String,
+    backend_state: State<'_, BackendState>,
+) -> Result<Vec<SinRecordWire>, String> {
+    backend_state.ensure_unlocked()?;
+    let root = std::path::PathBuf::from(project_path.trim());
+    if !root.is_dir() {
+        return Err(format!("Not a directory: {}", root.display()));
+    }
+    let records = crate::polis::augure::ledger::load_all_sins(&root);
+    Ok(records
+        .into_iter()
+        .map(|r| SinRecordWire {
+            id: r.id,
+            rel_path: r.rel_path,
+            rule_id: r.rule_id,
+            line: r.line,
+            severity: r.severity,
+            description: r.description,
+            evidence: r.evidence,
+            disposition: serde_json::to_string(&r.disposition)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        })
+        .collect())
+}
+
+/// Set a sin's disposition. Only `"open"` and `"ignored"` are accepted;
+/// `"fixed"` is rejected (the checker, not the coder, arbitrates Fixed).
+/// The frontend should re-invoke `generate_city_state` after a successful
+/// dispose to refresh the map (P1.4 will wire this into the UI flow).
+#[tauri::command]
+pub fn polis_dispose_sin(
+    project_path: String,
+    rel_path: Option<String>,
+    sin_id: String,
+    disposition: String,
+    backend_state: State<'_, BackendState>,
+) -> Result<bool, String> {
+    backend_state.ensure_unlocked()?;
+    let root = std::path::PathBuf::from(project_path.trim());
+    if !root.is_dir() {
+        return Err(format!("Not a directory: {}", root.display()));
+    }
+    let disp = match disposition.as_str() {
+        "open" => crate::polis::augure::Disposition::Open,
+        "ignored" => crate::polis::augure::Disposition::Ignored,
+        "fixed" => {
+            return Err(
+                "Cannot manually set a sin to Fixed — the checker, not the coder, is the arbiter of fixed.".to_string(),
+            );
+        }
+        other => return Err(format!("Invalid disposition: {other}. Use 'open' or 'ignored'.")),
+    };
+    crate::polis::augure::ledger::dispose(
+        &root,
+        rel_path.as_deref(),
+        &sin_id,
+        disp,
+    )
+}
+
 #[tauri::command]
 pub fn polis_debug_log(line: String) {
     polis_debug_append(&line);
