@@ -41,6 +41,16 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             pass
 
 
+def sanitize(key: str) -> str:
+    """Filesystem-safe name for a semantic key: ':' -> '__'."""
+    return key.replace(":", "__")
+
+
+def copy_single(src: Path, dest: Path) -> None:
+    """Atomic copy of a standalone (singles) PNG to the atlas dir."""
+    atomic_write_bytes(dest, src.read_bytes())
+
+
 def load_staged(staged_dir: Path) -> list[dict]:
     """Collect every staged sprite as {group,key,w,h,png} from *.png+meta."""
     sprites: list[dict] = []
@@ -156,12 +166,14 @@ def pack_group(group: str, sprites: list[dict], page_size: int, padding: int,
     return written
 
 
-def print_summary(summary: list[tuple[str, int, int, int]], total_pages: int,
+def print_summary(summary: list[tuple[str, int, int, int, int]], total_pages: int,
                   total_bytes: int) -> None:
-    print(f"{'GROUP':<14}{'SPRITES':>8}{'PAGES':>7}{'BYTES':>12}")
-    for group, sprites, pages, bytes_ in summary:
-        print(f"{group:<14}{sprites:>8}{pages:>7}{bytes_:>12}")
-    print(f"{'TOTAL':<14}{'':>8}{total_pages:>7}{total_bytes:>12}")
+    print(f"{'GROUP':<14}{'SPRITES':>8}{'PAGES':>7}{'BYTES':>12}{'SINGLES':>8}")
+    total_singles = 0
+    for group, sprites, pages, bytes_, singles in summary:
+        print(f"{group:<14}{sprites:>8}{pages:>7}{bytes_:>12}{singles:>8}")
+        total_singles += singles
+    print(f"{'TOTAL':<14}{'':>8}{total_pages:>7}{total_bytes:>12}{total_singles:>8}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -172,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--padding", type=int, default=2)
     parser.add_argument("--max-pages", type=int, default=6)
     parser.add_argument("--max-bytes", type=int, default=12_000_000)
+    parser.add_argument("--singles-groups", default="tex",
+                        help="comma-separated groups shipped as standalone "
+                             "pow2 PNGs (not shelf-packed)")
     args = parser.parse_args(argv)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -180,28 +195,43 @@ def main(argv: list[str] | None = None) -> int:
     for s in sprites:
         by_group.setdefault(s["group"], []).append(s)
 
-    summary: list[tuple[str, int, int, int]] = []
+    summary: list[tuple[str, int, int, int, int]] = []
     total_pages = 0
     total_bytes = 0
+    singles_groups = {g.strip() for g in args.singles_groups.split(",") if g.strip()}
 
     for group in sorted(by_group):
+        sprites = by_group[group]
+        if group in singles_groups:
+            # Standalone repeatable textures: copy each PNG as-is (atomically),
+            # excluded from page packing. They count toward bytes, not pages.
+            written_singles: list[Path] = []
+            for s in sprites:
+                dest = args.out / f"{sanitize(s['key'])}.png"
+                copy_single(s["png"], dest)
+                written_singles.append(dest)
+            group_bytes = sum(p.stat().st_size for p in written_singles)
+            summary.append((group, len(sprites), 0, group_bytes,
+                            len(written_singles)))
+            total_bytes += group_bytes
+            continue
         try:
-            written = pack_group(group, by_group[group], args.page_size,
+            written = pack_group(group, sprites, args.page_size,
                                   args.padding, args.out)
         except OversizeError as exc:
             print(f"ERROR oversize sprite: {exc} exceeds page size {args.page_size}",
                   file=sys.stderr)
             return 1
         group_bytes = sum(p.stat().st_size for p in written)
-        summary.append((group, len(by_group[group]), len(written), group_bytes))
+        summary.append((group, len(sprites), len(written), group_bytes, 0))
         total_pages += len(written)
         total_bytes += group_bytes
 
     if total_pages > args.max_pages or total_bytes > args.max_bytes:
         print("BUDGET EXCEEDED", file=sys.stderr)
-        for group, sprites_n, pages, bytes_ in summary:
-            print(f"  {group}: sprites={sprites_n} pages={pages} bytes={bytes_}",
-                  file=sys.stderr)
+        for group, sprites_n, pages, bytes_, singles_n in summary:
+            print(f"  {group}: sprites={sprites_n} pages={pages} bytes={bytes_} "
+                  f"singles={singles_n}", file=sys.stderr)
         print(f"TOTAL: pages={total_pages} (max {args.max_pages}) "
               f"bytes={total_bytes} (max {args.max_bytes})", file=sys.stderr)
         print("stale files left in --out for inspection; clean before rerun",

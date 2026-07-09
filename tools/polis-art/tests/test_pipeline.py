@@ -385,3 +385,122 @@ def test_manifest_custom_anchor_propagates(tmp_path):
     ts = out.read_text()
     assert '"prop:o:v0"' in ts
     assert "anchor: [0.5, 0.3]" in ts
+
+
+# --------------------------------------------------------------------------- #
+# "singles" (standalone repeatable textures) regression tests
+# --------------------------------------------------------------------------- #
+
+def test_pack_singles_copied_excluded_from_pages(tmp_path):
+    in_tex = make_raw(tmp_path, "grass.png", 16, (0, 200, 0, 255))
+    in_prop = make_raw(tmp_path, "rock.png", 10, (120, 0, 0, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [
+        {"key": "tex:grass", "source": "s", "in": in_tex},
+        {"key": "prop:rock:v0", "source": "s", "in": in_prop},
+    ])
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    staged = staged_dir(tmp_path)
+    out1 = tmp_path / "atlas1"
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(out1)]) == 0
+
+    single_png = out1 / "tex__grass.png"
+    assert single_png.exists()
+    # Standalone copy is byte-identical to the staged source PNG.
+    staged_png = staged / "tex" / "tex__grass.png"
+    assert single_png.read_bytes() == staged_png.read_bytes()
+    # tex is excluded from page packing (no tex-0 page).
+    assert not (out1 / "tex-0.png").exists()
+    assert not (out1 / "tex-0.json").exists()
+    # The normal group still shelves into a page.
+    assert (out1 / "prop-0.png").exists() and (out1 / "prop-0.json").exists()
+
+    # Byte-identical on a second run.
+    out2 = tmp_path / "atlas2"
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(out2)]) == 0
+    assert (out2 / "tex__grass.png").read_bytes() == single_png.read_bytes()
+
+
+def test_pack_singles_counted_in_bytes(tmp_path):
+    in_tex = make_raw(tmp_path, "grass.png", 16, (0, 200, 0, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "tex:grass", "source": "s", "in": in_tex}])
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    staged = staged_dir(tmp_path)
+    size = (staged / "tex" / "tex__grass.png").stat().st_size
+    # Singles count toward --max-bytes.
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(tmp_path / "a"),
+                            "--max-bytes", str(size - 1)]) == 2
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(tmp_path / "b"),
+                            "--max-bytes", str(size + 1)]) == 0
+
+
+def test_manifest_emits_singles_and_injection_idempotent(tmp_path):
+    in_tex = make_raw(tmp_path, "grass.png", 16, (0, 200, 0, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "tex:grass", "source": "s", "in": in_tex}])
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    staged = staged_dir(tmp_path)
+    atlas = tmp_path / "atlas"
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out)]) == 0
+    ts = out.read_text()
+    assert '"tex:grass": "/polis/atlas/tex__grass.png"' in ts
+    assert "readonly singles?: Record<string, string>;" in ts
+    # Interface injection is idempotent (no duplicate members on a 2nd pass).
+    once = manifest.inject_singles_interface(ts)
+    assert once == ts
+    assert ts.count("singles?:") == 1
+    # Full re-run yields byte-identical output.
+    out2 = tmp_path / "out2.ts"
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out2)]) == 0
+    assert out2.read_bytes() == out.read_bytes()
+
+
+def test_manifest_singles_png_missing_error(tmp_path):
+    staged = staged_dir(tmp_path)
+    g = staged / "tex"
+    g.mkdir(parents=True, exist_ok=True)
+    (g / "tex__grass.meta.json").write_text(json.dumps(
+        {"key": "tex:grass", "source": "s", "w": 16, "h": 16}))
+    atlas = tmp_path / "atlas"
+    atlas.mkdir()  # intentionally no tex__grass.png here
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    rc = manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                        "--ledger", str(ledger), "--out", str(out)])
+    assert rc == 1
+    assert not out.exists()
+
+
+def test_manifest_dual_presence_error(tmp_path):
+    staged = staged_dir(tmp_path)
+    g = staged / "tex"
+    g.mkdir(parents=True, exist_ok=True)
+    (g / "tex__grass.meta.json").write_text(json.dumps(
+        {"key": "tex:grass", "source": "s", "w": 4, "h": 4}))
+    atlas = tmp_path / "atlas"
+    atlas.mkdir(parents=True, exist_ok=True)
+    # Atlas frame + standalone PNG for the SAME key => dual presence.
+    (atlas / "prop-0.json").write_text(json.dumps({
+        "frames": {"tex:grass": {"frame": {"x": 0, "y": 0, "w": 4, "h": 4},
+                                  "rotated": False, "trimmed": False,
+                                  "spriteSourceSize": {"x": 0, "y": 0, "w": 4, "h": 4},
+                                  "sourceSize": {"w": 4, "h": 4}}},
+        "meta": {"image": "prop-0.png", "format": "RGBA8888",
+                 "size": {"w": 8, "h": 8}, "scale": "1"}}))
+    Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(atlas / "prop-0.png")
+    Image.new("RGBA", (4, 4), (0, 128, 0, 255)).save(atlas / "tex__grass.png")
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    rc = manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                        "--ledger", str(ledger), "--out", str(out)])
+    assert rc == 1
+    assert not out.exists()

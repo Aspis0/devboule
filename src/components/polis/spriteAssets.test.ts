@@ -172,6 +172,59 @@ describe("loadPolisSprites — fallback contract", () => {
   });
 });
 
+describe("loadPolisSprites — singles (repeatable standalone textures)", () => {
+  const SINGLES_MANIFEST: SpriteManifest = {
+    version: 1,
+    atlases: {},
+    singles: { "tex:grass": "/polis/atlas/tex__grass.png", "tex:cobble": "/polis/atlas/tex__cobble.png" },
+    entries: {},
+  };
+
+  it("loads a singles-only manifest (no atlases) into a usable bank", async () => {
+    const bank = await loadPolisSprites({
+      loader: okLoader,
+      textureLoader: async () => tex(),
+      manifest: SINGLES_MANIFEST,
+    });
+    expect(bank).not.toBeNull();
+    expect(bank!.get("tex:grass")).not.toBeNull();
+    expect(bank!.size).toBe(2);
+  });
+
+  it("a failed single warns and stays procedural; the rest load", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const bank = await loadPolisSprites({
+        loader: okLoader,
+        textureLoader: async (url) => {
+          if (url.includes("cobble")) throw new Error("404");
+          return tex();
+        },
+        manifest: SINGLES_MANIFEST,
+      });
+      expect(bank!.has("tex:grass")).toBe(true);
+      expect(bank!.has("tex:cobble")).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("singles present but no textureLoader ⇒ warned, and null bank when nothing else loads", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const bank = await loadPolisSprites({
+        loader: okLoader,
+        manifest: SINGLES_MANIFEST,
+      });
+      expect(bank).toBeNull();
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe("sheetTextures — Assets.load result validation", () => {
   it("throws (⇒ per-atlas fallback upstream) when the url resolved to plain JSON", () => {
     expect(() => sheetTextures({ frames: {}, meta: {} }, "/x.json")).toThrow(/spritesheet/);

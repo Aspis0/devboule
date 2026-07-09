@@ -37,6 +37,32 @@ DEFAULT_ANCHOR = [0.5, 1.0]
 # and '-'. URLs are NOT validated against this (they legitimately contain '/').
 _IDENT_RE = re.compile(r"^[a-z0-9_:.-]+$")
 
+
+def sanitize(key: str) -> str:
+    """Filesystem-safe name for a semantic key: ':' -> '__'."""
+    return key.replace(":", "__")
+
+
+# Injection of the `singles` member into the (read-only) template interface.
+SINGLES_MEMBER = (
+    "  /** Standalone repeatable textures: key -> PNG url (pow2, wrap-repeat). */\n"
+    "  readonly singles?: Record<string, string>;"
+)
+_ATLAS_MEMBER_MARKER = "  atlases: Record<string, string>;"
+
+
+def inject_singles_interface(template: str) -> str:
+    """Add the optional `singles` member after `atlases` in the interface.
+
+    Idempotent: if the member is already present (e.g. a previously generated
+    file is fed back as the template) the injection is skipped, so re-running
+    the pipeline never duplicates the declaration.
+    """
+    if "singles?:" in template:
+        return template
+    return template.replace(_ATLAS_MEMBER_MARKER,
+                            _ATLAS_MEMBER_MARKER + "\n" + SINGLES_MEMBER, 1)
+
 _EMBEDDED_TEMPLATE = """\
 // Polis sprite manifest — the typed index of every real-art sprite the renderer
 // may use, keyed by SEMANTIC key, decoupled from atlas layout.
@@ -157,7 +183,7 @@ def check_variant_families(metas: list[dict], warnings: list[str]) -> None:
 
 def validate(loaded: list[tuple[dict, str]], page_files: dict[str, str],
              frame_pages: dict[str, set], atlas_dir: Path,
-             ledger_sources: dict) -> tuple[list[str], list[str]]:
+             ledger_sources: dict, singles_groups: set[str]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -172,6 +198,18 @@ def validate(loaded: list[tuple[dict, str]], page_files: dict[str, str],
                 f"meta file {name} invalid key {key!r} "
                 f"(must match ^[a-z0-9_:.-]+$)"
             )
+        group = key.split(":", 1)[0]
+        is_single = group in singles_groups
+        in_atlas = key in frame_pages
+        single_png = (atlas_dir / f"{sanitize(key)}.png").exists()
+        if is_single:
+            if in_atlas and single_png:
+                errors.append(f"key '{key}' appears in both atlas and singles")
+            elif not single_png:
+                errors.append(f"singles PNG missing for key '{key}' in {atlas_dir}")
+        else:
+            if in_atlas and single_png:
+                errors.append(f"key '{key}' appears in both atlas and singles")
         source = m.get("source")
         if source is None:
             errors.append(f"meta file {name} missing field 'source'")
@@ -185,6 +223,8 @@ def validate(loaded: list[tuple[dict, str]], page_files: dict[str, str],
     for key, count in seen_keys.items():
         if count > 1:
             errors.append(f"duplicate staged key '{key}'")
+        if key.split(":", 1)[0] in singles_groups:
+            continue  # singles presence is validated above
         pages = frame_pages.get(key, set())
         if len(pages) == 0:
             errors.append(f"key '{key}' not found in any atlas")
@@ -225,7 +265,8 @@ def build_entries(metas: list[dict], frame_pages: dict[str, set]) -> dict[str, d
     return entries
 
 
-def render_block(atlases: dict[str, str], entries: dict[str, dict]) -> str:
+def render_block(atlases: dict[str, str], entries: dict[str, dict],
+                 singles: dict[str, str]) -> str:
     j = json.dumps  # emits TS-valid, properly escaped string/number literals
     lines: list[str] = []
     lines.append("export const SPRITE_MANIFEST: SpriteManifest = {")
@@ -239,6 +280,13 @@ def render_block(atlases: dict[str, str], entries: dict[str, dict]) -> str:
         lines.append("  },")
     else:
         lines.append("  atlases: {},")
+    if singles:
+        lines.append("  singles: {")
+        skeys = sorted(singles)
+        for i, key in enumerate(skeys):
+            comma = "," if i < len(skeys) - 1 else ""
+            lines.append(f"    {j(key)}: {j(singles[key])}{comma}")
+        lines.append("  },")
     if entries:
         lines.append("  entries: {")
         keys = sorted(entries)
@@ -273,16 +321,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ledger", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--atlas-url-prefix", default="/polis/atlas/")
+    parser.add_argument("--singles-groups", default="tex",
+                        help="comma-separated groups shipped as standalone "
+                             "pow2 PNGs (tex by default)")
     args = parser.parse_args(argv)
 
     loaded = load_metas(args.staged)
-    metas = [m for m, _ in loaded]
     page_files, frame_pages = load_atlases(args.atlas_dir)
     ledger = json.loads(args.ledger.read_text(encoding="utf-8"))
     ledger_sources = ledger.get("sources", {})
+    singles_groups = {g.strip() for g in args.singles_groups.split(",")
+                      if g.strip()}
 
     errors, warnings = validate(loaded, page_files, frame_pages, args.atlas_dir,
-                                ledger_sources)
+                                ledger_sources, singles_groups)
     for w in warnings:
         print(f"WARNING {w}", file=sys.stderr)
     if errors:
@@ -294,10 +346,20 @@ def main(argv: list[str] | None = None) -> int:
         pid: args.atlas_url_prefix.rstrip("/") + "/" + fname
         for pid, fname in page_files.items()
     }
-    entries = build_entries(metas, frame_pages)
-    block = render_block(atlases, entries)
+    normal_metas = [m for m, _ in loaded
+                    if m.get("key", "").split(":", 1)[0] not in singles_groups]
+    entries = build_entries(normal_metas, frame_pages)
+    prefix = args.atlas_url_prefix.rstrip("/") + "/"
+    singles: dict[str, str] = {}
+    for m, _ in loaded:
+        key = m.get("key")
+        if key and key.split(":", 1)[0] in singles_groups:
+            singles[key] = prefix + sanitize(key) + ".png"
+    block = render_block(atlases, entries, singles)
 
-    template = load_template().replace(GEN_NOTE_OLD, GEN_NOTE_NEW)
+    template = load_template()
+    template = inject_singles_interface(template)
+    template = template.replace(GEN_NOTE_OLD, GEN_NOTE_NEW)
     template = MANIFEST_BLOCK_RE.sub(lambda _m: block, template, count=1)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -16,5 +16,8 @@ License notes:
 
 ## Sources
 
-_None yet — populated from phase A1 onward. Planned sources and their verified
-licenses are documented in `docs/polis-sprite-art-plan-2026-07.md` §2._
+- **Screaming Brain Studios** — seamless terrain/material textures (grass,
+  dirt, stone; `tex:*`) from the "Tiny Texture Pack" series.
+  https://opengameart.org/content/tiny-texture-pack — License: **CC0**
+  ("released under the CC0/Public Domain License", pack License.txt).
+  Used unmodified except rescaling. Thank you!

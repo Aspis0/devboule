@@ -35,6 +35,14 @@ import {
  */
 export type AtlasLoader = (url: string) => Promise<Record<string, Texture>>;
 
+/**
+ * Loader for standalone single-PNG textures (the manifest's `singles` map:
+ * seamless REPEATING fills — grass, cobble — which can't live in an atlas
+ * because GPU wrap-repeat applies to the whole base texture). Production is
+ * {@link defaultTextureLoader}, which also flips the texture to repeat mode.
+ */
+export type TextureLoader = (url: string) => Promise<Texture>;
+
 /** Default anchor: bottom-center — sprite base sits on its iso ground point. */
 export const DEFAULT_SPRITE_ANCHOR: readonly [number, number] = [0.5, 1];
 
@@ -132,27 +140,42 @@ export class SpriteBank {
  */
 export async function loadPolisSprites(opts: {
   loader: AtlasLoader;
+  /** Required when the manifest has a `singles` map; unused otherwise. */
+  textureLoader?: TextureLoader;
   manifest?: SpriteManifest;
   disabled?: boolean;
 }): Promise<SpriteBank | null> {
   const manifest = opts.manifest ?? SPRITE_MANIFEST;
   if (opts.disabled) return null;
   const atlasIds = Object.keys(manifest.atlases);
-  if (atlasIds.length === 0) return null;
+  const singleKeys = Object.keys(manifest.singles ?? {});
+  if (atlasIds.length === 0 && singleKeys.length === 0) return null;
 
   const pages = new Map<string, Record<string, Texture>>();
-  await Promise.all(
-    atlasIds.map(async (id) => {
+  const textures = new Map<string, Texture>();
+  await Promise.all([
+    ...atlasIds.map(async (id) => {
       try {
         pages.set(id, await opts.loader(manifest.atlases[id]));
       } catch (err) {
         console.warn(`[polis] sprite atlas '${id}' failed to load — its entries stay procedural`, err);
       }
     }),
-  );
-  if (pages.size === 0) return null;
+    ...singleKeys.map(async (key) => {
+      const url = manifest.singles![key];
+      if (!opts.textureLoader) {
+        console.warn(`[polis] sprite single '${key}' skipped — no textureLoader provided`);
+        return;
+      }
+      try {
+        textures.set(key, await opts.textureLoader(url));
+      } catch (err) {
+        console.warn(`[polis] sprite single '${key}' failed to load ('${url}') — stays procedural`, err);
+      }
+    }),
+  ]);
+  if (pages.size === 0 && textures.size === 0) return null;
 
-  const textures = new Map<string, Texture>();
   const metas = new Map<string, SpriteEntryMeta>();
   const unknownAtlases = new Set<string>();
   for (const [key, meta] of Object.entries(manifest.entries)) {
@@ -225,4 +248,19 @@ export function sheetTextures(loaded: unknown, url: string): Record<string, Text
 export const defaultAtlasLoader: AtlasLoader = async (url) => {
   const { Assets } = await import("pixi.js");
   return sheetTextures(await Assets.load(url), url);
+};
+
+/**
+ * Production single-PNG loader. Flips the texture source to wrap-repeat —
+ * singles exist exclusively to be tiled/filled, and the pipeline guarantees
+ * pow2 dimensions (repeat requires them on WebGL1-class fallbacks).
+ */
+export const defaultTextureLoader: TextureLoader = async (url) => {
+  const { Assets } = await import("pixi.js");
+  const texture = (await Assets.load(url)) as Texture;
+  if (!texture?.source) {
+    throw new Error(`[polis] '${url}' did not resolve to a Texture`);
+  }
+  texture.source.addressMode = "repeat";
+  return texture;
 };
