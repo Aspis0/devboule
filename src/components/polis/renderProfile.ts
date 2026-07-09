@@ -140,6 +140,8 @@ const MINIMAL_MAX_VRAM_GB = 1.5;
 const RICH_MIN_CORES = 8;
 /** At/below this core count the box is forced to `minimal` regardless of GPU. */
 const MINIMAL_MAX_CORES = 4;
+/** Apple Silicon unified-memory RICH gate: minimum total RAM (GiB). Unified memory doubles as the VRAM pool, so total RAM is the capability signal. */
+const APPLE_SILICON_RICH_MIN_RAM_GB = 32;
 
 /**
  * Pick the render tier for a hardware snapshot. PURE.
@@ -149,9 +151,14 @@ const MINIMAL_MAX_CORES = 4;
  *     cheapest; an unmeasured box gets the conservative profile).
  *   - `minimal` when the box is genuinely weak: a known VRAM below
  *     {@link MINIMAL_MAX_VRAM_GB}, OR a core count at/below {@link MINIMAL_MAX_CORES}.
- *   - `rich` ONLY for a discrete GPU with VRAM at/above {@link RICH_MIN_VRAM_GB}
+ *   - `rich` for Apple Silicon unified-memory boxes: integrated GPU with an
+ *     "Apple M*" name, ramTotalGb >= {@link APPLE_SILICON_RICH_MIN_RAM_GB}, and at least {@link RICH_MIN_CORES} cores.
+ *     Apple Silicon's unified memory IS the VRAM pool, so these machines deserve
+ *     full detail even though gpuKind is "integrated".
+ *   - `rich` ALSO for a discrete GPU with VRAM at/above {@link RICH_MIN_VRAM_GB}
  *     AND at least {@link RICH_MIN_CORES} cores.
- *   - everything else (integrated/unknown GPU, <4GB VRAM, <8 cores) → `lean`.
+ *   - everything else (non-Apple integrated/unknown GPU, <4GB VRAM, <8 cores)
+ *     → `lean`.
  *
  * The `minimal` test runs FIRST so a tiny-VRAM discrete part (or a 4-core box)
  * lands on the floor even if it would otherwise look discrete; `rich` is the most
@@ -173,6 +180,24 @@ export function profileFor(hw: HardwareInfo | null): RenderProfile {
   // FLOOR first: a genuinely weak box (tiny known VRAM, or a 1-4 core CPU).
   if (cores <= MINIMAL_MAX_CORES) return MINIMAL;
   if (vram !== null && vram < MINIMAL_MAX_VRAM_GB) return MINIMAL;
+
+  // RICH — Apple Silicon unified memory. Apple Silicon's unified memory IS the
+  // VRAM pool: the GPU shares the full system RAM, so an M1 Max with 64GB RAM
+  // has far more usable VRAM than a 4GB discrete card. The old conservative
+  // default starved these machines (lean: antialias off, 18 walkers, half-res
+  // atlas) once hero-fire counts became tier-gated. We require all four signals
+  // — integrated kind, Apple M* name, ramTotalGb >= APPLE_SILICON_RICH_MIN_RAM_GB,
+  // at least RICH_MIN_CORES cores — to avoid a false-positive classification
+  // on low-RAM M-series or non-Apple integrated GPUs.
+  const ram = Number.isFinite(hw.ramTotalGb) && hw.ramTotalGb > 0 ? hw.ramTotalGb : 0;
+  if (
+    hw.gpuKind === "integrated"
+    && /^Apple M/.test(hw.gpuName) // exact-case prefix: the probe emits "Apple M…" verbatim; anomalous casing = ambiguous signal = stay conservative
+    && ram >= APPLE_SILICON_RICH_MIN_RAM_GB
+    && cores >= RICH_MIN_CORES
+  ) {
+    return RICH;
+  }
 
   // RICH: only a discrete card with real VRAM on a capable CPU.
   if (

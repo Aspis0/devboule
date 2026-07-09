@@ -136,3 +136,110 @@ describe("LOD thresholds are MONOTONIC across tiers (minimal >= lean >= rich)", 
     );
   });
 });
+
+describe("profileFor — Apple Silicon unified-memory RICH classification", () => {
+  it("M1 Max (10 cores, 64GB, integrated) → rich", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 10,
+        ramTotalGb: 64,
+        ramAvailableGb: 40,
+        gpuName: "Apple M1 Max",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("rich");
+  });
+
+  it("M4 Pro (12 cores, 48GB, integrated) → rich", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 12,
+        ramTotalGb: 48,
+        gpuName: "Apple M4 Pro",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("rich");
+  });
+
+  it("M1 (8 cores, 16GB, integrated) → lean (RAM below 32)", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 8,
+        ramTotalGb: 16,
+        gpuName: "Apple M1",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("lean");
+  });
+
+  it("M2 (4 cores, 32GB, integrated) → minimal (core floor wins)", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 4,
+        ramTotalGb: 32,
+        gpuName: "Apple M2",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("minimal");
+  });
+
+  it("Intel UHD (16 cores, 64GB, integrated) → lean (not Apple)", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 16,
+        ramTotalGb: 64,
+        gpuName: "Intel(R) UHD Graphics 770",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("lean");
+  });
+
+  it("M3 (10 cores, 64GB, gpuKind unknown) → lean (kind must be integrated)", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 10,
+        ramTotalGb: 64,
+        gpuName: "Apple M3",
+        vramGb: null,
+        gpuKind: "unknown",
+      }),
+    );
+    expect(p.tier).toBe("lean");
+  });
+
+  it("Fake Apple M1 Max (not prefix-matched) → lean (regex anchor ^)", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 10,
+        ramTotalGb: 64,
+        gpuName: "Fake Apple M1 Max",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("lean");
+  });
+
+  it("M1 Max (10 cores, Infinity RAM, integrated) → lean (RAM sanitisation)", () => {
+    const p = profileFor(
+      hw({
+        cpuCores: 10,
+        ramTotalGb: Infinity,
+        gpuName: "Apple M1 Max",
+        vramGb: null,
+        gpuKind: "integrated",
+      }),
+    );
+    expect(p.tier).toBe("lean");
+  });
+});
