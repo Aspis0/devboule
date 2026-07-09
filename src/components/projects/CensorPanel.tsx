@@ -351,7 +351,7 @@ export function CensorPanelView({
 				data-help-title="Censor is disabled for this project until you trust it."
 				data-help-lines="Censor runs this repository's OWN linter/build configs (eslint plugins, cargo build scripts, semgrep rules), which can execute arbitrary code. Only enable it for repositories you trust.|Trusting is per-project and reversible from the project settings."
 			>
-				<div className="space-y-3 rounded-2xl border border-amber/25 bg-amber/8 p-5 text-[12px] text-cream-600">
+				<div className="space-y-3 rounded-2xl border border-amber/25 bg-amber/10 p-5 text-[12px] text-cream-600">
 					<div className="flex items-center gap-2 text-[13px] font-semibold text-amber-dark">
 						<ShieldAlert className="h-4 w-4 shrink-0" />
 						Censor is off for this project
@@ -371,7 +371,7 @@ export function CensorPanelView({
 						Trust &amp; enable Censor
 					</button>
 					{loadError && (
-						<p className="rounded-lg bg-coral/8 px-3 py-2 text-[11px] text-coral-dark">
+						<p className="rounded-lg bg-coral/10 px-3 py-2 text-[11px] text-coral-dark">
 							{loadError}
 						</p>
 					)}
@@ -431,7 +431,7 @@ export function CensorPanelView({
 
 			{/* ---- soft error ---- */}
 			{loadError && (
-				<p className="rounded-lg bg-coral/8 px-3 py-2 text-[11px] text-coral-dark">
+				<p className="rounded-lg bg-coral/10 px-3 py-2 text-[11px] text-coral-dark">
 					{loadError}
 				</p>
 			)}

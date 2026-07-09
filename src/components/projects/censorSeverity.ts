@@ -29,19 +29,19 @@ export interface SeverityStyle {
 // Verbatim palette from RiskFlags.severityConfig (cream/terracotta/teal tokens).
 const SEVERITY_STYLES: Record<CensorSeverity, SeverityStyle> = {
   high: {
-    bg: "bg-coral/8",
+    bg: "bg-coral/10",
     border: "border-coral/20",
     text: "text-coral-dark",
     badge: "bg-coral/10 text-coral-dark",
   },
   medium: {
-    bg: "bg-amber/8",
+    bg: "bg-amber/10",
     border: "border-amber/20",
     text: "text-amber-dark",
     badge: "bg-amber/10 text-amber-dark",
   },
   low: {
-    bg: "bg-teal/8",
+    bg: "bg-teal/10",
     border: "border-teal/20",
     text: "text-teal-dark",
     badge: "bg-teal/10 text-teal-dark",

@@ -234,7 +234,7 @@ export function WorkingSetCard({
       </button>
 
       {error && (
-        <p className="rounded-lg bg-coral/8 px-3 py-2 text-[11px] text-coral-dark">
+        <p className="rounded-lg bg-coral/10 px-3 py-2 text-[11px] text-coral-dark">
           {error}
         </p>
       )}

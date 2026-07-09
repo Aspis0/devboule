@@ -320,7 +320,7 @@ export function BudgetView() {
               </div>
             ))}
           </div>
-          <p className="mt-3 rounded-xl border border-amber/20 bg-amber/8 px-3 py-2 text-[11px] leading-5 text-amber-dark">
+          <p className="mt-3 rounded-xl border border-amber/20 bg-amber/10 px-3 py-2 text-[11px] leading-5 text-amber-dark">
             Bucket names and bounded object-size scans are live when a Scaleway access key is saved
             in Secrets. Very large buckets are marked partial instead of silently pretending to be
             invoice-grade.

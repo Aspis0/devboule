@@ -127,6 +127,35 @@ describe("PolisBottomBar", () => {
     ).not.toBeNull();
   });
 
+  it("Filters panel lists every sin rule id, including the P4 roster", () => {
+    const { container } = renderBar();
+
+    const filtersBtn = Array.from(container.querySelectorAll("button")).find(
+      (b) => b.textContent?.includes("Filters"),
+    )!;
+    act(() => {
+      filtersBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const text = container.textContent ?? "";
+    for (const label of [
+      "Secrets",
+      "Dep cycle",
+      "TODO density",
+      "Dead export",
+      "Env missing",
+      "Complexity",
+      "God file",
+      "Test gap",
+      "Clones",
+    ]) {
+      expect(text).toContain(label);
+    }
+    // Panels must carry a REAL Tailwind background class — /97 does not exist
+    // in the Tailwind 3.4 opacity scale and silently renders transparent.
+    expect(container.innerHTML).not.toMatch(/\/97|\/8[^0-9]/);
+  });
+
   it("toggling the Oracle button again closes OracleAskPanel", () => {
     const { container } = renderBar();
 

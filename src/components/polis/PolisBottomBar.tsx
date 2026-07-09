@@ -517,7 +517,7 @@ function AnomaliesPanel({
   );
 
   return (
-    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[420px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/97 shadow-soft-lg backdrop-blur">
+    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[420px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/95 shadow-soft-lg backdrop-blur">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-cream-100 px-3 py-2">
         <h4 className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-cream-500">
@@ -725,7 +725,7 @@ function FileTypesPanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[340px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/97 p-3 shadow-soft-lg backdrop-blur">
+    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[340px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/95 p-3 shadow-soft-lg backdrop-blur">
       <div className="mb-2 flex items-center justify-between">
         <h4 className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-cream-500">
           <FileCode className="h-3.5 w-3.5" /> File types
@@ -793,7 +793,7 @@ function FileTypesPanel({ onClose }: { onClose: () => void }) {
 
 function LegendOverlay({ onClose }: { onClose: () => void }) {
   return (
-    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[300px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/97 p-3 shadow-soft-lg backdrop-blur">
+    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[300px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/95 p-3 shadow-soft-lg backdrop-blur">
       <div className="mb-2 flex items-center justify-between">
         <h4 className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-cream-500">
           <MapIcon className="h-3.5 w-3.5" /> Building legend
@@ -1111,6 +1111,10 @@ const ANOMALY_RULE_IDS = [
   "todo-density",
   "dead-export",
   "env-missing",
+  "complexity",
+  "god-file",
+  "test-gap",
+  "clone",
 ] as const;
 
 const RULE_GLYPH: Record<string, string> = {
@@ -1119,6 +1123,10 @@ const RULE_GLYPH: Record<string, string> = {
   "todo-density": "\u{1F4DD}",
   "dead-export": "\u{1F480}",
   "env-missing": "\u{1F527}",
+  "complexity": "\u{1F300}",
+  "god-file": "\u{1F3DB}",
+  "test-gap": "\u{1F573}",
+  "clone": "\u{1F46F}",
 };
 
 const RULE_LABEL: Record<string, string> = {
@@ -1127,6 +1135,10 @@ const RULE_LABEL: Record<string, string> = {
   "todo-density": "TODO density",
   "dead-export": "Dead export",
   "env-missing": "Env missing",
+  "complexity": "Complexity",
+  "god-file": "God file",
+  "test-gap": "Test gap",
+  "clone": "Clones",
 };
 
 const SEVERITY_OPTIONS = [
@@ -1211,7 +1223,7 @@ function FiltersPanel({ onClose, filterSets }: { onClose: () => void; filterSets
   };
 
   return (
-    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[400px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/97 shadow-soft-lg backdrop-blur">
+    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[400px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/95 shadow-soft-lg backdrop-blur">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-cream-100 px-3 py-2">
         <h4 className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-cream-500">

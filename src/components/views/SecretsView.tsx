@@ -87,7 +87,7 @@ function auditTone(audit: ProviderConnectionAudit) {
   if (audit.status === "healthy") {
     return {
       border: "border-sage/20",
-      bg: "bg-sage/8",
+      bg: "bg-sage/10",
       icon: "text-sage-dark",
       label: "Connection audit passed",
     };
@@ -95,7 +95,7 @@ function auditTone(audit: ProviderConnectionAudit) {
   if (audit.status === "degraded") {
     return {
       border: "border-amber/25",
-      bg: "bg-amber/8",
+      bg: "bg-amber/10",
       icon: "text-amber-dark",
       label: "Connection audit has warnings",
     };
@@ -616,7 +616,7 @@ export function SecretsView() {
 
       {/* Summary footer */}
       {dueCount > 0 && (
-        <div className="flex items-center gap-3 px-5 py-3.5 rounded-2xl bg-amber/8 border border-amber/20">
+        <div className="flex items-center gap-3 px-5 py-3.5 rounded-2xl bg-amber/10 border border-amber/20">
           <AlertTriangle className="w-4 h-4 text-amber shrink-0" />
           <p className="text-[12px] text-amber-dark font-medium">
             {dueCount} secret{dueCount > 1 ? "s" : ""} require
