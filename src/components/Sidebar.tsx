@@ -62,6 +62,13 @@ const SKILLS_NAV: NavItem = {
 // Injected the same way as Skills; not in the ADMIN_ONLY_VIEWS denylist.
 const LABS_NAV: NavItem = { id: "labs", label: "Labs", icon: "FlaskConical" };
 
+// Nav ids that must never render in the sidebar, even if a stored/loaded
+// config still lists them (e.g. a stale persisted "providers" entry from an
+// older saved config on disk or the backend get_config). The cloud providers
+// area is hidden until the provider-agnostic refactor; it stays reachable by
+// deep link (requestView("providers")).
+const HIDDEN_NAV_IDS = new Set<string>(["providers"]);
+
 export function Sidebar() {
 	const { config, activeView, roleStatus } = useAppContext();
 	const { setActiveView } = useAppActions();
@@ -77,9 +84,12 @@ export function Sidebar() {
 	const withSkills = withDesign.some((n) => n.id === SKILLS_NAV.id)
 		? withDesign
 		: [...withDesign, SKILLS_NAV];
-	const baseNavigation = withSkills.some((n) => n.id === LABS_NAV.id)
+	const withLabs = withSkills.some((n) => n.id === LABS_NAV.id)
 		? withSkills
 		: [...withSkills, LABS_NAV];
+	// Drop any hidden nav ids (e.g. a stale "providers" entry from a stored
+	// config) so they never reach the role filter and never render.
+	const baseNavigation = withLabs.filter((n) => !HIDDEN_NAV_IDS.has(n.id));
 	// Filter by role (cosmetic — the backend enforces privileged commands). A
 	// null/loading role defaults to the restricted collaborator set.
 	const allowedIds = new Set(

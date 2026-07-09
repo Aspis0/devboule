@@ -40,16 +40,12 @@ const viewTitles: Record<string, string> = {
 // Compute, Budget, Devices and Workspace. The standalone Agents page was
 // dissolved (Phase G): agents now live inside a project's Work mode, reached by
 // opening a project from the Board — so there is no separate Agents jump target.
-const JUMP_TARGETS: { label: string; target: string }[] = [
+export const JUMP_TARGETS: { label: string; target: string }[] = [
   { label: "Projects", target: "projects" },
   // The standalone Oracle page (search + info + admin) is the primary target.
   { label: "Oracle", target: "oracle" },
   // The Polis parchment ask panel is an additional way to ask Oracle from the map.
   { label: "Oracle (Ask)", target: "polis" },
-  { label: "Providers", target: "providers" },
-  { label: "Cloudflare", target: "providers#cloudflare" },
-  { label: "Scaleway / Compute", target: "providers#scaleway" },
-  { label: "Budget", target: "providers#budget" },
   { label: "Polis", target: "polis" },
   { label: "Settings", target: "settings" },
   { label: "Secrets", target: "settings#secrets" },

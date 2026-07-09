@@ -77,9 +77,11 @@ const EMPTY_CONFIG: AppConfig = {
   // Compressed top-level nav (Polis is injected by Sidebar). Re-homed pages now
   // live as tabs: Agents→Projects; Cloudflare/Compute/Budget→Providers;
   // Secrets/Devices/Workspace→Settings (opened from the user area).
+  // The cloud "providers" entry is intentionally omitted from the default nav
+  // (hidden until the provider-agnostic refactor); it stays reachable by deep
+  // link via requestView("providers").
   navigation: [
     { id: "projects", label: "Projects", icon: "FolderKanban" },
-    { id: "providers", label: "Providers", icon: "Boxes" },
     { id: "oracle", label: "Oracle", icon: "BrainCircuit" },
   ],
   providers: [],
