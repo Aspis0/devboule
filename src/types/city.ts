@@ -354,6 +354,12 @@ export interface Agent {
   color: string;
   lastIntervention?: string;
   /**
+   * The driving model string (e.g. "MiMo-V2.5", "deepseek-r1", "claude-sonnet").
+   * Used by the Polis walker layer to tint the agent tunic by provider family.
+   * Absent (omitted) for agents without a model — no-churn serde.
+   */
+  model?: string | null;
+  /**
    * Set when this session is a mini-coder spawned by a parent coder. Its
    * presence selects the mini-coder figure (watercarrier) instead of the plain
    * coder builder. Absent (omitted) for every ordinary agent — no-churn serde.

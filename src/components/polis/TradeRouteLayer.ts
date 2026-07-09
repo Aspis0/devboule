@@ -301,6 +301,7 @@ export class TradeRouteLayer {
         phase: p.phase,
         actionPhase: 0,
         tunic: p.tunic,
+        carrying: "crate",
       });
     }
   }
@@ -468,6 +469,7 @@ export class TradeRouteLayer {
       phase,
       actionPhase: 0,
       tunic,
+      carrying: "crate",
     });
     return porter;
   }

@@ -5452,6 +5452,7 @@ pub fn attach_agents(
             // Carry the mini-coder parentage straight through; absent for every
             // ordinary agent (no-churn).
             parent_agent_id: s.parent_agent_id.clone(),
+            model: s.model.clone(),
             subagents,
         });
     }
@@ -9640,19 +9641,57 @@ import { cdn } from 'https://cdn.example.com/x';
         );
         assert_eq!(city.agents.len(), 1);
         assert!(city.agents[0].parent_agent_id.is_none());
+        assert!(city.agents[0].model.is_none());
         assert!(city.agents[0].subagents.is_empty());
 
         // Serde no-churn: a plain coder Agent must serialize WITHOUT the
-        // `parentAgentId` / `subagents` keys (camelCase, skip-if-none/empty).
+        // `parentAgentId` / `model` / `subagents` keys (camelCase, skip-if-none/empty).
         let json = serde_json::to_string(&city.agents[0]).unwrap();
         assert!(
             !json.contains("parentAgentId"),
             "plain agent must omit parentAgentId: {json}"
         );
+        assert!(!json.contains("model"), "plain agent must omit model: {json}");
         assert!(
             !json.contains("subagents"),
             "plain agent must omit subagents: {json}"
         );
+    }
+
+    // ---- Polis-P1: model carried onto the emitted Agent ----
+
+    #[test]
+    fn attach_agents_carries_model_from_session() {
+        // A session with model = Some("MiMo-V2.5") must emit an Agent whose
+        // `model` is set, so the walker layer can tint the tunic by provider.
+        let mut city = CityState::empty("City", "main");
+        let mut s = session("mimo-1", "coder", "active");
+        s.model = Some("MiMo-V2.5".into());
+        attach_agents(
+            &mut city,
+            &live_with(vec![s]),
+            Path::new("/nonexistent-root"),
+            &BTreeMap::new(),
+        );
+        assert_eq!(city.agents.len(), 1);
+        assert_eq!(city.agents[0].model.as_deref(), Some("MiMo-V2.5"));
+    }
+
+    #[test]
+    fn attach_agents_model_none_stays_none() {
+        // A session with model = None must emit an Agent whose `model` is None
+        // (and omitted from serialized JSON by the skip-if-none serde).
+        let mut city = CityState::empty("City", "main");
+        attach_agents(
+            &mut city,
+            &live_with(vec![session("coder-1", "coder", "active")]),
+            Path::new("/nonexistent-root"),
+            &BTreeMap::new(),
+        );
+        assert_eq!(city.agents.len(), 1);
+        assert!(city.agents[0].model.is_none());
+        let json = serde_json::to_string(&city.agents[0]).unwrap();
+        assert!(!json.contains("model"), "model=None must be omitted: {json}");
     }
 
     #[test]
@@ -9669,6 +9708,7 @@ import { cdn } from 'https://cdn.example.com/x';
         }"##;
         let a: Agent = serde_json::from_str(old).unwrap();
         assert!(a.parent_agent_id.is_none());
+        assert!(a.model.is_none());
         assert!(a.subagents.is_empty());
 
         // A NEW payload round-trips camelCase keys (`parentAgentId`, `subagents`
@@ -9681,6 +9721,7 @@ import { cdn } from 'https://cdn.example.com/x';
             current_task: None,
             color: "#abc".into(),
             last_intervention: None,
+            model: Some("MiMo-V2.5".into()),
             parent_agent_id: Some("coder-parent".into()),
             subagents: vec![AgentSubagentBrief {
                 role: "coder".into(),
@@ -9688,6 +9729,7 @@ import { cdn } from 'https://cdn.example.com/x';
             }],
         };
         let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"model\":\"MiMo-V2.5\""));
         assert!(json.contains("\"parentAgentId\":\"coder-parent\""));
         assert!(json.contains("\"subagents\":[{\"role\":\"coder\",\"count\":2}]"));
         let back: Agent = serde_json::from_str(&json).unwrap();

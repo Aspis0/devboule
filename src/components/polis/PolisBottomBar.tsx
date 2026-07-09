@@ -977,6 +977,34 @@ function LegendOverlay({ onClose }: { onClose: () => void }) {
         </p>
       </div>
 
+      {/* AGENT FIGURES — the walking agent taxonomy. Informational only:
+          lists each figure type + the livery-tint note. No toggles. */}
+      <div className="mt-3 border-t border-cream-100 pt-2">
+        <h5 className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+          <Bot className="h-3 w-3" /> Agent figures
+        </h5>
+        <ul className="grid grid-cols-2 gap-x-3 gap-y-1">
+          {[
+            { fig: "Noble", desc: "Orchestrator" },
+            { fig: "Builder", desc: "Coder" },
+            { fig: "Water carrier", desc: "Mini-coder" },
+            { fig: "Citizen", desc: "Verifier" },
+            { fig: "Priest", desc: "Augur" },
+            { fig: "Hooded foreigner", desc: "External / unknown" },
+          ].map((e) => (
+            <li key={e.fig} className="flex items-center gap-1.5">
+              <span className="min-w-0 truncate text-[10px] text-cream-600">
+                <strong>{e.fig}</strong> — {e.desc}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-1 text-[9px] leading-3 text-cream-400">
+          Tunic tint hints at the model: jade = MiMo, indigo = DeepSeek,
+          terracotta = Claude family.
+        </p>
+      </div>
+
       <p className="mt-2 border-t border-cream-100 pt-2 text-[10px] leading-4 text-cream-400">
         The shape/type of a building shows what its file does. Bigger building =
         more lines of code. A small flag on the roof marks the cloud provider, and
@@ -1099,11 +1127,16 @@ function HelpPanel({
           >
             Real AI agents working on your code are marked with a small{" "}
             <strong className="text-cream-700">gold arrow</strong> above their
-            head and a glow on the building they are editing — click one to see
-            its role, status, and task. The other figures wandering the streets
-            are <strong className="text-cream-700">decorative townsfolk</strong>:
-            scenery to make the city feel alive. They have no arrow, are not
-            clickable, and never represent a real agent.
+            head and a glow on the building they are editing. Each figure
+            reflects the agent’s role: <strong>noble</strong> = orchestrator,
+            <strong>builder</strong> = coder, <strong>water carrier</strong> =
+            mini-coder, <strong>citizen</strong> = verifier, <strong>priest</strong> =
+            augur, and a <strong>hooded foreigner</strong> = external or unknown
+            roles. A tunic tint hints at the driving model: jade = MiMo, indigo =
+            DeepSeek, terracotta = Claude family. The other figures wandering the
+            streets are <strong className="text-cream-700">decorative
+            townsfolk</strong>: scenery to make the city feel alive. They have no
+            arrow, are not clickable, and never represent a real agent.
           </HelpSection>
 
           <HelpSection icon={Bot} title="A living city">

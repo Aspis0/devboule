@@ -27,6 +27,8 @@ const HUE_SEA = 0x3f7fa6; // saturated sea-blue bias target
 // DISTINCT color from the orange/red disaster fire (the HONESTY invariant: a
 // suspect is Oracle's GUESS, never a confirmed disaster).
 const HUE_INVESTIGATE = 0x5a6fd8; // indigo-violet bias target
+const HUE_JADE = 0x4a9a7a; // jade green bias target for MiMo livery
+const HUE_INDIGO = 0x4a5a9e; // indigo blue bias target for DeepSeek livery
 
 export const PALETTE = {
   cream: 0xf4f0e6,
@@ -143,6 +145,13 @@ export const DERIVED = {
   // mistaken for a confirmed disaster (the HONESTY invariant).
   investigate: saturate(blend(PALETTE.water, HUE_INVESTIGATE, 0.62), 0.08),
   investigateMark: lighten(saturate(blend(PALETTE.water, HUE_INVESTIGATE, 0.7), 0.12), 0.22),
+
+  // Provider livery tints — applied to an agent's tunic to hint at the driving
+  // model family. Pure derivations: jade for MiMo, indigo for DeepSeek, terracotta
+  // for Claude family. No raw hex outside this file.
+  liveryMimo: saturate(blend(PALETTE.grass, HUE_JADE, 0.55), 0.2),
+  liveryDeepseek: saturate(blend(PALETTE.water, HUE_INDIGO, 0.6), 0.15),
+  liveryClaude: PALETTE.terracotta,
 } as const;
 
 /** Alpha constants reused across the renderer (semantic, not magic numbers). */

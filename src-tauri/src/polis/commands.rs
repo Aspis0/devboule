@@ -2268,6 +2268,7 @@ mod tests {
             current_task: None,
             color: "#FFB347".into(),
             last_intervention: None,
+            model: None,
             parent_agent_id: None,
             subagents: Vec::new(),
         });

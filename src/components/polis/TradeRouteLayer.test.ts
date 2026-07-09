@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Container, Rectangle } from "pixi.js";
 import { cartToIso, type IsoPoint } from "./iso";
 import { TradeRouteLayer } from "./TradeRouteLayer";
 import type { Road } from "../../types/city";
+import * as people from "./kitcd/people";
 
 // These tests exercise the DATA-BINDING + pooling + LOD/cull discipline of the
 // trade-route porter layer WITHOUT a WebGL renderer. PIXI v8 Container/Graphics
@@ -407,6 +408,41 @@ describe("TradeRouteLayer — teardown + rebuild", () => {
       (id) => (id === "A" ? { x: 0, y: 0 } : null), // GONE unresolved
     );
     expect(layer.count).toBe(0);
+    layer.clear();
+  });
+});
+
+describe("TradeRouteLayer — porters draw with carrying: crate", () => {
+  let spy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    // Spy on drawCitizen to capture the opts passed by the layer.
+    spy = vi.spyOn(people, "drawCitizen").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    spy.mockRestore();
+  });
+
+  it("passes carrying: crate at both redraw and spawn call sites", () => {
+    const root = new Container();
+    const layer = new TradeRouteLayer(root);
+    layer.setWorld(
+      [mkRoad("A", "B", 5, [{ x: 0, y: 0 }, { x: 4, y: 0 }])],
+      resolveAll,
+    );
+    layer.setLodVisible(true);
+    // Step triggers the per-frame redraw path (call site 1).
+    layer.step(0, VIEW);
+    // update triggers the per-frame redraw path too.
+    layer.update(50);
+    // Every call to drawCitizen from the layer must include carrying: "crate".
+    for (const call of spy.mock.calls) {
+      const opts = call[2] as Record<string, unknown>;
+      expect(opts.carrying).toBe("crate");
+    }
+    // At least one call must have been made.
+    expect(spy.mock.calls.length).toBeGreaterThan(0);
     layer.clear();
   });
 });

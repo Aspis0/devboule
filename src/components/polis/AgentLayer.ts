@@ -38,7 +38,7 @@
 import { Container, Graphics, Rectangle } from "pixi.js";
 import type { Agent, AgentStatus, AgentType } from "../../types/city";
 import { type IsoPoint, isoToCart } from "./iso";
-import { agentColor } from "./palette";
+import { agentColor, DERIVED } from "./palette";
 import { steppedPulse } from "./effects";
 import { hashString } from "./rng";
 import { SlotAllocator, buildSafeSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint, type SafeSplineLeg } from "./locomotion";
@@ -99,8 +99,10 @@ function figureForType(type: AgentType): CitizenType {
       return "noble";
     case "verifier":
       return "citizen";
+    case "augur":
+      return "priest";
     default:
-      return "citizen";
+      return "foreigner";
   }
 }
 
@@ -112,7 +114,8 @@ function figureForType(type: AgentType): CitizenType {
  *     coder). This takes PRECEDENCE over `type`, regardless of the underlying
  *     type slug.
  *   - otherwise fall back to the type map ({@link figureForType}): coder→builder,
- *     orchestrator→noble, verifier→citizen, anything else→citizen.
+ *     orchestrator→noble, verifier→citizen, augur→priest,
+ *     anything else→foreigner.
  *
  * Agent rendering routes through here; {@link figureForType} stays for any
  * type-only callers.
@@ -127,7 +130,7 @@ export function figureForAgent(
 /**
  * Polis-P2 — pick the kit figure for a SUBAGENT by its role slug (used by P4 to
  * render each subagent as the scaled-down figure of its OWN role):
- * coder→builder, verifier→citizen, anything else→citizen. A subagent of a coder
+ * coder→builder, verifier→citizen, augur→priest, anything else→foreigner. A subagent of a coder
  * is itself doing coder work, so it draws as a builder; the SCALE
  * ({@link subagentFigureScale}) is what marks it as a subordinate, not the figure.
  */
@@ -137,9 +140,37 @@ export function figureForRole(role: string): CitizenType {
       return "builder";
     case "verifier":
       return "citizen";
+    case "augur":
+      return "priest";
     default:
-      return "citizen";
+      return "foreigner";
   }
+}
+
+/**
+ * Provider livery tint: returns a PALETTE-derived tunic override colour when
+ * the model string matches a known provider family, or `undefined` to use the
+ * figure's default tunic. Case-insensitive substring match.
+ *
+ *   - contains "mimo"  ⇒ jade green
+ *   - contains "deepseek" ⇒ indigo
+ *   - contains "claude" / "sonnet" / "opus" / "fable" ⇒ terracotta
+ *   - otherwise (including undefined / null / empty) ⇒ undefined
+ */
+export function liveryTint(model?: string | null): number | undefined {
+  if (!model) return undefined;
+  const m = model.toLowerCase();
+  if (m.includes("mimo")) return DERIVED.liveryMimo;
+  if (m.includes("deepseek")) return DERIVED.liveryDeepseek;
+  if (
+    m.includes("claude") ||
+    m.includes("sonnet") ||
+    m.includes("opus") ||
+    m.includes("fable")
+  ) {
+    return DERIVED.liveryClaude;
+  }
+  return undefined;
 }
 
 // A subtly-varied per-citizen tunic so a crowd of the same role isn't uniform.
@@ -1032,11 +1063,11 @@ export class AgentLayer {
     const nextFigure = figureForAgent(p.agent);
     if (nextFigure !== p.figure) {
       // The agent's figure changed (e.g. a parentAgentId appeared/disappeared,
-      // flipping coder→watercarrier). The tunic was keyed to the OLD figure's
-      // default tone; re-derive it from the SAME seed so it tracks the new
-      // figure deterministically (same seed ⇒ same tunic).
+      // flipping coder→watercarrier). Re-apply the livery tint first (model-
+      // based override) then fall back to the figure's default tone from the
+      // SAME seed so it tracks the new figure deterministically.
       p.figure = nextFigure;
-      p.tunic = tunicForAgent(nextFigure, p.seed);
+      p.tunic = liveryTint(p.agent.model) ?? tunicForAgent(nextFigure, p.seed);
     }
   }
 
@@ -1154,8 +1185,9 @@ export class AgentLayer {
     const figure = pinnedFigure ?? figureForAgent(agent);
     // Per-citizen tunic: start from the figure's default tone, varied subtly per
     // agent so a crowd of the same role isn't uniform. Kept on-palette by only
-    // nudging the figure's own tunic.
-    const tunic = tunicForAgent(figure, seed);
+    // nudging the figure's own tunic. The livery tint overrides the default tunic
+    // when the agent's model matches a known provider family.
+    const tunic = liveryTint(agent.model) ?? tunicForAgent(figure, seed);
 
     const tracked: PlacedAgent = {
       agent,
