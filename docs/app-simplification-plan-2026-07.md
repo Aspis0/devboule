@@ -52,32 +52,68 @@ branch — fixed numbers would go stale).
 
 ## Roles
 - **All coding goes to pi coders.** The orchestrator NEVER writes production code
-  inline — not even one-liners. Coder model: `mimo-v2.5` (or `mimo-v2.5-pro` where a
-  task says so). Reviewer model: `deepseek-v4-pro`. Both via the `pi` CLI.
+  inline — not even one-liners. Reviewer model: `deepseek-v4-pro` via `pi`.
+- **Coder model policy (owner directive 2026-07-09): default coder = `hy3:free`**
+  (Tencent Hy3, FREE via OpenRouter — save paid tokens; there is a ~1k free-request
+  budget). **`mimo-v2.5-pro` is RESERVED** for the genuinely complex, multi-file /
+  concurrency / heavy-refactor phases — here that is **ONLY S5 (work-mode tab
+  restructure) and S9 (Rust module split)**. Every other task (S1, S2, S3, S4, S6,
+  S7, S8) uses `hy3:free`.
 - The orchestrator itself only: writes task-spec files, runs pi, reads reports,
   verifies files on disk, runs vitest/cargo, arbitrates review findings, commits.
 
 ## pi commands (exact — do not improvise flags)
 Prompt ALWAYS via `$(cat file)`, ALWAYS `< /dev/null`, stdout ALWAYS redirected to a
 file you then Read (terminal stdout is untrusted). NEVER run pi with
-run_in_background. Frontend tasks: run from `<repo>/src`. Rust tasks: from
-`<repo>/src-tauri`. Thinking ALWAYS `high`.
+run_in_background. This plan runs in an ISOLATED WORKTREE
+(`/Users/user/Projects/Aspis-management-simpl`) — run frontend-task pi dispatches
+from `<worktree>/src`, Rust-task dispatches from `<worktree>/src-tauri`. Thinking
+ALWAYS `high` (hy3 has `reasoning:false` so the flag is a no-op there — pass it
+anyway, it does no harm).
 
 ```sh
-# coder (fresh task) — from src/ or src-tauri/ per the task
-pi -ne --provider xiaomi-token-plan-sgp --model "mimo-v2.5" --thinking high \
+# DEFAULT coder = hy3 free (S1-S4, S6-S8) — from <worktree>/src or /src-tauri
+pi -ne --provider openrouter-curated --model "tencent/hy3:free" --thinking high \
   -t read,bash,edit,write -p "$(cat SPEC.md)" < /dev/null > OUT.md 2>&1
-# coder, harder task
-... --model "mimo-v2.5-pro" ...
-# reviewer (read-only tools!)
+# RESERVED coder = mimo-v2.5-pro (S5, S9 ONLY)
+pi -ne --provider xiaomi-token-plan-sgp --model "mimo-v2.5-pro" --thinking high \
+  -t read,bash,edit,write -p "$(cat SPEC.md)" < /dev/null > OUT.md 2>&1
+# reviewer (read-only tools!) — always deepseek-v4-pro
 pi -ne --provider deepseek --model "deepseek-v4-pro" --thinking high \
   -t read,bash -p "$(cat REVIEW-SPEC.md)" < /dev/null > REVIEW-OUT.md 2>&1
-# fix pass — SAME session as the original author, SAME cwd as the original dispatch
-pi -ne -c --provider xiaomi-token-plan-sgp --model "mimo-v2.5" --thinking high \
+# fix pass — SAME session as the original author (-c), SAME provider/model, SAME cwd
+pi -ne -c --provider openrouter-curated --model "tencent/hy3:free" --thinking high \
   -t read,bash,edit,write -p "$(cat FIXES.md)" < /dev/null > OUT2.md 2>&1
 ```
 If the 10-min Bash timeout cuts a run, resume with `-c ... -p "Continue exactly where
 you left off"`. Spec files live in the scratchpad dir, never in the repo.
+
+## hy3:free pitfalls — PASTE into every hy3 coder spec (learned the hard way)
+- **hy3 SKIPS tests unless forced.** Every hy3 spec must say, in bold: "write the
+  tests FIRST and show them failing (RED), THEN implement until green — do not skip
+  tests." Verify on disk that the test file exists before accepting the task.
+- **hy3 blows up token usage on broad tasks** (one run burned 913K tokens for 9
+  tests). Keep each hy3 dispatch NARROW: if a task section is large (e.g. S8), split
+  it into sub-dispatches (one component / one command-group at a time), not one
+  giant prompt.
+- **hy3 puts React hooks after early returns** (`if (!x) return null;` then
+  `useState`) — a Rules-of-Hooks violation. The reviewer must explicitly check hook
+  ordering; the spec must say "all hooks before any early return."
+- **hy3 aborts mid-task on complex features.** If a run stops early, resume with
+  `-c "Continue exactly where you left off"`. If it aborts twice on the same task,
+  ESCALATE that task to `mimo-v2.5-pro` (fresh session, note it in the handoff).
+- **hy3 rate-limit / free-budget exhaustion**: if pi returns a 429 / quota error
+  from `openrouter-curated`, fall back to `mimo-v2.5-pro` for that dispatch and log
+  it in the handoff (don't burn retries against a dead quota).
+- **hy3 max output is 32768 tokens** — it cannot rewrite a huge file in one shot;
+  prefer surgical edits, and for big files instruct it to edit region-by-region.
+
+## Escalation to Fable (the human's Opus/Fable co-pilot is watching)
+If a task is beyond Sonnet+hy3 after the rules above (two failed attempts, or the
+review keeps finding BLOCKERs the fix pass can't clear), STOP that task, write a
+crisp blocker note in the handoff (`handoff-s1-s9.md`) naming the file/symptom, and
+move to the next independent task. Fable monitors the handoff and will step in on
+flagged tasks, then restart the orchestrator from the next clean point.
 
 ## Safety preamble — PREPEND VERBATIM to every spec (coder AND reviewer)
 A deepseek pi task once ran `git checkout -- src/` mid-task and silently wiped ~600
@@ -146,7 +182,7 @@ hash and the list of other-Claude dirty files from `git status`.
 ---
 
 ## S1 — Hide the cloud-Providers area from the sidebar
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
 
 Facts: nav base list is `EMPTY_CONFIG.navigation` (`src/context/AppContext.tsx:80-83`
 — projects, providers, oracle) + 4 injected entries in `src/components/Sidebar.tsx:70-79`
@@ -191,7 +227,7 @@ unchanged.
 ---
 
 ## S2 — Board mode reorder: board first, calendar behind a button
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
 
 Facts (all `src/components/views/ProjectsView.tsx`, Board branch at 3819): current
 order = error banners (3820) → create bar (3832) → clone dialog (3896) →
@@ -244,7 +280,7 @@ path unchanged — no remount flicker of the gsap entrance on toggle interaction
 ---
 
 ## S3 — Self-explanatory project cards
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
 
 Facts: `ProjectCard` (`src/components/projects/ProjectCard.tsx`, memoized at 118)
 currently shows status dot + title, agent line, git chip, censor chip, done/total.
@@ -286,7 +322,7 @@ who's working, git/censor state, task breakdown, next deadline — without click
 ---
 
 ## S4 — Planner simplification: chat first, stages under the chat
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
 
 Facts (`src/components/projects/planner/PlannerPlanMode.tsx`): internal order today
 = goal echo (231) → orchestrator selector row (269: Local | Claude | Codex | OpenAI)
@@ -406,7 +442,7 @@ nothing that existed is unreachable; archived projects still read-only everywher
 ---
 
 ## S6 — Skills page title + explainer
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
 
 Facts: `src/components/views/SkillsView.tsx` has NO h1 — only a banner (31-34) and
 Library/Tools tabs. Header titles come from `viewTitles` in
@@ -434,7 +470,7 @@ per-project skills live.
 ---
 
 ## S7 — New "Help" view in the sidebar
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src/ · Rust: no**
 
 Facts: NO getting-started content exists anywhere (recon-confirmed). Only the
 Alt-key `HelpModeOverlay` and the collaborator `OnboardingWizard`. Adding a view =
@@ -497,7 +533,7 @@ the Help page; every claim in it matches the shipped UI (post S1-S6 states).
 ---
 
 ## S8 — Dead-code purge (frontend + Tauri commands)
-**Coder: mimo-v2.5 · Reviewer: deepseek-v4-pro · cwd: src-tauri/ · Rust: YES (orchestrator runs cargo)**
+**Coder: hy3:free · Reviewer: deepseek-v4-pro · cwd: src-tauri/ · Rust: YES (orchestrator runs cargo)**
 
 Facts (recon, to be RE-VERIFIED per item before deleting): ~320 commands in
 `generate_handler![]` (`src-tauri/src/lib.rs:90-410`), ~42 with zero frontend call
