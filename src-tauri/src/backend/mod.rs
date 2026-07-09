@@ -61,6 +61,7 @@ pub mod pi_sidecar;
 pub mod prompt_routing;
 pub mod plan_approval;
 pub mod project_skill;
+pub mod project_git;
 pub mod projects;
 pub mod roles_config;
 pub mod provider_detect;
