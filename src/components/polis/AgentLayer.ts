@@ -41,6 +41,7 @@ import { type IsoPoint } from "./iso";
 import { agentColor } from "./palette";
 import { steppedPulse } from "./effects";
 import { hashString } from "./rng";
+import { SlotAllocator, buildSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint } from "./locomotion";
 import {
   drawCitizen,
   defaultTunic,
@@ -213,9 +214,9 @@ type MoveMode =
   // Standing at `pos`; normal in-place pose + bob.
   | { kind: "idle" }
   // Walking along `route` from `route[seg]`→`route[seg+1]`, `t` in [0,1).
-  | { kind: "walk"; route: IsoPoint[]; seg: number; t: number }
+  | { kind: "walk"; route: IsoPoint[]; seg: number; t: number; destFileId: string | null; originFileId: string | null }
   // Fade-teleport: phase out at old pos, jump, phase in at `target`.
-  | { kind: "fadeOut"; elapsed: number; target: IsoPoint }
+  | { kind: "fadeOut"; elapsed: number; target: IsoPoint; originFileId: string | null }
   | { kind: "fadeIn"; elapsed: number }
   // Appearance fade for a brand-new agent.
   | { kind: "appear"; elapsed: number };
@@ -272,6 +273,8 @@ interface PlacedAgent {
   ghostMult: number;
   /** Horizontal facing (+1 right, -1 left); flips with travel direction. */
   facing: number;
+  /** P5.2 — per-agent lane-offset px (deterministic from agentId). */
+  laneOff: number;
 }
 
 /**
@@ -318,6 +321,8 @@ export class AgentLayer {
   private ominoVisible = true;
   /** P3.2 — Last step frame for ghost-filter glow recompute. */
   private _lastFrame = 0;
+  // P5.2 — per-building entry-slot allocator (presentation state, NOT CityState).
+  private slotAllocator = new SlotAllocator();
   private onSelectAgent?: (agent: Agent | null) => void;
 
   constructor(root: Container, onSelectAgent?: (agent: Agent | null) => void) {
@@ -377,7 +382,7 @@ export class AgentLayer {
           // honest road route from the handoff node exists).
           const route = findRoute ? findRoute(d.startNodeId, d.targetFileId) : null;
           if (route && route.length >= 2) {
-            this.beginWalk(p, route, d.targetIso);
+            this.beginWalk(p, route, d.targetIso, d.targetFileId, d.startNodeId);
           } else {
             this.beginFadeTeleport(p, d.targetIso);
           }
@@ -407,7 +412,7 @@ export class AgentLayer {
           p.fileId = d.targetFileId;
           const route = findRoute ? findRoute(prevFileId, d.targetFileId) : null;
           if (route && route.length >= 2) {
-            this.beginWalk(p, route, d.targetIso);
+            this.beginWalk(p, route, d.targetIso, d.targetFileId, prevFileId);
           } else {
             this.beginFadeTeleport(p, d.targetIso);
           }
@@ -527,7 +532,7 @@ export class AgentLayer {
     });
     this.externals.set(id, p);
     const route = findRoute ? findRoute(startNodeId, targetFileId) : null;
-    if (route && route.length >= 2) this.beginWalk(p, route, targetIso);
+    if (route && route.length >= 2) this.beginWalk(p, route, targetIso, targetFileId, startNodeId);
     else this.beginFadeTeleport(p, targetIso);
   }
 
@@ -560,7 +565,7 @@ export class AgentLayer {
     const prevFileId = p.fileId;
     p.fileId = targetFileId;
     const route = findRoute ? findRoute(prevFileId, targetFileId) : null;
-    if (route && route.length >= 2) this.beginWalk(p, route, targetIso);
+    if (route && route.length >= 2) this.beginWalk(p, route, targetIso, targetFileId, prevFileId);
     else this.beginFadeTeleport(p, targetIso);
   }
 
@@ -825,39 +830,37 @@ export class AgentLayer {
   /** Put an agent into the WALKING state along `route`, ending at `dest`. The
    *  route already begins at (or very near) the agent's current building. We
    *  swap in the walking leg-frames and start at segment 0. */
-  private beginWalk(p: PlacedAgent, route: IsoPoint[], dest: IsoPoint): void {
+  private beginWalk(p: PlacedAgent, route: IsoPoint[], dest: IsoPoint, destFileId?: string, originFileId?: string): void {
     // Ensure the route ends exactly at the resolved destination iso (defends
     // against tiny grid-vs-building-anchor offsets so the omino lands cleanly).
     route[route.length - 1] = { x: dest.x, y: dest.y };
     // Snap the omino's start to the route's first waypoint.
     p.pos = { x: route[0].x, y: route[0].y };
-    p.move = { kind: "walk", route, seg: 0, t: 0 };
+    p.move = { kind: "walk", route, seg: 0, t: 0, destFileId: destFileId ?? null, originFileId: originFileId ?? null };
     this.setPoseStatus(p, "walking");
     this.applyTransform(p);
   }
 
-  /** Advance walking along the polyline by `deltaMs`. Consumes segments as the
-   *  agent passes their endpoints; clamps to the final waypoint on arrival and
-   *  returns to the idle/real-status pose. Faces the travel direction. */
+  /**
+   * P5.2 — advance walking along the route polyline using Catmull-Rom spline
+   * easing (no corner snapping) + per-walker lane offset.
+   */
   private advanceWalk(
     p: PlacedAgent,
-    m: { kind: "walk"; route: IsoPoint[]; seg: number; t: number },
+    m: { kind: "walk"; route: IsoPoint[]; seg: number; t: number; destFileId: string | null; originFileId: string | null },
     deltaMs: number,
   ): void {
-    let remaining = (WALK_SPEED * deltaMs) / 1000; // px to travel this frame
+    let remaining = (WALK_SPEED * deltaMs) / 1000;
     const route = m.route;
-    // Guard: a route should always have >= 2 points, but clamp defensively.
     while (remaining > 0 && m.seg < route.length - 1) {
       const a = route[m.seg];
       const b = route[m.seg + 1];
       const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1e-6;
       const distLeft = segLen * (1 - m.t);
       if (remaining < distLeft) {
-        // Stay within this segment.
         m.t += remaining / segLen;
         remaining = 0;
       } else {
-        // Reach the segment end; carry the leftover into the next segment.
         remaining -= distLeft;
         m.seg += 1;
         m.t = 0;
@@ -865,9 +868,22 @@ export class AgentLayer {
     }
 
     if (m.seg >= route.length - 1) {
-      // Arrived at the final waypoint.
+      // Arrived.
       const end = route[route.length - 1];
-      p.pos = { x: end.x, y: end.y };
+      // P5.2 — release ORIGIN slot (p.fileId was changed to dest before walk start).
+      if (m.originFileId) this.slotAllocator.release(m.originFileId, p.agent.agentId);
+      const destId = m.destFileId ?? "";
+      if (destId) {
+        const slotIdx = this.slotAllocator.acquire(destId, p.agent.agentId);
+        // Position at the slot's idle spot along the incoming road.
+        // The incoming road direction is from the second-to-last waypoint.
+        const secondLast = route[Math.max(0, route.length - 2)];
+        const dir = { x: end.x - secondLast.x, y: end.y - secondLast.y };
+        const slotPos = this.slotAllocator.positionFor(slotIdx, end, dir);
+        p.pos = { x: slotPos.x, y: slotPos.y };
+      } else {
+        p.pos = { x: end.x, y: end.y };
+      }
       this.faceTowards(p, route[Math.max(0, route.length - 2)], end);
       p.move = { kind: "idle" };
       this.refreshIdlePose(p);
@@ -875,10 +891,33 @@ export class AgentLayer {
       return;
     }
 
-    // Mid-route: interpolate position on the current segment + face direction.
+    // Mid-route: Catmull-Rom spline + lane offset.
+    // P5.2 — W3: chord-vs-curve speed accepted simplification: we advance at
+    // constant speed along the chord; the slight speed variation through
+    // spline bends is tolerated for the decorative crowd (handful of agents,
+    // imperceptible visual difference).
     const a = route[m.seg];
     const b = route[m.seg + 1];
-    p.pos = { x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t };
+    // M2: cache the spline sampler per leg; rebuild only on seg change.
+    const splineKey = m.seg;
+    const cached = (m as any)._spline as { key: number; fn: (t: number) => IPoint } | undefined;
+    let spline: (t: number) => IPoint;
+    if (cached && cached.key === splineKey) {
+      spline = cached.fn;
+    } else {
+      spline = buildSplineLeg(route, m.seg);
+      (m as any)._spline = { key: splineKey, fn: spline };
+    }
+    const raw = spline(m.t);
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const off = applyPerpendicularOffset(
+      raw,
+      dx,
+      dy,
+      directedLaneOffset(p.agent.agentId, dx, dy),
+    );
+    p.pos = { x: off.x, y: off.y };
     this.faceTowards(p, a, b);
     this.applyTransform(p);
   }
@@ -887,12 +926,12 @@ export class AgentLayer {
    *  the destination to jump to once invisible. Used when no road route exists
    *  so the figure never slides through buildings. */
   private beginFadeTeleport(p: PlacedAgent, target: IsoPoint): void {
-    p.move = { kind: "fadeOut", elapsed: 0, target: { x: target.x, y: target.y } };
+    p.move = { kind: "fadeOut", elapsed: 0, target: { x: target.x, y: target.y }, originFileId: p.fileId ?? null };
   }
 
   private advanceFadeOut(
     p: PlacedAgent,
-    m: { kind: "fadeOut"; elapsed: number; target: IsoPoint },
+    m: { kind: "fadeOut"; elapsed: number; target: IsoPoint; originFileId: string | null },
     deltaMs: number,
   ): void {
     m.elapsed += deltaMs;
@@ -902,6 +941,8 @@ export class AgentLayer {
     p.glow.alpha = alpha * 0.45 * p.ghostMult;
     if (t >= 1) {
       // Reposition while invisible, then fade back in.
+      // P5.2 — release origin slot on teleport depart.
+      if (m.originFileId) this.slotAllocator.release(m.originFileId, p.agent.agentId);
       p.pos = { x: m.target.x, y: m.target.y };
       this.refreshIdlePose(p);
       this.applyTransform(p);
@@ -1117,6 +1158,7 @@ export class AgentLayer {
       // fresh: run the appear-fade.
       move: claimed ? { kind: "idle" } : { kind: "appear", elapsed: 0 },
       facing: 1,
+    laneOff: laneOffset(agent.agentId),
       ghostMult: 1,
     };
     // Draw the initial frame so the appear-fade shows the figure immediately.
@@ -1183,6 +1225,9 @@ export class AgentLayer {
   }
 
   private destroyAgent(p: PlacedAgent): void {
+    // P5.2 — release entry slot + sweep allocator on agent removal.
+    if (p.fileId) this.slotAllocator.release(p.fileId, p.agent.agentId);
+    this.slotAllocator.sweep(p.agent.agentId);
     // Detach from the parent (layers.agents) BEFORE destroying so the parent
     // never retains a dead child ref that the next-frame render would touch.
     // Guard on `.destroyed` so a double-destroy (e.g. clear() then layer
@@ -1212,5 +1257,7 @@ export class AgentLayer {
     // Polis-P4 — tear down subagent omini too so a city reload leaves no extras.
     for (const s of this.subs.values()) this.destroySub(s);
     this.subs.clear();
+    // P5.2 — clear entry slots on scene teardown.
+    this.slotAllocator.clear();
   }
 }

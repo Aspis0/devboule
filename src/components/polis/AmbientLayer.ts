@@ -25,6 +25,7 @@
 import { Container, Graphics, Rectangle } from "pixi.js";
 import { type IsoPoint } from "./iso";
 import { Rng, rngFromString, hashString } from "./rng";
+import { SlotAllocator, buildSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint } from "./locomotion";
 import {
   drawCitizen,
   defaultTunic,
@@ -99,7 +100,7 @@ type WalkerState =
   // Standing at `pos`, counting down to the next stroll.
   | { kind: "idle"; remainingMs: number }
   // Walking `route[seg]`→`route[seg+1]`, `t` in [0,1), ending at `toNode`.
-  | { kind: "walk"; route: IsoPoint[]; seg: number; t: number; toNode: string };
+  | { kind: "walk"; route: IsoPoint[]; seg: number; t: number; toNode: string; destFileId: string };
 
 interface Walker {
   /** Per-citizen deterministic RNG (seeded from the walker index). */
@@ -120,9 +121,15 @@ interface Walker {
   bobPhase: number;
   /** Horizontal facing (+1 right, -1 left). */
   facing: number;
+  /** P5.2 — per-walker lane offset px (deterministic from rng). */
+  laneOff: number;
   /** DECORATIVE "forum lingerer": pauses longer + biases its next stop toward a
    *  civic anchor (market/townhall/commons). Pure scenery, like every walker. */
   forum: boolean;
+  /** P5.2 — idle variant: "none" | "lookAround" | "sit". Seeded per walker. */
+  idleVariant: "none" | "lookAround" | "sit";
+  /** P5.2 — stable walker id for slot allocation (does NOT change on move). */
+  wid: string;
   state: WalkerState;
 }
 
@@ -208,6 +215,8 @@ export class AmbientLayer {
   // while P4 owns it; `adopt` decrements it when the agent's omino returns to the
   // crowd. Single-owner invariant: a walker is owned by EITHER this layer OR
   // AgentLayer, never both — the claimedCount tracks how many we've handed away.
+  // P5.2 — per-building entry-slot allocator (presentation, NOT CityState).
+  private slotAllocator = new SlotAllocator();
   private claimedCount = 0;
   // Monotonic counter feeding a DETERMINISTIC seed for each `adopt`ed walker, so a
   // re-inserted omino roams reproducibly without Math.random/Date.now. Combined
@@ -489,10 +498,25 @@ export class AmbientLayer {
       w.container.position.y = w.pos.y + OMINO_Y_OFFSET + bob;
 
       const moving = w.state.kind === "walk";
+      // P5.2 — idle variants.
+      //   lookAround: slow phase creep for a subtle idle sway (moving=false so
+      //     drawCitizen keeps legs static; the evolving phase feeds a future
+      //     head-turn drawing branch — TODO(P5.2) add head-turn draw logic to
+      //     kitcd/people.ts).
+      //   sit: shifts the figure down 6px (no new drawing pipeline).
+      let drawPhase = w.phase;
+      let yShift = 0;
+      if (!moving && w.idleVariant === "lookAround") {
+        drawPhase += 0.03;
+        w.phase += 0.03;
+      } else if (!moving && w.idleVariant === "sit") {
+        yShift = 6;
+      }
       if (moving) w.phase += 0.6; // legs/arms swing while strolling
+      w.container.position.y = w.pos.y + OMINO_Y_OFFSET + bob + yShift;
       drawCitizen(w.base, w.type, {
-        moving,
-        phase: w.phase,
+        moving, // false for idle variants (no leg swing)
+        phase: drawPhase,
         actionPhase: 0, // ambient citizens never perform actions
         tunic: w.tunic,
       });
@@ -569,7 +593,7 @@ export class AmbientLayer {
         // Snap the start to the route's first waypoint so the figure doesn't
         // jump, and walk to the destination anchor.
         w.pos = { x: route[0].x, y: route[0].y };
-        w.state = { kind: "walk", route, seg: 0, t: 0, toNode: target };
+        w.state = { kind: "walk", route, seg: 0, t: 0, toNode: target, destFileId: target };
         return;
       }
     }
@@ -602,9 +626,12 @@ export class AmbientLayer {
     return this.nodeIds[lo];
   }
 
+  /**
+   * P5.2 — advance walk with Catmull-Rom spline easing + lane offset.
+   */
   private advanceWalk(
     w: Walker,
-    m: { kind: "walk"; route: IsoPoint[]; seg: number; t: number; toNode: string },
+    m: { kind: "walk"; route: IsoPoint[]; seg: number; t: number; toNode: string; destFileId: string },
     deltaMs: number,
   ): void {
     let remaining = (WALK_SPEED * deltaMs) / 1000;
@@ -628,16 +655,42 @@ export class AmbientLayer {
       // Arrived.
       const end = route[route.length - 1];
       this.faceTowards(w, route[Math.max(0, route.length - 2)], end);
-      w.pos = { x: end.x, y: end.y };
+      // P5.2 — release old slot, acquire new entry slot.
+      this.slotAllocator.release(w.nodeId, w.wid);
+      const slotIdx = this.slotAllocator.acquire(m.toNode, w.wid);
+      const secondLast = route[Math.max(0, route.length - 2)];
+      const dir = { x: end.x - secondLast.x, y: end.y - secondLast.y };
+      const slotPos = this.slotAllocator.positionFor(slotIdx, end, dir);
+      w.pos = { x: slotPos.x, y: slotPos.y };
       w.nodeId = m.toNode;
       w.state = { kind: "idle", remainingMs: this.pauseMs(w) };
       this.applyTransform(w);
       return;
     }
 
+    // Mid-route: Catmull-Rom spline + lane offset.
+    // P5.2 — W3: chord-vs-curve speed accepted simplification (constant speed
+    // along the chord, minor variation through spline bends tolerated).
     const a = route[m.seg];
     const b = route[m.seg + 1];
-    w.pos = { x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t };
+    // M2: cache spline sampler per leg; rebuild only on seg change.
+    const splineKey = m.seg;
+    const cached = (m as any)._spline as { key: number; fn: (t: number) => IPoint } | undefined;
+    let spline: (t: number) => IPoint;
+    if (cached && cached.key === splineKey) {
+      spline = cached.fn;
+    } else {
+      spline = buildSplineLeg(route, m.seg);
+      (m as any)._spline = { key: splineKey, fn: spline };
+    }
+    const raw = spline(m.t);
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const off = applyPerpendicularOffset(
+      raw, dx, dy,
+      directedLaneOffset(w.wid, dx, dy),
+    );
+    w.pos = { x: off.x, y: off.y };
     this.faceTowards(w, a, b);
     this.applyTransform(w);
   }
@@ -758,6 +811,10 @@ export class AmbientLayer {
 
     const phase = rng.float() * Math.PI * 2;
 
+    // P5.2 — per-walker lane offset from seeded rng (deterministic).
+    const laneOff = laneOffset(`ambient:${nodeId}:${type}`);
+    // P5.2 — stable walker id for slot allocation.
+    const wid = `amb:${nodeId}:${type}:${rng.float().toString(36).slice(2, 6)}`;
     const w: Walker = {
       rng,
       type,
@@ -770,6 +827,12 @@ export class AmbientLayer {
       bobPhase: opts.bobPhase,
       facing: 1,
       forum: opts.forum,
+      // P5.2 — idle variant: forum lingerers prefer sit (~50%), others get look-around (~25%)
+      wid,
+      idleVariant: opts.forum
+        ? (rng.float() < 0.5 ? "sit" : "none")
+        : (rng.float() < 0.25 ? "lookAround" : "none"),
+      laneOff,
       state: { kind: "idle", remainingMs: opts.remainingMs },
     };
     drawCitizen(base, type, { moving: false, phase, actionPhase: 0, tunic });
@@ -777,6 +840,9 @@ export class AmbientLayer {
   }
 
   private destroyWalker(w: Walker): void {
+    // P5.2 — release entry slot + sweep on walker removal.
+    this.slotAllocator.release(w.nodeId, w.wid);
+    this.slotAllocator.sweep(w.wid);
     // Detach from `this.root` BEFORE destroying so the parent never retains a
     // dead child ref the next-frame render would touch. Guard on `.destroyed`
     // so a double-call (clear() then a layer destroy({children:true})) is safe.
@@ -805,5 +871,7 @@ export class AmbientLayer {
     // teardown, NOT a per-agent vanish; per-agent release↔adopt pairing is P4's
     // responsibility, enforced by P4's own tests.
     this.claimedCount = 0;
+    // P5.2 — clear entry slots on scene teardown.
+    this.slotAllocator.clear();
   }
 }
