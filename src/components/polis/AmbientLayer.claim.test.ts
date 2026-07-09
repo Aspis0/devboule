@@ -364,9 +364,6 @@ describe("AmbientLayer blocked-tile property test", () => {
     return [a, b];
   }
 
-  const HALF_W = 20; // must match iso.ts HALF_W
-  const HALF_H = 10; // must match iso.ts HALF_H
-
   it("no walker position ever maps to a blocked tile over 100 update ticks", () => {
     const root = new Container();
     const layer = new AmbientLayer(root, undefined, propBlocked);

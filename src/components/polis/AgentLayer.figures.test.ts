@@ -236,7 +236,7 @@ describe("AgentLayer.setBlocked — T2 walk blocker propagation", () => {
 
 describe("livery tint preserved across figure flip (setPoseStatus)", () => {
   it("retains model-based livery when parentAgentId appears mid-lifecycle", () => {
-    const { root, layer } = makeLayer();
+    const { layer } = makeLayer();
     // Spy on the real drawCitizen (keep original impl) so we can inspect
     // the tunic value passed on each draw call.
     const spy = vi.spyOn(people, "drawCitizen");

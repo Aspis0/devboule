@@ -18,7 +18,6 @@
 
 import { Graphics } from "pixi.js";
 import { cartToIso } from "./iso";
-import { roundTile } from "./navWalkable";
 import { buildingFootprintTiles } from "./navWalkable";
 import { DERIVED } from "./palette";
 import { rngFromCoords, type Rng } from "./rng";

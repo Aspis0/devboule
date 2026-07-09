@@ -28,19 +28,19 @@ function captureGraphicsCalls(terrain: TerrainData) {
 
   (Graphics.prototype as unknown as Record<string, unknown>).poly = function (...args: unknown[]) {
     calls.poly.push(args);
-    return origPoly.apply(this, args as []);
+    return origPoly.apply(this, args as any);
   };
   (Graphics.prototype as unknown as Record<string, unknown>).rect = function (...args: unknown[]) {
     calls.rect.push(args);
-    return origRect.apply(this, args as []);
+    return origRect.apply(this, args as any);
   };
   (Graphics.prototype as unknown as Record<string, unknown>).ellipse = function (...args: unknown[]) {
     calls.ellipse.push(args);
-    return origEllipse.apply(this, args as []);
+    return origEllipse.apply(this, args as any);
   };
   (Graphics.prototype as unknown as Record<string, unknown>).moveTo = function (...args: unknown[]) {
     calls.moveTo.push(args);
-    return origMoveTo.apply(this, args as []);
+    return origMoveTo.apply(this, args as any);
   };
 
   try {
@@ -424,10 +424,10 @@ describe("drawBridgeDeck — stone arch bridge", () => {
       const origRect = Graphics.prototype.rect;
       const origEllipse = Graphics.prototype.ellipse;
       const origMoveTo = Graphics.prototype.moveTo;
-      (Graphics.prototype as unknown as Record<string, unknown>).poly = function (...a: unknown[]) { poly++; return origPoly.apply(this, a as []); };
-      (Graphics.prototype as unknown as Record<string, unknown>).rect = function (...a: unknown[]) { rect++; return origRect.apply(this, a as []); };
-      (Graphics.prototype as unknown as Record<string, unknown>).ellipse = function (...a: unknown[]) { ellipse++; return origEllipse.apply(this, a as []); };
-      (Graphics.prototype as unknown as Record<string, unknown>).moveTo = function (...a: unknown[]) { moveTo++; return origMoveTo.apply(this, a as []); };
+      (Graphics.prototype as unknown as Record<string, unknown>).poly = function (...a: unknown[]) { poly++; return origPoly.apply(this, a as any); };
+      (Graphics.prototype as unknown as Record<string, unknown>).rect = function (...a: unknown[]) { rect++; return origRect.apply(this, a as any); };
+      (Graphics.prototype as unknown as Record<string, unknown>).ellipse = function (...a: unknown[]) { ellipse++; return origEllipse.apply(this, a as any); };
+      (Graphics.prototype as unknown as Record<string, unknown>).moveTo = function (...a: unknown[]) { moveTo++; return origMoveTo.apply(this, a as any); };
       try {
         buildTerrainFrame(terrain, CHUNK);
         return { poly, rect, ellipse, moveTo };

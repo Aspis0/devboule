@@ -9,7 +9,6 @@ import {
   SlotAllocator,
   MAX_LANE_OFFSET_PX,
   type IPoint,
-  type SafeSplineLeg,
 } from "./locomotion";
 import { cartToIso, isoToCart } from "./iso";
 import { roundTile } from "./navWalkable";
