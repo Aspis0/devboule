@@ -510,6 +510,9 @@ export class PolisRenderer {
   }[] = [];
   // Fields (farmland parcels) — one Graphics, LOD-gated at zoom >= 0.3.
   private fieldsGraphics: Graphics | null = null;
+  // T6a — terrain grid Graphics tracked separately for zoom gating (sub-pixel
+  // below zoom 0.5; hidden there to save ~557 draw calls).
+  private terrainGridGraphics: Graphics | null = null;
   private animatedNodes: BuildingNode[] = []; // nodes with >=1 kit anim instance
   // The last CityState rendered (full build OR live diff). Diff input for the
   // next live update; null until the first setCityState. We snapshot the
@@ -2312,6 +2315,7 @@ export class PolisRenderer {
       .removeChildren()
       .forEach((c) => c.destroy({ children: true }));
     this.terrainChunks = [];
+    this.terrainGridGraphics = null;
     if (this.fieldsGraphics) {
       this.fieldsGraphics.destroy();
       this.fieldsGraphics = null;
@@ -2375,8 +2379,14 @@ export class PolisRenderer {
   }
 
   private drawTerrainLayer(ext: ReturnType<typeof computeExtent>): void {
-    const { graphics } = drawTerrain(ext);
+    const { graphics, gridGraphics } = drawTerrain(ext);
     for (const g of graphics) this.layers.terrain.addChild(g);
+    // T6a — track grid Graphics separately for zoom gating (sub-pixel below 0.5).
+    this.terrainGridGraphics = gridGraphics;
+    if (gridGraphics) {
+      gridGraphics.visible = this.viewport.scale.x >= 0.5;
+      this.layers.terrain.addChild(gridGraphics);
+    }
   }
 
   private drawPropsLayer(
@@ -2390,7 +2400,7 @@ export class PolisRenderer {
       for (const key of fieldTiles) occupied.add(key);
     }
     const { graphics } = drawProps(ext, occupied);
-    this.layers.terrain.addChild(graphics);
+    for (const g of graphics) this.layers.terrain.addChild(g);
   }
 
   // ---------------------------------------------------------------------------
@@ -2509,12 +2519,38 @@ export class PolisRenderer {
     // Two batched layers + their Graphics. minorG is faded by zoom in the LOD
     // pass; trunkG is always visible. Minor draws BELOW the trunk so cobble
     // always sits on top of the faint lanes at a crossing.
+    //
+    // T6a — Pixi v8 marks Graphics with ≥400 vertices as non-batchable (each
+    // shape primitive → a separate GL draw call). We rotate Graphics every
+    // ROAD_CHUNK_OPS (80) fill/stroke operations so each stays under the
+    // batchability threshold → the batcher merges them into O(10) draw calls.
+    const ROAD_CHUNK_OPS = 80;
     const minorLayer = new Container();
     const trunkLayer = new Container();
-    const minorG = new Graphics();
-    const trunkG = new Graphics();
+    let minorG = new Graphics();
+    let minorOps = 0;
+    let trunkG = new Graphics();
+    let trunkOps = 0;
     minorLayer.addChild(minorG);
     trunkLayer.addChild(trunkG);
+
+    // Rotate to a fresh Graphics when the current chunk is full.
+    const rotateMinor = (ops: number): void => {
+      minorOps += ops;
+      if (minorOps >= ROAD_CHUNK_OPS) {
+        minorG = new Graphics();
+        minorLayer.addChild(minorG);
+        minorOps = 0;
+      }
+    };
+    const rotateTrunk = (ops: number): void => {
+      trunkOps += ops;
+      if (trunkOps >= ROAD_CHUNK_OPS) {
+        trunkG = new Graphics();
+        trunkLayer.addChild(trunkG);
+        trunkOps = 0;
+      }
+    };
 
     // Junction nodes: only TRUE trunk hubs (>= ROAD_JUNCTION_MIN routed roads
     // through a waypoint). Drawn last on the trunk layer. Keyed by quantized
@@ -2543,10 +2579,10 @@ export class PolisRenderer {
           const shared = segUsage.get(segKey(raw[i], raw[i + 1])) ?? 1;
           const isTrunk = heavyImport || shared >= ROAD_SHARED_TRUNK;
           if (isTrunk) {
-            this.drawTrunk(trunkG, pts[i], pts[i + 1], road.weight, shared, roadAlphaMult(road.from, road.to));
+            rotateTrunk(this.drawTrunk(trunkG, pts[i], pts[i + 1], road.weight, shared, roadAlphaMult(road.from, road.to)));
             anyTrunk = true;
           } else {
-            this.drawMinorLane(minorG, pts[i], pts[i + 1], roadAlphaMult(road.from, road.to));
+            rotateMinor(this.drawMinorLane(minorG, pts[i], pts[i + 1], roadAlphaMult(road.from, road.to)));
           }
         }
         // Only count junctions for trunk-bearing routes — minor kinks are not
@@ -2571,7 +2607,7 @@ export class PolisRenderer {
       if (!from || !to) continue; // only draw roads whose endpoints exist
       const a = cartToIso(from.coords.x, from.coords.y);
       const b = cartToIso(to.coords.x, to.coords.y);
-      this.drawMinorLane(minorG, a, b, roadAlphaMult(road.from, road.to));
+      rotateMinor(this.drawMinorLane(minorG, a, b, roadAlphaMult(road.from, road.to)));
     }
 
     // True trunk-hub discs. A single neutral disc tidies the overlap where many
@@ -2596,6 +2632,7 @@ export class PolisRenderer {
   // and alpha scale with BOTH import weight AND shared-ness so the busiest
   // avenues read widest/most solid. Drawn into the shared trunk Graphics at a
   // flat alpha so crossings stay clean.
+  // T6a: returns fill+stroke count so drawRoads can rotate Graphics chunks.
   private drawTrunk(
     g: Graphics,
     from: IsoPoint,
@@ -2603,7 +2640,7 @@ export class PolisRenderer {
     weight: number,
     shared: number,
     alphaMult = 1,
-  ): void {
+  ): number {
     // weight 1..5 and shared 1..~13 both push the trunk wider. Clamp so the
     // fattest avenue stays sane. Base 6, +~1.4/weight, +~0.8/extra-share.
     const w = Math.max(1, Math.min(weight, 5));
@@ -2638,14 +2675,17 @@ export class PolisRenderer {
     g.moveTo(from.x + px, from.y + py).lineTo(to.x + px, to.y + py);
     g.moveTo(from.x - px, from.y - py).lineTo(to.x - px, to.y - py);
     g.stroke({ color: ROAD.trunkKerb, alpha: ROAD_ALPHA.trunkKerb * alphaMult, width: 1 });
+    return steps + 1; // fills + 1 stroke
   }
 
   // MINOR: a single faint desaturated earth line — a hint of a footpath, not a
   // cobbled street. One stroke per segment into the shared minor Graphics at a
   // flat low alpha; LOD fades/hides the whole layer when zoomed out.
-  private drawMinorLane(g: Graphics, from: IsoPoint, to: IsoPoint, alphaMult = 1): void {
+  // T6a: returns stroke count so drawRoads can rotate Graphics chunks.
+  private drawMinorLane(g: Graphics, from: IsoPoint, to: IsoPoint, alphaMult = 1): number {
     g.moveTo(from.x, from.y).lineTo(to.x, to.y);
     g.stroke({ color: ROAD.minorPath, alpha: ROAD_ALPHA.minor * alphaMult, width: 2 });
+    return 1; // 1 stroke
   }
 
   // LOD for roads: fade/hide the minor-lane layer by zoom. Allocation-free —
@@ -3293,6 +3333,8 @@ export class PolisRenderer {
       this.externalLayer.setLodVisible(scale >= LOD_EXTERNAL);
       // Fields (farmland): hidden below LOD_FIELDS so the far view is clean.
       if (this.fieldsGraphics) this.fieldsGraphics.visible = scale >= LOD_FIELDS;
+      // T6a — terrain grid: sub-pixel below zoom 0.5, hide to save ~557 draw calls.
+      if (this.terrainGridGraphics) this.terrainGridGraphics.visible = scale >= 0.5;
     }
   }
 
@@ -3771,6 +3813,7 @@ export class PolisRenderer {
       .forEach((c) => c.destroy({ children: true }));
     this.terrainChunks = [];
     this.fieldsGraphics = null;
+    this.terrainGridGraphics = null;
     this.layers.districts.removeChildren().forEach((c) => c.destroy());
     // Roads are now sub-containers (minor/trunk) each wrapping a Graphics, so
     // destroy children too. Drop the LOD handle.

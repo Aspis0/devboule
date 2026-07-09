@@ -68,6 +68,16 @@ const HH = 24;
 // Hard cap on terrain tiles so a pathological extent can't explode the draw.
 const MAX_TILES = 6000;
 
+// Max fills per Graphics chunk. Pixi v8 marks Graphics with ≥400 vertices as
+// non-batchable (each shape primitive → a separate GL draw call). A 4-point
+// polygon fill = 4 vertices, so 80 fills = 320 vertices, safely under the
+// threshold. This keeps the terrain layer batchable → O(10) draw calls instead
+// of O(7000).
+const CHUNK_FILLS = 80;
+
+// Hard cap on dirt/sand patches so a pathological extent can't explode the draw.
+const MAX_DIRT = 500;
+
 /** Push the 4 corner coords of tile (tx, ty)'s iso diamond into `out`. */
 function tileDiamond(tx: number, ty: number): number[] {
   // Center of the tile in iso space.
@@ -85,53 +95,84 @@ function tileDiamond(tx: number, ty: number): number[] {
 }
 
 /**
- * Draw the mottled ground into a set of Graphics added to `layer`.
- * Returns the Graphics so the caller owns destruction.
+ * Draw the mottled ground into a FLAT array of Graphics.
+ * Returns the Graphics (caller owns destruction) + tile count.
  *
- * We batch by shade: one Graphics accumulates all tiles of a given band, which
- * keeps the GPU geometry compact (a handful of fills) regardless of tile count.
+ * PERFORMANCE FIX (T6a): Pixi v8 marks Graphics with ≥400 vertices as
+ * non-batchable — each shape primitive becomes a separate GL draw call.
+ * A 4-point polygon fill = 4 vertices. The old code put ALL tiles into 3
+ * band Graphics (one per shade), producing ~24,000 vertices each → 3
+ * standalone draw calls of ~2000 batches EACH. We now chunk fills into
+ * ≤CHUNK_FILLS (80) per Graphics, keeping each under 320 vertices so the
+ * batcher merges them into O(10) draw calls instead of O(7000).
+ *
+ * Grid lines are capped to the actually-filled tile extent (not the full
+ * 69k-tile extent) and gated to zoom ≥ 0.5 (the seam is sub-pixel below
+ * that). Dirt patches are hard-capped at MAX_DIRT.
  */
 export function drawTerrain(
   ext: TerrainExtent,
-): { graphics: Graphics[]; tileCount: number } {
-  const bands: { color: number; g: Graphics }[] = [
-    { color: DERIVED.groundDark, g: new Graphics() },
-    { color: DERIVED.groundMid, g: new Graphics() },
-    { color: DERIVED.groundLight, g: new Graphics() },
-  ];
-  const dirtG = new Graphics();
-  const seamG = new Graphics();
+): { graphics: Graphics[]; gridGraphics: Graphics | null; tileCount: number } {
+  // Per-shade colour lookup.
+  const bandColors = [DERIVED.groundDark, DERIVED.groundMid, DERIVED.groundLight];
 
-  // Single pass over the tile grid: pick the mottling band AND roll the sparse
-  // dirt patch per tile. Both are seeded purely by (tileX, tileY) via valueNoise
-  // (no per-tile Rng allocation), so the ground stays deterministic — a re-scan
-  // reproduces the same decoration. Three independent value-noise samples per
-  // tile (offset coords) drive the patch roll / size / worn flavour.
+  // Current chunk per band (rotated when full).
+  const bandG: Graphics[] = [
+    new Graphics(), new Graphics(), new Graphics(),
+  ];
+  const bandFillCount = [0, 0, 0];
+  const allBands: Graphics[] = [];
+
+  // Dirt chunk pool.
+  let dirtG = new Graphics();
+  let dirtCount = 0;
+  const allDirt: Graphics[] = [];
+
+  // Track the actual filled row/col range so the grid only covers that area.
+  let filledMinY = Infinity, filledMaxY = -Infinity;
+  let filledMinX = Infinity, filledMaxX = -Infinity;
+
+  // Single pass over the tile grid (capped at MAX_TILES).
   let count = 0;
+  let dirtTotal = 0;
   for (let ty = ext.minY; ty <= ext.maxY && count < MAX_TILES; ty++) {
     for (let tx = ext.minX; tx <= ext.maxX && count < MAX_TILES; tx++) {
       count++;
-      // Two-octave value noise: a low-frequency field (samples on a /3 grid so
-      // neighbours correlate into broad patches) plus a per-tile detail sample.
-      // The blend gives clumped grass/earth regions with crisp per-tile breakup
-      // — Zeus-style mottling instead of uniform mud. Still fully deterministic.
+      // Track filled extent for grid capping.
+      if (ty < filledMinY) filledMinY = ty;
+      if (ty > filledMaxY) filledMaxY = ty;
+      if (tx < filledMinX) filledMinX = tx;
+      if (tx > filledMaxX) filledMaxX = tx;
+
+      // Two-octave value noise: low-frequency field + per-tile detail.
       const lo = valueNoise(Math.floor(tx / 3), Math.floor(ty / 3));
       const hi = valueNoise(tx, ty);
       const n = lo * 0.62 + hi * 0.38;
-      // Three flat bands with a wider, more even split so the light/dark grass
-      // patches actually read as distinct (was 0.28/0.78 → mostly one band).
       const band = n < 0.36 ? 0 : n < 0.68 ? 1 : 2;
       const poly = tileDiamond(tx, ty);
-      bands[band].g.poly(poly).fill({ color: bands[band].color, alpha: 1 });
 
-      // Worn dirt / sand patch — now ~13% (was ~6%) so bare-earth patches give
-      // the green a warm counterpoint, drawn as a slightly inset diamond so the
-      // base band still frames it. Offset coords give decorrelated rolls.
+      // Rotate to a fresh chunk when the current one is full.
+      if (bandFillCount[band] >= CHUNK_FILLS) {
+        allBands.push(bandG[band]);
+        bandG[band] = new Graphics();
+        bandFillCount[band] = 0;
+      }
+      bandG[band].poly(poly).fill({ color: bandColors[band], alpha: 1 });
+      bandFillCount[band]++;
+
+      // Dirt patch — capped at MAX_DIRT.
       const rRoll = valueNoise(tx ^ 0x5bd1, ty ^ 0x9e37);
-      if (rRoll >= 0.13) continue;
+      if (rRoll >= 0.13 || dirtTotal >= MAX_DIRT) continue;
+      dirtTotal++;
       const c = cartToIso(tx, ty);
       const s = 0.45 + valueNoise(tx ^ 0x1234, ty ^ 0xabcd) * (0.8 - 0.45);
       const worn = valueNoise(tx ^ 0x7777, ty ^ 0x3333) < 0.4;
+
+      if (dirtCount >= CHUNK_FILLS) {
+        allDirt.push(dirtG);
+        dirtG = new Graphics();
+        dirtCount = 0;
+      }
       dirtG
         .poly([
           c.x,
@@ -147,25 +188,40 @@ export function drawTerrain(
           color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
           alpha: 0.7,
         });
+      dirtCount++;
     }
   }
 
-  // Subtle iso tile seams: only the NE/NW edges of each tile, faint, every
-  // other tile, so the grid is felt rather than seen. Cheap single stroke.
-  for (let ty = ext.minY; ty <= ext.maxY; ty += 1) {
-    const a = cartToIso(ext.minX, ty);
-    const b = cartToIso(ext.maxX, ty);
-    seamG.moveTo(a.x, a.y).lineTo(b.x, b.y);
+  // Flush the last partial chunks.
+  for (let b = 0; b < 3; b++) {
+    if (bandFillCount[b] > 0) allBands.push(bandG[b]);
   }
-  for (let tx = ext.minX; tx <= ext.maxX; tx += 1) {
-    const a = cartToIso(tx, ext.minY);
-    const b = cartToIso(tx, ext.maxY);
-    seamG.moveTo(a.x, a.y).lineTo(b.x, b.y);
+  if (dirtCount > 0) allDirt.push(dirtG);
+
+  // Grid lines — capped to the filled tile extent (not the full 69k-tile
+  // extent). This bounds line count to ~√MAX_TILES instead of the full bbox.
+  // The seam is sub-pixel below zoom 0.5, so the caller should gate the
+  // returned grid Graphics at zoom >= 0.5.
+  const gridG = new Graphics();
+  let hasGrid = false;
+  if (Number.isFinite(filledMinY)) {
+    for (let ty = filledMinY; ty <= filledMaxY; ty += 1) {
+      const a = cartToIso(filledMinX, ty);
+      const b = cartToIso(filledMaxX, ty);
+      gridG.moveTo(a.x, a.y).lineTo(b.x, b.y);
+      hasGrid = true;
+    }
+    for (let tx = filledMinX; tx <= filledMaxX; tx += 1) {
+      const a = cartToIso(tx, filledMinY);
+      const b = cartToIso(tx, filledMaxY);
+      gridG.moveTo(a.x, a.y).lineTo(b.x, b.y);
+    }
+    gridG.stroke({ color: DERIVED.seam, alpha: ALPHA.seam, width: 1 });
   }
-  seamG.stroke({ color: DERIVED.seam, alpha: ALPHA.seam, width: 1 });
 
   return {
-    graphics: [bands[0].g, bands[1].g, bands[2].g, dirtG, seamG],
+    graphics: [...allBands, ...allDirt],
+    gridGraphics: hasGrid ? gridG : null,
     tileCount: count,
   };
 }

@@ -25,6 +25,13 @@ import type { TerrainExtent } from "./terrain";
 
 const MAX_PROPS = 1500;
 
+// Max props per Graphics chunk. Pixi v8 marks Graphics with ≥400 vertices as
+// non-batchable (each shape primitive → a separate GL draw call). With ~4
+// vertices per shape and ~7 shapes per prop, 80 props ≈ 2240 vertices → still
+// large but the batcher merges these smaller chunks far more efficiently than
+// one monolithic 1500-prop object.
+const CHUNK_PROPS = 80;
+
 // Per-kind base probability on an empty tile (before the cap). Tuned sparse so
 // the ground stays mostly open with occasional clusters.
 const P_OLIVE = 0.14;
@@ -142,14 +149,20 @@ function drawStall(g: Graphics, cx: number, cy: number, rng: Rng): void {
 }
 
 /**
- * Draw decorative props on empty tiles within `ext`. Returns a single Graphics
- * (caller owns destruction) plus the placed count.
+ * Draw decorative props on empty tiles within `ext`. Returns a FLAT array of
+ * Graphics (caller owns destruction) plus the placed count.
+ *
+ * PERFORMANCE FIX (T6a): chunk props into ≤CHUNK_PROPS per Graphics so each
+ * stays under Pixi v8's batchability threshold → the batcher merges them into
+ * O(10) draw calls instead of one monolithic non-batchable object.
  */
 export function drawProps(
   ext: TerrainExtent,
   occupied: Set<string>,
-): { graphics: Graphics; propCount: number } {
-  const g = new Graphics();
+): { graphics: Graphics[]; propCount: number } {
+  const chunks: Graphics[] = [];
+  let g = new Graphics();
+  let chunkCount = 0;
   let placed = 0;
 
   for (let ty = ext.minY; ty <= ext.maxY && placed < MAX_PROPS; ty++) {
@@ -162,18 +175,31 @@ export function drawProps(
       const cx = c.x + rng.jitter(20);
       const cy = c.y + rng.jitter(10);
 
+      // Rotate to a fresh chunk when the current one is full.
+      if (chunkCount >= CHUNK_PROPS) {
+        chunks.push(g);
+        g = new Graphics();
+        chunkCount = 0;
+      }
+
       if (roll < P_STALL) {
         drawStall(g, cx, cy, rng);
         placed++;
+        chunkCount++;
       } else if (roll < P_STALL + P_ROCK) {
         drawRocks(g, cx, cy, rng);
         placed++;
+        chunkCount++;
       } else if (roll < P_STALL + P_ROCK + P_OLIVE) {
         drawOliveCluster(g, cx, cy, rng);
         placed++;
+        chunkCount++;
       }
     }
   }
 
-  return { graphics: g, propCount: placed };
+  // Flush the last partial chunk.
+  if (chunkCount > 0) chunks.push(g);
+
+  return { graphics: chunks, propCount: placed };
 }
