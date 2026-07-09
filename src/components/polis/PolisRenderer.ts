@@ -1590,6 +1590,29 @@ export class PolisRenderer {
     this.fitCameraToIsoBounds(minX, minY, maxX, maxY);
   }
 
+
+  /**
+   * Fly the camera to a specific building by fileId. Animates 600ms with
+   * easeInOutSine. If the current scale is below 0.6, also scales to 1.0.
+   * No-op with a debug log when fileId is unknown.
+   */
+  flyTo(fileId: string): void {
+    const node = this.buildingNodes.get(fileId);
+    if (!node) {
+      console.debug(`[Polis] flyTo: unknown fileId "${fileId}"`);
+      return;
+    }
+    const opts: { position: { x: number; y: number }; time: number; ease: string; scale?: number } = {
+      position: { x: node.iso.x, y: node.iso.y },
+      time: 600,
+      ease: "easeInOutSine",
+    };
+    if (this.viewport.scale.x < 0.6) {
+      opts.scale = 1.0;
+    }
+    this.viewport.animate(opts);
+  }
+
   /**
    * B2b — pre-fit the camera to a building set's ISO extent BEFORE the chunked
    * build runs, so the viewport already sits at its final framing and the build

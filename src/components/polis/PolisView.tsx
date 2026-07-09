@@ -53,6 +53,7 @@ function polisDebug(line: string): void {
 
 export function PolisView() {
   const hostRef = useRef<HTMLDivElement>(null);
+  const polisFocusedRef = useRef(false);
   const handleRef = useRef<PolisHandle | null>(null);
   const [ready, setReady] = useState(false);
   // The inspect subject is either a BUILDING, an AGENT, or nothing.
@@ -554,9 +555,13 @@ export function PolisView() {
                   {folderName} ·{" "}
                 </span>
               ) : null}
-              {buildings.length.toLocaleString()} buildings ·{" "}
-              {onMapAgents.length} on map · {agents.length} agents
-              {usingFixture ? " · fixture" : ""}
+              {!immersive && (
+                <>
+                  {buildings.length.toLocaleString()} buildings ·{" "}
+                  {onMapAgents.length} on map · {agents.length} agents
+                  {usingFixture ? " · fixture" : ""}
+                </>
+              )}
             </p>
           </div>
         </div>
@@ -614,7 +619,13 @@ export function PolisView() {
 
       {/* Map + overlays */}
       <div className="relative min-h-0 flex-1 overflow-hidden rounded-3xl border border-cream-200 bg-cream-50 shadow-soft">
-        <div ref={hostRef} className="absolute inset-0" />
+        <div
+          ref={hostRef}
+          tabIndex={-1}
+          onFocus={() => { polisFocusedRef.current = true; }}
+          onBlur={() => { polisFocusedRef.current = false; }}
+          className="absolute inset-0 outline-none"
+        />
 
         {/* Empty state — no folder mapped yet (desktop only). Workspace-aware:
             if the app has a workspace folder, the primary action MAPS it; the
@@ -849,6 +860,11 @@ export function PolisView() {
             roadCount={roads.length}
             agentCount={agents.length}
             onFocusFile={handleFocusFile}
+            onSelectBuilding={selectBuilding}
+            handleRef={handleRef}
+            viewportReady={ready}
+            immersive={immersive}
+            polisFocusedRef={polisFocusedRef}
           />
         )}
       </div>

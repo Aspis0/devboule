@@ -59,6 +59,8 @@ export interface PolisHandle {
   /** Polis-P5 — update the cached gemma availability; "offline" suppresses (and
    *  releases) the Censor firefighter. */
   setCensorGemmaStatus: (status: GemmaStatus) => void;
+  /** P3.1 — fly the camera to a specific building by fileId (600ms animate). */
+  flyTo: (fileId: string) => void;
   destroy: () => void;
 }
 
@@ -227,6 +229,7 @@ export async function createPolis(
     onCensorFindings: (payload) =>
       renderer.onCensorFindings(payload, performance.now()),
     setCensorGemmaStatus: (status) => renderer.setCensorGemmaStatus(status),
+    flyTo: (fileId) => renderer.flyTo(fileId),
     destroy,
   };
 }

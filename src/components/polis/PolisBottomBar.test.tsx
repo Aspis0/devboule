@@ -3,6 +3,7 @@
 // Tests for PolisBottomBar: oracle item in BAR_ITEMS, toggling renders OracleAskPanel.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -19,12 +20,16 @@ vi.mock("./OracleAskPanel", () => ({
     createElement("div", { "data-testid": "oracle-ask-panel" }, "OraclePanel"),
 }));
 
-// useCityStore: return empty values (PolisBottomBar calls it via FileTypesPanel)
+// useCityStore: return empty values (PolisBottomBar calls it via FileTypesPanel + anomalies)
 vi.mock("../../store/cityStore", () => ({
   useCityStore: (selector: (s: unknown) => unknown) =>
     selector({
       getScanExtensions: vi.fn(),
       applyScanExtensions: vi.fn(),
+      sinRecords: null,
+      sinActionPending: [],
+      disposeSin: vi.fn(),
+      cityState: null,
     }),
 }));
 
@@ -45,8 +50,21 @@ beforeEach(async () => {
 // Helpers
 // ---------------------------------------------------------------------------
 
+function makeHandleRef() {
+  return createRef() as any;
+}
+
 function renderBar(
-  props = { buildingCount: 3, roadCount: 2, agentCount: 1, onFocusFile: vi.fn() },
+  props = {
+    buildingCount: 3,
+    roadCount: 2,
+    agentCount: 1,
+    onFocusFile: vi.fn(),
+    handleRef: makeHandleRef(),
+    viewportReady: false,
+    immersive: false,
+    polisFocusedRef: { current: false },
+  },
 ): { container: HTMLElement; root: Root } {
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -72,12 +90,15 @@ describe("PolisBottomBar", () => {
   });
 
   it("BAR_ITEMS contains an oracle entry", async () => {
-    // Access via the static markup — the oracle button must be present
     const html = renderToStaticMarkup(
       createElement(PolisBottomBar, {
         buildingCount: 1,
         roadCount: 0,
         agentCount: 0,
+        handleRef: makeHandleRef(),
+        viewportReady: false,
+        immersive: false,
+        polisFocusedRef: { current: false },
       }),
     );
     expect(html).toContain("Oracle");
@@ -86,7 +107,6 @@ describe("PolisBottomBar", () => {
   it("toggling the Oracle button renders OracleAskPanel", () => {
     const { container } = renderBar();
 
-    // Panel should not be present before clicking
     expect(container.querySelector("[data-testid='oracle-ask-panel']")).toBeNull();
 
     const oracleBtn = Array.from(container.querySelectorAll("button")).find(
@@ -116,7 +136,6 @@ describe("PolisBottomBar", () => {
       container.querySelector("[data-testid='oracle-ask-panel']"),
     ).not.toBeNull();
 
-    // Toggle off
     act(() => {
       oracleBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });

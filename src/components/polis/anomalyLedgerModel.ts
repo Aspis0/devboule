@@ -34,7 +34,7 @@ export interface AnomalyLedgerModel {
 
 /** Normalize a project-relative path for comparison: unify separators to `/`
  *  and strip leading `./` so backslash and dot-prefixed paths match. */
-function normalizeRelPath(p: string): string {
+export function normalizeRelPath(p: string): string {
   return p.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
