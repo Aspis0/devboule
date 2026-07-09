@@ -1230,6 +1230,12 @@ export class PolisRenderer {
     this.applyFilter();
   }
 
+  /** T1b — set which external providers are visible. Delegates to the
+   *  ExternalServiceLayer which composes it with LOD visibility. */
+  setVisibleProviders(providers: ReadonlySet<string>): void {
+    this.externalLayer.setVisibleProviders(providers);
+  }
+
   /** Apply the current filter to all built nodes. ONE PASS over building nodes
    *  + road segments + agents — no coords, no rebuild, plain property writes.
    *  Idempotent — safe to call anytime, no matter the scene state. */

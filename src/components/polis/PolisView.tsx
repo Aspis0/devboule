@@ -430,6 +430,14 @@ export function PolisView() {
     }
   }, [ready, filterSets]);
 
+  // T1b — push the user's visible provider preference to the renderer layer.
+  // "monument" is always visible regardless; the layer composes this internally.
+  const visibleProviders = useCityStore((s) => s.visibleProviders);
+  useEffect(() => {
+    if (!ready) return;
+    handleRef.current?.setVisibleProviders(new Set(visibleProviders));
+  }, [ready, visibleProviders]);
+
   const handleRefresh = useCallback(() => {
     void refresh();
   }, [refresh]);

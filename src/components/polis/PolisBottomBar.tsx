@@ -52,6 +52,7 @@ import {
 import { OracleAskPanel } from "./OracleAskPanel";
 import { purposeLabel } from "../../types/city";
 import { getProfile, PALETTE, PROVIDER_LIVERY } from "./palette";
+import { hashString } from "./rng";
 import { useCityStore } from "../../store/cityStore";
 import {
   buildAnomaliesPanelModel,
@@ -104,8 +105,36 @@ function purposeSwatch(slug: string): string {
   return `#${profile.colorTop.toString(16).padStart(6, "0")}`;
 }
 
-function providerSwatch(slug: string): string {
-  return `#${(PROVIDER_LIVERY[slug] ?? 0).toString(16).padStart(6, "0")}`;
+/**
+ * Deterministic swatch color for a provider slug. Known providers use
+ * PROVIDER_LIVERY; unknown providers get a muted olive-family hue derived
+ * from hashing the slug, so different unknown providers are distinguishable.
+ */
+export function providerSwatch(slug: string): string {
+  const known = PROVIDER_LIVERY[slug];
+  if (known !== undefined) {
+    return `#${known.toString(16).padStart(6, "0")}`;
+  }
+  // Derive a deterministic hue (0-359) from the slug via hashString.
+  // Saturation 0.35, lightness 0.45 — muted, earthy, reads as a livery swatch
+  // consistent with the palette's olive-family anchors.
+  const h = (hashString(slug) % 360) | 0;
+  const s = 0.35;
+  const l = 0.45;
+  const hueNorm = ((h % 360) + 360) % 360 / 60;
+  const hueFrac = hueNorm - Math.floor(hueNorm);
+  const q = l + s - l * s;
+  const p = 2 * l - q;
+  const hueSector = Math.floor(hueNorm) % 6;
+  let r: number, g: number, b: number;
+  if (hueSector === 0) { r = q; g = p + (q - p) * hueFrac; b = p; }
+  else if (hueSector === 1) { r = p + (q - p) * (1 - hueFrac); g = q; b = p; }
+  else if (hueSector === 2) { r = p; g = q; b = p + (q - p) * hueFrac; }
+  else if (hueSector === 3) { r = p; g = p + (q - p) * (1 - hueFrac); b = q; }
+  else if (hueSector === 4) { r = p + (q - p) * hueFrac; g = p; b = q; }
+  else { r = q; g = p; b = p + (q - p) * (1 - hueFrac); }
+  const packed = ((Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255)) >>> 0;
+  return `#${packed.toString(16).padStart(6, "0")}`;
 }
 
 const LEGEND_PROVIDERS: { slug: string; label: string }[] = [
@@ -792,6 +821,28 @@ function FileTypesPanel({ onClose }: { onClose: () => void }) {
 // ---------------------------------------------------------------------------
 
 function LegendOverlay({ onClose }: { onClose: () => void }) {
+  const visibleProviders = useCityStore((s) => s.visibleProviders);
+  const setProviderVisible = useCityStore((s) => s.setProviderVisible);
+  const cityState = useCityStore((s) => s.cityState);
+
+  // Dynamic provider list: union of hardcoded known providers + any providers
+  // present in the city's externalServices (excluding "monument").
+  const allProviders = useMemo(() => {
+    const slugs = new Map<string, string>();
+    // Seed with the known static providers (label from LEGEND_PROVIDERS)
+    for (const p of LEGEND_PROVIDERS) slugs.set(p.slug, p.label);
+    // Merge in any providers from the live city data
+    for (const svc of cityState?.externalServices ?? []) {
+      if (svc.provider !== "monument" && !slugs.has(svc.provider)) {
+        // Capitalize the slug as a reasonable label fallback
+        slugs.set(svc.provider, svc.provider.charAt(0).toUpperCase() + svc.provider.slice(1));
+      }
+    }
+    return [...slugs.entries()];
+  }, [cityState?.externalServices]);
+
+  const visibleSet = useMemo(() => new Set(visibleProviders), [visibleProviders]);
+
   return (
     <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[300px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/95 p-3 shadow-soft-lg backdrop-blur">
       <div className="mb-2 flex items-center justify-between">
@@ -845,25 +896,56 @@ function LegendOverlay({ onClose }: { onClose: () => void }) {
         </ul>
       </div>
 
-      {/* CLOUD HARBOUR — external services. Small outposts at the map's seaward
-          margin mirror your LIVE Scaleway/Cloudflare resources; a status lamp
-          shows whether each is running, stopped, starting, or in error. */}
+      {/* CLOUD HARBOUR — external services. Toggleable per provider: providers
+          are OFF by default; toggle to show their structures on the map. */}
       <div className="mt-3 border-t border-cream-100 pt-2">
         <h5 className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
           <Cloud className="h-3 w-3" /> Cloud harbour
         </h5>
-        <ul className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-          {LEGEND_PROVIDERS.map((p) => (
-            <li key={p.slug} className="flex items-center gap-2">
-              <span
-                className="h-3 w-3 shrink-0 rounded-sm ring-1 ring-black/5"
-                style={{ backgroundColor: providerSwatch(p.slug) }}
-              />
-              <span className="min-w-0 truncate text-[11px] text-cream-600">
-                {p.label}
-              </span>
-            </li>
-          ))}
+        <p className="mb-1.5 text-[9px] leading-3 text-cream-400">
+          Providers are hidden by default. Toggle to show on the map.
+        </p>
+        <ul className="space-y-1">
+          {allProviders.map(([slug, label]) => {
+            const on = visibleSet.has(slug);
+            return (
+              <li key={slug}>
+                <button
+                  onClick={() => setProviderVisible(slug, !on)}
+                  className={`flex w-full items-center gap-2 rounded-lg border px-2 py-1 text-[11px] transition-colors ${
+                    on
+                      ? "border-cream-200 bg-white text-cream-700"
+                      : "border-cream-100 bg-cream-50 text-cream-400"
+                  }`}
+                >
+                  <span
+                    className={`h-3 w-3 shrink-0 rounded-sm ring-1 ring-black/5 ${on ? "" : "opacity-40"}`}
+                    style={{ backgroundColor: providerSwatch(slug) }}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-left font-medium">
+                    {label}
+                  </span>
+                  {/* Toggle indicator */}
+                  <span
+                    className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+                      on ? "bg-terracotta" : "bg-cream-300"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3 w-3 rounded-full bg-white shadow-sm transition-transform ${
+                        on ? "translate-x-3.5" : "translate-x-0.5"
+                      }`}
+                    />
+                  </span>
+                </button>
+                {!on && (
+                  <p className="ml-5 mt-0.5 text-[9px] italic text-cream-400">
+                    hidden \u{2014} toggle to show on the map
+                  </p>
+                )}
+              </li>
+            );
+          })}
         </ul>
         <ul className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
           {[
@@ -889,7 +971,7 @@ function LegendOverlay({ onClose }: { onClose: () => void }) {
         </h5>
         <p className="text-[10px] leading-4 text-cream-500">
           Triumphal arches at the landward edge mark each past era. The
-          inscription is real — the file count and disasters still burning when
+          inscription is real \u{2014} the file count and disasters still burning when
           that era ended. Starting a new era archives the city to a snapshot and
           adds a monument.
         </p>
@@ -1044,6 +1126,13 @@ function HelpPanel({
             the building to read each issue in plain language.
           </HelpSection>
 
+          <HelpSection icon={Cloud} title="Cloud harbour & providers">
+            Outposts at the shoreline represent your live cloud resources
+            (Scaleway, Cloudflare, etc.). Providers are <strong className="text-cream-700">hidden by
+            default</strong> and can be toggled on from the Legend panel. Era
+            monuments (triumphal arches at the landward edge) are always visible.
+          </HelpSection>
+
           <HelpSection icon={MousePointerClick} title="Controls">
             <ul className="space-y-1">
               <li>
@@ -1124,8 +1213,8 @@ const RULE_GLYPH: Record<string, string> = {
   "dead-export": "\u{1F480}",
   "env-missing": "\u{1F527}",
   "complexity": "\u{1F300}",
-  "god-file": "\u{1F3DB}",
-  "test-gap": "\u{1F573}",
+  "god-file": "\u{1F3DB}\u{FE0F}",
+  "test-gap": "\u{1F573}\u{FE0F}",
   "clone": "\u{1F46F}",
 };
 

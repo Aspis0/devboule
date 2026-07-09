@@ -40,7 +40,8 @@ pub struct SinRecord {
     #[serde(default)]
     pub rel_path: String,
     /// Which check produced this sin: `"secret"`, `"dep-cycle"`, `"todo-density"`,
-    /// `"dead-export"`, `"env-missing"`.
+    /// `"dead-export"`, `"env-missing"`, `"complexity"`, `"god-file"`,
+    /// `"test-gap"`, `"clone"`.
     #[serde(default)]
     pub rule_id: String,
     /// 1-based line number, or `None` for file-level sins.

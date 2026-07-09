@@ -177,3 +177,94 @@ describe("ExternalServiceLayer — era monuments render the real wonder", () => 
     layer.clear();
   });
 });
+
+// T1b.2 — provider visibility: providers are OFF by default; monument always visible.
+describe("ExternalServiceLayer — provider visibility (opt-in, default OFF)", () => {
+  it("with empty visibleProviders, cloud outposts are hidden even when lodVisible=true", () => {
+    const root = new Container();
+    const layer = new ExternalServiceLayer(root);
+
+    layer.setServices([svc({}), monument({})]);
+    expect(layer.placedCount).toBe(2);
+
+    // Set lodVisible = true (default), but no providers enabled.
+    layer.setLodVisible(true);
+    layer.setVisibleProviders(new Set<string>());
+
+    // The root container is visible (lod gate), but individual cloud outpost
+    // containers are hidden (no provider enabled).
+    expect(root.visible).toBe(true);
+    // First child = cloud outpost (scaleway), second = monument.
+    const cloudNode = root.children[0] as Container;
+    const monumentNode = root.children[1] as Container;
+    expect(cloudNode.visible).toBe(false);
+    expect(monumentNode.visible).toBe(true);
+
+    layer.clear();
+  });
+
+  it("enabling scaleway shows only scaleway structures; monument stays visible", () => {
+    const root = new Container();
+    const layer = new ExternalServiceLayer(root);
+
+    const cloudflareSvc = svc({ serviceId: "cf-1", provider: "cloudflare", coords: { x: 10, y: 0 } });
+    const scalewaySvc = svc({ serviceId: "scw-1", provider: "scaleway", coords: { x: 12, y: 0 } });
+    const m = monument({});
+    layer.setServices([cloudflareSvc, scalewaySvc, m]);
+    expect(layer.placedCount).toBe(3);
+
+    layer.setVisibleProviders(new Set(["scaleway"]));
+
+    // Find each node by serviceId using the placed map (accessible via reflection).
+    // We can check by iterating root children and checking their iso positions.
+    const cfIso = cartToIso(cloudflareSvc.coords.x, cloudflareSvc.coords.y);
+    const scwIso = cartToIso(scalewaySvc.coords.x, scalewaySvc.coords.y);
+    const mIso = cartToIso(m.coords.x, m.coords.y);
+
+    const cfNode = root.children.find((c) => Math.abs(c.position.x - cfIso.x) < 1 && Math.abs(c.position.y - cfIso.y) < 1) as Container;
+    const scwNode = root.children.find((c) => Math.abs(c.position.x - scwIso.x) < 1 && Math.abs(c.position.y - scwIso.y) < 1) as Container;
+    const mNode = root.children.find((c) => Math.abs(c.position.x - mIso.x) < 1 && Math.abs(c.position.y - mIso.y) < 1) as Container;
+
+    expect(cfNode.visible).toBe(false);
+    expect(scwNode.visible).toBe(true);
+    expect(mNode.visible).toBe(true);
+
+    layer.clear();
+  });
+
+  it("monument is always visible regardless of visibleProviders", () => {
+    const root = new Container();
+    const layer = new ExternalServiceLayer(root);
+
+    const m = monument({});
+    layer.setServices([m]);
+    layer.setVisibleProviders(new Set<string>());
+
+    const mNode = root.children[0] as Container;
+    expect(mNode.visible).toBe(true);
+
+    layer.clear();
+  });
+
+  it("setVisibleProviders applies immediately without setServices call", () => {
+    const root = new Container();
+    const layer = new ExternalServiceLayer(root);
+
+    layer.setServices([svc({})]);
+    // Initially visible (lodVisible default = true, provider "scaleway" not in
+    // the default set, so it's hidden after setVisibleProviders([])).
+    layer.setVisibleProviders(new Set<string>());
+    const node = root.children[0] as Container;
+    expect(node.visible).toBe(false);
+
+    // Enabling scaleway makes it visible immediately.
+    layer.setVisibleProviders(new Set(["scaleway"]));
+    expect(node.visible).toBe(true);
+
+    // Disabling again hides it.
+    layer.setVisibleProviders(new Set<string>());
+    expect(node.visible).toBe(false);
+
+    layer.clear();
+  });
+});

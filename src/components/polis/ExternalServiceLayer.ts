@@ -109,6 +109,7 @@ export class ExternalServiceLayer {
   private root: Container;
   private placed = new Map<string, PlacedService>();
   private lodVisible = true;
+  private visibleProviders: ReadonlySet<string> = new Set<string>();
   private onSelect?: (service: ExternalService | null) => void;
 
   constructor(
@@ -161,6 +162,9 @@ export class ExternalServiceLayer {
         this.placed.delete(id);
       }
     }
+
+    // Apply the composed provider visibility to all placed entries (new + existing).
+    this.applyProviderVisibility();
   }
 
   /** Number of outposts actually drawn. */
@@ -171,7 +175,30 @@ export class ExternalServiceLayer {
   /** LOD gate: hide the whole layer when zoomed out (mirrors trade routes). */
   setLodVisible(visible: boolean): void {
     this.lodVisible = visible;
-    this.root.visible = visible;
+    this.applyProviderVisibility();
+  }
+
+  /** Set the user's visible providers. "monument" is always visible.
+   *  Applies composed visibility immediately. */
+  setVisibleProviders(providers: ReadonlySet<string>): void {
+    this.visibleProviders = providers;
+    this.applyProviderVisibility();
+  }
+
+  /** Compose lodVisible + provider filter. Called when either input changes.
+   *  A structure is visible iff lodVisible AND (provider === "monument" OR
+   *  providers.has(provider)). This is a cheap pass over placed entries;
+   *  no per-frame work. */
+  private applyProviderVisibility(): void {
+    const lod = this.lodVisible;
+    const provs = this.visibleProviders;
+    for (const p of this.placed.values()) {
+      const provider = p.service.provider ?? "";
+      p.container.visible = lod && (provider === "monument" || provs.has(provider));
+    }
+    // Also set the root visibility for the overall layer (the root container
+    // controls whether PIXI processes this subtree at all).
+    this.root.visible = lod;
   }
 
   /**

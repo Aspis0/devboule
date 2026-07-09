@@ -47,6 +47,29 @@ function writeLastFolder(path: string | null): void {
   }
 }
 
+/** localStorage key for the user's visible external providers preference. */
+const VISIBLE_PROVIDERS_KEY = "polis:visibleProviders";
+
+function readVisibleProviders(): string[] {
+  try {
+    const raw = window.localStorage.getItem(VISIBLE_PROVIDERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return [...new Set(parsed.filter((v): v is string => typeof v === "string"))];
+  } catch {
+    return [];
+  }
+}
+
+function writeVisibleProviders(list: string[]): void {
+  try {
+    window.localStorage.setItem(VISIBLE_PROVIDERS_KEY, JSON.stringify(list));
+  } catch {
+    // Private mode / quota — non-fatal.
+  }
+}
+
 /** Last path component (basename) for display, handling both `/` and `\`. */
 export function folderBasename(path: string | null): string | null {
   if (!path) return null;
@@ -172,6 +195,14 @@ interface CityStoreState {
   filter: FilterState;
   setFilter: (patch: Partial<FilterState>) => void;
   resetFilter: () => void;
+
+  /** T1b — User preference: which external providers are visible on the map.
+   *  Default [] = all providers OFF (user must toggle them on via Legend).
+   *  "monument" is always visible regardless of this list. Persists to
+   *  localStorage. Does NOT reset on folder switch. */
+  visibleProviders: string[];
+  /** Toggle a single provider on/off. Deduplicates and persists. */
+  setProviderVisible: (provider: string, on: boolean) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +528,7 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
   sinRecords: null,
   sinActionPending: [],
   filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" },
+  visibleProviders: readVisibleProviders(),
 
   load: async () => {
     if (get().loading) return;
@@ -648,6 +680,16 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
 
   setFilter: (patch) => set((s) => ({ filter: { ...s.filter, ...patch } })),
   resetFilter: () => set({ filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" } }),
+
+  setProviderVisible: (provider, on) =>
+    set((s) => {
+      const prev = s.visibleProviders;
+      const next = on
+        ? (prev.includes(provider) ? prev : [...prev, provider])
+        : prev.filter((p) => p !== provider);
+      writeVisibleProviders(next);
+      return { visibleProviders: next };
+    }),
 
   startAgentPoll: () => {
     // Tauri-only; the browser fixture has no live agents. Idempotent: a second

@@ -63,6 +63,9 @@ export interface PolisHandle {
   flyTo: (fileId: string) => void;
   /** P3.2 — set the filter state (null = clear). Applied in one pass. */
   setFilter: (sets: import("./filterModel").FilterSets | null) => void;
+  /** T1b — set which external providers are visible on the map.
+   *  Providers not in the set (except "monument") are hidden. */
+  setVisibleProviders: (providers: ReadonlySet<string>) => void;
   destroy: () => void;
 }
 
@@ -232,6 +235,7 @@ export async function createPolis(
       renderer.onCensorFindings(payload, performance.now()),
     setCensorGemmaStatus: (status) => renderer.setCensorGemmaStatus(status),
     setFilter: (sets) => renderer.setFilter(sets),
+    setVisibleProviders: (provs) => renderer.setVisibleProviders(provs),
     flyTo: (fileId) => renderer.flyTo(fileId),
     destroy,
   };
