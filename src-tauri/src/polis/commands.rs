@@ -229,10 +229,15 @@ pub fn generate_city_state(
     Ok(city)
 }
 
-/// Shared scan core: run the deterministic scanner on `path`, fold in REAL agents
-/// from the live state (best-effort), store the result as the shared `CityState`,
-/// and return it. Does NOT touch `last_project_path` (callers set it). Holds the
-/// city lock only briefly to swap in the new state — never across the scan.
+/// Shared scan core: run the deterministic scanner on `path`, fold REAL agents +
+/// suspects + cloud sources on top of the pure scanner output, store the result
+/// as the shared `CityState`, and return it. Does NOT touch `last_project_path`
+/// (callers set it). Holds the city lock only briefly — never across the scan.
+///
+/// P7 assembly refactor: the hardcoded attach chain (agents → suspects → cloud)
+/// is now a [`source::fold_sources`] over a [`Vec<Box<dyn source::CityDataSource>>`].
+/// The pure scanner produces scanner truth; sources decorate it in order.  Each
+/// source failure is recorded in `city.scan_note` and never aborts the fold.
 fn scan_and_store(
     path: &Path,
     app: &tauri::AppHandle,
@@ -240,49 +245,45 @@ fn scan_and_store(
     polis: &State<'_, PolisState>,
     live: Option<AgentLiveState>,
 ) -> Result<CityState, String> {
+    use crate::polis::source::{self, AgentsSource, CloudSource, ScanContext, SuspectCardsSource};
+
     // EXPLICIT/USER-INITIATED scan path: use the metrics-returning builder so we can
-    // emit the payload-composition debug line ONCE per scan, AFTER real agents are
-    // attached. The watcher's debounced rescans use `scanner::generate_city_state`
+    // emit the payload-composition debug line ONCE per scan, AFTER sources are
+    // folded. The watcher's debounced rescans use `scanner::generate_city_state`
     // (the thin wrapper) instead, which neither serializes the city nor logs — so a
     // file-save storm never pays a full `serde_json::to_vec` + a log write per save.
     let (mut city, mut metrics) = scanner::generate_city_state_with_metrics(path)?;
 
-    // Populate REAL agents as players. Sourced ONLY from the real live state;
-    // the project-id -> root map comes from the real project files. A telemetry
-    // read failure leaves the map honestly agent-less.
-    if let Some(live) = live {
-        let project_roots = project_root_map(app, backend_state);
-        scanner::attach_agents(&mut city, &live, path, &project_roots);
-    }
-
-    // Bug-investigation P3 — mark the buildings OPEN bug cards suspect as "under
-    // investigation" (the investigative-smoke overlay). Sourced from the live
-    // project files (open `category=="bug"` cards with localized suspects). FAIL-
-    // OPEN: a projects-read error yields an empty list (no suspects), never breaks
-    // the scan. Independent of `attach_agents`: the two transient overlays coexist.
+    // Build the one-shot context for all data sources.
+    let project_roots = project_root_map(app, backend_state);
     let open_bug_suspects = crate::backend::projects::gather_open_bug_suspects(app);
-    scanner::attach_suspect_cards(&mut city, &open_bug_suspects);
-
-    // POLIS 5 — external cloud services ("the city meets the cloud"). Populate
-    // `external_services` from the ALREADY-SYNCED in-memory provider inventory
-    // (`BackendState::cached_provider_inventories`). PURE + OFFLINE: reads the cached
-    // Scaleway/Cloudflare snapshot only — NO new network call, never blocks. The
-    // backend state already gates this snapshot (it is cleared on lock / idle-expiry),
-    // so an unavailable/locked inventory yields an empty snapshot and the harbour is
-    // honestly empty (era monuments are preserved by `attach_external_services`).
-    // NEVER fabricates a cloud resource.
     let inventories = backend_state
         .cached_provider_inventories()
         .unwrap_or_default();
-    crate::polis::cloud::attach_external_services(&mut city, &inventories);
+
+    let ctx = ScanContext {
+        project_root: path,
+        live: live.as_ref(),
+        project_roots: &project_roots,
+        open_bug_suspects: &open_bug_suspects,
+        inventories: &inventories,
+    };
+
+    // Ordered source fold: agents → suspect-cards → cloud.
+    // TODO(D2): when the typed-patch surface lands, the P6 semantic refresh
+    // becomes an OracleSource in this vector; today it remains a post-fold
+    // background task.
+    // Shared source list (see default_sources in source.rs — add new sources THERE).
+    let sources = source::default_sources();
+    source::fold_sources(&sources, &ctx, &mut city);
 
     // PAYLOAD-COMPOSITION LOG (Phase-0 measurement). Fire-and-forget, ONCE per
-    // user-initiated scan: now that the FINAL shipped city is assembled (real agents
-    // + external services folded in), fill the two figures the pure core left at 0 —
-    // the real agent count and the serialized size of the city actually shipped to
-    // the front end — and append one bounded debug line. Serializing once per
-    // explicit scan is acceptable; the watcher path never does this. IO errors are
-    // ignored on purpose (best-effort diagnostic).
+    // user-initiated scan: now that the FINAL shipped city is assembled (sources
+    // folded in), fill the two figures the pure core left at 0 — the real agent
+    // count and the serialized size of the city actually shipped to the front
+    // end — and append one bounded debug line. Serializing once per explicit scan
+    // is acceptable; the watcher path never does this. IO errors are ignored on
+    // purpose (best-effort diagnostic).
     metrics.agents = city.agents.len();
     metrics.json_bytes = serde_json::to_vec(&city).map(|v| v.len()).unwrap_or(0);
     polis_debug_append(&scanner::format_build_log(&metrics));

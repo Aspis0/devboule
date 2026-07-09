@@ -33,6 +33,7 @@ pub mod nav;
 pub mod scanner;
 pub mod semantic;
 pub mod sins;
+pub mod source;
 pub mod terrain;
 pub mod watcher;
 

@@ -348,13 +348,19 @@ impl AttachAgents {
                 .ok()
                 .or_else(|| self.live.clone());
 
-        // 2) Fresh project-root map; empty (a read failure) falls back too, so
-        //    agents don't all drop off-map on a transient project-list miss.
-        let project_roots = crate::polis::commands::fresh_project_roots(&self.app);
-        let project_roots = if project_roots.is_empty() {
-            self.project_roots.clone()
+        // 2) Fresh project-root map. Only computed when live agents actually
+        //    exist (cheap guard: the project-root read costs a filesystem call).
+        //    Empty (a read failure) falls back to the captured snapshot so agents
+        //    do not all drop off-map on a transient project-list miss.
+        let project_roots = if live.is_some() {
+            let roots = crate::polis::commands::fresh_project_roots(&self.app);
+            if roots.is_empty() {
+                self.project_roots.clone()
+            } else {
+                roots
+            }
         } else {
-            project_roots
+            self.project_roots.clone()
         };
 
         (live, project_roots)
@@ -448,40 +454,33 @@ fn rescan_and_emit(
         return;
     }
 
-    // Re-attach real agents from a FRESH read of the live state (GAP A): the
-    // watcher must reflect agents moving/appearing/disappearing, not just file
-    // changes. `fresh()` re-reads `.aspis-agents.json` + the project roots each
-    // rescan, falling back to the captured snapshot on a transient read miss.
-    // Best-effort; never fabricates. A None live state leaves the map agent-less.
+
+    // P7 — Unified source fold (watcher path).  `attach.fresh()` re-reads the
+    // real agent live state + project roots each rescan (GAP A), falling back to
+    // the captured snapshot on a transient read miss.  The open-bug suspects and
+    // cached provider inventory are gathered here; the shared `default_sources()`
+    // vector ensures this path and `commands::scan_and_store` can never diverge.
     let (live, project_roots) = attach.fresh();
-    if let Some(ref live) = live {
-        scanner::attach_agents(&mut city, live, root, &project_roots);
-    }
-
-    // Bug-investigation P3 — re-attach the open-bug investigative-smoke markers on a
-    // live file-change re-scan too, so a saved file does NOT wipe the smoke until
-    // the next 5s agent poll. Sourced from the live project files; FAIL-OPEN (a
-    // read error → empty list → stale markers cleared). Mirrors the agent re-attach.
     let open_bug_suspects = crate::backend::projects::gather_open_bug_suspects(app);
-    scanner::attach_suspect_cards(&mut city, &open_bug_suspects);
-
-    // POLIS 5 — re-attach external cloud services from the ALREADY-SYNCED in-memory
-    // provider inventory so a live re-scan keeps the harbour in sync (otherwise a
-    // file change would emit a city with an empty `externalServices` and the cloud
-    // outposts would vanish). PURE + OFFLINE: reads the cached snapshot via the
-    // managed `BackendState` (resolved off the `AppHandle`, same posture as
-    // `fresh_project_roots`) — NO network call, never blocks. The cache is cleared
-    // on lock/idle-expiry, so a locked app honestly yields an empty harbour. Era
-    // monuments are preserved by `attach_external_services`. Never fabricates.
     {
         use tauri::Manager;
         let inventories = app
             .state::<crate::backend::state::BackendState>()
             .cached_provider_inventories()
             .unwrap_or_default();
-        crate::polis::cloud::attach_external_services(&mut city, &inventories);
+        let ctx = crate::polis::source::ScanContext {
+            project_root: root,
+            live: live.as_ref(),
+            project_roots: &project_roots,
+            open_bug_suspects: &open_bug_suspects,
+            inventories: &inventories,
+        };
+        crate::polis::source::fold_sources(
+            &crate::polis::source::default_sources(),
+            &ctx,
+            &mut city,
+        );
     }
-
     // SKIP-IF-UNCHANGED: with this fully-attached city, compute its content
     // signature (timestamp excluded) and compare to the last one we emitted. If a
     // file-change event produced a city IDENTICAL to what the frontend already
