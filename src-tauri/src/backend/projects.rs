@@ -862,18 +862,6 @@ pub fn refresh_project_live_status(
     live_status_from_state(&state, Some(&project.state.tasks))
 }
 
-/// Read the configured custom agent clients (Settings -> Workspace). Returns the
-/// normalized list from config.json; an empty list when unset. Unlock-gated like
-/// the other project commands.
-#[tauri::command]
-pub fn get_custom_agent_clients(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-) -> Result<Vec<CustomAgentClient>, String> {
-    state.ensure_unlocked()?;
-    Ok(read_custom_agent_clients(&app))
-}
-
 /// Persist the custom agent clients into config.json (read-modify-write, mirroring
 /// `roles::bake_trust_anchor`). Validates + normalizes the whole list (id/label/
 /// command rules + cross-set uniqueness) before writing. Unlock-gated. In a
@@ -928,17 +916,6 @@ pub fn set_custom_agent_clients(
     replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")
         .map_err(|e| format!("{e}. In a packaged build this file is read-only."))?;
     Ok(normalized)
-}
-
-/// Read the configured global mini-coder backend (Settings → Workspace). Returns
-/// `None` when unset or invalid. Unlock-gated like the other project commands.
-#[tauri::command]
-pub fn get_mini_coder_backend(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-) -> Result<Option<super::mini_coder::MiniCoderBackend>, String> {
-    state.ensure_unlocked()?;
-    Ok(read_mini_coder_backend(&app))
 }
 
 /// Persist the global mini-coder backend into config.json (read-modify-write,
@@ -1080,19 +1057,6 @@ pub fn set_design_llm_backend(
     replace_file_with_backup(&temp_path, &path, &backup_path, "config.json")
         .map_err(|e| format!("{e}. In a packaged build this file is read-only."))?;
     Ok(normalized)
-}
-
-/// Read the configured global LOCAL MAIN-CODER backend (Settings → Providers & Models,
-/// "Local main coder (Devboule)" card). Returns `None` when unset or invalid. Unlock-gated
-/// like the other project commands. A SEPARATE value from `get_mini_coder_backend` — the
-/// orchestrator (local main coder) and the mini (delegated worker) are distinct tiers.
-#[tauri::command]
-pub fn get_local_coder_backend(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-) -> Result<Option<super::local_coder::LocalCoderBackend>, String> {
-    state.ensure_unlocked()?;
-    Ok(read_local_coder_backend(&app))
 }
 
 /// Persist the global LOCAL MAIN-CODER backend into config.json under `localCoderBackend`
@@ -2588,20 +2552,6 @@ pub fn set_project_net_enabled(
     .map(|_| ())
 }
 
-/// Tauri command: persist the network-unblock flag for a project.
-/// Mirrors `set_censor_trusted` (`censor/commands.rs:746`):
-/// same signature shape, same `ensure_unlocked` guard.
-#[tauri::command]
-pub fn set_project_net_enabled_cmd(
-    project_id: String,
-    enabled: bool,
-    app: tauri::AppHandle,
-    backend_state: State<'_, BackendState>,
-) -> Result<(), String> {
-    backend_state.ensure_unlocked()?;
-    set_project_net_enabled(&app, &project_id, enabled)
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // sandbox_mode — per-project autonomy mode (broker Slice 1)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2961,17 +2911,6 @@ fn remove_project_working_set_by_path(
         Ok(())
     })?;
     Ok(updated.map(|p| p.metadata.working_set).unwrap_or_default())
-}
-
-/// Tauri command: read the project's working set.
-#[tauri::command]
-pub fn project_working_set_cmd(
-    project_id: String,
-    app: tauri::AppHandle,
-    backend_state: State<'_, BackendState>,
-) -> Result<Vec<String>, String> {
-    backend_state.ensure_unlocked()?;
-    project_working_set(&app, &project_id)
 }
 
 /// Tauri command: add a folder to the project's working set.

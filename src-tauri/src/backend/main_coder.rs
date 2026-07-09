@@ -8,7 +8,6 @@
 //! scan and, for `DirectiveTier::Main`, always runs the agentic worker (or fails
 //! the directive — never a one-shot downgrade).
 
-use tauri::AppHandle;
 
 use crate::backend::mini_coder::{DirectiveTier, MiniCoderDirective, MiniCoderStatus, WriteMode};
 
@@ -153,31 +152,6 @@ pub(crate) fn append_main_coder_directive(
 
     // 5. Return the directive id.
     Ok(id)
-}
-
-/// Tauri command: append a first-class Main coder directive to the shared
-/// agent ledger.
-///
-/// This is the UI twin of the Python MCP tool `spawn_main_coder` (aspis_mcp.py).
-/// It validates the request, builds a `MiniCoderDirective` with `tier: Main` and
-/// `write_mode: AgenticIterative`, and appends it under the ledger lock.
-/// The executor (mini_coder_executor.rs) claims pending directives on its 1.5s
-/// scan and, for `DirectiveTier::Main`, always runs the agentic worker (or fails
-/// the directive — never a one-shot downgrade).
-#[tauri::command]
-pub fn spawn_main_coder_directive(
-    app: AppHandle,
-    state: tauri::State<'_, crate::backend::state::BackendState>,
-    project_id: String,
-    task: String,
-    files: Vec<String>,
-) -> Result<String, String> {
-    // 1. Unlocked vault check (spawning work requires the unlocked vault).
-    state.ensure_unlocked()?;
-
-    // 2. Delegate to the extracted helper (validation + project check + build +
-    //    append + cap_pass). Behavior identical to the original inlined body.
-    append_main_coder_directive(&app, &project_id, task, files)
 }
 
 // ---------------------------------------------------------------------------

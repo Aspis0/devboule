@@ -5,7 +5,7 @@
 //! stack-trace bodies, hangs/timeouts) as records for benchmark/training.
 //!
 //! ## Not a watcher, not automatic
-//! This module does nothing until a human invokes [`api_fuzz_run`] with an explicit
+//! This module does nothing until a human invokes it with an explicit
 //! `base_url`. Every invocation is idempotent and repeatable.
 //!
 //! ## Tool detection — detected, not embedded
@@ -783,7 +783,7 @@ pub struct CaseOutcome {
     pub symptom: Option<String>,
 }
 
-/// The report returned by [`api_fuzz_run`] to the caller (JS frontend / tests).
+/// The report returned to the caller (JS frontend / tests).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiFuzzReport {
@@ -805,7 +805,7 @@ pub struct ApiFuzzReport {
 /// rail, and return a report. The sender is injectable so tests can pass a
 /// `FakeSender` without any network.
 ///
-/// This is the real implementation; [`api_fuzz_run`] is the thin Tauri command wrapper.
+/// This is the real implementation; the Tauri command wrapper calls it.
 pub fn run_fuzz<S: RequestSender>(
     base_url: &str,
     project_root: &Path,
@@ -933,53 +933,6 @@ fn append_fuzz_finding(root: &Path, finding: &FuzzFinding) -> std::io::Result<()
 // ---------------------------------------------------------------------------
 // Tauri command
 // ---------------------------------------------------------------------------
-
-/// Tauri command: run the API fuzz harness against `base_url`.
-///
-/// Arguments (camelCase over the IPC boundary):
-///   - `base_url`: the loopback dev-server to target (must be `http://127.*`,
-///     `http://localhost`, or `http://[::1]`).
-///   - `project_root`: the project root under which `.aspis-training/` lives.
-///   - `openapi_spec`: optional path to an OpenAPI spec file; if present and
-///     `schemathesis` is available, additional OpenAPI-driven negative cases are run.
-///
-/// Returns `Ok(ApiFuzzReport)` or `Err(message)` if validation fails.
-#[tauri::command]
-pub fn api_fuzz_run(
-    base_url: String,
-    project_root: String,
-    openapi_spec: Option<String>,
-) -> Result<ApiFuzzReport, String> {
-    let root = PathBuf::from(&project_root);
-    if !root.is_absolute() {
-        return Err("api-fuzz: project_root must be an absolute path".to_string());
-    }
-
-    let tools = ToolAvailability::detect();
-    let sender = XhSender::new(tools.xh.clone());
-
-    // `run_fuzz` validates `base_url` is a loopback origin before any request is sent;
-    // after it returns Ok the URL is known-loopback (precondition for `run_schemathesis`).
-    let mut report = run_fuzz(&base_url, &root, &sender, &tools)?;
-
-    // If an OpenAPI spec is provided and schemathesis is available, run additional cases.
-    if let (Some(spec_path), Some(st_bin)) = (&openapi_spec, &tools.schemathesis) {
-        // WARNING 7: `spec_path` arrives raw from IPC; validate it is an existing regular
-        // file INSIDE `project_root` before handing it to a subprocess that reads it.
-        match validate_spec_path(&root, spec_path) {
-            Ok(validated) => {
-                let st_findings = run_schemathesis(st_bin, &base_url, &validated, &root);
-                report.findings_recorded += st_findings;
-            }
-            Err(e) => {
-                // Reject quietly into the report path-only log; never abort the whole run.
-                eprintln!("api-fuzz: openapi spec rejected: {e}");
-            }
-        }
-    }
-
-    Ok(report)
-}
 
 /// WARNING 7: validate that `spec_path` is an existing regular file located INSIDE
 /// `project_root`. Canonicalizes both and prefix-checks so symlink / `..` traversal can't

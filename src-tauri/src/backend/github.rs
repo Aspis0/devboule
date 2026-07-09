@@ -1,4 +1,4 @@
-use super::model::{GithubConnectionStatus, GithubRepoAccessStatus};
+use super::model::GithubConnectionStatus;
 use super::state::BackendState;
 use super::vault;
 use chrono::Utc;
@@ -31,29 +31,6 @@ struct GithubUserResponse {
     name: Option<String>,
     avatar_url: Option<String>,
     html_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRepoResponse {
-    html_url: Option<String>,
-    description: Option<String>,
-    private: Option<bool>,
-    default_branch: Option<String>,
-    open_issues_count: Option<u32>,
-    stargazers_count: Option<u32>,
-    forks_count: Option<u32>,
-    pushed_at: Option<String>,
-    updated_at: Option<String>,
-    permissions: Option<GithubRepoPermissions>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRepoPermissions {
-    admin: Option<bool>,
-    maintain: Option<bool>,
-    push: Option<bool>,
-    triage: Option<bool>,
-    pull: Option<bool>,
 }
 
 #[tauri::command]
@@ -105,15 +82,6 @@ pub fn import_github_token_from_cli(
             Some("Imported your GitHub CLI login into Windows Credential Manager.".into());
     }
     Ok(status)
-}
-
-#[tauri::command]
-pub fn check_github_repo_access(
-    state: State<'_, BackendState>,
-    url: String,
-) -> Result<GithubRepoAccessStatus, String> {
-    state.ensure_unlocked()?;
-    github_repo_access_status(&url)
 }
 
 pub fn github_connection_status() -> Result<GithubConnectionStatus, String> {
@@ -206,85 +174,6 @@ fn github_connection_status_for_token(
     })
 }
 
-pub fn github_repo_access_status(url: &str) -> Result<GithubRepoAccessStatus, String> {
-    let checked_at = now();
-    let Some((owner, repo)) = parse_github_repo(url) else {
-        return Ok(GithubRepoAccessStatus {
-            url: url.trim().into(),
-            status: "invalid".into(),
-            checked_at,
-            message: Some("This is not a recognized GitHub repository URL.".into()),
-            ..GithubRepoAccessStatus::default()
-        });
-    };
-    let api_url = format!("{GITHUB_API}/repos/{owner}/{repo}");
-    let client = github_client();
-    let mut request = client.get(api_url);
-    if let Some(token) = vault::read_github_token()? {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().map_err(|e| {
-        format!(
-            "GitHub repo check failed: {}",
-            sanitize_error(&e.to_string())
-        )
-    })?;
-    let status = response.status();
-    if status == StatusCode::NOT_FOUND {
-        return Ok(GithubRepoAccessStatus {
-            url: github_web_url(&owner, &repo),
-            owner: Some(owner),
-            repo: Some(repo),
-            accessible: false,
-            status: "not_accessible".into(),
-            checked_at,
-            message: Some(
-                "GitHub returned 404. The repo is private, missing, or the saved token lacks access."
-                    .into(),
-            ),
-            ..GithubRepoAccessStatus::default()
-        });
-    }
-    if !status.is_success() {
-        return Ok(GithubRepoAccessStatus {
-            url: github_web_url(&owner, &repo),
-            owner: Some(owner),
-            repo: Some(repo),
-            accessible: false,
-            status: "error".into(),
-            checked_at,
-            message: Some(github_status_message(status)),
-            ..GithubRepoAccessStatus::default()
-        });
-    }
-    let repo_response = response.json::<GithubRepoResponse>().map_err(|e| {
-        format!(
-            "GitHub repo response could not be parsed: {}",
-            sanitize_error(&e.to_string())
-        )
-    })?;
-    Ok(GithubRepoAccessStatus {
-        url: repo_response
-            .html_url
-            .unwrap_or_else(|| github_web_url(&owner, &repo)),
-        owner: Some(owner),
-        repo: Some(repo),
-        description: repo_response.description,
-        accessible: true,
-        private: repo_response.private,
-        default_branch: repo_response.default_branch,
-        open_issues_count: repo_response.open_issues_count,
-        stargazers_count: repo_response.stargazers_count,
-        forks_count: repo_response.forks_count,
-        pushed_at: repo_response.pushed_at,
-        updated_at: repo_response.updated_at,
-        permissions: repo_permissions(repo_response.permissions),
-        status: "accessible".into(),
-        checked_at,
-        message: Some("Saved GitHub auth can read this repository.".into()),
-    })
-}
-
 fn github_client() -> &'static Client {
     GITHUB_HTTP_CLIENT.get_or_init(|| {
         Client::builder()
@@ -366,22 +255,6 @@ fn parse_scopes(value: Option<&reqwest::header::HeaderValue>) -> Vec<String> {
         .collect()
 }
 
-fn repo_permissions(value: Option<GithubRepoPermissions>) -> Vec<String> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    [
-        ("admin", value.admin),
-        ("maintain", value.maintain),
-        ("push", value.push),
-        ("triage", value.triage),
-        ("pull", value.pull),
-    ]
-    .into_iter()
-    .filter_map(|(label, enabled)| enabled.unwrap_or(false).then_some(label.to_string()))
-    .collect()
-}
-
 /// Crate-visible so the clone path (`projects::project_git_clone`) can validate a
 /// pasted remote URL with the EXACT same rules (https/github.com only, sanitized
 /// owner/repo segments) instead of hand-rolling a second, weaker parser.
@@ -415,10 +288,6 @@ fn clean_github_path_segment(value: &str) -> Option<String> {
         return None;
     }
     Some(clean.to_string())
-}
-
-fn github_web_url(owner: &str, repo: &str) -> String {
-    format!("https://github.com/{owner}/{repo}")
 }
 
 fn github_status_message(status: StatusCode) -> String {

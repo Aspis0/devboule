@@ -1192,17 +1192,6 @@ pub fn spawn_sidecar_for_role(
     })
 }
 
-/// Tauri command: spawn a pi sidecar session for a named agent role
-/// (orchestrator / main-coder / mini-coder). See [`spawn_sidecar_for_role`].
-#[tauri::command]
-pub async fn spawn_agent_session(
-    app: AppHandle,
-    role: String,
-    project_id: Option<String>,
-) -> Result<SessionInfo, String> {
-    spawn_sidecar_for_role(&app, &role, project_id.as_deref())
-}
-
 /// Tauri command: stop a specific pi sidecar session.
 #[tauri::command]
 pub async fn spike_pi_stop(app: AppHandle, session_id: String) -> Result<bool, String> {

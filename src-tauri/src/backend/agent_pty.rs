@@ -550,26 +550,6 @@ pub fn agent_pty_list(
     Ok(map.keys().cloned().collect())
 }
 
-/// Kill an app-hosted agent: kill the child, then `wait` it so it is reaped (no
-/// zombie), join the reader thread best-effort with a timeout, drop the session,
-/// and mark the agent session closed. Idempotent: a missing session is success.
-#[tauri::command]
-pub fn agent_pty_kill(
-    app: tauri::AppHandle,
-    state: State<'_, BackendState>,
-    sessions: State<'_, AgentPtySessions>,
-    agent_id: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    validate_agent_id(&agent_id)?;
-    kill_session_in_map(&sessions, &agent_id);
-    // Reflect closure in the shared live-state too (the reader thread also does
-    // this on EOF, but an explicit kill should not depend on the reader winning
-    // the race). Best-effort.
-    super::agents::mark_agent_session_closed_public(&app, &agent_id);
-    Ok(())
-}
-
 /// Kill + reap an app-hosted agent's PTY session by id, resolving the managed
 /// state from the AppHandle. Used by `stop_agent` (agents.rs) when the ledger
 /// host is "app", so the stop path does not need the `AgentPtySessions` State in

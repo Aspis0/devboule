@@ -1724,22 +1724,6 @@ pub fn delete_oracle_llm_api_key(
 }
 
 #[tauri::command]
-pub fn disable_oracle_llm(
-    state: State<'_, BackendState>,
-) -> Result<OracleLlmSettingsStatus, String> {
-    state.ensure_unlocked()?;
-    let disabled = OracleLlmSettings {
-        provider: String::new(),
-        model: String::new(),
-        base_url: None,
-        remote_enabled: false,
-    };
-    let status = vault::save_oracle_llm_settings(&disabled, None)?;
-    crate::backend::oracle_service::request_llm_restart();
-    Ok(status)
-}
-
-#[tauri::command]
 pub fn get_oracle_index_preferences(
     state: State<'_, BackendState>,
 ) -> Result<OracleIndexPreferences, String> {

@@ -576,37 +576,6 @@ pub struct ChatTurn {
     pub msg_id: Option<String>,
 }
 
-/// B15b: read an agent's DURABLE chat transcript directly from its on-disk
-/// `.jsonl` bridge, independent of the in-memory store. Lets the planner chat
-/// survive the orchestrator process ending, a store eviction, or an app restart.
-/// Best-effort: returns an empty Vec on any resolution/read error (a missing
-/// transcript is "no history", never a hard failure).
-#[tauri::command]
-pub fn read_activity_chat(app: tauri::AppHandle, agent_id: String) -> Vec<ChatTurn> {
-    let Ok(projects_dir) = crate::backend::projects::ensure_projects_dir(&app) else {
-        return Vec::new();
-    };
-    // Reviewer max-recall: resolve the path WITHOUT creating the .devboule-activity dir
-    // (a read must not mutate the filesystem). `activity_file_name` is the same
-    // traversal-safe basename `activity_file_path` uses; we just skip the create_dir_all.
-    let Some(name) = activity_file_name(&agent_id) else {
-        return Vec::new();
-    };
-    let path = projects_dir.join(ACTIVITY_SUBDIR).join(name);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    content
-        .lines()
-        .filter_map(parse_chat_line)
-        .map(|chat| ChatTurn {
-            role: chat.role,
-            text: chat.text,
-            msg_id: chat.msg_id,
-        })
-        .collect()
-}
-
 /// D-resume: the chat turns inside a bridge file's HYDRATION WINDOW — a bounded tail
 /// read, never the whole file (max-recall: an unbounded read on the launch path means
 /// ever-growing relaunch latency for a months-old project). Empty on a missing file.

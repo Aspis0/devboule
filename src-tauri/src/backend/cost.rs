@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -54,101 +53,6 @@ fn pricing_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app_data_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create app data dir: {e}"))?;
     Ok(dir.join("openrouter-pricing.json"))
-}
-
-/// Parse the JSON body of `GET /api/v1/models` into a per-Mtok price map.
-/// Malformed or non-finite pricing entries are silently skipped.
-fn parse_openrouter_models(body: &serde_json::Value) -> BTreeMap<String, ModelPrice> {
-    let mut map = BTreeMap::new();
-    let data = match body.get("data").and_then(|d| d.as_array()) {
-        Some(arr) => arr,
-        None => return map,
-    };
-    for item in data {
-        let id = match item.get("id").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let pricing = match item.get("pricing") {
-            Some(p) => p,
-            None => continue,
-        };
-        let Some(prompt) = pricing
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        else {
-            continue
-        };
-        let Some(completion) = pricing
-            .get("completion")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        else {
-            continue
-        };
-        map.insert(
-            id,
-            ModelPrice {
-                input_per_mtok: prompt * 1_000_000.0,
-                output_per_mtok: completion * 1_000_000.0,
-            },
-        );
-    }
-    map
-}
-
-fn write_pricing_to_path(
-    path: &Path,
-    map: &BTreeMap<String, ModelPrice>,
-) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-    super::design::atomic_write(path, &json, "openrouter-pricing")
-}
-
-/// Fetch the full model catalogue from OpenRouter, extract per-Mtok pricing,
-/// and atomically cache it to `<app-data>/openrouter-pricing.json`.
-/// Returns the number of entries cached.
-/// Errors **only** on HTTP/network failure (no key in the message).
-#[tauri::command]
-pub async fn refresh_openrouter_pricing(
-    app: tauri::AppHandle,
-) -> Result<usize, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
-
-    let mut req = client.get("https://openrouter.ai/api/v1/models");
-    if let Ok(Some(key)) = super::vault::read_cloud_llm_key() {
-        req = req.header("Authorization", format!("Bearer {}", key));
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("OpenRouter pricing fetch failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "OpenRouter pricing fetch returned HTTP {}",
-            response.status()
-        ));
-    }
-
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("OpenRouter pricing parse failed: {}", e))?;
-
-    let map = parse_openrouter_models(&body);
-
-    let path = pricing_path(&app)?;
-    write_pricing_to_path(&path, &map)?;
-
-    Ok(map.len())
 }
 
 fn load_cached_pricing_from_path(path: &Path) -> BTreeMap<String, ModelPrice> {
@@ -260,13 +164,6 @@ fn load_ledger_from_path(path: &Path) -> CostLedger {
     serde_json::from_slice(&data).unwrap_or_default()
 }
 
-fn load_ledger(app: &tauri::AppHandle) -> CostLedger {
-    match ledger_path(app) {
-        Ok(p) => load_ledger_from_path(&p),
-        Err(_) => CostLedger::default(),
-    }
-}
-
 fn record_cost_to_path(path: &Path, model_id: &str, usd: f64) -> Result<(), String> {
     if usd < 0.0 || usd.is_nan() || usd.is_infinite() {
         return Err("cost must be a non-negative finite number".into());
@@ -288,11 +185,6 @@ pub fn record_cost(
     record_cost_to_path(&path, &model_id, usd)
 }
 
-#[tauri::command]
-pub fn get_cost_summary(app: tauri::AppHandle) -> Result<CostLedger, String> {
-    Ok(load_ledger(&app))
-}
-
 // ---------------------------------------------------------------------------
 // 5. Tests
 // ---------------------------------------------------------------------------
@@ -300,58 +192,6 @@ pub fn get_cost_summary(app: tauri::AppHandle) -> Result<CostLedger, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- parse_openrouter_models --
-
-    #[test]
-    fn test_parse_openrouter_models() {
-        let json = serde_json::json!({
-            "data": [
-                {
-                    "id": "z-ai/glm-5.2",
-                    "pricing": {
-                        "prompt": "0.0000014",
-                        "completion": "0.0000044",
-                        "request": "0"
-                    }
-                },
-                {
-                    "id": "deepseek/deepseek-v4-pro",
-                    "pricing": {
-                        "prompt": "0.000000435",
-                        "completion": "0.00000087"
-                    }
-                }
-            ]
-        });
-        let map = parse_openrouter_models(&json);
-        assert_eq!(map.len(), 2);
-
-        let glm = map.get("z-ai/glm-5.2").unwrap();
-        assert!((glm.input_per_mtok - 1.4).abs() < 0.001);
-        assert!((glm.output_per_mtok - 4.4).abs() < 0.001);
-
-        let ds = map.get("deepseek/deepseek-v4-pro").unwrap();
-        assert!((ds.input_per_mtok - 0.435).abs() < 0.001);
-        assert!((ds.output_per_mtok - 0.87).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_parse_openrouter_models_skips_malformed() {
-        let json = serde_json::json!({
-            "data": [
-                { "id": "good/model", "pricing": { "prompt": "0.001", "completion": "0.002" } },
-                { "id": "bad/model", "pricing": { "prompt": "not-a-number", "completion": "0.002" } },
-                { "no_id": true },
-                { "id": "no_pricing" }
-            ]
-        });
-        let map = parse_openrouter_models(&json);
-        // malformed/missing-price entries are silently skipped
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key("good/model"));
-        assert!(!map.contains_key("bad/model"));
-    }
 
     // -- fallback_price --
 

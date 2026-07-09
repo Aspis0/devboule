@@ -394,23 +394,6 @@ pub fn classify_prompt_full(text: &str, app: &AppHandle) -> Classification {
     }
 }
 
-/// Tauri command `classify_prompt` (exposed to the frontend/tests; the sidecar
-/// reaches the same logic via the JSONL `classify_prompt` → `classified` round
-/// trip, NOT by calling this command directly). Returns `{ tier, provider,
-/// model, path }`.
-#[tauri::command(name = "classify_prompt")]
-pub fn classify_prompt_command(text: String, app: AppHandle) -> Result<Classification, String> {
-    let tier = classify_prompt(&text);
-    let path = decide_agent_path(&text, tier, &app);
-    let (provider, model) = resolve_tier(tier, path, &app);
-    Ok(Classification {
-        tier,
-        provider,
-        model,
-        path,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

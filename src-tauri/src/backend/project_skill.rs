@@ -72,18 +72,6 @@ fn default_enabled() -> bool {
 /// inject (no way to turn it off). Membership here == "the panel can manage this role".
 pub(crate) const KNOWN_ROLES: &[&str] = &["mini", "coder", "design", "orchestrator"];
 
-/// Reject any `role` not in [`KNOWN_ROLES`]. Gate on EVERY write/install command so a
-/// crafted role can never become a directory name under `.claude/skills/`.
-fn validate_role(role: &str) -> Result<(), String> {
-    if KNOWN_ROLES.contains(&role) {
-        Ok(())
-    } else {
-        Err(format!(
-            "unknown skill role '{role}' (expected one of: {})",
-            KNOWN_ROLES.join(", ")
-        ))
-    }
-}
 
 /// The Work Console ASSIGNMENT layer: the capability tiers a project assigns skills/tools to
 /// from the "Skills & Tools" modal. This is SEPARATE from [`KNOWN_ROLES`] (the injection +
@@ -695,46 +683,9 @@ mod lang_skill_tests {
         assert!(out.contains("ROLE RULES WIN"));
     }
 
-    #[test]
-    fn list_langs_falls_back_to_bundled() {
-        let dir = fresh_dir("list_langs_fallback");
-        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
-        assert_eq!(entries.len(), bundled_lang_keys().count());
-        assert!(entries.iter().all(|e| e.source == "bundled"));
-        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
-        assert!(rust.content.contains("veteran Rust"));
-    }
 
-    #[test]
-    fn save_lang_then_list_shows_project_override() {
-        let dir = fresh_dir("save_then_list_lang");
-        skills_save_lang_impl(dir.to_str().unwrap(), "coder", "rust", "PROJECT RUST OVERRIDE")
-            .unwrap();
-        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
-        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
-        assert_eq!(rust.source, "project");
-        assert_eq!(rust.content, "PROJECT RUST OVERRIDE");
-    }
 
-    #[test]
-    fn reset_lang_reverts_to_bundled() {
-        let dir = fresh_dir("reset_lang");
-        skills_save_lang_impl(dir.to_str().unwrap(), "coder", "rust", "PROJECT RUST OVERRIDE")
-            .unwrap();
-        skills_reset_lang_impl(dir.to_str().unwrap(), "coder", "rust").unwrap();
-        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
-        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
-        assert_eq!(rust.source, "bundled");
-    }
 
-    #[test]
-    fn save_lang_rejects_oversized_unknown_lang_and_role() {
-        let dir = fresh_dir("save_lang_rejects");
-        let big = "a".repeat(MAX_SKILL_BYTES + 1);
-        assert!(skills_save_lang_impl(dir.to_str().unwrap(), "coder", "rust", &big).is_err());
-        assert!(skills_save_lang_impl(dir.to_str().unwrap(), "coder", "javascript", "x").is_err());
-        assert!(skills_save_lang_impl(dir.to_str().unwrap(), "bogus_role", "rust", "x").is_err());
-    }
 
     #[test]
     fn bundled_lang_catalog_covers_known_langs() {
@@ -745,29 +696,7 @@ mod lang_skill_tests {
         assert!(rust.body.contains("veteran Rust"));
     }
 
-    #[test]
-    fn reset_lang_on_absent_file_is_idempotent_ok() {
-        let dir = fresh_dir("reset_absent");
-        // No project override yet → reset must succeed (already bundled), not error.
-        assert!(skills_reset_lang_impl(dir.to_str().unwrap(), "coder", "rust").is_ok());
-        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
-        assert_eq!(entries.iter().find(|e| e.lang == "rust").unwrap().source, "bundled");
-    }
 
-    #[test]
-    fn list_langs_caps_and_flags_an_oversized_override() {
-        let dir = fresh_dir("lang_truncation");
-        // Write the file DIRECTLY (bypassing the save byte-cap) to simulate an oversized override,
-        // then confirm the raw reader caps + flags it (same contract as read_skill_raw).
-        let skill_dir = dir.join(".claude").join("skills").join("coder");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("lang-rust.md"), "x".repeat(MAX_SKILL_BYTES + 100)).unwrap();
-        let entries = skills_list_langs_impl(dir.to_str().unwrap(), "coder").unwrap();
-        let rust = entries.iter().find(|e| e.lang == "rust").unwrap();
-        assert_eq!(rust.source, "project");
-        assert!(rust.truncated);
-        assert!(rust.bytes <= MAX_SKILL_BYTES);
-    }
 
     #[test]
     fn fallback_to_bundled_on_missing_project_file() {
@@ -1002,24 +931,6 @@ pub struct SkillEntry {
 /// `body` is shipped IN THE BINARY (never fetched) so installing is owner-initiated and
 /// supply-chain-safe. `source_url` is `None` for our own templates (it exists for a
 /// future owner-vetted external catalog, which would carry provenance).
-/// `pub` for the same reason as [`SkillEntry`] — it is a `#[tauri::command]` return
-/// type the `generate_handler!` macro must be able to name. Fields stay private.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CatalogEntry {
-    /// Stable id used by `skills_install_from_catalog` to select the template.
-    id: String,
-    /// Human-facing template name for the panel.
-    name: String,
-    /// Which role this template targets (one of [`KNOWN_ROLES`]).
-    role: String,
-    /// One-line description shown next to the name.
-    description: String,
-    /// Provenance for a future external catalog; `None` for our bundled templates.
-    source_url: Option<String>,
-    /// The SKILL.md body installed verbatim. Kept well under MAX_SKILL_BYTES.
-    body: String,
-}
 
 /// Build the role's SKILL.md path under an ALREADY-CANONICAL working folder, create the
 /// `.claude/skills/<role>/` directory, and atomic-write `content`. `role` MUST be
@@ -1033,77 +944,6 @@ fn write_skill_file(canonical_root: &Path, role: &str, content: &str) -> Result<
     atomic_write(&dir.join("SKILL.md"), content, "SKILL.md")
 }
 
-/// The bundled catalog of safe, self-authored starter templates — ONE per role. Product-
-/// general house conventions (no Aspis/Cloudflare/Scaleway specifics): a neutral skeleton
-/// the owner can adopt and edit. Built fresh on each call (cheap; a handful of entries).
-fn bundled_catalog() -> Vec<CatalogEntry> {
-    vec![
-        CatalogEntry {
-            id: "starter-mini".to_string(),
-            name: "Mini executor — edit discipline".to_string(),
-            role: "mini".to_string(),
-            description: "Stay in scope, emit clean edits, leave the tree building.".to_string(),
-            source_url: None,
-            body: "# Mini executor — house conventions\n\n\
-- Stay strictly inside the FILE SCOPE you were given. Do not touch unrelated files.\n\
-- Make the smallest change that fully solves the task; no speculative refactors.\n\
-- Emit complete, well-formed edits — never leave a file half-edited or syntactically broken.\n\
-- Match the surrounding code's existing style, naming, and patterns.\n\
-- Run the project's formatter/linter before considering a file done.\n\
-- Leave the build green: if a change would break compilation, finish or revert it.\n\
-- Do not invent new dependencies; reuse what the project already imports.\n"
-                .to_string(),
-        },
-        CatalogEntry {
-            id: "starter-coder".to_string(),
-            name: "Coder agent — delivery discipline".to_string(),
-            role: "coder".to_string(),
-            description: "Delegate mechanical edits, self-review before handing off, never force-push.".to_string(),
-            source_url: None,
-            body: "# Coder agent — house conventions\n\n\
-- Understand the task and read the relevant code before writing anything.\n\
-- Delegate purely mechanical edits (renames, boilerplate, find/replace) to the cheapest capable tool.\n\
-- Write or update a failing test first for non-trivial behavior, then make it pass.\n\
-- Self-review the full diff before moving a task to review: correctness, edge cases, error paths.\n\
-- Keep changes surgical and scoped to the task; do not refactor unrelated code.\n\
-- Never run a raw force/destructive git push; let the review gate run first.\n\
-- Report what changed and why, including any risks or trade-offs.\n"
-                .to_string(),
-        },
-        CatalogEntry {
-            id: "starter-design".to_string(),
-            name: "Design generation — contract & tokens".to_string(),
-            role: "design".to_string(),
-            description: "Honor the design contract, reuse tokens, stay consistent.".to_string(),
-            source_url: None,
-            body: "# Design generation — house conventions\n\n\
-- Treat the project's design contract (design.md) as the source of truth; do not contradict it.\n\
-- Reuse existing design tokens (color, spacing, type) instead of introducing new literals.\n\
-- Match the established visual language: components, radii, and density already in use.\n\
-- Keep markup accessible: semantic elements, labelled controls, sufficient contrast.\n\
-- Prefer composing existing components over inventing one-off variants.\n\
-- Do not add external fonts, CDNs, or assets the project does not already self-host.\n\
-- Keep output focused on the request; avoid unrelated visual changes.\n"
-                .to_string(),
-        },
-        CatalogEntry {
-            id: "starter-orchestrator".to_string(),
-            name: "Orchestrator — plan, ground, and route".to_string(),
-            role: "orchestrator".to_string(),
-            description: "Ground in the repo first, plan before coding, delegate the I/O, keep egress minimal.".to_string(),
-            source_url: None,
-            body: "# Orchestrator — house conventions\n\n\
-- Ground yourself in the actual repository before acting: read the relevant files and the project state first.\n\
-- Plan the change, then make the smallest edit that fully solves the task; no speculative refactors.\n\
-- Delegate mechanical I/O (bulk reads, boilerplate, simple edits) and keep the reasoning yourself.\n\
-- Use web search sparingly and only when the repo and local knowledge are insufficient; prefer first-party docs.\n\
-- Match the surrounding code's existing style, naming, and patterns; reuse what the project already imports.\n\
-- Run the project's formatter/linter and keep the build green before handing work off.\n\
-- Never print secrets or tokens; never push to remotes without going through the review gate.\n"
-                .to_string(),
-        },
-    ]
-}
 
 /// One featured open-source marketplace the UI surfaces as a discovery pointer (the owner browses
 /// it to find skills to install via the marketplace URL flow). All entries are real, open-licensed.
@@ -1275,52 +1115,6 @@ mod featured_marketplaces_tests {
 /// `enabled` from the toggle state (fail-open true), the rest from the RAW editor reader
 /// so content round-trips exactly. Always returns one entry per [`KNOWN_ROLES`] (absent
 /// skills come back `exists=false, content=""`), so the panel renders a stable grid.
-#[tauri::command]
-pub fn skills_list(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-) -> Result<Vec<SkillEntry>, String> {
-    state.ensure_unlocked()?;
-    skills_list_impl(&working_folder_path)
-}
-
-fn skills_list_impl(working_folder_path: &str) -> Result<Vec<SkillEntry>, String> {
-    let canonical = canonical_working_folder(working_folder_path)?;
-    // Read the toggle state ONCE so the `enabled` column is internally consistent: calling
-    // `skill_enabled` per role would re-read skills-state.json 3 times, so a concurrent
-    // toggle landing mid-loop could make the rows' `enabled` flags mutually inconsistent.
-    // Deriving each row's `enabled` from this one snapshot preserves the EXACT fail-open
-    // semantics of `skill_enabled` (None state ⇒ enabled; role absent ⇒ enabled; explicit
-    // false ⇒ false).
-    //
-    // NOT a fully-consistent snapshot of the WHOLE list: only `enabled` comes from this one
-    // state-file read. Each role's `exists`/`content` is read per-role inside the loop below
-    // (`read_skill_raw`), at slightly different instants — so a SKILL.md written concurrently
-    // mid-loop could appear in one role's row but not reflect in another's. That is an
-    // inherent TOCTOU for any multi-file list with no cross-file lock; it is benign (the
-    // panel self-heals on the next refresh) and not worth a global FS lock on a read path.
-    let state = read_skills_state(&canonical);
-    let entries = KNOWN_ROLES
-        .iter()
-        .map(|&role| {
-            let (exists, content, truncated) = read_skill_raw(&canonical, role);
-            let enabled = state
-                .as_ref()
-                .and_then(|s| s.skills.get(role))
-                .map(|t| t.enabled)
-                .unwrap_or(true);
-            SkillEntry {
-                role: role.to_string(),
-                exists,
-                enabled,
-                bytes: content.len(),
-                content,
-                truncated,
-            }
-        })
-        .collect();
-    Ok(entries)
-}
 
 /// List the editor + toggle state for every Work Console ASSIGNMENT PROFILE
 /// ([`ASSIGNMENT_PROFILES`]) in this project — the tier-aware sibling of [`skills_list`].
@@ -1374,66 +1168,7 @@ fn skills_list_profiles_impl(working_folder_path: &str) -> Result<Vec<SkillEntry
     Ok(entries)
 }
 
-/// Persist (create or overwrite) the `role` SKILL.md for this project. Rejects an unknown
-/// role (no traversal) and a `content` over MAX_SKILL_BYTES with a clear, UI-surfaceable
-/// message (the editor must not silently lose the tail). Serialized via the design write
-/// guard so it never races a concurrent toggle/design write.
-///
-/// DATA-LOSS CONTRACT (Step 3 UI): this overwrites the whole file with `content`. When the
-/// editor was populated from a `truncated == true` read (see [`read_skill_raw`]), `content`
-/// is only the first MAX_SKILL_BYTES of the original — saving it here PERMANENTLY discards
-/// the tail past the cap. The panel MUST warn the user and require explicit confirmation
-/// before issuing this save for a truncated skill.
-#[tauri::command]
-pub fn skills_save(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    role: String,
-    content: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-    skills_save_impl(&working_folder_path, &role, &content)
-}
 
-fn skills_save_impl(working_folder_path: &str, role: &str, content: &str) -> Result<(), String> {
-    validate_role(role)?;
-    if content.len() > MAX_SKILL_BYTES {
-        return Err(format!(
-            "skill too large ({} bytes > {MAX_SKILL_BYTES} max); trim it before saving",
-            content.len()
-        ));
-    }
-    let canonical = canonical_working_folder(working_folder_path)?;
-    write_skill_file(&canonical, role, content)
-}
-
-/// Toggle the `role` skill on/off for this project (read-modify-write of
-/// skills-state.json). Rejects an unknown role. PRESERVES every other role's entry: it
-/// reads the existing state (absent ⇒ empty), mutates only `role`, then re-serializes the
-/// whole map. Held under the design write guard so two concurrent toggles cannot lose an
-/// update (read-modify-write must be atomic per process).
-#[tauri::command]
-pub fn skills_set_enabled(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    role: String,
-    enabled: bool,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-    skills_set_enabled_impl(&working_folder_path, role, enabled)
-}
-
-fn skills_set_enabled_impl(
-    working_folder_path: &str,
-    role: String,
-    enabled: bool,
-) -> Result<(), String> {
-    validate_role(&role)?;
-    let canonical = canonical_working_folder(working_folder_path)?;
-    apply_skill_toggle(&canonical, role, enabled)
-}
 
 /// Mirrors [`skills_set_enabled`] but validates against [`ASSIGNMENT_PROFILES`] (the Work
 /// Console capability tiers, e.g. "mini-big" / "mini-small") instead of [`KNOWN_ROLES`], so
@@ -1496,32 +1231,6 @@ fn apply_skill_toggle(
     atomic_write(&dir.join("skills-state.json"), &json, "skills-state.json")
 }
 
-/// Return the bundled starter-template catalog. No state, no working folder, no FS — just
-/// the SELF-AUTHORED, in-binary templates the panel offers. (Still GPU-free, no network.)
-#[tauri::command]
-pub fn skills_catalog() -> Vec<CatalogEntry> {
-    // No `ensure_unlocked()` ON PURPOSE: this returns only static, in-binary template data —
-    // no project, user, or filesystem state — so there is nothing to gate. The omission is
-    // intentional, not a forgotten lock (the writer `skills_install_from_catalog` IS gated).
-    bundled_catalog()
-}
-
-/// Install a bundled catalog template into the `role` SKILL.md for this project. Rejects
-/// an unknown role and an unknown `catalog_id` (404-style). Owner-initiated, BUNDLED body
-/// only — no network/fetch. Writes through the SAME path as `skills_save` (so the dir
-/// creation, atomic write, and serialization are identical).
-#[tauri::command]
-pub fn skills_install_from_catalog(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    role: String,
-    catalog_id: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-    skills_install_from_catalog_impl(&working_folder_path, &role, &catalog_id)
-}
-
 /// One installable bundled LIBRARY skill row for the panel (name + description; the body is fetched
 /// on install). `pub` because it is a `#[tauri::command]` return type.
 #[derive(Debug, Serialize)]
@@ -1544,73 +1253,6 @@ pub fn skills_library_catalog() -> Vec<LibraryCatalogEntry> {
         .collect()
 }
 
-/// Install a bundled library skill into `.claude/skills/<name>/` for this project. BUNDLED body only
-/// (no network); installs through the SAME vetted path as a marketplace skill (`install_skill_package`:
-/// reserved-name + traversal guards + provenance), so the in-binary skills get identical safety.
-#[tauri::command]
-pub fn skills_install_bundled_library(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    skill_name: String,
-) -> Result<String, String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-    skills_install_bundled_library_impl(&working_folder_path, &skill_name)
-}
-
-fn skills_install_bundled_library_impl(
-    working_folder_path: &str,
-    skill_name: &str,
-) -> Result<String, String> {
-    let tpl = bundled_library_skills()
-        .into_iter()
-        .find(|t| t.name == skill_name)
-        .ok_or_else(|| format!("unknown bundled library skill '{skill_name}'"))?;
-
-    let root = canonical_working_folder(working_folder_path)?;
-    let lib_root = root.join(".claude").join("skills");
-    std::fs::create_dir_all(&lib_root).map_err(|e| format!("create library failed: {e}"))?;
-
-    // Use the VETTED compile-time template name (not the caller's raw string) for the dir + provenance.
-    let prov = super::skill_marketplace::SkillProvenance {
-        source_url: format!("bundled:devboule/{}", tpl.name),
-        fetched_at: String::new(),
-        sha256: super::skill_marketplace::sha256_hex(&tpl.body),
-    };
-
-    let dest = super::skill_marketplace::install_skill_package(
-        &lib_root,
-        &tpl.name,
-        &tpl.body,
-        &[],
-        &prov,
-    )?;
-
-    Ok(dest.to_string_lossy().into_owned())
-}
-
-fn skills_install_from_catalog_impl(
-    working_folder_path: &str,
-    role: &str,
-    catalog_id: &str,
-) -> Result<(), String> {
-    validate_role(role)?;
-    let entry = bundled_catalog()
-        .into_iter()
-        .find(|e| e.id == catalog_id)
-        .ok_or_else(|| format!("unknown catalog template '{catalog_id}'"))?;
-    // A template is authored FOR one role; installing it under a different role would put
-    // (e.g.) the coder template into mini/SKILL.md. Reject the mismatch so a UI bug or a
-    // hand-crafted call can't silently cross-wire a role's house conventions.
-    if entry.role != role {
-        return Err(format!(
-            "catalog template '{catalog_id}' is for role '{}', not '{role}'",
-            entry.role
-        ));
-    }
-    let canonical = canonical_working_folder(working_folder_path)?;
-    write_skill_file(&canonical, role, &entry.body)
-}
 
 // ---------------------------------------------------------------------------
 // LANGUAGE PERSONAS — the (role × language) layer surfaced in the Skills panel.
@@ -1797,103 +1439,8 @@ fn validate_lang(lang: &str) -> Result<(), String> {
 }
 
 /// List the `role`'s language personas (one per bundled-persona language): project override when present,
-/// else the bundled body, with a `source` flag. Always returns the full set so the panel renders
-/// a stable per-role section.
-#[tauri::command]
-pub fn skills_list_langs(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    role: String,
-) -> Result<Vec<LangEntry>, String> {
-    state.ensure_unlocked()?;
-    skills_list_langs_impl(&working_folder_path, &role)
-}
 
-fn skills_list_langs_impl(working_folder_path: &str, role: &str) -> Result<Vec<LangEntry>, String> {
-    validate_role(role)?;
-    let canonical = canonical_working_folder(working_folder_path)?;
-    let entries = bundled_lang_keys()
-        .map(|lang| {
-            let (source, content, truncated) = read_lang_raw(&canonical, role, lang);
-            LangEntry {
-                role: role.to_string(),
-                lang: lang.to_string(),
-                bytes: content.len(),
-                source,
-                content,
-                truncated,
-            }
-        })
-        .collect();
-    Ok(entries)
-}
 
-/// Fork a language persona into the project: atomic-write `.claude/skills/<role>/lang-<lang>.md`.
-/// Same byte-cap + role/lang allowlist as `skills_save`; held under the design write guard.
-#[tauri::command]
-pub fn skills_save_lang(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    role: String,
-    lang: String,
-    content: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-    skills_save_lang_impl(&working_folder_path, &role, &lang, &content)
-}
-
-fn skills_save_lang_impl(
-    working_folder_path: &str,
-    role: &str,
-    lang: &str,
-    content: &str,
-) -> Result<(), String> {
-    validate_role(role)?;
-    validate_lang(lang)?;
-    if content.len() > MAX_SKILL_BYTES {
-        return Err(format!(
-            "skill too large ({} bytes > {MAX_SKILL_BYTES} max); trim it before saving",
-            content.len()
-        ));
-    }
-    let canonical = canonical_working_folder(working_folder_path)?;
-    write_lang_file(&canonical, role, lang, content)
-}
-
-/// Reset a language persona to the bundled default by deleting the project override file. An
-/// absent file is already-bundled ⇒ success (idempotent). Held under the design write guard.
-#[tauri::command]
-pub fn skills_reset_lang(
-    state: State<'_, BackendState>,
-    working_folder_path: String,
-    role: String,
-    lang: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-    skills_reset_lang_impl(&working_folder_path, &role, &lang)
-}
-
-fn skills_reset_lang_impl(working_folder_path: &str, role: &str, lang: &str) -> Result<(), String> {
-    validate_role(role)?;
-    validate_lang(lang)?;
-    let canonical = canonical_working_folder(working_folder_path)?;
-    let target = canonical
-        .join(".claude")
-        .join("skills")
-        .join(role)
-        .join(format!("lang-{lang}.md"));
-    // symlink_metadata = lstat (does NOT follow): only remove a REGULAR file at the override path.
-    // A symlink there is not our file (skip it, don't follow+delete its target); a dir/absent ⇒
-    // nothing to reset (idempotent). role+lang are allowlisted, so the path can't traverse out.
-    match std::fs::symlink_metadata(&target) {
-        Ok(meta) if meta.is_file() => std::fs::remove_file(&target)
-            .map_err(|e| format!("could not reset language persona: {e}"))?,
-        _ => {}
-    }
-    Ok(())
-}
 
 // --- PROFILE-AWARE language personas (Work Console modal): mirror the role versions above but
 // validate ASSIGNMENT_PROFILES so the capability tiers (mini-big/mini-small) can carry per-language
@@ -2374,104 +1921,10 @@ mod tests {
         root.to_str().unwrap().to_string()
     }
 
-    #[test]
-    fn save_then_list_round_trips_content_and_bytes() {
-        let root = fresh_root("save-list");
-        let body = "# Coder rules\nUse tabs.\nTrailing space kept.   ";
-        skills_save_impl(&root_str(&root), "coder", body).unwrap();
-        let entries = skills_list_impl(&root_str(&root)).unwrap();
-        let coder = entries.iter().find(|e| e.role == "coder").unwrap();
-        assert!(coder.exists);
-        assert!(coder.enabled); // no state file ⇒ fail-open enabled
-        assert_eq!(coder.content, body); // exact round-trip (no trim, no marker)
-        assert_eq!(coder.bytes, body.len());
-        assert!(!coder.truncated);
-        // The roles we did NOT write come back absent + enabled + empty.
-        let mini = entries.iter().find(|e| e.role == "mini").unwrap();
-        assert!(!mini.exists);
-        assert!(mini.enabled);
-        assert_eq!(mini.content, "");
-        assert_eq!(mini.bytes, 0);
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn list_on_empty_folder_yields_absent_enabled_empty_for_every_role() {
-        let root = fresh_root("list-empty");
-        let entries = skills_list_impl(&root_str(&root)).unwrap();
-        assert_eq!(entries.len(), KNOWN_ROLES.len());
-        for e in &entries {
-            assert!(!e.exists, "role {} should be absent", e.role);
-            assert!(e.enabled, "role {} should fail-open enabled", e.role);
-            assert_eq!(e.content, "");
-            assert_eq!(e.bytes, 0);
-            assert!(!e.truncated);
-        }
-        // Every known role is present exactly once.
-        for role in KNOWN_ROLES {
-            assert_eq!(entries.iter().filter(|e| &e.role == role).count(), 1);
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn set_enabled_false_reflects_in_list_and_preserves_other_roles() {
-        let root = fresh_root("toggle-list");
-        // Pre-seed an explicit OTHER-role entry so we can prove the RMW preserves it.
-        write_state(&root, r#"{ "skills": { "design": { "enabled": false } } }"#);
-        // Disable coder; design must STAY disabled, mini stays fail-open enabled.
-        skills_set_enabled_impl(&root_str(&root), "coder".to_string(), false).unwrap();
-        let entries = skills_list_impl(&root_str(&root)).unwrap();
-        assert!(!entries.iter().find(|e| e.role == "coder").unwrap().enabled);
-        assert!(!entries.iter().find(|e| e.role == "design").unwrap().enabled);
-        assert!(entries.iter().find(|e| e.role == "mini").unwrap().enabled);
 
-        // The on-disk state round-trips and still carries the pre-existing design entry.
-        let state = read_skills_state(
-            &std::fs::canonicalize(&root).unwrap(),
-        )
-        .expect("state file parses");
-        assert_eq!(state.skills.get("coder").map(|t| t.enabled), Some(false));
-        assert_eq!(state.skills.get("design").map(|t| t.enabled), Some(false));
-        assert!(state.skills.get("mini").is_none()); // never written ⇒ absent ⇒ fail-open
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn set_enabled_true_after_false_flips_back_and_keeps_others() {
-        let root = fresh_root("toggle-flip");
-        skills_set_enabled_impl(&root_str(&root), "mini".to_string(), false).unwrap();
-        skills_set_enabled_impl(&root_str(&root), "coder".to_string(), false).unwrap();
-        // Re-enable mini; coder stays disabled (no lost update across the two RMWs).
-        skills_set_enabled_impl(&root_str(&root), "mini".to_string(), true).unwrap();
-        let entries = skills_list_impl(&root_str(&root)).unwrap();
-        assert!(entries.iter().find(|e| e.role == "mini").unwrap().enabled);
-        assert!(!entries.iter().find(|e| e.role == "coder").unwrap().enabled);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn set_enabled_errors_on_corrupt_state_and_leaves_it_untouched() {
-        let root = fresh_root("toggle-corrupt");
-        // A corrupt skills-state.json EXISTS (unparseable). The toggle must NOT treat it as
-        // an empty map (which would wipe every other role on the read-modify-write); it must
-        // hard-error and leave the file byte-for-byte unchanged so the user can fix/delete it.
-        let corrupt = "{ not json";
-        write_state(&root, corrupt);
-        let err = skills_set_enabled_impl(&root_str(&root), "coder".to_string(), false)
-            .unwrap_err();
-        assert!(
-            err.contains("unreadable or corrupt"),
-            "unexpected error: {err}"
-        );
-        // The corrupt file is left exactly as-is (no silent overwrite, no other-role wipe).
-        let on_disk = std::fs::read_to_string(
-            root.join(".claude").join("skills").join("skills-state.json"),
-        )
-        .unwrap();
-        assert_eq!(on_disk, corrupt);
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
     // --- Per-PROFILE toggle (Work Console tiers) — skills_set_enabled_profile ---
 
@@ -2578,113 +2031,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn save_rejects_content_over_the_byte_cap() {
-        let root = fresh_root("save-toobig");
-        let big = "x".repeat(MAX_SKILL_BYTES + 1);
-        let err = skills_save_impl(&root_str(&root), "coder", &big).unwrap_err();
-        assert!(err.contains("too large"), "unexpected error: {err}");
-        // Nothing was written.
-        let (exists, _, _) = read_skill_raw(&std::fs::canonicalize(&root).unwrap(), "coder");
-        assert!(!exists);
-        // Exactly at the cap is allowed.
-        let at_cap = "y".repeat(MAX_SKILL_BYTES);
-        skills_save_impl(&root_str(&root), "coder", &at_cap).unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn save_set_enabled_and_install_reject_an_unknown_role() {
-        let root = fresh_root("unknown-role");
-        assert!(skills_save_impl(&root_str(&root), "../etc", "hi").is_err());
-        assert!(skills_save_impl(&root_str(&root), "reviewer", "hi").is_err());
-        assert!(
-            skills_set_enabled_impl(&root_str(&root), "reviewer".to_string(), false).is_err()
-        );
-        assert!(
-            skills_install_from_catalog_impl(&root_str(&root), "reviewer", "starter-coder")
-                .is_err()
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn install_from_catalog_writes_the_template_body() {
-        let root = fresh_root("install");
-        skills_install_from_catalog_impl(&root_str(&root), "coder", "starter-coder").unwrap();
-        let (exists, content, truncated) =
-            read_skill_raw(&std::fs::canonicalize(&root).unwrap(), "coder");
-        assert!(exists);
-        assert!(!truncated);
-        // The exact bundled body landed on disk.
-        let expected = bundled_catalog()
-            .into_iter()
-            .find(|e| e.id == "starter-coder")
-            .unwrap()
-            .body;
-        assert_eq!(content, expected);
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn install_from_catalog_rejects_unknown_catalog_id() {
-        let root = fresh_root("install-bad-id");
-        let err = skills_install_from_catalog_impl(&root_str(&root), "coder", "nope")
-            .unwrap_err();
-        assert!(err.contains("unknown catalog template"), "unexpected: {err}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn install_from_catalog_rejects_a_role_template_mismatch() {
-        let root = fresh_root("install-role-mismatch");
-        // "starter-coder" is a CODER template; installing it under "mini" must be rejected
-        // (a valid role + a valid id, but they don't match) and must write NOTHING.
-        let err =
-            skills_install_from_catalog_impl(&root_str(&root), "mini", "starter-coder").unwrap_err();
-        assert!(err.contains("is for role 'coder'"), "unexpected: {err}");
-        let canon = std::fs::canonicalize(&root).unwrap();
-        let (mini_exists, _, _) = read_skill_raw(&canon, "mini");
-        let (coder_exists, _, _) = read_skill_raw(&canon, "coder");
-        assert!(!mini_exists, "mini SKILL.md must not be written on a mismatch");
-        assert!(!coder_exists, "no other role should be written either");
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn catalog_has_one_safe_self_authored_template_per_role() {
-        let catalog = bundled_catalog();
-        for role in KNOWN_ROLES {
-            let entry = catalog
-                .iter()
-                .find(|e| &e.role == role)
-                .unwrap_or_else(|| panic!("no catalog template for role {role}"));
-            assert!(entry.source_url.is_none()); // self-authored ⇒ no external provenance
-            assert!(!entry.body.is_empty());
-            assert!(entry.body.len() < MAX_SKILL_BYTES);
-            // Product-general: no hardcoded ecosystem names.
-            for banned in ["Devboule", "Cloudflare", "Scaleway"] {
-                assert!(!entry.body.contains(banned), "{banned} leaked into {role} template");
-            }
-            // A bundled template is installed VERBATIM into a SKILL.md, then later wrapped by
-            // fenced_skill_block at injection time. A template body must therefore never carry
-            // a fence sentinel itself: even though fenced_skill_block neutralizes forgeries at
-            // injection, our OWN templates must be clean at the source so a future edit can't
-            // smuggle a marker past review under the guise of a "starter".
-            for marker in ["--- END PROJECT SKILL", "--- BEGIN PROJECT SKILL"] {
-                assert!(
-                    !entry.body.contains(marker),
-                    "fence marker {marker:?} leaked into {role} template body"
-                );
-            }
-        }
-        // ids are unique so install-by-id is unambiguous.
-        let mut ids: Vec<&str> = catalog.iter().map(|e| e.id.as_str()).collect();
-        ids.sort_unstable();
-        let unique = ids.len();
-        ids.dedup();
-        assert_eq!(ids.len(), unique, "duplicate catalog ids");
-    }
 
     #[test]
     fn read_skill_raw_does_not_trim_or_add_a_truncation_marker() {

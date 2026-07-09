@@ -605,15 +605,6 @@ fn load_allowed_commands_from_path(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Path-based writer used by the Tauri commands and tests.
-fn write_allowed_commands_to_path(path: &Path, commands: &BTreeSet<String>) -> Result<(), String> {
-    let file = AllowedCommandsFile {
-        allowed_commands: commands.iter().cloned().collect(),
-    };
-    let contents = serde_json::to_string_pretty(&file)
-        .map_err(|e| format!("Could not serialize allowed commands: {e}"))?;
-    super::design::atomic_write(path, &contents, "user-mcp-allowed-commands.json")
-}
 
 // ---------------------------------------------------------------------------
 // Merge — the launch-injection entry point
@@ -893,64 +884,6 @@ pub fn user_mcp_set_enabled(
     let _guard = design_write_guard()?;
     let path = resolve_path(&app, scope, project_root.as_deref())?;
     set_enabled_impl(&path, &name, enabled)
-}
-
-/// List the globally-allowlisted MCP commands. Returns an empty list if the file is absent
-/// or malformed (fail-open semantics match the launch-time loader).
-#[tauri::command]
-pub fn user_mcp_allowed_commands_list(
-    state: State<'_, BackendState>,
-    app: tauri::AppHandle,
-) -> Result<Vec<String>, String> {
-    state.ensure_unlocked()?;
-    // Fail-open: returns an empty list if the file is absent/malformed.
-    let allowed = load_allowed_commands(&app);
-    Ok(allowed.into_iter().collect())
-}
-
-/// Add a command to the global allowlist. Validates the command is non-empty, has no
-/// control characters, and does not exceed 4096 characters. Deduplicates automatically.
-#[tauri::command]
-pub fn user_mcp_allowed_commands_add(
-    state: State<'_, BackendState>,
-    app: tauri::AppHandle,
-    command: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return Err("Command must not be empty.".to_string());
-    }
-    if trimmed.chars().any(|c| c.is_control()) {
-        return Err("Command must not contain control characters.".to_string());
-    }
-    if trimmed.chars().count() > 4096 {
-        return Err("Command must not exceed 4096 characters.".to_string());
-    }
-
-    let path = global_allowed_commands_path(&app)?;
-    let mut allowed = load_allowed_commands(&app);
-    allowed.insert(trimmed.to_string()); // BTreeSet dedupes
-    write_allowed_commands_to_path(&path, &allowed)
-}
-
-/// Remove a command from the global allowlist (idempotent: no-op if absent).
-#[tauri::command]
-pub fn user_mcp_allowed_commands_remove(
-    state: State<'_, BackendState>,
-    app: tauri::AppHandle,
-    command: String,
-) -> Result<(), String> {
-    state.ensure_unlocked()?;
-    let _guard = design_write_guard()?;
-
-    let trimmed = command.trim();
-    let path = global_allowed_commands_path(&app)?;
-    let mut allowed = load_allowed_commands(&app);
-    allowed.remove(trimmed);
-    write_allowed_commands_to_path(&path, &allowed)
 }
 
 #[cfg(test)]
@@ -1732,33 +1665,4 @@ mod allowlist_tests {
         );
     }
 
-    #[test]
-    fn allowed_commands_round_trip() {
-        let dir = temp_dir();
-        let path = dir.join("allowlist.json");
-
-        // File absent → empty.
-        assert!(load_allowed_commands_from_path(&path).is_empty());
-
-        // Add "python" and "node".
-        let mut allowed = load_allowed_commands_from_path(&path);
-        allowed.insert("python".to_string());
-        allowed.insert("node".to_string());
-        write_allowed_commands_to_path(&path, &allowed).unwrap();
-
-        let list = load_allowed_commands_from_path(&path);
-        assert_eq!(list.len(), 2);
-        assert!(list.contains("python"));
-        assert!(list.contains("node"));
-
-        // Remove "python".
-        let mut allowed = load_allowed_commands_from_path(&path);
-        allowed.remove("python");
-        write_allowed_commands_to_path(&path, &allowed).unwrap();
-
-        let list = load_allowed_commands_from_path(&path);
-        assert_eq!(list.len(), 1);
-        assert!(list.contains("node"));
-        assert!(!list.contains("python"));
-    }
 }
