@@ -1,6 +1,7 @@
 import {
 	AlertCircle,
 	Archive,
+	CalendarDays,
 	CheckCircle2,
 	Circle,
 	Clock3,
@@ -36,6 +37,8 @@ import type { PendingSend } from "../projects/planner/plannerModel";
 import type { SlashResult } from "../../hooks/useSlashCommands";
 import type { DesignProjectEntry } from "../../types/design";
 import { ProjectCalendar } from "../projects/ProjectCalendar";
+import { totalMilestoneCount } from "../projects/projectCalendarModel";
+import { readCalendarOpenPref, writeCalendarOpenPref } from "../projects/calendarOpenPref";
 import {
 	clearPersistedProjectRootDraft,
 	persistProjectRootDraft,
@@ -203,6 +206,10 @@ const PLANNER_CLIENT_KEY = "devboule.planner.orchestratorClient";
 // volatile selection made a restarted app look like the same conversation
 // while the composer was actually unbound, swallowing messages).
 const SELECTED_PROJECT_KEY = "devboule.projects.selectedId";
+// localStorage key for the board calendar visibility toggle (open/closed). The
+// read/write helpers live in ../projects/calendarOpenPref (readCalendarOpenPref /
+// writeCalendarOpenPref); the key is co-located there with them, matching the
+// persisted-pref convention used by projectRootDraft.ts.
 // (The former `devboule.orch.<projectId>` persisted-orchestrator-id key is GONE —
 // D1 made the orchestrator id a pure function of the project id, so nothing needs
 // remembering. Old keys are dead-but-harmless.)
@@ -236,6 +243,11 @@ export function ProjectsView() {
 	// (default) vs. a simple read-only list of archived projects. Purely a view
 	// sub-state of board mode; it never affects Work mode or the selection.
 	const [overviewTab, setOverviewTab] = useState<"board" | "archived">("board");
+	// Board calendar visibility: hidden by default, toggled by the new Calendar
+	// button in the overview row, and persisted so a reload restores it.
+	const [calendarOpen, setCalendarOpen] = useState<boolean>(() =>
+		readCalendarOpenPref(),
+	);
 	// Planner panel (Plan Mode) controls — lifted from the old OrchestratorHeroCard so
 	// the choices survive (coder hand-off, auto-create, websearch auto/manual).
 	const [plannerCoderId, setPlannerCoderId] = useState<string>("claude");
@@ -457,6 +469,10 @@ export function ProjectsView() {
 			/* storage unavailable — non-fatal */
 		}
 	}, [selectedId]);
+	// Persist the board calendar-open preference so it survives a reload (S2).
+	useEffect(() => {
+		writeCalendarOpenPref(calendarOpen);
+	}, [calendarOpen]);
 	// Restore ONCE, after the first project-list load: only if nothing is selected
 	// yet and the stored project still exists. Guarded by a ref so a later
 	// deliberate deselection is never fought by a re-restore.
@@ -1036,6 +1052,12 @@ export function ProjectsView() {
 	const activeProjects = useMemo(
 		() => projects.filter((p) => p.status !== "archived"),
 		[projects],
+	);
+	// Milestone total powering the Calendar toggle's count chip. Reuses the exact
+	// helper ProjectCalendar uses internally so the two never disagree.
+	const milestoneCount = useMemo(
+		() => totalMilestoneCount(activeProjects),
+		[activeProjects],
 	);
 
 	// The archived projects, surfaced via the overview "Archived (N)" toggle. Most
@@ -3502,6 +3524,154 @@ export function ProjectsView() {
 						</section>
 					)}
 
+
+					{/* Overview segmented toggle: the active stage board (default) vs. a simple
+          read-only list of archived projects. The "Archived (N)" segment is shown
+          disabled when there is nothing archived, so the control stays predictable
+          without cluttering the header when N === 0. */}
+					<div className="flex items-center gap-1 rounded-lg border border-cream-200 bg-white p-1 w-fit">
+						<button
+							type="button"
+							onClick={() => setOverviewTab("board")}
+							aria-pressed={overviewTab === "board"}
+							data-help-title="Show the active stage board and calendar."
+							data-help-lines="The board is the active project workflow.|Archived projects leave the board and the calendar.|Use the Archived tab to find and reopen them.|This toggle only changes the overview, not the selection."
+							className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+								overviewTab === "board"
+									? "bg-terracotta text-white"
+									: "text-cream-600 hover:bg-cream-50"
+							}`}
+						>
+							Board
+						</button>
+						<button
+							type="button"
+							onClick={() => setOverviewTab("archived")}
+							aria-pressed={overviewTab === "archived"}
+							disabled={archivedProjects.length === 0}
+							data-help-title="Show archived projects."
+							data-help-lines="Archived projects are read-only and out of the active workflow.|They do not appear on the board or the calendar.|Open one to view it, then Unarchive from its page to make it active again.|Archiving is reversible."
+							className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors disabled:opacity-40 ${
+								overviewTab === "archived"
+									? "bg-terracotta text-white"
+									: "text-cream-600 hover:bg-cream-50"
+							}`}
+						>
+							Archived ({archivedProjects.length})
+						</button>
+						{overviewTab === "board" && (
+							<button
+								type="button"
+								onClick={() => setCalendarOpen((open) => !open)}
+								aria-expanded={calendarOpen}
+								data-help-title="Show or hide the milestone calendar."
+								data-help-lines="The calendar aggregates every project's milestones into a dated agenda.|Toggle it to plan around deadlines without leaving the board.|Its open/closed state is remembered across reloads.|Archived projects are excluded, just like on the board."
+								className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors ${
+									calendarOpen
+										? "bg-terracotta text-white"
+										: "text-cream-600 hover:bg-cream-50"
+								}`}
+							>
+								<CalendarDays className="h-3.5 w-3.5" aria-hidden />
+								Calendar
+								{milestoneCount > 0 && (
+									<span
+										className={`ml-1 rounded-full px-1.5 text-[10px] font-semibold ${
+											calendarOpen
+												? "bg-white/25 text-white"
+												: "bg-cream-100 text-cream-600"
+											}`}
+									>
+										{milestoneCount}
+									</span>
+								)}
+							</button>
+						)}
+					</div>
+
+					{overviewTab === "archived" ? (
+						// Archived list: a calm read-only list of archived projects, each with an
+						// [Open] button that enters the same single-project Work mode a board card
+						// does (enterWorkMode). Unarchive lives in the page banner (Part 2).
+						<section className="rounded-lg border border-cream-200 bg-white p-4">
+							<div className="mb-3 flex items-center gap-2">
+								<Archive className="h-4 w-4 text-cream-500" aria-hidden />
+								<h3 className="text-sm font-semibold text-cream-800">
+									Archived projects
+								</h3>
+							</div>
+							{archivedProjects.length === 0 ? (
+								<p className="text-[12px] text-cream-400">
+									No archived projects.
+								</p>
+							) : (
+								<ul className="space-y-2">
+									{archivedProjects.map((item) => (
+										<li
+											key={item.id}
+											className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-cream-50 p-3 sm:flex-row sm:items-center sm:justify-between"
+										>
+											<div className="min-w-0">
+												<p className="truncate text-[12px] font-semibold text-cream-800">
+													{item.title}
+												</p>
+												<p className="mt-0.5 text-[11px] text-cream-400">
+													Updated {formatDateTime(item.updatedAt)}
+												</p>
+											</div>
+											<button
+												type="button"
+												onClick={() => enterWorkMode(item.id)}
+												className="shrink-0 self-start rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 sm:self-auto"
+											>
+												Open
+											</button>
+										</li>
+									))}
+								</ul>
+							)}
+						</section>
+					) : (
+						<>
+							{activeProjects.length === 0 ? (
+								<main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
+									<FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />
+									<p className="text-sm font-semibold text-cream-700">
+										{error && projects.length === 0
+											? "Project list unavailable."
+											: "Create a project to start."}
+									</p>
+									<p className="mt-1 text-[12px] text-cream-400">
+										{error && projects.length === 0
+											? "Fix the load error above or reload the project folder."
+											: "Files are stored as local Markdown with a structured Devboule project block."}
+									</p>
+								</main>
+							) : (
+								<ProjectsBoard
+									projectsByStage={projectsByStage}
+									claimsByProject={claimsByProject}
+									sessionsByProject={sessionsByProject}
+									censorCountByProject={censorCountByProject}
+									selectedId={selectedId}
+									isLoading={isLoadingProjects}
+									onSelect={enterWorkMode}
+								/>
+							)}
+
+							{/* Calendar / organizer BELOW the board (Board mode only: this whole
+              block is skipped in Work mode). Fed from activeProjects so archived
+              projects leave the calendar exactly as they leave the stage board. */}
+							{calendarOpen && (
+								<ProjectCalendar
+									projects={activeProjects}
+									onSelectProject={selectProjectOnly}
+									onChanged={() => void loadProjects()}
+								/>
+							)}
+						</>
+					)}
+
 					{/* The Orchestrator composer — the centerpiece "describe a goal → plan → board" surface.
           Always visible; "Plan it" stays guarded until a project with a working folder is selected
           (the wiring to the existing plan-first flow lands in a follow-up). */}
@@ -3817,106 +3987,6 @@ export function ProjectsView() {
 						}}
 					/>
 
-					{/* Overview segmented toggle: the active stage board (default) vs. a simple
-          read-only list of archived projects. The "Archived (N)" segment is shown
-          disabled when there is nothing archived, so the control stays predictable
-          without cluttering the header when N === 0. */}
-					<div className="flex items-center gap-1 rounded-lg border border-cream-200 bg-white p-1 w-fit">
-						<button
-							type="button"
-							onClick={() => setOverviewTab("board")}
-							aria-pressed={overviewTab === "board"}
-							data-help-title="Show the active stage board and calendar."
-							data-help-lines="The board is the active project workflow.|Archived projects leave the board and the calendar.|Use the Archived tab to find and reopen them.|This toggle only changes the overview, not the selection."
-							className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors ${
-								overviewTab === "board"
-									? "bg-terracotta text-white"
-									: "text-cream-600 hover:bg-cream-50"
-							}`}
-						>
-							Board
-						</button>
-						<button
-							type="button"
-							onClick={() => setOverviewTab("archived")}
-							aria-pressed={overviewTab === "archived"}
-							disabled={archivedProjects.length === 0}
-							data-help-title="Show archived projects."
-							data-help-lines="Archived projects are read-only and out of the active workflow.|They do not appear on the board or the calendar.|Open one to view it, then Unarchive from its page to make it active again.|Archiving is reversible."
-							className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors disabled:opacity-40 ${
-								overviewTab === "archived"
-									? "bg-terracotta text-white"
-									: "text-cream-600 hover:bg-cream-50"
-							}`}
-						>
-							Archived ({archivedProjects.length})
-						</button>
-					</div>
-
-					{overviewTab === "archived" ? (
-						// Archived list: a calm read-only list of archived projects, each with an
-						// [Open] button that enters the same single-project Work mode a board card
-						// does (enterWorkMode). Unarchive lives in the page banner (Part 2).
-						<section className="rounded-lg border border-cream-200 bg-white p-4">
-							<div className="mb-3 flex items-center gap-2">
-								<Archive className="h-4 w-4 text-cream-500" aria-hidden />
-								<h3 className="text-sm font-semibold text-cream-800">
-									Archived projects
-								</h3>
-							</div>
-							{archivedProjects.length === 0 ? (
-								<p className="text-[12px] text-cream-400">
-									No archived projects.
-								</p>
-							) : (
-								<ul className="space-y-2">
-									{archivedProjects.map((item) => (
-										<li
-											key={item.id}
-											className="flex flex-col gap-2 rounded-lg border border-cream-200 bg-cream-50 p-3 sm:flex-row sm:items-center sm:justify-between"
-										>
-											<div className="min-w-0">
-												<p className="truncate text-[12px] font-semibold text-cream-800">
-													{item.title}
-												</p>
-												<p className="mt-0.5 text-[11px] text-cream-400">
-													Updated {formatDateTime(item.updatedAt)}
-												</p>
-											</div>
-											<button
-												type="button"
-												onClick={() => enterWorkMode(item.id)}
-												className="shrink-0 self-start rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-700 hover:bg-cream-50 sm:self-auto"
-											>
-												Open
-											</button>
-										</li>
-									))}
-								</ul>
-							)}
-						</section>
-					) : (
-						<>
-							<ProjectsBoard
-								projectsByStage={projectsByStage}
-								claimsByProject={claimsByProject}
-								sessionsByProject={sessionsByProject}
-								censorCountByProject={censorCountByProject}
-								selectedId={selectedId}
-								isLoading={isLoadingProjects}
-								onSelect={enterWorkMode}
-							/>
-
-							{/* Calendar / organizer BELOW the board (Board mode only: this whole
-              block is skipped in Work mode). Fed from activeProjects so archived
-              projects leave the calendar exactly as they leave the stage board. */}
-							<ProjectCalendar
-								projects={activeProjects}
-								onSelectProject={selectProjectOnly}
-								onChanged={() => void loadProjects()}
-							/>
-						</>
-					)}
 
 					<div className="grid grid-cols-1 gap-5">
 						{selectedId &&
@@ -3936,7 +4006,7 @@ export function ProjectsView() {
 						) : currentProject ? // B8: the per-project detail moved to the single-project Work page
 						// (ProjectWorkspace detailSlot ← projectDetailNode). The landing is now
 						// create + Kanban(history); a selected project opens its own page.
-						null : (
+						null : projects.length === 0 || activeProjects.length === 0 ? null : (
 							<main className="rounded-lg border border-dashed border-cream-200 bg-white p-8 text-center">
 								<FolderKanban className="mx-auto mb-3 h-8 w-8 text-cream-300" />
 								<p className="text-sm font-semibold text-cream-700">
