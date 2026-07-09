@@ -13,6 +13,38 @@ export function formatDate(value: string | null | undefined) {
   return value.slice(0, 10);
 }
 
+// How long ago a project was last updated, in coarse buckets.
+const RELATIVE_THRESHOLD_DAYS = 30;
+
+function differenceMs(iso: string, now: Date): number {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return 0;
+  return now.getTime() - then;
+}
+
+function fmt(diff: number, now: Date): string {
+  // Negative diff (a future timestamp) is treated as "just now" — never a
+  // negative bucket.
+  if (diff < 0) return "just now";
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  if (diff < RELATIVE_THRESHOLD_DAYS * 86_400_000) {
+    return `${Math.floor(diff / 86_400_000)}d ago`;
+  }
+  // Beyond the threshold: fall back to the existing absolute short date so we
+  // don't invent a different long-format renderer.
+  return formatDate(new Date(now.getTime() - diff).toISOString());
+}
+
+/** Coarse relative-time label for an ISO timestamp. `now` is injectable so the
+ *  result is deterministic in tests; defaults to the current time. Buckets:
+ *  seconds→"just now", minutes→"Xm ago", hours→"Xh ago", days→"Xd ago";
+ *  beyond `RELATIVE_THRESHOLD_DAYS` it falls back to the absolute short date. */
+export function relativeTime(iso: string, now: Date = new Date()): string {
+  return fmt(differenceMs(iso, now), now);
+}
+
 export function formatDateTime(value: string | null | undefined) {
   if (!value) return "never";
   const date = new Date(value);

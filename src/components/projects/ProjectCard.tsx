@@ -6,6 +6,13 @@ import type {
   ProjectSummary,
 } from "../../types/backend";
 import { censorChipAria, censorChipLabel, gitChipModel } from "./censorCounts";
+import {
+  folderBasename,
+  nextMilestone,
+  TASK_BREAKDOWN_ORDER,
+  taskCountsLine,
+} from "./projectCardModel";
+import { formatDate, relativeTime } from "./projectFormat";
 
 const statusDotTone: Record<ProjectStatus, string> = {
   draft: "bg-cream-300",
@@ -67,15 +74,19 @@ function ProjectCardComponent({
   const censorLabel = censorChipLabel(censorCount);
   const censorAria = censorChipAria(censorCount);
 
+  // Self-explanatory face derivations (pure; see projectCardModel / projectFormat).
+  const folder = folderBasename(project.rootPath);
+  const relTime = relativeTime(project.updatedAt);
+  const countsLine = taskCountsLine(counts);
+  const next = nextMilestone(project.milestones, new Date());
+
   return (
     <button
       type="button"
       onClick={() => onSelect(project.id)}
       data-help-title="This opens a project from the stage board."
       data-help-lines="The stage board is the mini-Notion view of all projects.|Cards move stage based on tasks, agent claims, sessions, and verifier status.|Opening a card shows the detailed Kanban, notes, root, and agent controls.|The card itself does not modify the project."
-      aria-label={`Open project ${project.title}. Stage ${stageLabel}. ${counts.done} of ${counts.total} tasks done.${
-        agentActive ? " Agent working." : ""
-      }`}
+      aria-label={`Open project ${project.title}. Stage ${stageLabel}. ${counts.done} of ${counts.total} tasks done.${counts.blocked > 0 ? ` ${counts.blocked} blocked.` : ""}${agentActive ? " Agent working." : ""}${next ? ` Next milestone: ${next.title}${next.overdue ? " (overdue)" : ""}.` : ""}`}
       aria-pressed={selected}
       className={`w-full rounded-lg border bg-white p-3 text-left shadow-soft-sm transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-terracotta/40 ${
         selected
@@ -96,8 +107,28 @@ function ProjectCardComponent({
         </p>
       </div>
 
-      {/* WHO + CHIPS + PROGRESS: a single muted second line. WHO on the left;
-          the git/Censor chips and the done/total hint clustered on the right. */}
+      {/* WHERE + WHEN: the project's folder basename (full path on hover) on the
+          left, a coarse relative updated-at on the right. Both single-line,
+          truncated, so the card never grows unpredictably tall. */}
+      <div className="mt-1.5 flex items-center justify-between gap-2 pl-4">
+        {folder ? (
+          <span
+            className="min-w-0 truncate font-mono text-[10px] text-cream-500"
+            title={project.rootPath ?? undefined}
+          >
+            {folder}
+          </span>
+        ) : (
+          <span />
+        )}
+        <span className="shrink-0 font-mono text-[10px] text-cream-400">
+          {relTime}
+        </span>
+      </div>
+
+      {/* WHO + CHIPS + PROGRESS: a single muted line. WHO on the left; the
+          git/Censor chips and the compact per-state breakdown clustered right.
+          `blocked` is tinted the warn/coral tone used elsewhere for warnings. */}
       <div className="mt-2 flex items-center justify-between gap-2 pl-4">
         {who ? (
           <span
@@ -137,11 +168,70 @@ function ProjectCardComponent({
               {censorLabel}
             </span>
           )}
-          <span className="font-mono text-[10px] font-semibold text-cream-400">
-            {counts.done}/{counts.total}
-          </span>
+          {countsLine ? (
+            <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] font-semibold">
+              {TASK_BREAKDOWN_ORDER.filter((s) => counts[s.key] > 0).map(
+                (s, i) => (
+                  <span key={s.key} className="flex items-center gap-1.5">
+                    {i > 0 && (
+                      <span className="text-cream-300" aria-hidden>
+                        ·
+                      </span>
+                    )}
+                    <span
+                      className={
+                        s.key === "blocked"
+                          ? "text-coral-dark"
+                          : "text-cream-400"
+                      }
+                    >
+                      {counts[s.key]} {s.label}
+                    </span>
+                  </span>
+                ),
+              )}
+            </span>
+          ) : counts.total === 0 ? (
+            <span className="shrink-0 font-mono text-[10px] font-medium text-cream-400">
+              no tasks yet
+            </span>
+          ) : (
+            <span className="shrink-0 font-mono text-[10px] font-medium text-cream-400">
+              {counts.todo} to do
+            </span>
+          )}
         </span>
       </div>
+
+      {/* NEXT MILESTONE (conditional): the soonest upcoming milestone, or the
+          most recent overdue one (coral + "overdue"). Omitted entirely when the
+          project has no milestones. Single-line + truncate. */}
+      {next && (
+        <div className="mt-1 flex min-w-0 items-center gap-1 pl-4">
+          <span className="shrink-0 text-cream-400" aria-hidden>
+            {"\u{25C7}"}
+          </span>
+          <span
+            className={`min-w-0 truncate text-[10px] ${
+              next.overdue ? "text-coral-dark" : "text-cream-500"
+            }`}
+          >
+            {next.title}
+          </span>
+          <span
+            className={`shrink-0 font-mono text-[10px] ${
+              next.overdue ? "text-coral-dark" : "text-cream-400"
+            }`}
+          >
+            {formatDate(next.date)}
+          </span>
+          {next.overdue && (
+            <span className="shrink-0 text-[10px] font-medium text-coral-dark">
+              overdue
+            </span>
+          )}
+        </div>
+      )}
     </button>
   );
 }
