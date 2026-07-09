@@ -69,6 +69,10 @@ pub struct SinRecord {
     /// RFC 3339 UTC timestamp of last state change.
     #[serde(default)]
     pub updated_at: String,
+    /// Id of the last main-coder directive dispatched for this sin.
+    /// Cleared when the file's content hash changes (different-hash upsert).
+    #[serde(default)]
+    pub fix_directive_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +219,7 @@ pub fn to_records(
                 disposition: Disposition::Open,
                 created_at: now.clone(),
                 updated_at: now.clone(),
+                fix_directive_id: None,
             }
         })
         .collect()

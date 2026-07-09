@@ -83,6 +83,74 @@ pub(crate) fn validate_main_coder_request(
     Ok((task, validated_files))
 }
 
+/// Append a first-class Main coder directive to the shared agent ledger.
+///
+/// Core logic extracted from the `spawn_main_coder_directive` Tauri command so
+/// that non-command code (e.g. `polis_fix_sin`) can dispatch directives without
+/// needing a `State<BackendState>` handle. The caller is responsible for the
+/// unlocked-vault check — this helper does NOT call `ensure_unlocked`.
+///
+/// Returns the generated directive id on success.
+pub(crate) fn append_main_coder_directive(
+    app: &tauri::AppHandle,
+    project_id: &str,
+    task: String,
+    files: Vec<String>,
+) -> Result<String, String> {
+    // 1. Pure validation (see module doc comment).
+    let (task, files) = validate_main_coder_request(&task, &files)?;
+
+    // 2. Fail-fast: project must exist (the executor re-resolves the root).
+    crate::backend::projects::resolve_project_root_by_id(app, project_id)?;
+
+    // 3. Build the directive.
+    //
+    // MiniCoderDirective does NOT implement Default. Every field must be
+    // filled explicitly — the pattern is copied from the `directive(...)`
+    // test fixture in mini_coder.rs.
+    let id = generate_id();
+    let directive = MiniCoderDirective {
+        id: id.clone(),
+        parent_agent_id: "app-user".into(),
+        status: MiniCoderStatus::Pending,
+        task,
+        files,
+        write: true,
+        write_mode: WriteMode::AgenticIterative,
+        tier: DirectiveTier::Main,
+        // Explicit scope: app-authored directives carry their project directly
+        // (there is no live parent session to derive it from).
+        project_id: Some(project_id.to_string()),
+        backend: None,
+        allow_oracle: false,
+        kill_requested: false,
+        steer_queue: Vec::new(),
+        result_path: format!("{id}.json"),
+        agent_id: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        claimed_at: None,
+        scratch_path: None,
+        started_at: None,
+        result: None,
+        attempt: 0,
+        parent_directive_id: None,
+        pigeon_ticket: None,
+        collected: None,
+    };
+
+    // 4. Append under the ledger lock, then run the shared eviction pass so the
+    //    directive queue honors MAX_DIRECTIVES like every other mutation site
+    //    (terminal directives beyond the cap are evicted oldest-first; an active
+    //    one is never dropped).
+    crate::backend::agents::mutate_agent_live_state(app, |st| {
+        st.mini_coder_directives.push(directive.clone());
+        crate::backend::mini_coder_executor::cap_pass(st);
+    })?;
+
+    // 5. Return the directive id.
+    Ok(id)
+}
+
 /// Tauri command: append a first-class Main coder directive to the shared
 /// agent ledger.
 ///
@@ -103,58 +171,9 @@ pub fn spawn_main_coder_directive(
     // 1. Unlocked vault check (spawning work requires the unlocked vault).
     state.ensure_unlocked()?;
 
-    // 2. Pure validation (see module doc comment).
-    let (task, files) = validate_main_coder_request(&task, &files)?;
-
-    // 3. Fail-fast: project must exist (the executor re-resolves the root).
-    crate::backend::projects::resolve_project_root_by_id(&app, &project_id)?;
-
-    // 4. Build the directive.
-    //
-    // MiniCoderDirective does NOT implement Default. Every field must be
-    // filled explicitly — the pattern is copied from the `directive(...)`
-    // test fixture in mini_coder.rs.
-    let id = generate_id();
-    let directive = MiniCoderDirective {
-        id: id.clone(),
-        parent_agent_id: "app-user".into(),
-        status: MiniCoderStatus::Pending,
-        task,
-        files,
-        write: true,
-        write_mode: WriteMode::AgenticIterative,
-        tier: DirectiveTier::Main,
-        // Explicit scope: app-authored directives carry their project directly
-        // (there is no live parent session to derive it from).
-        project_id: Some(project_id.clone()),
-        backend: None,
-        allow_oracle: false,
-        kill_requested: false,
-        steer_queue: Vec::new(),
-        result_path: format!("{id}.json"),
-        agent_id: None,
-        created_at: chrono::Utc::now().to_rfc3339(),
-        claimed_at: None,
-        scratch_path: None,
-        started_at: None,
-        result: None,
-        attempt: 0,
-        parent_directive_id: None,
-        pigeon_ticket: None,
-        collected: None,
-    };
-
-    // 5. Append under the ledger lock, then run the shared eviction pass so the
-    //    directive queue honors MAX_DIRECTIVES like every other mutation site
-    //    (terminal directives beyond the cap are evicted oldest-first; an active
-    //    one is never dropped).
-    crate::backend::agents::mutate_agent_live_state(&app, |st| {
-        st.mini_coder_directives.push(directive.clone());
-        crate::backend::mini_coder_executor::cap_pass(st);
-    })?;
-
-    // 6. Return the directive id.
-    Ok(id)
+    // 2. Delegate to the extracted helper (validation + project check + build +
+    //    append + cap_pass). Behavior identical to the original inlined body.
+    append_main_coder_directive(&app, &project_id, task, files)
 }
 
 // ---------------------------------------------------------------------------

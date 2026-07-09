@@ -367,6 +367,10 @@ fn merge_sins(
 ) -> PolisSinShard {
     // Build a map of old sins by id (only those at the SAME content hash).
     // Sins at a different hash are dropped entirely.
+    // DIFFERENT-HASH RESET: when old hash != new hash, old_by_id stays empty so all
+    // fresh sins enter via the "new sin" branch — fix_directive_id resets to None
+    // because SinRecord::fix_directive_id defaults to None in fresh records (built
+    // from DetectedSins which have no dispatch-tracking field).
     let mut old_by_id: HashMap<String, SinRecord> = HashMap::new();
     if let Some(ref old_shard) = existing {
         if old_shard.content_hash == new_hash {
@@ -395,10 +399,13 @@ fn merge_sins(
         let fresh = deduped[id];
         let mut sin = fresh.clone();
         if let Some(old) = old_by_id.get(fresh.id.as_str()) {
-            // Same id at same hash: carry over disposition. By definition the
-            // disposition hasn't changed (it's a carry-over), so keep the old
-            // updated_at — the re-detection is not a state change.
+            // Same id at same hash: carry over disposition AND fix_directive_id.
+            // By definition the disposition hasn't changed (it's a carry-over),
+            // so keep the old updated_at — the re-detection is not a state change.
+            // fix_directive_id is a dispatch-tracking field set by D8; it must
+            // survive re-scans at the same content hash, exactly like disposition.
             sin.disposition = old.disposition;
+            sin.fix_directive_id = old.fix_directive_id.clone();
             sin.created_at = old.created_at.clone();
             sin.updated_at = old.updated_at.clone();
         } else {
@@ -590,6 +597,212 @@ pub fn dispose(
     Ok(false)
 }
 
+
+/// Read-only lookup for a single sin by id. Same location strategy as `dispose`
+/// (hint fast-path when `rel_path_hint` is provided, else full scan). Corrupt
+/// shards are tolerated (skipped), like `load_all_sins`.
+///
+/// **Hint semantics:** when a `rel_path_hint` is given the hinted shard is tried
+/// first. If the sin is NOT found there (e.g. the hint is stale after a rename
+/// or the sin lives in a different shard), the lookup FALLS THROUGH to a full
+/// scan instead of returning `None` prematurely -- a stale hint must never cause
+/// a false not-found.
+///
+/// Returns `Some(SinRecord)` if found, `None` if not found in any healthy shard.
+pub fn find_sin(root: &Path, rel_path_hint: Option<&str>, sin_id: &str) -> Option<SinRecord> {
+    // Fast path: try the hinted shard first.
+    if let Some(rel) = rel_path_hint {
+        if let Ok(path) = shard_path(root, rel) {
+            if let Ok(Some(shard)) = read_shard_at(&path) {
+                if let Some(found) = shard.sins.into_iter().find(|s| s.id == sin_id) {
+                    return Some(found);
+                }
+            }
+            // Hinted shard didn't contain the sin -- fall through to full scan
+            // (stale hint after rename must not cause a false not-found).
+        }
+    }
+
+    // Full scan: check every shard.
+    let dir = sins_dir(root);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        _ => return None,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match read_shard_at(&path) {
+            Ok(Some(shard)) => {
+                if let Some(found) = shard.sins.into_iter().find(|s| s.id == sin_id) {
+                    return Some(found);
+                }
+            }
+            _ => {} // skip absent or corrupt shards
+        }
+    }
+    None
+}
+
+/// Mark a sin's `fix_directive_id` after a main-coder directive has been
+/// dispatched for it. Same locking discipline as `dispose` (SIN_WRITE_LOCK +
+/// per-shard lock, atomic temp-then-rename).
+///
+/// **Compare-and-set semantics:** `expected_prev` is the value read from the
+/// record before the directive was spawned.  If the record's current
+/// `fix_directive_id` does not match `expected_prev` the write is rejected with
+/// `Err("another fix was dispatched concurrently for this sin")` -- no
+/// modification is made.
+///
+/// **Hint semantics:** when a `rel_path_hint` is given the hinted shard is tried
+/// first.  If the sin is NOT found there the lookup FALLS THROUGH to a full scan
+/// instead of returning `Ok(false)` prematurely -- a stale hint after a rename
+/// must not cause a false not-found.
+///
+/// - Sets `fix_directive_id = Some(directive_id)` and bumps `updated_at` on CAS
+///   success.
+/// - Rejects (`Err`) if the record's disposition is not `Open` -- only Open sins
+///   can be dispatched.
+/// - Returns `Ok(false)` if the sin was not found in any shard.
+pub fn mark_fix_dispatched(
+    root: &Path,
+    rel_path_hint: Option<&str>,
+    sin_id: &str,
+    directive_id: &str,
+    expected_prev: Option<&str>,
+) -> Result<bool, String> {
+    // Fast path: try the hinted shard first; fall through to full scan if the
+    // sin is not there (stale hint after rename -> still found).
+    if let Some(rel) = rel_path_hint {
+        if let Ok(shard_path) = shard_path(root, rel) {
+            let result = try_mark_fix_dispatched_in_shard(
+                &shard_path,
+                sin_id,
+                directive_id,
+                expected_prev,
+            )?;
+            if result.is_some() {
+                return result.unwrap();
+            }
+            // Hinted shard didn't contain the sin -- fall through to full scan.
+        }
+    }
+
+    // Full scan: check every shard.
+    let dir = sins_dir(root);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("Failed to read sins directory: {e}")),
+    };
+
+    let mut found_shard: Option<PathBuf> = None;
+    let mut corrupt_count: usize = 0;
+    let mut first_corrupt: Option<PathBuf> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match read_shard_at(&path) {
+            Ok(Some(shard)) => {
+                if shard.sins.iter().any(|sin| sin.id == sin_id) {
+                    found_shard = Some(path);
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                corrupt_count += 1;
+                if first_corrupt.is_none() {
+                    first_corrupt = Some(path.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(shard_path) = found_shard {
+        let result = try_mark_fix_dispatched_in_shard(
+            &shard_path,
+            sin_id,
+            directive_id,
+            expected_prev,
+        )?;
+        if let Some(r) = result {
+            return r;
+        }
+    }
+
+    // Not found in any healthy shard.
+    if corrupt_count > 0 {
+        let first = first_corrupt.unwrap();
+        return Err(format!(
+            "sin not found; {corrupt_count} corrupt shard(s) skipped: {}",
+            first.display()
+        ));
+    }
+    Ok(false)
+}
+
+/// Inner helper: attempt to mark fix_directive_id in a single shard under lock.
+/// Returns `Ok(None)` if the sin is not in this shard (caller should fall through
+/// to the next shard / full scan). Returns `Ok(Some(result))` when the sin was
+/// found (success, CAS rejection, or non-Open rejection).  All IO errors are
+/// `Err`.
+fn try_mark_fix_dispatched_in_shard(
+    shard_path: &std::path::Path,
+    sin_id: &str,
+    directive_id: &str,
+    expected_prev: Option<&str>,
+) -> Result<Option<Result<bool, String>>, String> {
+    let _guard = SIN_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _shard_lock =
+        lock_shard(shard_path).map_err(|e| format!("could not lock shard: {e}"))?;
+
+    let mut shard = match read_shard_at(shard_path) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(format!("could not read shard: {e}")),
+    };
+
+    // Locate the sin record.
+    let sin = match shard.sins.iter_mut().find(|s| s.id == sin_id) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // Check disposition -- only Open sins can be dispatched.
+    if sin.disposition != Disposition::Open {
+        return Ok(Some(Err(format!(
+            "Sin {} has disposition {:?} -- only Open sins can be dispatched",
+            sin_id, sin.disposition,
+        ))));
+    }
+
+    // Compare-and-set: reject if the current fix_directive_id doesn't match the
+    // expected previous value (another fix was dispatched concurrently).
+    if sin.fix_directive_id.as_deref() != expected_prev {
+        return Ok(Some(Err(
+            "another fix was dispatched concurrently for this sin".into(),
+        )));
+    }
+
+    // CAS succeeded -- write the new directive id.
+    sin.fix_directive_id = Some(directive_id.to_string());
+    sin.updated_at = chrono::Utc::now().to_rfc3339();
+
+    write_shard_locked(shard_path, &shard)
+        .map_err(|e| format!("Failed to write shard after mark_fix_dispatched: {e}"))?;
+
+    Ok(Some(Ok(true)))
+}
+
 /// Load all sins with disposition `Open` from the ledger.
 /// Tolerant of corrupt shards (skip + continue).
 pub fn load_open_sins(root: &Path) -> Vec<SinRecord> {
@@ -741,6 +954,7 @@ mod tests {
             disposition: SDisposition::Open,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+            fix_directive_id: None,
         }
     }
 
@@ -1281,4 +1495,278 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // =========================================================================
+    // Tests for find_sin
+    // =========================================================================
+
+    #[test]
+    fn find_sin_hint_fast_path_locates_record() {
+        let dir = unique_temp_root("find-hint");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-find-me", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/a.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        let found = find_sin(root, Some("src/a.rs"), "id-find-me");
+        assert!(found.is_some(), "hint fast-path must find the sin");
+        assert_eq!(found.unwrap().id, "id-find-me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_sin_full_scan_locates_record() {
+        let dir = unique_temp_root("find-scan");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-scan-me", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/b.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // No hint → full scan.
+        let found = find_sin(root, None, "id-scan-me");
+        assert!(found.is_some(), "full scan must find the sin");
+        assert_eq!(found.unwrap().id, "id-scan-me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_sin_missing_returns_none() {
+        let dir = unique_temp_root("find-missing");
+        let root = dir.as_path();
+
+        let found = find_sin(root, None, "nonexistent-id");
+        assert!(found.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Tests for mark_fix_dispatched
+    // =========================================================================
+
+    #[test]
+    fn mark_fix_dispatched_sets_id_and_bumps_updated_at() {
+        let dir = unique_temp_root("mark-ok");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-mark", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        let before = load_all_sins(root);
+        let old_updated = before.iter().find(|s| s.id == "id-mark").unwrap().updated_at.clone();
+
+        // Sleep briefly so timestamp differs.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let result = mark_fix_dispatched(root, Some("src/test.rs"), "id-mark", "directive-abc", None);
+        assert!(result.unwrap(), "must return Ok(true)");
+
+        let after = load_all_sins(root);
+        let sin = after.iter().find(|s| s.id == "id-mark").unwrap();
+        assert_eq!(sin.fix_directive_id.as_deref(), Some("directive-abc"));
+        assert!(sin.updated_at > old_updated, "updated_at must be bumped");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_fix_dispatched_on_ignored_sin_errors() {
+        let dir = unique_temp_root("mark-ignored");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-ignored", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // Set to Ignored.
+        dispose(root, None, "id-ignored", SDisposition::Ignored).unwrap();
+
+        let result = mark_fix_dispatched(root, Some("src/test.rs"), "id-ignored", "d-123", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("only Open sins"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_fix_dispatched_on_missing_sin_returns_false() {
+        let dir = unique_temp_root("mark-missing");
+        let root = dir.as_path();
+
+        let result = mark_fix_dispatched(root, None, "nonexistent", "d-456", None);
+        assert_eq!(result.unwrap(), false);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_fix_dispatched_cas_rejects_when_expected_mismatched() {
+        let dir = unique_temp_root("mark-cas-reject");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-cas", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // Seed the record with fix_directive_id=Some("a").
+        mark_fix_dispatched(root, Some("src/test.rs"), "id-cas", "a", None).unwrap();
+
+        // CAS with expected=None should fail (current is "a", not None).
+        let result = mark_fix_dispatched(root, Some("src/test.rs"), "id-cas", "b", None);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("concurrently"),
+            "must mention concurrent dispatch"
+        );
+
+        // Shard must be unchanged -- still "a".
+        let after = load_all_sins(root);
+        let sin = after.iter().find(|s| s.id == "id-cas").unwrap();
+        assert_eq!(sin.fix_directive_id.as_deref(), Some("a"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_fix_dispatched_cas_succeeds_when_expected_matches() {
+        let dir = unique_temp_root("mark-cas-ok");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-cas2", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // Seed with "a".
+        mark_fix_dispatched(root, Some("src/test.rs"), "id-cas2", "a", None).unwrap();
+
+        // CAS with expected=Some("a") -> Ok(true), now set to "b".
+        let result =
+            mark_fix_dispatched(root, Some("src/test.rs"), "id-cas2", "b", Some("a"));
+        assert!(result.unwrap());
+
+        let after = load_all_sins(root);
+        let sin = after.iter().find(|s| s.id == "id-cas2").unwrap();
+        assert_eq!(sin.fix_directive_id.as_deref(), Some("b"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_sin_stale_hint_falls_through_to_full_scan() {
+        let dir = unique_temp_root("find-stale-hint");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-rename", "hash1");
+        // Sin is in src/new.rs, NOT in src/old.rs.
+        upsert_scan_results(
+            root,
+            &[("src/new.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // Stale hint pointing at the OLD path -> must still find via full scan.
+        let found = find_sin(root, Some("src/old.rs"), "id-rename");
+        assert!(
+            found.is_some(),
+            "stale hint must not cause false not-found -- full scan must find it"
+        );
+        assert_eq!(found.unwrap().id, "id-rename");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // Tests for fix_directive_id preservation in upsert_scan_results
+    // =========================================================================
+
+    #[test]
+    fn same_hash_upsert_preserves_fix_directive_id() {
+        let dir = unique_temp_root("upsert-preserve-fix");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-preserve", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // Mark as dispatched.
+        mark_fix_dispatched(root, Some("src/test.rs"), "id-preserve", "d-789", None).unwrap();
+
+        // Re-upsert same hash with same sin.
+        let s1_again = mk_sin_det("id-preserve", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1_again])],
+        )
+        .unwrap();
+
+        let all = load_all_sins(root);
+        let sin = all.iter().find(|s| s.id == "id-preserve").unwrap();
+        assert_eq!(
+            sin.fix_directive_id.as_deref(),
+            Some("d-789"),
+            "same-hash upsert must preserve fix_directive_id"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn different_hash_upsert_resets_fix_directive_id() {
+        let dir = unique_temp_root("upsert-reset-fix");
+        let root = dir.as_path();
+
+        let s1 = mk_sin_det("id-reset-fix", "hash1");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash1".to_string(), vec![s1])],
+        )
+        .unwrap();
+
+        // Mark as dispatched.
+        mark_fix_dispatched(root, Some("src/test.rs"), "id-reset-fix", "d-999", None).unwrap();
+
+        // Re-upsert with NEW hash, same sin.
+        let s2 = mk_sin_det("id-reset-fix", "hash2");
+        upsert_scan_results(
+            root,
+            &[("src/test.rs".to_string(), "hash2".to_string(), vec![s2])],
+        )
+        .unwrap();
+
+        let all = load_all_sins(root);
+        let sin = all.iter().find(|s| s.id == "id-reset-fix").unwrap();
+        assert!(
+            sin.fix_directive_id.is_none(),
+            "different-hash upsert must reset fix_directive_id to None"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
 }

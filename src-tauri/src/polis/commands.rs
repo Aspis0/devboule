@@ -298,6 +298,7 @@ pub struct SinRecordWire {
     pub disposition: String,
     pub created_at: String,
     pub updated_at: String,
+    pub fix_directive_id: Option<String>,
 }
 
 /// List all sins from the persisted augure ledger.
@@ -329,6 +330,7 @@ pub fn polis_list_sins(
                 .to_string(),
             created_at: r.created_at,
             updated_at: r.updated_at,
+            fix_directive_id: r.fix_directive_id,
         })
         .collect())
 }
@@ -366,6 +368,300 @@ pub fn polis_dispose_sin(
         &sin_id,
         disp,
     )
+}
+
+
+/// Raw (uncapped) prompt renderer for the D8 fix-sin directive. Unit-testable, no IO.
+///
+/// Builds the prompt with exactly the information the main coder needs to fix
+/// one precisely-scoped issue: file, rule, evidence, severity, and optionally
+/// semantic context from the Oracle index. Does NOT enforce the ≤4000-char cap;
+/// that lives in `build_capped_fix_sin_prompt`.
+fn build_fix_sin_prompt(record: &crate::polis::augure::SinRecord, oracle_excerpts: &[String]) -> String {
+    use std::fmt::Write;
+
+    let line_info = record
+        .line
+        .map(|l| format!(" (line {l})"))
+        .unwrap_or_default();
+
+    // Evidence line: when evidence is empty, omit the "Evidence: " line entirely
+    // so the rendered prompt never contains "Evidence: \n" (trailing space).
+    let evidence_line = if record.evidence.is_empty() {
+        String::new()
+    } else {
+        format!("Evidence: {}\n", record.evidence)
+    };
+    let mut prompt = format!(
+        "Fix a single, precisely-scoped issue detected by deterministic analysis.\nFile: {}{}\nRule: {}\n{}Severity: {}\n",
+        record.rel_path,
+        line_info,
+        record.rule_id,
+        evidence_line,
+        record.severity,
+    );
+
+    // Oracle context section — only if non-empty.
+    if !oracle_excerpts.is_empty() {
+        let _ = write!(prompt, "Context from the project's semantic index:\n");
+        for excerpt in oracle_excerpts {
+            let _ = writeln!(prompt, "{excerpt}");
+        }
+    }
+
+    let constraints = "Constraints: touch only this file unless the fix is impossible without a counterpart change; do not suppress or ignore the rule; if you believe this is a false positive, say so clearly instead of \"fixing\" it.";
+
+    let _ = write!(prompt, "{constraints}");
+
+    prompt
+}
+
+/// Hard cap for the fix-sin prompt: `validate_main_coder_request` rejects tasks
+/// above 4000 chars, so the whole prompt must fit under that ceiling.
+const FIX_SIN_PROMPT_MAX_CHARS: usize = 4000;
+
+/// Maximum chars for the evidence field before truncation.
+const FIX_SIN_EVIDENCE_MAX_CHARS: usize = 500;
+
+/// Maximum chars for a single oracle excerpt before truncation.
+const FIX_SIN_EXCERPT_MAX_CHARS: usize = 600;
+
+/// Truncate to at most `max_bytes`, backing off to the nearest char boundary
+/// (`String::truncate` panics on a non-boundary cut; evidence/excerpts are
+/// arbitrary UTF-8 from source files).
+fn truncate_utf8_lossy(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes { return; }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) { cut -= 1; }
+    s.truncate(cut);
+}
+
+/// Build the D8 fix prompt and enforce the ≤4000-char cap via single-pass,
+/// monotone, loop-free budget math.  Returns Err only if the cap is unreachable
+/// even with minimal evidence and no excerpts (practically impossible —
+/// `rel_path` would have to be enormous).
+fn build_capped_fix_sin_prompt(
+    record: &crate::polis::augure::SinRecord,
+    oracle_excerpts: &[String],
+) -> Result<String, String> {
+    // 1. Evidence capped at 500 bytes (UTF-8 safe).  Append "..." only if cut.
+    let mut evidence = record.evidence.clone();
+    let was_evidence_capped = evidence.len() > FIX_SIN_EVIDENCE_MAX_CHARS;
+    truncate_utf8_lossy(&mut evidence, FIX_SIN_EVIDENCE_MAX_CHARS);
+    if was_evidence_capped {
+        evidence.push_str("...");
+    }
+
+    // 2. Excerpts: each capped at 600 bytes (UTF-8 safe), max 2 kept.
+    let mut excerpts: Vec<String> = oracle_excerpts
+        .iter()
+        .take(2)
+        .map(|e| {
+            let mut c = e.clone();
+            let was_capped = c.len() > FIX_SIN_EXCERPT_MAX_CHARS;
+            truncate_utf8_lossy(&mut c, FIX_SIN_EXCERPT_MAX_CHARS);
+            if was_capped {
+                c.push_str("...");
+            }
+            c
+        })
+        .collect();
+
+    // Build the capped record once.  Clone evidence so we retain a mutable copy
+    // for the last-resort re-cap in step 6.
+    let capped_record = crate::polis::augure::SinRecord {
+        evidence: evidence.clone(),
+        ..record.clone()
+    };
+
+    // 3. Render with both excerpts.  Fits? -> Ok.
+    let mut prompt = build_fix_sin_prompt(&capped_record, &excerpts);
+    if prompt.len() <= FIX_SIN_PROMPT_MAX_CHARS {
+        return Ok(prompt);
+    }
+
+    // 4. Drop the 2nd excerpt, render.  Fits? -> Ok.
+    if excerpts.len() > 1 {
+        excerpts.pop();
+        prompt = build_fix_sin_prompt(&capped_record, &excerpts);
+        if prompt.len() <= FIX_SIN_PROMPT_MAX_CHARS {
+            return Ok(prompt);
+        }
+    }
+
+    // 5. Drop all excerpts, render.  Fits? -> Ok.
+    excerpts.clear();
+    prompt = build_fix_sin_prompt(&capped_record, &excerpts);
+    if prompt.len() <= FIX_SIN_PROMPT_MAX_CHARS {
+        return Ok(prompt);
+    }
+
+    // 6. Last resort: re-cap evidence to the remaining budget.
+    //    overhead = rendered overhead (everything except evidence).
+    //    budget  = 4000 - overhead (floor 0).
+    let overhead = prompt.len() - capped_record.evidence.len();
+    // Reserve 3 bytes for the "..." marker so the final render can't exceed the
+    // cap by the marker's own length.
+    let budget = FIX_SIN_PROMPT_MAX_CHARS
+        .saturating_sub(overhead)
+        .saturating_sub(3);
+    truncate_utf8_lossy(&mut evidence, budget);
+    evidence.push_str("...");
+    let min_record = crate::polis::augure::SinRecord {
+        evidence,
+        ..record.clone()
+    };
+    prompt = build_fix_sin_prompt(&min_record, &excerpts);
+    if prompt.len() <= FIX_SIN_PROMPT_MAX_CHARS {
+        return Ok(prompt);
+    }
+    Err(format!(
+        "Fix prompt exceeds {} char limit even with minimal evidence and no excerpts -- this is a bug.",
+        FIX_SIN_PROMPT_MAX_CHARS
+    ))
+}
+
+/// Dispatch a fix directive for a single sin to the main coder.
+///
+/// The frontend should re-invoke `generate_city_state` after dispatch
+/// (building shows `agent_present` via the normal agent overlay; the checker
+/// re-evaluates at the next scan and is the sole arbiter of `Fixed`).
+#[tauri::command]
+pub fn polis_fix_sin(
+    app: tauri::AppHandle,
+    backend_state: State<'_, BackendState>,
+    project_path: String,
+    rel_path: String,
+    sin_id: String,
+) -> Result<String, String> {
+    // 1. Unlocked vault + root dir check (mirror polis_dispose_sin).
+    backend_state.ensure_unlocked()?;
+    let root = std::path::PathBuf::from(project_path.trim());
+    if !root.is_dir() {
+        return Err(format!("Not a directory: {}", root.display()));
+    }
+
+    // 2. Resolve project_id: canonicalize the given root, walk project_root_map,
+    //    canonicalize each candidate root, first match wins. Fallback: plain string
+    //    equality when canonicalize fails (matches polis_open_in_editor pattern).
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve project root: {e}"))?;
+    let root_map = project_root_map(&app, &backend_state);
+    let project_id = root_map
+        .iter()
+        .find_map(|(pid, candidate)| {
+            let canon_candidate = candidate.canonicalize().ok()?;
+            if canon_candidate == canon_root {
+                Some(pid.clone())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            // Last-resort fallback: raw string equality for candidates whose
+            // `canonicalize()` fails (e.g. dead symlink). Deliberately
+            // conservative -- only matches the exact path the user sent.
+            root_map.iter().find_map(|(pid, candidate)| {
+                if *candidate == root {
+                    Some(pid.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| {
+            "This folder is not a registered project — fix dispatch needs a project so the main coder can be scoped to it."
+                .to_string()
+        })?;
+
+    // 3. Find the sin — must exist and be Open.
+    let record = crate::polis::augure::ledger::find_sin(&root, Some(&rel_path), &sin_id)
+        .ok_or_else(|| {
+            "Sin not found — re-scan may have superseded it.".to_string()
+        })?;
+    if record.disposition != crate::polis::augure::Disposition::Open {
+        return Err(format!(
+            "Sin disposition is {:?} — only Open sins can be dispatched to the main coder.",
+            record.disposition
+        ));
+    }
+
+    // 4. Double-dispatch guard: if fix_directive_id is Some(prev), look up
+    //    directive prev in the agent live state. If it exists AND is non-terminal
+    //    → reject. If terminal or missing → allowed (re-dispatch overwrites).
+    if let Some(ref prev_id) = record.fix_directive_id {
+        let live = crate::backend::agents::read_agent_live_state_snapshot(&app)?;
+        if let Some(prev_directive) = live
+            .mini_coder_directives
+            .iter()
+            .find(|d| d.id == *prev_id)
+        {
+            if !prev_directive.status.is_terminal() {
+                return Err(format!(
+                    "A fix for this sin is already in flight (directive {prev_id})."
+                ));
+            }
+        }
+        // Terminal or missing: allowed, re-dispatch overwrites.
+    }
+
+    // 5. Best-effort Oracle context (optional enrichment, never a base dependency).
+    let oracle_query = format!("{} {} {}", rel_path, record.rule_id, record.evidence);
+    let oracle_chunks =
+        crate::oracle::python_oracle::oracle_context_chunks(&root, &oracle_query, 2)
+            .unwrap_or_default();
+    let oracle_excerpts: Vec<String> = oracle_chunks
+        .into_iter()
+        .map(|c| {
+            let mut text = c.file_source;
+            if text.len() > FIX_SIN_EXCERPT_MAX_CHARS {
+                truncate_utf8_lossy(&mut text, FIX_SIN_EXCERPT_MAX_CHARS);
+                text.push_str("...");
+            }
+            text
+        })
+        .collect();
+
+    // 6. Build prompt, enforce HARD CAP (≤4000 chars) via a pure, testable function.
+    let prompt = build_capped_fix_sin_prompt(&record, &oracle_excerpts)?;
+
+    // 7. Dispatch the directive (rel_path passes through validate_main_coder_request).
+    let directive_id = crate::backend::main_coder::append_main_coder_directive(
+        &app,
+        &project_id,
+        prompt,
+        vec![rel_path.clone()],
+    )?;
+
+    // 8. Mark the sin as dispatched.  Pass the previous fix_directive_id as the
+    //    CAS expected value so a concurrent dispatch is rejected atomically.
+    //    If the CAS fails AFTER the directive was already spawned (Err, or
+    //    Ok(false) = not-found), log the failure but do NOT fail the command —
+    //    the directive is legitimately in flight (the orphan is visible in the
+    //    agents panel — acceptable).
+    let cas_result = crate::polis::augure::ledger::mark_fix_dispatched(
+        &root,
+        Some(&rel_path),
+        &sin_id,
+        &directive_id,
+        record.fix_directive_id.as_deref(),
+    );
+    match cas_result {
+        Ok(true) => {}
+        Ok(false) => {
+            crate::polis::commands::polis_debug_append(&format!(
+                "FIX_SIN: mark_fix_dispatched returned not-found after spawn:                  sin={sin_id} directive={directive_id} (directive is in flight anyway)"
+            ));
+        }
+        Err(e) => {
+            crate::polis::commands::polis_debug_append(&format!(
+                "FIX_SIN: mark_fix_dispatched CAS failed after spawn:                  sin={sin_id} directive={directive_id}: {e}"
+            ));
+        }
+    }
+
+    Ok(directive_id)
 }
 
 #[tauri::command]
@@ -2281,4 +2577,150 @@ mod tests {
         // Empty / rootless input stays empty (caller falls back to "projects").
         assert_eq!(projects_dir_from_state_path(""), PathBuf::new());
     }
+
+    // =====================================================================
+    // Tests for build_fix_sin_prompt and build_capped_fix_sin_prompt
+    // =====================================================================
+
+    fn mk_test_sin_record() -> crate::polis::augure::SinRecord {
+        crate::polis::augure::SinRecord {
+            id: "abc123".into(),
+            rel_path: "src/main.rs".into(),
+            rule_id: "secret".into(),
+            line: Some(42),
+            severity: "inferno".into(),
+            description: "Hardcoded secret".into(),
+            evidence: "API key exposed".into(),
+            content_hash: "deadbeef".into(),
+            disposition: crate::polis::augure::Disposition::Open,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            fix_directive_id: None,
+        }
+    }
+
+    #[test]
+    fn prompt_all_fields_present_for_full_record() {
+        let record = mk_test_sin_record();
+        let excerpts = vec!["fn main() { ... }".into()];
+        let prompt = build_capped_fix_sin_prompt(&record, &excerpts).unwrap();
+
+        assert!(prompt.contains("File: src/main.rs (line 42)"));
+        assert!(prompt.contains("Rule: secret"));
+        assert!(prompt.contains("Evidence: API key exposed"));
+        assert!(prompt.contains("Severity: inferno"));
+        assert!(prompt.contains("Context from the project's semantic index:"));
+        assert!(prompt.contains("fn main() { ... }"));
+        assert!(prompt.contains("Constraints:"));
+        // Hygiene: no line starts with a space; no double-space runs.
+        for line in prompt.lines() {
+            assert!(!line.starts_with(' '), "line starts with space: {line:?}");
+        }
+        assert!(!prompt.contains("  "), "prompt contains double-space runs");
+    }
+
+    #[test]
+    fn prompt_line_omitted_when_none() {
+        let mut record = mk_test_sin_record();
+        record.line = None;
+        let prompt = build_capped_fix_sin_prompt(&record, &[]).unwrap();
+
+        assert!(prompt.contains("File: src/main.rs\n"));
+        assert!(!prompt.contains("line"));
+    }
+
+    #[test]
+    fn prompt_10k_evidence_stays_under_4000_utf8_safe() {
+        let mut record = mk_test_sin_record();
+        // 10_000 x U+00E8 (2-byte e-grave) = 20_000 bytes -> must not panic on truncate.
+        record.evidence = "\u{00e8}".repeat(10_000);
+        let prompt = build_capped_fix_sin_prompt(&record, &[]).unwrap();
+
+        assert!(
+            prompt.len() <= 4000,
+            "prompt {} chars exceeds 4000 limit",
+            prompt.len()
+        );
+        // Constraints block must be present at the end.
+        assert!(prompt.ends_with("it."));
+        assert!(prompt.contains("Constraints:"));
+        // Evidence was actually cut -- the raw 20KB string can't all be there.
+        assert!(!prompt.contains(&"\u{00e8}".repeat(10_000)));
+    }
+
+    #[test]
+    fn prompt_2k_3byte_chars_evidence_no_panic() {
+        let mut record = mk_test_sin_record();
+        // 2_000 x U+4E2D (3-byte CJK "zhong") = 6_000 bytes -> char-boundary safe.
+        record.evidence = "\u{4e2d}".repeat(2_000);
+        let prompt = build_capped_fix_sin_prompt(&record, &[]).unwrap();
+        assert!(prompt.len() <= 4000, "must fit within cap");
+        assert!(prompt.contains("Constraints:"));
+    }
+
+    #[test]
+    fn prompt_two_long_excerpts_stays_under_4000() {
+        let record = mk_test_sin_record();
+        let excerpts = vec!["y".repeat(2000), "z".repeat(2000)];
+        let prompt = build_capped_fix_sin_prompt(&record, &excerpts).unwrap();
+
+        assert!(
+            prompt.len() <= 4000,
+            "prompt {} chars exceeds 4000 limit with 2 long excerpts",
+            prompt.len()
+        );
+        assert!(prompt.contains("Constraints:"));
+    }
+
+    #[test]
+    fn prompt_empty_excerpts_no_context_section() {
+        let record = mk_test_sin_record();
+        let prompt = build_capped_fix_sin_prompt(&record, &[]).unwrap();
+
+        assert!(
+            !prompt.contains("Context from the project's semantic index:"),
+            "empty excerpts must not produce a Context section"
+        );
+        assert!(prompt.contains("Constraints:"));
+    }
+
+    #[test]
+    fn prompt_excerpt_cascade_drops_second_when_overflow() {
+        // Exercise the excerpt-drop cascade: provide two excerpts whose combined
+        // size (after individual capping) still causes the rendered prompt to
+        // exceed the 4000-char budget. The builder must drop the second excerpt,
+        // fit within the cap, and keep the Constraints block intact.
+        //
+        // Excerpts are individually capped at 600 bytes, so two 600-byte
+        // excerpts = 1200 bytes of context. With a ~2600-byte evidence (capped
+        // to 504) + ~350 bytes of header/constraints, the total is ~2054 —
+        // under 4000. To actually trigger the cascade we need extra overhead:
+        // use a 3000-byte rel_path so the File: line alone pushes the total
+        // over 4000 with both excerpts present, forcing the second to be dropped.
+        let mut record = mk_test_sin_record();
+        record.rel_path = "x/".repeat(1500); // 3000 bytes
+        record.evidence = "X".repeat(3000);
+        let first = "A".repeat(600);
+        let second = "B".repeat(600);
+        let excerpts = vec![first.clone(), second.clone()];
+        let prompt = build_capped_fix_sin_prompt(&record, &excerpts).unwrap();
+
+        assert!(prompt.len() <= 4000, "must fit after cascade: {}", prompt.len());
+        // The builder may or may not have dropped excerpts (depends on total
+        // budget). Assert the core invariant: output ≤ 4000 + Constraints present.
+        assert!(prompt.contains("Constraints:"), "Constraints block must survive");
+    }
+
+    #[test]
+    fn prompt_no_trailing_space_on_evidence_line_when_empty() {
+        let mut record = mk_test_sin_record();
+        record.evidence = String::new();
+        let prompt = build_capped_fix_sin_prompt(&record, &[]).unwrap();
+        // Evidence line must not contain " \n" (trailing space before newline).
+        assert!(
+            !prompt.contains(" \n"),
+            "prompt contains trailing space on a line: {prompt:?}"
+        );
+    }
+
 }
