@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from "react";
 import { invokeBackendCommand } from "../../../context/AppContext";
 import gsap from "gsap";
-import { Search, ListOrdered, LayoutDashboard } from "lucide-react";
+import { Search, ListOrdered, LayoutDashboard, ChevronDown, ChevronRight } from "lucide-react";
 import "./planner.css";
 import { useStageRotation } from "./useStageRotation";
 import type {
@@ -136,6 +136,28 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 		setArtifactActive(active);
 	}, []);
 
+	// Stage drawer: collapsed by default when idle AND empty; opens itself when there
+	// is something to show (live, artifact, or any stage content). A manual
+	// collapse/expand always wins over the auto-expand — until fresh content arrives.
+	// `stageHasContent`: true if ANY of the three stage views carries content.
+	const stageHasContent =
+		pages.length > 0 ||
+		findings.length > 0 ||
+		planCards.length > 0 ||
+		questions.length > 0 ||
+		design != null;
+	const [stageExpanded, setStageExpanded] = useState(
+		live || artifactActive || stageHasContent,
+	);
+	// Whether the user has taken manual control of the drawer. Once true, live/artifact
+	// auto-expands no-op — but an incoming DOUBT still forces open (see below).
+	const userToggled = useRef(false);
+
+	const toggleStage = useCallback(() => {
+		userToggled.current = true;
+		setStageExpanded((v) => !v);
+	}, []);
+
 	// Task-link: derive { n, title } list from planCards for the StageDesign selector.
 	const taskOptions = useMemo(
 		() => planCards.map((c) => ({ n: c.n, title: c.title })),
@@ -166,6 +188,35 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 		artifactActive,
 	);
 	const ref = useRef<HTMLDivElement>(null);
+
+	// Click a collapsed tab label: select that view AND open the drawer (a click on an
+	// inert-looking collapsed label must not silently do nothing).
+	const selectAndExpand = useCallback(
+		(v: "exa" | "plan" | "design") => {
+			pick(v);
+			userToggled.current = true;
+			setStageExpanded(true);
+		},
+		[pick],
+	);
+
+	// Auto-expand the drawer when something worth showing appears. Doubts are the HARD
+	// exception: an incoming doubt MUST always surface — even if the user collapsed the
+	// drawer by hand — unanswered doubts are never hidden by a collapsed drawer.
+	const prevLive = useRef(live);
+	const prevArtifact = useRef(artifactActive);
+	const prevQuestionsLen = useRef(questions.length);
+	useEffect(() => {
+		if (questions.length > 0 && prevQuestionsLen.current === 0) {
+			setStageExpanded(true);
+		} else if (!userToggled.current) {
+			if (live && !prevLive.current) setStageExpanded(true);
+			if (artifactActive && !prevArtifact.current) setStageExpanded(true);
+		}
+		prevLive.current = live;
+		prevArtifact.current = artifactActive;
+		prevQuestionsLen.current = questions.length;
+	}, [live, artifactActive, questions.length]);
 
 	// Kairion doubt<->task link: hovering a doubt highlights its task card(s) and vice-versa.
 	// One source of hover at a time; the derived Sets feed both panels.
@@ -290,98 +341,217 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 					</div>
 				)}
 
-				{/* 2) Orchestrator selector — WHO YOU TALK TO. Replaces the old status strip
-            (searching/planning/designing duplicated the view tabs below). The active backend
-            pulses while it's live. Local = our Stage; Claude/Codex run their own CLI. */}
-				<div
-					style={{
-						display: "flex",
-						alignItems: "center",
-						gap: 7,
-					}}
-				>
-					<span
-						className="pp-mono"
+				{/* 2) Chat (local Stage / pre-launch composer) — the first substantial block.
+            The orchestrator selector now lives inside PlannerChat's own header. */}
+				<PlannerChat
+					messages={messages}
+					modelLabel={`Orchestrator · ${plannerModelLabel}`}
+					live={live}
+					awaitingReply={awaitingReply}
+					banner={banner}
+					onSend={onSend}
+					onInterrupt={onInterrupt}
+					onSlashCommand={onSlashCommand}
+					onResetChat={onResetChat}
+					orchestrators={orchestrators}
+					orchestratorId={orchestratorId}
+					onOrchestratorChange={onOrchestratorChange}
+				/>
+
+				{/* 3) Stage Container — cloud duplex orchestrators drive the SAME Stage as the
+            local one. Collapsed by default; opens itself when there is something to show
+            (live, artifact, doubts, or any stage content). The collapsed slim header still
+            exposes the tab labels (with live content-count badges) and the Auto toggle. */}
+				{stageExpanded ? (
+					<div
 						style={{
-							fontSize: 10,
-							color: "#A89F90",
-							marginRight: 1,
-							cursor: "help",
+							background: "#FAF7F1",
+							border: "1px solid #ECE6DB",
+							borderRadius: 12,
+							padding: 13,
+							height: 316,
+							display: "flex",
+							flexDirection: "column",
 						}}
-						data-help-title="The orchestrator is the agent you talk to here to shape the plan."
-						data-help-lines="A project is a plan: you discuss the goal with the orchestrator, and it drafts the tasks.|Local (Devboule) keeps this rich Stage (chat + websearch + plan + design); Claude/Codex/OpenAI run in their own embedded terminal.|Once the plan is ready you hand it off to a main coder, which writes the code.|It is the create-time conversation — not a permanent agent of the project."
 					>
-						orchestrator
-					</span>
-					{orchestrators.map((o) => {
-						const isActive = o.id === orchestratorId;
-						const disabled = o.disabled === true;
-						return (
-							<button
-								type="button"
-								className="pp-mono"
-								key={o.id}
-								onClick={() => {
-									if (!disabled) onOrchestratorChange(o.id);
-								}}
-								disabled={disabled}
-								title={
-									disabled
-										? `${o.label} CLI is not installed on this machine`
-										: undefined
-								}
+						{/* Tab Row */}
+						<div
+							style={{
+								display: "flex",
+								alignItems: "center",
+								gap: 9,
+								marginBottom: 12,
+							}}
+						>
+							<div
 								style={{
 									display: "flex",
+									background: "#F1E9DC",
+									borderRadius: 10,
+									padding: 3,
+								}}
+							>
+								{[
+									{ v: "exa" as const, icon: Search, label: "Websearch" },
+									{ v: "plan" as const, icon: ListOrdered, label: "Plan" },
+									{
+										v: "design" as const,
+										icon: LayoutDashboard,
+										label: "Design",
+									},
+								].map(({ v, icon: Icon, label }) => {
+									const isActive = view === v;
+									return (
+										<div
+											key={v}
+											onClick={() => pick(v)}
+											className="pp-mono"
+											style={{
+												display: "flex",
+												alignItems: "center",
+												gap: 6,
+												padding: "6px 12px",
+												borderRadius: 8,
+												fontSize: 12,
+												fontWeight: 600,
+												cursor: "pointer",
+												background: isActive ? "#C8945C" : "transparent",
+												color: isActive ? "#FBF6EF" : "#9c9488",
+											}}
+										>
+											<Icon size={13} />
+											<span>{label}</span>
+										</div>
+									);
+								})}
+							</div>
+
+							{/* Auto Toggle */}
+							<div
+								onClick={toggleAuto}
+								className="pp-mono"
+								style={{
+									marginLeft: "auto",
+									fontSize: 9,
+									cursor: "pointer",
+									padding: "3px 8px",
+									borderRadius: 7,
+									display: "flex",
 									alignItems: "center",
-									gap: 6,
-									fontSize: 10.5,
-									borderRadius: 8,
-									padding: "5px 9px",
-									cursor: disabled ? "not-allowed" : "pointer",
-									opacity: disabled ? 0.45 : 1,
-									fontWeight: isActive ? 600 : 400,
-									color: isActive ? "#9A6A2E" : "#A89F90",
-									background: isActive ? "#F1E4D2" : "#fff",
-									border: isActive ? "1px solid #E6D3BB" : "1px solid #ECE6DB",
-									animation:
-										isActive && live ? "pp-pulse 1.9s infinite" : "none",
+									gap: 5,
+									...(auto
+										? { color: "#B3AB9C" }
+										: {
+												color: "#9A6A2E",
+												background: "#F1E4D2",
+												border: "1px solid #E6D3BB",
+											}),
 								}}
 							>
 								<div
 									style={{
-										width: 6,
-										height: 6,
+										width: 5,
+										height: 5,
 										borderRadius: "50%",
-										background: isActive ? "#C0894F" : "#CFC6B6",
+										background: auto ? "#B3AB9C" : "#C0894F",
 									}}
 								/>
-								<span>{o.label}</span>
-							</button>
-						);
-					})}
-				</div>
+								<span>{auto ? "auto" : "paused · resume"}</span>
+							</div>
 
-				{/* 3) Stage Container — cloud duplex orchestrators drive the SAME Stage as the
-            local one (their reader thread writes the same bridge file), so the former
-            cloud-terminal branch here was unreachable dead code and is gone. */}
-				<div
-					style={{
-						background: "#FAF7F1",
-						border: "1px solid #ECE6DB",
-						borderRadius: 12,
-						padding: 13,
-						height: 316,
-						display: "flex",
-						flexDirection: "column",
-					}}
-				>
-					{/* Tab Row */}
+							{/* Collapse chevron */}
+							<button
+								type="button"
+								onClick={toggleStage}
+								title="Collapse stage panels"
+								style={{
+									marginLeft: 8,
+									border: "1px solid #E6D3BB",
+									background: "#F1E4D2",
+									borderRadius: 7,
+									padding: "3px 6px",
+									cursor: "pointer",
+									display: "flex",
+									alignItems: "center",
+								}}
+							>
+								<ChevronDown size={13} />
+							</button>
+						</div>
+
+						{/* Active View */}
+						<div style={{ flex: 1, overflow: "hidden" }}>
+							{view === "exa" && (
+								<StageWebsearch
+									pages={pages}
+									findings={findings}
+									mode={webMode}
+									live={live}
+									onModeChange={onWebModeChange}
+									onManualSearch={onManualSearch}
+								/>
+							)}
+							{view === "plan" &&
+								(questions.length > 0 ? (
+									// Kairion two-panel Plan view: LEFT = open doubts, RIGHT = the firming plan.
+									<div style={{ display: "flex", height: "100%", minHeight: 0 }}>
+										<DoubtPanel
+											questions={questions}
+											onSend={onSend}
+											highlightedDoubtIds={highlightedDoubtIds}
+											onHoverDoubt={setHoveredDoubtId}
+										/>
+										<div
+											className="pp-scroll"
+											style={{
+												flex: 1,
+												minWidth: 0,
+												overflowY: "auto",
+												paddingLeft: 11,
+											}}
+										>
+											<StagePlan
+												cards={planCards}
+												singleColumn
+												highlightedTaskNums={highlightedTaskNums}
+												onHoverTask={setHoveredCardN}
+											/>
+										</div>
+									</div>
+								) : (
+									// Degrade: no doubts -> the plan task-cards alone, exactly as before.
+									<StagePlan cards={planCards} />
+								))}
+							{view === "design" && (
+								<StageDesign
+									design={design}
+									linkedTask={linkedTask}
+									onOpenInDesign={onOpenInDesign}
+									projectRoot={projectRoot}
+									onGenerated={onGenerated}
+									onArtifactActiveChange={handleArtifactActiveChange}
+									tasks={taskOptions}
+									onLinkTask={handleLinkTask}
+								/>
+							)}
+						</div>
+					</div>
+				) : (
+					/* Collapsed slim header: tab labels with live content-count badges, the
+					   Auto toggle, and an expand chevron. Clicking a tab both selects it and
+					   opens the drawer (selectAndExpand), so no click silently does nothing.
+					   Badge counts: Websearch = pages + findings (combined source yield);
+					   Plan = planCards (+ " · N doubts" when Kairion has open doubts, the most
+					   urgent content); Design = 1 when an artifact is active, else 0. */
 					<div
 						style={{
 							display: "flex",
 							alignItems: "center",
 							gap: 9,
-							marginBottom: 12,
+							background: "#FAF7F1",
+							border: "1px solid #ECE6DB",
+							borderRadius: 12,
+							padding: "8px 12px",
 						}}
 					>
 						<div
@@ -390,41 +560,71 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 								background: "#F1E9DC",
 								borderRadius: 10,
 								padding: 3,
+								gap: 2,
 							}}
 						>
-							{[
-								{ v: "exa" as const, icon: Search, label: "Websearch" },
-								{ v: "plan" as const, icon: ListOrdered, label: "Plan" },
-								{
-									v: "design" as const,
-									icon: LayoutDashboard,
-									label: "Design",
-								},
-							].map(({ v, icon: Icon, label }) => {
-								const isActive = view === v;
-								return (
-									<div
-										key={v}
-										onClick={() => pick(v)}
-										className="pp-mono"
-										style={{
-											display: "flex",
-											alignItems: "center",
-											gap: 6,
-											padding: "6px 12px",
-											borderRadius: 8,
-											fontSize: 12,
-											fontWeight: 600,
-											cursor: "pointer",
-											background: isActive ? "#C8945C" : "transparent",
-											color: isActive ? "#FBF6EF" : "#9c9488",
-										}}
-									>
-										<Icon size={13} />
-										<span>{label}</span>
-									</div>
-								);
-							})}
+							<button
+								type="button"
+								onClick={() => selectAndExpand("exa")}
+								className="pp-mono"
+								style={{
+									display: "flex",
+									alignItems: "center",
+									gap: 5,
+									padding: "5px 10px",
+									borderRadius: 8,
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: "pointer",
+									background: view === "exa" ? "#C8945C" : "transparent",
+									color: view === "exa" ? "#FBF6EF" : "#9c9488",
+									border: "1px solid transparent",
+								}}
+							>
+								Websearch ({pages.length + findings.length})
+							</button>
+							<button
+								type="button"
+								onClick={() => selectAndExpand("plan")}
+								className="pp-mono"
+								style={{
+									display: "flex",
+									alignItems: "center",
+									gap: 5,
+									padding: "5px 10px",
+									borderRadius: 8,
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: "pointer",
+									background: view === "plan" ? "#C8945C" : "transparent",
+									color: view === "plan" ? "#FBF6EF" : "#9c9488",
+									border: "1px solid transparent",
+								}}
+							>
+								{questions.length > 0
+									? `Plan (${planCards.length} · ${questions.length} doubts)`
+									: `Plan (${planCards.length})`}
+							</button>
+							<button
+								type="button"
+								onClick={() => selectAndExpand("design")}
+								className="pp-mono"
+								style={{
+									display: "flex",
+									alignItems: "center",
+									gap: 5,
+									padding: "5px 10px",
+									borderRadius: 8,
+									fontSize: 11,
+									fontWeight: 600,
+									cursor: "pointer",
+									background: view === "design" ? "#C8945C" : "transparent",
+									color: view === "design" ? "#FBF6EF" : "#9c9488",
+									border: "1px solid transparent",
+								}}
+							>
+								Design ({design ? 1 : 0})
+							</button>
 						</div>
 
 						{/* Auto Toggle */}
@@ -459,80 +659,29 @@ export function PlannerPlanMode(props: PlannerPlanModeProps) {
 							/>
 							<span>{auto ? "auto" : "paused · resume"}</span>
 						</div>
+
+						{/* Expand chevron */}
+						<button
+							type="button"
+							onClick={toggleStage}
+							title="Expand stage panels"
+							style={{
+								marginLeft: 8,
+								border: "1px solid #E6D3BB",
+								background: "#F1E4D2",
+								borderRadius: 7,
+								padding: "3px 6px",
+								cursor: "pointer",
+								display: "flex",
+								alignItems: "center",
+							}}
+						>
+							<ChevronRight size={13} />
+						</button>
 					</div>
+				)}
 
-					{/* Active View */}
-					<div style={{ flex: 1, overflow: "hidden" }}>
-						{view === "exa" && (
-							<StageWebsearch
-								pages={pages}
-								findings={findings}
-								mode={webMode}
-								live={live}
-								onModeChange={onWebModeChange}
-								onManualSearch={onManualSearch}
-							/>
-						)}
-						{view === "plan" &&
-							(questions.length > 0 ? (
-								// Kairion two-panel Plan view: LEFT = open doubts, RIGHT = the firming plan.
-								<div style={{ display: "flex", height: "100%", minHeight: 0 }}>
-									<DoubtPanel
-										questions={questions}
-										onSend={onSend}
-										highlightedDoubtIds={highlightedDoubtIds}
-										onHoverDoubt={setHoveredDoubtId}
-									/>
-									<div
-										className="pp-scroll"
-										style={{
-											flex: 1,
-											minWidth: 0,
-											overflowY: "auto",
-											paddingLeft: 11,
-										}}
-									>
-										<StagePlan
-											cards={planCards}
-											singleColumn
-											highlightedTaskNums={highlightedTaskNums}
-											onHoverTask={setHoveredCardN}
-										/>
-									</div>
-								</div>
-							) : (
-								// Degrade: no doubts -> the plan task-cards alone, exactly as before.
-								<StagePlan cards={planCards} />
-							))}
-						{view === "design" && (
-							<StageDesign
-								design={design}
-								linkedTask={linkedTask}
-								onOpenInDesign={onOpenInDesign}
-								projectRoot={projectRoot}
-								onGenerated={onGenerated}
-								onArtifactActiveChange={handleArtifactActiveChange}
-								tasks={taskOptions}
-								onLinkTask={handleLinkTask}
-							/>
-						)}
-					</div>
-				</div>
-
-				{/* 4) Chat (local Stage / pre-launch composer; the cloud terminal replaces it above) */}
-				<PlannerChat
-					messages={messages}
-					modelLabel={`Orchestrator · ${plannerModelLabel}`}
-					live={live}
-					awaitingReply={awaitingReply}
-					banner={banner}
-					onSend={onSend}
-					onInterrupt={onInterrupt}
-					onSlashCommand={onSlashCommand}
-						onResetChat={onResetChat}
-				/>
-
-				{/* 5) Hand-off + auto-create controls (preserved choices) */}
+				{/* 4) Hand-off + auto-create controls (preserved choices) */}
 				<PlannerControls
 					coders={coders}
 					mainCoderOverride={mainCoderOverride}

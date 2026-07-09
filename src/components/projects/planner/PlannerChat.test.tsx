@@ -53,3 +53,40 @@ describe("PlannerChat banner (D4 chrome)", () => {
     expect(out).toContain("Describe a goal");
   });
 });
+
+describe("PlannerChat orchestrator selector (S4)", () => {
+  const orcs = [
+    { id: "orchestrator", label: "Local" },
+    { id: "claude", label: "Claude" },
+    { id: "codex", label: "Codex" },
+    { id: "openai", label: "OpenAI" },
+  ];
+
+  it("renders the segmented control with every label", () => {
+    const out = html({
+      orchestrators: orcs,
+      orchestratorId: "claude",
+      onOrchestratorChange: () => {},
+    });
+    expect(out).toContain("Local");
+    expect(out).toContain("Claude");
+    expect(out).toContain("Codex");
+    expect(out).toContain("OpenAI");
+  });
+
+  it("highlights the active entry and pulses it while live", () => {
+    const out = html({
+      live: true,
+      orchestrators: orcs,
+      orchestratorId: "claude",
+      onOrchestratorChange: () => {},
+    });
+    // The active entry runs the same pp-pulse animation used by the standalone selector.
+    expect(out).toContain("pp-pulse");
+  });
+
+  it("omits the control when no orchestrators are supplied", () => {
+    const out = html({});
+    expect(out).not.toContain(">Local<");
+  });
+});

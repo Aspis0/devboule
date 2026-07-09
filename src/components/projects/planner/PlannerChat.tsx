@@ -31,6 +31,13 @@ interface PlannerChatProps {
 	/** Reset the orchestrator chat: stop the session, wipe the transcript, start
 	 *  clean. Absent when no orchestrator agent id is bound. */
 	onResetChat?: () => void;
+	/** S4: optional orchestrator backend selector (WHO YOU TALK TO). When supplied it
+	 *  renders as a compact segmented control inside the chat header, next to the
+	 *  CHAT label, before the live/reset controls. The active entry pulses while
+	 *  `live`. Absent => no selector (the planner renders it standalone instead). */
+	orchestrators?: { id: string; label: string; disabled?: boolean }[];
+	orchestratorId?: string;
+	onOrchestratorChange?: (id: string) => void;
 }
 
 export function PlannerChat({
@@ -43,6 +50,9 @@ export function PlannerChat({
 	onInterrupt,
 	onSlashCommand,
 	onResetChat,
+	orchestrators,
+	orchestratorId,
+	onOrchestratorChange,
 }: PlannerChatProps) {
 	const [value, setValue] = useState("");
 	const slash = useSlashCommands();
@@ -125,7 +135,7 @@ export function PlannerChat({
 				overflow: "hidden",
 				display: "flex",
 				flexDirection: "column",
-				minHeight: 340,
+				minHeight: 420,
 				maxHeight: "clamp(460px, 62vh, 1200px)",
 				flex: 1,
 			}}
@@ -150,6 +160,65 @@ export function PlannerChat({
 				<span className="pp-mono" style={{ fontSize: 9.5, color: "#9c9488" }}>
 					{modelLabel}
 				</span>
+				{orchestrators && orchestrators.length > 0 && (
+					<div
+						style={{
+							display: "flex",
+							alignItems: "center",
+							gap: 4,
+							marginLeft: 6,
+						}}
+					>
+						{orchestrators.map((o) => {
+							const isActive = o.id === orchestratorId;
+							const disabled = o.disabled === true;
+							return (
+								<button
+									type="button"
+									key={o.id}
+									className="pp-mono"
+									onClick={() => {
+										if (!disabled) onOrchestratorChange?.(o.id);
+									}}
+									disabled={disabled}
+									title={
+										disabled
+											? `${o.label} CLI is not installed on this machine`
+											: undefined
+									}
+									style={{
+										display: "flex",
+										alignItems: "center",
+										gap: 5,
+										fontSize: 9.5,
+										borderRadius: 7,
+										padding: "4px 8px",
+										cursor: disabled ? "not-allowed" : "pointer",
+										opacity: disabled ? 0.45 : 1,
+										fontWeight: isActive ? 600 : 400,
+										color: isActive ? "#9A6A2E" : "#A89F90",
+										background: isActive ? "#F1E4D2" : "transparent",
+										border: isActive
+											? "1px solid #E6D3BB"
+											: "1px solid transparent",
+										animation:
+											isActive && live ? "pp-pulse 1.9s infinite" : "none",
+									}}
+								>
+									<div
+										style={{
+											width: 6,
+											height: 6,
+											borderRadius: "50%",
+											background: isActive ? "#C0894F" : "#CFC6B6",
+										}}
+									/>
+									<span>{o.label}</span>
+								</button>
+							);
+						})}
+					</div>
+				)}
 				<span
 					style={{
 						marginLeft: "auto",
