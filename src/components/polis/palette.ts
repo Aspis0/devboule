@@ -123,6 +123,12 @@ export const DERIVED = {
   bridgeWood: saturate(blend(PALETTE.terracottaDark, PALETTE.sandDark, 0.35), 0.04),
   bridgeWoodDark: darken(PALETTE.terracottaDark, 0.22),
 
+  // BRIDGE STONE (Polis terrain frame): raised stone arch bridge piers, arches,
+  // side walls, parapets, and end-posts. Derived from the stone family so the
+  // bridge reads as weathered limestone against the blue water.
+  bridgeStone: saturate(lighten(PALETTE.stone, 0.08), 0.06),
+  bridgeStoneDark: saturate(darken(PALETTE.stoneDark, 0.12), 0.08),
+
   // Smoke / fire (square retro particles + flame shapes).
   smoke: lighten(PALETTE.stoneDark, 0.28),
   fireCore: lighten(PALETTE.terracotta, 0.1),
