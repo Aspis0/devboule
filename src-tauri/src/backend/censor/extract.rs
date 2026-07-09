@@ -66,6 +66,27 @@ pub struct ReviewItem {
     pub start_line: u32,
     /// 1-based last line of the item (inclusive).
     pub end_line: u32,
+    /// McCabe-style cyclomatic complexity: 1 + count of branch-inducing nodes
+    /// in the item's subtree. Computed during parse; 1 for a flat, branchless item.
+    /// For container items (impl, class), this is the aggregate; the per-function
+    /// breakdown lives in [`child_complexities`].
+    pub complexity: u32,
+    /// Per-function complexity breakdown for container items (Rust `impl_item`,
+    /// TS/Kotlin `class_declaration`).  Empty for non-containers.  Each entry
+    /// names a child function and its own cyclomatic complexity.  The sin
+    /// detector uses these instead of the aggregate `complexity`.
+    pub child_complexities: Vec<ChildComplexity>,
+}
+
+/// A single function's complexity inside a container item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildComplexity {
+    /// Function name (e.g. `"Type::method"`).
+    pub name: Option<String>,
+    /// 1-based start line of the function.
+    pub line: u32,
+    /// McCabe-style cyclomatic complexity of just this function.
+    pub complexity: u32,
 }
 
 /// The deterministic facts extracted from a source file: its line count, its
@@ -104,6 +125,14 @@ pub struct ParsedFile {
     /// Import statements extracted from the file (module specifiers + symbol counts).
     /// EMPTY when the language has no import grammar wired.
     pub imports: Vec<RawImport>,
+    /// Token-fingerprint hashes for clone detection (P4.2). One entry per leaf
+    /// token in source order, after comment/string-content normalization.
+    /// EMPTY when the language has no grammar, the file exceeds 20 000 tokens,
+    /// or parsing failed.
+    pub token_hashes: Vec<u64>,
+    /// 1-based line numbers paired with [`token_hashes`], same length.  Used
+    /// to attribute clone-match start lines.
+    pub token_lines: Vec<u32>,
 }
 
 /// The verdict of grounding one finding against a [`ParsedFile`]. `Kept` means the
@@ -193,66 +222,80 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
     let total_lines = count_lines(source);
     match lang {
         FileLang::Rust => {
-            let (items, identifiers, imports) = parse_rust(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_rust(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         FileLang::Ts => {
-            let (items, identifiers, imports) = parse_ts(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_ts(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         FileLang::Py => {
-            let (items, identifiers, imports) = parse_py(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_py(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         FileLang::Go => {
-            let (items, identifiers, imports) = parse_go(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_go(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         FileLang::Cpp => {
-            let (items, identifiers, imports) = parse_cpp(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_cpp(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         FileLang::Html => {
-            let (items, identifiers, imports) = parse_html(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_html(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         FileLang::Kotlin => {
-            let (items, identifiers, imports) = parse_kotlin(source);
+            let (items, identifiers, imports, token_hashes, token_lines) = parse_kotlin(source);
             ParsedFile {
                 total_lines,
                 items,
                 identifiers,
                 imports,
+                token_hashes,
+                token_lines,
             }
         }
         // No grammar wired for these (lint-runner-only quick wins) — they degrade
@@ -269,6 +312,8 @@ pub fn parse_file(source: &str, lang: FileLang) -> ParsedFile {
             items: Vec::new(),
             identifiers: HashSet::new(),
             imports: Vec::new(),
+            token_hashes: Vec::new(),
+            token_lines: Vec::new(),
         },
     }
 }
@@ -397,6 +442,305 @@ where
     (kept, dropped)
 }
 
+
+/// McCabe-style cyclomatic complexity: 1 + count of branch-inducing nodes
+/// in the subtree rooted at `node`. Iterative explicit-stack walk; never
+/// recurses unbounded. `lang` selects the per-grammar branch-node set.
+fn compute_complexity(node: &tree_sitter::Node, bytes: &[u8], lang: super::detect::FileLang) -> u32 {
+    use super::detect::FileLang;
+    let mut count: u32 = 1; // baseline — a flat, branchless item
+    let mut stack: Vec<tree_sitter::Node> = vec![*node];
+    while let Some(n) = stack.pop() {
+        if is_branch_node(&n, bytes, lang) {
+            count += 1;
+        }
+        let mut cursor = n.walk();
+        // Push children in reverse so leftmost is processed first (order does not
+        // affect the count; this is just a consistent iteration).
+        let mut children: Vec<tree_sitter::Node> = n.children(&mut cursor).collect();
+        children.reverse();
+        for child in children {
+            stack.push(child);
+        }
+    }
+    count
+}
+
+/// True when `node` is a branch-inducing node for `lang` as defined in
+/// the P4.1 design: per-grammar dispatch mirroring the imports-capture surface.
+fn is_branch_node(node: &tree_sitter::Node, bytes: &[u8], lang: super::detect::FileLang) -> bool {
+    use super::detect::FileLang;
+    let kind = node.kind();
+    match lang {
+        FileLang::Rust => {
+            matches!(kind, "if_expression" | "match_arm" | "while_expression"
+                | "loop_expression" | "for_expression")
+                || (kind == "binary_expression" && is_logic_operator(node, bytes))
+        }
+        FileLang::Ts => {
+            matches!(kind, "if_statement" | "for_statement" | "for_in_statement"
+                | "while_statement" | "do_statement" | "switch_case" | "catch_clause"
+                | "ternary_expression")
+                || (kind == "binary_expression" && is_logic_operator(node, bytes))
+        }
+        FileLang::Py => {
+            matches!(kind, "if_statement" | "elif_clause" | "for_statement"
+                | "while_statement" | "except_clause" | "conditional_expression")
+                || (kind == "boolean_operator" && has_py_logic_operator(node, bytes))
+        }
+        FileLang::Go => {
+            matches!(kind, "if_statement" | "for_statement" | "expression_case"
+                | "type_case")
+                || (kind == "binary_expression" && is_logic_operator(node, bytes))
+        }
+        FileLang::Cpp => {
+            matches!(kind, "if_statement" | "while_statement" | "for_statement"
+                | "do_statement" | "case_statement" | "catch_clause"
+                | "conditional_expression")
+                || (kind == "binary_expression" && is_logic_operator(node, bytes))
+        }
+        FileLang::Kotlin => {
+            matches!(kind, "if_expression" | "when_entry" | "while_statement"
+                | "for_statement" | "do_statement" | "catch_clause"
+                | "when_expression")
+                || (kind == "conjunction_expression" || kind == "disjunction_expression")
+        }
+        // HTML and grammar-less langs have no branch nodes of interest.
+        _ => false,
+    }
+}
+
+/// Check whether a `binary_expression` node has a logic operator (&& or ||).
+/// Handles two grammar conventions: operator as a named field, and operator
+/// as a child whose node kind IS the operator string.
+fn is_logic_operator(node: &tree_sitter::Node, bytes: &[u8]) -> bool {
+    // Convention 1: operator lives in the `operator` field (Rust, Go, TS).
+    if let Some(op) = node.child_by_field_name("operator") {
+        if let Ok(t) = op.utf8_text(bytes) {
+            if t == "&&" || t == "||" {
+                return true;
+            }
+        }
+    }
+    // Convention 2: operator is a direct child whose kind is "&&" or "||".
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let k = child.kind();
+        if k == "&&" || k == "||" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether a Python `boolean_operator` node uses `and` or `or`
+/// (as opposed to, say, a comparison chain). tree-sitter-python names the
+/// operator child with kind "and" or "or".
+fn has_py_logic_operator(node: &tree_sitter::Node, _bytes: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let k = child.kind();
+        if k == "and" || k == "or" {
+            return true;
+        }
+    }
+    false
+}
+
+
+/// Maximum tokens a single file contributes to the clone-detection index.
+/// Files with more leaves than this store an empty `token_hashes` — clone
+/// analysis skips them.  Keeps the Rabin-Karp window index bounded.
+const MAX_CLONE_TOKENS_PER_FILE: usize = 20_000;
+
+/// Collect deterministic token-fingerprint hashes + line numbers from a
+/// tree-sitter tree, for clone detection (P4.2).
+///
+/// Walks ALL leaf nodes in source order via an explicit stack.  For each leaf:
+///   - COMMENT nodes are skipped entirely (their children are never pushed).
+///   - STRING/CHAR literal leaves are hashed by their NODE KIND (not content),
+///     so changing a string value does not break clone equality and secrets
+///     are never hashed.
+///   - IDENTIFIER leaves are normalized to a single SENTINEL hash (type-2
+///     clone detection: renamed variables still match).
+///   - Everything else (keywords, operators, punctuation) is hashed by its
+///     text verbatim.
+///
+/// Returns two parallel vectors (`hashes`, `lines`).  Lines are 1-based.
+/// A file exceeding `MAX_CLONE_TOKENS_PER_FILE` returns empty vectors (the
+/// caller treats this as "too large for clone analysis").
+fn collect_token_hashes(
+    root: tree_sitter::Node,
+    bytes: &[u8],
+) -> (Vec<u64>, Vec<u32>) {
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut lines: Vec<u32> = Vec::new();
+
+    // Stack for explicit DFS (never recurses unbounded).  Each entry is a node
+    // to visit.
+    let mut stack: Vec<tree_sitter::Node> = vec![root];
+
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+
+        // --- Comment nodes: skip entirely (do not push children). ---
+        if is_comment_kind(kind) {
+            continue;
+        }
+
+        // Check cap BEFORE pushing children so we don't waste work on a giant
+        // file whose tokens would be discarded.
+        if hashes.len() >= MAX_CLONE_TOKENS_PER_FILE {
+            return (Vec::new(), Vec::new());
+        }
+
+        if node.child_count() == 0 {
+            // ---- Leaf node -------------------------------------------------
+            let line = u32::try_from(node.start_position().row)
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            let h = token_leaf_hash(&node, bytes);
+            hashes.push(h);
+            lines.push(line);
+        } else {
+            // ---- Interior node: push children for continued walk. ----------
+            // Push in reverse so leftmost is visited first.
+            let mut cursor = node.walk();
+            let mut children: Vec<tree_sitter::Node> =
+                node.children(&mut cursor).collect();
+            children.reverse();
+            for child in children {
+                stack.push(child);
+            }
+        }
+    }
+
+    (hashes, lines)
+}
+
+/// True when `kind` names a comment node in any wired grammar.
+fn is_comment_kind(kind: &str) -> bool {
+    // tree-sitter grammars use `comment`, `line_comment`, `block_comment`,
+    // or `doc_comment`.
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "doc_comment"
+    )
+}
+
+/// Hash a single leaf token for clone detection.
+fn token_leaf_hash(node: &tree_sitter::Node, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let kind = node.kind();
+
+    // String/char literal → hash the node KIND (not content).
+    if is_string_or_char_kind(kind) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        kind.hash(&mut h);
+        return h.finish();
+    }
+
+    // Identifier → sentinel hash so renamed vars match (type-2 clones).
+    // Check for "identifier" as a substring of the kind so ALL grammar-specific
+    // identifier kinds (shorthand_property_identifier, simple_identifier, etc.)
+    // are normalised, not just the Rust set.
+    if kind.contains("identifier") {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        "IDENT".hash(&mut h);
+        return h.finish();
+    }
+
+    // Everything else (keyword, operator, punctuation) → hash its text.
+    if let Ok(text) = node.utf8_text(bytes) {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
+    } else {
+        // Fallback: hash the kind (should not happen for well-formed code).
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        kind.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// True when `kind` names a string or char literal in any wired grammar.
+fn is_string_or_char_kind(kind: &str) -> bool {
+    kind.contains("string")
+        || kind.contains("char")
+        || kind == "escape_sequence"
+}
+
+
+/// For a container node (`impl_item` or `class_declaration`), walk direct
+/// children and return `ChildComplexity` entries for each contained function.
+/// The function name is prefixed with the container name (e.g. `"Point::new"`).
+fn container_child_complexities(
+    node: &tree_sitter::Node,
+    bytes: &[u8],
+    lang: super::detect::FileLang,
+    container_name: Option<&str>,
+) -> Vec<ChildComplexity> {
+    use super::detect::FileLang;
+    let to_line = |row: usize| -> u32 {
+        u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1)
+    };
+
+    // Per-language function-child node kinds.
+    let func_kinds: &[&str] = match lang {
+        FileLang::Rust => &["function_item"],
+        FileLang::Ts => &[
+            "method_definition",
+            "function_declaration",
+            "generator_function_declaration",
+        ],
+        FileLang::Kotlin => &["function_declaration"],
+        _ => return Vec::new(),
+    };
+
+    // The function children live one level down, inside the container's body
+    // node (Rust `declaration_list`, TS/Kotlin `class_body`) — direct children
+    // of the container are name/type nodes plus that body.
+    const BODY_KINDS: [&str; 2] = ["declaration_list", "class_body"];
+    let mut candidates: Vec<tree_sitter::Node> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if BODY_KINDS.contains(&child.kind()) {
+            let mut body_cursor = child.walk();
+            for grandchild in child.children(&mut body_cursor) {
+                candidates.push(grandchild);
+            }
+        } else {
+            candidates.push(child);
+        }
+    }
+
+    let mut children = Vec::new();
+    for child in candidates {
+        let kind = child.kind();
+        if !func_kinds.contains(&kind) {
+            continue;
+        }
+        let cc = compute_complexity(&child, bytes, lang);
+        let name = child
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string());
+        let qualified = match (container_name, name) {
+            (Some(ct), Some(n)) => Some(format!("{ct}::{n}")),
+            (Some(ct), None) => Some(format!("{ct}::<unnamed>")),
+            (None, Some(n)) => Some(n),
+            (None, None) => None,
+        };
+        children.push(ChildComplexity {
+            name: qualified,
+            line: to_line(child.start_position().row),
+            complexity: cc,
+        });
+    }
+    children
+}
+
 /// Count the lines in `source` for line-range grounding. Empty input ⇒ 0 (no valid
 /// 1-based line). A trailing newline does NOT add a phantom final line: a finding's
 /// line index can only reference content lines. `"a\nb"` and `"a\nb\n"` both have 2
@@ -443,11 +787,24 @@ fn rust_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewI
     }
     // tree-sitter rows are 0-based usize; the Censor uses 1-based inclusive lines.
     let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    let container_name = rust_item_name(node, bytes);
+    let child_complexities = if kind == "impl_item" {
+        container_child_complexities(
+            node,
+            bytes,
+            super::detect::FileLang::Rust,
+            container_name.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
     Some(ReviewItem {
         kind: kind.to_string(),
-        name: rust_item_name(node, bytes),
+        name: container_name,
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(node, bytes, super::detect::FileLang::Rust),
+        child_complexities,
     })
 }
 
@@ -460,10 +817,10 @@ fn rust_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewI
 /// legitimately cite a local variable, a called function, a field, or a lifetime, not
 /// only a top-level item. A parse failure yields empty `items` + empty `identifiers`
 /// (symbol grounding then disabled — fail-open, never a false drop).
-fn parse_rust(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_rust(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_rust_tree(source) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -511,7 +868,8 @@ fn parse_rust(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>
     }
 
     let imports = extract_rust_imports(&tree.root_node(), &bytes);
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 /// Strip a Rust raw-identifier prefix (`r#`) so `r#type` and `type` compare equal.
@@ -632,11 +990,23 @@ fn ts_review_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> 
     } else {
         return None;
     };
+    let child_complexities = if kind == "class_declaration" || kind == "abstract_class_declaration" {
+        container_child_complexities(
+            node,
+            bytes,
+            super::detect::FileLang::Ts,
+            name.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
     Some(ReviewItem {
         kind: kind.to_string(),
         name,
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(node, bytes, super::detect::FileLang::Ts),
+        child_complexities,
     })
 }
 
@@ -701,10 +1071,10 @@ fn is_ts_identifier_kind(kind: &str) -> bool {
 /// declaration). The identifier set is every identifier-like leaf in the whole tree
 /// (see [`is_ts_identifier_kind`]). A parse failure yields empty + empty (symbol
 /// grounding then disabled — fail-open, never a false drop).
-fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_with(source, tree_sitter_typescript::LANGUAGE_TSX.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -730,7 +1100,8 @@ fn parse_ts(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) 
 
     let identifiers = collect_identifiers(root, bytes, is_ts_identifier_kind);
     let imports = extract_ts_imports(&tree.root_node(), &bytes);
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 // ===========================================================================
@@ -761,6 +1132,8 @@ fn py_review_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> 
         name,
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(node, bytes, super::detect::FileLang::Py),
+        child_complexities: Vec::new(),
     })
 }
 
@@ -770,10 +1143,10 @@ fn py_review_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewItem> 
 /// `function_definition`, named `f`; the line range is taken from that inner node, i.e.
 /// the `def`/`class` line through the body). The identifier set is every `identifier`
 /// leaf in the whole tree. A parse failure yields empty + empty (fail-open).
-fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_with(source, tree_sitter_python::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -797,7 +1170,8 @@ fn parse_py(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) 
 
     let identifiers = collect_identifiers(root, bytes, |k| k == "identifier");
     let imports = extract_py_imports(&tree.root_node(), &bytes);
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 // ===========================================================================
@@ -835,6 +1209,8 @@ fn go_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewIte
         name: go_item_name(node, bytes),
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(node, bytes, super::detect::FileLang::Go),
+        child_complexities: Vec::new(),
     })
 }
 
@@ -890,10 +1266,10 @@ fn is_go_identifier_kind(kind: &str) -> bool {
 /// identifier set is every identifier-like leaf in the whole tree (see
 /// [`is_go_identifier_kind`]). A parse failure yields empty + empty (symbol grounding
 /// then disabled — fail-open, never a false drop).
-fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_with(source, tree_sitter_go::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -908,7 +1284,8 @@ fn parse_go(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) 
 
     let identifiers = collect_identifiers(root, bytes, is_go_identifier_kind);
     let imports = extract_go_imports(&tree.root_node(), &bytes);
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 // ===========================================================================
@@ -1025,6 +1402,8 @@ fn cpp_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewIt
         name: cpp_item_name(&node, bytes),
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(&node, bytes, super::detect::FileLang::Cpp),
+        child_complexities: Vec::new(),
     })
 }
 
@@ -1103,10 +1482,10 @@ fn is_cpp_identifier_kind(kind: &str) -> bool {
 /// see [`CPP_ITEM_KINDS`]); the identifier set is every identifier-like leaf in the
 /// whole tree (see [`is_cpp_identifier_kind`]). A parse failure yields empty + empty
 /// (symbol grounding then disabled — fail-open, never a false drop).
-fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_with(source, tree_sitter_cpp::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -1121,7 +1500,8 @@ fn parse_cpp(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>)
 
     let identifiers = collect_identifiers(root, bytes, is_cpp_identifier_kind);
     let imports = extract_cpp_imports(&tree.root_node(), &bytes);
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 // ===========================================================================
@@ -1168,6 +1548,8 @@ fn html_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<ReviewI
         name: html_element_tag_name(node, bytes),
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(node, bytes, super::detect::FileLang::Html),
+        child_complexities: Vec::new(),
     })
 }
 
@@ -1302,10 +1684,10 @@ fn collect_html_attribute(
 /// see [`html_top_level_item`]); the identifier set is every `tag_name` plus the values of
 /// `id`/`class`/`name` attributes (see [`collect_html_identifiers`]). A parse failure
 /// yields empty + empty (symbol grounding then disabled — fail-open, never a false drop).
-fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_with(source, tree_sitter_html::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -1320,7 +1702,8 @@ fn parse_html(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>
 
     let identifiers = collect_html_identifiers(root, bytes);
     let imports = Vec::new();
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 // ===========================================================================
@@ -1347,11 +1730,24 @@ fn kotlin_top_level_item(node: &tree_sitter::Node, bytes: &[u8]) -> Option<Revie
         return None;
     }
     let to_line = |row: usize| -> u32 { u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1) };
+    let container_name = kotlin_item_name(node, bytes);
+    let child_complexities = if kind == "class_declaration" {
+        container_child_complexities(
+            node,
+            bytes,
+            super::detect::FileLang::Kotlin,
+            container_name.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
     Some(ReviewItem {
         kind: kind.to_string(),
-        name: kotlin_item_name(node, bytes),
+        name: container_name,
         start_line: to_line(node.start_position().row),
         end_line: to_line(node.end_position().row),
+        complexity: compute_complexity(node, bytes, super::detect::FileLang::Kotlin),
+        child_complexities,
     })
 }
 
@@ -1419,10 +1815,10 @@ fn is_kotlin_identifier_kind(kind: &str) -> bool {
 /// the identifier set is every identifier-like leaf in the whole tree (see
 /// [`is_kotlin_identifier_kind`]). A parse failure yields empty + empty (symbol grounding
 /// then disabled — fail-open, never a false drop).
-fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>) {
+fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImport>, Vec<u64>, Vec<u32>) {
     let tree = match parse_with(source, tree_sitter_kotlin_ng::LANGUAGE.into()) {
         Some(t) => t,
-        None => return (Vec::new(), HashSet::new(), Vec::new()),
+        None => return (Vec::new(), HashSet::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     let root = tree.root_node();
     let bytes = source.as_bytes();
@@ -1437,7 +1833,8 @@ fn parse_kotlin(source: &str) -> (Vec<ReviewItem>, HashSet<String>, Vec<RawImpor
 
     let identifiers = collect_identifiers(root, bytes, is_kotlin_identifier_kind);
     let imports = extract_kotlin_imports(&tree.root_node(), &bytes);
-    (items, identifiers, imports)
+    let (token_hashes, token_lines) = collect_token_hashes(tree.root_node(), bytes);
+    (items, identifiers, imports, token_hashes, token_lines)
 }
 
 // ===========================================================================
@@ -3360,5 +3757,218 @@ val greeting = \"hi\"
 
 
 
+
+
+    // =========================================================================
+    // Complexity tests (P4.1 — per-language branch-node counting)
+    // =========================================================================
+
+    /// Rust: a flat fn → complexity 1.
+    #[test]
+    fn complexity_flat_rust_fn_is_1() {
+        let items = extract_items("fn flat() { let x = 1; }", FileLang::Rust);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].complexity, 1);
+    }
+
+    /// Rust: fn with 2 if-expressions + 1 loop + 1 && → 1 + 4 = 5.
+    #[test]
+    fn complexity_rust_branches() {
+        let src = "fn branchy(x: bool) {
+    if x { let a = 1; }
+    if !x { let b = 2; }
+    while x { break; }
+    let c = x && true;
+}";
+        let items = extract_items(src, FileLang::Rust);
+        assert_eq!(items.len(), 1);
+        // 2 if + 1 while + 1 && = 4 branch nodes → 1 + 4 = 5
+        assert_eq!(items[0].complexity, 5, "2 ifs + 1 while + 1 && = 5");
+    }
+
+    /// Rust: match expression contributes one per arm.
+    #[test]
+    fn complexity_rust_match_arms() {
+        let src = "fn matcher(x: u32) -> u32 {
+    match x {
+        1 => 10,
+        2 => 20,
+        3 => 30,
+    }
+}";
+        let items = extract_items(src, FileLang::Rust);
+        assert_eq!(items.len(), 1);
+        // 3 match_arms → 1 + 3 = 4
+        assert_eq!(items[0].complexity, 4, "3 match arms => 4");
+    }
+
+    /// TS: flat function → 1.
+    #[test]
+    fn complexity_flat_ts_fn_is_1() {
+        let items = extract_items("function flat() { const x = 1; }", FileLang::Ts);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].complexity, 1);
+    }
+
+    /// TS: 2 ifs + 1 for + 1 && → 1 + 4 = 5.
+    #[test]
+    fn complexity_ts_branches() {
+        let src = "function branchy(a: boolean) {
+    if (a) { console.log(1); }
+    if (!a) { console.log(2); }
+    for (let i = 0; i < 10; i++) { break; }
+    const ok = a && true;
+}";
+        let items = extract_items(src, FileLang::Ts);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].complexity, 5, "2 ifs + 1 for + 1 && = 5");
+    }
+
+    /// Python: flat function → 1.
+    #[test]
+    fn complexity_flat_py_fn_is_1() {
+        let items = extract_items("def flat():
+    x = 1
+", FileLang::Py);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].complexity, 1);
+    }
+
+    /// Python: 1 if + 1 elif + 1 for + 1 and → 1 + 4 = 5.
+    #[test]
+    fn complexity_py_branches() {
+        let src = "def branchy(x):
+    if x:
+        pass
+    elif not x:
+        pass
+    for i in range(10):
+        pass
+    return x and True
+";
+        let items = extract_items(src, FileLang::Py);
+        assert_eq!(items.len(), 1);
+        // if + elif + for + and = 4 → 1 + 4 = 5
+        assert_eq!(items[0].complexity, 5, "if+elif+for+and => 5");
+    }
+
+    /// Go: flat function → 1.
+    #[test]
+    fn complexity_flat_go_fn_is_1() {
+        let items = extract_items("package p
+func flat() { x := 1 }", FileLang::Go);
+        // Go items are the function_declaration
+        let fns: Vec<_> = items.iter().filter(|i| i.kind == "function_declaration").collect();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].complexity, 1);
+    }
+
+    /// Go: 2 ifs + 1 for → 1 + 3 = 4.
+    #[test]
+    fn complexity_go_branches() {
+        let src = "package p
+func branchy(x bool) {
+if x { a := 1 }
+if !x { b := 2 }
+for i := 0; i < 10; i++ { break }
+}";
+        let items = extract_items(src, FileLang::Go);
+        let fns: Vec<_> = items.iter().filter(|i| i.kind == "function_declaration").collect();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].complexity, 4, "2 ifs + 1 for => 4");
+    }
+
+
+
+    // =========================================================================
+    // P4.2 — token-fingerprint hashing for clone detection
+    // =========================================================================
+
+    /// Two identical functions with renamed variables must produce equal
+    /// token_hashes (type-2 clone: identifiers → sentinel).
+    #[test]
+    fn token_hashes_identical_for_renamed_vars() {
+        let a = parse_file("fn foo(x: i32) -> i32 { x + 1 }", FileLang::Rust);
+        let b = parse_file("fn bar(y: i32) -> i32 { y + 1 }", FileLang::Rust);
+        assert!(!a.token_hashes.is_empty(), "Rust file must produce hashes");
+        assert_eq!(a.token_hashes.len(), b.token_hashes.len(),
+            "same structure → same token count");
+        assert_eq!(a.token_hashes, b.token_hashes,
+            "renamed vars must produce identical hashes");
+    }
+
+    /// Comment content must not affect token_hashes.
+    #[test]
+    fn token_hashes_ignore_comments() {
+        let a = parse_file("fn f() { /* hello */ 1 }", FileLang::Rust);
+        let b = parse_file("fn f() { /* world */ 1 }", FileLang::Rust);
+        assert_eq!(a.token_hashes, b.token_hashes,
+            "different comments → identical token_hashes");
+    }
+
+    /// String literal content must not affect token_hashes.
+    #[test]
+    fn token_hashes_ignore_string_contents() {
+        let a = parse_file(r#"fn f() { let s = "secret1"; s }"#, FileLang::Rust);
+        let b = parse_file(r#"fn f() { let s = "secret2"; s }"#, FileLang::Rust);
+        assert_eq!(a.token_hashes, b.token_hashes,
+            "different string contents → identical token_hashes");
+    }
+
+    /// Files without a grammar produce empty token_hashes.
+    #[test]
+    fn token_hashes_empty_for_other_lang() {
+        let p = parse_file("anything", FileLang::Other);
+        assert!(p.token_hashes.is_empty());
+        assert!(p.token_lines.is_empty());
+    }
+
+    /// Lines are 1-based and match the token positions.
+    #[test]
+    fn token_lines_are_1_based() {
+        let p = parse_file("fn f() {
+    1
+}", FileLang::Rust);
+        assert_eq!(p.token_hashes.len(), p.token_lines.len());
+        // First token should be on line 1.
+        assert!(p.token_lines.first().copied().unwrap_or(0) >= 1,
+            "lines must be 1-based");
+    }
+
+
+
+    /// M1: impl with two methods — child_complexities has both, not the aggregate.
+    #[test]
+    fn container_child_complexities_rust_impl_two_methods() {
+        let src = "impl Counter {
+    fn new() -> Self { Counter { n: 0 } }
+    fn increment(&mut self) {
+        if self.n > 0 { self.n += 1; } else { self.n = 1; }
+    }
+}
+";
+        let items = extract_items(src, FileLang::Rust);
+        let imp = item(&items, "impl_item");
+        // The impl itself still gets its aggregate complexity.
+        assert!(imp.complexity >= 1);
+        // But child_complexities has the per-method breakdown.
+        assert_eq!(imp.child_complexities.len(), 2, "two methods expected");
+        let new_fn = imp.child_complexities.iter()
+            .find(|c| c.name.as_deref() == Some("Counter::new"))
+            .expect("Counter::new");
+        assert_eq!(new_fn.complexity, 1, "fn new is flat → cc 1");
+        let inc_fn = imp.child_complexities.iter()
+            .find(|c| c.name.as_deref() == Some("Counter::increment"))
+            .expect("Counter::increment");
+        assert!(inc_fn.complexity >= 2, "increment has an if/else → cc >= 2");
+    }
+
+    /// M1: a non-container item has empty child_complexities.
+    #[test]
+    fn plain_function_has_empty_child_complexities() {
+        let items = extract_items("fn flat() { let x = 1; }", FileLang::Rust);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].child_complexities.is_empty());
+    }
 
 }

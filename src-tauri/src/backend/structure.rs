@@ -218,6 +218,13 @@ pub(crate) struct FileFacts {
     /// The full parsed top-level items (kind/name/start_line/end_line) — the CKG's symbol nodes.
     /// Carried so the CKG reuses THIS parse instead of re-walking + re-parsing the tree.
     pub(crate) items: Vec<ReviewItem>,
+    /// Token-fingerprint hashes for clone detection (P4.2). One entry per leaf
+    /// token in source order, after comment/string-content normalization.
+    /// Empty when the language has no grammar, the file exceeds 20 000 tokens,
+    /// or parsing failed.
+    pub(crate) token_hashes: Vec<u64>,
+    /// 1-based line numbers paired with `token_hashes`, same length.
+    pub(crate) token_lines: Vec<u32>,
 }
 
 /// Build the deterministic cross-file structure graph + spine for `project_root`.
@@ -604,6 +611,8 @@ fn collect_files_bounded(
             total_lines,
             imports,
             items: parsed.items,
+            token_hashes: parsed.token_hashes,
+            token_lines: parsed.token_lines,
         });
     }
 

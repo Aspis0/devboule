@@ -454,6 +454,10 @@ pub mod road_type {
     pub const IMPORT: &str = "import";
     pub const SEMANTIC: &str = "semantic";
     pub const INFRASTRUCTURE: &str = "infrastructure";
+    /// Clone-pair twin road (P4.2).  Connects two buildings that share a
+    /// detected clone block.  Visual style deferred to P5 — renders as a
+    /// minor road for now.
+    pub const CLONE: &str = "clone";
 }
 
 /// Known road styles.

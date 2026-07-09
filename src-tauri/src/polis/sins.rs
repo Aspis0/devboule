@@ -21,9 +21,38 @@
 use crate::polis::augure::DetectedSin;
 use crate::polis::model::{purpose, severity, Building, Road, UrbanSin};
 use crate::polis::scanner::{RoadGraph, ScannedFile};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
+
+// =========================================================================
+// P4.1 — Threshold policy constants (all pure, doc-commented)
+// =========================================================================
+
+/// Cyclomatic complexity at or above which a per-item sin is emitted: >= 15 → smoke.
+const COMPLEXITY_SMOKE: u32 = 15;
+/// CC >= 25 → fire.
+const COMPLEXITY_FIRE: u32 = 25;
+/// CC >= 40 → inferno.
+const COMPLEXITY_INFERNO: u32 = 40;
+/// Max per-file complexity sins emitted (the 3 worst items).  Prevents sin spam
+/// on a file full of switch/match arms.
+const COMPLEXITY_MAX_PER_FILE: usize = 3;
+
+/// A file is a "god-file" when BOTH its LOC and its fan-in exceed the project
+/// P95 of the respective metric.  Severity fire by default.
+/// When EITHER exceeds P99 → inferno.
+/// Skipped entirely when the project has fewer than this many files in the
+/// import graph (percentiles are meaningless on tiny sets).
+const GOD_FILE_MIN_FILES: usize = 20;
+
+/// A src file (not a test) triggers the test-gap sin when it has at least this
+/// many exported symbols with ZERO membership in `test_refs` AND the project
+/// has at least one test file.
+const TEST_GAP_MIN_UNREF_SYMBOLS: usize = 3;
+
+/// Clone pair with >= this many tokens raises a fire sin (otherwise smoke).
+const CLONE_FIRE_TOKENS: u32 = 100;
 
 /// Result of a full sin sweep.
 pub struct SinReport {
@@ -70,8 +99,11 @@ pub fn detect_content_sins(content: &str, env_example: Option<&HashSet<String>>)
 /// production iterative implementation in `crate::backend::graph::tarjan_scc`.
 fn tarjan_scc_from_roads(roads: &[Road]) -> Vec<Vec<String>> {
     use crate::backend::graph;
+    // Filter to IMPORT roads only — clone/semantic/infrastructure roads are
+    // visual-only and must not fabricate dep-cycle SCCs (B1 fix).
     let edges: Vec<graph::ImportEdge> = roads
         .iter()
+        .filter(|r| r.road_type == crate::polis::model::road_type::IMPORT)
         .map(|r| graph::ImportEdge {
             from: r.from.clone(),
             to: r.to.clone(),
@@ -86,6 +118,7 @@ pub fn detect_graph_sins(
     buildings: &[Building],
     graph: &RoadGraph,
     roads: &[Road],
+    import_graph: Option<&crate::backend::graph::ImportGraph>,
 ) -> SinReport {
     let mut by_file: HashMap<String, Vec<DetectedSin>> = HashMap::new();
     let city_wide: Vec<DetectedSin> = Vec::new();
@@ -167,8 +200,41 @@ pub fn detect_graph_sins(
         }
     }
 
-    // Exported-but-never-imported symbol -> smoke.
-    let imported_targets: HashSet<&str> = graph.directed_targets();
+    // =====================================================================
+    // P4.1 — dead-export UPGRADE (AST fan-in beats name-heuristic)
+    // =====================================================================
+    //
+    // The existing dead-export check fires when a file has exported symbols
+    // but zero incoming roads.  With AST data available, we UPGRADE it:
+    //   - If the file IS in the import graph AND has fan-in > 0, the AST
+    //     evidence beats the regex heuristic → SUPPRESS the sin.
+    //   - If fan-in == 0 (or not in the graph), keep the original sin.
+    //
+    // Fan-in per file = count of import edges whose `to` == file's rel_path.
+    // The import graph's edges use rel_paths, not file_ids.
+    // B1 fix: compute import targets from IMPORT-only roads (clone/semantic/
+    // infrastructure roads are visual-only and must not suppress dead-export).
+    let imported_targets: HashSet<&str> = roads
+        .iter()
+        .filter(|r| r.road_type == crate::polis::model::road_type::IMPORT)
+        .map(|r| r.to.as_str())
+        .collect();
+
+    // Build a fan-in map from AST edges: rel_path -> count of distinct importers.
+    let ast_fan_in: HashMap<&str, usize> = if let Some(ig) = import_graph {
+        let mut m: HashMap<&str, usize> = HashMap::new();
+        for e in &ig.edges {
+            *m.entry(e.to.as_str()).or_insert(0) += 1;
+        }
+        m
+    } else {
+        HashMap::new()
+    };
+    // Quick lookup: is rel_path an AST-covered file?
+    let ast_files: HashSet<&str> = import_graph
+        .map(|ig| ig.files.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
     for f in scanned {
         let Some(&file_id) = id_by_path.get(f.rel_path.as_str()) else {
             continue;
@@ -177,7 +243,36 @@ pub fn detect_graph_sins(
         if is_entry_point {
             continue;
         }
-        if f.has_exported_symbol && !imported_targets.contains(file_id) {
+        if !f.has_exported_symbol {
+            continue;
+        }
+        // Original heuristic: no incoming regex roads → dead export.
+        let no_regex_imports = !imported_targets.contains(file_id);
+
+        // UPGRADE: if the file is AST-covered, fan-in > 0 means the AST saw
+        // real importers → the regex heuristic's silence is a false negative
+        // (the import uses a path alias / re-export / etc.).  SUPPRESS the sin.
+        // If fan-in == 0, the AST confirms the heuristic → KEEP the sin.
+        let ast_fi = ast_files
+            .contains(f.rel_path.as_str())
+            .then(|| ast_fan_in.get(f.rel_path.as_str()).copied().unwrap_or(0));
+
+        let should_fire = match ast_fi {
+            Some(fi) if fi > 0 => {
+                // AST says this file HAS importers → suppress the name-heuristic sin.
+                false
+            }
+            Some(_fi) => {
+                // AST confirms zero fan-in → keep the sin (stronger evidence).
+                true
+            }
+            None => {
+                // Not AST-covered → original heuristic alone.
+                no_regex_imports
+            }
+        };
+
+        if should_fire {
             by_file
                 .entry(file_id.to_string())
                 .or_default()
@@ -196,7 +291,315 @@ pub fn detect_graph_sins(
         }
     }
 
+    // =====================================================================
+    // P4.1 — COMPLEXITY (per-item cyclomatic complexity)
+    // =====================================================================
+    if let Some(ig) = import_graph {
+        // Map rel_path -> file_id for attribution.
+        let fid_by_path: HashMap<&str, &str> = buildings
+            .iter()
+            .map(|b| (b.file_path.as_str(), b.file_id.as_str()))
+            .collect();
+
+        for m in &ig.metrics {
+            let Some(&file_id) = fid_by_path.get(m.rel_path.as_str()) else {
+                continue;
+            };
+            // Collect all offending items: (complexity, severity, item).
+            let mut offenders: Vec<(u32, &str, &crate::backend::graph::ItemMetric)> = Vec::new();
+            for it in &m.items {
+                // Container aggregates (impl/class) never trip — their per-method
+                // breakdown is expanded into separate function entries by
+                // graph.rs's FileMetrics construction; a stray container entry
+                // (older cache, hand-built fixture) must not sin on the blended
+                // number the design doc forbids.
+                if matches!(
+                    it.kind.as_str(),
+                    "impl_item" | "class_declaration" | "abstract_class_declaration"
+                ) {
+                    continue;
+                }
+                if it.complexity < COMPLEXITY_SMOKE {
+                    continue;
+                }
+                let sev = if it.complexity >= COMPLEXITY_INFERNO {
+                    severity::INFERNO
+                } else if it.complexity >= COMPLEXITY_FIRE {
+                    severity::FIRE
+                } else {
+                    severity::SMOKE
+                };
+                offenders.push((it.complexity, sev, it));
+            }
+            if offenders.is_empty() {
+                continue;
+            }
+            // Take the 3 worst (highest cc), then sort by severity desc (inferno
+            // first) so the worst items appear first in the sin list.
+            offenders.sort_by(|a, b| b.0.cmp(&a.0));
+            offenders.truncate(COMPLEXITY_MAX_PER_FILE);
+            // Optional: resort by severity so inferno/fire/smoke order is nicer.
+            offenders.sort_by(|a, b| {
+                severity_rank(b.1).cmp(&severity_rank(a.1))
+                    .then_with(|| a.2.line.cmp(&b.2.line))
+            });
+
+            for (cc, sev, it) in &offenders {
+                let fn_label = it.name.as_deref().unwrap_or("<unnamed>");
+                let threshold = if *sev == severity::INFERNO {
+                    COMPLEXITY_INFERNO
+                } else if *sev == severity::FIRE {
+                    COMPLEXITY_FIRE
+                } else {
+                    COMPLEXITY_SMOKE
+                };
+                let evidence = format!(
+                    "fn {fn_label} exceeds the cyclomatic threshold"
+                );
+                by_file.entry(file_id.to_string()).or_default().push(DetectedSin {
+                    sin: UrbanSin {
+                        sin_id: deterministic_sin_id(
+                            &format!("complexity-{}-{}", it.line, cc),
+                            file_id,
+                        ),
+                        severity: sev.to_string(),
+                        description: format!(
+                            "High cyclomatic complexity in {fn_label} (cc {cc}, threshold {threshold})"
+                        ),
+                        auto_detectable: true,
+                        file_id: Some(file_id.to_string()),
+                    },
+                    rule_id: "complexity",
+                    evidence,
+                    line: Some(it.line),
+                });
+            }
+        }
+    }
+
+    // =====================================================================
+    // P4.1 — GOD-FILE (above P95 of both LOC and fan-in)
+    // =====================================================================
+    if let Some(ig) = import_graph {
+        let n = ig.metrics.len();
+        if n >= GOD_FILE_MIN_FILES {
+            // Compute P95 and P99 of LOC.
+            let mut locs: Vec<u32> = ig.metrics.iter().map(|m| m.loc).collect();
+            locs.sort();
+            let p95_loc = percentile(&locs, 0.95);
+            let p99_loc = percentile(&locs, 0.99);
+
+            // Compute P95 and P99 of fan-in.
+            let mut fan_ins: Vec<usize> = ig.metrics.iter().map(|m| {
+                ast_fan_in.get(m.rel_path.as_str()).copied().unwrap_or(0)
+            }).collect();
+            fan_ins.sort();
+            let p95_fan = percentile_usize(&fan_ins, 0.95);
+            let p99_fan = percentile_usize(&fan_ins, 0.99);
+
+            let fid_by_path: HashMap<&str, &str> = buildings
+                .iter()
+                .map(|b| (b.file_path.as_str(), b.file_id.as_str()))
+                .collect();
+
+            for m in &ig.metrics {
+                let Some(&file_id) = fid_by_path.get(m.rel_path.as_str()) else {
+                    continue;
+                };
+                let fi = ast_fan_in.get(m.rel_path.as_str()).copied().unwrap_or(0);
+                let loc = m.loc;
+
+                // Must exceed BOTH P95 thresholds.
+                if loc as usize <= p95_loc || fi <= p95_fan {
+                    continue;
+                }
+                let severity = if (loc as usize) > p99_loc || fi > p99_fan {
+                    severity::INFERNO
+                } else {
+                    severity::FIRE
+                };
+                let evidence = "file size and fan-in both above project P95".to_string();
+                by_file.entry(file_id.to_string()).or_default().push(DetectedSin {
+                    sin: UrbanSin {
+                        sin_id: deterministic_sin_id("god-file", file_id),
+                        severity: severity.to_string(),
+                        description: format!(
+                            "God file: {loc} LOC (P95 {p95_loc}) with {fi} importers (P95 {p95_fan}) — above P95 on both axes"
+                        ),
+                        auto_detectable: true,
+                        file_id: Some(file_id.to_string()),
+                    },
+                    rule_id: "god-file",
+                    evidence,
+                    line: None,
+                });
+            }
+        }
+    }
+
+    // =====================================================================
+    // P4.1 — TEST-GAP (exported symbols unreferenced by any test)
+    // =====================================================================
+    if let Some(ig) = import_graph {
+        // Only fire when the project has at least one test file.
+        let has_test_file = ig.metrics.iter().any(|m| {
+            crate::backend::graph::is_test_path(&m.rel_path)
+        });
+        if has_test_file {
+            let fid_by_path: HashMap<&str, &str> = buildings
+                .iter()
+                .map(|b| (b.file_path.as_str(), b.file_id.as_str()))
+                .collect();
+
+            for m in &ig.metrics {
+                // Only src files (not tests themselves).
+                if crate::backend::graph::is_test_path(&m.rel_path) {
+                    continue;
+                }
+                let Some(&file_id) = fid_by_path.get(m.rel_path.as_str()) else {
+                    continue;
+                };
+                // Exported symbols with zero membership in test_refs.
+                let unreferenced: Vec<&String> = m.exported.iter()
+                    .filter(|sym| !ig.test_refs.contains(sym.as_str()))
+                    .collect();
+                if unreferenced.len() < TEST_GAP_MIN_UNREF_SYMBOLS {
+                    continue;
+                }
+                let first_few: Vec<&str> = unreferenced.iter()
+                    .take(3)
+                    .map(|s| s.as_str())
+                    .collect();
+                let evidence = "exported symbols unreferenced by any test".to_string();
+                by_file.entry(file_id.to_string()).or_default().push(DetectedSin {
+                    sin: UrbanSin {
+                        sin_id: deterministic_sin_id("test-gap", file_id),
+                        severity: severity::SMOKE.to_string(),
+                        description: format!(
+                            "{} exported symbols not covered by any test (e.g. {})",
+                            unreferenced.len(),
+                            first_few.join(", ")
+                        ),
+                        auto_detectable: true,
+                        file_id: Some(file_id.to_string()),
+                    },
+                    rule_id: "test-gap",
+                    evidence,
+                    line: None,
+                });
+            }
+        }
+    }
+
+    // =====================================================================
+    // P4.2 — CLONE sin (per file in each detected clone pair)
+    // =====================================================================
+    if let Some(ig) = import_graph {
+        let fid_by_path: HashMap<&str, &str> = buildings
+            .iter()
+            .map(|b| (b.file_path.as_str(), b.file_id.as_str()))
+            .collect();
+
+        for cp in &ig.clones {
+            // File A sin.
+            if let Some(&fid_a) = fid_by_path.get(cp.a.as_str()) {
+                let sev = if cp.tokens >= CLONE_FIRE_TOKENS {
+                    severity::FIRE
+                } else {
+                    severity::SMOKE
+                };
+                let evidence = format!(
+                    "duplicated block shared with {other}",
+                    other = cp.b,
+                );
+                by_file.entry(fid_a.to_string()).or_default().push(DetectedSin {
+                    sin: UrbanSin {
+                        sin_id: deterministic_sin_id(
+                            &format!("clone-{}", &cp.b.replace('/', "-")),
+                            fid_a,
+                        ),
+                        severity: sev.to_string(),
+                        description: format!(
+                            "~{tokens} tokens duplicated with {} (from line {line})",
+                            cp.b,
+                            tokens = cp.tokens,
+                            line = cp.a_line,
+                        ),
+                        auto_detectable: true,
+                        file_id: Some(fid_a.to_string()),
+                    },
+                    rule_id: "clone",
+                    evidence,
+                    line: Some(cp.a_line),
+                });
+            }
+
+            // File B sin.
+            if let Some(&fid_b) = fid_by_path.get(cp.b.as_str()) {
+                let sev = if cp.tokens >= CLONE_FIRE_TOKENS {
+                    severity::FIRE
+                } else {
+                    severity::SMOKE
+                };
+                let evidence = format!(
+                    "duplicated block shared with {other}",
+                    other = cp.a,
+                );
+                by_file.entry(fid_b.to_string()).or_default().push(DetectedSin {
+                    sin: UrbanSin {
+                        sin_id: deterministic_sin_id(
+                            &format!("clone-{}", &cp.a.replace("/", "-")),
+                            fid_b,
+                        ),
+                        severity: sev.to_string(),
+                        description: format!(
+                            "~{tokens} tokens duplicated with {} (from line {line})",
+                            cp.a,
+                            tokens = cp.tokens,
+                            line = cp.b_line,
+                        ),
+                        auto_detectable: true,
+                        file_id: Some(fid_b.to_string()),
+                    },
+                    rule_id: "clone",
+                    evidence,
+                    line: Some(cp.b_line),
+                });
+            }
+        }
+    }
+
     SinReport { by_file, city_wide }
+}
+
+/// Numeric rank of a severity string for sorting (inferno > fire > smoke).
+fn severity_rank(s: &str) -> u8 {
+    match s {
+        "inferno" => 3,
+        "fire" => 2,
+        "smoke" => 1,
+        _ => 0,
+    }
+}
+
+/// The value at the given percentile (0.0–1.0) of a sorted slice.
+/// Returns the floor: index = ceil(p * len) - 1, clamped.
+fn percentile(sorted: &[u32], p: f64) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (p * sorted.len() as f64).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx] as usize
+}
+
+fn percentile_usize(sorted: &[usize], p: f64) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (p * sorted.len() as f64).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +1131,9 @@ fn random_sin_id() -> String {
 mod tests {
     use super::*;
     use crate::polis::model::Coords;
-    use crate::polis::model::{building_status, purpose, purpose_source, visual_tier, Road};
+    use crate::polis::model::{
+        building_status, purpose, purpose_source, road_style, road_type, visual_tier, Road,
+    };
 
     fn mk_building(id: &str, path: &str) -> Building {
         mk_building_with_purpose(id, path, purpose::HOUSE)
@@ -974,7 +1379,7 @@ env::var_os("E_VAR");
             mk_scanned("a.ts", "import './b';\n"),
             mk_scanned("b.ts", "import './a';\n"),
         ];
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
         assert!(a_sins
             .iter()
@@ -993,7 +1398,7 @@ env::var_os("E_VAR");
             mk_scanned("lib.ts", "export const orphan = 1;\n"),
             mk_scanned("user.ts", "const x = 1;\n"),
         ];
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         let lib_sins = report.by_file.get("lib").cloned().unwrap_or_default();
         assert!(lib_sins
             .iter()
@@ -1016,7 +1421,7 @@ env::var_os("E_VAR");
             "src/main.tsx",
             "export default function App() {}\n",
         )];
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         let main_sins = report.by_file.get("main").cloned().unwrap_or_default();
         assert!(
             !main_sins.iter().any(|s| s.sin.description.contains("Exported")),
@@ -1053,7 +1458,7 @@ env::var_os("E_VAR");
             "s.ts",
             "api_key = \"AbCdEfGhIjKlMnOpQrStUvWx\"\n",
         )];
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         let s = report
             .by_file
             .get("fid-secret")
@@ -1099,7 +1504,7 @@ env::var_os("E_VAR");
             mk_scanned("a.ts", "import './b';\n"),
             mk_scanned("b.ts", "import './a';\n"),
         ];
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
         let cycle_sin = a_sins.iter().find(|s| s.rule_id == "dep-cycle").expect("dep-cycle sin expected");
         assert_eq!(cycle_sin.sin.severity, severity::FIRE, "2-member SCC must be fire");
@@ -1142,7 +1547,7 @@ env::var_os("E_VAR");
             mk_scanned("b.ts", "import './c';\n"),
             mk_scanned("c.ts", "import './a';\n"),
         ];
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
         let cycle_sin = a_sins.iter().find(|s| s.rule_id == "dep-cycle").expect("dep-cycle sin expected");
         assert_eq!(cycle_sin.sin.severity, severity::INFERNO, ">=3 SCC must be inferno");
@@ -1177,7 +1582,7 @@ env::var_os("E_VAR");
             });
         }
         let graph = RoadGraph::build(&buildings, &roads);
-        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads);
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
         // Every member gets a dep-cycle sin.
         let a_sins = report.by_file.get("a").cloned().unwrap_or_default();
         let cycle_sin = a_sins.iter().find(|s| s.rule_id == "dep-cycle").expect("dep-cycle sin expected");
@@ -1190,6 +1595,626 @@ env::var_os("E_VAR");
         // Evidence should use file paths (.ts), not file_ids (single letters).
         assert!(cycle_sin.evidence.contains(".ts"),
             "evidence must contain paths, got: {}", cycle_sin.evidence);
+    }
+
+
+
+    #[test]
+    fn clone_road_does_not_fabricate_dep_cycle() {
+        // B1 regression: import A→B + clone road B→A must produce NO dep-cycle sin.
+        // Without the B1 filter, tarjan_scc_from_roads sees both edges → 2-node SCC.
+        let buildings = vec![mk_building("a", "a.ts"), mk_building("b", "b.ts")];
+        let roads = vec![
+            // Real import: A imports B.
+            Road {
+                road_id: "r-import".into(),
+                from: "a".into(),
+                to: "b".into(),
+                road_type: road_type::IMPORT.to_string(),
+                style: road_style::LASTRICATA.to_string(),
+                weight: 1,
+                path: None,
+                provenance: Some("ast".into()),
+            },
+            // Clone road: B↔A (opposite direction).  Must NOT create a cycle.
+            Road {
+                road_id: "r-clone".into(),
+                from: "b".into(),
+                to: "a".into(),
+                road_type: road_type::CLONE.to_string(),
+                style: road_style::TERRA_BATTUTA.to_string(),
+                weight: 1,
+                path: None,
+                provenance: Some("ast".into()),
+            },
+        ];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("a.ts", "import './b';\n"),
+            mk_scanned("b.ts", "export const x = 1;\n"),
+        ];
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, None);
+        let all_sins: Vec<_> = report.by_file.values().flatten().collect();
+        assert!(
+            all_sins.iter().all(|s| s.rule_id != "dep-cycle"),
+            "clone road must not fabricate a dep-cycle sin, got {:?}",
+            all_sins.iter().filter(|s| s.rule_id == "dep-cycle").collect::<Vec<_>>()
+        );
+    }
+
+    // =========================================================================
+    // P4.1 — complexity sin thresholds + 3-worst cap
+    // =========================================================================
+
+    #[test]
+    fn complexity_items_fire_at_thresholds() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let buildings = vec![mk_building("fid", "src/lib.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/lib.rs", "pub fn flat() {}")];
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/lib.rs".to_string(),
+                loc: 60,
+                items: vec![
+                    // cc 15 → smoke threshold exactly
+                    ItemMetric { name: Some("smoker".to_string()), line: 1, complexity: 15, kind: "function_item".to_string() },
+                    // cc 25 → fire
+                    ItemMetric { name: Some("burner".to_string()), line: 20, complexity: 25, kind: "function_item".to_string() },
+                    // cc 40 → inferno
+                    ItemMetric { name: Some("inferno_fn".to_string()), line: 30, complexity: 40, kind: "function_item".to_string() },
+                ],
+                exported: vec![],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let sins = report.by_file.get("fid").cloned().unwrap_or_default();
+
+        let smoke_sin = sins.iter().find(|s| s.rule_id == "complexity" && s.sin.severity == severity::SMOKE);
+        let fire_sin = sins.iter().find(|s| s.rule_id == "complexity" && s.sin.severity == severity::FIRE);
+        let inferno_sin = sins.iter().find(|s| s.rule_id == "complexity" && s.sin.severity == severity::INFERNO);
+
+        assert!(smoke_sin.is_some(), "cc 15 must produce smoke");
+        assert!(fire_sin.is_some(), "cc 25 must produce fire");
+        assert!(inferno_sin.is_some(), "cc 40 must produce inferno");
+    }
+
+    #[test]
+    fn complexity_capped_at_three_worst() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let buildings = vec![mk_building("fid", "src/lib.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/lib.rs", "pub fn flat() {}")];
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/lib.rs".to_string(),
+                loc: 100,
+                items: (0..10).map(|i| ItemMetric {
+                    name: Some(format!("fn{i}")),
+                    line: i * 10 + 1,
+                    complexity: 16 + i, // 16, 17, ..., 25
+                    kind: "function_item".to_string(),
+                }).collect(),
+                exported: vec![],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let sins = report.by_file.get("fid").cloned().unwrap_or_default();
+        let complexity_sins: Vec<_> = sins.iter().filter(|s| s.rule_id == "complexity").collect();
+        assert_eq!(complexity_sins.len(), 3, "must cap at 3 worst, got {}", complexity_sins.len());
+    }
+
+    #[test]
+    fn complexity_skips_below_threshold() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let buildings = vec![mk_building("fid", "src/lib.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/lib.rs", "pub fn flat() {}")];
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/lib.rs".to_string(),
+                loc: 10,
+                items: vec![
+                    ItemMetric { name: Some("low".to_string()), line: 1, complexity: 14, kind: "function_item".to_string() },
+                ],
+                exported: vec![],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let sins = report.by_file.get("fid").cloned().unwrap_or_default();
+        let complexity_sins: Vec<_> = sins.iter().filter(|s| s.rule_id == "complexity").collect();
+        assert!(complexity_sins.is_empty(), "cc 14 < 15 → no sin");
+    }
+
+    // =========================================================================
+    // P4.1 — god-file (P95 of loc AND fan-in)
+    // =========================================================================
+
+    #[test]
+    fn god_file_fires_when_above_p95_both_axes() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric, ImportEdge};
+        use std::collections::BTreeSet;
+
+        // Build 25 synthetic files — one is a clear outlier in BOTH loc and fan-in.
+        let n = 25usize;
+        let mut metrics = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..n {
+            let path = format!("src/file{i}.rs");
+            let loc = if i == 0 { 5000 } else { 50 + i as u32 }; // file0 is the god
+            metrics.push(FileMetrics {
+                rel_path: path.clone(),
+                loc,
+                items: vec![ItemMetric {
+                    name: Some(format!("fn{i}")),
+                    line: 1,
+                    complexity: 1,
+                    kind: "function_item".to_string(),
+                }],
+                exported: vec![format!("Fn{i}")],
+            });
+            // Give file0 lots of inbound edges (high fan-in).
+            if i > 0 {
+                edges.push(ImportEdge {
+                    from: format!("src/file{i}.rs"),
+                    to: "src/file0.rs".to_string(),
+                    weight: 1,
+                });
+            }
+        }
+        let all_paths: BTreeSet<String> = metrics.iter().map(|m| m.rel_path.clone()).collect();
+
+        let ig = ImportGraph {
+            edges,
+            capped: false,
+            files: all_paths,
+            metrics,
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let mut buildings = Vec::new();
+        let mut scanned = Vec::new();
+        for i in 0..n {
+            let id = format!("fid{i}");
+            let path = format!("src/file{i}.rs");
+            buildings.push(mk_building(&id, &path));
+            scanned.push(mk_scanned(&path, &format!("pub fn fn{i}() {{}}")));
+        }
+        let roads: Vec<Road> = vec![];
+        let road_graph = RoadGraph::build(&buildings, &roads);
+
+        let report = detect_graph_sins(&scanned, &buildings, &road_graph, &roads, Some(&ig));
+        let god_sin = report.by_file.get("fid0").and_then(|sins| {
+            sins.iter().find(|s| s.rule_id == "god-file")
+        });
+        assert!(god_sin.is_some(), "file0 must be a god-file: high LOC + high fan-in");
+        // B2: evidence is stable, description carries numbers.
+        assert_eq!(god_sin.unwrap().evidence, "file size and fan-in both above project P95");
+        assert!(god_sin.unwrap().sin.description.contains("5000"), "description must carry LOC");
+        // file1 (no fan-in, normal LOC) must NOT be god-file.
+        let others: Vec<_> = report.by_file.iter()
+            .filter(|(id, sins)| *id != "fid0" && sins.iter().any(|s| s.rule_id == "god-file"))
+            .collect();
+        assert!(others.is_empty(), "only the outlier is a god-file, got {:?}", others);
+    }
+
+    #[test]
+    fn god_file_skipped_when_below_min_files() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/a.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/a.rs".to_string(),
+                loc: 10_000,
+                items: vec![],
+                exported: vec![],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let buildings = vec![mk_building("fid", "src/a.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/a.rs", "pub fn huge() {}")];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let any_god = report.by_file.values().flatten().any(|s| s.rule_id == "god-file");
+        assert!(!any_god, "< 20 files → god-file skipped");
+    }
+
+    // =========================================================================
+    // P4.1 — test-gap (exported symbols unreferenced by tests)
+    // =========================================================================
+
+    #[test]
+    fn test_gap_fires_when_unreferenced_symbols_exist() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string(), "tests/test.rs".to_string()].into_iter().collect(),
+            metrics: vec![
+                FileMetrics {
+                    rel_path: "src/lib.rs".to_string(),
+                    loc: 20,
+                    items: vec![],
+                    exported: vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()],
+                },
+                FileMetrics {
+                    rel_path: "tests/test.rs".to_string(),
+                    loc: 10,
+                    items: vec![],
+                    exported: vec![],
+                },
+            ],
+            // test_refs is empty → none of the exported symbols are referenced by tests
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let buildings = vec![
+            mk_building("fid-lib", "src/lib.rs"),
+            mk_building("fid-test", "tests/test.rs"),
+        ];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("src/lib.rs", "pub struct Alpha; pub struct Beta; pub struct Gamma;"),
+            mk_scanned("tests/test.rs", "// no test references"),
+        ];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let lib_sins = report.by_file.get("fid-lib").cloned().unwrap_or_default();
+        let gap = lib_sins.iter().find(|s| s.rule_id == "test-gap");
+        assert!(gap.is_some(), "3 unreferenced exported symbols → test-gap sin");
+        // B2: evidence is stable; description carries the measured values.
+        assert!(gap.unwrap().sin.description.contains("Alpha"), "description must name the symbols");
+        assert!(!gap.unwrap().evidence.contains("Alpha"), "evidence must NOT carry symbol names");
+    }
+
+    #[test]
+    fn test_gap_skips_when_fewer_than_three_unreferenced() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string(), "tests/test.rs".to_string()].into_iter().collect(),
+            metrics: vec![
+                FileMetrics {
+                    rel_path: "src/lib.rs".to_string(),
+                    loc: 10,
+                    items: vec![],
+                    exported: vec!["Only".to_string(), "Two".to_string()],
+                },
+                FileMetrics {
+                    rel_path: "tests/test.rs".to_string(),
+                    loc: 5,
+                    items: vec![],
+                    exported: vec![],
+                },
+            ],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let buildings = vec![
+            mk_building("fid-lib", "src/lib.rs"),
+            mk_building("fid-test", "tests/test.rs"),
+        ];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("src/lib.rs", "pub struct Only; pub struct Two;"),
+            mk_scanned("tests/test.rs", "// empty"),
+        ];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let lib_sins = report.by_file.get("fid-lib").cloned().unwrap_or_default();
+        assert!(lib_sins.iter().all(|s| s.rule_id != "test-gap"), "< 3 unreferenced → skip");
+    }
+
+    #[test]
+    fn test_gap_skips_when_no_test_files() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/lib.rs".to_string(),
+                loc: 10,
+                items: vec![],
+                exported: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let buildings = vec![mk_building("fid", "src/lib.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/lib.rs", "pub struct A; pub struct B; pub struct C;")];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let sins = report.by_file.get("fid").cloned().unwrap_or_default();
+        assert!(sins.iter().all(|s| s.rule_id != "test-gap"), "no test files → skip");
+    }
+
+    // =========================================================================
+    // P4.1 — dead-export upgrade (AST evidence suppresses name-heuristic)
+    // =========================================================================
+
+    #[test]
+    fn dead_export_suppressed_when_ast_fan_in_positive() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric, ImportEdge};
+        use std::collections::BTreeSet;
+
+        // AST says src/lib.ts has fan-in 1 → the name-heuristic dead-export sin
+        // (from zero regex roads) must be SUPPRESSED.
+        let ig = ImportGraph {
+            edges: vec![ImportEdge {
+                from: "src/consumer.ts".to_string(),
+                to: "src/lib.ts".to_string(),
+                weight: 1,
+            }],
+            capped: false,
+            files: ["src/lib.ts".to_string(), "src/consumer.ts".to_string()]
+                .into_iter().collect(),
+            metrics: vec![
+                FileMetrics {
+                    rel_path: "src/lib.ts".to_string(),
+                    loc: 5,
+                    items: vec![],
+                    exported: vec!["Helper".to_string()],
+                },
+                FileMetrics {
+                    rel_path: "src/consumer.ts".to_string(),
+                    loc: 5,
+                    items: vec![],
+                    exported: vec![],
+                },
+            ],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let buildings = vec![
+            mk_building("fid-lib", "src/lib.ts"),
+            mk_building("fid-consumer", "src/consumer.ts"),
+        ];
+        // NO regex roads → old heuristic would fire dead-export.
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("src/lib.ts", "export const Helper = 1;"),
+            mk_scanned("src/consumer.ts", "import { Helper } from './lib';"),
+        ];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let lib_sins = report.by_file.get("fid-lib").cloned().unwrap_or_default();
+        assert!(
+            lib_sins.iter().all(|s| s.rule_id != "dead-export"),
+            "AST fan-in > 0 must suppress dead-export sin"
+        );
+    }
+
+    #[test]
+    fn dead_export_kept_when_ast_fan_in_zero() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        // AST says fan-in == 0 AND regex says no imports → keep the sin.
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/orphan.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/orphan.rs".to_string(),
+                loc: 5,
+                items: vec![],
+                exported: vec!["OrphanFn".to_string()],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: Vec::new(),
+        };
+
+        let buildings = vec![mk_building("fid", "src/orphan.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/orphan.rs", "pub fn orphan_fn() {}")];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let sins = report.by_file.get("fid").cloned().unwrap_or_default();
+        assert!(
+            sins.iter().any(|s| s.rule_id == "dead-export"),
+            "AST fan-in == 0 + regex zero → dead-export must fire"
+        );
+    }
+
+
+    // =========================================================================
+    // P4.2 — clone sin (both files get a sin, cross-referencing evidence)
+    // =========================================================================
+
+    #[test]
+    fn clone_pair_produces_two_sins_with_cross_references() {
+        use crate::backend::graph::{ImportGraph, ClonePair, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/a.rs".to_string(), "src/b.rs".to_string()].into_iter().collect(),
+            metrics: vec![
+                FileMetrics { rel_path: "src/a.rs".to_string(), loc: 10, items: vec![], exported: vec![] },
+                FileMetrics { rel_path: "src/b.rs".to_string(), loc: 10, items: vec![], exported: vec![] },
+            ],
+            test_refs: BTreeSet::new(),
+            clones: vec![ClonePair {
+                a: "src/a.rs".to_string(),
+                b: "src/b.rs".to_string(),
+                a_line: 5,
+                b_line: 12,
+                tokens: 80,
+            }],
+        };
+
+        let buildings = vec![
+            mk_building("fid-a", "src/a.rs"),
+            mk_building("fid-b", "src/b.rs"),
+        ];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![
+            mk_scanned("src/a.rs", "fn a() {}"),
+            mk_scanned("src/b.rs", "fn b() {}"),
+        ];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+
+        let a_sins = report.by_file.get("fid-a").cloned().unwrap_or_default();
+        let a_clone = a_sins.iter().find(|s| s.rule_id == "clone").expect("a must have clone sin");
+        assert!(a_clone.evidence.contains("src/b.rs"), "evidence must reference other file");
+        // B2: evidence is stable — measured numbers live in description only.
+        assert!(a_clone.sin.description.contains("80"), "description must carry token count");
+        assert!(!a_clone.evidence.contains("80 tokens"), "evidence must NOT carry token count");
+        assert_eq!(a_clone.sin.severity, severity::SMOKE, "80 tokens → smoke");
+
+        let b_sins = report.by_file.get("fid-b").cloned().unwrap_or_default();
+        let b_clone = b_sins.iter().find(|s| s.rule_id == "clone").expect("b must have clone sin");
+        assert!(b_clone.evidence.contains("src/a.rs"), "evidence must reference other file");
+    }
+
+    #[test]
+    fn clone_pair_with_100_tokens_is_fire() {
+        use crate::backend::graph::{ImportGraph, ClonePair, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["x.rs".to_string(), "y.rs".to_string()].into_iter().collect(),
+            metrics: vec![
+                FileMetrics { rel_path: "x.rs".to_string(), loc: 10, items: vec![], exported: vec![] },
+                FileMetrics { rel_path: "y.rs".to_string(), loc: 10, items: vec![], exported: vec![] },
+            ],
+            test_refs: BTreeSet::new(),
+            clones: vec![ClonePair {
+                a: "x.rs".to_string(), b: "y.rs".to_string(),
+                a_line: 1, b_line: 1, tokens: 100,
+            }],
+        };
+        let buildings = vec![mk_building("fx", "x.rs"), mk_building("fy", "y.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("x.rs", "fn x() {}"), mk_scanned("y.rs", "fn y() {}")];
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let x_sins = report.by_file.get("fx").cloned().unwrap_or_default();
+        let clone = x_sins.iter().find(|s| s.rule_id == "clone").expect("clone sin expected");
+        assert_eq!(clone.sin.severity, severity::FIRE, "100 tokens → fire");
+    }
+
+
+    // =========================================================================
+    // M1 — container complexity: impl/class aggregates don't trip; per-method do
+    // =========================================================================
+
+    #[test]
+    fn container_aggregate_does_not_trip_but_heavy_method_does() {
+        use crate::backend::graph::{ImportGraph, FileMetrics, ItemMetric};
+        use std::collections::BTreeSet;
+
+        // An impl with 10 trivial methods (cc=1 each) and one heavy method (cc=27).
+        // Before M1 fix: the aggregate impl cc trips.  After: only the heavy method.
+        let ig = ImportGraph {
+            edges: vec![],
+            capped: false,
+            files: ["src/lib.rs".to_string()].into_iter().collect(),
+            metrics: vec![FileMetrics {
+                rel_path: "src/lib.rs".to_string(),
+                loc: 200,
+                items: vec![
+                    // The impl container itself — aggregate cc high but child_complexities
+                    // are expanded per-method.
+                    ItemMetric { name: Some("Counter".to_string()), line: 1, complexity: 30, kind: "impl_item".to_string() },
+                    // Per-method entries: 10 trivial + 1 heavy.
+                    ItemMetric { name: Some("Counter::triv1".to_string()), line: 2, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv2".to_string()), line: 3, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv3".to_string()), line: 4, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv4".to_string()), line: 5, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv5".to_string()), line: 6, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv6".to_string()), line: 7, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv7".to_string()), line: 8, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv8".to_string()), line: 9, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv9".to_string()), line: 10, complexity: 1, kind: "function_item".to_string() },
+                    ItemMetric { name: Some("Counter::triv10".to_string()), line: 11, complexity: 1, kind: "function_item".to_string() },
+                    // This one should trip.
+                    ItemMetric { name: Some("Counter::heavy_method".to_string()), line: 12, complexity: 27, kind: "function_item".to_string() },
+                ],
+                exported: vec![],
+            }],
+            test_refs: BTreeSet::new(),
+            clones: vec![],
+        };
+
+        let buildings = vec![mk_building("fid", "src/lib.rs")];
+        let roads: Vec<Road> = vec![];
+        let graph = RoadGraph::build(&buildings, &roads);
+        let scanned = vec![mk_scanned("src/lib.rs", "pub struct Counter;")];
+
+        let report = detect_graph_sins(&scanned, &buildings, &graph, &roads, Some(&ig));
+        let sins = report.by_file.get("fid").cloned().unwrap_or_default();
+        let complexity_sins: Vec<_> = sins.iter().filter(|s| s.rule_id == "complexity").collect();
+
+        // Only the heavy method should trip — not the impl aggregate and not the trivial ones.
+        assert_eq!(complexity_sins.len(), 1, "only heavy method must trip, got {:?}",
+            complexity_sins.iter().map(|s| &s.sin.description).collect::<Vec<_>>());
+        let only = &complexity_sins[0];
+        assert!(only.sin.description.contains("Counter::heavy_method"),
+            "sin must name the heavy method, got: {}", only.sin.description);
+        assert_eq!(only.line, Some(12), "sin line must be the method's line");
     }
 
 }

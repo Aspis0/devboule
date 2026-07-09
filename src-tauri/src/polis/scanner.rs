@@ -305,6 +305,38 @@ pub(crate) fn generate_city_state_with_metrics(
         &alias,
         ast_graph.as_ref(),
     );
+    // P4.2 — CLONE twin roads (one per clone pair whose both endpoints are
+    // buildings).  Renders as a minor road with the existing `terra_battuta`
+    // style; distinct glyph deferred to P5.
+    // Capped at 20 pairs by the clone pass upstream (graph.rs); no extra cap here.
+    if let Some(ref ig) = ast_graph {
+        // Build rel_path -> file_id lookup from the existing file_id_by_path
+        // (which maps rel_path -> file_id).  Clone pairs use rel_paths.
+        let path_to_fid: std::collections::HashMap<&str, &str> =
+            file_id_by_path.iter().map(|(p, id)| (p.as_str(), id.as_str())).collect();
+
+        for cp in &ig.clones {
+            let Some(&fid_a) = path_to_fid.get(cp.a.as_str()) else {
+                continue;
+            };
+            let Some(&fid_b) = path_to_fid.get(cp.b.as_str()) else {
+                continue;
+            };
+            roads.push(Road {
+                road_id: road_id(fid_a, fid_b, road_type::CLONE),
+                from: fid_a.to_string(),
+                to: fid_b.to_string(),
+                road_type: road_type::CLONE.to_string(),
+                // P5: distinct clone-road style.  For now, terra_battuta
+                // (minor road) so clones render visibly but subtly.
+                style: road_style::TERRA_BATTUTA.to_string(),
+                weight: 1,
+                path: None,
+                provenance: Some("ast".to_string()),
+            });
+        }
+    }
+
     // POLIS FOLLOW-UP: add `semantic` roads (Oracle embedding similarity > 0.82)
     // and `infrastructure` roads (wrangler.toml bindings / env URLs) here.
 
@@ -480,7 +512,7 @@ pub(crate) fn generate_city_state_with_metrics(
     // Augure — urban sins. Content sins were already detected per-file during
     // the scan (with content dropped); here we add the graph-derived sins
     // (cycles, orphan-export) and key everything by file_id.
-    let sin_result = sins::detect_graph_sins(&scanned, &buildings, &graph, &roads);
+    let sin_result = sins::detect_graph_sins(&scanned, &buildings, &graph, &roads, ast_graph.as_ref());
 
     // Build (rel_path, content_hash, Vec<SinRecord>) per file and upsert to
     // the persisted sin ledger. Failures are logged but never fail the scan.
@@ -10870,6 +10902,9 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
                 weight: 3,
             }],
             capped: false,
+            metrics: Vec::new(),
+            test_refs: std::collections::BTreeSet::new(),
+            clones: Vec::new(),
             files: ["a.ts".into(), "b.ts".into()].into_iter().collect(),
         };
         let scanned = vec![
@@ -10897,6 +10932,9 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         let ast_graph = ImportGraph {
             edges: vec![],
             capped: false,
+            metrics: Vec::new(),
+            test_refs: std::collections::BTreeSet::new(),
+            clones: Vec::new(),
             files: ["c.ts".into()].into_iter().collect(),
         };
         let scanned = vec![
@@ -10929,6 +10967,9 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
                 weight: 1,
             }],
             capped: false,
+            metrics: Vec::new(),
+            test_refs: std::collections::BTreeSet::new(),
+            clones: Vec::new(),
             files: ["a.ts".into(), "external.ts".into()].into_iter().collect(),
         };
         let scanned = vec![
@@ -10955,6 +10996,9 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         let ast_graph = ImportGraph {
             edges: vec![],
             capped: false,
+            metrics: Vec::new(),
+            test_refs: std::collections::BTreeSet::new(),
+            clones: Vec::new(),
             files: ["a.ts".into()].into_iter().collect(),
         };
         let scanned = vec![
