@@ -30,6 +30,9 @@ vi.mock("../../store/cityStore", () => ({
       sinActionPending: [],
       disposeSin: vi.fn(),
       cityState: null,
+      filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" },
+      setFilter: vi.fn(),
+      resetFilter: vi.fn(),
     }),
 }));
 
@@ -64,6 +67,7 @@ function renderBar(
     viewportReady: false,
     immersive: false,
     polisFocusedRef: { current: false },
+    filterSets: null,
   },
 ): { container: HTMLElement; root: Root } {
   const container = document.createElement("div");
@@ -99,6 +103,7 @@ describe("PolisBottomBar", () => {
         viewportReady: false,
         immersive: false,
         polisFocusedRef: { current: false },
+        filterSets: null,
       }),
     );
     expect(html).toContain("Oracle");

@@ -61,6 +61,8 @@ export interface PolisHandle {
   setCensorGemmaStatus: (status: GemmaStatus) => void;
   /** P3.1 — fly the camera to a specific building by fileId (600ms animate). */
   flyTo: (fileId: string) => void;
+  /** P3.2 — set the filter state (null = clear). Applied in one pass. */
+  setFilter: (sets: import("./filterModel").FilterSets | null) => void;
   destroy: () => void;
 }
 
@@ -229,6 +231,7 @@ export async function createPolis(
     onCensorFindings: (payload) =>
       renderer.onCensorFindings(payload, performance.now()),
     setCensorGemmaStatus: (status) => renderer.setCensorGemmaStatus(status),
+    setFilter: (sets) => renderer.setFilter(sets),
     flyTo: (fileId) => renderer.flyTo(fileId),
     destroy,
   };

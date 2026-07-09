@@ -15,7 +15,7 @@
 
 import { create } from "zustand";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { CityState, SinRecord } from "../types/city";
+import type { CityState, SinRecord, FilterState } from "../types/city";
 import { invokeBackendCommand, isTauriRuntime } from "../context/AppContext";
 
 /** localStorage key for the last folder the user mapped (folder-agnostic reload). */
@@ -163,6 +163,11 @@ interface CityStoreState {
   /** Dispatch a fix directive to the main coder. Returns an error string or null.
    *  On success refreshes the ledger + city. */
   fixSin: (relPath: string, sinId: string) => Promise<string | null>;
+
+  /** P3.2 — Filters panel state. Survives city refresh automatically. */
+  filter: FilterState;
+  setFilter: (patch: Partial<FilterState>) => void;
+  resetFilter: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +464,7 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
   pendingFocusAgentId: null,
   sinRecords: null,
   sinActionPending: [],
+  filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" },
 
   load: async () => {
     if (get().loading) return;
@@ -499,7 +505,15 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
     // Persist + reflect the selection immediately so the header shows the folder
     // even while the scan is in flight.
     writeLastFolder(trimmed);
-    set({ loading: true, error: null, selectedFolder: trimmed });
+    // P3.2 — reset filter when switching to a different folder so old project's
+    // features/glob don't ghost the entire new city.
+    const prev = get().selectedFolder;
+    set({
+      loading: true,
+      error: null,
+      selectedFolder: trimmed,
+      ...(prev !== trimmed ? { filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" as const } } : {}),
+    });
     try {
       const city = await scanFolder(trimmed);
       // Drop the response if a newer request started meanwhile.
@@ -599,6 +613,9 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
   },
 
   selectBuilding: (fileId) => set({ selectedBuildingId: fileId }),
+
+  setFilter: (patch) => set((s) => ({ filter: { ...s.filter, ...patch } })),
+  resetFilter: () => set({ filter: { categories: [], minSeverity: null, features: [], pathGlob: "", mode: "ghost" } }),
 
   startAgentPoll: () => {
     // Tauri-only; the browser fixture has no live agents. Idempotent: a second

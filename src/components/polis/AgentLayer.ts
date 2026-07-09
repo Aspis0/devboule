@@ -267,6 +267,9 @@ interface PlacedAgent {
   phase: number;
   /** Movement state machine. */
   move: MoveMode;
+  /** P3.2 — ghost multiplier: 0.4 when agent targets a ghosted building, else 1.
+   *  Set by setGhostFilter; applied in all alpha-setter sites. Idempotent. */
+  ghostMult: number;
   /** Horizontal facing (+1 right, -1 left); flips with travel direction. */
   facing: number;
 }
@@ -313,6 +316,8 @@ export class AgentLayer {
   // the only producer today; its `extinguishing` flag gates the water-arc tell.
   private externals = new Map<string, PlacedAgent>();
   private ominoVisible = true;
+  /** P3.2 — Last step frame for ghost-filter glow recompute. */
+  private _lastFrame = 0;
   private onSelectAgent?: (agent: Agent | null) => void;
 
   constructor(root: Container, onSelectAgent?: (agent: Agent | null) => void) {
@@ -581,6 +586,33 @@ export class AgentLayer {
     for (const s of this.subs.values()) s.omino.visible = visible;
   }
 
+  /** P3.2 — Set the ghosted building fileIds. Agents targeting ghosted buildings
+   *  render at 0.4 alpha. Called from PolisRenderer.applyFilter.
+   *  Idempotent: sets `ghostMult` on each placed agent ONCE; all alpha-setter
+   *  sites multiply by it, so alpha never compounds across frames. */
+  setGhostFilter(ids: Set<string>): void {
+    // ghostMult set per-agent below
+    for (const p of this.placed.values()) {
+      p.ghostMult = (p.fileId && ids.has(p.fileId)) ? 0.4 : 1;
+    }
+    for (const p of this.externals.values()) {
+      p.ghostMult = (p.fileId && ids.has(p.fileId)) ? 0.4 : 1;
+    }
+    // Re-apply alpha immediately: multiply current omino/glow alpha by the
+    // new multiplier (only for idle/walking states that aren't mid-fade).
+    for (const p of this.placed.values()) {
+      if (p.move.kind === "idle" || p.move.kind === "walk") {
+        p.omino.alpha = p.ghostMult;
+        p.glow.alpha = steppedPulse(this._lastFrame ?? 0, GLOW_LEVELS, 2) * p.ghostMult;
+      }
+    }
+    for (const p of this.externals.values()) {
+      if (p.move.kind === "idle" || p.move.kind === "walk") {
+        p.omino.alpha = p.ghostMult;
+      }
+    }
+  }
+
   /**
    * Advance the stepped pose / bob / glow for ONE placed omino (real agent OR an
    * external engine omino). Extracted so the Censor firefighter (Polis-P5) reuses
@@ -592,7 +624,7 @@ export class AgentLayer {
     // stepped pulse doesn't clobber the fade. Walking + idle pulse normally;
     // while walking the glow tracks the omino's position (set in update()).
     if (p.move.kind === "idle" || p.move.kind === "walk") {
-      p.glow.alpha = steppedPulse(frame, GLOW_LEVELS, 2);
+      p.glow.alpha = steppedPulse(frame, GLOW_LEVELS, 2) * p.ghostMult;
     }
 
     // Omino animation only when it's actually shown (LOD-gated == visible).
@@ -781,6 +813,9 @@ export class AgentLayer {
         }
       }
     }
+
+    // P3.2 — ghost filter is applied via ghostMult in all alpha-setter sites.
+    // No per-frame accumulation — setGhostFilter sets ghostMult once.
   }
 
   // -------------------------------------------------------------------------
@@ -863,8 +898,8 @@ export class AgentLayer {
     m.elapsed += deltaMs;
     const t = Math.min(1, m.elapsed / FADE_OUT_MS);
     const alpha = 1 - t;
-    p.omino.alpha = alpha;
-    p.glow.alpha = alpha * 0.45;
+    p.omino.alpha = alpha * p.ghostMult;
+    p.glow.alpha = alpha * 0.45 * p.ghostMult;
     if (t >= 1) {
       // Reposition while invisible, then fade back in.
       p.pos = { x: m.target.x, y: m.target.y };
@@ -881,9 +916,9 @@ export class AgentLayer {
   ): void {
     m.elapsed += deltaMs;
     const t = Math.min(1, m.elapsed / FADE_IN_MS);
-    p.omino.alpha = t;
+    p.omino.alpha = t * p.ghostMult;
     if (t >= 1) {
-      p.omino.alpha = 1;
+      p.omino.alpha = p.ghostMult;
       p.move = { kind: "idle" };
     }
   }
@@ -895,10 +930,10 @@ export class AgentLayer {
   ): void {
     m.elapsed += deltaMs;
     const t = Math.min(1, m.elapsed / APPEAR_MS);
-    p.omino.alpha = t;
-    p.glow.alpha = t * 0.45;
+    p.omino.alpha = t * p.ghostMult;
+    p.glow.alpha = t * 0.45 * p.ghostMult;
     if (t >= 1) {
-      p.omino.alpha = 1;
+      p.omino.alpha = p.ghostMult;
       p.move = { kind: "idle" };
     }
   }
@@ -989,13 +1024,13 @@ export class AgentLayer {
     glow.ellipse(0, 0, 26, 13).fill({ color, alpha: 1 });
     // A claimed walker is already present, so its glow starts visible; a fresh
     // agent fades its glow in via the appear state.
-    glow.alpha = claimed ? GLOW_LEVELS[0] : 0;
+    glow.alpha = (claimed ? GLOW_LEVELS[0] : 0);
     this.root.addChild(glow);
 
     const omino = new Container();
     omino.position.set(pos.x, pos.y + OMINO_Y_OFFSET);
     omino.visible = this.ominoVisible;
-    omino.alpha = claimed ? 1 : 0; // claimed: already visible; fresh: fade in
+    omino.alpha = claimed ? 1 : 0; // ghostMult applied below
 
     // Make the citizen clickable -> opens the agent inspect popup. A generous
     // hit area around the omino body (it's a tiny ~9px figure). The tap is
@@ -1082,6 +1117,7 @@ export class AgentLayer {
       // fresh: run the appear-fade.
       move: claimed ? { kind: "idle" } : { kind: "appear", elapsed: 0 },
       facing: 1,
+      ghostMult: 1,
     };
     // Draw the initial frame so the appear-fade shows the figure immediately.
     drawCitizen(base, figure, {

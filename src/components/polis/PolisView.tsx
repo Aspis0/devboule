@@ -6,7 +6,7 @@
 // counts, refresh, recenter, and an immersive/fullscreen toggle that hides the
 // app chrome). PIXI is fully torn down on unmount — no leaks.
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   RefreshCw,
   Crosshair,
@@ -38,6 +38,7 @@ import { createPolis, type PolisHandle } from "./createPolis";
 import { InspectSidebar, type InspectSubject } from "./InspectSidebar";
 import { PolisBottomBar } from "./PolisBottomBar";
 import { findBuildingByCitation } from "./findBuildingByCitation";
+import { computeFilterSets } from "./filterModel";
 
 // DIAGNOSTIC (temporary, Phase 0): fire-and-forget a line to
 // `%TEMP%/aspis-polis-debug.log` via the proven invokeBackendCommand path, so we
@@ -405,6 +406,19 @@ export function PolisView() {
     }
     handleRef.current?.setSelected(ringId);
   }, [selected]);
+
+  // P3.2 — single memoized FilterSets computation; used by the renderer effect
+  // and passed to PolisBottomBar for the panel footer (no double compute).
+  const filterState = useCityStore((s) => s.filter);
+  const sinRecords = useCityStore((s) => s.sinRecords);
+  const filterSets = useMemo(
+    () => computeFilterSets(cityState, sinRecords, filterState),
+    [cityState, sinRecords, filterState],
+  );
+  useEffect(() => {
+    if (!ready) return;
+    handleRef.current?.setFilter(filterSets);
+  }, [ready, filterSets]);
 
   const handleRefresh = useCallback(() => {
     void refresh();
@@ -865,6 +879,7 @@ export function PolisView() {
             viewportReady={ready}
             immersive={immersive}
             polisFocusedRef={polisFocusedRef}
+            filterSets={filterSets}
           />
         )}
       </div>

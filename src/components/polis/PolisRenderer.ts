@@ -86,6 +86,7 @@ import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
 import { buildingChanged, worstSinSeverity } from "./diffCity";
 import { StepClock } from "./effects";
+import type { FilterSets } from "./filterModel";
 import { GrowthFx, Scaffold, Disaster, Investigation } from "./growthEffects";
 import { sliceBatches, DEFAULT_BUILD_BATCH } from "./chunk";
 import {
@@ -303,6 +304,28 @@ export function removeFromArrayByIdentity<T>(list: T[], item: T): boolean {
   return false;
 }
 
+/** P3.2 — Pure per-node filter verdict. Exported so the filter test can import
+ *  the PRODUCTION function (not a stub). The renderer uses this through
+ *  applyFilterToNode and the filter-aware LOD helpers. */
+export interface FilterVerdict {
+  ghosted: boolean;
+  hide: boolean;
+  effectsHidden: boolean;
+}
+
+export function nodeFilterVerdict(
+  fileId: string,
+  sets: import("./filterModel").FilterSets | null,
+): FilterVerdict {
+  if (!sets) return { ghosted: false, hide: false, effectsHidden: false };
+  const ghosted = sets.ghostedFileIds.has(fileId);
+  return {
+    ghosted,
+    hide: ghosted && sets.mode === "hide",
+    effectsHidden: sets.effectsHiddenFileIds.has(fileId),
+  };
+}
+
 interface Chunk {
   container: Container;
   bounds: Rectangle;
@@ -406,6 +429,9 @@ export class PolisRenderer {
   // update(t, dt). Advanced once per step in update(); only visible-chunk anims
   // are actually ticked.
   private animT = 0;
+
+  // P3.2 — Filter pass state. Null means no filter applied.
+  private filterSets: FilterSets | null = null;
 
   // Building-level road navigation graph for the AgentMover. Rebuilt once
   // whenever roads change (setCityState + applyCityDiff); agents query it for a
@@ -910,6 +936,8 @@ export class PolisRenderer {
         this.recenter();
         // Force a cull/LOD pass on the next tick for the freshly built scene.
         this.cullDirty = true;
+        // P3.2 — apply any active filter to the freshly built scene
+        if (this.filterSets) this.applyFilter();
         this.lastCity = city;
         // FIX 2 — report the CURRENT visible total (a mid-build reprioritization
         // may have changed it); fall back to the initial value if buildState was
@@ -1106,6 +1134,146 @@ export class PolisRenderer {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // P3.2 — Filter pass
+  // -------------------------------------------------------------------------
+
+  /** Set the filter state and apply in one pass. Null/empty = clear filter.
+   *  Idempotent — calling twice with the same sets is a no-op. */
+  setFilter(sets: FilterSets | null): void {
+    this.filterSets = sets;
+    this.applyFilter();
+  }
+
+  /** Apply the current filter to all built nodes. ONE PASS over building nodes
+   *  + road segments + agents — no coords, no rebuild, plain property writes.
+   *  Idempotent — safe to call anytime, no matter the scene state. */
+  private applyFilter(): void {
+    const sets = this.filterSets;
+    const isHide = sets?.mode === "hide";
+    const ghosted = sets?.ghostedFileIds ?? new Set<string>();
+    const effectsHidden = sets?.effectsHiddenFileIds ?? new Set<string>();
+
+    // --- Buildings: one pass over all nodes ---
+    for (const [fileId, node] of this.buildingNodes) {
+      const g = ghosted.has(fileId);
+      const eh = effectsHidden.has(fileId);
+
+      if (g) {
+        // Ghost or hide the whole building
+        if (isHide) {
+          node.container.visible = false;
+        } else {
+          node.container.visible = true;
+          node.container.alpha = 0.15;
+        }
+        node.container.eventMode = "none";
+        node.container.cursor = "none";
+        // Hide label
+        if (node.label) node.label.visible = false;
+        // Hide disaster/investigation effects
+        if (node.disaster) node.disaster.node.visible = false;
+        if (node.investigation) node.investigation.node.visible = false;
+      } else {
+        // Restore full visibility (respecting LOD which will re-apply next cull)
+        node.container.visible = true;
+        node.container.alpha = 1;
+        node.container.eventMode = "static";
+        node.container.cursor = "pointer";
+        // Labels: let LOD decide (set visible true, LOD will hide if zoomed out)
+        if (node.label) node.label.visible = true;
+        // Disaster/investigation: let LOD decide
+        if (node.disaster) node.disaster.node.visible = true;
+        if (node.investigation) node.investigation.node.visible = true;
+
+        // Effects-hidden: only toggle sin-effect display objects
+        if (eh && node.disaster) {
+          node.disaster.node.visible = false;
+        }
+        // If not effects-hidden but LOD-hidden, LOD will re-hide on next cull
+      }
+    }
+
+    // --- Roads: redraw with ghost-alpha multiplier ---
+    // Roads are O(N) strokes, fully rebuilt on every diff. Redrawing them
+    // here with filter-aware alpha is cheap (no building geometry involved).
+    if (this.lastCity) {
+      const byId = new Map<string, typeof this.lastCity.buildings[number]>();
+      for (const b of this.lastCity.buildings) byId.set(b.fileId, b);
+      this.redrawRoads(this.lastCity.roads, byId);
+    }
+
+    // --- Agents: set ghost filter on AgentLayer ---
+    this.agentLayer.setGhostFilter(sets ? ghosted : new Set<string>());
+
+    // Force a cull pass so LOD restores correct alpha/labels on unfiltered nodes
+    this.cullDirty = true;
+  }
+
+  // -------------------------------------------------------------------------
+  // P3.2 — Filter-aware LOD helpers. Single source of truth for building alpha
+  // and effect visibility — used by BOTH applyFilterToNode and updateCulling's
+  // LOD block so they can never disagree.
+  // -------------------------------------------------------------------------
+
+  /** Target alpha for a building node, respecting BOTH LOD and the active
+   *  filter. Returns the alpha (0.15 ghosted, LOD value, or 1). */
+  private targetBuildingAlpha(fileId: string, lodAlpha: number): number {
+    const sets = this.filterSets;
+    if (!sets) return lodAlpha;
+    if (sets.ghostedFileIds.has(fileId)) {
+      return sets.mode === "hide" ? lodAlpha : 0.15;
+    }
+    return lodAlpha;
+  }
+
+  /** Whether the sin-effect overlay should be visible, respecting BOTH LOD
+   *  and the active filter. Ghosted buildings never show effects. */
+  private effectVisible(_node: BuildingNode, fileId: string, lodVisible: boolean): boolean {
+    if (!lodVisible) return false;
+    const sets = this.filterSets;
+    if (!sets) return true;
+    if (sets.ghostedFileIds.has(fileId)) return false;
+    if (sets.effectsHiddenFileIds.has(fileId)) return false;
+    return true;
+  }
+
+  /** Whether the label should be visible, respecting BOTH filter and LOD. */
+  private labelVisible(fileId: string, hasLabel: boolean): boolean {
+    if (!hasLabel) return false;
+    const sets = this.filterSets;
+    if (!sets) return true;
+    if (sets.ghostedFileIds.has(fileId)) return false;
+    return true;
+  }
+
+  /** Apply the current filter to a SINGLE building node. Called from
+   *  createBuildingNode so buildings born during incremental build are filtered
+   *  from birth — satisfying the threaded-predicate requirement (§1.2). */
+  private applyFilterToNode(node: BuildingNode, fileId: string): void {
+    const sets = this.filterSets;
+    if (!sets) return;
+    const isHide = sets.mode === "hide";
+    const ghosted = sets.ghostedFileIds.has(fileId);
+    const effectsHidden = sets.effectsHiddenFileIds.has(fileId);
+
+    if (ghosted) {
+      if (isHide) {
+        node.container.visible = false;
+      } else {
+        node.container.visible = true;
+        node.container.alpha = 0.15;
+      }
+      node.container.eventMode = "none";
+      node.container.cursor = "none";
+      if (node.label) node.label.visible = false;
+      if (node.disaster) node.disaster.node.visible = false;
+      if (node.investigation) node.investigation.node.visible = false;
+    } else if (effectsHidden && node.disaster) {
+      node.disaster.node.visible = false;
+    }
+  }
+
   /** The actual in-place diff body. Extracted so `applyCityDiff` can wrap it in a
    *  single try/finally that guarantees `mutationState` is restored to idle even
    *  if a PIXI op throws (FIX 3). Assumes the caller set `mutationState =
@@ -1264,6 +1432,8 @@ export class PolisRenderer {
     //    Force one cull/LOD pass so new/changed chunks get correct visibility.
     this.cullDirty = true;
     this.lastCity = next;
+    // P3.2 — re-apply any active filter to the freshly diffed scene
+    if (this.filterSets) this.applyFilter();
     // mutationState restored to idle by the caller's finally (FIX 3).
   }
 
@@ -2037,6 +2207,15 @@ export class PolisRenderer {
   }
 
   private drawRoads(roads: Road[], byId: Map<string, Building>): void {
+    const ghosted = this.filterSets?.ghostedFileIds;
+    const isHideMode = this.filterSets?.mode === "hide";
+    const roadAlphaMult = (from: string, to: string): number => {
+      if (!ghosted || ghosted.size === 0) return 1;
+      const endpointGhosted = ghosted.has(from) || ghosted.has(to);
+      if (!endpointGhosted) return 1;
+      if (isHideMode) return 0; // vanished building → no roads
+      return 0.3;
+    };
     // VISUAL HIERARCHY. The backend over-draws: ~35% of roads are weight-1
     // single-import lanes and ~half lack a routed `path` (straight fallbacks).
     // Drawn uniformly they bury the town in a red mesh. We split the network in
@@ -2105,10 +2284,10 @@ export class PolisRenderer {
           const shared = segUsage.get(segKey(raw[i], raw[i + 1])) ?? 1;
           const isTrunk = heavyImport || shared >= ROAD_SHARED_TRUNK;
           if (isTrunk) {
-            this.drawTrunk(trunkG, pts[i], pts[i + 1], road.weight, shared);
+            this.drawTrunk(trunkG, pts[i], pts[i + 1], road.weight, shared, roadAlphaMult(road.from, road.to));
             anyTrunk = true;
           } else {
-            this.drawMinorLane(minorG, pts[i], pts[i + 1]);
+            this.drawMinorLane(minorG, pts[i], pts[i + 1], roadAlphaMult(road.from, road.to));
           }
         }
         // Only count junctions for trunk-bearing routes — minor kinks are not
@@ -2133,7 +2312,7 @@ export class PolisRenderer {
       if (!from || !to) continue; // only draw roads whose endpoints exist
       const a = cartToIso(from.coords.x, from.coords.y);
       const b = cartToIso(to.coords.x, to.coords.y);
-      this.drawMinorLane(minorG, a, b);
+      this.drawMinorLane(minorG, a, b, roadAlphaMult(road.from, road.to));
     }
 
     // True trunk-hub discs. A single neutral disc tidies the overlap where many
@@ -2164,6 +2343,7 @@ export class PolisRenderer {
     to: IsoPoint,
     weight: number,
     shared: number,
+    alphaMult = 1,
   ): void {
     // weight 1..5 and shared 1..~13 both push the trunk wider. Clamp so the
     // fattest avenue stays sane. Base 6, +~1.4/weight, +~0.8/extra-share.
@@ -2194,19 +2374,19 @@ export class PolisRenderer {
         p1.y - py,
         p0.x - px,
         p0.y - py,
-      ]).fill({ color, alpha: ROAD_ALPHA.trunkFill });
+      ]).fill({ color, alpha: ROAD_ALPHA.trunkFill * alphaMult });
     }
     g.moveTo(from.x + px, from.y + py).lineTo(to.x + px, to.y + py);
     g.moveTo(from.x - px, from.y - py).lineTo(to.x - px, to.y - py);
-    g.stroke({ color: ROAD.trunkKerb, alpha: ROAD_ALPHA.trunkKerb, width: 1 });
+    g.stroke({ color: ROAD.trunkKerb, alpha: ROAD_ALPHA.trunkKerb * alphaMult, width: 1 });
   }
 
   // MINOR: a single faint desaturated earth line — a hint of a footpath, not a
   // cobbled street. One stroke per segment into the shared minor Graphics at a
   // flat low alpha; LOD fades/hides the whole layer when zoomed out.
-  private drawMinorLane(g: Graphics, from: IsoPoint, to: IsoPoint): void {
+  private drawMinorLane(g: Graphics, from: IsoPoint, to: IsoPoint, alphaMult = 1): void {
     g.moveTo(from.x, from.y).lineTo(to.x, to.y);
-    g.stroke({ color: ROAD.minorPath, alpha: ROAD_ALPHA.minor, width: 2 });
+    g.stroke({ color: ROAD.minorPath, alpha: ROAD_ALPHA.minor * alphaMult, width: 2 });
   }
 
   // LOD for roads: fade/hide the minor-lane layer by zoom. Allocation-free —
@@ -2369,6 +2549,9 @@ export class PolisRenderer {
     container.on("pointerout", () => this.callbacks.onHoverBuilding?.(null));
 
     this.buildingNodes.set(b.fileId, node);
+    // P3.2 — apply current filter to this newly-created node so buildings born
+    // during incremental build are filtered from birth.
+    this.applyFilterToNode(node, b.fileId);
     // Polis-P5 — index the normalized project-relative path → fileId so the Censor
     // relPath→building resolution mirrors the agents' fileId-based resolution.
     this.fileIdByPath.set(PolisRenderer.normalizeRelPath(b.filePath), b.fileId);
@@ -2800,10 +2983,15 @@ export class PolisRenderer {
             node.label = this.makeLabel(node.building, node.labelDepth);
             node.container.addChild(node.label);
           }
+          // P3.2 — hide label when ghosted (filter-aware), even after creation
+          if (node.label) node.label.visible = this.labelVisible(node.building.fileId, true);
         } else if (destroyLabels && node.label) {
           node.label.removeFromParent();
           node.label.destroy();
           node.label = null;
+        } else if (node.label) {
+          // P3.2 — in the dead-band, still respect filter (ghosted → hide)
+          node.label.visible = this.labelVisible(node.building.fileId, true);
         }
         // TECH LIVERY: hide provider pennants in the far view (a static toggle,
         // allocation-free). Never touched for buildings with no provider (null).
@@ -2812,16 +3000,22 @@ export class PolisRenderer {
         // isn't a field of tiny flames; when hidden, `Disaster.update` also
         // early-returns so the kit fire/smoke redraw is skipped per step. Never
         // touched for buildings with no sins (null). Allocation-free toggle.
-        if (node.disaster) node.disaster.node.visible = showDisaster;
+        // P3.2 — filter-aware: ghosted/effects-hidden buildings suppress disaster.
+        if (node.disaster) {
+          node.disaster.node.visible = this.effectVisible(node, node.building.fileId, showDisaster);
+        }
         // ON-MAP INVESTIGATION (P3): same LOD band as the disaster — hide the
         // suspect smoke + "?" in the far view (when hidden `Investigation.update`
         // early-returns, skipping the kit smoke redraw). Never touched for buildings
         // that are not a bug suspect (null). Allocation-free toggle.
-        if (node.investigation)
-          node.investigation.node.visible = showDisaster;
+        if (node.investigation) {
+          node.investigation.node.visible = this.effectVisible(node, node.building.fileId, showDisaster);
+        }
         // Below LOD_DETAILS, fade the fine detail (the kit's textured faces /
         // props read as one mass) by dropping the whole display alpha slightly.
-        node.container.alpha = showDetails ? 1 : 0.92;
+        // P3.2 — filter-aware: ghosted stays at 0.15 regardless of LOD.
+        const lodAlpha = showDetails ? 1 : 0.92;
+        node.container.alpha = this.targetBuildingAlpha(node.building.fileId, lodAlpha);
       }
       // Road LOD: reveal/fade the faint minor-lane layer by zoom (trunks always
       // shown). Allocation-free — toggles the prebuilt sub-container only.

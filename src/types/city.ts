@@ -452,3 +452,21 @@ export interface CityState {
    */
   terrain?: TerrainData;
 }
+
+// ---------------------------------------------------------------------------
+// P3.2 — Filters
+// ---------------------------------------------------------------------------
+
+/** Filter axis that hides sin effects only — never ghosts buildings. */
+export interface FilterState {
+  /** rule_ids whose EFFECTS are hidden; empty = none hidden */
+  categories: string[];
+  /** Null = show all severities; "fire" = fire + inferno; "inferno" = inferno only */
+  minSeverity: "fire" | "inferno" | null;
+  /** Feature/district ids to KEEP; empty = all */
+  features: string[];
+  /** Simple glob/substring; "" = all */
+  pathGlob: string;
+  /** "ghost" = alpha 0.15 translucent; "hide" = visible=false */
+  mode: "ghost" | "hide";
+}

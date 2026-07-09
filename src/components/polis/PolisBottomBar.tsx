@@ -142,7 +142,7 @@ function worstSeverityColor(sinRecords: SinRecord[]): string {
 // Panel items registry
 // ---------------------------------------------------------------------------
 
-type PanelId = "guide" | "legend" | "filetypes" | "oracle" | "anomalies";
+type PanelId = "guide" | "legend" | "filetypes" | "oracle" | "anomalies" | "filters";
 
 interface PanelItem {
   id: PanelId;
@@ -188,6 +188,7 @@ function PolisBottomBarInner({
   viewportReady,
   immersive,
   polisFocusedRef,
+  filterSets,
 }: {
   buildingCount: number;
   roadCount: number;
@@ -198,6 +199,7 @@ function PolisBottomBarInner({
   viewportReady: boolean;
   immersive: boolean;
   polisFocusedRef: React.RefObject<boolean>;
+  filterSets: import("./filterModel").FilterSets | null;
 }) {
   const [open, setOpen] = useState<PanelId | null>(null);
   const toggle = (id: PanelId) => setOpen((prev) => (prev === id ? null : id));
@@ -212,6 +214,16 @@ function PolisBottomBarInner({
     const open = sinRecords?.filter((r) => r.disposition === "open") ?? [];
     return { openSinCount: open.length, sinColor: worstSeverityColor(open) };
   }, [sinRecords]);
+
+  const filterState = useCityStore((s) => s.filter);
+  const filterActiveDot = useMemo(() => {
+    return (
+      filterState.categories.length > 0 ||
+      filterState.minSeverity !== null ||
+      filterState.features.length > 0 ||
+      filterState.pathGlob !== ""
+    );
+  }, [filterState]);
 
   // --- Zoom cluster state ---
   const [zoomPct, setZoomPct] = useState(100);
@@ -327,6 +339,9 @@ function PolisBottomBarInner({
           onClose={() => setOpen(null)}
         />
       )}
+      {open === "filters" && (
+        <FiltersPanel onClose={() => setOpen(null)} filterSets={filterSets} />
+      )}
 
       {/* --- The Deck bar (three clusters) --- */}
       <div className="absolute inset-x-0 bottom-3 flex justify-center">
@@ -382,15 +397,21 @@ function PolisBottomBarInner({
               );
             })}
 
-            {/* Filters — disabled placeholder */}
+            {/* Filters — active when any axis is non-default */}
             <button
-              disabled
-              aria-disabled="true"
-              title="Filters — coming soon"
-              className="flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-medium text-cream-300 cursor-not-allowed"
+              onClick={() => toggle('filters')}
+              title="Filter buildings by anomaly, severity, quarter, or path"
+              className={`relative flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+                open === 'filters'
+                  ? 'bg-terracotta text-white'
+                  : 'text-cream-600 hover:bg-cream-100 hover:text-cream-800'
+              }`}
             >
               <SlidersHorizontal className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Filters</span>
+              {filterActiveDot && (
+                <span className="absolute right-1 top-0.5 h-2 w-2 rounded-full bg-coral" />
+              )}
             </button>
           </div>
 
@@ -1058,3 +1079,254 @@ function HelpSection({
 
 export const PolisBottomBar = memo(PolisBottomBarInner);
 export default PolisBottomBar;
+
+// ---------------------------------------------------------------------------
+// Filters panel (P3.2)
+// ---------------------------------------------------------------------------
+
+const ANOMALY_RULE_IDS = [
+  "secret",
+  "dep-cycle",
+  "todo-density",
+  "dead-export",
+  "env-missing",
+] as const;
+
+const RULE_GLYPH: Record<string, string> = {
+  "secret": "\u{1F512}",
+  "dep-cycle": "\u{1F504}",
+  "todo-density": "\u{1F4DD}",
+  "dead-export": "\u{1F480}",
+  "env-missing": "\u{1F527}",
+};
+
+const RULE_LABEL: Record<string, string> = {
+  "secret": "Secrets",
+  "dep-cycle": "Dep cycle",
+  "todo-density": "TODO density",
+  "dead-export": "Dead export",
+  "env-missing": "Env missing",
+};
+
+const SEVERITY_OPTIONS = [
+  { key: null, label: "All" },
+  { key: "fire" as const, label: "\u{2265}\u{46}\u{69}\u{72}\u{65}" },
+  { key: "inferno" as const, label: "\u{2265}\u{49}\u{6E}\u{66}\u{65}\u{72}\u{6E}\u{6F}" },
+] as const;
+
+function useDebouncedValue<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+  return debounced;
+}
+
+function FiltersPanel({ onClose, filterSets }: { onClose: () => void; filterSets: import("./filterModel").FilterSets | null }) {
+  const filter = useCityStore((s) => s.filter);
+  const setFilter = useCityStore((s) => s.setFilter);
+  const resetFilterAction = useCityStore((s) => s.resetFilter);
+  const sinRecords = useCityStore((s) => s.sinRecords);
+  const cityState = useCityStore((s) => s.cityState);
+
+  // Per-category open count
+  const catCounts = useMemo(() => {
+    const open = sinRecords?.filter((r) => r.disposition === "open") ?? [];
+    const counts: Record<string, number> = {};
+    for (const r of open) {
+      counts[r.ruleId] = (counts[r.ruleId] ?? 0) + 1;
+    }
+    return counts;
+  }, [sinRecords]);
+
+  // District/feature names
+  const features = useMemo(() => {
+    const set = new Map<string, string>();
+    if (cityState?.features) {
+      for (const f of cityState.features) {
+        set.set(f.id, f.label);
+      }
+    }
+    // Also collect featureIds from buildings
+    for (const b of cityState?.buildings ?? []) {
+      if (b.featureId && !set.has(b.featureId)) {
+        set.set(b.featureId, b.featureId);
+      }
+    }
+    return [...set.entries()];
+  }, [cityState]);
+
+  // Path glob local state with debounce
+  const [pathInput, setPathInput] = useState(filter.pathGlob);
+  const debouncedPath = useDebouncedValue(pathInput, 300);
+
+  // Sync debounced path to store
+  useEffect(() => {
+    if (debouncedPath !== filter.pathGlob) {
+      setFilter({ pathGlob: debouncedPath });
+    }
+  }, [debouncedPath, filter.pathGlob, setFilter]);
+
+  // Sync store → local on reset
+  useEffect(() => {
+    setPathInput(filter.pathGlob);
+  }, [filter.pathGlob]);
+
+  const toggleCategory = (ruleId: string) => {
+    const cats = filter.categories;
+    const next = cats.includes(ruleId)
+      ? cats.filter((c) => c !== ruleId)
+      : [...cats, ruleId];
+    setFilter({ categories: next });
+  };
+
+  const toggleFeature = (id: string) => {
+    const feats = filter.features;
+    const next = feats.includes(id)
+      ? feats.filter((f) => f !== id)
+      : [...feats, id];
+    setFilter({ features: next });
+  };
+
+  return (
+    <div className="pointer-events-auto absolute bottom-16 left-1/2 w-[400px] max-w-[92vw] -translate-x-1/2 rounded-2xl border border-cream-200 bg-white/97 shadow-soft-lg backdrop-blur">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-cream-100 px-3 py-2">
+        <h4 className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-cream-500">
+          <SlidersHorizontal className="h-3.5 w-3.5" /> Filters
+        </h4>
+        <button
+          onClick={onClose}
+          className="rounded-full p-1 text-cream-400 hover:bg-cream-100 hover:text-cream-700"
+          aria-label="Close filters"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      <div className="max-h-[340px] space-y-3 overflow-y-auto p-3">
+        {/* 1. Anomaly categories */}
+        <fieldset>
+          <legend className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+            Anomaly categories (hide effects)
+          </legend>
+          <div className="flex flex-wrap gap-1">
+            {ANOMALY_RULE_IDS.map((ruleId) => {
+              const active = filter.categories.includes(ruleId);
+              const count = catCounts[ruleId] ?? 0;
+              const glyph = RULE_GLYPH[ruleId] ?? "\u{1F538}";
+              const label = RULE_LABEL[ruleId] ?? ruleId;
+              return (
+                <button
+                  key={ruleId}
+                  onClick={() => toggleCategory(ruleId)}
+                  title={`${label}: ${count} open`}
+                  className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-medium transition-colors ${
+                    active
+                      ? "border-terracotta bg-terracotta text-white"
+                      : "border-cream-200 bg-cream-50 text-cream-500 hover:bg-cream-100"
+                  }`}
+                >
+                  <span className="text-[11px]">{glyph}</span>
+                  <span>{label}</span>
+                  {count > 0 && (
+                    <span className="ml-0.5 rounded bg-white/20 px-1 text-[9px]">
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </fieldset>
+
+        {/* 2. Severity floor */}
+        <fieldset>
+          <legend className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+            Severity floor
+          </legend>
+          <div className="flex gap-0.5">
+            {SEVERITY_OPTIONS.map((opt) => {
+              const active = filter.minSeverity === opt.key;
+              return (
+                <button
+                  key={opt.label}
+                  onClick={() => setFilter({ minSeverity: opt.key })}
+                  className={`flex-1 rounded-lg px-2 py-1 text-[11px] font-medium transition-colors ${
+                    active
+                      ? "bg-terracotta text-white"
+                      : "bg-cream-50 text-cream-500 hover:bg-cream-100"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </fieldset>
+
+        {/* 3. Quarters (features) */}
+        {features.length > 0 && (
+          <fieldset>
+            <legend className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+              Quarters (keep only selected)
+            </legend>
+            <div className="flex flex-wrap gap-1">
+              {features.map(([id, label]) => {
+                const active = filter.features.includes(id);
+                return (
+                  <button
+                    key={id}
+                    onClick={() => toggleFeature(id)}
+                    className={`rounded-lg border px-2 py-1 text-[10px] font-medium transition-colors ${
+                      active
+                        ? "border-terracotta bg-terracotta text-white"
+                        : "border-cream-200 bg-cream-50 text-cream-500 hover:bg-cream-100"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </fieldset>
+        )}
+
+        {/* 4. Path glob */}
+        <fieldset>
+          <legend className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-cream-400">
+            Path glob
+          </legend>
+          <input
+            type="text"
+            value={pathInput}
+            onChange={(e) => setPathInput(e.target.value)}
+            placeholder="e.g. src/components/* or polis"
+            className="w-full rounded-xl border border-cream-200 bg-white px-3 py-1.5 text-[11px] text-cream-800 outline-none focus:border-terracotta-300 focus:ring-1 focus:ring-terracotta-100"
+          />
+        </fieldset>
+
+        {/* 5. File types fold-in SKIP — TODO: merge standalone File Types panel here */}
+        <p className="text-[10px] italic text-cream-400">
+          {/* TODO: fold in the standalone File Types panel controls here */}
+        </p>
+
+        {/* 6. Footer */}
+        <div className="flex items-center justify-between border-t border-cream-100 pt-2">
+          <button
+            onClick={resetFilterAction}
+            className="rounded-lg px-2 py-1 text-[11px] font-medium text-cream-500 transition-colors hover:bg-cream-100 hover:text-cream-700"
+          >
+            Reset all
+          </button>
+          <span className="text-[10px] text-cream-400">
+            {filterSets
+              ? `shows ${filterSets.shownBuildings} of ${filterSets.totalBuildings} buildings, ${filterSets.shownAnomalies} of ${filterSets.totalAnomalies} anomalies`
+              : "…"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
