@@ -540,7 +540,9 @@ export class AgentLayer {
   /** A minimal synthetic Agent backing an external omino's PlacedAgent struct. It
    *  is NEVER exposed (no marker, no inspect, never in `placed`/the roster) — it
    *  only feeds the shared machine's color/seed/status. The figure is PINNED so
-   *  this synthetic `type` never drives the drawn figure. */
+   *  this synthetic `type` never drives the drawn figure.
+   *  NOTE: `model` must stay absent so liveryTint(undefined) falls through to the
+   *  firefighter red (the kit tunic for the pinned figure). */
   private syntheticExternalAgent(id: string): Agent {
     return {
       agentId: id,
@@ -1061,14 +1063,9 @@ export class AgentLayer {
     // silently flip the engine omino to a citizen. Leave its figure + tunic intact.
     if (p.pinnedFigure) return;
     const nextFigure = figureForAgent(p.agent);
-    if (nextFigure !== p.figure) {
-      // The agent's figure changed (e.g. a parentAgentId appeared/disappeared,
-      // flipping coder→watercarrier). Re-apply the livery tint first (model-
-      // based override) then fall back to the figure's default tone from the
-      // SAME seed so it tracks the new figure deterministically.
-      p.figure = nextFigure;
-      p.tunic = liveryTint(p.agent.model) ?? tunicForAgent(nextFigure, p.seed);
-    }
+    if (nextFigure !== p.figure) p.figure = nextFigure;
+    // ALWAYS re-derive: the model may have changed even when the figure didn't.
+    p.tunic = liveryTint(p.agent.model) ?? tunicForAgent(p.figure, p.seed);
   }
 
   /** Restore the figure to the agent's REAL status (on arrival / standing). */

@@ -195,6 +195,9 @@ export class TradeRouteLayer {
       // can cross a 1-wide un-bridged river column even when both corners are dry),
       // mirroring the backend rasterization. The backend guarantees road tiles are
       // walkable, so in practice no edge is dropped; this is belt-and-suspenders.
+      // NOTE: this blocker is refreshed only on graphRebuilt (roads/terrain changed),
+      // NOT on building-only diffs — accepted gap (building moves don't affect
+      // road walkability, which is the only thing this guard checks).
       if (isBlocked && pathTouchesBlocked(path, isBlocked)) continue;
       const weight = Math.max(1, road.weight || 1);
       // Routed polyline is stored from→to (CONSUMER → SUPPLIER). A porter walks

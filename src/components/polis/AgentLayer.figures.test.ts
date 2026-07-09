@@ -234,6 +234,60 @@ describe("AgentLayer.setBlocked — T2 walk blocker propagation", () => {
   });
 });
 
+describe("livery tint re-derived on model-only change (setPoseStatus)", () => {
+  it("re-derives tunic when model changes but figure stays the same", () => {
+    const { layer } = makeLayer();
+    const spy = vi.spyOn(people, "drawCitizen");
+
+    const jadeColor = liveryTint("MiMo-V2.5")!;
+    expect(jadeColor).toBeDefined();
+
+    // 1. Create a coder with NO model → figure=builder, tunic=figure default.
+    layer.applyDecisions([
+      {
+        kind: "createFresh",
+        agentId: "c1",
+        agent: mkAgent({ agentId: "c1", type: "coder" }),
+        targetFileId: "f1",
+        targetIso: { x: 10, y: 20 },
+      },
+    ]);
+
+    // Initial draw uses default tunic (no model → liveryTint returns undefined).
+    const builderCalls = spy.mock.calls.filter(([, fig]) => fig === "builder");
+    expect(builderCalls.length).toBeGreaterThan(0);
+    const defaultTunic = builderCalls[0][2].tunic;
+    expect(defaultTunic).not.toBe(jadeColor);
+
+    // 2. Advance past appear-fade → idle so refresh can trigger setPoseStatus.
+    layer.update(250); // > APPEAR_MS (200)
+
+    // 3. Refresh with SAME type but model="MiMo-V2.5" → tunic should flip to jade.
+    spy.mockClear();
+    layer.applyDecisions([
+      {
+        kind: "refresh",
+        agentId: "c1",
+        agent: mkAgent({
+          agentId: "c1",
+          type: "coder",
+          model: "MiMo-V2.5",
+        }),
+      },
+    ]);
+
+    // Step to trigger the redraw with the new tunic.
+    layer.step(1);
+
+    // The builder figure must NOW use the jade livery tint.
+    const refreshedCalls = spy.mock.calls.filter(([, fig]) => fig === "builder");
+    expect(refreshedCalls.length).toBeGreaterThan(0);
+    expect(refreshedCalls[0][2]).toHaveProperty("tunic", jadeColor);
+
+    spy.mockRestore();
+  });
+});
+
 describe("livery tint preserved across figure flip (setPoseStatus)", () => {
   it("retains model-based livery when parentAgentId appears mid-lifecycle", () => {
     const { layer } = makeLayer();

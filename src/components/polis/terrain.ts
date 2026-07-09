@@ -521,11 +521,12 @@ function drawBridgeDeck(
     // Outer pier blocks at both tile ends — positioned at the tile boundary
     // (c.x ± HW for horizontal, c.y ± HH for vertical) so adjacent tiles'
     // piers overlap at the shared boundary.
-    drawPierBlock(-HW, pDepth);
-    drawPierBlock(+HW, pDepth);
+    const runEnd = isH ? HW : HH;
+    drawPierBlock(-runEnd, pDepth);
+    drawPierBlock(+runEnd, pDepth);
     // Inner pier blocks (near centre, define arch opening edges).
-    drawPierBlock(-HW * PIER_INSET, pDepth);
-    drawPierBlock(+HW * PIER_INSET, pDepth);
+    drawPierBlock(-runEnd * PIER_INSET, pDepth);
+    drawPierBlock(+runEnd * PIER_INSET, pDepth);
     // Arch opening between inner piers.
     drawArch(pDepth, 0.76, 0.62);
   }

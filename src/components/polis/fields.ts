@@ -14,6 +14,7 @@ import type { TerrainExtent } from "./terrain";
 import type { Bounds, TerrainData } from "../../types/city";
 import { Proj, Z_UNIT } from "./kitcd/iso";
 import { gardenBed } from "./kitcd/detail";
+import { roundTile } from "./navWalkable";
 import {
   cropRows,
   vineyard,
@@ -74,8 +75,8 @@ export function buildFieldBlockedSet(
   // Building footprints dilated by 1 (Chebyshev +1).
   for (const b of buildings) {
     for (const c of b.coords) {
-      const cx = Math.round(c.x);
-      const cy = Math.round(c.y);
+      const cx = roundTile(c.x);
+      const cy = roundTile(c.y);
       for (let dx = -1; dx <= 1; dx++) {
         for (let dy = -1; dy <= 1; dy++) {
           blocked.add(`${cx + dx},${cy + dy}`);
@@ -148,9 +149,13 @@ export function planFields(input: {
   // Pre-rasterize dilated district bounds into the `used` set so the per-tile
   // placement loop is a single `used.has()` check — eliminates the O(tiles×D)
   // inner district-loop that would unboundedly slow cities with many districts.
+  // Floor/ceil to integer tile coverage so fractional bounds (Rust f64) match
+  // the integer lattice keys used elsewhere.
   for (const db of dilatedDistricts) {
-    for (let ty = db.y; ty < db.y + db.h; ty++) {
-      for (let tx = db.x; tx < db.x + db.w; tx++) {
+    const ix = Math.floor(db.x), iy = Math.floor(db.y);
+    const ix2 = Math.ceil(db.x + db.w), iy2 = Math.ceil(db.y + db.h);
+    for (let ty = iy; ty < iy2; ty++) {
+      for (let tx = ix; tx < ix2; tx++) {
         used.add(`${tx},${ty}`);
       }
     }
@@ -161,8 +166,7 @@ export function planFields(input: {
   // parcels at the centre — treat everything as garden.
   const halfW = (ext.maxX - ext.minX) / 2;
   const halfH = (ext.maxY - ext.minY) / 2;
-  const halfMax = Math.max(halfW, halfH);
-  const isTinyExtent = halfMax < 2;
+  const isTinyExtent = halfW < 2 && halfH < 2;
 
   const parcels: FieldParcel[] = [];
 
@@ -189,13 +193,14 @@ export function planFields(input: {
         // Parcel fits! Determine kind by distance from centre.
         const parcelCx = gx + pw / 2;
         const parcelCy = gy + ph / 2;
-        // Normalized Chebyshev distance from centre (guarded: halfMax can be 0
-        // for degenerate extents; isTinyExtent short-circuits the banding).
+        // Normalized Chebyshev distance from centre, per-axis so elongated
+        // maps (e.g. 200×40) don't compress the y-axis into inner bands.
+        // Guarded: halfW/halfH can be 0 for degenerate extents.
         const dist = isTinyExtent
           ? 0
           : Math.max(
-              Math.abs(parcelCx - centre.x) / halfMax,
-              Math.abs(parcelCy - centre.y) / halfMax,
+              Math.abs(parcelCx - centre.x) / Math.max(halfW, 1),
+              Math.abs(parcelCy - centre.y) / Math.max(halfH, 1),
             );
 
         const parcelSeed = hashString(`parcel:${gx},${gy}`);

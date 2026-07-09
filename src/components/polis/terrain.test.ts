@@ -444,6 +444,78 @@ describe("drawBridgeDeck — stone arch bridge", () => {
   });
 
   // -----------------------------------------------------------------------
+  // BLOCKER 1 fix: vertical bridge piers at correct y-offsets.
+  // -----------------------------------------------------------------------
+  it("BLOCKER 1: vertical bridge pier y-coords stay within tile boundary (not past ±HH)", () => {
+    // Vertical 3-tile bridge at (5,3)-(5,4)-(5,5). Each tile's pier blocks
+    // must stay within HH + hh*pHW + PIER_H ≈ 52.3 of THAT tile's centre, NOT
+    // HW + hh*pHW + PIER_H ≈ 76.3 (which was the old bug).
+    const terrain: TerrainData = {
+      seaX: 0, minY: 0, maxY: 10, rivers: [{ gxMin: 0, gxMax: 10 }],
+      water: [
+        { gx: 5, gy: 3, deep: false },
+        { gx: 5, gy: 4, deep: false },
+        { gx: 5, gy: 5, deep: false },
+      ],
+      sand: [],
+      bridges: [
+        { gx: 5, gy: 3 },
+        { gx: 5, gy: 4 },
+        { gx: 5, gy: 5 },
+      ],
+    };
+    const { calls } = captureGraphicsCalls(terrain);
+    const pierBlocks = extractPierBlockPolys(calls);
+    expect(pierBlocks.length).toBeGreaterThan(0);
+
+    const cartToIso = (x: number, y: number) => ({
+      x: (x - y) * 48,
+      y: (x + y) * 24,
+    });
+
+    const HH = 24;
+    const HW = 48;
+    const DECK_INSET = 0.82;
+    const pHW = 0.88;
+    const PIER_H = 11;
+    // Correct bound: HH + hh*pHW + PIER_H (pier extends PIER_H below run offset).
+    const bound = HH + HH * DECK_INSET * pHW + PIER_H; // ≈ 52.32
+    // Old wrong bound: HW + hh*pHW + PIER_H (used HW instead of HH for runEnd).
+    const wrongBound = HW + HH * DECK_INSET * pHW + PIER_H; // ≈ 76.32
+
+    // Tile centres for the 3-tile vertical bridge.
+    const tileCentres = [
+      cartToIso(5.5, 3.5),
+      cartToIso(5.5, 4.5),
+      cartToIso(5.5, 5.5),
+    ];
+
+    for (const args of pierBlocks) {
+      const coords = args[0] as number[];
+      const xs = [coords[0], coords[2], coords[4], coords[6]];
+      const ys = [coords[1], coords[3], coords[5], coords[7]];
+      // Only check vertical piers (uniqueX=1, uniqueY=4).
+      if (new Set(xs).size === 1 && new Set(ys).size === 4) {
+        // The pier block's iso-x (pDepth axis) tells us which tile it belongs to.
+        // Find the closest tile centre by x-coordinate.
+        const pierX = xs[0];
+        let bestDist = Infinity;
+        let bestCentre = tileCentres[0];
+        for (const tc of tileCentres) {
+          const d = Math.abs(pierX - tc.x);
+          if (d < bestDist) { bestDist = d; bestCentre = tc; }
+        }
+        for (const y of ys) {
+          const dist = Math.abs(y - bestCentre.y);
+          expect(dist).toBeLessThanOrEqual(bound + 0.01);
+          // Sanity: the old wrong bound would have been much larger.
+          expect(dist).toBeLessThan(wrongBound - 1);
+        }
+      }
+    }
+  });
+
+  // -----------------------------------------------------------------------
   // Regression.
   // -----------------------------------------------------------------------
   it("regression — water shimmer and shore rendering untouched", () => {

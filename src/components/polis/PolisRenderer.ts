@@ -1435,9 +1435,14 @@ export class PolisRenderer {
         // re-chunk the node, so it still falls back to destroy+rebuild.
         const moved =
           old.coords.x !== b.coords.x || old.coords.y !== b.coords.y;
-        const fresh = moved
-          ? (this.destroyBuildingNode(node), this.createBuildingNode(b))
-          : this.updateBuildingNodeInPlace(node, b);
+        let fresh;
+        if (moved) {
+          this.destroyBuildingNode(node);
+          fresh = this.createBuildingNode(b);
+          addedOrRemoved = true; // a reposition changes the footprint set exactly like an add+remove
+        } else {
+          fresh = this.updateBuildingNodeInPlace(node, b);
+        }
         if (grew) {
           // Grow the larger silhouette into place + a small dust puff. A tier
           // DECREASE (code shrank) is left as a plain swap (no over-animation).
@@ -1494,10 +1499,11 @@ export class PolisRenderer {
     const terrainChanged = terrainSig !== this.lastTerrainSig;
     const graphRebuilt = roadsChanged || terrainChanged;
     if (graphRebuilt) {
-      this.roadGraph = new RoadGraph(next.roads, makeWaterBlocker(next.terrain));
+      const waterBlocked = makeWaterBlocker(next.terrain);
+      this.roadGraph = new RoadGraph(next.roads, waterBlocked);
       // T2 — rebuild the combined walk blocker when the graph is rebuilt.
       this.blocked = combineBlockers(
-        makeWaterBlocker(next.terrain),
+        waterBlocked,
         makeBuildingBlocker(next.buildings),
       );
       this.agentLayer.setBlocked(this.blocked);

@@ -133,7 +133,8 @@ export function providerSwatch(slug: string): string {
   else if (hueSector === 3) { r = p; g = p + (q - p) * (1 - hueFrac); b = q; }
   else if (hueSector === 4) { r = p + (q - p) * hueFrac; g = p; b = q; }
   else { r = q; g = p; b = p + (q - p) * (1 - hueFrac); }
-  const packed = ((Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255)) >>> 0;
+  const clamp = (v: number) => Math.min(255, Math.max(0, Math.round(v * 255)));
+  const packed = ((clamp(r) << 16) | (clamp(g) << 8) | clamp(b)) >>> 0;
   return `#${packed.toString(16).padStart(6, "0")}`;
 }
 

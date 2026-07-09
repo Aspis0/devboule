@@ -361,6 +361,41 @@ describe("planFields cap", () => {
 // 9. buildFieldBlockedSet
 // ---------------------------------------------------------------------------
 
+describe("fractional district bounds", () => {
+  it("no parcel tile falls inside the dilated integer coverage of a fractional district", () => {
+    // Fractional district bounds: centre at (4.5, 4.5), size 3.2×2.7.
+    // Dilated: x=3.5, y=3.5, w=5.2, h=4.7.
+    // Integer coverage: floor(3.5)=3, floor(3.5)=3, ceil(3.5+5.2)=9, ceil(3.5+4.7)=9.
+    // So tiles 3..8 × 3..8 should be blocked.
+    const ext = mkExtent(0, 0, 30, 30);
+    const centre = { x: 15, y: 15 };
+    const districts = [mkBounds(4.5, 4.5, 3.2, 2.7)];
+    const parcels = planFields({ ext, districts, blocked: new Set<string>(), centre });
+
+    // Verify no parcel tile falls inside the integer coverage of the dilated rect.
+    const dilatedX1 = Math.floor(4.5 - 1); // 3
+    const dilatedY1 = Math.floor(4.5 - 1); // 3
+    const dilatedX2 = Math.ceil(4.5 + 3.2 + 1); // 9
+    const dilatedY2 = Math.ceil(4.5 + 2.7 + 1); // 9
+
+    for (const p of parcels) {
+      for (let dy = 0; dy < p.h; dy++) {
+        for (let dx = 0; dx < p.w; dx++) {
+          const tx = p.x + dx;
+          const ty = p.y + dy;
+          const inside =
+            tx >= dilatedX1 && tx < dilatedX2 && ty >= dilatedY1 && ty < dilatedY2;
+          if (inside) {
+            expect.fail(
+              `Parcel tile (${tx},${ty}) falls inside dilated integer coverage of fractional district`,
+            );
+          }
+        }
+      }
+    }
+  });
+});
+
 describe("buildFieldBlockedSet", () => {
   it("includes dilated building tiles", () => {
     const buildings = [{ coords: [{ x: 10, y: 10 }] }];
