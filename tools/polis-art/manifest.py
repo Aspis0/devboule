@@ -33,6 +33,9 @@ MANIFEST_BLOCK_RE = re.compile(
     r"export const SPRITE_MANIFEST: SpriteManifest = \{.*?\n\};", re.DOTALL
 )
 DEFAULT_ANCHOR = [0.5, 1.0]
+# Semantic keys / atlas frame names carry only lowercased word chars, ':', '.'
+# and '-'. URLs are NOT validated against this (they legitimately contain '/').
+_IDENT_RE = re.compile(r"^[a-z0-9_:.-]+$")
 
 _EMBEDDED_TEMPLATE = """\
 // Polis sprite manifest — the typed index of every real-art sprite the renderer
@@ -107,23 +110,15 @@ def load_template() -> str:
     return _EMBEDDED_TEMPLATE
 
 
-def fmt_num(x: float) -> str:
-    """Render numbers the way the shipped TS does (1.0 -> '1', 0.5 -> '0.5')."""
-    if isinstance(x, bool):
-        return "true" if x else "false"
-    f = float(x)
-    if f.is_integer():
-        return str(int(f))
-    return repr(f)
-
-
-def load_metas(staged: Path) -> list[dict]:
-    metas: list[dict] = []
+def load_metas(staged: Path) -> list[tuple[dict, str]]:
+    """Collect (meta, filename) pairs from every staged *.meta.json."""
+    metas: list[tuple[dict, str]] = []
     if not staged.exists():
         return metas
     for group_dir in sorted(p for p in staged.iterdir() if p.is_dir()):
         for meta_path in sorted(group_dir.glob("*.meta.json")):
-            metas.append(json.loads(meta_path.read_text(encoding="utf-8")))
+            metas.append((json.loads(meta_path.read_text(encoding="utf-8")),
+                          meta_path.name))
     return metas
 
 
@@ -144,7 +139,10 @@ def check_variant_families(metas: list[dict], warnings: list[str]) -> None:
     """Warn (non-fatal) when a ':vN' family is not contiguous from v0."""
     families: dict[str, list[int]] = {}
     for m in metas:
-        parts = m["key"].split(":")
+        key = m.get("key")
+        if not key:
+            continue
+        parts = key.split(":")
         if parts and re.fullmatch(r"v\d+", parts[-1]):
             fam = ":".join(parts[:-1])
             families.setdefault(fam, []).append(int(parts[-1][1:]))
@@ -157,20 +155,32 @@ def check_variant_families(metas: list[dict], warnings: list[str]) -> None:
             )
 
 
-def validate(metas: list[dict], page_files: dict[str, str],
+def validate(loaded: list[tuple[dict, str]], page_files: dict[str, str],
              frame_pages: dict[str, set], atlas_dir: Path,
              ledger_sources: dict) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
     seen_keys: dict[str, int] = {}
-    for m in metas:
-        key = m["key"]
-        seen_keys[key] = seen_keys.get(key, 0) + 1
-        if m["source"] not in ledger_sources:
+    for m, name in loaded:
+        key = m.get("key")
+        if key is None:
+            errors.append(f"meta file {name} missing field 'key'")
+            continue
+        if not _IDENT_RE.match(key):
             errors.append(
-                f"source '{m['source']}' for key '{key}' not listed in ledger"
+                f"meta file {name} invalid key {key!r} "
+                f"(must match ^[a-z0-9_:.-]+$)"
             )
+        source = m.get("source")
+        if source is None:
+            errors.append(f"meta file {name} missing field 'source'")
+            continue
+        if source not in ledger_sources:
+            errors.append(
+                f"source '{source}' for key '{key}' not listed in ledger"
+            )
+        seen_keys[key] = seen_keys.get(key, 0) + 1
 
     for key, count in seen_keys.items():
         if count > 1:
@@ -185,7 +195,14 @@ def validate(metas: list[dict], page_files: dict[str, str],
         if not (atlas_dir / fname).exists():
             errors.append(f"atlas image '{fname}' (page '{page_id}') missing")
 
-    check_variant_families(metas, warnings)
+    for fname in frame_pages:
+        if not _IDENT_RE.match(fname):
+            errors.append(
+                f"invalid atlas frame name {fname!r} "
+                f"(must match ^[a-z0-9_:.-]+$)"
+            )
+
+    check_variant_families([m for m, _ in loaded], warnings)
     return errors, warnings
 
 
@@ -209,6 +226,7 @@ def build_entries(metas: list[dict], frame_pages: dict[str, set]) -> dict[str, d
 
 
 def render_block(atlases: dict[str, str], entries: dict[str, dict]) -> str:
+    j = json.dumps  # emits TS-valid, properly escaped string/number literals
     lines: list[str] = []
     lines.append("export const SPRITE_MANIFEST: SpriteManifest = {")
     lines.append("  version: 1,")
@@ -217,32 +235,33 @@ def render_block(atlases: dict[str, str], entries: dict[str, dict]) -> str:
         pids = sorted(atlases)
         for i, pid in enumerate(pids):
             comma = "," if i < len(pids) - 1 else ""
-            lines.append(f'    "{pid}": "{atlases[pid]}"{comma}')
+            lines.append(f"    {j(pid)}: {j(atlases[pid])}{comma}")
         lines.append("  },")
     else:
         lines.append("  atlases: {},")
-    lines.append("  entries: {")
-    keys = sorted(entries)
-    for i, key in enumerate(keys):
-        comma = "," if i < len(keys) - 1 else ""
-        inner: list[str] = []
-        e = entries[key]
-        inner.append(f'frame: "{e["frame"]}"')
-        inner.append(f'atlas: "{e["atlas"]}"')
-        if "foot" in e:
-            f = e["foot"]
-            inner.append(f"foot: [{fmt_num(f[0])}, {fmt_num(f[1])}]")
-        if "anchor" in e:
-            a = e["anchor"]
-            inner.append(f"anchor: [{fmt_num(a[0])}, {fmt_num(a[1])}]")
-        if e.get("hasBakedShadow"):
-            inner.append("hasBakedShadow: true")
-        lines.append(f'    "{key}": {{')
-        for j, prop in enumerate(inner):
-            c = "," if j < len(inner) - 1 else ""
-            lines.append(f"      {prop}{c}")
-        lines.append(f"    }}{comma}")
-    lines.append("  }")
+    if entries:
+        lines.append("  entries: {")
+        keys = sorted(entries)
+        for i, key in enumerate(keys):
+            comma = "," if i < len(keys) - 1 else ""
+            inner: list[str] = []
+            e = entries[key]
+            inner.append(f"frame: {j(e['frame'])}")
+            inner.append(f"atlas: {j(e['atlas'])}")
+            if "foot" in e:
+                inner.append(f"foot: {j(e['foot'])}")
+            if "anchor" in e:
+                inner.append(f"anchor: {j(e['anchor'])}")
+            if e.get("hasBakedShadow"):
+                inner.append("hasBakedShadow: true")
+            lines.append(f"    {j(key)}: {{")
+            for k, prop in enumerate(inner):
+                c = "," if k < len(inner) - 1 else ""
+                lines.append(f"      {prop}{c}")
+            lines.append(f"    }}{comma}")
+        lines.append("  }")
+    else:
+        lines.append("  entries: {}")
     lines.append("};")
     return "\n".join(lines)
 
@@ -256,12 +275,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--atlas-url-prefix", default="/polis/atlas/")
     args = parser.parse_args(argv)
 
-    metas = load_metas(args.staged)
+    loaded = load_metas(args.staged)
+    metas = [m for m, _ in loaded]
     page_files, frame_pages = load_atlases(args.atlas_dir)
     ledger = json.loads(args.ledger.read_text(encoding="utf-8"))
     ledger_sources = ledger.get("sources", {})
 
-    errors, warnings = validate(metas, page_files, frame_pages, args.atlas_dir,
+    errors, warnings = validate(loaded, page_files, frame_pages, args.atlas_dir,
                                 ledger_sources)
     for w in warnings:
         print(f"WARNING {w}", file=sys.stderr)
@@ -270,7 +290,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR {e}", file=sys.stderr)
         return 1
 
-    atlases = {pid: args.atlas_url_prefix + fname for pid, fname in page_files.items()}
+    atlases = {
+        pid: args.atlas_url_prefix.rstrip("/") + "/" + fname
+        for pid, fname in page_files.items()
+    }
     entries = build_entries(metas, frame_pages)
     block = render_block(atlases, entries)
 

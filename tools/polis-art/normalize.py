@@ -14,14 +14,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
 DEFAULT_ANCHOR = [0.5, 1.0]
+# Semantic keys carry only lowercased word chars, ':', '.' and '-'. No slashes,
+# so group/name segments can never escape staged/<group>/ via '..' or '/'.
+KEY_RE = re.compile(r"^[a-z0-9_.:-]+$")
 
 
 def stage_root(repo_root: Path) -> Path:
@@ -58,6 +63,8 @@ def apply_recolor(img: Image.Image, spec: dict) -> Image.Image:
     ``val``, then merge back the UNAFFECTED original alpha. Keeping the source
     alpha bit-exact is what preserves soft edges and baked shadows.
     """
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
     r, g, b, a = img.split()
     hsv = Image.merge("RGB", (r, g, b)).convert("HSV")
     h, s, v = hsv.split()
@@ -99,6 +106,10 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
     bad sprite never aborts the whole batch.
     """
     key = job["key"]
+    if key is None or not KEY_RE.match(key):
+        raise ValueError(
+            f"invalid key {key!r} (must match ^[a-z0-9_.:-]+$)"
+        )
     source = job["source"]
     in_rel = job["in"]
     scale = float(job.get("scale", 1.0))
@@ -112,6 +123,8 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
     if not src.exists():
         raise FileNotFoundError(f"input not found: {in_rel}")
     img = Image.open(src).convert("RGBA")
+    if img.getbbox() is None:
+        raise ValueError(f"fully transparent image: {in_rel}")
 
     if do_trim:
         bbox = img.getbbox()
@@ -132,7 +145,7 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
     out_png = staged / group / f"{sanitize(key)}.png"
     out_meta = staged / group / f"{sanitize(key)}.meta.json"
 
-    buf = __import__("io").BytesIO()
+    buf = BytesIO()
     img.save(buf, "PNG")
     atomic_write(out_png, buf.getvalue())
 
@@ -148,7 +161,7 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
     meta["hasBakedShadow"] = has_baked
     meta["w"] = w
     meta["h"] = h
-    meta_str = json.dumps(meta, indent=2, sort_keys=False) + "\n"
+    meta_str = json.dumps(meta, indent=2, sort_keys=True) + "\n"
     atomic_write(out_meta, meta_str.encode("utf-8"))
 
 

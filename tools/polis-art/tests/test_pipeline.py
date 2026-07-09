@@ -238,3 +238,150 @@ def test_manifest_end_to_end(tmp_path):
                          "--ledger", str(bad_ledger), "--out", str(out_ts)])
     assert rc2 == 1
     assert not out_ts.exists()
+
+
+# --------------------------------------------------------------------------- #
+# hostile-review regression tests
+# --------------------------------------------------------------------------- #
+
+def test_normalize_rejects_path_traversal_key(tmp_path):
+    in_rel = make_trim_fixture(tmp_path)
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "../../etc:x", "source": "s", "in": in_rel}])
+    rc = normalize.main(["--spec", str(spec), "--root", str(tmp_path)])
+    assert rc == 1  # SKIP path -> exit 1
+    staged = staged_dir(tmp_path)
+    # Nothing should be written, and the '..' must not escape staged/.
+    assert list(staged.rglob("*.png")) == []
+    assert not (staged / "etc").exists()
+
+
+def test_normalize_skips_fully_transparent(tmp_path):
+    raw = POLIS_ART_under(tmp_path) / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (8, 8), (0, 0, 0, 0)).save(raw / "empty.png")
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "prop:empty:v0", "source": "s",
+                       "in": "tools/polis-art/raw/empty.png"}])
+    rc = normalize.main(["--spec", str(spec), "--root", str(tmp_path)])
+    assert rc == 1
+    assert list(staged_dir(tmp_path).rglob("*.png")) == []
+
+
+def test_downscale_size_math(tmp_path):
+    in_rel = make_trim_fixture(tmp_path)  # 4x4 non-transparent bbox
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "prop:t:v0", "source": "s", "in": in_rel,
+                       "scale": 0.5}])
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    out_png = staged_dir(tmp_path) / "prop" / "prop__t__v0.png"
+    img = Image.open(out_png)
+    assert img.size == (2, 2)  # round(4 * 0.5)
+    meta = json.loads(
+        (staged_dir(tmp_path) / "prop" / "prop__t__v0.meta.json").read_text())
+    assert meta["w"] == 2 and meta["h"] == 2
+
+
+def test_shelf_pack_out_of_order_does_not_overflow():
+    """shelf_pack must catch a tall sprite arriving late, even when the global
+    height-desc sort is bypassed by calling it directly with unsorted input."""
+    sprites = [
+        {"key": "a", "w": 5, "h": 10, "png": Path("/n/a.png")},
+        {"key": "b", "w": 5, "h": 3, "png": Path("/n/b.png")},
+        {"key": "e", "w": 5, "h": 3, "png": Path("/n/e.png")},
+        {"key": "c", "w": 3, "h": 15, "png": Path("/n/c.png")},  # tall, last
+    ]
+    pages = pack_atlas.shelf_pack(sprites, page_size=20, padding=2)
+    for page in pages:
+        for _key, x, y, w, h, _png in page:
+            assert y + h + 2 <= 20, "sprite placed past page bottom"
+    # The guard must have forced the tall sprite onto a new page.
+    assert len(pages) == 2
+
+
+def test_manifest_rejects_malformed_meta(tmp_path, capfd):
+    staged = staged_dir(tmp_path)
+    g = staged / "prop"
+    g.mkdir(parents=True, exist_ok=True)
+    (g / "prop__a__v0.meta.json").write_text(json.dumps({"key": "prop:a:v0"}))
+    (g / "prop__b__v0.meta.json").write_text(json.dumps({"source": "s"}))
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    rc = manifest.main(["--staged", str(staged),
+                        "--atlas-dir", str(tmp_path / "atlas"),
+                        "--ledger", str(ledger), "--out", str(out)])
+    assert rc == 1  # validation error, not a KeyError crash
+    err = capfd.readouterr().err
+    assert "missing field" in err
+    assert not out.exists()
+
+
+def test_manifest_rejects_hostile_key(tmp_path):
+    staged = staged_dir(tmp_path)
+    g = staged / "prop"
+    g.mkdir(parents=True, exist_ok=True)
+    (g / "prop__x.meta.json").write_text(json.dumps(
+        {"key": 'prop"x:v0', "source": "s", "w": 4, "h": 4}))
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    rc = manifest.main(["--staged", str(staged),
+                        "--atlas-dir", str(tmp_path / "atlas"),
+                        "--ledger", str(ledger), "--out", str(out)])
+    assert rc == 1
+    assert not out.exists()  # validation caught it before any (corrupt) emit
+
+
+def test_manifest_empty_staged_emits_empty(tmp_path):
+    staged = staged_dir(tmp_path)
+    staged.mkdir(parents=True, exist_ok=True)
+    atlas = tmp_path / "atlas"
+    atlas.mkdir(parents=True, exist_ok=True)
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    rc = manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                        "--ledger", str(ledger), "--out", str(out)])
+    assert rc == 0
+    ts = out.read_text()
+    assert "entries: {}" in ts
+    assert "atlases: {}" in ts
+
+
+def test_manifest_deterministic_rerun(tmp_path):
+    in_rel = make_raw(tmp_path, "o.png", 12, (0, 128, 0, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "prop:o:v0", "source": "s", "in": in_rel}])
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    staged = staged_dir(tmp_path)
+    atlas = tmp_path / "atlas"
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out1 = tmp_path / "out1.ts"
+    out2 = tmp_path / "out2.ts"
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out1)]) == 0
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out2)]) == 0
+    assert out1.read_bytes() == out2.read_bytes()
+
+
+def test_manifest_custom_anchor_propagates(tmp_path):
+    in_rel = make_raw(tmp_path, "o.png", 12, (0, 128, 0, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "prop:o:v0", "source": "s", "in": in_rel,
+                       "anchor": [0.5, 0.3]}])
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    staged = staged_dir(tmp_path)
+    atlas = tmp_path / "atlas"
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    out = tmp_path / "out.ts"
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out)]) == 0
+    ts = out.read_text()
+    assert '"prop:o:v0"' in ts
+    assert "anchor: [0.5, 0.3]" in ts

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,22 @@ from PIL import Image
 
 class OversizeError(Exception):
     """A single sprite cannot fit a page even with edge padding."""
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write via an adjacent temp file then os.replace so a crash mid-write
+    can never leave a half-written atlas page or spritesheet behind."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def load_staged(staged_dir: Path) -> list[dict]:
@@ -71,13 +90,16 @@ def shelf_pack(
             y += shelf_h + padding
             x = padding
             shelf_h = 0
-            if y + h + padding > page_size:
-                # Current page is full; begin a fresh one.
-                pages.append(cur)
-                cur = []
-                x = padding
-                y = padding
-                shelf_h = 0
+        if y + h + padding > page_size:
+            # Current page cannot hold this sprite's height even on a fresh
+            # shelf: begin a new page. Hoisting this out of the "wrap shelf"
+            # branch means a future sort change (e.g. not strictly height-desc)
+            # can never silently drop a sprite past the page bottom.
+            pages.append(cur)
+            cur = []
+            x = padding
+            y = padding
+            shelf_h = 0
         cur.append((s["key"], x, y, w, h, s["png"]))
         x += w + padding
         if h > shelf_h:
@@ -102,9 +124,8 @@ def write_atlas_json(path: Path, group: str, page_index: int, page_size: int,
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
-        f.write("\n")
+    text = json.dumps(doc, indent=2) + "\n"
+    atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def pack_group(group: str, sprites: list[dict], page_size: int, padding: int,
@@ -127,7 +148,9 @@ def pack_group(group: str, sprites: list[dict], page_size: int, padding: int,
                 "sourceSize": {"w": w, "h": h},
             }
         png_path = out / f"{group}-{i}.png"
-        canvas.save(png_path, "PNG", optimize=False, compress_level=9)
+        buf = BytesIO()
+        canvas.save(buf, "PNG", optimize=False, compress_level=9)
+        atomic_write_bytes(png_path, buf.getvalue())
         write_atlas_json(out / f"{group}-{i}.json", group, i, page_size, frames)
         written.append(png_path)
     return written
@@ -181,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
         print(f"TOTAL: pages={total_pages} (max {args.max_pages}) "
               f"bytes={total_bytes} (max {args.max_bytes})", file=sys.stderr)
+        print("stale files left in --out for inspection; clean before rerun",
+              file=sys.stderr)
         return 2
 
     print_summary(summary, total_pages, total_bytes)
