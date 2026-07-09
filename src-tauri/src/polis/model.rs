@@ -504,6 +504,13 @@ pub struct Agent {
     /// ISO timestamp of the last augur action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_intervention: Option<String>,
+    /// The driving model string (e.g. "MiMo-V2.5", "deepseek-r1", "claude-sonnet").
+    /// Copied straight from `AgentSession.model` — the Polis walker layer uses it
+    /// to tint the agent tunic by provider family (see `liveryTint`). Additive +
+    /// skip-if-none so older payloads (and agents without a model) round-trip
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Set when this session is a MINI-CODER spawned by a parent coder
     /// (`AgentSession.parent_agent_id`). The Polis walker layer uses its
     /// presence to pick the mini-coder figure (watercarrier) instead of the
@@ -809,6 +816,7 @@ mod tests {
             current_task: None,
             color: "#FFB347".into(),
             last_intervention: None,
+            model: None,
             parent_agent_id: None,
             subagents: Vec::new(),
         };

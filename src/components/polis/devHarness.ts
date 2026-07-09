@@ -61,6 +61,39 @@ export async function mountDevHarness(host: HTMLElement): Promise<void> {
     `${city.projectName} · ${city.buildings.length} buildings · ${city.roads.length} roads · ${city.agents.length} agents`,
   );
 
+  // Dev instrumentation (T6a): expose handle + app on window for live
+  // verification of frame times, layer children counts, and geometry stats.
+  // NEVER shipped to production (this file is POLIS_DEV=1 only).
+  const win = window as unknown as Record<string, unknown>;
+  win.__POLIS_DEV = { handle, app: handle.app };
+  const frameTimes: number[] = [];
+  let lastFrameStart = performance.now();
+  const tickerCb = (): void => {
+    const now = performance.now();
+    frameTimes.push(now - lastFrameStart);
+    if (frameTimes.length > 10) frameTimes.shift();
+    lastFrameStart = now;
+  };
+  handle.app.ticker.add(tickerCb);
+  win.__POLIS_STATS = (): Record<string, unknown> => {
+    const layers: Record<string, number> = {};
+    for (const [name, layer] of Object.entries(handle.renderer['layers'] as Record<string, { children: unknown[] }>)) {
+      layers[name] = layer.children.length;
+    }
+    return {
+      layerChildren: layers,
+      buildingNodes: handle.renderer['buildingNodes']?.size ?? 0,
+      terrainChunks: handle.renderer['terrainChunks']?.length ?? 0,
+      lastFrameTimesMs: [...frameTimes],
+      avgFrameMs: frameTimes.length > 0 ? frameTimes.reduce((a: number, b: number) => a + b, 0) / frameTimes.length : 0,
+      viewport: {
+        scale: handle.viewport.scale.x,
+        centerX: handle.viewport.center.x,
+        centerY: handle.viewport.center.y,
+      },
+    };
+  };
+
   // Tear down on hot-reload / navigation to avoid leaking the PIXI app.
   window.addEventListener("beforeunload", () => handle.destroy(), {
     once: true,

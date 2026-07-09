@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "comment": "Per-asset provenance ledger for Polis sprite art (plan: docs/polis-sprite-art-plan-2026-07.md). RULE: no asset is committed to public/polis/ or tools/polis-art/ without an entry here; tools/polis-art/manifest.py (A2) cross-checks this file against the packed atlases and CREDITS.md. Sources below are download-level entries (raw/ is gitignored); staged/packed assets get per-file ids referencing their source key. Fields: id, source, url, author, license, modified, lightDirection, notes.",
+  "sources": {
+    "sbs-town": {
+      "url": "https://opengameart.org/content/400-isometric-town-tiles",
+      "author": "Screaming Brain Studios",
+      "license": "CC0-1.0",
+      "licenseVerified": "2026-07-09 — shipped License.txt: 'released under the CC0/Public Domain License … commercial or non-commercial, with no restrictions, … with or without credit'",
+      "contents": "3 building-wall sheets 64x96, roof sheet 143x92",
+      "curationVerdict": "REJECTED for buildings (modern urban apartment facades, wrong era); roof sheet possibly useful as texture material only",
+      "lightDirection": "both variants shipped per SBS docs"
+    },
+    "sbs-textures": {
+      "url": "https://opengameart.org/content/tiny-texture-pack + /tiny-texture-pack-2",
+      "author": "Screaming Brain Studios",
+      "license": "CC0-1.0",
+      "licenseVerified": "2026-07-09 — same SBS CC0 blanket license",
+      "contents": "256x256 seamless texture sets: Brick(s), Dirt, Grass, Plaster, Roofs, Stone, Tile, Wood, Metal, Elements",
+      "curationVerdict": "ACCEPTED — primary material for A5a kit texture fills (plaster/stone/roofs/wood) and A3 ground/road textures (grass/dirt); free to recolor toward PALETTE",
+      "lightDirection": "neutral (seamless material textures)"
+    },
+    "unknown-horizons": {
+      "url": "https://github.com/unknown-horizons/unknown-horizons (content/gfx, sparse clone in raw/uh)",
+      "author": "Unknown Horizons team (multiple artists — see their doc/AUTHORS.md)",
+      "license": "CC-BY-SA-3.0 (art; some pieces CC-BY-3.0) per doc/LICENSE",
+      "licenseVerified": "2026-07-09 — doc/LICENSE on disk: 'Published under the terms of Creative Commons Attribution Sharealike 3.0'",
+      "contents": "buildings (128x128 per rotation, tile 64x32 => x1.5 to our 96x48), terrain/trees (64x128), units with 8-direction x 4-frame walk cycles (~32x42/frame, move + move_full carrying variants: carrier, farmer, fisherman, priest, inhabitant, ...)",
+      "curationVerdict": "ACCEPTED — Mediterranean subset curated per building (verified excellent: merchants/as_bath stone+columns+terracotta, merchants/as_estate1 plastered house); trees ACCEPTED; units = A6 walker verdict YES",
+      "shareAlikeNote": "any edited/recolored UH sprite we ship stays CC-BY-SA and is flagged modified:true here + listed in public/polis/CREDITS.md",
+      "lightDirection": "reads NW-consistent on sampled sprites; re-check per building at staging"
+    },
+    "yar-outside": {
+      "url": "https://opengameart.org/content/isometric-64x64-outside-tileset",
+      "author": "Yar",
+      "license": "CC-BY-3.0",
+      "licenseVerified": "2026-07-09 — OGA page license block",
+      "contents": "iso-64x64-outside.png 640x1024 (trees, rocks, grass, hills, water)",
+      "curationVerdict": "BACKUP for nature props if UH trees insufficient; light-neutral",
+      "lightDirection": "neutral"
+    },
+    "galbraith-buildings": {
+      "url": "https://opengameart.org/content/isometric-64x64-medieval-building-tileset",
+      "author": "Seth Galbraith",
+      "license": "CC-BY-3.0",
+      "licenseVerified": "2026-07-09 — OGA page license block",
+      "contents": "iso-64x64-building_2/3.png 640x512 wall/roof/door pieces",
+      "curationVerdict": "BACKUP only (northern-medieval flavor)",
+      "lightDirection": "unverified"
+    },
+    "oga-fire-9frame": {
+      "url": "https://opengameart.org/content/9-frame-fire-animation-16x-32x-64x",
+      "author": "see OGA page (recorded at staging time before any frame ships)",
+      "license": "CC-BY-3.0",
+      "licenseVerified": "2026-07-09 — OGA page license block",
+      "contents": "9-frame fire strips 32x (96x96 grid) + 64x (192x192 grid)",
+      "curationVerdict": "CANDIDATE for A7 F1 crowd-fire flipbook; hero fire stays particle-based",
+      "lightDirection": "n/a (emissive)"
+    }
+  },
+  "assets": []
+}

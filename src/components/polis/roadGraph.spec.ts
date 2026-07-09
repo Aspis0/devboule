@@ -156,6 +156,65 @@ export function runRoadGraphSpec(): void {
     );
   }
 
+  // --- 7b) T6e: bent road polyline — a route across a staircase road MUST
+  // include the bend points (every corner of the drawn road), NOT just the
+  // node-to-node straight segment. This is the core T6e assertion.
+  {
+    // Layout: X(0,0) --roadA--> Y(2,2) --roadB--> Z(4,2)
+    // roadA zigzags: (0,0)→(0,1)→(1,1)→(1,2)→(2,2) — a staircase.
+    // roadB is straight: (2,2)→(3,2)→(4,2).
+    // If findRoute returned only node endpoints, the route X→Z would be a
+    // straight line cutting across grass. With polyline expansion it must
+    // contain all 8 intermediate points.
+    const roadA = mkRoad("X", "Y", [
+      { x: 0, y: 0 },
+      { x: 0, y: 1 },
+      { x: 1, y: 1 },
+      { x: 1, y: 2 },
+      { x: 2, y: 2 },
+    ]);
+    const roadB = mkRoad("Y", "Z", [
+      { x: 2, y: 2 },
+      { x: 3, y: 2 },
+      { x: 4, y: 2 },
+    ]);
+    const bentGraph = new RoadGraph([roadA, roadB]);
+    const route = bentGraph.findRoute("X", "Z");
+    assert(route !== null, "X→Z bent route exists");
+    const r = route!;
+    // Must contain ALL polyline waypoints: roadA's 5 points + roadB's 2 (skip
+    // shared junction at (2,2) = 7 total.
+    const wantCart = [
+      { x: 0, y: 0 },
+      { x: 0, y: 1 },
+      { x: 1, y: 1 },
+      { x: 1, y: 2 },
+      { x: 2, y: 2 }, // junction (from roadA)
+      { x: 3, y: 2 },
+      { x: 4, y: 2 },
+    ];
+    assert(
+      r.length === wantCart.length,
+      `X→Z bent: length ${r.length} !== ${wantCart.length}`,
+    );
+    const wantIso = wantCart.map((p) => cartToIso(p.x, p.y));
+    eqPoints(r, wantIso, "X→Z staircase polyline");
+    // Verify the route is NOT a straight line from (0,0) to (4,2): the
+    // intermediate points must differ from a linear interpolation.
+    const linearMid = {
+      x: wantIso[0].x + (wantIso[6].x - wantIso[0].x) * 0.5,
+      y: wantIso[0].y + (wantIso[6].y - wantIso[0].y) * 0.5,
+    };
+    const routeMid = r[3]; // the midpoint of the staircase
+    const offLine = Math.hypot(routeMid.x - linearMid.x, routeMid.y - linearMid.y);
+    assert(
+      offLine > 1,
+      `X→Z bent: route midpoint (${routeMid.x.toFixed(1)},${routeMid.y.toFixed(1)}) ` +
+        `should differ from straight-line midpoint (${linearMid.x.toFixed(1)},${linearMid.y.toFixed(1)}) ` +
+        `but diff=${offLine.toFixed(1)}`,
+    );
+  }
+
   // --- 8) Visited cap respected: a chain LONGER than the cap returns null even
   // though a path topologically exists. Build N0-N1-...-Nk with k > cap.
   {

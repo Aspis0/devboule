@@ -38,7 +38,7 @@ function mkCity(label: string): CityState {
   } as unknown as CityState;
 }
 
-let useCityStore: ReturnType<typeof import("./cityStore").useCityStore>;
+let useCityStore: typeof import("./cityStore").useCityStore;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -91,7 +91,7 @@ describe("cityStore — visibleProviders", () => {
     useCityStore.getState().setProviderVisible("scaleway", true);
 
     const state = useCityStore.getState();
-    const count = state.visibleProviders.filter((p) => p === "scaleway").length;
+    const count = state.visibleProviders.filter((p: string) => p === "scaleway").length;
     expect(count).toBe(1);
   });
 

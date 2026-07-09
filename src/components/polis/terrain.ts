@@ -17,7 +17,7 @@
 
 import { Container, Graphics } from "pixi.js";
 import { cartToIso } from "./iso";
-import { DERIVED, ALPHA } from "./palette";
+import { DERIVED } from "./palette";
 import { valueNoise } from "./rng";
 import type { TerrainData } from "../../types/city";
 
@@ -65,109 +65,159 @@ export function computeExtent(
 const HW = 48;
 const HH = 24;
 
-// Hard cap on terrain tiles so a pathological extent can't explode the draw.
-const MAX_TILES = 6000;
+// Hard cap on ACCENT patches (meadow tone variation on top of the full-extent
+// base fill) so a pathological extent can't explode the draw. The base ground
+// itself is a single 4-vertex polygon, so coverage is always 100% regardless
+// of this cap — the cap only bounds decoration density.
+const MAX_ACCENTS = 1600;
 
-/** Push the 4 corner coords of tile (tx, ty)'s iso diamond into `out`. */
-function tileDiamond(tx: number, ty: number): number[] {
-  // Center of the tile in iso space.
-  const c = cartToIso(tx, ty);
-  return [
-    c.x,
-    c.y - HH, // top
-    c.x + HW,
-    c.y, // right
-    c.x,
-    c.y + HH, // bottom
-    c.x - HW,
-    c.y, // left
-  ];
-}
+// Accent sampling lattice step (tiles). Coarser than 1 so accents read as
+// meadow patches, not per-tile noise.
+const ACCENT_STEP = 2;
+
+// The lattice is visited in PHASES interleaved passes (i, i+PHASES, ...) so a
+// cap hit truncates density uniformly across the WHOLE map instead of filling
+// the north corner row-major and leaving the south bare.
+const PHASES = 16;
+
+// Max fills per Graphics chunk. Pixi v8 marks Graphics with ≥400 vertices as
+// non-batchable (each shape primitive → a separate GL draw call). A 4-point
+// polygon fill = 4 vertices, so 80 fills = 320 vertices, safely under the
+// threshold. This keeps the terrain layer batchable → O(10) draw calls instead
+// of O(7000).
+const CHUNK_FILLS = 80;
+
+// Hard cap on dirt/sand patches so a pathological extent can't explode the draw.
+const MAX_DIRT = 500;
+
 
 /**
- * Draw the mottled ground into a set of Graphics added to `layer`.
- * Returns the Graphics so the caller owns destruction.
+ * Draw the ground into a FLAT array of Graphics.
+ * Returns the Graphics (caller owns destruction) + painted shape count.
  *
- * We batch by shade: one Graphics accumulates all tiles of a given band, which
- * keeps the GPU geometry compact (a handful of fills) regardless of tile count.
+ * ARCHITECTURE (T6b, replaces the per-tile fill approach):
+ *  1. BASE — ONE 4-vertex polygon covering the entire extent, painted
+ *     groundMid. Coverage is 100% at O(1) cost no matter how large the map
+ *     is (the old per-tile loop capped at 6,000 of ~69,000 tiles, leaving
+ *     91% of the map as raw page background — the "empty white map" bug).
+ *  2. ACCENTS — bounded meadow tone patches (dark/light) + dirt patches on
+ *     top, sampled on a coarse lattice visited in PHASES interleaved passes
+ *     so cap hits thin density uniformly instead of clustering north.
+ *
+ * PERFORMANCE (T6a rules kept): fills chunked at ≤CHUNK_FILLS per Graphics
+ * so everything stays batchable. No tile grid is drawn at all — Caesar III
+ * ground has no grid, and the old full-extent line pass was both ugly and
+ * the main unbatchable GPU load.
  */
 export function drawTerrain(
   ext: TerrainExtent,
-): { graphics: Graphics[]; tileCount: number } {
-  const bands: { color: number; g: Graphics }[] = [
-    { color: DERIVED.groundDark, g: new Graphics() },
-    { color: DERIVED.groundMid, g: new Graphics() },
-    { color: DERIVED.groundLight, g: new Graphics() },
-  ];
-  const dirtG = new Graphics();
-  const seamG = new Graphics();
+): { graphics: Graphics[]; gridGraphics: Graphics | null; tileCount: number } {
+  const out: Graphics[] = [];
 
-  // Single pass over the tile grid: pick the mottling band AND roll the sparse
-  // dirt patch per tile. Both are seeded purely by (tileX, tileY) via valueNoise
-  // (no per-tile Rng allocation), so the ground stays deterministic — a re-scan
-  // reproduces the same decoration. Three independent value-noise samples per
-  // tile (offset coords) drive the patch roll / size / worn flavour.
-  let count = 0;
-  for (let ty = ext.minY; ty <= ext.maxY && count < MAX_TILES; ty++) {
-    for (let tx = ext.minX; tx <= ext.maxX && count < MAX_TILES; tx++) {
-      count++;
-      // Two-octave value noise: a low-frequency field (samples on a /3 grid so
-      // neighbours correlate into broad patches) plus a per-tile detail sample.
-      // The blend gives clumped grass/earth regions with crisp per-tile breakup
-      // — Zeus-style mottling instead of uniform mud. Still fully deterministic.
+  // --- 1. Full-coverage base: the extent rectangle projected to iso. Tile
+  // (t) is centred on cartToIso(t), so the rect spans ±0.5 beyond the ends.
+  const a = cartToIso(ext.minX - 0.5, ext.minY - 0.5);
+  const b = cartToIso(ext.maxX + 0.5, ext.minY - 0.5);
+  const c = cartToIso(ext.maxX + 0.5, ext.maxY + 0.5);
+  const d = cartToIso(ext.minX - 0.5, ext.maxY + 0.5);
+  const base = new Graphics();
+  base.poly([a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y]).fill({
+    color: DERIVED.groundMid,
+    alpha: 1,
+  });
+  out.push(base);
+
+  // --- 2. Accent + dirt patches on an interleaved coarse lattice.
+  const cols = Math.max(1, Math.floor((ext.maxX - ext.minX + 1) / ACCENT_STEP));
+  const rows = Math.max(1, Math.floor((ext.maxY - ext.minY + 1) / ACCENT_STEP));
+  const latticeN = cols * rows;
+
+  let accentG = new Graphics();
+  let accentFills = 0;
+  let accentTotal = 0;
+  let dirtG = new Graphics();
+  let dirtFills = 0;
+  let dirtTotal = 0;
+  let count = 1; // the base polygon
+
+  for (
+    let phase = 0;
+    phase < PHASES && (accentTotal < MAX_ACCENTS || dirtTotal < MAX_DIRT);
+    phase++
+  ) {
+    for (
+      let i = phase;
+      i < latticeN && (accentTotal < MAX_ACCENTS || dirtTotal < MAX_DIRT);
+      i += PHASES
+    ) {
+      const tx = ext.minX + (i % cols) * ACCENT_STEP;
+      const ty = ext.minY + Math.floor(i / cols) * ACCENT_STEP;
+
+      // Two-octave value noise picks the meadow tone band.
       const lo = valueNoise(Math.floor(tx / 3), Math.floor(ty / 3));
       const hi = valueNoise(tx, ty);
       const n = lo * 0.62 + hi * 0.38;
-      // Three flat bands with a wider, more even split so the light/dark grass
-      // patches actually read as distinct (was 0.28/0.78 → mostly one band).
-      const band = n < 0.36 ? 0 : n < 0.68 ? 1 : 2;
-      const poly = tileDiamond(tx, ty);
-      bands[band].g.poly(poly).fill({ color: bands[band].color, alpha: 1 });
 
-      // Worn dirt / sand patch — now ~13% (was ~6%) so bare-earth patches give
-      // the green a warm counterpoint, drawn as a slightly inset diamond so the
-      // base band still frames it. Offset coords give decorrelated rolls.
+      // Meadow tone patch (dark or light band only — mid IS the base).
+      if ((n < 0.36 || n > 0.68) && accentTotal < MAX_ACCENTS) {
+        accentTotal++;
+        const cc = cartToIso(tx, ty);
+        // Patch radius 1.2..2.4 tiles — reads as a meadow, not tile noise.
+        const s = 1.2 + valueNoise(tx ^ 0x51ed, ty ^ 0x2b9c) * 1.2;
+        if (accentFills >= CHUNK_FILLS) {
+          out.push(accentG);
+          accentG = new Graphics();
+          accentFills = 0;
+        }
+        accentG
+          .poly([
+            cc.x, cc.y - HH * s,
+            cc.x + HW * s, cc.y,
+            cc.x, cc.y + HH * s,
+            cc.x - HW * s, cc.y,
+          ])
+          .fill({
+            color: n < 0.36 ? DERIVED.groundDark : DERIVED.groundLight,
+            alpha: 0.55,
+          });
+        accentFills++;
+        count++;
+      }
+
+      // Dirt patch — sparse, warm contrast on the green.
       const rRoll = valueNoise(tx ^ 0x5bd1, ty ^ 0x9e37);
-      if (rRoll >= 0.13) continue;
-      const c = cartToIso(tx, ty);
-      const s = 0.45 + valueNoise(tx ^ 0x1234, ty ^ 0xabcd) * (0.8 - 0.45);
-      const worn = valueNoise(tx ^ 0x7777, ty ^ 0x3333) < 0.4;
-      dirtG
-        .poly([
-          c.x,
-          c.y - HH * s,
-          c.x + HW * s,
-          c.y,
-          c.x,
-          c.y + HH * s,
-          c.x - HW * s,
-          c.y,
-        ])
-        .fill({
-          color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
-          alpha: 0.7,
-        });
+      if (rRoll < 0.1 && dirtTotal < MAX_DIRT) {
+        dirtTotal++;
+        const cc = cartToIso(tx, ty);
+        const s = 0.45 + valueNoise(tx ^ 0x1234, ty ^ 0xabcd) * (0.8 - 0.45);
+        const worn = valueNoise(tx ^ 0x7777, ty ^ 0x3333) < 0.4;
+        if (dirtFills >= CHUNK_FILLS) {
+          out.push(dirtG);
+          dirtG = new Graphics();
+          dirtFills = 0;
+        }
+        dirtG
+          .poly([
+            cc.x, cc.y - HH * s,
+            cc.x + HW * s, cc.y,
+            cc.x, cc.y + HH * s,
+            cc.x - HW * s, cc.y,
+          ])
+          .fill({
+            color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
+            alpha: 0.7,
+          });
+        dirtFills++;
+        count++;
+      }
     }
   }
+  if (accentFills > 0) out.push(accentG);
+  if (dirtFills > 0) out.push(dirtG);
 
-  // Subtle iso tile seams: only the NE/NW edges of each tile, faint, every
-  // other tile, so the grid is felt rather than seen. Cheap single stroke.
-  for (let ty = ext.minY; ty <= ext.maxY; ty += 1) {
-    const a = cartToIso(ext.minX, ty);
-    const b = cartToIso(ext.maxX, ty);
-    seamG.moveTo(a.x, a.y).lineTo(b.x, b.y);
-  }
-  for (let tx = ext.minX; tx <= ext.maxX; tx += 1) {
-    const a = cartToIso(tx, ext.minY);
-    const b = cartToIso(tx, ext.maxY);
-    seamG.moveTo(a.x, a.y).lineTo(b.x, b.y);
-  }
-  seamG.stroke({ color: DERIVED.seam, alpha: ALPHA.seam, width: 1 });
-
-  return {
-    graphics: [bands[0].g, bands[1].g, bands[2].g, dirtG, seamG],
-    tileCount: count,
-  };
+  // No tile grid: Caesar III ground has none, and the full-extent line pass
+  // was the dominant unbatchable GPU cost. Callers already handle null.
+  return { graphics: out, gridGraphics: null, tileCount: count };
 }
 
 // ===========================================================================
@@ -180,7 +230,7 @@ export function drawTerrain(
 //     the coast),
 //   - sea + river water tiles (flat diamonds, blue, with a cheap animated
 //     shimmer overlay that is ticked ONLY for visible chunks),
-//   - raised wooden bridge decks over the river tiles a road crosses.
+//   - raised stone arch bridge decks over the river tiles a road crosses.
 //
 // PERFORMANCE: tiles are bucketed into CHUNK-keyed Graphics so the renderer can
 // cull whole off-screen chunks (the big-map win — water geometry is built ONCE,
@@ -307,15 +357,40 @@ export function buildTerrainFrame(
     }
   }
 
-  // 3) Bridge decks — a raised wooden plank over the crossed river tile. Drawn
-  //    last so they sit visually on top of the water. Sorted back→front (depth)
-  //    so overlapping decks layer correctly.
+  // 3) Bridge decks — raised stone arch bridges over river tiles. Drawn last so
+  //    they sit visually on top of the water. Sorted back→front (depth) so
+  //    overlapping bridges layer correctly.
+  //
+  // Orientation inference: build an adjacency map from the sorted bridge list,
+  // then determine each tile's orientation (horizontal/vertical) and per-side
+  // exposed-end flags by looking for neighbours sharing an axis.
+  // Build adjacency map: key "gx,gy" → true for each bridge tile.
+  const bridgeSet = new Set<string>();
+  for (const b of terrain.bridges) bridgeSet.add(`${b.gx},${b.gy}`);
+
   const bridges = [...terrain.bridges].sort(
     (p, q) => p.gx + p.gy - (q.gx + q.gy),
   );
   for (const b of bridges) {
     const a = accOf(b.gx, b.gy);
-    drawBridgeDeck(a.bridges, b.gx, b.gy);
+    // Determine orientation from neighbours. "horizontal" means the bridge
+    // run follows the x-axis (dx=±1); "vertical" follows the y-axis (dy=±1).
+    const hasH = bridgeSet.has(`${b.gx - 1},${b.gy}`) || bridgeSet.has(`${b.gx + 1},${b.gy}`);
+    const hasV = bridgeSet.has(`${b.gx},${b.gy - 1}`) || bridgeSet.has(`${b.gx},${b.gy + 1}`);
+    // MAJOR 1 fix: lone tile (hasH=false, hasV=false) → fallback "horizontal".
+    // Only commit to "vertical" when the tile is UNAMBIGUOUSLY part of a
+    // vertical run (hasV && !hasH). All other cases → "horizontal".
+    const orientation: "horizontal" | "vertical" =
+      hasV && !hasH ? "vertical" : "horizontal";
+    // Per-side exposed end detection: before = negative neighbour missing,
+    // after = positive neighbour missing, along the run axis.
+    const endBefore = orientation === "horizontal"
+      ? !bridgeSet.has(`${b.gx - 1},${b.gy}`)
+      : !bridgeSet.has(`${b.gx},${b.gy - 1}`);
+    const endAfter = orientation === "horizontal"
+      ? !bridgeSet.has(`${b.gx + 1},${b.gy}`)
+      : !bridgeSet.has(`${b.gx},${b.gy + 1}`);
+    drawBridgeDeck(a.bridges, b.gx, b.gy, orientation, endBefore, endAfter);
   }
 
   // Assemble one container per chunk (sand → water → shimmer → bridges).
@@ -376,61 +451,168 @@ function makeShimmer(
   };
 }
 
-/** A raised wooden bridge deck spanning one river tile (walkable). Ported from
- *  `drawBridge` in `js/map_app.js`: a slightly inset wooden quad lifted off the
- *  water with plank seams + corner rail posts. Static geometry (no per-frame
- *  cost). The river still flows visibly under the inset edges. */
-function drawBridgeDeck(g: Graphics, gx: number, gy: number): void {
-  // Raised deck: the tile diamond lifted by a small screen-space z so it reads
-  // as a deck above the water. We lift by drawing the diamond shifted up.
-  const LIFT = 7; // px the deck floats above the water surface
+/** A raised stone bridge deck spanning one river tile (walkable).
+ *
+ *  ISO-CORRECT GEOMETRY (T6d): every horizontal surface is projected from the
+ *  tile's four cart-space corners via cartToIso, exactly like buildings and
+ *  roads — so a bridge run reads correctly at EITHER orientation. (The old
+ *  code mixed screen-axis rectangles with iso directions; since both grid
+ *  axes are diagonal on screen, its stone blocks stuck out at wrong angles.)
+ *  Vertical faces (walls, parapets, posts) drop straight down in screen
+ *  space, which IS correct for vertical surfaces in an iso projection.
+ *
+ *  Corner naming (screen position): A=cartToIso(gx,gy) top, B=(gx+1,gy)
+ *  right, C=(gx+1,gy+1) bottom, D=(gx,gy+1) left. A horizontal run (along
+ *  grid x) connects through edges A–D / B–C and gets parapets on A–B / D–C;
+ *  a vertical run swaps the two pairs. Camera-facing wall faces are B–C
+ *  (south-east) and D–C (south-west). Adjacent bridge tiles share corner
+ *  projections, so multi-tile spans join seamlessly.
+ *
+ *  All geometry is static (zero per-frame cost) and deterministic.
+ *  Orientation + per-side exposed-end flags are inferred once in
+ *  buildTerrainFrame and passed in so the function stays self-contained. */
+function drawBridgeDeck(
+  g: Graphics,
+  gx: number,
+  gy: number,
+  orientation: "horizontal" | "vertical",
+  endBefore: boolean,
+  endAfter: boolean,
+): void {
+  const LIFT = 6; // px the deck floats above the water surface
+  const WALL = 9; // wall depth from deck edge down toward the water
+  const PARAPET_H = 3.5; // parapet wall height above the deck
+  const POST_W = 3;
+  const POST_H = 6;
+
+  const isH = orientation === "horizontal";
   const c = cartToIso(gx + 0.5, gy + 0.5);
-  const inset = 0.92; // deck is slightly smaller than the tile (water peeks at edges)
-  const hw = HW * inset;
-  const hh = HH * inset;
-  const top = [
-    c.x,
-    c.y - hh - LIFT,
-    c.x + hw,
-    c.y - LIFT,
-    c.x,
-    c.y + hh - LIFT,
-    c.x - hw,
-    c.y - LIFT,
-  ];
-  // Deck side (the dark under-board) — a thin skirt between the lifted top and
-  // the water, drawn first so the top sits on it.
+
+  // Tile corner projections (cart corners -> iso screen points).
+  const A = cartToIso(gx, gy); // top
+  const B = cartToIso(gx + 1, gy); // right
+  const C = cartToIso(gx + 1, gy + 1); // bottom
+  const D = cartToIso(gx, gy + 1); // left
+
+  const lerp = (
+    p: { x: number; y: number },
+    q: { x: number; y: number },
+    t: number,
+  ): { x: number; y: number } => ({
+    x: p.x + (q.x - p.x) * t,
+    y: p.y + (q.y - p.y) * t,
+  });
+
+  // ------------------------------------------------------------------
+  // (a) Shadow on the water beneath the span.
+  // ------------------------------------------------------------------
+  g.ellipse(c.x, c.y + 2, HW * 0.7, HH * 0.7).fill({
+    color: DERIVED.bridgeStoneDark,
+    alpha: 0.18,
+  });
+
+  // ------------------------------------------------------------------
+  // (b) Front walls — the two camera-facing vertical faces, dropping from
+  //     the lifted deck edge down toward the water. Two-tone for depth.
+  // ------------------------------------------------------------------
+  const wallQuad = (
+    p1: { x: number; y: number },
+    p2: { x: number; y: number },
+    color: number,
+  ): void => {
+    g.poly([
+      p1.x, p1.y - LIFT,
+      p2.x, p2.y - LIFT,
+      p2.x, p2.y - LIFT + WALL,
+      p1.x, p1.y - LIFT + WALL,
+    ]).fill({ color });
+  };
+  wallQuad(B, C, DERIVED.bridgeStone); // south-east face (lit)
+  wallQuad(D, C, DERIVED.bridgeStoneDark); // south-west face (shaded)
+
+  // Arch opening: a dark half-ellipse on the camera-facing face that is
+  // PARALLEL to the run (the water passes under it). Horizontal run ->
+  // D-C face; vertical run -> B-C face. The ellipse is centred on the
+  // wall's bottom edge so its visible upper half reads as the opening
+  // and the lower half blends into the water as a soft reflection.
+  const archEdge: [typeof A, typeof A] = isH ? [D, C] : [B, C];
+  const archMid = lerp(archEdge[0], archEdge[1], 0.5);
+  const archHalfLen =
+    Math.hypot(archEdge[1].x - archEdge[0].x, archEdge[1].y - archEdge[0].y) *
+    0.26;
+  g.ellipse(archMid.x, archMid.y - LIFT + WALL, archHalfLen, WALL * 0.72).fill({
+    color: DERIVED.waterDeep,
+    alpha: 0.85,
+  });
+
+  // ------------------------------------------------------------------
+  // (c) Deck — the lifted tile diamond with paver seams along the run.
+  // ------------------------------------------------------------------
   g.poly([
-    c.x - hw,
-    c.y - LIFT,
-    c.x,
-    c.y + hh - LIFT,
-    c.x,
-    c.y + hh,
-    c.x - hw,
-    c.y,
-  ]).fill({ color: DERIVED.bridgeWoodDark, alpha: 1 });
+    A.x, A.y - LIFT,
+    B.x, B.y - LIFT,
+    C.x, C.y - LIFT,
+    D.x, D.y - LIFT,
+  ]).fill({ color: DERIVED.bridgeStone, alpha: 1 });
+  // Camber highlight: a lighter band along the middle of the run.
+  const bandLo = 0.32;
+  const bandHi = 0.68;
+  const bandCorners = isH
+    ? [lerp(A, D, bandLo), lerp(B, C, bandLo), lerp(B, C, bandHi), lerp(A, D, bandHi)]
+    : [lerp(A, B, bandLo), lerp(D, C, bandLo), lerp(D, C, bandHi), lerp(A, B, bandHi)];
   g.poly([
-    c.x,
-    c.y + hh - LIFT,
-    c.x + hw,
-    c.y - LIFT,
-    c.x + hw,
-    c.y,
-    c.x,
-    c.y + hh,
-  ]).fill({ color: DERIVED.bridgeWoodDark, alpha: 1 });
-  // Deck top.
-  g.poly(top).fill({ color: DERIVED.bridgeWood, alpha: 1 });
-  // Plank seams across the deck top (cheap static strokes).
-  for (let i = 1; i < 4; i++) {
-    const tt = i / 4;
-    // Interpolate left→right across the top diamond at parameter tt (front face).
-    const ax = c.x - hw + tt * hw;
-    const ay = c.y - LIFT + tt * hh;
-    const bx = c.x + tt * hw;
-    const by = c.y - hh - LIFT + tt * hh;
-    g.moveTo(ax, ay).lineTo(bx, by);
+    bandCorners[0].x, bandCorners[0].y - LIFT,
+    bandCorners[1].x, bandCorners[1].y - LIFT,
+    bandCorners[2].x, bandCorners[2].y - LIFT,
+    bandCorners[3].x, bandCorners[3].y - LIFT,
+  ]).fill({ color: DERIVED.bridgeStoneLight, alpha: 0.35 });
+  // Paver seams parallel to the run: from the "before" open edge to the
+  // "after" open edge at fixed perpendicular fractions.
+  for (const t of [0.25, 0.5, 0.75]) {
+    const s = isH ? lerp(A, D, t) : lerp(A, B, t);
+    const e = isH ? lerp(B, C, t) : lerp(D, C, t);
+    g.moveTo(s.x, s.y - LIFT).lineTo(e.x, e.y - LIFT);
   }
-  g.stroke({ color: DERIVED.bridgeWoodDark, alpha: 0.5, width: 1 });
+  g.stroke({ color: DERIVED.bridgeStoneDark, alpha: 0.4, width: 1 });
+
+  // ------------------------------------------------------------------
+  // (d) Parapets — low raised walls on the two edges parallel to the run.
+  // ------------------------------------------------------------------
+  const parapetEdges: Array<[typeof A, typeof A]> = isH
+    ? [[A, B], [D, C]]
+    : [[A, D], [B, C]];
+  for (const [p1, p2] of parapetEdges) {
+    g.poly([
+      p1.x, p1.y - LIFT,
+      p2.x, p2.y - LIFT,
+      p2.x, p2.y - LIFT - PARAPET_H,
+      p1.x, p1.y - LIFT - PARAPET_H,
+    ]).fill({ color: DERIVED.bridgeStoneDark });
+    // Lighter coping line on top of the parapet.
+    g.moveTo(p1.x, p1.y - LIFT - PARAPET_H).lineTo(p2.x, p2.y - LIFT - PARAPET_H);
+    g.stroke({ color: DERIVED.bridgeStone, alpha: 0.85, width: 1.2 });
+  }
+
+  // ------------------------------------------------------------------
+  // (e) End posts — two small stone pillars flanking each EXPOSED end
+  //     (no live bridge neighbour on that side).
+  // ------------------------------------------------------------------
+  const drawEndPosts = (edge: [typeof A, typeof A]): void => {
+    for (const t of [0.12, 0.88]) {
+      const p = lerp(edge[0], edge[1], t);
+      g.rect(p.x - POST_W / 2, p.y - LIFT - POST_H, POST_W, POST_H).fill({
+        color: DERIVED.bridgeStoneDark,
+      });
+      // Lit cap on the post.
+      g.rect(p.x - POST_W / 2, p.y - LIFT - POST_H, POST_W, 1.4).fill({
+        color: DERIVED.bridgeStoneLight,
+        alpha: 0.9,
+      });
+    }
+  };
+  // "before" = negative-neighbour edge along the run; "after" = positive.
+  const beforeEdge: [typeof A, typeof A] = isH ? [A, D] : [A, B];
+  const afterEdge: [typeof A, typeof A] = isH ? [B, C] : [D, C];
+  if (endBefore) drawEndPosts(beforeEdge);
+  if (endAfter) drawEndPosts(afterEdge);
 }

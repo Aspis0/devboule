@@ -1,0 +1,11 @@
+{
+  "jobs": [
+    { "key": "tex:grass", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Grass/Grass 5 - 256x256.png", "trim": false },
+    { "key": "tex:grassdry", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Grass/Grass 19 - 256x256.png", "trim": false },
+    { "key": "tex:grassdark", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Grass/Grass 17 - 256x256.png", "trim": false },
+    { "key": "tex:dirt", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Dirt/Dirt_17-256x256.png", "trim": false },
+    { "key": "tex:dirtolive", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Dirt/Dirt_19-256x256.png", "trim": false },
+    { "key": "tex:cobble", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Stone/Stone_03-256x256.png", "trim": false },
+    { "key": "tex:stonegrey", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Stone/Stone_05-256x256.png", "trim": false }
+  ]
+}

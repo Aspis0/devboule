@@ -9,7 +9,6 @@ import {
   SlotAllocator,
   MAX_LANE_OFFSET_PX,
   type IPoint,
-  type SafeSplineLeg,
 } from "./locomotion";
 import { cartToIso, isoToCart } from "./iso";
 import { roundTile } from "./navWalkable";
@@ -536,5 +535,116 @@ describe("buildSafeSplineLeg", () => {
     const result = buildSafeSplineLeg(route, 0, tileGridBlocked);
     // The spline sample at t=0 is isoStart which maps to tile (5,10) — blocked.
     expect(result.mode).toBe("linear");
+  });
+});
+
+// =========================================================================
+// T6e — adjacent-tile legs use linear (no spline bowing off the road)
+// =========================================================================
+
+describe("buildSafeSplineLeg — T6e adjacent-tile linear skip", () => {
+  it("uses linear mode for adjacent-tile legs (1 tile apart)", () => {
+    // Two adjacent tiles in cartesian: (5,10) → (6,10). ISO distance ~53.67 px.
+    const isoA = cartToIso(5, 10);
+    const isoB = cartToIso(6, 10);
+    // Use a 3-point route so the spline would actually curve (not the 2-point
+    // linear fallback that buildSplineLeg already applies). The middle point
+    // gives Catmull-Rom enough context to bow.
+    const isoM = cartToIso(5.5, 10);
+    const route = [isoA, isoM, isoB];
+
+    const result = buildSafeSplineLeg(route, 0, () => false);
+    expect(result.mode).toBe("linear");
+    // Sample must be exactly on the linear chord.
+    const mid = result.sample(0.5);
+    expect(mid.x).toBeCloseTo((isoA.x + isoM.x) / 2, 5);
+    expect(mid.y).toBeCloseTo((isoA.y + isoM.y) / 2, 5);
+  });
+
+  it("uses linear mode for diagonal adjacent-tile legs (1 tile diag)", () => {
+    // Diagonal: (5,10) → (6,11). Cartesian distance sqrt(2) ≈ 1.414 tiles.
+    // ISO distance ~48 px — well under the ~80.5 px threshold.
+    const isoA = cartToIso(5, 10);
+    const isoB = cartToIso(6, 11);
+    const isoM = cartToIso(5.5, 10.5);
+    const route = [isoA, isoM, isoB];
+
+    const result = buildSafeSplineLeg(route, 0, () => false);
+    expect(result.mode).toBe("linear");
+  });
+
+  it("uses spline mode for long legs (multi-tile gap)", () => {
+    // Two points 10 tiles apart — well over the 1.5-tile threshold.
+    const isoA = cartToIso(5, 10);
+    const isoB = cartToIso(15, 10);
+    const isoM = cartToIso(10, 10);
+    const route = [isoA, isoM, isoB];
+
+    const result = buildSafeSplineLeg(route, 0, () => false);
+    // Long leg: no blocked tiles → spline mode.
+    expect(result.mode).toBe("spline");
+  });
+
+  it("degrades long legs to linear when blocked tile detected", () => {
+    // Long leg but with a blocked tile along the spline path.
+    const isoA = cartToIso(0, 0);
+    const isoB = cartToIso(0, 10);
+    // Place a blocked tile the spline must cross.
+    const blockAll = () => true;
+    const route = [isoA, isoB]; // 2-point → already linear from buildSplineLeg
+
+    const result = buildSafeSplineLeg(route, 0, blockAll);
+    expect(result.mode).toBe("linear");
+  });
+
+  it("short leg: linear samples are exact linear interpolation", () => {
+    // Adjacent tiles: (10, 20) → (11, 20).
+    const isoA = cartToIso(10, 20);
+    const isoB = cartToIso(11, 20);
+    // 4-point route: enough context for spline to bow if it were used.
+    const isoPrev = cartToIso(9, 20);
+    const isoNext = cartToIso(12, 20);
+    const route = [isoPrev, isoA, isoB, isoNext];
+
+    // Leg 1 (isoA → isoB): adjacent tiles → must be linear.
+    const result = buildSafeSplineLeg(route, 1, () => false);
+    expect(result.mode).toBe("linear");
+
+    // Verify linearity: every sample lies on the chord isoA→isoB.
+    for (let i = 0; i <= 10; i++) {
+      const t = i / 10;
+      const s = result.sample(t);
+      const expectedX = isoA.x + (isoB.x - isoA.x) * t;
+      const expectedY = isoA.y + (isoB.y - isoA.y) * t;
+      expect(s.x).toBeCloseTo(expectedX, 5);
+      expect(s.y).toBeCloseTo(expectedY, 5);
+    }
+  });
+
+  it("short leg: lane offset still clamped when extreme hits blocked tile", () => {
+    // Adjacent tiles with a blocked tile at the extreme offset position.
+    const isoA = cartToIso(10, 20);
+    const isoB = cartToIso(11, 20);
+    const route = [isoA, isoB];
+
+    // Compute where the extreme offset lands.
+    const dx = isoB.x - isoA.x;
+    const dy = isoB.y - isoA.y;
+    const offPos = applyPerpendicularOffset(isoA, dx, dy, MAX_LANE_OFFSET_PX);
+    const offNeg = applyPerpendicularOffset(isoA, dx, dy, -MAX_LANE_OFFSET_PX);
+    const cartPos = isoToCart(offPos.x, offPos.y);
+    const cartNeg = isoToCart(offNeg.x, offNeg.y);
+    const gxPos = roundTile(cartPos.x);
+    const gyPos = roundTile(cartPos.y);
+    const gxNeg = roundTile(cartNeg.x);
+    const gyNeg = roundTile(cartNeg.y);
+
+    // Block the tiles the extreme offsets land on.
+    const blockedTiles = new Set([`${gxPos},${gyPos}`, `${gxNeg},${gyNeg}`]);
+    const blocked = tileBlocked(blockedTiles);
+
+    const result = buildSafeSplineLeg(route, 0, blocked, MAX_LANE_OFFSET_PX);
+    expect(result.mode).toBe("linear"); // short leg → linear
+    expect(result.laneOffsetClamped).toBe(true); // extreme offset hits blocked
   });
 });

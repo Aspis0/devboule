@@ -7,7 +7,7 @@
 // DETERMINISM: NO Math.random anywhere. Lane offset uses the existing
 // deterministic hash (hashString from ./rng). Slot choice is by arrival order.
 
-import { isoToCart } from "./iso";
+import { isoToCart, TILE_W, TILE_H } from "./iso";
 import { roundTile } from "./navWalkable";
 import { hashString } from "./rng";
 
@@ -117,10 +117,29 @@ export interface SafeSplineLeg {
 export const MAX_LANE_OFFSET_PX = 4;
 
 /**
+ * Approximate ISO pixel length of 1.5 cartesian tile-diagonals. Legs whose
+ * endpoints are closer than this are "adjacent-tile" -- the dense per-tile
+ * polyline doesn't need Catmull-Rom smoothing, and the spline bow is exactly
+ * what pulls figures visually off the road. We skip the spline entirely
+ * (linear) for these short legs.
+ *
+ * Derivation: one tile's iso-diagonal is sqrt((TILE_W/2)^2 + (TILE_H/2)^2)
+ * ~53.67 px. 1.5 tiles ~80.5 px. Computed from the constants so it stays
+ * in sync if tile size changes.
+ */
+const ADJACENT_TILE_ISO = 1.5 * Math.hypot(TILE_W / 2, TILE_H / 2);
+
+/**
  * Build a SAFE spline leg: if ANY sample of the raw Catmull-Rom spline lands
  * on a blocked tile, degrade THAT LEG to plain linear interpolation. If the
  * extreme lane offset (\u00b1maxOffset px) lands on a blocked tile, clamp the lane
  * offset to 0 for the whole leg.
+ *
+ * T6e FIX: when the leg's endpoints are adjacent tiles (ISO distance <= ~1.5
+ * tiles -- the dense per-tile polyline), skip the spline entirely (linear).
+ * Dense polylines don't need smoothing; the Catmull-Rom bow is exactly what
+ * pulls figures visually off the road onto adjacent grass. Long legs (sparse
+ * polylines or multi-tile gaps) keep the spline so the path reads smooth.
  *
  * Validation runs ONCE at leg-build time (not per frame). The sample density
  * matches the walk stepping: ceil(segLen / 8) samples per leg (8px \u2248 half a
@@ -147,6 +166,41 @@ export function buildSafeSplineLeg(
   const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1;
   const dx = b.x - a.x;
   const dy = b.y - a.y;
+
+  // T6e -- SHORT-LEG LINEAR SKIP: when endpoints are adjacent tiles (dense
+  // per-tile polyline), skip the Catmull-Rom spline entirely. The spline's
+  // bow across the surrounding context is what pulls figures off the road on
+  // dense polylines. Long legs keep the spline for smooth paths.
+  if (segLen <= ADJACENT_TILE_ISO) {
+    // Still need to check lane-offset clamping for the linear path.
+    let laneOffsetClamped = false;
+    if (maxOffsetPx > 0) {
+      const sampleCount = Math.max(2, Math.ceil(segLen / 8));
+      for (let i = 0; i <= sampleCount; i++) {
+        const t = i / sampleCount;
+        const rawPt: IPoint = { x: a.x + dx * t, y: a.y + dy * t };
+        const offPos = applyPerpendicularOffset(rawPt, dx, dy, maxOffsetPx);
+        const offNeg = applyPerpendicularOffset(rawPt, dx, dy, -maxOffsetPx);
+        const cartPos = isoToCart(offPos.x, offPos.y);
+        const cartNeg = isoToCart(offNeg.x, offNeg.y);
+        if (
+          blocked(roundTile(cartPos.x), roundTile(cartPos.y)) ||
+          blocked(roundTile(cartNeg.x), roundTile(cartNeg.y))
+        ) {
+          laneOffsetClamped = true;
+          break;
+        }
+      }
+    }
+    return {
+      mode: "linear",
+      sample: (t: number) => {
+        const clamped = Math.max(0, Math.min(1, t));
+        return { x: a.x + dx * clamped, y: a.y + dy * clamped };
+      },
+      laneOffsetClamped,
+    };
+  }
 
   // Number of samples: enough to catch a blocked tile crossing. 8px \u2248 half
   // a tile width (a tile is ~16px across in iso). At least 2 samples.

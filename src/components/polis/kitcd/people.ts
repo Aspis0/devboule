@@ -51,6 +51,8 @@ const TUNIC: Record<CitizenType, number> = {
   watercarrier: 0xbfc7cc,
   merchant: 0xc98a2b,
   noble: 0xf3edde,
+  priest: 0xf0ece0,  // long white robe base
+  foreigner: 0x7a9e9a, // muted teal travel cloak
 };
 
 /** The source's default tunic colour for a figure type (read-only lookup). */
@@ -71,7 +73,9 @@ export type CitizenType =
   | "firefighter"
   | "watercarrier"
   | "merchant"
-  | "noble";
+  | "noble"
+  | "priest"
+  | "foreigner";
 
 export interface CitizenDrawOpts {
   /** true while the agent is moving (drives leg swing + arm sway via Math.sin). */
@@ -92,6 +96,9 @@ export interface CitizenDrawOpts {
   actionPhase: number;
   /** explicit tunic override; if omitted, the per-type default TUNIC is used. */
   tunic?: number;
+  /** When set, draws a carried wooden crate in front of the figure at hand height.
+   *  The crate bobs with the walk phase for a natural carry feel. */
+  carrying?: "crate";
 }
 
 // shade(hex, factor): multiply each RGB channel by `factor`, clamp to [0,255].
@@ -280,6 +287,64 @@ export function drawCitizen(
     g.moveTo(3.6 * s, -17 * s)
       .lineTo(3.6 * s, 0)
       .stroke({ width: 1.1 * s, color: 0x6e4a2a });
+  }
+
+  // ---- priest: long white robe, purple trim band, laurel circlet ----
+  if (type === "priest") {
+    // purple trim band across the tunic at chest height
+    g.moveTo(-3.4 * s, -12.8 * s)
+      .lineTo(3.4 * s, -12.8 * s)
+      .stroke({ width: 1.3 * s, color: 0x7a3f86 });
+    g.moveTo(-3.4 * s, -12.2 * s)
+      .lineTo(3.4 * s, -12.2 * s)
+      .stroke({ width: 0.8 * s, color: 0x7a3f86, alpha: 0.5 });
+    // laurel circlet: small leaf-shaped ovals around the crown
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI * 0.8 + (i * Math.PI * 0.4) / 4;
+      const lx = Math.cos(a) * 3.2 * s;
+      const ly = -19 * s + Math.sin(a) * 3.2 * s;
+      g.ellipse(lx, ly, 1.2 * s, 0.5 * s).fill({ color: 0x6a8a3e });
+    }
+  }
+
+  // ---- foreigner: hooded teal cloak + walking staff ----
+  if (type === "foreigner") {
+    // hood over the head
+    g.poly([
+      -3.5 * s, -19.5 * s,
+      0, -23.5 * s,
+      3.5 * s, -19.5 * s,
+    ]).fill({ color: 0x6a8e8a });
+    // cloak drape over shoulders
+    g.poly([
+      -4.2 * s, hipY,
+      4.2 * s, hipY,
+      3.6 * s, -15 * s,
+      -3.6 * s, -15 * s,
+    ]).fill({ color: shade(0x7a9e9a, 0.88) });
+    // walking staff in the right hand
+    g.moveTo(3.8 * s, -16 * s)
+      .lineTo(3.8 * s, 0)
+      .stroke({ width: 1.2 * s, color: 0x5a4020, cap: "round" });
+  }
+
+  // ---- carried crate (trade porters) ----
+  if (opts.carrying === "crate") {
+    // Vertical bob synced to walk phase: reuses the same Math.sin the walk
+    // cycle uses, so the crate bobs in step with the legs.
+    const bob = moving ? Math.sin(phase) * 0.8 * s : 0;
+    const cx = 0; // centered in front of the figure
+    const cy = -8 * s + bob; // hand height
+    const cw = 4 * s;
+    const ch = 3 * s;
+    // crate body
+    g.rect(cx - cw / 2, cy - ch / 2, cw, ch).fill({ color: 0x8a6a3a });
+    g.rect(cx - cw / 2, cy - ch / 2, cw, ch).stroke({ width: 0.6 * s, color: 0x5a4a28 });
+    // rope cross
+    g.moveTo(cx - cw / 2, cy).lineTo(cx + cw / 2, cy)
+      .stroke({ width: 0.5 * s, color: 0x4a3a1a });
+    g.moveTo(cx, cy - ch / 2).lineTo(cx, cy + ch / 2)
+      .stroke({ width: 0.5 * s, color: 0x4a3a1a });
   }
 
   // ---- firefighter water-throw arc ----
