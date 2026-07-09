@@ -75,6 +75,9 @@ export interface RenderProfile {
   maxAmbientWalkers: number;
   /** WebGL antialias flag for `app.init` (off on weak tiers to save fill-rate). */
   antialias: boolean;
+  /** P5.1 — max number of hero fires (Tier F2 ParticleContainers). Capped at init;
+   *  pooled once, re-targeted between buildings. RICH 6 / LEAN 3 / MINIMAL 0. */
+  maxHeroFires: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +97,7 @@ const RICH: RenderProfile = {
   atlasResolutionCap: 2,
   maxAmbientWalkers: 40,
   antialias: true,
+  maxHeroFires: 6,
 };
 
 /** LEAN — integrated / unknown GPU, low VRAM, or a modest CPU. Also the SAFE
@@ -110,6 +114,7 @@ const LEAN: RenderProfile = {
   atlasResolutionCap: 1,
   maxAmbientWalkers: 18,
   antialias: false,
+  maxHeroFires: 3,
 };
 
 /** MINIMAL — the lowest floor (tiny VRAM or a 1-4 core box). Labels/detail only
@@ -125,6 +130,7 @@ const MINIMAL: RenderProfile = {
   atlasResolutionCap: 1,
   maxAmbientWalkers: 6,
   antialias: false,
+  maxHeroFires: 0,
 };
 
 // ---------------------------------------------------------------------------

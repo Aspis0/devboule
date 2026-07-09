@@ -88,6 +88,14 @@ import { buildingChanged, worstSinSeverity } from "./diffCity";
 import { StepClock } from "./effects";
 import type { FilterSets } from "./filterModel";
 import { GrowthFx, Scaffold, Disaster, Investigation } from "./growthEffects";
+import { EffectsBudget, type BudgetRung } from "./effectsBudget";
+import {
+  bakeFireAtlas, destroyFireAtlas, createCrowdFire, stepCrowdFire,
+  createHeroFire, retargetHeroFire, stepHeroFire, parkHeroFire,
+  beginDemotionCrossfade, rankForPromotion,
+  type FireAtlas, type CrowdFire, type HeroFire, type FireSeverity,
+  type PromotableBuilding,
+} from "./fire";
 import { sliceBatches, DEFAULT_BUILD_BATCH } from "./chunk";
 import {
   orderBuildQueue,
@@ -295,6 +303,22 @@ interface BuildingNode {
  * no longer appears, while siblings survive. (No-op when the item is absent —
  * destroy is safe to call on a static, never-tracked node.)
  */
+
+/** P5.1 — deterministic seeded phase from fileId (same algo as fire.ts:seededPhase,
+ *  inlined here to avoid an import cycle with fire.ts). */
+function seededPhaseFromId(fileId: string): number {
+  // Use the hashString from rng.ts (already imported)
+  let h = 1779033703 ^ fileId.length;
+  for (let i = 0; i < fileId.length; i++) {
+    h = Math.imul(h ^ fileId.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  h = Math.imul(h ^ (h >>> 16), 2246822507);
+  h = Math.imul(h ^ (h >>> 13), 3266489909);
+  h ^= h >>> 16;
+  return ((h >>> 0) % 9973) / 9973 * 100;
+}
+
 export function removeFromArrayByIdentity<T>(list: T[], item: T): boolean {
   const idx = list.indexOf(item);
   if (idx >= 0) {
@@ -360,6 +384,7 @@ export class PolisRenderer {
     external: new Container(),
     agents: new Container(),
     effects: new Container(),
+    halos: new Container(),
     ui: new Container(),
   };
 
@@ -595,6 +620,31 @@ export class PolisRenderer {
   // overlay would stay invisible until an explicit resize. The step tick draws it
   // once as soon as the host gains size (FIX 5). Alloc-free in steady state.
   private dayCycleDrawn = false;
+
+  /**
+   * P5.1 — exposed day-phase value (folded triangle wave, 0 noon → 1 dusk → 0).
+   * Drives halos night-boost (both evening and morning twilight — symmetric reuse
+   * of the existing 4-minute day-cycle warmth loop) and shadow skew angle.
+   * Updated every step in applyDayCycle(), allocation-free.
+   */
+  public dayPhase = 0;
+  // P5.1 — previous budget rung (for transition detection on ladder shift).
+  private _prevBudgetRung: BudgetRung = 0;
+
+  // P5.1 — fire atlas (baked once per session), hero fire pool, crowd fires map.
+  private fireAtlas: FireAtlas | null = null;
+  private heroFirePool: HeroFire[] = [];
+  private crowdFires = new Map<string, CrowdFire>();
+  private effectsBudget!: EffectsBudget;
+  // P5.1 — debug overlay (dev-flag). One Text node, updated at 2Hz.
+  private debugOverlay: import('pixi.js').Text | null = null;
+  private debugOverlayTimer = 0;
+  // P5.1 — hero-promotion-dirty flag (re-eval on moved/zoomed + sin changes).
+  private heroPromoDirty = true;
+  // P5.1 — shared halo radial texture (256px, rendered once).
+  private haloTex: import('pixi.js').Texture | null = null;
+  // P5.1 — pooled halo sprites keyed by fileId (mirrors crowdFires lifecycle).
+  private haloSprites = new Map<string, import('pixi.js').Sprite>();
   private onResize: (() => void) | null = null;
   private onBackgroundTap: (() => void) | null = null;
 
@@ -687,6 +737,33 @@ export class PolisRenderer {
     this.layers.effects.eventMode = "none";
     this.growthFx = new GrowthFx(this.layers.effects);
 
+    // P5.1 — halos layer: z-grouped additive sprites (two blend switches per frame).
+    this.layers.halos.eventMode = "none";
+    // P5.1 — effects budget (pure, injectable clock).
+    this.effectsBudget = new EffectsBudget(this.profile, () => performance.now() / 1000);
+    // P5.1 — bake fire atlas (Flame/Smoke → RenderTexture flip-book frames).
+    // The PIXI renderer is required; it is ready by the time the constructor runs.
+    try {
+      this.fireAtlas = bakeFireAtlas(this.app.renderer as unknown as import('./fire').FireTextureSource);
+    } catch {
+      this.debugLog("P5.1 fire atlas bake failed — crowd fires disabled");
+    }
+    // P5.1 — shared halo texture (256px radial gradient, additive blend).
+    this.haloTex = this.makeHaloTexture();
+    // P5.1 — pre-allocate hero fire pool (maxHeroFires ParticleContainers).
+    if (this.profile.maxHeroFires > 0 && this.fireAtlas) {
+      for (let i = 0; i < this.profile.maxHeroFires; i++) {
+        // Parked hero fires — will be re-targeted on promotion.
+        const hf = createHeroFire(
+          this.app.renderer as unknown as import('./fire').FireTextureSource,
+          `__pool_${i}`, 0, 0,
+        );
+        parkHeroFire(hf);
+        this.layers.effects.addChild(hf.container);
+        this.heroFirePool.push(hf);
+      }
+    }
+
     this.labelStyle = new TextStyle({
       fontFamily: "Inter, system-ui, sans-serif",
       fontSize: 12,
@@ -706,6 +783,8 @@ export class PolisRenderer {
     this.vignette.eventMode = "none";
     this.app.stage.addChild(this.vignette);
     this.drawVignette();
+    // P5.1 — debug overlay (dev-flag toggle via localStorage).
+    this.initDebugOverlay();
 
     // Day-cycle tint overlay — a screen-space WHITE rect on app.stage, ABOVE the
     // vignette so the warmth reads over the whole view (it does NOT pan/zoom with
@@ -732,6 +811,8 @@ export class PolisRenderer {
     // pinch/animate). Subscribing to both covers every camera change.
     this.onViewportChanged = () => {
       this.cullDirty = true;
+      // P5.1 — hero promotion re-eval on camera move/zoom.
+      this.heroPromoDirty = true;
       // B2b — if a chunked build is still filling in the background, a camera move
       // RE-PRIORITIZES the not-yet-placed remainder so the chunks the user just
       // panned/zoomed to build next. Debounced (a pan/zoom burst coalesces to one
@@ -2020,6 +2101,13 @@ export class PolisRenderer {
     // Recolor the screen-space day-cycle tint for the new elapsed time.
     this.applyDayCycle();
 
+    // P5.1 — shadow skew: container-level skew.x driven by dayPhase.
+    // One transform write per tick on the shadows layer (not per shadow).
+    this.layers.shadows.skew.x = -0.12 + this.dayPhase * 0.24;
+
+    // P5.1 — effects budget: bracket the effects pass.
+    const effectsStart = performance.now();
+
     // Buildings: drive the ported kit anim instances (Flame/Beacon/Flag/Smoke/
     // Water) — but ONLY for nodes whose chunk is currently visible. Each anim's
     // update(t, dt) clears+redraws its own small Graphics (inherent to the
@@ -2037,6 +2125,43 @@ export class PolisRenderer {
       const anims = node.kitAnims;
       for (let i = 0; i < anims.length; i++) anims[i].update(t, dt);
     }
+
+    // P5.1 — step crowd fires + hero fires (gated on budget rung).
+    const rung = this.effectsBudget.rung;
+    const prevRung = this._prevBudgetRung;
+    this._prevBudgetRung = rung;
+    const halfRate = rung >= 3; // rung 3+ → crowd at 15fps
+
+    // Tier F2 promotion/demotion (reconcile only when rung < 1).
+    if (rung < 1 && this.fireAtlas) {
+      this.reconcileHeroFires();
+    }
+    // Transition INTO rung >= 1: mass-demote all active heroes.
+    if (rung >= 1 && prevRung === 0 && this.fireAtlas) {
+      for (const hf of this.heroFirePool) {
+        if (hf.targetFileId !== null) beginDemotionCrossfade(hf);
+      }
+    }
+    // Always step heroes with active crossfade or target (regardless of rung).
+    // Demotion fades play to completion; promotion fades only when rung<1.
+    if (this.fireAtlas) {
+      for (const hf of this.heroFirePool) {
+        if (hf.targetFileId !== null || hf.crossfading) {
+          stepHeroFire(hf, dt);
+        }
+      }
+    }
+    // Tier F1: crowd fires (always active unless rung 5 pauses everything).
+    // Sync crowd fires from current burning buildings (no alloc in steady state).
+    if (this.fireAtlas) {
+      this.syncCrowdFires();
+      for (const [, cf] of this.crowdFires) {
+        stepCrowdFire(cf, this.fireAtlas, frame, halfRate || rung >= 3);
+      }
+    }
+
+    // P5.1 — halos: additive sprites per on-screen burning building.
+    this.updateHalos(frame);
 
     // Water shimmer: redraw the wave lines for VISIBLE terrain chunks only (each
     // is a bounded handful of strokes; off-screen water is skipped entirely so
@@ -2057,7 +2182,13 @@ export class PolisRenderer {
     // real agents are always stepped (few, and they carry the live marker/glow).
     this.agentLayer.step(frame, this.viewBounds);
     // Ambient crowd: stepped bob + figure redraw (LOD-gated + viewport-culled #9).
-    this.ambientLayer.step(frame, this.viewBounds);
+    // P5.1 budget rung 4 → half anim rate (every other step).
+    // P5.1 budget rung 5 → ambient walkers pause.
+    if (rung < 5) {
+      if (rung < 4 || frame % 2 === 0) {
+        this.ambientLayer.step(frame, this.viewBounds);
+      }
+    }
     // Trade-route porters: stepped bob + merchant figure redraw, LOD-gated and
     // VISIBLE-CHUNK-only (each porter is skipped unless its position is inside
     // `viewBounds` — the same cull rectangle the growth FX use, refreshed by the
@@ -2068,6 +2199,13 @@ export class PolisRenderer {
     // stepped status-lamp pulse for "spawning" nodes (steady states are set once
     // at build). LOD-gated inside the layer.
     this.externalLayer.step(frame, t, dt);
+
+    // P5.1 — effects budget: record elapsed ms.
+    const effectsElapsed = performance.now() - effectsStart;
+    this.effectsBudget.record(effectsElapsed);
+
+    // P5.1 — debug overlay (2Hz update).
+    this.updateDebugOverlay(deltaMs, effectsElapsed);
   }
 
   // ---------------------------------------------------------------------------
@@ -2823,6 +2961,8 @@ export class PolisRenderer {
     node.pennant = dyn.pennant;
     node.disaster = dyn.disaster;
     node.investigation = dyn.investigation;
+    // Sin/disaster state may have changed → re-evaluate hero promotions.
+    this.heroPromoDirty = true;
     node.hitRadius = built.hw;
 
     // Keep the path→fileId index correct (filePath could change with a rename,
@@ -3125,11 +3265,305 @@ export class PolisRenderer {
     const k = phase < 0.5 ? phase * 2 : (1 - phase) * 2; // 0 at noon, 1 at dusk
     this.dayCycle.tint = blend(DAY_TINT_NOON, DAY_TINT_EVENING, k);
     this.dayCycle.alpha = DAY_ALPHA_NOON + (DAY_ALPHA_EVENING - DAY_ALPHA_NOON) * k;
+    this.dayPhase = k; // P5.1 — exposed for halos + shadow skew
   }
 
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // P5.1 — HALOS
+  // ---------------------------------------------------------------------------
+
+  /** Create the shared 256px radial-gradient halo texture (additive blend). */
+  private makeHaloTexture(): import('pixi.js').Texture | null {
+    try {
+      const size = 256;
+      const g = new Graphics();
+      // Radial gradient: white core fading to transparent edge.
+      // We approximate with concentric circles of decreasing alpha.
+      for (let i = size / 2; i > 0; i -= 4) {
+        const t = i / (size / 2);
+        const a = (1 - t) * 0.5; // alpha from 0.5 at center to 0 at edge
+        g.circle(size / 2, size / 2, i).fill({ color: 0xffffff, alpha: a * a });
+      }
+      const container = new Container();
+      container.addChild(g);
+      const tex = this.app.renderer.generateTexture({ target: container, resolution: 1, antialias: false });
+      g.destroy();
+      container.destroy({ children: false });
+      return tex;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * P5.1 — Pooled halo update. Sprites are created/destroyed alongside crowd
+   * fires (in syncCrowdFires); per-tick we ONLY mutate alpha/width/height/position
+   * of existing pool entries. No per-tick allocation, no removeChildren storm.
+   */
+  private updateHalos(_frame: number): void {
+    if (!this.haloTex) return;
+    const rung = this.effectsBudget.rung;
+    const flickerFreeze = rung >= 2;
+    const tileSize = 64;
+    const scale = this.viewport.scale.x;
+
+    for (const [fileId, sprite] of this.haloSprites) {
+      const node = this.buildingNodes.get(fileId);
+      if (!node) continue;
+      const chunk = this.chunks.get(node.chunkKey);
+      if (!(chunk?.visible ?? false)) {
+        sprite.visible = false;
+        continue;
+      }
+      sprite.visible = true;
+
+      const sev = (worstSinSeverity(node.building) ?? "smoke") as FireSeverity;
+      const baseRadius = sev === "inferno" ? 6 : sev === "fire" ? 4 : 2.5;
+      const baseAlpha = sev === "inferno" ? 0.22 : sev === "fire" ? 0.16 : 0.10;
+
+      const cf = this.crowdFires.get(fileId);
+      const phase = cf ? cf.phase : seededPhaseFromId(fileId);
+      let flicker = 0;
+      if (!flickerFreeze) {
+        flicker = ((phase % 1) * 2 - 1) * 0.04;
+      }
+      let alpha = baseAlpha + flicker;
+      let radius = baseRadius;
+
+      const k = this.dayPhase;
+      if (k > 0.3) {
+        const night = Math.min(1, (k - 0.3) / 0.7);
+        alpha *= 1 + night * 0.8;
+        radius *= 1 + night * 0.2;
+      }
+
+      const r = radius * tileSize * scale;
+      sprite.position.set(node.iso.x, node.iso.y - 12);
+      sprite.width = r * 2;
+      sprite.height = r * 2;
+      sprite.alpha = Math.max(0, Math.min(1, alpha));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // P5.1 — FIRE PROMOTION
+  // ---------------------------------------------------------------------------
+
+  /** Sync crowd fires with current building disaster state. No allocation in
+   *  steady state (creates/destroys only when sins change, which is rare). */
+  private syncCrowdFires(): void {
+    if (!this.fireAtlas) return;
+    // Track which buildings currently have a visible disaster.
+    const currentBurning = new Set<string>();
+    for (const [fileId, node] of this.buildingNodes) {
+      if (node.disaster && node.disaster.node.visible) {
+        currentBurning.add(fileId);
+      }
+    }
+    // Remove crowd fires + halo sprites for buildings no longer burning.
+    for (const [fileId] of this.crowdFires) {
+      if (!currentBurning.has(fileId)) {
+        const cf = this.crowdFires.get(fileId)!;
+        cf.fireSprite.removeFromParent();
+        cf.smokeSprite.removeFromParent();
+        cf.fireSprite.destroy();
+        cf.smokeSprite.destroy();
+        this.crowdFires.delete(fileId);
+        // Destroy pooled halo sprite
+        const hs = this.haloSprites.get(fileId);
+        if (hs) {
+          hs.removeFromParent();
+          hs.destroy();
+          this.haloSprites.delete(fileId);
+        }
+        // Re-enable legacy Flame/Smoke for this building
+        const node = this.buildingNodes.get(fileId);
+        if (node?.disaster) node.disaster.setLegacyVisible(true);
+        // Extinguished fire → re-evaluate hero promotions
+        this.heroPromoDirty = true;
+      }
+    }
+    // Create crowd fires for newly burning buildings.
+    for (const fileId of currentBurning) {
+      if (!this.crowdFires.has(fileId)) {
+        const node = this.buildingNodes.get(fileId);
+        if (!node) continue;
+        const sev = (worstSinSeverity(node.building) ?? "smoke") as FireSeverity;
+        const cf = createCrowdFire(
+          this.fireAtlas, fileId, sev,
+          node.iso.x, node.iso.y - 20,
+        );
+        cf.fireSprite.eventMode = "none";
+        cf.smokeSprite.eventMode = "none";
+        this.layers.effects.addChild(cf.fireSprite);
+        this.layers.effects.addChild(cf.smokeSprite);
+        this.crowdFires.set(fileId, cf);
+        // Pooled halo sprite for this building (created once, mutated per tick).
+        if (this.haloTex && !this.haloSprites.has(fileId)) {
+          const hs = new Sprite(this.haloTex);
+          hs.anchor.set(0.5);
+          hs.blendMode = "add";
+          hs.eventMode = "none";
+          this.layers.halos.addChild(hs);
+          this.haloSprites.set(fileId, hs);
+        }
+        // Suppress legacy Flame/Smoke — crowd fire sprites replace them.
+        if (node.disaster) node.disaster.setLegacyVisible(false);
+        // Mark hero promo dirty so new fire gets considered
+        this.heroPromoDirty = true;
+      }
+    }
+  }
+
+  /** Re-evaluate hero fire promotion set.
+  /** Re-evaluate hero fire promotion set. Called on StepClock ticks (not per frame). */
+  private reconcileHeroFires(): void {
+    if (!this.fireAtlas || this.heroFirePool.length === 0) return;
+    if (!this.heroPromoDirty) return;
+    this.heroPromoDirty = false;
+
+    // Defensive sweep: park heroes whose target building is no longer burning.
+    for (let i = 0; i < this.heroFirePool.length; i++) {
+      const hf = this.heroFirePool[i];
+      if (!hf.targetFileId) continue;
+      const node = this.buildingNodes.get(hf.targetFileId);
+      if (!node || !node.disaster || !node.disaster.node.visible) {
+        beginDemotionCrossfade(hf);
+      }
+    }
+
+    // Collect on-screen burning buildings
+    const candidates: PromotableBuilding[] = [];
+    const cx = this.viewport.center.x;
+    const cy = this.viewport.center.y;
+
+    for (const [fileId, node] of this.buildingNodes) {
+      const disaster = node.disaster;
+      if (!disaster || !disaster.node.visible) continue;
+      const chunk = this.chunks.get(node.chunkKey);
+      if (!(chunk?.visible ?? false)) continue;
+
+      const sev = (worstSinSeverity(node.building) ?? "smoke") as FireSeverity;
+      const dist = Math.hypot(node.iso.x - cx, node.iso.y - cy);
+      candidates.push({ fileId, severity: sev, distToCenter: dist });
+    }
+
+    const ranked = rankForPromotion(candidates);
+    const maxHeroes = this.profile.maxHeroFires;
+    const promoteSet = new Set(ranked.slice(0, maxHeroes).map(b => b.fileId));
+
+    // Assign hero fires to promoted buildings, demote the rest
+    const currentAssignments = new Map<string, number>(); // fileId → pool index
+    for (let i = 0; i < this.heroFirePool.length; i++) {
+      const hf = this.heroFirePool[i];
+      if (hf.targetFileId) currentAssignments.set(hf.targetFileId, i);
+    }
+
+    // Promote new entries
+    let nextPoolIdx = 0;
+    const usedPoolIndices = new Set<number>();
+
+    for (const b of ranked) {
+      if (!promoteSet.has(b.fileId)) break; // no more promotion slots
+
+      // Already has a hero fire?
+      const existingIdx = currentAssignments.get(b.fileId);
+      if (existingIdx !== undefined) {
+        usedPoolIndices.add(existingIdx);
+        continue;
+      }
+
+      // Find a free pool slot
+      while (usedPoolIndices.has(nextPoolIdx) && nextPoolIdx < this.heroFirePool.length) {
+        nextPoolIdx++;
+      }
+      if (nextPoolIdx >= this.heroFirePool.length) break;
+
+      const node = this.buildingNodes.get(b.fileId);
+      if (!node) continue;
+
+      const hf = this.heroFirePool[nextPoolIdx];
+      retargetHeroFire(hf, b.fileId, b.severity, node.iso.x, node.iso.y - 20);
+      usedPoolIndices.add(nextPoolIdx);
+      currentAssignments.set(b.fileId, nextPoolIdx);
+    }
+
+    // Demote un-promoted hero fires
+    for (let i = 0; i < this.heroFirePool.length; i++) {
+      const hf = this.heroFirePool[i];
+      if (hf.targetFileId && !promoteSet.has(hf.targetFileId)) {
+        beginDemotionCrossfade(hf);
+      }
+    }
+
+    // Demoted heroes auto-park inside stepHeroFire when crossfade reaches 0.
+    // No separate completion check needed — demotionComplete is dead.
+  }
+
+  // NOTE: seededPhaseFromId — duplicate-safe, same as fire.ts seededPhase.
+  // We avoid the import cycle by inlining the hash.
+
+  // ---------------------------------------------------------------------------
+  // P5.1 — DEBUG OVERLAY
+  // ---------------------------------------------------------------------------
+
+  /** Initialize the debug overlay Text node (hidden by default). */
+  private initDebugOverlay(): void {
+    // Dev flag: localStorage key 'polisDebugOverlay'
+    try {
+      if (typeof localStorage !== "undefined" && localStorage.getItem("polisDebugOverlay") !== "1") {
+        return;
+      }
+    } catch { return; }
+    
+    this.debugOverlay = new Text({
+      text: "",
+      style: new TextStyle({
+        fontFamily: "monospace",
+        fontSize: 11,
+        fill: 0x00ff88,
+        stroke: { color: 0x000000, width: 2 },
+        align: "left",
+      }),
+    });
+    this.debugOverlay.eventMode = "none";
+    this.debugOverlay.position.set(8, 8);
+    this.app.stage.addChild(this.debugOverlay);
+  }
+
+  /** Update debug overlay text at ~2Hz. */
+  private updateDebugOverlay(deltaMs: number, _effectsMs: number): void {
+    if (!this.debugOverlay) return;
+    this.debugOverlayTimer += deltaMs;
+    if (this.debugOverlayTimer < 500) return;
+    this.debugOverlayTimer = 0;
+
+    const fps = Math.round(1000 / Math.max(1, deltaMs));
+    const smoothed = Math.round(this.effectsBudget.smoothedCostMs * 100) / 100;
+    const rung = this.effectsBudget.rung;
+    const heroCount = this.heroFirePool.filter(h => h.targetFileId !== null).length;
+    const crowdCount = this.crowdFires.size;
+
+    // TODO(P5.2): walker count — not yet exposed via AmbientLayer
+    const walkerCount = 0;
+
+    const culledChunks = [...this.chunks.values()].filter(c => !c.visible).length;
+    const totalChunks = this.chunks.size;
+    const builtBld = this.buildingNodes.size;
+    // Total buildings from lastCity
+    const totalBld = this.lastCity?.buildings.length ?? builtBld;
+
+    const rungLabels = ["full", "h→c", "halo", "15fps", "½anim", "pause"];
+    this.debugOverlay.text =
+      `fps:${fps} fx:${smoothed}ms parts:${heroCount * 50} hero:${heroCount} crowd:${crowdCount}
+` +
+      `rung:${rung}(${rungLabels[rung] ?? "?"}) cull:${culledChunks}/${totalChunks} bld:${builtBld}/${totalBld} walk:${walkerCount}`;
+  }
+
 
   private clearScene(): void {
     this.agentLayer.clear();
@@ -3157,6 +3591,27 @@ export class PolisRenderer {
     // L2: park any in-flight bursts + drop node transitions. The pool Graphics
     // are KEPT (reused across rebuilds) — they live on the effects layer, which
     // clearScene does not tear down; dispose() (in destroy) frees them.
+    // P5.1 — clear crowd fires + park hero fires.
+    for (const [, cf] of this.crowdFires) {
+      cf.fireSprite.removeFromParent();
+      cf.smokeSprite.removeFromParent();
+      cf.fireSprite.destroy();
+      cf.smokeSprite.destroy();
+    }
+    this.crowdFires.clear();
+    for (const hf of this.heroFirePool) {
+      parkHeroFire(hf);
+    }
+    this.heroPromoDirty = true;
+    this.effectsBudget.reset();
+    this._prevBudgetRung = 0;
+    // P5.1 — clear halo sprite pool.
+    for (const [, hs] of this.haloSprites) {
+      hs.removeFromParent();
+      hs.destroy();
+    }
+    this.haloSprites.clear();
+
     this.growthFx.clear();
     this.roadGraph = null;
     // FIX: reset the live-diff baselines. Leaving these set would let the next
@@ -3238,6 +3693,21 @@ export class PolisRenderer {
     // L2: detach + destroy the growth-effect pool Graphics BEFORE the effects
     // layer is destroyed below (no removeFromParent leak — the L1 audit caught
     // this exact pattern).
+    // P5.1 — destroy fire atlas textures + halos.
+    if (this.fireAtlas) {
+      destroyFireAtlas(this.fireAtlas);
+      this.fireAtlas = null;
+    }
+    if (this.haloTex) {
+      this.haloTex.destroy(true);
+      this.haloTex = null;
+    }
+    // P5.1 — remove debug overlay from stage.
+    if (this.debugOverlay) {
+      this.debugOverlay.removeFromParent();
+      this.debugOverlay.destroy();
+      this.debugOverlay = null;
+    }
     this.growthFx.dispose();
     // Both overlays live directly on app.stage. PIXI v8 `destroy()` does NOT
     // detach a child from its parent, and PolisRenderer.destroy() does NOT stop

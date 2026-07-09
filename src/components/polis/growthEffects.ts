@@ -206,6 +206,20 @@ export class Disaster implements AnimInstance {
     this.parts.push(part);
   }
 
+  /**
+   * P5.1 — suppress legacy Flame/Smoke rendering when the new crowd-fire
+   * flip-book system (Tier F1) is active. The crowd-fire Sprites on the effects
+   * layer replace the per-frame clear+redraw entirely.
+   */
+  private legacyVisible = true;
+
+  /** Toggle legacy Flame/Smoke visibility. Called by PolisRenderer when crowd
+   *  fires are created/removed for this building. */
+  setLegacyVisible(visible: boolean): void {
+    this.legacyVisible = visible;
+    for (const p of this.parts) p.node.visible = visible;
+  }
+
   /** Drive every composed kit part. Called by the renderer's step clock only for
    *  VISIBLE chunks (and skipped entirely when the LOD pass has hidden `node`),
    *  so the per-frame clear+redraw cost is bounded to on-screen, zoomed-in fires.
@@ -215,6 +229,8 @@ export class Disaster implements AnimInstance {
     // entirely — the kit parts each clear()+refill a Graphics, so this keeps a
     // zoomed-out city's fires from costing anything per step.
     if (!this.node.visible) return;
+    // P5.1 — if legacy rendering is suppressed (crowd fires active), skip.
+    if (!this.legacyVisible) return;
     const parts = this.parts;
     for (let i = 0; i < parts.length; i++) parts[i].update(t, dt);
   }
