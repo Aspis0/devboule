@@ -25,6 +25,7 @@ const viewTitles: Record<string, string> = {
   polis: "Polis",
   oracle: "Oracle",
   design: "Design",
+  skills: "Skills",
   // Re-homed views still resolve a title for any lingering deep-link.
   secrets: "Secrets & API Keys",
   compute: "Infrastructure & Compute",
@@ -34,6 +35,8 @@ const viewTitles: Record<string, string> = {
   workspace: "Workspace",
 
 };
+
+export { viewTitles };
 
 // Jump-search targets after the sidebar was compressed. Includes the re-homed
 // pages as "view#tab" deep-links so search still reaches Secrets, Cloudflare,

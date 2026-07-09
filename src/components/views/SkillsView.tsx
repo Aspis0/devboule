@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { BookOpen } from "lucide-react";
 import { invokeBackendCommand } from "../../context/AppContext";
 import type { FeaturedMarketplace } from "../../types/skills";
 import { GlobalLibraryPanel } from "./GlobalLibraryPanel";
@@ -33,10 +34,18 @@ export function SkillsView() {
 
   return (
     <div data-testid="skills-view" className="flex flex-col gap-4 p-4">
-      <div className="rounded-2xl border border-cream-200 bg-cream-50 px-4 py-3 text-[12px] text-cream-600">
-        Your global skill <strong>Library</strong> and MCP <strong>Tools</strong>, shared across
-        every project. Per-project, per-role skills (and language personas) are managed in the Work
-        Console&apos;s Skills &amp; Tools panel. <em>Skills are manuals; Tools are MCP machines.</em>
+      <div className="mb-6 flex items-center gap-3">
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-amber/10">
+          <BookOpen className="h-4 w-4 text-amber-dark" />
+        </div>
+        <div>
+          <h1 className="text-lg font-semibold text-cream-900">Skills</h1>
+          <p className="text-sm text-cream-500">
+            Your global skill <strong>Library</strong> and MCP <strong>Tools</strong>, shared across
+            every project. Skills are manuals agents read before working; Tools are MCP machines they
+            can call. Per-project skills live in the project&apos;s Work console.
+          </p>
+        </div>
       </div>
 
       <div role="tablist" aria-label="Skills view" className="flex gap-2">

@@ -5,7 +5,7 @@
 // don't point at "providers" (in full or via a "providers#tab" deep link).
 
 import { describe, it, expect } from "vitest";
-import { JUMP_TARGETS } from "./Header";
+import { JUMP_TARGETS, viewTitles } from "./Header";
 
 describe("Header JUMP_TARGETS (S1)", () => {
   it("no jump target references the hidden providers view", () => {
@@ -14,5 +14,11 @@ describe("Header JUMP_TARGETS (S1)", () => {
       expect(entry.target).not.toBe("providers");
       expect(entry.target.startsWith("providers#")).toBe(false);
     }
+  });
+});
+
+describe("Header viewTitles (S6)", () => {
+  it("resolves the Skills view title so the header shows 'Skills'", () => {
+    expect(viewTitles.skills).toBe("Skills");
   });
 });

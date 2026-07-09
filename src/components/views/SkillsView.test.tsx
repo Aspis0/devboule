@@ -77,4 +77,26 @@ describe("SkillsView (global-only shell)", () => {
     });
     expect(document.querySelector("[data-testid='global-library-panel']")).toBeNull();
   });
+
+  it("shows a page header with h1 'Skills' and an explainer subtitle", async () => {
+    await mount();
+    const h1 = Array.from(document.querySelectorAll("h1")).find(
+      (el) => el.textContent?.trim() === "Skills",
+    );
+    expect(h1).toBeTruthy();
+
+    const body = document.body.textContent ?? "";
+    expect(body.toLowerCase()).toContain("library");
+    expect(body.toLowerCase()).toContain("tools");
+
+    // The old duplicate banner text must now appear exactly ONCE (in the subtitle).
+    const needle = "shared across every project";
+    const matches = body.match(new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"));
+    expect(matches).not.toBeNull();
+    expect(matches?.length).toBe(1);
+
+    // Tabs are unchanged.
+    expect(document.querySelector("[data-testid='skills-view-tab-library']")).toBeTruthy();
+    expect(document.querySelector("[data-testid='skills-view-tab-tools']")).toBeTruthy();
+  });
 });
