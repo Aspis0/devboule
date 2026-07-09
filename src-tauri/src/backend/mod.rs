@@ -2,6 +2,7 @@ pub mod agent_notifications;
 pub mod agent_prompt;
 pub mod agent_pty;
 pub mod agent_role;
+pub mod agent_spawn;
 pub mod agentic_loop;
 pub mod agentic_runner;
 pub mod agentic_tools;
