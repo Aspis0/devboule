@@ -62,6 +62,7 @@ pub mod prompt_routing;
 pub mod plan_approval;
 pub mod project_skill;
 pub mod project_git;
+pub mod project_file;
 pub mod projects;
 pub mod roles_config;
 pub mod provider_detect;
