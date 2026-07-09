@@ -379,6 +379,14 @@ export class PolisRenderer {
     // the porter pool out from under the layer.
     tradeRoutes: new Container(),
     shadows: new Container(),
+    // Ambient roaming crowd: BELOW buildings (same occlusion discipline as the
+    // tradeRoutes porters). Crowd walkers live on the road network; in iso a
+    // building sprite only extends UP-screen from its base, so a walker passing
+    // NORTH of (behind) a building is correctly hidden by it, while a walker on
+    // the road south of it never overlaps the sprite. Real, arrow-marked agents
+    // stay on the `agents` layer above buildings so a parked omino at a door is
+    // never swallowed by the facade.
+    crowd: new Container(),
     buildings: new Container(),
     // External cloud services ("harbour / cloud outposts") at the seaward margin.
     // Its OWN layer (above buildings, below agents) so the road/terrain redraws on
@@ -720,11 +728,12 @@ export class PolisRenderer {
       this.callbacks.onSelectAgent?.(agent);
     }, sharedSlotAllocator);
 
-    // Decorative ambient crowd in its own sub-container, added to the agents
-    // layer BEFORE any agent omino so it renders behind the real, arrow-marked
-    // agents. PURE-DATA NOTE: scenery only — never part of city.agents.
+    // Decorative ambient crowd in its own sub-container on the dedicated
+    // `crowd` layer (below buildings — see the layer declaration for the
+    // occlusion rationale). PURE-DATA NOTE: scenery only — never part of
+    // city.agents.
     const ambientContainer = new Container();
-    this.layers.agents.addChild(ambientContainer);
+    this.layers.crowd.addChild(ambientContainer);
     this.ambientLayer = new AmbientLayer(ambientContainer, sharedSlotAllocator);
 
     // Trade-route porters: built directly on their dedicated `tradeRoutes`
