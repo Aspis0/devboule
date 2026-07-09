@@ -451,18 +451,26 @@ function makeShimmer(
   };
 }
 
-/** A raised stone arch bridge deck spanning one river tile (walkable).
- *  Replaces the earlier flat wooden plank: Caesar III stone bridge style with
- *  pier blocks, arch openings, paver deck with camber, parapets, and
- *  end-ramps. All geometry is static (zero per-frame cost) and deterministic.
- *  Orientation + per-side exposed-end flags are inferred once in
- *  buildTerrainFrame and passed in so the function stays self-contained.
+/** A raised stone bridge deck spanning one river tile (walkable).
  *
- *  Axis convention (orientation → geometry mapping):
- *    horizontal: run = screen-x (+48px per tile); perpendicular = screen-y
- *    vertical:   run = iso y (−48,+24 per tile); perpendicular = iso x
- *  Pier faces at tile boundaries use FULL HW/HH (not the deck-inset hw/hh)
- *  so adjacent tiles' piers share the boundary exactly. */
+ *  ISO-CORRECT GEOMETRY (T6d): every horizontal surface is projected from the
+ *  tile's four cart-space corners via cartToIso, exactly like buildings and
+ *  roads — so a bridge run reads correctly at EITHER orientation. (The old
+ *  code mixed screen-axis rectangles with iso directions; since both grid
+ *  axes are diagonal on screen, its stone blocks stuck out at wrong angles.)
+ *  Vertical faces (walls, parapets, posts) drop straight down in screen
+ *  space, which IS correct for vertical surfaces in an iso projection.
+ *
+ *  Corner naming (screen position): A=cartToIso(gx,gy) top, B=(gx+1,gy)
+ *  right, C=(gx+1,gy+1) bottom, D=(gx,gy+1) left. A horizontal run (along
+ *  grid x) connects through edges A–D / B–C and gets parapets on A–B / D–C;
+ *  a vertical run swaps the two pairs. Camera-facing wall faces are B–C
+ *  (south-east) and D–C (south-west). Adjacent bridge tiles share corner
+ *  projections, so multi-tile spans join seamlessly.
+ *
+ *  All geometry is static (zero per-frame cost) and deterministic.
+ *  Orientation + per-side exposed-end flags are inferred once in
+ *  buildTerrainFrame and passed in so the function stays self-contained. */
 function drawBridgeDeck(
   g: Graphics,
   gx: number,
@@ -471,243 +479,140 @@ function drawBridgeDeck(
   endBefore: boolean,
   endAfter: boolean,
 ): void {
-  const LIFT = 7; // px the deck floats above the water surface
-  const DECK_INSET = 0.82; // deck narrower than full tile (parapets on edges)
-  const PIER_INSET = 0.12; // inner pier edge fraction (arch start)
-  const PIER_H = 11; // pier block height (screen px)
-  const PARAPET_H = 3; // parapet wall height above deck
+  const LIFT = 6; // px the deck floats above the water surface
+  const WALL = 9; // wall depth from deck edge down toward the water
+  const PARAPET_H = 3.5; // parapet wall height above the deck
+  const POST_W = 3;
+  const POST_H = 6;
 
-  const c = cartToIso(gx + 0.5, gy + 0.5);
-  const hw = HW * DECK_INSET; // deck half-width (inset from tile edge)
-  const hh = HH * DECK_INSET; // deck half-height (inset from tile edge)
-  const cLift = { x: c.x, y: c.y - LIFT };
-
-  // ------------------------------------------------------------------
-  // Orientation-dependent axis mapping.
-  //
-  // For HORIZONTAL: the bridge run is along screen-x (+48 px per grid step).
-  //   dPerp is applied to screen-y for side walls / parapets.
-  //   Pier faces at tile boundaries sit at c.x ± HW.
-  //
-  // For VERTICAL: the bridge run is along iso y (−48,+24 per grid step).
-  //   dPerp is applied to screen-x for side walls / parapets.
-  //   Pier faces at tile boundaries sit at c.y ± HH.
-  // ------------------------------------------------------------------
   const isH = orientation === "horizontal";
+  const c = cartToIso(gx + 0.5, gy + 0.5);
 
-  // Perpendicular offset for side walls / parapets.
-  const dPerp = isH ? -HW * 0.08 : -HH * 0.08;
+  // Tile corner projections (cart corners -> iso screen points).
+  const A = cartToIso(gx, gy); // top
+  const B = cartToIso(gx + 1, gy); // right
+  const C = cartToIso(gx + 1, gy + 1); // bottom
+  const D = cartToIso(gx, gy + 1); // left
 
-  // Pier face half-width (perpendicular to run, fraction of deck hw/hh).
-  const pHW = 0.88;
+  const lerp = (
+    p: { x: number; y: number },
+    q: { x: number; y: number },
+    t: number,
+  ): { x: number; y: number } => ({
+    x: p.x + (q.x - p.x) * t,
+    y: p.y + (q.y - p.y) * t,
+  });
 
   // ------------------------------------------------------------------
-  // (a) Pier shadow — dark translucent ellipse on the water beneath
+  // (a) Shadow on the water beneath the span.
   // ------------------------------------------------------------------
-  g.ellipse(c.x, c.y + 2, HW * 0.72, HH * 0.72).fill({
+  g.ellipse(c.x, c.y + 2, HW * 0.7, HH * 0.7).fill({
     color: DERIVED.bridgeStoneDark,
     alpha: 0.18,
   });
 
   // ------------------------------------------------------------------
-  // (b) Side walls with arch openings — pier blocks at tile ends + arch
+  // (b) Front walls — the two camera-facing vertical faces, dropping from
+  //     the lifted deck edge down toward the water. Two-tone for depth.
   // ------------------------------------------------------------------
-  // Helper: draw one pier block quad at a position along the run axis
-  // (runOffset) and perpendicular offset (pDepth) from the tile centre.
-  const drawPierBlock = (
-    runOffset: number, // +HW or −HW
-    pDepth: number, // perpendicular offset from tile centre
+  const wallQuad = (
+    p1: { x: number; y: number },
+    p2: { x: number; y: number },
+    color: number,
   ): void => {
-    if (isH) {
-      // Horizontal: run axis = screen-x, perpendicular = screen-y.
-      g.poly([
-        c.x + runOffset - hw * pHW, c.y + pDepth,
-        c.x + runOffset + hw * pHW, c.y + pDepth,
-        c.x + runOffset + hw * pHW, c.y + pDepth - PIER_H,
-        c.x + runOffset - hw * pHW, c.y + pDepth - PIER_H,
-      ]).fill({ color: DERIVED.bridgeStone });
-    } else {
-      // Vertical: run axis = iso y, perpendicular = iso x.
-      g.poly([
-        c.x + pDepth, c.y + runOffset - hh * pHW,
-        c.x + pDepth, c.y + runOffset + hh * pHW,
-        c.x + pDepth, c.y + runOffset + hh * pHW - PIER_H,
-        c.x + pDepth, c.y + runOffset - hh * pHW - PIER_H,
-      ]).fill({ color: DERIVED.bridgeStone });
-    }
-  };
-
-  // Helper: draw arch-opening polygon on one side wall.
-  const drawArch = (
-    pDepth: number,
-    archRatio: number,
-    archCrown: number,
-  ): void => {
-    const archH = PIER_H * archCrown;
-    const innerR = PIER_INSET;
-    const midFrac = innerR + archRatio * 0.12;
-    if (isH) {
-      g.poly([
-        c.x - hw * innerR, c.y - hh * innerR + pDepth,
-        c.x - hw * midFrac, c.y - hh * midFrac + pDepth - archH * 0.5,
-        c.x, c.y + pDepth - archH,
-        c.x + hw * midFrac, c.y + hh * midFrac + pDepth - archH * 0.5,
-        c.x + hw * innerR, c.y + hh * innerR + pDepth,
-      ]).fill({ color: DERIVED.bridgeStoneDark });
-    } else {
-      g.poly([
-        c.x + pDepth, c.y - hh * innerR,
-        c.x + pDepth - archH * 0.5, c.y - hh * midFrac,
-        c.x - archH, c.y,
-        c.x + pDepth - archH * 0.5, c.y + hh * midFrac,
-        c.x + pDepth, c.y + hh * innerR,
-      ]).fill({ color: DERIVED.bridgeStoneDark });
-    }
-  };
-
-  // Draw two side walls (one per perpendicular side).
-  for (const sgn of [-1, 1]) {
-    const pDepth = sgn * dPerp;
-    // Outer pier blocks at both tile ends — positioned at the tile boundary
-    // (c.x ± HW for horizontal, c.y ± HH for vertical) so adjacent tiles'
-    // piers overlap at the shared boundary.
-    const runEnd = isH ? HW : HH;
-    drawPierBlock(-runEnd, pDepth);
-    drawPierBlock(+runEnd, pDepth);
-    // Inner pier blocks (near centre, define arch opening edges).
-    drawPierBlock(-runEnd * PIER_INSET, pDepth);
-    drawPierBlock(+runEnd * PIER_INSET, pDepth);
-    // Arch opening between inner piers.
-    drawArch(pDepth, 0.76, 0.62);
-  }
-
-  // ------------------------------------------------------------------
-  // (c) Deck — paver pattern
-  // ------------------------------------------------------------------
-  const top = [
-    cLift.x,
-    cLift.y - hh,
-    cLift.x + hw,
-    cLift.y,
-    cLift.x,
-    cLift.y + hh,
-    cLift.x - hw,
-    cLift.y,
-  ];
-  g.poly(top).fill({ color: DERIVED.bridgeStone, alpha: 1 });
-  // Paver seam lines across the deck top (parallel to the bridge run).
-  for (let i = 1; i < 4; i++) {
-    const t = i / 4;
-    if (isH) {
-      // Horizontal: seams run along the NE–SW diagonal (parallel to run).
-      const ax = cLift.x - hw + t * hw;
-      const ay = cLift.y + t * hh;
-      const bx = cLift.x + t * hw;
-      const by = cLift.y - hh + t * hh;
-      g.moveTo(ax, ay).lineTo(bx, by);
-    } else {
-      // Vertical: seams run along the NW–SE diagonal (parallel to run).
-      const ax = cLift.x - hw + t * hw;
-      const ay = cLift.y - t * hh;
-      const bx = cLift.x - t * hw;
-      const by = cLift.y + hh - t * hh;
-      g.moveTo(ax, ay).lineTo(bx, by);
-    }
-  }
-  g.stroke({ color: DERIVED.bridgeStoneDark, alpha: 0.45, width: 1 });
-
-  // ------------------------------------------------------------------
-  // (d) Parapets — low walls along both long sides with coping line
-  // ------------------------------------------------------------------
-  const drawParapet = (pDepth: number): void => {
-    const pOuter = 0.96;
-    const pInner = 0.86;
-    const wall = [
-      { x: cLift.x - hw * pOuter, y: cLift.y - hh * pOuter + pDepth },
-      { x: cLift.x + hw * pOuter, y: cLift.y + hh * pOuter + pDepth },
-      { x: cLift.x + hw * pInner, y: cLift.y + hh * pInner + pDepth - PARAPET_H },
-      { x: cLift.x - hw * pInner, y: cLift.y - hh * pInner + pDepth - PARAPET_H },
-    ];
     g.poly([
-      wall[0].x, wall[0].y,
-      wall[1].x, wall[1].y,
-      wall[2].x, wall[2].y,
-      wall[3].x, wall[3].y,
-    ]).fill({ color: DERIVED.bridgeStoneDark });
-    // Lighter coping line on top
-    g.moveTo(wall[3].x, wall[3].y).lineTo(wall[2].x, wall[2].y);
-    g.stroke({ color: DERIVED.bridgeStone, alpha: 0.85, width: 1.2 });
+      p1.x, p1.y - LIFT,
+      p2.x, p2.y - LIFT,
+      p2.x, p2.y - LIFT + WALL,
+      p1.x, p1.y - LIFT + WALL,
+    ]).fill({ color });
   };
-  // Parapet offset matches the side wall perpendicular offset.
-  const pOff = isH ? -HW * 0.1 : -HH * 0.1;
-  drawParapet(pOff);
-  drawParapet(-pOff);
+  wallQuad(B, C, DERIVED.bridgeStone); // south-east face (lit)
+  wallQuad(D, C, DERIVED.bridgeStoneDark); // south-west face (shaded)
+
+  // Arch opening: a dark half-ellipse on the camera-facing face that is
+  // PARALLEL to the run (the water passes under it). Horizontal run ->
+  // D-C face; vertical run -> B-C face. The ellipse is centred on the
+  // wall's bottom edge so its visible upper half reads as the opening
+  // and the lower half blends into the water as a soft reflection.
+  const archEdge: [typeof A, typeof A] = isH ? [D, C] : [B, C];
+  const archMid = lerp(archEdge[0], archEdge[1], 0.5);
+  const archHalfLen =
+    Math.hypot(archEdge[1].x - archEdge[0].x, archEdge[1].y - archEdge[0].y) *
+    0.26;
+  g.ellipse(archMid.x, archMid.y - LIFT + WALL, archHalfLen, WALL * 0.72).fill({
+    color: DERIVED.waterDeep,
+    alpha: 0.85,
+  });
 
   // ------------------------------------------------------------------
-  // (e) End tiles: short ramp skirt + two small stone end-posts
-  //     Only drawn on the EXPOSED side(s) (no live neighbour).
+  // (c) Deck — the lifted tile diamond with paver seams along the run.
   // ------------------------------------------------------------------
-  const rampOff = 0.14; // how far past the tile edge the ramp extends
-  const postW = 3;
-  const postH = 6;
-  const postAlongFrac = 0.6; // end-post span along the perpendicular
+  g.poly([
+    A.x, A.y - LIFT,
+    B.x, B.y - LIFT,
+    C.x, C.y - LIFT,
+    D.x, D.y - LIFT,
+  ]).fill({ color: DERIVED.bridgeStone, alpha: 1 });
+  // Camber highlight: a lighter band along the middle of the run.
+  const bandLo = 0.32;
+  const bandHi = 0.68;
+  const bandCorners = isH
+    ? [lerp(A, D, bandLo), lerp(B, C, bandLo), lerp(B, C, bandHi), lerp(A, D, bandHi)]
+    : [lerp(A, B, bandLo), lerp(D, C, bandLo), lerp(D, C, bandHi), lerp(A, B, bandHi)];
+  g.poly([
+    bandCorners[0].x, bandCorners[0].y - LIFT,
+    bandCorners[1].x, bandCorners[1].y - LIFT,
+    bandCorners[2].x, bandCorners[2].y - LIFT,
+    bandCorners[3].x, bandCorners[3].y - LIFT,
+  ]).fill({ color: DERIVED.bridgeStoneLight, alpha: 0.35 });
+  // Paver seams parallel to the run: from the "before" open edge to the
+  // "after" open edge at fixed perpendicular fractions.
+  for (const t of [0.25, 0.5, 0.75]) {
+    const s = isH ? lerp(A, D, t) : lerp(A, B, t);
+    const e = isH ? lerp(B, C, t) : lerp(D, C, t);
+    g.moveTo(s.x, s.y - LIFT).lineTo(e.x, e.y - LIFT);
+  }
+  g.stroke({ color: DERIVED.bridgeStoneDark, alpha: 0.4, width: 1 });
 
-  const drawEndTile = (side: "before" | "after"): void => {
-    if (isH) {
-      const sign = side === "before" ? -1 : 1;
-      // Ramp: two triangle halves extending beyond the tile boundary along run.
-      const runFrac = sign * (1 + rampOff);
-      const rampA = [
-        cLift.x + hw * runFrac, cLift.y + hh * runFrac,
-        cLift.x, cLift.y + hh,
-        cLift.x + hw * sign, cLift.y,
-      ];
-      const rampB = [
-        cLift.x + hw * runFrac, cLift.y - hh * runFrac,
-        cLift.x, cLift.y - hh,
-        cLift.x + hw * sign, cLift.y,
-      ];
-      g.poly(rampA).fill({ color: DERIVED.bridgeStone, alpha: 0.7 });
-      g.poly(rampB).fill({ color: DERIVED.bridgeStone, alpha: 0.7 });
-      // End-posts: two stone pillars flanking the entrance on the deck surface.
-      const postX = cLift.x + hw * sign * 0.92;
-      const postY0 = cLift.y - hh * postAlongFrac;
-      const postY1 = cLift.y + hh * postAlongFrac;
-      g.rect(postX - postW / 2, postY0 - postH, postW, postH).fill({
+  // ------------------------------------------------------------------
+  // (d) Parapets — low raised walls on the two edges parallel to the run.
+  // ------------------------------------------------------------------
+  const parapetEdges: Array<[typeof A, typeof A]> = isH
+    ? [[A, B], [D, C]]
+    : [[A, D], [B, C]];
+  for (const [p1, p2] of parapetEdges) {
+    g.poly([
+      p1.x, p1.y - LIFT,
+      p2.x, p2.y - LIFT,
+      p2.x, p2.y - LIFT - PARAPET_H,
+      p1.x, p1.y - LIFT - PARAPET_H,
+    ]).fill({ color: DERIVED.bridgeStoneDark });
+    // Lighter coping line on top of the parapet.
+    g.moveTo(p1.x, p1.y - LIFT - PARAPET_H).lineTo(p2.x, p2.y - LIFT - PARAPET_H);
+    g.stroke({ color: DERIVED.bridgeStone, alpha: 0.85, width: 1.2 });
+  }
+
+  // ------------------------------------------------------------------
+  // (e) End posts — two small stone pillars flanking each EXPOSED end
+  //     (no live bridge neighbour on that side).
+  // ------------------------------------------------------------------
+  const drawEndPosts = (edge: [typeof A, typeof A]): void => {
+    for (const t of [0.12, 0.88]) {
+      const p = lerp(edge[0], edge[1], t);
+      g.rect(p.x - POST_W / 2, p.y - LIFT - POST_H, POST_W, POST_H).fill({
         color: DERIVED.bridgeStoneDark,
       });
-      g.rect(postX - postW / 2, postY1 - postH, postW, postH).fill({
-        color: DERIVED.bridgeStoneDark,
-      });
-    } else {
-      const sign = side === "before" ? -1 : 1;
-      // Ramp: two triangle halves extending beyond the tile boundary.
-      const runFrac = sign * (1 + rampOff);
-      const rampA = [
-        cLift.x - hw * runFrac, cLift.y + hh * runFrac,
-        cLift.x - hw, cLift.y,
-        cLift.x, cLift.y + hh * sign,
-      ];
-      const rampB = [
-        cLift.x + hw * runFrac, cLift.y + hh * runFrac,
-        cLift.x + hw, cLift.y,
-        cLift.x, cLift.y + hh * sign,
-      ];
-      g.poly(rampA).fill({ color: DERIVED.bridgeStone, alpha: 0.7 });
-      g.poly(rampB).fill({ color: DERIVED.bridgeStone, alpha: 0.7 });
-      // End-posts: flanking the entrance on the deck surface.
-      const postX0 = cLift.x - hw * postAlongFrac;
-      const postX1 = cLift.x + hw * postAlongFrac;
-      const postY = cLift.y + hh * sign * 0.92;
-      g.rect(postX0 - postW / 2, postY - postH, postW, postH).fill({
-        color: DERIVED.bridgeStoneDark,
-      });
-      g.rect(postX1 - postW / 2, postY - postH, postW, postH).fill({
-        color: DERIVED.bridgeStoneDark,
+      // Lit cap on the post.
+      g.rect(p.x - POST_W / 2, p.y - LIFT - POST_H, POST_W, 1.4).fill({
+        color: DERIVED.bridgeStoneLight,
+        alpha: 0.9,
       });
     }
   };
-
-  if (endBefore) drawEndTile("before");
-  if (endAfter) drawEndTile("after");
+  // "before" = negative-neighbour edge along the run; "after" = positive.
+  const beforeEdge: [typeof A, typeof A] = isH ? [A, D] : [A, B];
+  const afterEdge: [typeof A, typeof A] = isH ? [B, C] : [D, C];
+  if (endBefore) drawEndPosts(beforeEdge);
+  if (endAfter) drawEndPosts(afterEdge);
 }

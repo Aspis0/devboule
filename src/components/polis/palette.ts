@@ -130,6 +130,7 @@ export const DERIVED = {
   // bridge reads as weathered limestone against the blue water.
   bridgeStone: saturate(lighten(PALETTE.stone, 0.08), 0.06),
   bridgeStoneDark: saturate(darken(PALETTE.stoneDark, 0.12), 0.08),
+  bridgeStoneLight: saturate(lighten(PALETTE.stone, 0.2), 0.05),
 
   // Smoke / fire (square retro particles + flame shapes).
   smoke: lighten(PALETTE.stoneDark, 0.28),
