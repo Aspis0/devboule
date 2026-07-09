@@ -17,25 +17,30 @@
 // assets land — loadPolisSprites returns null and every draw path stays on the
 // procedural kit.
 
-/** Per-sprite metadata carried alongside the atlas frame reference. */
+/**
+ * Per-sprite metadata carried alongside the atlas frame reference. Deliberately
+ * deep-readonly: entries are shared by reference between the manifest and every
+ * SpriteBank, so a writable field here would let one consumer silently corrupt
+ * the anchor/footprint of every building using the same key.
+ */
 export interface SpriteEntryMeta {
   /** Frame name inside the owning atlas spritesheet. */
-  frame: string;
+  readonly frame: string;
   /** Id of the atlas page (key into SpriteManifest.atlases) holding the frame. */
-  atlas: string;
+  readonly atlas: string;
   /** Building footprint in tiles [W, D] — building sprites only. */
-  foot?: [number, number];
+  readonly foot?: readonly [number, number];
   /**
    * Anchor in normalized texture coords. Default [0.5, 1]: bottom-center, so a
    * sprite placed at the footprint's front-corner iso point sits on the ground
    * like the kit containers do.
    */
-  anchor?: [number, number];
+  readonly anchor?: readonly [number, number];
   /**
    * True when the source art bakes its own ground shadow — the renderer must
    * then skip our contact-shadow sprite for this variant or shadows double up.
    */
-  hasBakedShadow?: boolean;
+  readonly hasBakedShadow?: boolean;
 }
 
 export interface SpriteManifest {

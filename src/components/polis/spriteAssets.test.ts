@@ -9,6 +9,7 @@ import { Texture } from "pixi.js";
 import {
   DEFAULT_SPRITE_ANCHOR,
   loadPolisSprites,
+  sheetTextures,
   spritesDisabled,
   type AtlasLoader,
 } from "./spriteAssets";
@@ -137,10 +138,51 @@ describe("loadPolisSprites — fallback contract", () => {
       const bank = await loadPolisSprites({ loader: okLoader, manifest: m });
       expect(bank!.has("prop:olive:v0")).toBe(true);
       expect(bank!.has("prop:olive:v1")).toBe(false);
-      expect(warn).toHaveBeenCalledTimes(1);
+      // one warn for the missing frame + one for the resulting family hole
+      const missingFrameWarns = warn.mock.calls.filter((c) =>
+        String(c[0]).includes("missing frame"),
+      );
+      expect(missingFrameWarns).toHaveLength(1);
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("warns (once per id) on entries referencing an unknown atlas id, keeps the rest", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const m = manifest(
+        { a: "/polis/atlas/a.json" },
+        {
+          "prop:olive:v0": { frame: "olive0", atlas: "a" },
+          "tex:grass": { frame: "grass", atlas: "TYPO" },
+          "tex:cobble": { frame: "cobble", atlas: "TYPO" },
+        },
+      );
+      const bank = await loadPolisSprites({ loader: okLoader, manifest: m });
+      expect(bank!.has("prop:olive:v0")).toBe(true);
+      expect(bank!.has("tex:grass")).toBe(false);
+      const unknownWarns = warn.mock.calls.filter((c) =>
+        String(c[0]).includes("unknown atlas id 'TYPO'"),
+      );
+      expect(unknownWarns).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("sheetTextures — Assets.load result validation", () => {
+  it("throws (⇒ per-atlas fallback upstream) when the url resolved to plain JSON", () => {
+    expect(() => sheetTextures({ frames: {}, meta: {} }, "/x.json")).toThrow(/spritesheet/);
+    expect(() => sheetTextures(null, "/x.json")).toThrow(/spritesheet/);
+    expect(() => sheetTextures(undefined, "/x.json")).toThrow(/spritesheet/);
+    expect(() => sheetTextures({ textures: 42 }, "/x.json")).toThrow(/spritesheet/);
+  });
+
+  it("extracts the frame map from a Spritesheet-shaped value", () => {
+    const textures = { house0: tex() };
+    expect(sheetTextures({ textures }, "/x.json")).toBe(textures);
   });
 });
 
@@ -153,25 +195,36 @@ describe("SpriteBank — variants & metadata", () => {
     return b!;
   }
 
-  it("counts contiguous variants and stops at the first hole", async () => {
+  it("counts resolved variants per family", async () => {
     const b = await bank();
     expect(b.variantCount("prop:olive")).toBe(3);
     expect(b.variantCount("tex:grass")).toBe(0); // not a variant family
     expect(b.variantCount("prop:missing")).toBe(0);
   });
 
-  it("holes cap the pick range so picks never land on missing variants", async () => {
-    const m = manifest(
-      { a: "/polis/atlas/a.json" },
-      {
-        "prop:olive:v0": { frame: "olive0", atlas: "a" },
-        // v1 intentionally absent
-        "prop:olive:v2": { frame: "olive2", atlas: "a" },
-      },
-    );
-    const b = (await loadPolisSprites({ loader: okLoader, manifest: m }))!;
-    expect(b.variantCount("prop:olive")).toBe(1);
-    expect(b.pickVariant("prop:olive", "any-seed")).toBe("prop:olive:v0");
+  it("families with holes stay fully reachable (picks from the resolved set) and warn once", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const m = manifest(
+        { a: "/polis/atlas/a.json" },
+        {
+          "prop:olive:v0": { frame: "olive0", atlas: "a" },
+          // v1 intentionally absent
+          "prop:olive:v2": { frame: "olive2", atlas: "a" },
+        },
+      );
+      const b = (await loadPolisSprites({ loader: okLoader, manifest: m }))!;
+      expect(b.variantCount("prop:olive")).toBe(2);
+      const picked = new Set(
+        Array.from({ length: 64 }, (_, i) => b.pickVariant("prop:olive", `f${i}`)),
+      );
+      // both loaded variants reachable, the missing one never picked
+      expect(picked).toEqual(new Set(["prop:olive:v0", "prop:olive:v2"]));
+      const holeWarns = warn.mock.calls.filter((c) => String(c[0]).includes("has holes"));
+      expect(holeWarns).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("pickVariant is deterministic per seed and spreads across variants", async () => {
