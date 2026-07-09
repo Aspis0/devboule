@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "comment": "Per-asset provenance ledger for Polis sprite art (plan: docs/polis-sprite-art-plan-2026-07.md). RULE: no asset is committed to public/polis/ or tools/polis-art/ without an entry here; tools/polis-art/manifest.py (A2) cross-checks this file against the packed atlases and CREDITS.md. Fields per asset: id (semantic key or raw-file path), source (pack name), url (license/source page), author, license (SPDX-ish: CC0-1.0 | CC-BY-3.0 | CC-BY-SA-3.0 | CC-BY-ND-4.0 | Reiner-custom), modified (bool — true triggers share-alike republication note for CC-BY-SA), lightDirection (NW | neutral | other), notes.",
+  "assets": []
+}
