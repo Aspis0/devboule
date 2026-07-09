@@ -25,7 +25,7 @@
 // `Bridge`. Built ONCE per terrain frame from the sparse wire payload (water +
 // bridge tile lists), then a polyline is checked in O(waypoints).
 
-import type { TerrainData } from "../../types/city";
+import type { Building, TerrainData } from "../../types/city";
 
 /**
  * Round a cartesian coordinate to its tile index, matching the BACKEND exactly.
@@ -77,6 +77,62 @@ export function makeWaterBlocker(
     if (!bridges.has(k)) blocked.add(k);
   }
   return (gx, gy) => blocked.has(tileKey(roundTile(gx), roundTile(gy)));
+}
+
+/**
+ * Extract building FOOTPRINT tiles (one tile per building coordinate, NO
+ * neighbourhood padding). Walkers may hug walls; the 4-neighbourhood expansion
+ * that props need stays local in `occupiedTiles`.
+ *
+ * Exported so `makeBuildingBlocker` and `props.ts` share one source of truth.
+ */
+export function buildingFootprintTiles(
+  coords: { x: number; y: number }[],
+): Set<number> {
+  const set = new Set<number>();
+  for (const c of coords) {
+    set.add(tileKey(roundTile(c.x), roundTile(c.y)));
+  }
+  return set;
+}
+
+/**
+ * Precomputed predicate: `blocked(gx, gy)` is true for a building FOOTPRINT
+ * tile only (no neighbourhood padding — walkers may hug walls). The caller
+ * passes `buildings[].coords` from the city data.
+ *
+ * Built ONCE per city load from the building list. The closure captures a
+ * prebuilt `Set<number>` of tile keys, so calls are O(1) Set lookups.
+ */
+export function makeBuildingBlocker(
+  buildings: readonly Building[] | undefined,
+): (gx: number, gy: number) => boolean {
+  if (!buildings || buildings.length === 0) return () => false;
+  const coords = buildings.filter((b) => b.coords).map((b) => b.coords!);
+  if (coords.length === 0) return () => false;
+  const footprints = buildingFootprintTiles(coords);
+  return (gx, gy) => footprints.has(tileKey(roundTile(gx), roundTile(gy)));
+}
+
+/**
+ * OR-composition of multiple blocked predicates. Returns a single predicate
+ * that is true when ANY of the source blockers is true.
+ *
+ * Built ONCE per city load (typically water + building blockers). The returned
+ * closure captures the array, so a call evaluates each blocker in order and
+ * short-circuits on the first `true`.
+ */
+export function combineBlockers(
+  ...blockers: ((gx: number, gy: number) => boolean)[]
+): (gx: number, gy: number) => boolean {
+  if (blockers.length === 0) return () => false;
+  if (blockers.length === 1) return blockers[0];
+  return (gx, gy) => {
+    for (const b of blockers) {
+      if (b(gx, gy)) return true;
+    }
+    return false;
+  };
 }
 
 /**

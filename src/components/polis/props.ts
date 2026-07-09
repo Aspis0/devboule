@@ -19,6 +19,7 @@
 import { Graphics } from "pixi.js";
 import { cartToIso } from "./iso";
 import { roundTile } from "./navWalkable";
+import { buildingFootprintTiles } from "./navWalkable";
 import { DERIVED } from "./palette";
 import { rngFromCoords, type Rng } from "./rng";
 import type { TerrainExtent } from "./terrain";
@@ -34,12 +35,11 @@ const P_STALL = 0.02;
 /** Build the set of occupied tile keys ("tx,ty") from building coords. */
 export function occupiedTiles(coords: { x: number; y: number }[]): Set<string> {
   const set = new Set<string>();
-  for (const c of coords) {
-    // Round-half-away-from-zero to match the backend footprint tiling exactly
-    // (Rust `f64::round`), so prop-avoidance agrees with the real footprint tiles
-    // even at negative half-coordinates (see `roundTile`).
-    const tx = roundTile(c.x);
-    const ty = roundTile(c.y);
+  const footprints = buildingFootprintTiles(coords);
+  for (const key of footprints) {
+    // Unpack tileKey → (tx, ty) for the 4-neighbourhood expansion.
+    const tx = (key >>> 16) - 0x8000;
+    const ty = (key & 0xFFFF) - 0x8000;
     // Claim the tile and its 4-neighborhood so props don't crowd footprints.
     set.add(`${tx},${ty}`);
     set.add(`${tx + 1},${ty}`);

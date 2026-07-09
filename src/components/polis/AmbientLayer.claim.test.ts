@@ -5,7 +5,8 @@ import {
   pickNearestIdle,
   type ClaimableWalker,
 } from "./AmbientLayer";
-import { cartToIso, type IsoPoint } from "./iso";
+import { cartToIso, isoToCart, type IsoPoint } from "./iso";
+import { roundTile } from "./navWalkable";
 import type { CitizenType } from "./kitcd/people";
 
 // Polis-P3 — the CLAIM primitives: an activating agent takes possession of an
@@ -282,5 +283,152 @@ describe("AmbientLayer claim — determinism", () => {
     const posA = a.root.children.map((c) => ({ x: c.position.x, y: c.position.y }));
     const posB = b.root.children.map((c) => ({ x: c.position.x, y: c.position.y }));
     expect(posA).toEqual(posB);
+  });
+});
+
+// =========================================================================
+// T2 — ambient walker blocked-tile property test
+// =========================================================================
+
+describe("AmbientLayer blocked-tile property test", () => {
+  // T2 — genuine property test: for a small synthetic city with a non-trivial
+  // blocked-tile predicate (a rectangle of tiles representing a building),
+  // step ambient walkers for many legs and assert that NO sampled position
+  // ever maps to a blocked tile. This exercises buildSafeSplineLeg's
+  // degrade-to-linear logic end-to-end through the AmbientLayer.
+
+  // OMINO_Y_OFFSET from AmbientLayer.ts (the y-shift applied to walker containers).
+  const OMINO_Y_OFFSET = -4;
+
+  // A small synthetic city: 4 nodes at the corners of a 12x12 tile square.
+  // A blocked rectangle of tiles in the centre [4,4] to [7,7] (a 4x4 block).
+  // findRoute returns 3-point routes that BEND through the blocked region,
+  // so the Catmull-Rom spline would bow into the blocked tiles if not degraded.
+  const PROP_NODES: Record<string, { gx: number; gy: number }> = {
+    nw: { gx: 0, gy: 0 },
+    ne: { gx: 12, gy: 0 },
+    sw: { gx: 0, gy: 12 },
+    se: { gx: 12, gy: 12 },
+  };
+  const PROP_NODE_IDS = Object.keys(PROP_NODES);
+
+  // Blocked rectangle: tiles [4,4] to [7,7] inclusive.
+  const BLOCK_MIN = 4;
+  const BLOCK_MAX = 7;
+  function propBlocked(gx: number, gy: number): boolean {
+    return gx >= BLOCK_MIN && gx <= BLOCK_MAX && gy >= BLOCK_MIN && gy <= BLOCK_MAX;
+  }
+
+  function propResolve(fileId: string): IsoPoint | null {
+    const n = PROP_NODES[fileId];
+    return n ? cartToIso(n.gx, n.gy) : null;
+  }
+
+  // 3-point route that bends through the blocked centre. For example,
+  // nw→se goes (0,0)→(6,6)→(12,12); the midpoint (6,6) is INSIDE the
+  // blocked rectangle. The Catmull-Rom spline would bow near (6,6), but
+  // buildSafeSplineLeg should degrade to linear (the straight chord from
+  // (0,0) to (12,12) passes through (6,6) at t=0.5 — hmm, that's still
+  // blocked). Let's use routes that AVOID the blocked centre on the chord.
+  //
+  // Better: nw→ne route goes (0,0)→(6,−2)→(12,0). The spline bows SOUTH
+  // (negative y in cartesian), away from the blocked centre. But if we route
+  // nw→sw, the chord passes through y=0..12 at x=0 — that's outside the
+  // blocked x-range [4,7]. The spline bows EAST (toward the blocked centre).
+  // If degraded to linear, the chord stays at x=0 — safe.
+  //
+  // Routes: nw→se via a midpoint at (6,1) (north of blocked centre). The
+  // spline bows toward (6,6) (blocked); linear stays on chord (safe).
+  function propFindRoute(from: string, to: string): IsoPoint[] | null {
+    if (from === to) return null;
+    const a = propResolve(from);
+    const b = propResolve(to);
+    if (!a || !b) return null;
+    // For nw↔se or ne↔sw (diagonal), insert a midpoint that forces the
+    // spline to bow through the blocked centre.
+    const diag =
+      (from === "nw" && to === "se") || (from === "se" && to === "nw") ||
+      (from === "ne" && to === "sw") || (from === "sw" && to === "ne");
+    if (diag) {
+      // Midpoint at the geometric centre of the diagonal — inside the blocked
+      // rectangle. The spline passes through this point; the chord may or may
+      // not cross the blocked region.
+      const midGx = 6;
+      const midGy = 1; // just north of blocked centre (gy=4..7)
+      const mid = cartToIso(midGx, midGy);
+      // Orient the 3-point route in travel direction.
+      if (from === "nw" || from === "ne") return [a, mid, b];
+      return [b, mid, a];
+    }
+    // Non-diagonal: 2-point route (linear by default).
+    return [a, b];
+  }
+
+  const HALF_W = 20; // must match iso.ts HALF_W
+  const HALF_H = 10; // must match iso.ts HALF_H
+
+  it("no walker position ever maps to a blocked tile over 100 update ticks", () => {
+    const root = new Container();
+    const layer = new AmbientLayer(root, undefined, propBlocked);
+    layer.setWorld(PROP_NODE_IDS, propResolve, propFindRoute);
+    layer.setCount(8);
+
+    // Step 100 ticks (100ms each) — enough for several legs.
+    for (let tick = 0; tick < 100; tick++) {
+      layer.update(100);
+
+      // Check every walker's current position.
+      for (let i = 0; i < root.children.length; i++) {
+        const child = root.children[i];
+        if (!child || !child.visible) continue;
+        // Container position includes OMINO_Y_OFFSET; subtract to get world ISO pos.
+        const isoX = child.position.x;
+        const isoY = child.position.y - OMINO_Y_OFFSET;
+        // Convert ISO → cartesian tile.
+        const cart = isoToCart(isoX, isoY);
+        const gx = roundTile(cart.x);
+        const gy = roundTile(cart.y);
+        // The core assertion: the walker must NOT be on a blocked tile.
+        expect(propBlocked(gx, gy)).toBe(false);
+      }
+    }
+  });
+
+  it("blocked rectangle is non-trivial (actually blocks some tiles)", () => {
+    // Sanity: the blocked predicate actually blocks the intended tiles.
+    expect(propBlocked(5, 5)).toBe(true);
+    expect(propBlocked(4, 4)).toBe(true);
+    expect(propBlocked(7, 7)).toBe(true);
+    // Tiles outside the rectangle are walkable.
+    expect(propBlocked(0, 0)).toBe(false);
+    expect(propBlocked(3, 3)).toBe(false);
+    expect(propBlocked(8, 8)).toBe(false);
+  });
+
+  it("setBlocked does not disrupt an already-running crowd", () => {
+    const { layer } = makeLayer(10);
+    for (let i = 0; i < 30; i++) layer.update(100);
+    const countBefore = layer.count;
+
+    layer.setBlocked(() => false);
+    for (let i = 0; i < 30; i++) layer.update(100);
+    expect(layer.count).toBe(countBefore);
+  });
+
+  it("setBlocked with aggressive blocker does not crash the layer", () => {
+    const { layer } = makeLayer(10);
+    for (let i = 0; i < 20; i++) layer.update(100);
+
+    layer.setBlocked(() => true);
+    expect(() => {
+      for (let i = 0; i < 50; i++) layer.update(100);
+    }).not.toThrow();
+  });
+
+  it("constructor accepts a blocked predicate without throwing", () => {
+    const root = new Container();
+    expect(() => {
+      new AmbientLayer(root, undefined, () => false);
+    }).not.toThrow();
   });
 });

@@ -73,7 +73,7 @@ import {
 import { TradeRouteLayer, TRADE_LOD_ZOOM } from "./TradeRouteLayer";
 import { ExternalServiceLayer } from "./ExternalServiceLayer";
 import { RoadGraph } from "./roadGraph";
-import { makeWaterBlocker } from "./navWalkable";
+import { makeWaterBlocker, makeBuildingBlocker, combineBlockers } from "./navWalkable";
 import {
   computeExtent,
   drawTerrain,
@@ -464,6 +464,10 @@ export class PolisRenderer {
   // walkable route only when they actually change building. Null until the first
   // city is set or when there are no roads.
   private roadGraph: RoadGraph | null = null;
+  // T2 — walk blocker: true on tiles walkers must never stand on (water/buildings).
+  // Built once per city load (where RoadGraph is constructed) and passed to
+  // AgentLayer and AmbientLayer. No per-frame construction.
+  private blocked: (gx: number, gy: number) => boolean = () => false;
   // Stable signature of the roads the current `roadGraph` was built from. A live
   // diff compares the incoming roads' signature to this; only when it DIFFERS do
   // we rebuild `roadGraph` + the road-dependent ambient crowd. A pure
@@ -919,6 +923,14 @@ export class PolisRenderer {
     // Record the road signature so the FIRST live diff after this build can tell
     // whether roads actually changed (FIX 3) instead of always rebuilding.
     this.roadGraph = new RoadGraph(city.roads, makeWaterBlocker(city.terrain));
+    // T2 — build the combined walk blocker (water + building footprints) once.
+    this.blocked = combineBlockers(
+      makeWaterBlocker(city.terrain),
+      makeBuildingBlocker(city.buildings),
+    );
+    // T2 — propagate the blocker to the walker layers.
+    this.agentLayer.setBlocked(this.blocked);
+    this.ambientLayer.setBlocked(this.blocked);
     this.debugLog("prelude: roadGraph built");
     this.lastRoadSig = PolisRenderer.roadSignature(city.roads);
     // Record the terrain signature (just drawn above) so the first live diff can
@@ -1478,7 +1490,25 @@ export class PolisRenderer {
     const graphRebuilt = roadsChanged || terrainChanged;
     if (graphRebuilt) {
       this.roadGraph = new RoadGraph(next.roads, makeWaterBlocker(next.terrain));
+      // T2 — rebuild the combined walk blocker when the graph is rebuilt.
+      this.blocked = combineBlockers(
+        makeWaterBlocker(next.terrain),
+        makeBuildingBlocker(next.buildings),
+      );
+      this.agentLayer.setBlocked(this.blocked);
+      this.ambientLayer.setBlocked(this.blocked);
       this.lastRoadSig = roadSig;
+    } else if (addedOrRemoved) {
+      // T2 FIX: buildings changed without road/terrain change — rebuild the
+      // building blocker only (the water blocker is still valid from the last
+      // graph rebuild). Without this, newly-added buildings wouldn't be blocked
+      // and demolished buildings would remain blocked.
+      this.blocked = combineBlockers(
+        makeWaterBlocker(next.terrain),
+        makeBuildingBlocker(next.buildings),
+      );
+      this.agentLayer.setBlocked(this.blocked);
+      this.ambientLayer.setBlocked(this.blocked);
     }
 
     // 4) Districts — cheap; rebuild so renamed/moved districts stay correct.

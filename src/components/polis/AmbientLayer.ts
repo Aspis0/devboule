@@ -23,9 +23,10 @@
 // actually picks a new destination, never per frame.
 
 import { Container, Graphics, Rectangle } from "pixi.js";
-import { type IsoPoint } from "./iso";
+import { type IsoPoint, isoToCart } from "./iso";
 import { Rng, rngFromString, hashString } from "./rng";
-import { SlotAllocator, buildSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint } from "./locomotion";
+import { SlotAllocator, buildSafeSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint, type SafeSplineLeg } from "./locomotion";
+import { roundTile } from "./navWalkable";
 import {
   drawCitizen,
   defaultTunic,
@@ -217,6 +218,9 @@ export class AmbientLayer {
   // AgentLayer, never both — the claimedCount tracks how many we've handed away.
   // P5.2 — shared per-building entry-slot allocator (presentation, NOT CityState).
   private slotAllocator: SlotAllocator;
+  // T2 — walk blocker: true on tiles walkers must never stand on (water/buildings).
+  // Built once in the renderer's world-setup and passed here. Identity-stable.
+  private blocked: (gx: number, gy: number) => boolean;
   private claimedCount = 0;
   // Monotonic counter feeding a DETERMINISTIC seed for each `adopt`ed walker, so a
   // re-inserted omino roams reproducibly without Math.random/Date.now. Combined
@@ -237,9 +241,10 @@ export class AmbientLayer {
   // prefer. A subset of `nodeIds`; empty when the city has none. Scenery only.
   private forumNodeIds: string[] = [];
 
-  constructor(root: Container, slotAllocator?: SlotAllocator) {
+  constructor(root: Container, slotAllocator?: SlotAllocator, blocked?: (gx: number, gy: number) => boolean) {
     this.root = root;
     this.slotAllocator = slotAllocator ?? new SlotAllocator();
+    this.blocked = blocked ?? (() => false);
   }
 
   /**
@@ -331,6 +336,11 @@ export class AmbientLayer {
       if (w) this.walkers.push(w);
       else break; // could not find any resolvable node — stop trying
     }
+  }
+
+  /** T2 — Update the walk blocker predicate (called once per city load). */
+  setBlocked(blocked: (gx: number, gy: number) => boolean): void {
+    this.blocked = blocked;
   }
 
   setLodVisible(visible: boolean): void {
@@ -662,7 +672,13 @@ export class AmbientLayer {
       const secondLast = route[Math.max(0, route.length - 2)];
       const dir = { x: end.x - secondLast.x, y: end.y - secondLast.y };
       const slotPos = this.slotAllocator.positionFor(slotIdx, end, dir);
-      w.pos = { x: slotPos.x, y: slotPos.y };
+      // T2 — validate slot position: convert ISO→cartesian before querying blocker.
+      const slotCart = isoToCart(slotPos.x, slotPos.y);
+      if (this.blocked(roundTile(slotCart.x), roundTile(slotCart.y))) {
+        w.pos = { x: end.x, y: end.y };
+      } else {
+        w.pos = { x: slotPos.x, y: slotPos.y };
+      }
       w.nodeId = m.toNode;
       w.state = { kind: "idle", remainingMs: this.pauseMs(w) };
       this.applyTransform(w);
@@ -670,27 +686,28 @@ export class AmbientLayer {
     }
 
     // Mid-route: Catmull-Rom spline + lane offset.
-    // P5.2 — W3: chord-vs-curve speed accepted simplification (constant speed
-    // along the chord, minor variation through spline bends tolerated).
+    // T2 — use buildSafeSplineLeg to validate the spline against blocked tiles
+    // and clamp the lane offset if the road hugs a shore.
     const a = route[m.seg];
     const b = route[m.seg + 1];
-    // M2: cache spline sampler per leg; rebuild only on seg change.
+    // M2: cache the safe spline result per leg; rebuild only on seg change.
     const splineKey = m.seg;
-    const cached = (m as any)._spline as { key: number; fn: (t: number) => IPoint } | undefined;
-    let spline: (t: number) => IPoint;
+    const cached = (m as any)._spline as { key: number; result: SafeSplineLeg } | undefined;
+    let safe: SafeSplineLeg;
     if (cached && cached.key === splineKey) {
-      spline = cached.fn;
+      safe = cached.result;
     } else {
-      spline = buildSplineLeg(route, m.seg);
-      (m as any)._spline = { key: splineKey, fn: spline };
+      safe = buildSafeSplineLeg(route as IPoint[], m.seg, this.blocked);
+      (m as any)._spline = { key: splineKey, result: safe };
     }
-    const raw = spline(m.t);
+    const raw = safe.sample(m.t);
     const dx = b.x - a.x;
     const dy = b.y - a.y;
-    const off = applyPerpendicularOffset(
-      raw, dx, dy,
-      directedLaneOffset(w.wid, dx, dy),
-    );
+    // T2 — if the lane offset is clamped for this leg, use 0.
+    const laneOff = safe.laneOffsetClamped
+      ? 0
+      : directedLaneOffset(w.wid, dx, dy);
+    const off = applyPerpendicularOffset(raw, dx, dy, laneOff);
     w.pos = { x: off.x, y: off.y };
     this.faceTowards(w, a, b);
     this.applyTransform(w);

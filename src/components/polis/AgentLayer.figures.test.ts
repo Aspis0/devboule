@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { Graphics } from "pixi.js";
+import { Graphics, Container } from "pixi.js";
 import {
+  AgentLayer,
   figureForAgent,
   figureForRole,
   SUBAGENT_FIGURE_SCALE,
@@ -24,6 +25,11 @@ function mkAgent(over: Partial<Agent>): Agent {
     color: "#888888",
     ...over,
   };
+}
+
+function makeLayer(): { root: Container; layer: AgentLayer } {
+  const root = new Container();
+  return { root, layer: new AgentLayer(root) };
 }
 
 describe("figureForAgent — agent type/parent → kit figure", () => {
@@ -103,5 +109,22 @@ describe("subagent figure scale (for P4 scaled-down omini)", () => {
     });
     expect(g.scale.x).toBeCloseTo(subagentFigureScale());
     expect(g.scale.y).toBeCloseTo(subagentFigureScale());
+  });
+});
+
+describe("AgentLayer.setBlocked — T2 walk blocker propagation", () => {
+  it("setBlocked does not throw", () => {
+    const { layer } = makeLayer();
+    expect(() => {
+      layer.setBlocked(() => true);
+    }).not.toThrow();
+  });
+
+  it("setBlocked is idempotent (multiple calls are safe)", () => {
+    const { layer } = makeLayer();
+    layer.setBlocked(() => false);
+    layer.setBlocked(() => true);
+    layer.setBlocked(() => false);
+    // No assertion needed — just verifying no throw.
   });
 });

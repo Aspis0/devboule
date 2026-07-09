@@ -7,6 +7,8 @@
 // DETERMINISM: NO Math.random anywhere. Lane offset uses the existing
 // deterministic hash (hashString from ./rng). Slot choice is by arrival order.
 
+import { isoToCart } from "./iso";
+import { roundTile } from "./navWalkable";
 import { hashString } from "./rng";
 
 // ---- IsoPoint (same shape as in iso.ts / AgentLayer) ----
@@ -94,6 +96,110 @@ export function buildSplineLeg(
   const p3 = li < n - 2 ? waypoints[li + 2] : p2; // repeat end
 
   return (t: number) => catmullRomPoint(p0, p1, p2, p3, Math.max(0, Math.min(1, t)));
+}
+
+/**
+ * A safe spline leg result: the effective sample function and metadata about
+ * which safety mode was chosen. Returned by {@link buildSafeSplineLeg}.
+ */
+export interface SafeSplineLeg {
+  /** "spline" when the Catmull-Rom curve is safe; "linear" when degraded. */
+  mode: "spline" | "linear";
+  /** Sample(t) for this leg — either the spline or the linear fallback. */
+  sample: (t: number) => IPoint;
+  /** True when the lane offset is forced to 0 for this leg because the
+   *  extreme offset (\u00b1maxOffset px) landed on a blocked tile. */
+  laneOffsetClamped: boolean;
+}
+
+/** Default extreme lane offset px to test. Matches the max from {@link laneOffset}.
+ *  Exported so tests can reference it. */
+export const MAX_LANE_OFFSET_PX = 4;
+
+/**
+ * Build a SAFE spline leg: if ANY sample of the raw Catmull-Rom spline lands
+ * on a blocked tile, degrade THAT LEG to plain linear interpolation. If the
+ * extreme lane offset (\u00b1maxOffset px) lands on a blocked tile, clamp the lane
+ * offset to 0 for the whole leg.
+ *
+ * Validation runs ONCE at leg-build time (not per frame). The sample density
+ * matches the walk stepping: ceil(segLen / 8) samples per leg (8px \u2248 half a
+ * tile width, catching any blocked-tile crossing).
+ *
+ * Returns the effective sample function, the chosen mode, and whether the lane
+ * offset is clamped.
+ */
+export function buildSafeSplineLeg(
+  waypoints: IPoint[],
+  legIndex: number,
+  blocked: (gx: number, gy: number) => boolean,
+  maxOffsetPx: number = MAX_LANE_OFFSET_PX,
+): SafeSplineLeg {
+  // Build the raw spline leg (Catmull-Rom or linear for 2-point routes).
+  const splineFn = buildSplineLeg(waypoints, legIndex);
+  const n = waypoints.length;
+  if (n < 2) {
+    return { mode: "spline", sample: splineFn, laneOffsetClamped: false };
+  }
+  const li = Math.max(0, Math.min(legIndex, n - 2));
+  const a = waypoints[li];
+  const b = waypoints[li + 1];
+  const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+
+  // Number of samples: enough to catch a blocked tile crossing. 8px \u2248 half
+  // a tile width (a tile is ~16px across in iso). At least 2 samples.
+  const sampleCount = Math.max(2, Math.ceil(segLen / 8));
+
+  // 1. Check if the raw spline samples are all safe.
+  // T2 FIX: the spline returns ISO pixel coords; the blocker expects cartesian
+  // tile-grid indices. Convert via isoToCart → roundTile before querying.
+  let splineBlocked = false;
+  for (let i = 0; i <= sampleCount; i++) {
+    const t = i / sampleCount;
+    const pt = splineFn(t);
+    const cart = isoToCart(pt.x, pt.y);
+    if (blocked(roundTile(cart.x), roundTile(cart.y))) {
+      splineBlocked = true;
+      break;
+    }
+  }
+
+  // 2. If spline is blocked, degrade to linear for this leg.
+  const mode: "spline" | "linear" = splineBlocked ? "linear" : "spline";
+  const sample = splineBlocked
+    ? (t: number) => {
+        const clamped = Math.max(0, Math.min(1, t));
+        return {
+          x: a.x + (b.x - a.x) * clamped,
+          y: a.y + (b.y - a.y) * clamped,
+        };
+      }
+    : splineFn;
+
+  // 3. Lane-offset clamping: test the extreme offset at each sample. If ANY
+  //    offset sample lands on a blocked tile, force lane offset 0.
+  // T2 FIX: perpendicular offsets are in ISO pixel space; convert to tile-grid
+  // via isoToCart → roundTile before querying the blocker.
+  let laneOffsetClamped = false;
+  if (maxOffsetPx > 0) {
+    for (let i = 0; i <= sampleCount; i++) {
+      const t = i / sampleCount;
+      const rawPt = sample(t);
+      // Test both positive and negative extremes.
+      const offPos = applyPerpendicularOffset(rawPt, dx, dy, maxOffsetPx);
+      const offNeg = applyPerpendicularOffset(rawPt, dx, dy, -maxOffsetPx);
+      const cartPos = isoToCart(offPos.x, offPos.y);
+      const cartNeg = isoToCart(offNeg.x, offNeg.y);
+      if (blocked(roundTile(cartPos.x), roundTile(cartPos.y)) || blocked(roundTile(cartNeg.x), roundTile(cartNeg.y))) {
+        laneOffsetClamped = true;
+        break;
+      }
+    }
+  }
+
+  return { mode, sample, laneOffsetClamped };
 }
 
 // =========================================================================

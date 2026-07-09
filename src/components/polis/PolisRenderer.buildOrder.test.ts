@@ -150,6 +150,8 @@ function makeRenderer(profileTier: "rich" | "lean" | "minimal" = "rich") {
   // visible; far ones (large tile coords) are out of view.
   set("viewport", makeViewport(-200, -400, 400, 600));
   set("externalLayer", { setServices: () => {}, setLodVisible: () => {} });
+  set("agentLayer", { setBlocked: () => {} });
+  set("ambientLayer", { setBlocked: () => {} });
   set("clock", { reset: () => {} });
 
   // STUB the heavy collaborators setCityState touches (not under test here).

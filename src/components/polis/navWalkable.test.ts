@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { Container } from "pixi.js";
 import {
   makeWaterBlocker,
+  makeBuildingBlocker,
+  combineBlockers,
   pathIsWalkable,
   pathTouchesBlocked,
   roundTile,
@@ -283,5 +285,105 @@ describe("TradeRouteLayer walkability guard", () => {
     layer.setWorld(roads, resolve, blocked);
     expect(layer.count).toBe(0);
     layer.clear();
+  });
+});
+
+// =========================================================================
+// T2 — makeBuildingBlocker / combineBlockers
+// =========================================================================
+
+describe("makeBuildingBlocker", () => {
+  it("blocks building footprint tiles only, NOT adjacent street tiles", () => {
+    // A building at (5, 5) occupies exactly that tile.
+    const buildings = [
+      { coords: { x: 5, y: 5 } },
+    ] as any[];
+    const blocked = makeBuildingBlocker(buildings);
+    // Footprint tile → blocked.
+    expect(blocked(5, 5)).toBe(true);
+    // Adjacent tiles (the 4-neighbourhood) → NOT blocked (walkers may hug walls).
+    expect(blocked(6, 5)).toBe(false);
+    expect(blocked(4, 5)).toBe(false);
+    expect(blocked(5, 6)).toBe(false);
+    expect(blocked(5, 4)).toBe(false);
+    // Far away → not blocked.
+    expect(blocked(0, 0)).toBe(false);
+  });
+
+  it("blocks multiple buildings' footprint tiles", () => {
+    const buildings = [
+      { coords: { x: 3, y: 3 } },
+      { coords: { x: 10, y: 10 } },
+    ] as any[];
+    const blocked = makeBuildingBlocker(buildings);
+    expect(blocked(3, 3)).toBe(true);
+    expect(blocked(10, 10)).toBe(true);
+    expect(blocked(5, 5)).toBe(false);
+  });
+
+  it("returns always-false for undefined / empty buildings", () => {
+    const none = makeBuildingBlocker(undefined);
+    expect(none(5, 5)).toBe(false);
+    const empty = makeBuildingBlocker([]);
+    expect(empty(5, 5)).toBe(false);
+  });
+
+  it("rounds fractional coords to tile before testing", () => {
+    const buildings = [
+      { coords: { x: 5, y: 5 } },
+    ] as any[];
+    const blocked = makeBuildingBlocker(buildings);
+    // Fractional coords near (5,5) should still map to the same tile.
+    expect(blocked(5.4, 5.1)).toBe(true);
+    expect(blocked(4.6, 4.9)).toBe(true);
+  });
+});
+
+describe("combineBlockers", () => {
+  it("OR-composes multiple blockers", () => {
+    const blockA = (gx: number, _gy: number) => gx === 5;
+    const blockB = (_gx: number, gy: number) => gy === 10;
+    const combined = combineBlockers(blockA, blockB);
+    expect(combined(5, 0)).toBe(true);   // blocked by A
+    expect(combined(0, 10)).toBe(true);  // blocked by B
+    expect(combined(5, 10)).toBe(true);  // blocked by both
+    expect(combined(3, 3)).toBe(false);  // blocked by neither
+  });
+
+  it("returns always-false for zero blockers", () => {
+    const combined = combineBlockers();
+    expect(combined(0, 0)).toBe(false);
+  });
+
+  it("returns the single blocker directly for one blocker", () => {
+    const block = (gx: number, gy: number) => gx === gy;
+    const combined = combineBlockers(block);
+    expect(combined(3, 3)).toBe(true);
+    expect(combined(3, 4)).toBe(false);
+  });
+
+  it("integrates with makeWaterBlocker and makeBuildingBlocker", () => {
+    const terrain: TerrainData = {
+      seaX: 100,
+      minY: 0,
+      maxY: 4,
+      rivers: [{ gxMin: 5, gxMax: 5 }],
+      water: [{ gx: 5, gy: 0, deep: false }],
+      sand: [],
+      bridges: [],
+    };
+    const buildings = [
+      { coords: { x: 10, y: 10 } },
+    ] as any[];
+    const combined = combineBlockers(
+      makeWaterBlocker(terrain),
+      makeBuildingBlocker(buildings),
+    );
+    // Water tile → blocked.
+    expect(combined(5, 0)).toBe(true);
+    // Building tile → blocked.
+    expect(combined(10, 10)).toBe(true);
+    // Land, not building → walkable.
+    expect(combined(0, 0)).toBe(false);
   });
 });
