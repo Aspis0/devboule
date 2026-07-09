@@ -27,7 +27,7 @@
 // editor buttons call the gated, path-validated `polis_open_in_editor` command.
 // Both are Tauri-only and degrade to a muted message in the browser harness.
 
-import { useMemo, useState, useCallback, useRef, useEffect } from "react";
+import React, { useMemo, useState, useCallback, useRef, useEffect, Suspense } from "react";
 import {
   X,
   Copy,
@@ -35,8 +35,6 @@ import {
   FileCode,
   ArrowDownToLine,
   ArrowUpFromLine,
-  Flame,
-  AlertTriangle,
   HelpCircle,
   Search,
   Bot,
@@ -85,6 +83,7 @@ import type {
   Agent,
   ExternalService,
 } from "../../types/city";
+const AnomalySection = React.lazy(() => import("./AnomalySection"));
 import type { OracleAnswer } from "../../types/backend";
 import { purposeLabel, agentTypeLabel } from "../../types/city";
 import { invokeBackendCommand, isTauriRuntime } from "../../context/AppContext";
@@ -121,11 +120,6 @@ interface InspectSidebarProps {
 // Purpose sources that are GUESSES rather than grounded verdicts.
 const GUESS_SOURCES = new Set(["heuristic", "default"]);
 
-const SIN_TONE: Record<string, string> = {
-  smoke: "text-cream-600 bg-cream-100 border-cream-300",
-  fire: "text-amber-dark bg-amber/10 border-amber/30",
-  inferno: "text-coral-dark bg-coral/10 border-coral/40",
-};
 
 // Purpose slug -> lucide icon (per the design brief).
 const PURPOSE_ICON: Record<string, LucideIcon> = {
@@ -671,36 +665,13 @@ function BuildingPopup({
         </section>
       )}
 
-      {/* ISSUES (urban sins) */}
-      {building.sins.length > 0 && (
-        <section className="mt-4">
-          <SectionTitle icon={<Flame className="h-3.5 w-3.5" />}>
-            Issues ({building.sins.length})
-          </SectionTitle>
-          <ul className="space-y-1.5">
-            {building.sins.map((s) => {
-              const SinIcon =
-                s.severity === "smoke" ? AlertTriangle : Flame;
-              return (
-                <li
-                  key={s.sinId}
-                  className={`flex items-start gap-2 rounded-xl border px-3 py-2 text-[12px] ${
-                    SIN_TONE[s.severity] ?? SIN_TONE.smoke
-                  }`}
-                >
-                  <SinIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>
-                    <span className="font-semibold capitalize">
-                      {s.severity}
-                    </span>{" "}
-                    — {s.description}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        </section>
-      )}
+      {/* ISSUES (augure sin ledger — P1.4, lazy-loaded) */}
+      <Suspense fallback={null}>
+        <AnomalySection
+          buildingFilePath={building.filePath}
+          buildingSins={building.sins}
+        />
+      </Suspense>
 
       {/* Agent present */}
       {presentAgent && (

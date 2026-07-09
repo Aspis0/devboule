@@ -15,7 +15,7 @@
 
 import { create } from "zustand";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { CityState } from "../types/city";
+import type { CityState, SinRecord } from "../types/city";
 import { invokeBackendCommand, isTauriRuntime } from "../context/AppContext";
 
 /** localStorage key for the last folder the user mapped (folder-agnostic reload). */
@@ -69,6 +69,14 @@ interface CityStoreState {
   selectedFolder: string | null;
   selectedBuildingId: string | null;
 
+  /** Augure sin ledger (P1.4): all records for the mapped project, or [] when
+   *  unavailable (browser, no folder, ledger error). Drives the parchment
+   *  anomaly section — the visual-layer `Building.sins` is open-sins-only. */
+  sinRecords: SinRecord[] | null;
+  /** Sin id of an in-flight dispose/fix action. When non-null the matching
+   *  row's action buttons are disabled (prevents double-dispatch). */
+  sinActionPending: string[];
+
   /**
    * DEEP-LINK (GAP B): a pending request to focus a specific agent in Polis.
    * `pendingFolder` is the agent's project root to auto-map; `pendingFocusAgentId`
@@ -91,7 +99,7 @@ interface CityStoreState {
   /** Map a specific folder. The one entry point for the folder picker. */
   loadFolder: (path: string) => Promise<void>;
   /** Re-scan the currently selected folder (or re-fetch the fixture in browser). */
-  refresh: () => Promise<void>;
+  refresh: (force?: boolean) => Promise<void>;
   /** Apply a live fs-watcher CityState (stored as `liveCity` for the view to
    *  diff). Also keeps `cityState` current so header counts/era reflect it. */
   applyLiveUpdate: (city: CityState) => void;
@@ -112,6 +120,7 @@ interface CityStoreState {
   /** DEEP-LINK consumer: read + clear the pending focus request (PolisView). The
    *  matching setter was removed in Phase G (no production writer remains); see the
    *  pendingFolder/pendingFocusAgentId note above. */
+
   consumeFocusRequest: () => { folder: string | null; agentId: string | null };
 
   /**
@@ -144,6 +153,16 @@ interface CityStoreState {
   getScanExtensions: () => Promise<{ available: string[]; enabled: string[] }>;
   /** Persist the scan extensions for the current folder, then rebuild the city. */
   applyScanExtensions: (extensions: string[]) => Promise<void>;
+
+  /** Load all sin ledger records for the mapped project (Tauri-only).
+   *  Called after every full city load; failures silently set records to null. */
+  loadSinRecords: () => Promise<void>;
+  /** Set a sin disposition (open|ignored). Returns an error string or null.
+   *  On success refreshes the ledger + city. */
+  disposeSin: (relPath: string, sinId: string, disposition: "open" | "ignored") => Promise<string | null>;
+  /** Dispatch a fix directive to the main coder. Returns an error string or null.
+   *  On success refreshes the ledger + city. */
+  fixSin: (relPath: string, sinId: string) => Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +457,8 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
   selectedBuildingId: null,
   pendingFolder: null,
   pendingFocusAgentId: null,
+  sinRecords: null,
+  sinActionPending: [],
 
   load: async () => {
     if (get().loading) return;
@@ -491,6 +512,8 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
       lastAppliedCitySig = sig;
       logCityComposition(city, "scanFolder", chars);
       set({ cityState: city, liveCity: null, usingFixture: false, loading: false });
+      // Enrichment: load the augure sin ledger (best-effort, non-blocking).
+      if (isTauriRuntime()) void get().loadSinRecords();
       // Start (or re-point) the live fs-watcher on this folder. Best-effort and
       // Tauri-only; never blocks or fails the load. The event handler funnels
       // into applyLiveUpdate (a separate, diff-only path).
@@ -507,8 +530,8 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
     }
   },
 
-  refresh: async () => {
-    if (get().loading) return;
+  refresh: async (force?: boolean) => {
+    if (!force && get().loading) return;
     const folder = get().selectedFolder;
     if (isTauriRuntime()) {
       // Nothing to refresh until a folder is chosen.
@@ -678,6 +701,81 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
     }
   },
 
+
+  // --- Augure sin ledger (P1.4) ---
+
+  loadSinRecords: async () => {
+    if (!isTauriRuntime()) return;
+    const folderAtRequest = get().selectedFolder;
+    if (!folderAtRequest) { set({ sinRecords: null }); return; }
+    // B1: capture the current requestSeq (read only — do NOT bump it)
+    const seq = requestSeq;
+    try {
+      const records = await invokeBackendCommand<SinRecord[]>(
+        "polis_list_sins",
+        { projectPath: folderAtRequest },
+      );
+      // B1: bail if folder switched or a newer load superseded us
+      if (get().selectedFolder !== folderAtRequest || requestSeq !== seq) return;
+      set({ sinRecords: records ?? [] });
+    } catch {
+      if (get().selectedFolder !== folderAtRequest || requestSeq !== seq) return;
+      // Ledger is enrichment — failures never block the parchment.
+      set({ sinRecords: null });
+    }
+  },
+
+  disposeSin: async (relPath, sinId, disposition) => {
+    const folder = get().selectedFolder;
+    if (!folder) return "No project mapped.";
+    // M1: idempotent — skip if this sin is already in-flight
+    if (get().sinActionPending.includes(sinId)) return null;
+    set({ sinActionPending: [...get().sinActionPending, sinId] });
+    try {
+      await invokeBackendCommand("polis_dispose_sin", {
+        projectPath: folder,
+        relPath,
+        sinId,
+        disposition,
+      });
+      // B1: re-check folder before reloading — a concurrent loadFolder may have switched
+      if (get().selectedFolder !== folder) return null;
+      // Refresh the ledger + city so the map reflects the changed disposition.
+      void get().loadSinRecords();
+      await get().refresh(true);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    } finally {
+      set({ sinActionPending: get().sinActionPending.filter((id) => id !== sinId) });
+    }
+  },
+
+  fixSin: async (relPath, sinId) => {
+    const folder = get().selectedFolder;
+    if (!folder) return "No project mapped.";
+    // M1: idempotent — skip if this sin is already in-flight
+    if (get().sinActionPending.includes(sinId)) return null;
+    set({ sinActionPending: [...get().sinActionPending, sinId] });
+    try {
+      await invokeBackendCommand("polis_fix_sin", {
+        projectPath: folder,
+        relPath,
+        sinId,
+      });
+      // B1: re-check folder before reloading — a concurrent loadFolder may have switched
+      if (get().selectedFolder !== folder) return null;
+      // Refresh the ledger + city so the building gains the agent overlay.
+      void get().loadSinRecords();
+      await get().refresh(true);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    } finally {
+      set({ sinActionPending: get().sinActionPending.filter((id) => id !== sinId) });
+    }
+  },
+
   consumeFocusRequest: () => {
     const { pendingFolder, pendingFocusAgentId } = get();
     // Clear immediately so a re-mount / re-render doesn't replay the request.
@@ -721,6 +819,7 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
       // city, so the next watcher/poll event carrying THIS city is treated as a
       // change and spuriously re-applies/rebuilds the scene.
       lastAppliedCitySig = citySignature(res.city).sig;
+      void get().loadSinRecords();
       return { changed: res.changed, status: res.status };
     } catch (e) {
       if (seq !== requestSeq)
@@ -791,6 +890,7 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
         lastAppliedCitySig = null;
         get().applyLiveUpdate(city);
         set({ loading: false });
+        void get().loadSinRecords();
         // Restart the live fs-watcher on the folder (best-effort, Tauri-only).
         if (watchedFolder !== folder) {
           void startWatchFor(folder, (live) => get().applyLiveUpdate(live));
@@ -800,6 +900,7 @@ export const useCityStore = create<CityStoreState>((set, get) => ({
         if (seq !== requestSeq)
           return { ok: true, status: `New era “${era}” begun.` };
         set({ loading: false });
+        void get().loadSinRecords();
         return {
           ok: true,
           status: `New era “${era}” begun — map the folder again to grow the new city.`,

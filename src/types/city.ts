@@ -226,6 +226,26 @@ export interface UrbanSin {
   fileId?: string;
 }
 
+/**
+ * Ledger record for a detected sin (Augure P1.1–P1.3). Mirrors the Rust
+ * `SinRecordWire` struct (camelCase serde). The UI drives the parchment
+ * anomaly section from these records — not from `Building.sins` (which is
+ * the visual-layer subset, open sins only, no ruleId/evidence).
+ */
+export interface SinRecord {
+  id: string;
+  relPath: string;
+  ruleId: string;
+  line: number | null;
+  severity: SinSeverity;
+  description: string;
+  evidence: string;
+  disposition: "open" | "ignored" | "fixed";
+  createdAt: string;
+  updatedAt: string;
+  fixDirectiveId: string | null;
+}
+
 export interface District {
   districtId: string;
   name: string;
