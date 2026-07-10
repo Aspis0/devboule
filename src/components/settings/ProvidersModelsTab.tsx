@@ -18,6 +18,7 @@ import {
 import type { DetectedProvider } from "../../types/config";
 import { RolesTableCard } from "./RolesTableCard";
 import { RecommendedConfigCard } from "./RecommendedConfigCard";
+import { detectApplePlatform } from "../../lib/platform";
 import { ModelRegistryCard } from "./ModelRegistryCard";
 import { MiniWriteBehaviorCard } from "./MiniWriteBehaviorCard";
 import { WebSearchCard } from "./WebSearchCard";
@@ -112,22 +113,7 @@ function DetectedProvidersStrip() {
     return entry as DetectedProvider;
   }, [detected]);
 
-  const isAppleHost = useMemo(() => {
-    if (typeof navigator === "undefined") return null;
-    const platform = (navigator.platform ?? "").toLowerCase();
-    const userAgent = (navigator.userAgent ?? "").toLowerCase();
-    const haystack = `${platform} ${userAgent}`;
-    if (haystack.includes("mac") || haystack.includes("darwin")) return true;
-    if (
-      haystack.includes("win") ||
-      haystack.includes("linux") ||
-      haystack.includes("android") ||
-      haystack.includes("iphone") ||
-      haystack.includes("ipad")
-    )
-      return false;
-    return null;
-  }, []);
+  const isAppleHost = detectApplePlatform();
 
   const appleFmStatusText = useMemo(() => {
     if (!detectedAppleFm) return null;

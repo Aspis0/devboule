@@ -12,6 +12,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useAppContext } from "../../context/AppContext";
+import { ALPHA_HIDDEN_PROVIDERS } from "../../lib/alphaHidden";
+import { authMethodLabel, isAppleHost } from "../../lib/platform";
 import type { ProviderConnectionAudit, ProviderId, SecretStatus } from "../../types/backend";
 import { GithubProviderCard } from "./GithubProviderCard";
 
@@ -145,7 +147,11 @@ export function SecretsView() {
   const [pendingObjectSecretKeyDelete, setPendingObjectSecretKeyDelete] = useState(false);
   const auditRequestSeq = useRef<Record<string, number>>({});
   const sortedStatuses = sortStatuses(secretStatuses);
-  const dueCount = sortedStatuses.filter(
+  // Alpha: hide any providers explicitly hidden from the UI (reversible via the set).
+  const visibleSecretStatuses = sortedStatuses.filter(
+    (s) => !ALPHA_HIDDEN_PROVIDERS.has(s.provider),
+  );
+  const dueCount = visibleSecretStatuses.filter(
     (s) => s.status === "rotation_due" || s.status === "stale",
   ).length;
 
@@ -289,14 +295,14 @@ export function SecretsView() {
 
   return (
     <div className="max-w-4xl space-y-6">
-      {/* Windows Hello banner */}
+      {/* Device-auth protection banner */}
       <div className="flex items-center gap-4 p-5 bg-white rounded-2xl border border-cream-200">
         <div className="w-10 h-10 rounded-xl bg-terracotta-50 flex items-center justify-center shrink-0">
           <Fingerprint className="w-5 h-5 text-terracotta" />
         </div>
         <div>
           <p className="text-[14px] font-medium text-cream-800">
-            Protected by Windows Hello
+            Protected by {authMethodLabel(isAppleHost())}
           </p>
           <p className="text-[12px] text-cream-400">
             All secret values are encrypted at rest and only accessible after
@@ -307,7 +313,7 @@ export function SecretsView() {
 
       {/* Secrets list */}
       <div className="bg-white rounded-2xl border border-cream-200 divide-y divide-cream-100 overflow-hidden">
-        {sortedStatuses.map((secret) => {
+        {visibleSecretStatuses.map((secret) => {
           const cfg = statusConfig[secret.status] || statusConfig.error;
           const StatusIcon = cfg.icon;
           const provider = secret.provider as ProviderId;
@@ -381,7 +387,7 @@ export function SecretsView() {
                         onClick={() => void handleSave(provider)}
                         disabled={isLoading || draft.trim().length === 0}
                         data-help-title={`This saves or rotates the ${providerLabels[provider]} token.`}
-                        data-help-lines="The token goes to Windows vault through the backend.|After saving, the app syncs provider inventory when possible.|It does not expose the raw token to Oracle or project files.|If the token is temporary, note its expiry outside the secret value and replace it before it dies."
+                        data-help-lines="The token goes to your OS keychain through the backend.|After saving, the app syncs provider inventory when possible.|It does not expose the raw token to Oracle or project files.|If the token is temporary, note its expiry outside the secret value and replace it before it dies."
                         className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl
                                    bg-terracotta text-white text-[12px] font-medium
                                    hover:bg-terracotta-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-terracotta/30
@@ -552,7 +558,7 @@ export function SecretsView() {
                             }}
                             placeholder="Paste Scaleway secret key"
                             data-help-title="This is the private Scaleway Object Storage secret key."
-                            data-help-lines="The secret key is the password half of the Object Storage pair.|Do not paste it into Projects, Oracle, or chat.|It is saved in the Windows vault and used only by backend inventory calls.|If it expires or leaks, delete it here and rotate it in Scaleway."
+                            data-help-lines="The secret key is the password half of the Object Storage pair.|Do not paste it into Projects, Oracle, or chat.|It is saved in the OS keychain and used only by backend inventory calls.|If it expires or leaks, delete it here and rotate it in Scaleway."
                             spellCheck={false}
                             autoComplete="off"
                             className="min-w-0 flex-1 rounded-lg border border-cream-200 bg-white px-3 py-2 text-[11px] font-mono text-cream-800 outline-none focus:border-teal/40 focus:ring-2 focus:ring-teal/10"
@@ -562,7 +568,7 @@ export function SecretsView() {
                               onClick={() => void handleSaveObjectAccessKey()}
                               disabled={isLoading || objectAccessKeyDraft.trim().length === 0}
                               data-help-title="This saves the Object Storage access key."
-                              data-help-lines="The key is stored in the Windows vault through Tauri.|It does not test bucket access by itself unless the surrounding sync runs.|Use it with the matching secret key from the same Scaleway credential.|Replace it when the credential expires or is rotated."
+                              data-help-lines="The key is stored in the OS keychain through Tauri.|It does not test bucket access by itself unless the surrounding sync runs.|Use it with the matching secret key from the same Scaleway credential.|Replace it when the credential expires or is rotated."
                               className="rounded-lg border border-cream-200 px-3 py-2 text-[11px] font-medium text-cream-600 hover:border-teal/30 hover:text-teal-dark disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               Save access
@@ -571,7 +577,7 @@ export function SecretsView() {
                               onClick={() => void handleSaveObjectSecretKey()}
                               disabled={isLoading || objectSecretKeyDraft.trim().length === 0}
                               data-help-title="This saves the Object Storage secret key."
-                              data-help-lines="The value is stored in the Windows vault and should never be indexed.|It must match the saved Object Storage access key.|Expired or leaked keys should be deleted and rotated at Scaleway.|Bucket inventory may fail until both halves are valid."
+                              data-help-lines="The value is stored in the OS keychain and should never be indexed.|It must match the saved Object Storage access key.|Expired or leaked keys should be deleted and rotated at Scaleway.|Bucket inventory may fail until both halves are valid."
                               className="rounded-lg border border-cream-200 px-3 py-2 text-[11px] font-medium text-cream-600 hover:border-teal/30 hover:text-teal-dark disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               Save secret
@@ -589,7 +595,7 @@ export function SecretsView() {
                               onClick={() => void handleDeleteObjectSecretKey()}
                               disabled={isLoading || !scalewayObjectSecretKeyStatus?.configured}
                               data-help-title="This deletes the saved Object Storage secret key."
-                              data-help-lines="Deleting removes the secret from the Windows vault.|It does not revoke it in Scaleway, so rotate there too if needed.|Use this when the credential expires or you pasted the wrong pair.|Bucket inventory will fail until a valid pair is saved."
+                              data-help-lines="Deleting removes the secret from the OS keychain.|It does not revoke it in Scaleway, so rotate there too if needed.|Use this when the credential expires or you pasted the wrong pair.|Bucket inventory will fail until a valid pair is saved."
                               className="rounded-lg border border-cream-200 px-3 py-2 text-[11px] font-medium text-cream-600 hover:border-coral/30 hover:text-coral disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               {pendingObjectSecretKeyDelete ? "Confirm secret" : "Delete secret"}
@@ -607,7 +613,7 @@ export function SecretsView() {
         {/* GitHub stays on its own bespoke path (not a ProviderId), but lives in
             the same Secrets list so all credentials are configured in one place. */}
         <GithubProviderCard />
-        {sortedStatuses.length === 0 && (
+        {visibleSecretStatuses.length === 0 && (
           <div className="px-5 py-8 text-center text-[13px] text-cream-400">
             No provider status loaded yet. Unlock the app and run audit.
           </div>

@@ -21,6 +21,7 @@ import { useEffect, useState } from "react";
 import type { AppConfig } from "../../types/config";
 import { useAppActions, useAppContext } from "../../context/AppContext";
 import { safeOpenExternal } from "../../utils/safeOpenExternal";
+import { ALPHA_HIDDEN_PROVIDERS } from "../../lib/alphaHidden";
 import { CloudflareView } from "./CloudflareView";
 import { ComputeView } from "./ComputeView";
 import { BudgetView } from "./BudgetView";
@@ -244,11 +245,33 @@ const PROVIDER_TABS: { id: ProvidersTabId; label: string }[] = [
   { id: "budget", label: "Budget" },
 ];
 
+// Alpha: drop any tabs explicitly hidden from the UI (reversible via the set).
+const VISIBLE_PROVIDER_TABS = PROVIDER_TABS.filter(
+  (t) => !ALPHA_HIDDEN_PROVIDERS.has(t.id),
+);
+
+// Alpha: the overview tab's readiness cards, console-map sub-tabs and the
+// selected console provider all hard-code the cloudflare/scaleway pair. Drop
+// any provider explicitly hidden from the UI here too (reversible by clearing
+// ALPHA_HIDDEN_PROVIDERS). When this ends up empty, the console-map + live
+// inventory sections are hidden entirely and the readiness grid renders nothing.
+const VISIBLE_CONSOLE_PROVIDERS = (["cloudflare", "scaleway"] as ProviderId[]).filter(
+  (id) => !ALPHA_HIDDEN_PROVIDERS.has(id),
+);
+
 export function ProvidersView({ config }: ProvidersViewProps) {
   const { cloudSnapshot, syncProviderInventory, isLoading, pendingTab } =
     useAppContext();
   const { consumePendingTab } = useAppActions();
   const [tab, setTab] = useState<ProvidersTabId>("overview");
+
+  // Fallback: if the active tab is (or becomes) hidden, land on the first
+  // visible tab so ProvidersView never renders a blank/hidden tab.
+  useEffect(() => {
+    if (!VISIBLE_PROVIDER_TABS.some((t) => t.id === tab)) {
+      setTab(VISIBLE_PROVIDER_TABS[0]?.id ?? "overview");
+    }
+  }, [tab]);
 
   // Deep-links (risk flags, jump-search) can request a specific tab via
   // requestView("providers", "cloudflare"). Depend on `pendingTab` (not just the
@@ -256,16 +279,21 @@ export function ProvidersView({ config }: ProvidersViewProps) {
   // active view still re-runs and switches the tab (otherwise the click is dead).
   useEffect(() => {
     const requested = consumePendingTab();
-    if (requested && PROVIDER_TABS.some((t) => t.id === requested)) {
+    if (requested && VISIBLE_PROVIDER_TABS.some((t) => t.id === requested)) {
       setTab(requested as ProvidersTabId);
     }
   }, [consumePendingTab, pendingTab]);
   const providerHealth = cloudSnapshot?.providerHealth ?? [];
+  const visibleProviderHealth = providerHealth.filter(
+    (health) => !ALPHA_HIDDEN_PROVIDERS.has(health.id),
+  );
   const providerServices = cloudSnapshot?.providerServices ?? [];
   const consoleResources = cloudSnapshot?.consoleResources ?? [];
   const selectedScopes = cloudSnapshot?.selectedScopes ?? [];
   const [externalError, setExternalError] = useState<string | null>(null);
-  const [serviceProvider, setServiceProvider] = useState<ProviderId>("cloudflare");
+  const [serviceProvider, setServiceProvider] = useState<ProviderId>(
+    VISIBLE_CONSOLE_PROVIDERS[0] ?? "cloudflare",
+  );
   const visibleServices = providerServices.filter(
     (service) => service.provider === serviceProvider,
   );
@@ -288,7 +316,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
   return (
     <div className="w-full space-y-6">
       <div className="flex w-fit flex-wrap gap-1 rounded-2xl border border-cream-200 bg-white p-1">
-        {PROVIDER_TABS.map((t) => {
+        {VISIBLE_PROVIDER_TABS.map((t) => {
           const isActive = tab === t.id;
           return (
             <button
@@ -341,7 +369,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
         </div>
 
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-          {(["cloudflare", "scaleway"] as ProviderId[]).map((provider) => {
+          {VISIBLE_CONSOLE_PROVIDERS.map((provider) => {
             const health = providerHealth.find((item) => item.id === provider);
             const scope = selectedScopes.find((item) => item.provider === provider);
             const resourcesForProvider = consoleResources.filter(
@@ -404,6 +432,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
         </div>
       </section>
 
+      {VISIBLE_CONSOLE_PROVIDERS.length > 0 && (
       <section>
         <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
@@ -415,7 +444,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
             </p>
           </div>
           <div className="flex w-fit rounded-2xl border border-cream-200 bg-white p-1">
-            {(["cloudflare", "scaleway"] as ProviderId[]).map((provider) => (
+            {VISIBLE_CONSOLE_PROVIDERS.map((provider) => (
               <button
                 key={provider}
                 onClick={() => setServiceProvider(provider)}
@@ -573,6 +602,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
           </div>
         </div>
       </section>
+      )}
 
       {/* Operational providers */}
       <section>
@@ -586,12 +616,12 @@ export function ProvidersView({ config }: ProvidersViewProps) {
             </p>
           </div>
           <span className="text-[11px] text-cream-400">
-            {providerHealth.length} providers
+            {visibleProviderHealth.length} providers
           </span>
         </div>
 
         <div className="space-y-3">
-          {providerHealth.map((health) => {
+          {visibleProviderHealth.map((health) => {
             const providerId = health.id as ProviderId;
             const meta = providerMeta[providerId];
             const consoleUrl = meta?.url;
@@ -680,7 +710,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
               </div>
             );
           })}
-          {providerHealth.length === 0 && (
+          {visibleProviderHealth.length === 0 && (
             <div className="rounded-2xl border border-cream-200 bg-white px-5 py-8 text-center text-[13px] text-cream-400">
               No live provider status yet. Sync after saving Cloudflare and Scaleway tokens.
             </div>

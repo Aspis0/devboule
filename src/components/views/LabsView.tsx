@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { FlaskConical, Bird, Sparkles, Moon, Lock, AlertTriangle } from "lucide-react";
+import { FlaskConical, Bird, Sparkles, Moon, Lock, AlertTriangle, Palette } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { invokeBackendCommand } from "../../context/AppContext";
+import { useDesignVisible, setDesignVisible } from "../../store/labsSettings";
 
 interface FeatureToggleCardProps {
   title: string;
@@ -111,6 +112,71 @@ function FeatureToggleCard({
   );
 }
 
+interface DesignToggleCardProps {
+  title: string;
+  subtitle: string;
+  description: string;
+  switchLabel: string;
+  Icon: LucideIcon;
+}
+
+/**
+ * A Labs toggle backed by the localStorage `labsSettings` store (NOT a backend
+ * command), mirroring the markup/props of `FeatureToggleCard` for UX
+ * consistency. Controls the Design nav entry's visibility in the Sidebar.
+ * Default ON (Design visible).
+ */
+function DesignToggleCard({
+  title,
+  subtitle,
+  description,
+  switchLabel,
+  Icon,
+}: DesignToggleCardProps) {
+  const enabled = useDesignVisible();
+
+  const onToggle = () => {
+    setDesignVisible(!enabled);
+  };
+
+  return (
+    <div className="rounded-2xl border border-cream-200 bg-white p-5">
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber/10">
+            <Icon className="h-4 w-4 text-amber-dark" />
+          </div>
+          <div className="mt-3 flex flex-col">
+            <span className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
+              {title}
+            </span>
+            <span className="text-[11px] text-cream-400">{subtitle}</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          aria-label={switchLabel}
+          onClick={() => void onToggle()}
+          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+            enabled ? "bg-teal" : "bg-cream-300"
+          }`}
+        >
+          <span
+            aria-hidden="true"
+            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+              enabled ? "translate-x-4" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
+      <p className="mt-4 text-[12px] leading-5 text-cream-600">{description}</p>
+      <p className="mt-2 text-[11px] text-cream-400">Applies immediately.</p>
+    </div>
+  );
+}
+
 interface ComingSoonCardProps {
   title: string;
   subtitle: string;
@@ -164,6 +230,13 @@ export function LabsView() {
         Active
       </h2>
       <div className="grid gap-4">
+        <DesignToggleCard
+          title="Design (experimental)"
+          subtitle="Generative design view"
+          description="Show the experimental Design view in the sidebar."
+          switchLabel="Toggle Design view"
+          Icon={Palette}
+        />
         <FeatureToggleCard
           title="Pigeon"
           subtitle="Async agent mailbox"

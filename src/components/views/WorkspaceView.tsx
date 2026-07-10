@@ -45,6 +45,7 @@ import type {
   CustomAgentClient,
   DetectedProvider,
 } from "../../types/config";
+import { detectApplePlatform } from "../../lib/platform";
 import type {
   AuxCredentialStatus,
   WorkspaceClassificationEntry,
@@ -926,22 +927,6 @@ function seedCensorString(raw: unknown): string {
   return typeof raw === "string" ? raw : "";
 }
 
-function inferIsAppleHostMac(): boolean | null {
-  if (typeof navigator === "undefined") return null;
-  const platform = (navigator.platform ?? "").toLowerCase();
-  const userAgent = (navigator.userAgent ?? "").toLowerCase();
-  const haystack = `${platform} ${userAgent}`;
-  if (haystack.includes("mac") || haystack.includes("darwin")) return true;
-  if (
-    haystack.includes("win") ||
-    haystack.includes("linux") ||
-    haystack.includes("android") ||
-    haystack.includes("iphone") ||
-    haystack.includes("ipad")
-  )
-    return false;
-  return null;
-}
 
 // Cloud Censor API-key field — rendered INSIDE the CensorLocalAiCard grid only when the
 // provider is "cloud". WRITE-ONLY (mirrors ExaSearchKeyCard): the value goes straight to the
@@ -1171,7 +1156,7 @@ export function CensorLocalAiCard() {
     () => validateCensorLocalAi({ provider, baseUrl, model, ollamaModel }),
     [provider, baseUrl, model, ollamaModel],
   );
-  const isAppleHostMac = useMemo(() => inferIsAppleHostMac(), []);
+  const isAppleHostMac = detectApplePlatform();
   const appleFmDisabled = provider === "appleFm" && isAppleHostMac === false;
   const appleFmAvailabilityNote = useMemo(() => {
     if (provider !== "appleFm") return null;

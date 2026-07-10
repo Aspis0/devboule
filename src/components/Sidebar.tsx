@@ -22,6 +22,7 @@ import {
 import type { NavItem } from "../types/config";
 import { useAppActions, useAppContext } from "../context/AppContext";
 import { navIdsForRole } from "../utils/roles";
+import { useDesignVisible } from "../store/labsSettings";
 
 const iconMap: Record<string, LucideIcon> = {
 	LayoutDashboard,
@@ -80,14 +81,21 @@ export function Sidebar() {
 	const { config, activeView, roleStatus } = useAppContext();
 	const { setActiveView } = useAppActions();
 	const { project } = config;
+	// Labs gate: the Design nav entry is shown by default, but can be hidden
+	// via the Labs toggle (persisted in labsSettings). When hidden, Design is
+	// never added to the navigation array.
+	const designVisible = useDesignVisible();
 	// Ensure the Polis map and Design entries are always present, even if the
 	// backend config does not list them yet (injected the same way).
 	const withPolis = config.navigation.some((n) => n.id === POLIS_NAV.id)
 		? config.navigation
 		: [...config.navigation, POLIS_NAV];
-	const withDesign = withPolis.some((n) => n.id === DESIGN_NAV.id)
-		? withPolis
-		: [...withPolis, DESIGN_NAV];
+	// Only inject DESIGN_NAV when the Labs preference allows it (default ON).
+	const withDesign = designVisible
+		? withPolis.some((n) => n.id === DESIGN_NAV.id)
+			? withPolis
+			: [...withPolis, DESIGN_NAV]
+		: withPolis;
 	const withSkills = withDesign.some((n) => n.id === SKILLS_NAV.id)
 		? withDesign
 		: [...withDesign, SKILLS_NAV];

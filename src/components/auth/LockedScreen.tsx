@@ -1,4 +1,5 @@
 import { Fingerprint } from "lucide-react";
+import { authMethodLabel, isAppleHost } from "../../lib/platform";
 
 interface LockedScreenProps {
   onUnlock: () => Promise<void>;
@@ -76,7 +77,7 @@ export function LockedScreen({
         )}
 
         <p className="text-[11px] text-cream-400 mt-4">
-          Protected by Windows Hello PIN, face, or fingerprint
+          Protected by {authMethodLabel(isAppleHost())}
         </p>
       </div>
     </div>
