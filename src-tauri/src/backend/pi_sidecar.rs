@@ -682,6 +682,18 @@ fn spawn_pi_session_inner(
     // sidecar's event channel never drifts from Rust's session slot.
     cmd.env("DEVBOULE_SESSION_ID", session_id);
 
+    // Pigeon (unified flag): when OFF (default) the sidecar skips all prompt
+    // classification/model-routing and runs each turn on the configured model.
+    // Restart-scoped, mirrors `pigeon_enabled_cached` used by the transport paths.
+    cmd.env(
+        "DEVBOULE_PIGEON_ENABLED",
+        if crate::backend::pigeon_service::pigeon_enabled_cached(app) {
+            "true"
+        } else {
+            "false"
+        },
+    );
+
     if let Some(role) = role {
         // A/B: name the session so the sidecar stamps the correct `_devboule`
         // metadata and the frontend console subscribes to the right channel.

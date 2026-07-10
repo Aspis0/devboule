@@ -225,7 +225,17 @@ async function applyPigeonRouting(session, modelRegistry, classification) {
  * then either redirect to the Claude-terminal subprocess (path === "terminal")
  * or apply the tier→model routing and run the turn in pi.
  */
-async function handlePromptCommand(cmd, session, modelRegistry) {
+export async function handlePromptCommand(cmd, session, modelRegistry, pigeonEnabled = false) {
+	if (!pigeonEnabled) {
+		// Pigeon OFF (default): no classification, no model switch, no redirect —
+		// run the turn on the spawn-time configured model.
+		await session.prompt(cmd.message, {
+			streamingBehavior: cmd.streamingBehavior,
+		});
+		emit({ type: "response", command: "prompt", success: true });
+		return;
+	}
+
 	const classification = await requestClassification(cmd.message);
 	// Phase 2: AgentPath routing only. Full multi-tier model switching
 	// (vault-aware tier resolution) deferred to Phase 3 — the spawn-time minimal
@@ -320,6 +330,7 @@ function buildCustomModelsJson() {
 // ---------------------------------------------------------------------------
 
 let activeSession = null;
+let pigeonEnabled = false;
 
 async function main() {
 	// #9: (re)build devbouleContext from the current process env at startup so
@@ -329,6 +340,7 @@ async function main() {
 		projectId: process.env.DEVBOULE_PROJECT_ID || null,
 		sessionId: process.env.DEVBOULE_SESSION_ID || null,
 	};
+	pigeonEnabled = process.env.DEVBOULE_PIGEON_ENABLED === "true";
 
 	const { createAgentSession, SessionManager, AuthStorage, ModelRegistry } =
 		await import("@earendil-works/pi-coding-agent");
@@ -540,7 +552,7 @@ async function main() {
 			const nextCmd = promptQueue.shift();
 			promptInFlight = true;
 			try {
-				await handlePromptCommand(nextCmd, session, modelRegistry);
+				await handlePromptCommand(nextCmd, session, modelRegistry, pigeonEnabled);
 			} catch (err) {
 				emit({
 					type: "response",
@@ -617,7 +629,7 @@ async function main() {
 				try {
 					// Phase 2 Pigeon: classify BEFORE prompting (handlePromptCommand
 					// awaits the Rust `classified` response, then applies routing).
-					await handlePromptCommand(cmd, session, modelRegistry);
+					await handlePromptCommand(cmd, session, modelRegistry, pigeonEnabled);
 				} catch (err) {
 					emit({
 						type: "response",
@@ -789,13 +801,6 @@ function cleanup(exitCode) {
 	process.exit(exitCode);
 }
 
-process.on("SIGTERM", () => cleanup(0));
-
-process.on("unhandledRejection", (reason) => {
-	emitError("fatal", reason);
-	cleanup(1);
-});
-
 // FIX 3: only auto-start `main()` when this module is the entry point. When
 // it is imported (e.g. by pigeon-flag.test.mjs) we must NOT spin up a full
 // sidecar session (AgentSession / stdin listeners). Compare the module's real
@@ -803,6 +808,13 @@ process.on("unhandledRejection", (reason) => {
 // symlink paths (e.g. macOS /tmp -> /private/tmp) so the guard is robust to how
 // the file is invoked, unlike a naive `pathToFileURL(process.argv[1])` compare.
 if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
+	process.on("SIGTERM", () => cleanup(0));
+
+	process.on("unhandledRejection", (reason) => {
+		emitError("fatal", reason);
+		cleanup(1);
+	});
+
 	main().catch((err) => {
 		emitError("fatal", err);
 		cleanup(1);
