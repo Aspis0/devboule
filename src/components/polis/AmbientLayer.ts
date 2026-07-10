@@ -55,8 +55,14 @@ const WALK_FRAMES = 4;
 // figure is ~23px at FIGURE_SCALE 0.55 ≈ 13px. 0.42 lands the sprite at a
 // matching on-screen height.
 const WALK_SPRITE_SCALE = 0.42;
-/** Per-sex direction×frame texture table (null ⇒ procedural fallback). */
-type WalkFrameTable = { m: Texture[][]; f: Texture[][] } | null;
+/** Per-sex direction×frame texture table (null ⇒ procedural fallback).
+ *  `anchor` comes from the manifest (the pipeline's authoritative feet
+ *  registration), read once — never hardcoded at the Sprite. */
+type WalkFrameTable = {
+  m: Texture[][];
+  f: Texture[][];
+  anchor: readonly [number, number];
+} | null;
 
 /**
  * A6 — direction bucket (0..7 into WALK_DIR_FOLDERS) for a screen-space
@@ -77,7 +83,11 @@ export function buildWalkFrameTable(
   bank: SpriteBank | null | undefined,
 ): WalkFrameTable {
   if (!bank) return null;
-  const out: { m: Texture[][]; f: Texture[][] } = { m: [], f: [] };
+  const out = {
+    m: [] as Texture[][],
+    f: [] as Texture[][],
+    anchor: bank.anchor("walk:citizenm:270:f0"),
+  };
   for (const sex of ["m", "f"] as const) {
     for (let k = 0; k < WALK_DIR_FOLDERS.length; k++) {
       const frames: Texture[] = [];
@@ -315,6 +325,19 @@ export class AmbientLayer {
     this.slotAllocator = slotAllocator ?? new SlotAllocator();
     this.blocked = blocked ?? (() => false);
     this.walkFrames = buildWalkFrameTable(spriteBank);
+  }
+
+  /**
+   * A6 — drop the walk-frame table. Called from PolisRenderer.destroy() ONLY
+   * (the same lifecycle moment as setKitSpriteBank(null)): right after it,
+   * createPolis unloads the bank's Assets urls, so the table's Textures die —
+   * a retained reference would hand any late caller dead GPU backings.
+   * Deliberately NOT part of clear(): clear() runs on every city rebuild
+   * (folder switch), where the bank is still live and the next crowd must
+   * keep its sprites.
+   */
+  dropSpriteBank(): void {
+    this.walkFrames = null;
   }
 
   /**
@@ -926,7 +949,10 @@ export class AmbientLayer {
     if (type === "citizen" && this.walkFrames) {
       spriteSex = rng.bool(0.5) ? "m" : "f";
       sprite = new Sprite(this.walkFrames[spriteSex][2][0]); // south, frame 0
-      sprite.anchor.set(0.5, 1); // feet on the node anchor, like the figure
+      // Feet registration comes from the manifest (via the table), so future
+      // walker art with a non-default anchor stays aligned automatically.
+      const [ax, ay] = this.walkFrames.anchor;
+      sprite.anchor.set(ax, ay);
       sprite.scale.set(WALK_SPRITE_SCALE);
       container.addChild(sprite);
     }

@@ -65,6 +65,8 @@ describe("buildWalkFrameTable", () => {
       expect(table![sex]).toHaveLength(8);
       for (const frames of table![sex]) expect(frames).toHaveLength(4);
     }
+    // Feet registration flows from the manifest (default when unspecified).
+    expect(table!.anchor).toEqual([0.5, 1]);
   });
 
   it("is all-or-nothing: one missing frame voids the whole table", () => {

@@ -3928,6 +3928,9 @@ export class PolisRenderer {
     // destroy; a stale kitBank would hand any later bake textures with a dead
     // GPU backing (black faces). The next constructor sets it fresh.
     setKitSpriteBank(null);
+    // A6 — same contract for the crowd's walk-frame table (its Textures die
+    // with the Assets unload below; never retain them past destroy).
+    this.ambientLayer.dropSpriteBank();
     // L2: detach + destroy the growth-effect pool Graphics BEFORE the effects
     // layer is destroyed below (no removeFromParent leak — the L1 audit caught
     // this exact pattern).
