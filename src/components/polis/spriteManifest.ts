@@ -61,6 +61,7 @@ export const SPRITE_MANIFEST: SpriteManifest = {
   atlases: {
     "fx-0": "/polis/atlas/fx-0.json",
     "prop-0": "/polis/atlas/prop-0.json",
+    "res-0": "/polis/atlas/res-0.json",
     "walk-0": "/polis/atlas/walk-0.json"
   },
   singles: {
@@ -142,6 +143,31 @@ export const SPRITE_MANIFEST: SpriteManifest = {
       atlas: "prop-0",
       foot: [1, 1]
     },
+    "prop:rock:v0": {
+      frame: "prop:rock:v0",
+      atlas: "prop-0",
+      hasBakedShadow: true
+    },
+    "prop:rock:v1": {
+      frame: "prop:rock:v1",
+      atlas: "prop-0",
+      hasBakedShadow: true
+    },
+    "prop:rock:v2": {
+      frame: "prop:rock:v2",
+      atlas: "prop-0",
+      hasBakedShadow: true
+    },
+    "prop:rock:v3": {
+      frame: "prop:rock:v3",
+      atlas: "prop-0",
+      hasBakedShadow: true
+    },
+    "prop:rock:v4": {
+      frame: "prop:rock:v4",
+      atlas: "prop-0",
+      hasBakedShadow: true
+    },
     "prop:tree:v0": {
       frame: "prop:tree:v0",
       atlas: "prop-0",
@@ -161,6 +187,21 @@ export const SPRITE_MANIFEST: SpriteManifest = {
       frame: "prop:tree:v3",
       atlas: "prop-0",
       foot: [1, 1]
+    },
+    "res:mine": {
+      frame: "res:mine",
+      atlas: "res-0",
+      hasBakedShadow: true
+    },
+    "res:quarry:v0": {
+      frame: "res:quarry:v0",
+      atlas: "res-0",
+      hasBakedShadow: true
+    },
+    "res:quarry:v1": {
+      frame: "res:quarry:v1",
+      atlas: "res-0",
+      hasBakedShadow: true
     },
     "walk:citizenf:0:f0": {
       frame: "walk:citizenf:0:f0",

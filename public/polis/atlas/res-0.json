@@ -1,0 +1,73 @@
+{
+  "frames": {
+    "res:mine": {
+      "frame": {
+        "x": 2,
+        "y": 2,
+        "w": 440,
+        "h": 284
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 440,
+        "h": 284
+      },
+      "sourceSize": {
+        "w": 440,
+        "h": 284
+      }
+    },
+    "res:quarry:v0": {
+      "frame": {
+        "x": 716,
+        "y": 2,
+        "w": 270,
+        "h": 135
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 270,
+        "h": 135
+      },
+      "sourceSize": {
+        "w": 270,
+        "h": 135
+      }
+    },
+    "res:quarry:v1": {
+      "frame": {
+        "x": 444,
+        "y": 2,
+        "w": 270,
+        "h": 159
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 270,
+        "h": 159
+      },
+      "sourceSize": {
+        "w": 270,
+        "h": 159
+      }
+    }
+  },
+  "meta": {
+    "image": "res-0.png",
+    "format": "RGBA8888",
+    "size": {
+      "w": 2048,
+      "h": 2048
+    },
+    "scale": "1"
+  }
+}

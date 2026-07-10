@@ -1,0 +1,12 @@
+{
+  "jobs": [
+    { "key": "res:mine", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/mountains/as_mine5x5/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "res:quarry:v0", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/resources/as_stonedeposit0/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "res:quarry:v1", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/buildings/citizens/as_stone_pit0/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "prop:rock:v0", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/ambient/as_rock0/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "prop:rock:v1", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/ambient/as_rock1/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "prop:rock:v2", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/ambient/as_rock2/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "prop:rock:v3", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/ambient/as_rock3/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true },
+    { "key": "prop:rock:v4", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/ambient/as_rock4/idle/45/0.png", "scale": 1.5, "trim": true, "hasBakedShadow": true }
+  ]
+}
