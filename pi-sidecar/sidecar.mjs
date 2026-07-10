@@ -398,23 +398,16 @@ async function main() {
 	const pendingToolPaths = new Map(); // toolCallId → filePath (from tool_execution_start)
 	let isReviewTurn = false;
 
-	// ---- subscribe to all events and forward as JSONL ---------------------
-	session.subscribe(async (event) => {
-		const enriched = {
-			...event,
-			_devboule: {
-				agentRole: devbouleContext.agentRole,
-				projectId: devbouleContext.projectId,
-				sessionId: devbouleContext.sessionId || session?.id,
-			},
-		};
-		// Devboule custom messages: web_search + plan tool results are echoed
-		// back as user-role messages so the Rust EventMapper can inject them
-		// into ConsoleActivity for PlannerPlanMode.
-		//
-		// IMPORTANT: queue these BEFORE forwarding the event to Rust (emit
-		// below). sendMessage must precede emit so the custom message is queued
-		// into the SAME turn's event stream, not delayed to the next turn.
+	// ---- subscribe helpers (close over main() locals) ----------------------
+
+	// Devboule custom messages: web_search + plan tool results are echoed
+	// back as user-role messages so the Rust EventMapper can inject them
+	// into ConsoleActivity for PlannerPlanMode.
+	//
+	// IMPORTANT: queue these BEFORE forwarding the event to Rust (emit
+	// below). sendMessage must precede emit so the custom message is queued
+	// into the SAME turn's event stream, not delayed to the next turn.
+	async function echoDevbouleCustomMessages(event) {
 		if (
 			event.type === "tool_execution_end" &&
 			event.toolName === "web_search"
@@ -458,11 +451,11 @@ async function main() {
 				/* best-effort */
 			}
 		}
+	}
 
-		emit(enriched);
-
-		// Censor hook: capture file path from tool_execution_start args
-		// (tool_execution_end does NOT carry args, only result)
+	// Censor hook: capture file path from tool_execution_start args
+	// (tool_execution_end does NOT carry args, only result)
+	function captureCensorToolPath(event) {
 		if (event.type === "tool_execution_start" && censorEnabled) {
 			if (event.toolName === "write" || event.toolName === "edit") {
 				const fp = event.args?.path;
@@ -471,8 +464,10 @@ async function main() {
 				}
 			}
 		}
+	}
 
-		// Censor hook: on tool end, correlate by toolCallId and extract patch
+	// Censor hook: on tool end, correlate by toolCallId and extract patch
+	function correlateCensorPatch(event) {
 		if (
 			event.type === "tool_execution_end" &&
 			!event.isError &&
@@ -485,7 +480,7 @@ async function main() {
 				//   → result.details.patch (unified diff string)
 				// For write: event.result is AgentToolResult<undefined>
 				//   → no patch available
-				const patch = event.result?.details?.patch;
+				let patch = event.result?.details?.patch;
 				if (patch && patch.length > 10_000) {
 					patch = patch.slice(0, 10_000) + "\n... [truncated to 10KB]";
 				}
@@ -493,8 +488,10 @@ async function main() {
 				console.error("[pi-sidecar] censor: queued", fp);
 			}
 		}
+	}
 
-		// Censor hook: trigger review at agent_end
+	// Censor hook: trigger review at agent_end
+	function handleCensorAgentEnd(event) {
 		if (event.type === "agent_end") {
 			if (isReviewTurn) {
 				isReviewTurn = false;
@@ -504,7 +501,9 @@ async function main() {
 				setTimeout(() => triggerCensorReview(), 0);
 			}
 		}
+	}
 
+	function handleStdinCloseAtAgentEnd(event) {
 		if (stdinClosed && event.type === "agent_end" && !isReviewTurn) {
 			clearTimeout(stdinGraceTimer);
 			// Fix 1: if prompts are queued (arrived while a turn was in flight),
@@ -515,6 +514,24 @@ async function main() {
 				setImmediate(() => cleanup(0));
 			}
 		}
+	}
+
+	// ---- subscribe to all events and forward as JSONL ---------------------
+	session.subscribe(async (event) => {
+		const enriched = {
+			...event,
+			_devboule: {
+				agentRole: devbouleContext.agentRole,
+				projectId: devbouleContext.projectId,
+				sessionId: devbouleContext.sessionId || session?.id,
+			},
+		};
+		await echoDevbouleCustomMessages(event);
+		emit(enriched);
+		captureCensorToolPath(event);
+		correlateCensorPatch(event);
+		handleCensorAgentEnd(event);
+		handleStdinCloseAtAgentEnd(event);
 	});
 
 	// ---- read JSONL commands from stdin -----------------------------------
