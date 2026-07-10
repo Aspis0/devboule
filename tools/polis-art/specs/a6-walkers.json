@@ -1,0 +1,708 @@
+{
+  "jobs": [
+    {
+      "key": "walk:citizenm:0:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/0/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:0:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/0/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:0:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/0/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:0:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/0/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:45:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/45/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:45:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/45/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:45:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/45/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:45:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/45/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:90:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/90/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:90:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/90/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:90:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/90/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:90:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/90/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:135:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/135/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:135:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/135/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:135:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/135/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:135:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/135/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:180:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/180/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:180:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/180/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:180:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/180/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:180:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/180/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:225:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/225/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:225:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/225/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:225:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/225/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:225:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/225/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:270:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/270/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:270:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/270/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:270:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/270/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:270:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/270/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:315:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/315/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:315:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/315/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:315:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/315/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenm:315:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenmale0/move/315/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:0:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/0/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:0:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/0/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:0:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/0/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:0:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/0/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:45:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/45/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:45:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/45/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:45:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/45/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:45:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/45/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:90:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/90/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:90:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/90/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:90:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/90/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:90:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/90/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:135:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/135/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:135:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/135/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:135:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/135/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:135:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/135/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:180:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/180/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:180:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/180/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:180:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/180/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:180:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/180/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:225:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/225/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:225:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/225/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:225:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/225/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:225:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/225/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:270:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/270/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:270:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/270/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:270:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/270/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:270:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/270/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:315:f0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/315/0001.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:315:f1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/315/0002.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:315:f2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/315/0003.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    },
+    {
+      "key": "walk:citizenf:315:f3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/units/inhabitant/citizen/as_citizenfemale0/move/315/0004.png",
+      "trim": false,
+      "anchor": [
+        0.5,
+        1.0
+      ],
+      "hasBakedShadow": true
+    }
+  ]
+}

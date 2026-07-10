@@ -749,7 +749,15 @@ export class PolisRenderer {
     // city.agents.
     const ambientContainer = new Container();
     this.layers.crowd.addChild(ambientContainer);
-    this.ambientLayer = new AmbientLayer(ambientContainer, sharedSlotAllocator);
+    // A6 — hand the sprite bank down so the anonymous crowd can walk with the
+    // real UH cycles (no blocked() override here: the historical default —
+    // nothing blocked — is kept by passing undefined).
+    this.ambientLayer = new AmbientLayer(
+      ambientContainer,
+      sharedSlotAllocator,
+      undefined,
+      this.spriteBank,
+    );
 
     // Trade-route porters: built directly on their dedicated `tradeRoutes`
     // layer (above road cobble, below buildings — see the layer declaration for

@@ -59,7 +59,8 @@ export interface SpriteManifest {
 export const SPRITE_MANIFEST: SpriteManifest = {
   version: 1,
   atlases: {
-    "prop-0": "/polis/atlas/prop-0.json"
+    "prop-0": "/polis/atlas/prop-0.json",
+    "walk-0": "/polis/atlas/walk-0.json"
   },
   singles: {
     "tex:ashlar": "/polis/atlas/tex__ashlar.png",
@@ -112,6 +113,326 @@ export const SPRITE_MANIFEST: SpriteManifest = {
       frame: "prop:tree:v3",
       atlas: "prop-0",
       foot: [1, 1]
+    },
+    "walk:citizenf:0:f0": {
+      frame: "walk:citizenf:0:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:0:f1": {
+      frame: "walk:citizenf:0:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:0:f2": {
+      frame: "walk:citizenf:0:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:0:f3": {
+      frame: "walk:citizenf:0:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:135:f0": {
+      frame: "walk:citizenf:135:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:135:f1": {
+      frame: "walk:citizenf:135:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:135:f2": {
+      frame: "walk:citizenf:135:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:135:f3": {
+      frame: "walk:citizenf:135:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:180:f0": {
+      frame: "walk:citizenf:180:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:180:f1": {
+      frame: "walk:citizenf:180:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:180:f2": {
+      frame: "walk:citizenf:180:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:180:f3": {
+      frame: "walk:citizenf:180:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:225:f0": {
+      frame: "walk:citizenf:225:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:225:f1": {
+      frame: "walk:citizenf:225:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:225:f2": {
+      frame: "walk:citizenf:225:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:225:f3": {
+      frame: "walk:citizenf:225:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:270:f0": {
+      frame: "walk:citizenf:270:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:270:f1": {
+      frame: "walk:citizenf:270:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:270:f2": {
+      frame: "walk:citizenf:270:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:270:f3": {
+      frame: "walk:citizenf:270:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:315:f0": {
+      frame: "walk:citizenf:315:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:315:f1": {
+      frame: "walk:citizenf:315:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:315:f2": {
+      frame: "walk:citizenf:315:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:315:f3": {
+      frame: "walk:citizenf:315:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:45:f0": {
+      frame: "walk:citizenf:45:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:45:f1": {
+      frame: "walk:citizenf:45:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:45:f2": {
+      frame: "walk:citizenf:45:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:45:f3": {
+      frame: "walk:citizenf:45:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:90:f0": {
+      frame: "walk:citizenf:90:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:90:f1": {
+      frame: "walk:citizenf:90:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:90:f2": {
+      frame: "walk:citizenf:90:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenf:90:f3": {
+      frame: "walk:citizenf:90:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:0:f0": {
+      frame: "walk:citizenm:0:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:0:f1": {
+      frame: "walk:citizenm:0:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:0:f2": {
+      frame: "walk:citizenm:0:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:0:f3": {
+      frame: "walk:citizenm:0:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:135:f0": {
+      frame: "walk:citizenm:135:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:135:f1": {
+      frame: "walk:citizenm:135:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:135:f2": {
+      frame: "walk:citizenm:135:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:135:f3": {
+      frame: "walk:citizenm:135:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:180:f0": {
+      frame: "walk:citizenm:180:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:180:f1": {
+      frame: "walk:citizenm:180:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:180:f2": {
+      frame: "walk:citizenm:180:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:180:f3": {
+      frame: "walk:citizenm:180:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:225:f0": {
+      frame: "walk:citizenm:225:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:225:f1": {
+      frame: "walk:citizenm:225:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:225:f2": {
+      frame: "walk:citizenm:225:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:225:f3": {
+      frame: "walk:citizenm:225:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:270:f0": {
+      frame: "walk:citizenm:270:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:270:f1": {
+      frame: "walk:citizenm:270:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:270:f2": {
+      frame: "walk:citizenm:270:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:270:f3": {
+      frame: "walk:citizenm:270:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:315:f0": {
+      frame: "walk:citizenm:315:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:315:f1": {
+      frame: "walk:citizenm:315:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:315:f2": {
+      frame: "walk:citizenm:315:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:315:f3": {
+      frame: "walk:citizenm:315:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:45:f0": {
+      frame: "walk:citizenm:45:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:45:f1": {
+      frame: "walk:citizenm:45:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:45:f2": {
+      frame: "walk:citizenm:45:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:45:f3": {
+      frame: "walk:citizenm:45:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:90:f0": {
+      frame: "walk:citizenm:90:f0",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:90:f1": {
+      frame: "walk:citizenm:90:f1",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:90:f2": {
+      frame: "walk:citizenm:90:f2",
+      atlas: "walk-0",
+      hasBakedShadow: true
+    },
+    "walk:citizenm:90:f3": {
+      frame: "walk:citizenm:90:f3",
+      atlas: "walk-0",
+      hasBakedShadow: true
     }
   }
 };

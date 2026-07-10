@@ -22,7 +22,7 @@
 // LOD-gated: hidden when zoomed far out. Routes are computed only when a citizen
 // actually picks a new destination, never per frame.
 
-import { Container, Graphics, Rectangle } from "pixi.js";
+import { Container, Graphics, Rectangle, Sprite, type Texture } from "pixi.js";
 import { type IsoPoint, isoToCart } from "./iso";
 import { Rng, rngFromString, hashString } from "./rng";
 import { SlotAllocator, buildSafeSplineLeg, laneOffset, applyPerpendicularOffset, directedLaneOffset, type IPoint, type SafeSplineLeg } from "./locomotion";
@@ -33,10 +33,64 @@ import {
   shadeColor,
   type CitizenType,
 } from "./kitcd/people";
+import type { SpriteBank } from "./spriteAssets";
 
 // Match AgentLayer so ambient citizens and real agents read at the same size.
 const FIGURE_SCALE = 0.55;
 const OMINO_Y_OFFSET = -4;
+
+// A6 — real UH walk-cycle sprites for the ANONYMOUS crowd ("citizen" type
+// only). Role-typed ambients (watercarrier/builder/firefighter/noble) keep the
+// procedural figures: their accessories (yoke, hammer, bucket) are semantic —
+// they visually pre-announce the claimable roles — and the UH set has no
+// equivalents. 8 directions × 4 frames per sex; textures resolved ONCE at
+// construction into a lookup array so the per-step swap allocates nothing.
+//
+// Direction convention (read off the UH frames): folder = compass with 0=W,
+// 90=N, 180=E, 270=S. Screen movement angle θ (atan2(dy,dx), y-down) maps to
+// folder (180+θ) mod 360 — bucket k = round(θ/45) mod 8 indexes this table.
+const WALK_DIR_FOLDERS = [180, 225, 270, 315, 0, 45, 90, 135] as const;
+const WALK_FRAMES = 4;
+// UH citizen canvas is 24×40 (figure ~34px + baked shadow); the procedural
+// figure is ~23px at FIGURE_SCALE 0.55 ≈ 13px. 0.42 lands the sprite at a
+// matching on-screen height.
+const WALK_SPRITE_SCALE = 0.42;
+/** Per-sex direction×frame texture table (null ⇒ procedural fallback). */
+type WalkFrameTable = { m: Texture[][]; f: Texture[][] } | null;
+
+/**
+ * A6 — direction bucket (0..7 into WALK_DIR_FOLDERS) for a screen-space
+ * movement delta (y-down). Pure so the octant math is unit-testable: bucket 0
+ * = east, 2 = south (toward the camera), 4 = west, 6 = north.
+ */
+export function walkDirBucket(dx: number, dy: number): number {
+  const theta = Math.atan2(dy, dx);
+  return ((Math.round(theta / (Math.PI / 4)) % 8) + 8) % 8;
+}
+
+/**
+ * Resolve the crowd walk-cycle textures from the bank ONCE. Returns null (⇒
+ * every walker stays procedural) unless BOTH sexes have ALL 8×4 frames — a
+ * partial set would leave some directions frozen mid-stride.
+ */
+export function buildWalkFrameTable(
+  bank: SpriteBank | null | undefined,
+): WalkFrameTable {
+  if (!bank) return null;
+  const out: { m: Texture[][]; f: Texture[][] } = { m: [], f: [] };
+  for (const sex of ["m", "f"] as const) {
+    for (let k = 0; k < WALK_DIR_FOLDERS.length; k++) {
+      const frames: Texture[] = [];
+      for (let f = 0; f < WALK_FRAMES; f++) {
+        const tex = bank.get(`walk:citizen${sex}:${WALK_DIR_FOLDERS[k]}:f${f}`);
+        if (!tex) return null;
+        frames.push(tex);
+      }
+      out[sex].push(frames);
+    }
+  }
+  return out;
+}
 
 // Strolling pace — deliberately slower than agents (70px/s) so the crowd
 // ambles rather than marches.
@@ -112,6 +166,13 @@ interface Walker {
   container: Container;
   /** The figure Graphics, cleared + redrawn each visible step. */
   base: Graphics;
+  /** A6 — UH walk-cycle sprite (anonymous "citizen" type only; null ⇒ the
+   *  procedural drawCitizen path). Texture swapped per step, never redrawn. */
+  sprite: Sprite | null;
+  /** A6 — which sex's frame table drives `sprite` ("m" | "f"). */
+  spriteSex: "m" | "f";
+  /** A6 — current direction bucket (0..7) into WALK_DIR_FOLDERS. */
+  dirIdx: number;
   /** Current ISO anchor (feet) of the citizen. */
   pos: IsoPoint;
   /** Building node the citizen is standing at / last departed from. */
@@ -241,10 +302,19 @@ export class AmbientLayer {
   // prefer. A subset of `nodeIds`; empty when the city has none. Scenery only.
   private forumNodeIds: string[] = [];
 
-  constructor(root: Container, slotAllocator?: SlotAllocator, blocked?: (gx: number, gy: number) => boolean) {
+  // A6 — prebuilt walk-cycle texture table (null ⇒ all-procedural crowd).
+  private walkFrames: WalkFrameTable = null;
+
+  constructor(
+    root: Container,
+    slotAllocator?: SlotAllocator,
+    blocked?: (gx: number, gy: number) => boolean,
+    spriteBank?: SpriteBank | null,
+  ) {
     this.root = root;
     this.slotAllocator = slotAllocator ?? new SlotAllocator();
     this.blocked = blocked ?? (() => false);
+    this.walkFrames = buildWalkFrameTable(spriteBank);
   }
 
   /**
@@ -525,12 +595,25 @@ export class AmbientLayer {
       }
       if (moving) w.phase += 0.6; // legs/arms swing while strolling
       w.container.position.y = w.pos.y + OMINO_Y_OFFSET + bob + yShift;
-      drawCitizen(w.base, w.type, {
-        moving, // false for idle variants (no leg swing)
-        phase: drawPhase,
-        actionPhase: 0, // ambient citizens never perform actions
-        tunic: w.tunic,
-      });
+      if (w.sprite && this.walkFrames) {
+        // A6 — sprite crowd: swap the walk-cycle frame (phase advances 0.6 per
+        // step ⇒ one frame per step tick), direction from the current route
+        // leg (dirIdx, updated in advanceWalk). Idle stands on frame 0. A
+        // texture assignment is a reference swap — no allocation, no redraw.
+        const frames = this.walkFrames[w.spriteSex][w.dirIdx];
+        const frame = moving
+          ? Math.floor(w.phase / 0.6) % WALK_FRAMES
+          : 0;
+        const tex = frames[frame];
+        if (w.sprite.texture !== tex) w.sprite.texture = tex;
+      } else {
+        drawCitizen(w.base, w.type, {
+          moving, // false for idle variants (no leg swing)
+          phase: drawPhase,
+          actionPhase: 0, // ambient citizens never perform actions
+          tunic: w.tunic,
+        });
+      }
     }
   }
 
@@ -715,6 +798,15 @@ export class AmbientLayer {
 
   private faceTowards(w: Walker, a: IsoPoint, b: IsoPoint): void {
     const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    // A6 — sprite walkers encode direction in the FRAME (8 real facings), so
+    // the container must never mirror (scale.x stays 1; a flip would swap
+    // left/right facings AND mirror the baked shadow). Procedural figures
+    // keep the classic 2-way mirror.
+    if (w.sprite) {
+      if (dx * dx + dy * dy > 1e-4) w.dirIdx = walkDirBucket(dx, dy);
+      return;
+    }
     if (dx > 0.01) w.facing = 1;
     else if (dx < -0.01) w.facing = -1;
     w.container.scale.x = w.facing;
@@ -722,7 +814,7 @@ export class AmbientLayer {
 
   private applyTransform(w: Walker): void {
     w.container.position.set(w.pos.x, w.pos.y + OMINO_Y_OFFSET);
-    w.container.scale.x = w.facing;
+    if (!w.sprite) w.container.scale.x = w.facing;
   }
 
   /** Seeded pause duration for the next idle stop. Forum lingerers mill — they
@@ -825,6 +917,19 @@ export class AmbientLayer {
     const base = new Graphics();
     base.scale.set(FIGURE_SCALE);
     container.addChild(base);
+
+    // A6 — the anonymous "citizen" walks with a real UH sprite when the full
+    // frame table resolved; every role-typed walker (and the whole crowd when
+    // the bank is absent) stays on the procedural drawCitizen path.
+    let sprite: Sprite | null = null;
+    let spriteSex: "m" | "f" = "m";
+    if (type === "citizen" && this.walkFrames) {
+      spriteSex = rng.bool(0.5) ? "m" : "f";
+      sprite = new Sprite(this.walkFrames[spriteSex][2][0]); // south, frame 0
+      sprite.anchor.set(0.5, 1); // feet on the node anchor, like the figure
+      sprite.scale.set(WALK_SPRITE_SCALE);
+      container.addChild(sprite);
+    }
     this.root.addChild(container);
 
     const phase = rng.float() * Math.PI * 2;
@@ -839,6 +944,9 @@ export class AmbientLayer {
       tunic,
       container,
       base,
+      sprite,
+      spriteSex,
+      dirIdx: 2, // south (toward the camera) until the first stroll
       pos: { x: pos.x, y: pos.y },
       nodeId,
       phase,
@@ -853,7 +961,10 @@ export class AmbientLayer {
       laneOff,
       state: { kind: "idle", remainingMs: opts.remainingMs },
     };
-    drawCitizen(base, type, { moving: false, phase, actionPhase: 0, tunic });
+    // Sprite walkers never draw into `base` (it stays an empty Graphics).
+    if (!sprite) {
+      drawCitizen(base, type, { moving: false, phase, actionPhase: 0, tunic });
+    }
     return w;
   }
 
