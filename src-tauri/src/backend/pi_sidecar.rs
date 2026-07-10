@@ -2510,12 +2510,10 @@ fn extract_pages(results: &serde_json::Value) -> Vec<PageEntry> {
 // ---- Phase 2 Pigeon control commands ------------------------------------
 
 /// Phase 2: handle a JSONL *control command* the sidecar emits on its stdout
-/// (`classify_prompt`, `redirect_to_claude`) before it is mistaken for a pi SDK
-/// event. Returns `true` if the line was a control command (and consumed);
-/// `false` lets the caller fall through to normal pi event parsing.
+/// (`classify_prompt`) before it is mistaken for a pi SDK event. Returns `true`
+/// if the line was a control command (and consumed); `false` lets the caller
+/// fall through to normal pi event parsing.
 fn handle_control_line(
-    app: &AppHandle,
-    agent_id: &str,
     line: &str,
     stdin: &Arc<Mutex<ChildStdin>>,
 ) -> bool {
@@ -2529,43 +2527,16 @@ fn handle_control_line(
     };
     match t {
         "classify_prompt" => {
-            // Non-blocking: classification is pure + fast, so the `classified`
-            // response is written back to the sidecar's stdin BEFORE the
-            // session.prompt() begins (the sidecar awaits it first).
-            //
-            // Phase 2: AgentPath routing only. Full multi-tier model switching
-            // (vault-aware tier resolution) deferred to Phase 3 — the sidecar's
-            // spawn-time minimal models.json can't resolve every classified
-            // (provider, model) pair, so `setModel` is deferred there.
+            // Pigeon-ON only: classify + return tier/provider/model for the sidecar.
             let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            let c = crate::backend::prompt_routing::classify_prompt_full(text, app);
+            let c = crate::backend::prompt_routing::classify_prompt_full(text);
             let response = serde_json::json!({
                 "type": "classified",
                 "tier": c.tier,
                 "provider": c.provider,
                 "model": c.model,
-                "path": c.path,
             });
             write_jsonl_to_stdin(stdin, &response);
-            true
-        }
-        "redirect_to_claude" => {
-            // path == Terminal: the sidecar declined to run this in pi and asked
-            // Rust to route it to the legacy Claude-terminal subprocess.
-            // TODO (Phase 3): spawn/route `message` to the existing Claude-terminal
-            // subprocess (decision #10). Spike: log it and surface a Tauri event
-            // so the frontend can later show the redirect.
-            let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
-            let truncated: String = message.chars().take(60).collect();
-            let suffix = if message.chars().count() > 60 { "…" } else { "" };
-            eprintln!(
-                "[pi-sidecar] Pigeon: path=Terminal redirect_to_claude: {}{}",
-                truncated, suffix
-            );
-            let _ = app.emit(
-                &format!("pigeon-redirect://{agent_id}"),
-                serde_json::json!({ "message": message }),
-            );
             true
         }
         _ => false,
@@ -2770,9 +2741,8 @@ fn read_sidecar_events(
         }
         // Phase 2 Pigeon: intercept control commands BEFORE treating the line as
         // a pi SDK event. `classify_prompt` → respond with `classified` on the
-        // sidecar's stdin; `redirect_to_claude` → log + emit a Tauri event
-        // (full routing to the Claude-terminal subprocess is deferred to Phase 3).
-        if handle_control_line(&app, agent_id, &line, &stdin) {
+        // sidecar's stdin.
+        if handle_control_line(&line, &stdin) {
             continue;
         }
         match serde_json::from_str::<PiEvent>(&line) {

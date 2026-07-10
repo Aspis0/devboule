@@ -153,7 +153,7 @@ let pendingClassification = null;
 
 /**
  * Emit a `classify_prompt` request to the Rust sidecar and await its `classified`
- * response (delivered on our stdin). Resolves with { tier, provider, model, path }.
+ * response (delivered on our stdin). Resolves with { tier, provider, model }.
  */
 function requestClassification(text) {
 	return new Promise((resolve, reject) => {
@@ -164,7 +164,6 @@ function requestClassification(text) {
 			tier: "default",
 			provider: null,
 			model: null,
-			path: "pi",
 		};
 		const timeout = setTimeout(() => {
 			console.error(
@@ -189,7 +188,7 @@ function requestClassification(text) {
 async function applyPigeonRouting(session, modelRegistry, classification) {
 	const { tier, provider, model } = classification;
 	console.error(
-		`[pi-sidecar] Pigeon: tier=${tier} provider=${provider} model=${model} path=${classification.path}`,
+		`[pi-sidecar] Pigeon: tier=${tier} provider=${provider} model=${model}`,
 	);
 	// Defensive null-guard: keep the session model if the classification target is
 	// null/undefined (e.g. the 5s timeout-fallback default where provider/model are
@@ -222,8 +221,7 @@ async function applyPigeonRouting(session, modelRegistry, classification) {
 
 /**
  * Phase 2 Pigeon: classify the prompt via Rust (await the `classified` response),
- * then either redirect to the Claude-terminal subprocess (path === "terminal")
- * or apply the tier→model routing and run the turn in pi.
+ * then apply the tier→model routing and run the turn in pi.
  */
 export async function handlePromptCommand(cmd, session, modelRegistry, pigeonEnabled = false) {
 	if (!pigeonEnabled) {
@@ -237,24 +235,7 @@ export async function handlePromptCommand(cmd, session, modelRegistry, pigeonEna
 	}
 
 	const classification = await requestClassification(cmd.message);
-	// Phase 2: AgentPath routing only. Full multi-tier model switching
-	// (vault-aware tier resolution) deferred to Phase 3 — the spawn-time minimal
-	// models.json can't resolve every classified model, so setModel is deferred.
-	console.error(
-		`[pi-sidecar] Pigeon routing: path=${classification.path}, model switching deferred (Phase 3)`,
-	);
-	if (classification.path === "terminal") {
-		// Route to the legacy Claude-terminal subprocess (decision #10): skip
-		// session.prompt() and let Rust handle the redirect.
-		emit({ type: "redirect_to_claude", message: cmd.message });
-		emit({
-			type: "response",
-			command: "prompt",
-			success: true,
-			routed: "terminal",
-		});
-		return;
-	}
+	// Pigeon ON: apply tier→model routing, then run the turn.
 	await applyPigeonRouting(session, modelRegistry, classification);
 	await session.prompt(cmd.message, {
 		streamingBehavior: cmd.streamingBehavior,

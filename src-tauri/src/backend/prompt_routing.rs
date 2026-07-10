@@ -2,7 +2,7 @@
 //!
 //! Routing intelligence lives in Rust (design doc §11 #3, decision #3): the pi
 //! sidecar's `before_agent_start` hook asks Rust to classify a prompt and gets
-//! back `{ tier, provider, model, path }`. This module owns the heuristic
+//! back `{ tier, provider, model }`. This module owns the heuristic
 //! classifier + the tier→provider/model table.
 //!
 //! Deliberately NOT in scope yet (explicit TODO markers):
@@ -17,7 +17,6 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
 
 /// Prompt complexity tier (Phase 2). Extends [`crate::backend::mini_coder::DirectiveTier`]
 /// (plan-level Mini|Main) onto the prompt level: how much model to spend.
@@ -32,17 +31,6 @@ pub enum PromptTier {
     Expensive,
 }
 
-/// Which runtime executes the prompt (Phase 2, decision #10: Claude is blocked
-/// inside pi, so Claude routes to the legacy terminal subprocess).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AgentPath {
-    /// The pi sidecar (non-Claude agents).
-    Pi,
-    /// The legacy Claude-terminal subprocess.
-    Terminal,
-}
-
 /// Classification result returned by the Tauri command + the JSONL `classified`
 /// response. JSON-serializable (camelCase).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +39,6 @@ pub struct Classification {
     pub tier: PromptTier,
     pub provider: String,
     pub model: String,
-    pub path: AgentPath,
 }
 
 // ---- heuristic classifier (multi-factor weighted scorer) -----------------
@@ -248,149 +235,28 @@ pub fn classify_prompt(text: &str) -> PromptTier {
     score_to_tier(classify_capability_needed(text))
 }
 
-// ---- vault cache (fix #4) --------------------------------------------------
-
-/// Cached `LocalCoderBackend` read. [`read_local_coder_backend`](crate::backend::projects::read_local_coder_backend)
-/// does a synchronous file read + JSON parse; classifying every prompt (per-turn via
-/// [`resolve_tier`]) was paying that cost on every call. The backend almost never changes
-/// mid-session, so we cache it on first read — see [`invalidate_local_coder_cache`].
-static CACHED_LOCAL_CODER: OnceLock<Option<crate::backend::local_coder::LocalCoderBackend>> =
-    OnceLock::new();
-
-fn cached_local_coder_backend(
-    app: &AppHandle,
-) -> Option<crate::backend::local_coder::LocalCoderBackend> {
-    CACHED_LOCAL_CODER
-        .get_or_init(|| crate::backend::projects::read_local_coder_backend(app))
-        .clone()
-}
-
-/// Invalidate the cached [`LocalCoderBackend`]. Spike: the cache is populated on first read
-/// and held for the process lifetime. TODO (Phase 3): call this from the config-save path
-/// whenever the local coder backend changes (swap `OnceLock` for a `Mutex`/`RwLock` so it
-/// can actually be cleared).
-pub fn invalidate_local_coder_cache() {}
-
-// ---- agent path decision (decision #10) -----------------------------------
-
-/// Decide the pi-vs-terminal axis (decision #10). A Claude model configured in the
-/// vault Cloud coder backend is the PRIMARY signal: when that backend model contains
-/// "claude", route to the Terminal path (Claude is blocked inside pi, decision #10).
-/// Only when the vault has no Claude do we fall through to the text heuristic (an
-/// explicit "use claude" request).
-pub fn decide_agent_path(text: &str, _tier: PromptTier, app: &AppHandle) -> AgentPath {
-    // Decision #10: vault Cloud backend configured with a Claude model ⇒ Terminal.
-    use crate::backend::local_coder::LocalCoderBackendKind;
-    if let Some(backend) = cached_local_coder_backend(app) {
-        if backend.kind == LocalCoderBackendKind::Cloud {
-            if let Some(model) = &backend.model {
-                if model.to_ascii_lowercase().contains("claude") {
-                    return AgentPath::Terminal;
-                }
-            }
-        }
-    }
-    decide_agent_path_text(text)
-}
-
-/// Pure text heuristic for the pi-vs-terminal decision (no vault access). Used as the
-/// fall-through when the vault has no Claude configured. Conservative on purpose so we
-/// never mis-route on an incidental "claude" mention.
-pub fn decide_agent_path_text(text: &str) -> AgentPath {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)\buse claude\b").unwrap());
-    if re.is_match(text) {
-        AgentPath::Terminal
-    } else {
-        AgentPath::Pi
-    }
-}
-
 // ---- tier table -----------------------------------------------------------
 
-/// Pure tier→(provider, model) defaults, no vault. Used by unit tests and as the
-/// spike-time fallback. Matches the vault conventions: local oMLX/Ollama is
-/// exposed to pi as the `openai` loopback provider; free cloud = openrouter/
-/// tencent/hy3:free. For `Terminal`, returns the Claude model (override via the
-/// `CLAUDE_MODEL` env var if set).
-pub fn resolve_tier_defaults(tier: PromptTier, path: AgentPath) -> (String, String) {
-    match path {
-        AgentPath::Terminal => (
-            "claude".to_string(),
-            std::env::var("CLAUDE_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
-        ),
-        AgentPath::Pi => match tier {
-            PromptTier::Cheap => ("openai".to_string(), "qwen2.5-coder:7b".to_string()),
-            PromptTier::Moderate => ("openrouter".to_string(), "tencent/hy3:free".to_string()),
-            // TODO (Phase 3): bandit-tuned tier→provider/model; default to a
-            // real openrouter model until the vault cloud coder backend is read.
-            PromptTier::Expensive => ("openrouter".to_string(), "openai/gpt-4o".to_string()),
-        },
+/// Pigeon-ON fallback table: pure tier→(provider, model) defaults.
+/// Used by unit tests and as the spike-time fallback when Pigeon routing is enabled.
+pub fn resolve_tier_defaults(tier: PromptTier) -> (String, String) {
+    match tier {
+        PromptTier::Cheap => ("openai".to_string(), "qwen2.5-coder:7b".to_string()),
+        // TODO(Phase 3): bandit-tuned tier→provider/model; these cloud defaults
+        // only apply when Pigeon is ENABLED.
+        PromptTier::Moderate => ("openrouter".to_string(), "tencent/hy3:free".to_string()),
+        PromptTier::Expensive => ("openrouter".to_string(), "openai/gpt-4o".to_string()),
     }
 }
 
-/// Vault-aware tier→(provider, model). Reuses the `LocalCoderBackend` (Step 1)
-/// for the local Cheap model and the cloud coder backend for Expensive; falls
-/// back to [`resolve_tier_defaults`] when the vault has nothing configured.
-///
-/// TODO (Phase 3): replace the hardcoded Moderate/Expensive defaults with the
-/// self-learning bandit-tuned threshold (design doc §9/#3).
-pub fn resolve_tier(tier: PromptTier, path: AgentPath, app: &AppHandle) -> (String, String) {
-    match path {
-        AgentPath::Terminal => resolve_tier_defaults(tier, AgentPath::Terminal),
-        AgentPath::Pi => {
-            use crate::backend::local_coder::LocalCoderBackendKind;
-            let local = cached_local_coder_backend(app);
-            match tier {
-                PromptTier::Cheap => {
-                    if let Some(backend) = local {
-                        if matches!(
-                            backend.kind,
-                            LocalCoderBackendKind::Omlx | LocalCoderBackendKind::Ollama
-                        ) {
-                            let (_, model) =
-                                crate::backend::local_coder::resolve_omlx_env(&backend);
-                            let model = if model.is_empty() {
-                                "qwen2.5-coder:7b"
-                            } else {
-                                &model
-                            };
-                            return ("openai".to_string(), model.to_string());
-                        }
-                    }
-                    resolve_tier_defaults(PromptTier::Cheap, AgentPath::Pi)
-                }
-                PromptTier::Moderate => resolve_tier_defaults(PromptTier::Moderate, AgentPath::Pi),
-                PromptTier::Expensive => {
-                    if let Some(backend) = local {
-                        if backend.kind == LocalCoderBackendKind::Cloud {
-                            let (_, model) =
-                                crate::backend::local_coder::resolve_cloud_env(&backend);
-                            if !model.is_empty() {
-                                return ("openrouter".to_string(), model);
-                            }
-                        }
-                    }
-                    resolve_tier_defaults(PromptTier::Expensive, AgentPath::Pi)
-                }
-            }
-        }
-    }
-}
-
-/// Full classification used by the JSONL protocol (`classified` response) using
-/// the pure defaults. The Tauri command additionally applies vault overrides
-/// via [`resolve_tier`]; this is the no-config fallback they share.
-pub fn classify_prompt_full(text: &str, app: &AppHandle) -> Classification {
+/// Full classification used by the JSONL protocol (`classified` response).
+pub fn classify_prompt_full(text: &str) -> Classification {
     let tier = classify_prompt(text);
-    let path = decide_agent_path(text, tier, app);
-    let (provider, model) = resolve_tier_defaults(tier, path);
+    let (provider, model) = resolve_tier_defaults(tier);
     Classification {
         tier,
         provider,
         model,
-        path,
     }
 }
 
@@ -449,40 +315,16 @@ that the panel scrolls if the window is short.";
     }
 
     #[test]
-    fn resolve_tier_terminal_returns_claude() {
-        // Terminal path → Claude model (the 4th required test: terminal path).
-        let (provider, model) = resolve_tier_defaults(PromptTier::Expensive, AgentPath::Terminal);
-        assert_eq!(provider, "claude");
-        assert!(
-            model.starts_with("claude"),
-            "expected a claude model, got {model}"
-        );
-    }
-
-    #[test]
     fn classify_prompt_command_returns_cheap_local_provider() {
-        // Exercises the classification + default-resolution core without needing
-        // an AppHandle: Cheap ⇒ local loopback provider (openai) + qwen model.
+        // Cheap ⇒ local loopback provider (openai) + qwen model (Pigeon-ON fallback).
         let tier = classify_prompt("fix typo in main.rs");
-        let path = decide_agent_path_text("fix typo in main.rs");
         assert_eq!(tier, PromptTier::Cheap);
-        assert_eq!(path, AgentPath::Pi);
-        let (provider, model) = resolve_tier_defaults(tier, path);
+        let (provider, model) = resolve_tier_defaults(tier);
         assert_eq!(
             provider, "openai",
             "Cheap must route to the local loopback provider"
         );
         assert_eq!(model, "qwen2.5-coder:7b");
-    }
-
-    #[test]
-    fn decide_agent_path_use_claude_terminal() {
-        // Text heuristic only (no vault). "use claude" ⇒ Terminal; otherwise Pi.
-        assert_eq!(
-            decide_agent_path_text("use claude to review this"),
-            AgentPath::Terminal
-        );
-        assert_eq!(decide_agent_path_text("fix typo in main.rs"), AgentPath::Pi);
     }
 
     #[test]
