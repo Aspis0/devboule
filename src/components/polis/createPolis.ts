@@ -26,6 +26,13 @@ import type {
 } from "../../types/city";
 import { PolisRenderer, type BuildProgress } from "./PolisRenderer";
 import {
+  defaultAtlasLoader,
+  defaultTextureLoader,
+  loadPolisSprites,
+  spritesDisabled,
+  type SpriteBank,
+} from "./spriteAssets";
+import {
   profileFor,
   type RenderProfile,
   type HardwareInfo,
@@ -132,6 +139,19 @@ export async function createPolis(
       `gpu=${hardware?.gpuName ?? "unknown"} kind=${hardware?.gpuKind ?? "unknown"}`,
   );
 
+  // A3 — kick off the real-art sprite load NOW so it overlaps app.init (both
+  // are network/GPU-bound). Bounded by a soft timeout: art is an enhancement,
+  // never worth stalling the city mount — late/failed ⇒ null ⇒ procedural kit.
+  const spriteBankPromise: Promise<SpriteBank | null> = loadPolisSprites({
+    loader: defaultAtlasLoader,
+    textureLoader: defaultTextureLoader,
+    disabled:
+      typeof location !== "undefined" && spritesDisabled(location.search),
+  }).catch((err) => {
+    console.warn("[polis] sprite load failed — staying procedural", err);
+    return null;
+  });
+
   const app = new Application();
   polisDebug(
     `createPolis: app.init start (host ${host.clientWidth}x${host.clientHeight}, dpr=${window.devicePixelRatio})`,
@@ -178,6 +198,17 @@ export async function createPolis(
   // The viewport itself is the root container the renderer attaches layers to.
   app.stage.addChild(viewport as unknown as Container);
 
+  // A3 — resolve the sprite bank before the renderer exists (draw paths read
+  // it synchronously). 3s cap: local bundled fetches resolve in ms; the cap
+  // only guards a pathological asset server so the city never mounts late.
+  const spriteBank = await Promise.race([
+    spriteBankPromise,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+  ]);
+  polisDebug(
+    `createPolis: sprite bank ${spriteBank ? `loaded (${spriteBank.size} sprites)` : "absent — procedural"}`,
+  );
+
   const renderer = new PolisRenderer(
     app,
     viewport,
@@ -191,6 +222,7 @@ export async function createPolis(
     // B2c — thread the chosen profile (+ raw hardware for the PROFILE debug line).
     profile,
     hardware,
+    spriteBank,
   );
 
   // Drive per-frame agent animation.

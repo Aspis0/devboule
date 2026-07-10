@@ -29,12 +29,14 @@ import {
   Application,
   Container,
   Graphics,
+  Matrix,
   Sprite,
   Text,
   TextStyle,
   Rectangle,
   FillGradient,
 } from "pixi.js";
+import type { SpriteBank } from "./spriteAssets";
 import { Viewport } from "pixi-viewport";
 import type {
   CityState,
@@ -668,6 +670,8 @@ export class PolisRenderer {
   private haloSprites = new Map<string, import('pixi.js').Sprite>();
   private onResize: (() => void) | null = null;
   private onBackgroundTap: (() => void) | null = null;
+  // A3 — real-art sprite bank; null means every draw path stays procedural.
+  private spriteBank: SpriteBank | null = null;
 
   constructor(
     app: Application,
@@ -675,10 +679,15 @@ export class PolisRenderer {
     callbacks: PolisRendererCallbacks = {},
     profile?: RenderProfile,
     hardware?: HardwareInfo | null,
+    spriteBank: SpriteBank | null = null,
   ) {
     this.app = app;
     this.viewport = viewport;
     this.callbacks = callbacks;
+    // A3 — real-art sprite bank (null ⇒ fully procedural). Resolved by
+    // createPolis BEFORE construction so every draw path can consult it
+    // synchronously; per-feature fallback happens at each texFill/get site.
+    this.spriteBank = spriteBank;
 
     // B2c — adopt the chosen render profile (or the safe MIDDLE default when none
     // is supplied: `profileFor(null)` returns the lean tier). Seed the per-instance
@@ -2388,7 +2397,7 @@ export class PolisRenderer {
   }
 
   private drawTerrainLayer(ext: ReturnType<typeof computeExtent>): void {
-    const { graphics, gridGraphics } = drawTerrain(ext);
+    const { graphics, gridGraphics } = drawTerrain(ext, this.spriteBank);
     for (const g of graphics) this.layers.terrain.addChild(g);
     // T6a — track grid Graphics separately for zoom gating (sub-pixel below 0.5).
     this.terrainGridGraphics = gridGraphics;
@@ -2664,6 +2673,13 @@ export class PolisRenderer {
     const px = (-dy / len) * (roadWidth / 2);
     const py = (dx / len) * (roadWidth / 2);
 
+    // A3 — real cobble texture when the bank has it: all stone quads share the
+    // trunk Graphics' local space, so ONE matrix keeps the pattern continuous
+    // across stones and adjacent segments; the alternating warm tints preserve
+    // the hand-laid lastricata rhythm on top of the texture. Fallback = the
+    // original flat alternating stones.
+    const cobble = this.spriteBank?.get("tex:cobble") ?? null;
+    const cobbleMatrix = cobble ? new Matrix().scale(0.3, 0.3) : null;
     for (let i = 0; i < steps; i++) {
       const t0 = i / steps;
       const t1 = (i + 0.82) / steps;
@@ -2679,7 +2695,20 @@ export class PolisRenderer {
         p1.y - py,
         p0.x - px,
         p0.y - py,
-      ]).fill({ color, alpha: ROAD_ALPHA.trunkFill * alphaMult });
+      ]).fill(
+        cobble && cobbleMatrix
+          ? {
+              texture: cobble,
+              matrix: cobbleMatrix,
+              // "global" (not the "local" default) — local stretches the
+              // texture per shape bounds; global keeps one continuous
+              // pattern across all stone quads in this Graphics.
+              textureSpace: "global" as const,
+              color: i % 2 === 0 ? 0xfff2dc : 0xeadfc4,
+              alpha: ROAD_ALPHA.trunkFill * alphaMult,
+            }
+          : { color, alpha: ROAD_ALPHA.trunkFill * alphaMult },
+      );
     }
     g.moveTo(from.x + px, from.y + py).lineTo(to.x + px, to.y + py);
     g.moveTo(from.x - px, from.y - py).lineTo(to.x - px, to.y - py);

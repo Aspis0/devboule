@@ -15,10 +15,11 @@
 // (one per shade band + one for seams) at setCityState time. Nothing here is
 // touched per frame.
 
-import { Container, Graphics } from "pixi.js";
+import { Container, Graphics, Matrix } from "pixi.js";
 import { cartToIso } from "./iso";
 import { DERIVED } from "./palette";
 import { valueNoise } from "./rng";
+import type { SpriteBank } from "./spriteAssets";
 import type { TerrainData } from "../../types/city";
 
 export interface TerrainExtent {
@@ -109,8 +110,50 @@ const MAX_DIRT = 500;
  * ground has no grid, and the old full-extent line pass was both ugly and
  * the main unbatchable GPU load.
  */
+// A3 — real-art ground. The seamless grass/dirt textures repeat in the
+// Graphics' LOCAL space; TEX_SCALE shrinks the 256px source so one repeat
+// spans ~1.7 tiles (reads as ground detail, not wallpaper). The multiply
+// tint pulls the stock green toward the muted olive of the palette so
+// textured and procedural (fallback) ground stay the same family.
+const TEX_SCALE = 0.35;
+const GRASS_TINT = 0xd9d6a4;
+const DIRT_TINT = 0xe0d5b8;
+
+/**
+ * Texture fill style, or null when the bank misses.
+ * `textureSpace: "global"` is LOAD-BEARING: pixi v8 defaults to "local",
+ * which STRETCHES the texture across the shape's bounding box — on the
+ * full-extent base polygon that renders one giant blurry copy instead of a
+ * repeating carpet. "global" ties UVs to the Graphics' coordinate space so
+ * the matrix controls the repeat size and the pattern is continuous across
+ * every shape sharing the Graphics.
+ */
+function texFill(
+  bank: SpriteBank | null | undefined,
+  key: string,
+  tint: number,
+  alpha: number,
+): {
+  texture: import("pixi.js").Texture;
+  matrix: Matrix;
+  textureSpace: "global";
+  color: number;
+  alpha: number;
+} | null {
+  const texture = bank?.get(key) ?? null;
+  if (!texture) return null;
+  return {
+    texture,
+    matrix: new Matrix().scale(TEX_SCALE, TEX_SCALE),
+    textureSpace: "global",
+    color: tint,
+    alpha,
+  };
+}
+
 export function drawTerrain(
   ext: TerrainExtent,
+  bank?: SpriteBank | null,
 ): { graphics: Graphics[]; gridGraphics: Graphics | null; tileCount: number } {
   const out: Graphics[] = [];
 
@@ -121,10 +164,17 @@ export function drawTerrain(
   const c = cartToIso(ext.maxX + 0.5, ext.maxY + 0.5);
   const d = cartToIso(ext.minX - 0.5, ext.maxY + 0.5);
   const base = new Graphics();
-  base.poly([a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y]).fill({
-    color: DERIVED.groundMid,
-    alpha: 1,
-  });
+  // VALUE SCHEME (Caesar III): the base is the LIGHTEST layer — dry
+  // Mediterranean grassland (tex:grassdry) tinted toward the palette olive —
+  // and the accents are DARKER green meadow patches on top. A multiply tint
+  // can only darken, so the base must start from the lightest texture; a dark
+  // base can never be tinted back up to the T6 olive.
+  base.poly([a.x, a.y, b.x, b.y, c.x, c.y, d.x, d.y]).fill(
+    texFill(bank, "tex:grassdry", GRASS_TINT, 1) ?? {
+      color: DERIVED.groundMid,
+      alpha: 1,
+    },
+  );
   out.push(base);
 
   // --- 2. Accent + dirt patches on an interleaved coarse lattice.
@@ -176,10 +226,17 @@ export function drawTerrain(
             cc.x, cc.y + HH * s,
             cc.x - HW * s, cc.y,
           ])
-          .fill({
-            color: n < 0.36 ? DERIVED.groundDark : DERIVED.groundLight,
-            alpha: 0.55,
-          });
+          .fill(
+            // Textured accents read as meadow-tone variation of the SAME
+            // grass carpet (shared local space keeps the pattern continuous);
+            // the flat-color version over a textured base read as glass panes.
+            (n < 0.36
+              ? texFill(bank, "tex:grass", 0xc2c496, 0.55)
+              : texFill(bank, "tex:grassdark", 0xdcd8ae, 0.5)) ?? {
+              color: n < 0.36 ? DERIVED.groundDark : DERIVED.groundLight,
+              alpha: 0.55,
+            },
+          );
         accentFills++;
         count++;
       }
@@ -203,10 +260,12 @@ export function drawTerrain(
             cc.x, cc.y + HH * s,
             cc.x - HW * s, cc.y,
           ])
-          .fill({
-            color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
-            alpha: 0.7,
-          });
+          .fill(
+            texFill(bank, "tex:dirtolive", worn ? 0xe8d8b8 : DIRT_TINT, 0.85) ?? {
+              color: worn ? DERIVED.groundWorn : DERIVED.groundDirt,
+              alpha: 0.7,
+            },
+          );
         dirtFills++;
         count++;
       }

@@ -262,5 +262,9 @@ export const defaultTextureLoader: TextureLoader = async (url) => {
     throw new Error(`[polis] '${url}' did not resolve to a Texture`);
   }
   texture.source.addressMode = "repeat";
+  // Repeated fills are heavily MINIFIED at city zoom (0.15–0.5): without
+  // mipmaps linear sampling averages only 4 texels and the ground degrades
+  // into aliased mush. Pow2 sources (pipeline-guaranteed) mipmap cleanly.
+  texture.source.autoGenerateMipmaps = true;
   return texture;
 };
