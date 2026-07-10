@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
-// Phase 5 Settings IA: 4 tabs (account / providers / workspace / security) with
-// legacy deep-link redirects. Child views + the Providers tab are mocked to markers
-// so this test only proves the WIRING: tab order, legacy pendingTab routing through
-// mapLegacySettingsTab, and the Security tab's admin-only Devices gate.
+// Phase 5 Settings IA: 5 tabs (account / providers / workspace / security /
+// dependencies) with legacy deep-link redirects. Child views + the Providers tab
+// are mocked to markers so this test only proves the WIRING: tab order, legacy
+// pendingTab routing through mapLegacySettingsTab, and the Security tab's
+// admin-only Devices gate.
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { act, createElement } from "react";
@@ -59,6 +60,10 @@ vi.mock("../settings/ProvidersModelsTab", () => ({
   ProvidersModelsTab: () =>
     createElement("div", { "data-testid": "providers-tab" }, "providers"),
 }));
+vi.mock("../settings/DependenciesTab", () => ({
+  DependenciesTab: () =>
+    createElement("div", { "data-testid": "dependencies-tab" }, "dependencies"),
+}));
 
 let SettingsView: typeof import("./SettingsView").SettingsView;
 
@@ -102,13 +107,14 @@ function tabLabels(container: HTMLElement): string[] {
 }
 
 describe("SettingsView Phase 5 — tabs + routing", () => {
-  it("renders the four tabs in order account / providers / workspace / security", () => {
+  it("renders the five tabs in order account / providers / workspace / security / dependencies", () => {
     const { container } = render();
     expect(tabLabels(container)).toEqual([
       "Account",
       "Providers & Models",
       "Workspace & Index",
       "Security",
+      "Dependencies",
     ]);
   });
 
