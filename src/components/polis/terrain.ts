@@ -357,6 +357,7 @@ export function buildTerrainFrame(
   terrain: TerrainData | undefined,
   chunkSize: number,
   bank?: SpriteBank | null,
+  maxWaterTiles: number = MAX_WATER_TILES,
 ): TerrainFrame {
   if (!terrain) return { chunks: [], waterGroup: null, waterBounds: null, waterAnim: null };
   const step = Math.max(1, Math.floor(chunkSize));
@@ -365,11 +366,11 @@ export function buildTerrainFrame(
 
   // Check for the textured water path: both tex:water and tex:waterdeep present
   // (all-or-nothing, same as other textured features).
-  const texWater = bank?.get("tex:water") ?? null;
-  const texWaterDeep = bank?.get("tex:waterdeep") ?? null;
-  const texturedWater = texWater !== null && texWaterDeep !== null;
+  const texWater = bank?.get("tex:water");
+  const texWaterDeep = bank?.get("tex:waterdeep");
+  const texturedWater = texWater != null && texWaterDeep != null && terrain.water.length > 0;
   // Sand textured fill: tex:dirt is available independently.
-  const texDirt = bank?.get("tex:dirt") ?? null;
+  const texDirt = bank?.get("tex:dirt");
 
   // Per-chunk accumulators. Water/sand are flat diamonds batched into a single
   // Graphics each; bridges are a separate Graphics drawn last (on top of water).
@@ -383,7 +384,6 @@ export function buildTerrainFrame(
     minY: number;
     maxY: number;
     hasWater: boolean;
-    hasDeepWater: boolean;
   }
   const accs = new Map<string, Acc>();
   const accOf = (gx: number, gy: number): Acc => {
@@ -399,7 +399,6 @@ export function buildTerrainFrame(
         minY: Infinity,
         maxY: -Infinity,
         hasWater: false,
-        hasDeepWater: false,
       };
       accs.set(key, a);
     }
@@ -418,28 +417,32 @@ export function buildTerrainFrame(
   }
 
   // 2) Water (sea + river). Deep open-sea uses the darker shade. Track the iso
-  //    bbox per chunk for the shimmer overlay. Bounded by MAX_WATER_TILES — a
+  //    bbox per chunk for the shimmer overlay. Bounded by `capped` tiles — a
   //    pathological extent can't explode the GPU. If we DO hit the cap we warn
   //    ONCE (honest: names the cap + the real counts), because a silent break
   //    leaves a half-drawn sea with sand/bridges floating over bare ground.
   //    In textured mode, flat mid/deep fills are skipped (TilingSprites cover
   //    the water body); only deep-tile overlay diamonds are drawn in the chunked
   //    Graphics so depth still reads.
-  let drawn = 0;
+  //    All five passes (waterSet, fills, bbox, mask, foam) iterate the SAME
+  //    index range [0, capped) so the cap is consistent everywhere.
+  const capped = Math.min(terrain.water.length, maxWaterTiles);
+  if (capped < terrain.water.length) {
+    console.warn(
+      `Polis terrain: water tile cap reached — drawing ${capped} of ` +
+        `${terrain.water.length} water tiles; the sea is truncated (sand/bridges ` +
+        `beyond the cap may sit over bare ground).`,
+    );
+  }
   // Pre-build O(1) water-tile lookup for foam edge detection.
   const waterSet = new Set<string>();
-  for (const w of terrain.water) waterSet.add(`${w.gx},${w.gy}`);
+  for (let i = 0; i < capped; i++) {
+    const w = terrain.water[i];
+    waterSet.add(`${w.gx},${w.gy}`);
+  }
 
-  for (const w of terrain.water) {
-    if (drawn >= MAX_WATER_TILES) {
-      console.warn(
-        `Polis terrain: water tile cap reached — drawing ${MAX_WATER_TILES} of ` +
-          `${terrain.water.length} water tiles; the sea is truncated (sand/bridges ` +
-          `beyond the cap may sit over bare ground).`,
-      );
-      break;
-    }
-    drawn++;
+  for (let i = 0; i < capped; i++) {
+    const w = terrain.water[i];
     const a = accOf(w.gx, w.gy);
     const poly = diamondAt(w.gx, w.gy);
     if (!texturedWater) {
@@ -454,27 +457,26 @@ export function buildTerrainFrame(
         color: DERIVED.waterDeep,
         alpha: 0.3,
       });
-      a.hasDeepWater = true;
     }
     a.hasWater = true;
     // Track bbox (poly is [x,y, x,y, ...]).
-    for (let i = 0; i < poly.length; i += 2) {
-      a.minX = Math.min(a.minX, poly[i]);
-      a.maxX = Math.max(a.maxX, poly[i]);
-      a.minY = Math.min(a.minY, poly[i + 1]);
-      a.maxY = Math.max(a.maxY, poly[i + 1]);
+    for (let j = 0; j < poly.length; j += 2) {
+      a.minX = Math.min(a.minX, poly[j]);
+      a.maxX = Math.max(a.maxX, poly[j]);
+      a.minY = Math.min(a.minY, poly[j + 1]);
+      a.maxY = Math.max(a.maxY, poly[j + 1]);
     }
   }
 
   // 2b) Static foam edges (textured path only): stroke each water-diamond edge
   //      that faces land, so the water/land boundary reads as surf. Drawn
   //      AFTER deep overlays so foam sits on top. Flat fallback untouched.
+  //      Only strokes into chunks that already exist from the fill pass.
   if (texturedWater) {
-    for (const w of terrain.water) {
-      if (!waterSet.has(`${w.gx},${w.gy}`)) continue;
-      const a = accOf(w.gx, w.gy);
-      const edges = foamEdges(waterSet, w.gx, w.gy);
-      if (edges === 0) continue;
+    for (let i = 0; i < capped; i++) {
+      const w = terrain.water[i];
+      const a = accs.get(chunkKey(w.gx, w.gy));
+      if (!a) continue;
       const p = diamondAt(w.gx, w.gy);
       // Diamond winding: TOP=p[0,1] RIGHT=p[2,3] BOTTOM=p[4,5] LEFT=p[6,7]
       // gx-1 neighbor → NW edge = LEFT–TOP;  gx+1 → SE edge = RIGHT–BOTTOM
@@ -495,7 +497,7 @@ export function buildTerrainFrame(
     // Batch-stroke all foam edges at once (one GPU draw call per chunk).
     for (const [, a] of accs) {
       if (!a.hasWater) continue;
-      a.water.stroke({ color: DERIVED.waterFoam, alpha: 0.38, width: 2.5 });
+      a.water.stroke({ color: DERIVED.waterFoam, alpha: 0.22, width: 1.5 });
     }
   }
 
@@ -546,15 +548,15 @@ export function buildTerrainFrame(
   let waterAnim: WaterChunkAnim | null = null;
 
   if (texturedWater) {
-    // 1) Compute pixel bbox of ALL water tiles.
+    // 1) Compute pixel bbox of capped water tiles.
     let gMinX = Infinity, gMaxX = -Infinity, gMinY = Infinity, gMaxY = -Infinity;
-    for (const w of terrain.water) {
-      const poly = diamondAt(w.gx, w.gy);
-      for (let i = 0; i < poly.length; i += 2) {
-        gMinX = Math.min(gMinX, poly[i]);
-        gMaxX = Math.max(gMaxX, poly[i]);
-        gMinY = Math.min(gMinY, poly[i + 1]);
-        gMaxY = Math.max(gMaxY, poly[i + 1]);
+    for (let i = 0; i < capped; i++) {
+      const poly = diamondAt(terrain.water[i].gx, terrain.water[i].gy);
+      for (let j = 0; j < poly.length; j += 2) {
+        gMinX = Math.min(gMinX, poly[j]);
+        gMaxX = Math.max(gMaxX, poly[j]);
+        gMinY = Math.min(gMinY, poly[j + 1]);
+        gMaxY = Math.max(gMaxY, poly[j + 1]);
       }
     }
     const originX = gMinX;
@@ -565,9 +567,10 @@ export function buildTerrainFrame(
     waterGroup = new Container();
     waterGroup.position.set(originX, originY);
 
-    // 2) Mask: one static Graphics filled with every water diamond.
+    // 2) Mask: one static Graphics filled with capped water diamonds.
     maskG = new Graphics();
-    for (const w of terrain.water) {
+    for (let i = 0; i < capped; i++) {
+      const w = terrain.water[i];
       const poly = diamondAt(w.gx, w.gy);
       maskG.poly([
         poly[0] - originX, poly[1] - originY,
@@ -619,59 +622,18 @@ export function buildTerrainFrame(
     container.addChild(a.sand);
     container.addChild(a.water);
 
-    // Shimmer → foam: textured path draws sparse glints (texture provides wave
-    // detail); flat path keeps the original dense shimmer.
+    // Shimmer: textured path has NO per-chunk anim (the only animation is
+    // the waterGroup tilePosition drift). Flat path keeps the original shimmer.
     let anim: WaterChunkAnim | null = null;
-    if (a.hasWater && Number.isFinite(a.minX)) {
+    if (!texturedWater && a.hasWater && Number.isFinite(a.minX)) {
       const shimmer = new Graphics();
       container.addChild(shimmer);
-      anim = texturedWater
-        ? makeFoam(shimmer, a.minX, a.maxX, a.minY, a.maxY, key)
-        : makeShimmer(shimmer, a.minX, a.maxX, a.minY, a.maxY, key);
+      anim = makeShimmer(shimmer, a.minX, a.maxX, a.minY, a.maxY, key);
     }
     container.addChild(a.bridges);
     out.push({ key, container, anim });
   }
   return { chunks: out, waterGroup, waterBounds, waterAnim };
-}
-
-/**
- * Sparse foam glints near the water/land boundary (textured path). The texture
- * provides wave detail, so only a handful of short-lived glint lines are drawn
- * at low alpha — much lighter than the full shimmer. Deterministic phase from
- * the chunk key (no Math.random). Allocation-free per frame.
- */
-function makeFoam(
-  g: Graphics,
-  minX: number,
-  maxX: number,
-  minY: number,
-  maxY: number,
-  key: string,
-): WaterChunkAnim {
-  let phase = 0;
-  for (let i = 0; i < key.length; i++) phase = (phase * 31 + key.charCodeAt(i)) % 1000;
-  const phase0 = (phase / 1000) * Math.PI * 2;
-  const rows = Math.max(1, Math.min(6, Math.round((maxY - minY) / 28)));
-  const stepX = Math.max(20, (maxX - minX) / 6);
-  let frame = 0;
-
-  return {
-    update(t: number): void {
-      g.clear();
-      // Draw foam every 3rd frame for sparsity.
-      if (++frame % 3 !== 0) return;
-      for (let r = 0; r < rows; r++) {
-        const yy = minY + (r / rows) * (maxY - minY);
-        const off = Math.sin(t * 1.2 + r * 0.9 + phase0) * 3;
-        g.moveTo(minX + r * 5, yy + off);
-        for (let x = minX + r * 5; x <= maxX - r * 5; x += stepX) {
-          g.lineTo(x, yy + off + Math.sin(t * 1.8 + x * 0.04 + phase0) * 1.5);
-        }
-      }
-      g.stroke({ color: DERIVED.waterFoam, alpha: 0.22, width: 1 });
-    },
-  };
 }
 
 /**
