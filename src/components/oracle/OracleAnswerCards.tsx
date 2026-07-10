@@ -6,6 +6,7 @@
 
 import { AlertTriangle, FileText, FolderOpen, Sparkles, Stethoscope } from "lucide-react";
 import type { OracleAnswer, OracleError, OracleErrorKind } from "../../types/backend";
+import { useAppContext } from "../../context/AppContext";
 
 // ---------------------------------------------------------------------------
 // AnswerCard
@@ -112,6 +113,26 @@ export function AskErrorCard({
   onConfigureProvider,
 }: AskErrorCardProps) {
   const kind: OracleErrorKind = error.kind;
+  // A clean, app-wide indexing signal: an active index job (or pending files)
+  // means Oracle is busy building the search index — a healthy, transient
+  // state — NOT actually down. Use it to soften transient-availability errors.
+  const { oracleIndexStatus } = useAppContext();
+  const isIndexing =
+    !!oracleIndexStatus?.job ||
+    (oracleIndexStatus?.index?.pendingFiles ?? 0) > 0;
+
+  const transientAvailability =
+    kind === "serverUnavailable" ||
+    kind === "embedderUnavailable" ||
+    kind === "pythonError";
+
+  // While indexing, transient "unavailable" errors are just the index being
+  // built — show a calm message instead of a hard error.
+  const indexingTitle = "Oracle is indexing your workspace";
+  const indexingBody =
+    "It's building the search index right now — ask again in a moment. This is normal, not an error.";
+  const showIndexingCopy = transientAvailability && isIndexing;
+
   return (
     <div className="mt-4 rounded-xl border border-coral/30 bg-coral/5 p-4">
       <div className="flex items-start gap-3">
@@ -119,12 +140,22 @@ export function AskErrorCard({
           <AlertTriangle className="h-4 w-4 text-coral-dark" />
         </div>
         <div className="min-w-0">
-          <p className="text-[13px] font-semibold text-coral-dark">
-            {error.message}
+          <p className={`text-[13px] font-semibold ${showIndexingCopy ? "text-amber-dark" : "text-coral-dark"}`}>
+            {showIndexingCopy ? indexingTitle : error.message}
           </p>
           {error.remediation && (
             <p className="mt-2 text-[11px] leading-5 text-cream-500">
               Remediation: {error.remediation}
+            </p>
+          )}
+          {showIndexingCopy && (
+            <p className="mt-2 text-[11px] leading-5 text-cream-500">
+              {indexingBody}
+            </p>
+          )}
+          {kind === "indexEmpty" && isIndexing && (
+            <p className="mt-2 text-[11px] leading-5 text-cream-500">
+              Indexing may still be in progress — try again in a moment.
             </p>
           )}
           <div className="mt-3 flex flex-wrap gap-2">
@@ -146,11 +177,9 @@ export function AskErrorCard({
                 Configure provider →
               </button>
             )}
-            {(kind === "embedderUnavailable" ||
-              kind === "pythonError" ||
-              kind === "serverUnavailable" ||
-              kind === "indexEmpty" ||
-              kind === "internal") && (
+            {(kind === "indexEmpty" ||
+              kind === "internal" ||
+              (!isIndexing && transientAvailability)) && (
               <button
                 onClick={onRunDoctor}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-cream-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-cream-600 hover:border-teal-light hover:text-teal-dark"
