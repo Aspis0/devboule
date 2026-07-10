@@ -18,7 +18,8 @@
        → v8 g.rect/circle/ellipse(...).fill(...).
    ========================================================================= */
 
-import { Graphics } from "pixi.js";
+import { Graphics, type FillInput } from "pixi.js";
+import { texFillStyle, type SpriteBank } from "../spriteAssets";
 
 export const TILE_W = 96;
 export const TILE_H = 48;
@@ -142,6 +143,98 @@ export const MAT = {
   ink: 0x2b2a26,
   shadow: 0x4a3a24,
 } as const;
+
+// ---- A5a: real material textures -----------------------------------------
+// The kit stays fully procedural (geometry, tier growth, sun shading) — the
+// only change is the BASE FILL of faces/roofs/ground: a light SBS texture
+// multiplied by the exact same shaded color the flat fill used. Bank absent
+// (or a key missing) ⇒ the flat fill below runs unchanged. Buildings are
+// baked ONCE per purpose:level (BuildingTextureAtlas), so texture fills cost
+// nothing per frame; the bank must be set BEFORE the first bake (the renderer
+// constructor does it).
+let kitBank: SpriteBank | null = null;
+
+export function setKitSpriteBank(bank: SpriteBank | null): void {
+  kitBank = bank;
+}
+
+const TEX_KEY: Record<string, string> = {
+  ashlar: "tex:ashlar",
+  stone: "tex:ashlar",
+  plaster: "tex:plaster",
+  marble: "tex:marble",
+  wood: "tex:wood",
+  rooftile: "tex:rooftile",
+  thatch: "tex:thatch",
+  paved: "tex:cobble",
+  earth: "tex:dirtolive",
+};
+
+// 256px sources: walls at 0.3 ⇒ ~19px ashlar course / ~3 courses per floor
+// (Z_UNIT=56); roofs at 0.45 ⇒ ~17px barrel-tile columns. Caesar-ish density.
+const WALL_TEX_SCALE = 0.3;
+const ROOF_TEX_SCALE = 0.45;
+
+/** Textured fill for a kit material kind, or null ⇒ caller keeps flat color. */
+function kitFill(
+  kind: string,
+  tint: number,
+  alpha = 1,
+  scale = WALL_TEX_SCALE,
+): ReturnType<typeof texFillStyle> {
+  const key = TEX_KEY[kind];
+  if (!key || !kitBank) return null;
+  return texFillStyle(kitBank, key, tint, alpha, scale);
+}
+
+/** Material kind for the MAT colors the generators pass as raw colors
+ *  (pediments, cylinders, steps) where no explicit `tex` kind exists. */
+function kindForMat(col: number): string | null {
+  switch (col) {
+    case MAT.marble:
+    case MAT.marbleCool:
+      return "marble";
+    case MAT.marbleWarm:
+    case MAT.plaster:
+    case MAT.plasterDk:
+    case MAT.mud:
+      return "plaster";
+    case MAT.stone:
+    case MAT.plinth:
+    case MAT.plinthDk:
+      return "ashlar";
+    case MAT.wood:
+    case MAT.woodLight:
+    case MAT.woodDk:
+      return "wood";
+    default:
+      return null;
+  }
+}
+
+function polyFill(g: Graphics, pts: Pt[], style: FillInput): void {
+  const flat: number[] = [];
+  for (const p of pts) flat.push(p.x, p.y);
+  g.poly(flat).fill(style);
+}
+
+/** Roof-slope texture fill: barrel tiles (or straw for thatch mats), with the
+ *  source's courses (image-X) rotated to run parallel to the eave a→b. */
+function roofFillFor(
+  mat: number,
+  lit: number,
+  eaveA: Pt,
+  eaveB: Pt,
+): ReturnType<typeof texFillStyle> {
+  const f = kitFill(
+    mat === MAT.thatch || mat === MAT.thatchDk ? "thatch" : "rooftile",
+    shade(mat, lit),
+    1,
+    ROOF_TEX_SCALE,
+  );
+  if (f) f.matrix.rotate(Math.atan2(eaveB.y - eaveA.y, eaveB.x - eaveA.x));
+  return f;
+}
 
 export interface Proj {
   W: number;
@@ -356,7 +449,11 @@ export function ground(
             mix(base, (gx + gy) % 2 ? MAT.grassDk : MAT.earth, 0.18 + v * 0.12),
             1,
           );
-      poly(g, [a, b, c, d], col);
+      // A5a — textured plot ground: cobbles when paved, packed earth
+      // otherwise (matches the terrain textures around the building).
+      const tileFill = kitFill(paved ? "paved" : "earth", col, 1, 0.35);
+      if (tileFill) polyFill(g, [a, b, c, d], tileFill);
+      else poly(g, [a, b, c, d], col);
       if (opt.grid)
         outlinePoly(
           g,
@@ -447,9 +544,17 @@ export function box(
     opt.rightColor !== undefined ? opt.rightColor : baseColor,
     faceFactor("right"),
   );
-  poly(g, Lq, cL);
-  poly(g, Rq, cR);
-  if (opt.tex) {
+  // A5a — textured walls: same shaded colors as the flat path, multiplied
+  // over a light material texture. When textured, the procedural texFace
+  // line-work is SKIPPED (its coursing would double-pattern the texture's).
+  // fillL/fillR resolve from the same key, so they are null together.
+  const fillL = opt.tex ? kitFill(opt.tex, cL) : null;
+  const fillR = opt.tex ? kitFill(opt.tex, cR) : null;
+  if (fillL) polyFill(g, Lq, fillL);
+  else poly(g, Lq, cL);
+  if (fillR) polyFill(g, Rq, fillR);
+  else poly(g, Rq, cR);
+  if (opt.tex && !fillL) {
     texFace(
       g,
       Lq,
@@ -625,42 +730,52 @@ export function tileQuad(
   opt?: TileOpt,
 ): void {
   opt = opt || {};
-  poly(g, [eaveL, eaveR, ridgeR, ridgeL], shade(base, lit));
-  const span = Math.hypot(ridgeL.x - eaveL.x, ridgeL.y - eaveL.y);
-  const rows = Math.max(2, Math.round(span / 8));
-  // courses (parallel to eave), slightly lighter toward ridge
-  for (let i = 1; i <= rows; i++) {
-    const t = i / rows;
-    const a = lerp(eaveL, ridgeL, t);
-    const b = lerp(eaveR, ridgeR, t);
-    line(g, a, b, shade(base, lit * 0.74), 1.3, 0.55);
-    if (i < rows) {
-      const t2 = (i + 0.5) / rows;
+  // A5a — real tile texture: the source's courses run along image-X, so
+  // rotate the fill matrix to lay image-X along the EAVE (courses parallel to
+  // the eave, barrel columns up the slope). Thatch mats pick the straw
+  // texture. Textured ⇒ procedural courses/seams are skipped (the texture IS
+  // the coursing); the eave gutter + antefixes below always draw.
+  const roofFill = roofFillFor(base, lit, eaveL, eaveR);
+  if (roofFill) {
+    polyFill(g, [eaveL, eaveR, ridgeR, ridgeL], roofFill);
+  } else {
+    poly(g, [eaveL, eaveR, ridgeR, ridgeL], shade(base, lit));
+    const span = Math.hypot(ridgeL.x - eaveL.x, ridgeL.y - eaveL.y);
+    const rows = Math.max(2, Math.round(span / 8));
+    // courses (parallel to eave), slightly lighter toward ridge
+    for (let i = 1; i <= rows; i++) {
+      const t = i / rows;
+      const a = lerp(eaveL, ridgeL, t);
+      const b = lerp(eaveR, ridgeR, t);
+      line(g, a, b, shade(base, lit * 0.74), 1.3, 0.55);
+      if (i < rows) {
+        const t2 = (i + 0.5) / rows;
+        line(
+          g,
+          lerp(eaveL, ridgeL, t2),
+          lerp(eaveR, ridgeR, t2),
+          shade(base, lit * 1.06),
+          1,
+          0.3,
+        );
+      }
+    }
+    // pan seams (up the slope)
+    const seams = Math.max(
+      3,
+      Math.round(Math.hypot(eaveR.x - eaveL.x, eaveR.y - eaveL.y) / 9),
+    );
+    for (let i = 1; i < seams; i++) {
+      const u = i / seams;
       line(
         g,
-        lerp(eaveL, ridgeL, t2),
-        lerp(eaveR, ridgeR, t2),
-        shade(base, lit * 1.06),
+        lerp(eaveL, eaveR, u),
+        lerp(ridgeL, ridgeR, u),
+        shade(base, lit * 0.7),
         1,
         0.3,
       );
     }
-  }
-  // pan seams (up the slope)
-  const seams = Math.max(
-    3,
-    Math.round(Math.hypot(eaveR.x - eaveL.x, eaveR.y - eaveL.y) / 9),
-  );
-  for (let i = 1; i < seams; i++) {
-    const u = i / seams;
-    line(
-      g,
-      lerp(eaveL, eaveR, u),
-      lerp(ridgeL, ridgeR, u),
-      shade(base, lit * 0.7),
-      1,
-      0.3,
-    );
   }
   // eave gutter + antefixes
   line(g, eaveL, eaveR, shade(base, lit * 0.6), 1.8, 0.7);
@@ -710,8 +825,11 @@ export function gableRoof(
     const ridgeB = P(rx, y0 - o, zt + rh);
     const eaveL1 = P(x0 - o, y0 + d + o, zt);
     const eaveL2 = P(x0 - o, y0 - o, zt);
-    // back-left slope (faint)
-    poly(g, [eaveL1, eaveL2, ridgeB, ridgeF], shade(mat, faceFactor("slopeL") * 0.9));
+    // back-left slope (faint) — A5a: textured like the lit slope, darker tint
+    const backLit = faceFactor("slopeL") * 0.9;
+    const backFill = roofFillFor(mat, backLit, eaveL1, eaveL2);
+    if (backFill) polyFill(g, [eaveL1, eaveL2, ridgeB, ridgeF], backFill);
+    else poly(g, [eaveL1, eaveL2, ridgeB, ridgeF], shade(mat, backLit));
     // right slope (visible, tiled)
     tileQuad(g, eaveR2, eaveR1, ridgeF, ridgeB, mat, faceFactor("slopeR"));
     // ridge cap
@@ -720,7 +838,12 @@ export function gableRoof(
     const triL = P(x0 - o, y0 + d + o, zt);
     const triR = P(x0 + w + o, y0 + d + o, zt);
     const triTop = P(rx, y0 + d + o, zt + rh);
-    poly(g, [triL, triR, triTop], shade(pedMat, faceFactor("gableLit")));
+    // A5a — textured pediment (material inferred from the MAT color).
+    const pedKind = kindForMat(pedMat);
+    const pedCol = shade(pedMat, faceFactor("gableLit"));
+    const pedFill = pedKind ? kitFill(pedKind, pedCol) : null;
+    if (pedFill) polyFill(g, [triL, triR, triTop], pedFill);
+    else poly(g, [triL, triR, triTop], pedCol);
     if (opt.tympanum)
       poly(
         g,
@@ -752,7 +875,11 @@ export function gableRoof(
     const triF = P(x0 + w + o, y0 + d + o, zt);
     const triB = P(x0 + w + o, y0 - o, zt);
     const triTop = P(x0 + w + o, ry, zt + rh);
-    poly(g, [triF, triB, triTop], shade(pedMat, faceFactor("gableShade")));
+    const pedKind = kindForMat(pedMat);
+    const pedCol = shade(pedMat, faceFactor("gableShade"));
+    const pedFill = pedKind ? kitFill(pedKind, pedCol) : null;
+    if (pedFill) polyFill(g, [triF, triB, triTop], pedFill);
+    else poly(g, [triF, triB, triTop], pedCol);
     if (opt.tympanum)
       poly(
         g,
@@ -840,12 +967,19 @@ export function cylinder(
     top.push(proj.p(gx, gy, z0 + h));
     bot.push(proj.p(gx, gy, z0));
   }
+  // A5a — textured shaft: per-segment tint keeps the roundness gradient; the
+  // texture is continuous across segments (fills share the Graphics' space).
+  const cylKind = kindForMat(mat);
   for (let i = 0; i < seg; i++) {
     const ang = ((i + 0.5) / seg) * Math.PI * 2;
     if (Math.sin(ang) <= -0.25) continue;
     const lr = Math.cos(ang);
     const f = 0.95 + lr * (SUN.dir === "NE" ? 0.24 : -0.24);
-    poly(g, [bot[i], bot[i + 1], top[i + 1], top[i]], shade(mat, Math.max(0.58, f)));
+    const quad = [bot[i], bot[i + 1], top[i + 1], top[i]];
+    const segCol = shade(mat, Math.max(0.58, f));
+    const segFill = cylKind ? kitFill(cylKind, segCol) : null;
+    if (segFill) polyFill(g, quad, segFill);
+    else poly(g, quad, segCol);
   }
   // courses
   for (let r = 1; r < Math.max(2, Math.round((h * Z_UNIT) / 12)); r++) {

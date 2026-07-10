@@ -1,0 +1,11 @@
+{
+  "jobs": [
+    { "key": "tex:plaster", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Plaster/Plaster_19-256x256.png", "trim": false },
+    { "key": "tex:plasterwarm", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Plaster/Plaster_10-256x256.png", "trim": false, "recolor": { "sat": 0.5, "val": 1.12 } },
+    { "key": "tex:ashlar", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Brick/Brick_03-256x256.png", "trim": false, "recolor": { "sat": 0.5, "val": 1.08 } },
+    { "key": "tex:marble", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Stone/Stone_15-256x256.png", "trim": false, "recolor": { "sat": 0.6, "val": 1.04 } },
+    { "key": "tex:wood", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Wood/Wood_14-256x256.png", "trim": false },
+    { "key": "tex:rooftile", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Roofs/Roof 13 - 256x256.png", "trim": false, "recolor": { "sat": 0.28, "val": 1.38 } },
+    { "key": "tex:thatch", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Roofs/Roof 9 - 256x256.png", "trim": false, "recolor": { "sat": 0.6, "val": 1.12 } }
+  ]
+}

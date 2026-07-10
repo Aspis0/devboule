@@ -87,6 +87,7 @@ import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fie
 import { buildBuildingParts, type BuiltParts } from "./buildings";
 import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
+import { setKitSpriteBank } from "./kitcd/iso";
 import { buildingChanged, worstSinSeverity } from "./diffCity";
 import { SlotAllocator } from "./locomotion";
 import { StepClock } from "./effects";
@@ -688,6 +689,11 @@ export class PolisRenderer {
     // createPolis BEFORE construction so every draw path can consult it
     // synchronously; per-feature fallback happens at each texFill/get site.
     this.spriteBank = spriteBank;
+    // A5a — hand the bank to the building kit (module-level: the generators
+    // are plain functions with a long call chain). Must precede the first
+    // BuildingTextureAtlas bake; set unconditionally so a bank-less renderer
+    // never inherits a previous instance's bank.
+    setKitSpriteBank(spriteBank);
 
     // B2c — adopt the chosen render profile (or the safe MIDDLE default when none
     // is supplied: `profileFor(null)` returns the lean tier). Seed the per-instance

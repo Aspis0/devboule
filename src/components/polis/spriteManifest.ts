@@ -62,13 +62,20 @@ export const SPRITE_MANIFEST: SpriteManifest = {
     "prop-0": "/polis/atlas/prop-0.json"
   },
   singles: {
+    "tex:ashlar": "/polis/atlas/tex__ashlar.png",
     "tex:cobble": "/polis/atlas/tex__cobble.png",
     "tex:dirt": "/polis/atlas/tex__dirt.png",
     "tex:dirtolive": "/polis/atlas/tex__dirtolive.png",
     "tex:grass": "/polis/atlas/tex__grass.png",
     "tex:grassdark": "/polis/atlas/tex__grassdark.png",
     "tex:grassdry": "/polis/atlas/tex__grassdry.png",
-    "tex:stonegrey": "/polis/atlas/tex__stonegrey.png"
+    "tex:marble": "/polis/atlas/tex__marble.png",
+    "tex:plaster": "/polis/atlas/tex__plaster.png",
+    "tex:plasterwarm": "/polis/atlas/tex__plasterwarm.png",
+    "tex:rooftile": "/polis/atlas/tex__rooftile.png",
+    "tex:stonegrey": "/polis/atlas/tex__stonegrey.png",
+    "tex:thatch": "/polis/atlas/tex__thatch.png",
+    "tex:wood": "/polis/atlas/tex__wood.png"
   },
   entries: {
     "prop:cypress:v0": {
