@@ -32,6 +32,8 @@ use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::io::Read;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -585,6 +587,251 @@ pub async fn detect_all_providers() -> Vec<DetectedProvider> {
 #[tauri::command]
 pub async fn detect_providers() -> Result<Vec<DetectedProvider>, String> {
     Ok(detect_all_providers().await)
+}
+
+// ---------------------------------------------------------------------------
+// External-tool dependency detection (TASK #13 — Settings "Dependencies" tab).
+// ---------------------------------------------------------------------------
+
+/// Max wait for a `<tool> --version` probe. Detection must feel instant; 2s is
+/// generous for a local `--version` (no network — just a child process) and keeps
+/// the whole `detect_dependencies` snappy even if a tool hangs.
+const DEP_VERSION_PROBE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Max chars of a version string we surface. Tools print a sentence like
+/// "git version 2.30.1"; we show its first line as-is, but cap it so a chatty
+/// tool can't bloat the IPC payload / UI.
+const MAX_DEP_VERSION_LEN: usize = 120;
+
+/// One external command-line tool Devboule can use, with its resolved location and
+/// version (best-effort). camelCase over the IPC boundary so the TS side reads it
+/// directly. Unlike `DetectedProvider`, dependencies intentionally EXPOSE `path`:
+/// the Dependencies page is user-requested diagnostics that should show WHERE each
+/// tool was found (this is a capability map the user asked to see, not a leak — the
+/// same set of names is public in this file).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedDependency {
+    /// The tool's display name (the binary, monospace in the UI).
+    pub name: String,
+    /// What Devboule uses the tool for.
+    pub purpose: String,
+    /// Grouping bucket shown as a section header in the UI.
+    pub category: String,
+    /// Whether the binary was found on the augmented PATH.
+    pub found: bool,
+    /// Resolved absolute path when `found`; `None` when not found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Best-effort `tool --version` output (first line), or `None` on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// A hard-coded spec for one tool this machine MAY have. `program` is the binary
+/// `resolve_program` looks for; `fallback` (optional) is tried only if the primary
+/// is absent (e.g. `python3` → `python`).
+struct DependencySpec {
+    program: &'static str,
+    fallback: Option<&'static str>,
+    name: &'static str,
+    purpose: &'static str,
+    category: &'static str,
+}
+
+/// Run `<resolved> --version` and return its first trimmed line (stdout OR stderr —
+/// `python --version` famously prints to stderr). Best-effort: any spawn failure, a
+/// non-zero exit, or a timeout yields `None`. Bounded (see [`DEP_VERSION_PROBE_TIMEOUT`]
+/// + [`MAX_DEP_VERSION_LEN`]) so a misbehaving tool can never hang or bloat detection.
+fn probe_version(resolved: &PathBuf) -> Option<String> {
+    let mut child = std::process::Command::new(resolved)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Inherit the augmented PATH so a tool that itself spawns another tool (or
+        // resolves its own helpers) finds them the same way the spawner would.
+        .env("PATH", augmented_path())
+        .spawn()
+        .ok()?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() >= DEP_VERSION_PROBE_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = std::io::copy(&mut s, &mut out);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let _ = std::io::copy(&mut s, &mut err);
+    }
+    let out_s = String::from_utf8_lossy(&out);
+    let err_s = String::from_utf8_lossy(&err);
+    let text = out_s
+        .lines()
+        .next()
+        .or_else(|| err_s.lines().next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.chars().take(MAX_DEP_VERSION_LEN).collect())
+    }
+}
+
+/// The curated, hard-coded tool list. Order here is the order they appear within
+/// their category section (categories are grouped in the frontend). Each purpose +
+/// category string matches the TASK #13 spec exactly. No heavy detection — only
+/// resolution via [`resolve_program`] + an optional `--version`.
+fn dependency_specs() -> Vec<DependencySpec> {
+    vec![
+        DependencySpec {
+            program: "node",
+            fallback: None,
+            name: "node",
+            purpose: "Runs the pi sidecar that powers the orchestrator and coders.",
+            category: "Runtime",
+        },
+        DependencySpec {
+            program: "python3",
+            fallback: Some("python"),
+            name: "python3",
+            purpose: "Oracle indexing and embeddings.",
+            category: "Runtime",
+        },
+        DependencySpec {
+            program: "git",
+            fallback: None,
+            name: "git",
+            purpose: "In-app version control (status, commit, push).",
+            category: "Runtime",
+        },
+        DependencySpec {
+            program: "ruff",
+            fallback: None,
+            name: "ruff",
+            purpose: "Python linter used by the Censor code-review gate.",
+            category: "Code review (Censor)",
+        },
+        DependencySpec {
+            program: "oxlint",
+            fallback: None,
+            name: "oxlint",
+            purpose: "Fast JS/TS linter used by the Censor gate.",
+            category: "Code review (Censor)",
+        },
+        DependencySpec {
+            program: "eslint",
+            fallback: None,
+            name: "eslint",
+            purpose: "JS/TS linter (Censor gate, if configured).",
+            category: "Code review (Censor)",
+        },
+        DependencySpec {
+            program: "pyright",
+            fallback: None,
+            name: "pyright",
+            purpose: "Python type checker (Censor gate).",
+            category: "Code review (Censor)",
+        },
+        DependencySpec {
+            program: "cargo",
+            fallback: None,
+            name: "cargo",
+            purpose: "Rust build/test + clippy for Rust projects.",
+            category: "Code review (Censor)",
+        },
+        DependencySpec {
+            program: "shellcheck",
+            fallback: None,
+            name: "shellcheck",
+            purpose: "Shell-script linter (Censor gate).",
+            category: "Code review (Censor)",
+        },
+        DependencySpec {
+            program: "claude",
+            fallback: None,
+            name: "claude",
+            purpose: "Claude CLI — a cloud orchestrator/coder backend.",
+            category: "AI providers",
+        },
+        DependencySpec {
+            program: "codex",
+            fallback: None,
+            name: "codex",
+            purpose: "Codex CLI — a cloud orchestrator/coder backend.",
+            category: "AI providers",
+        },
+        DependencySpec {
+            program: "ollama",
+            fallback: None,
+            name: "ollama",
+            purpose: "Local model server backend.",
+            category: "AI providers",
+        },
+    ]
+}
+
+/// Detect every external CLI Devboule can use. For each curated tool: resolve it on
+/// the augmented PATH (falling back once if a fallback program is listed), run an
+/// optional `--version` probe, and return the row. Failure-isolated: one tool's
+/// probe error NEVER fails the others (or the whole detection).
+pub fn detect_all_dependencies() -> Vec<DetectedDependency> {
+    dependency_specs()
+        .into_iter()
+        .map(|spec| {
+            let resolved = resolve_program(spec.program)
+                .or_else(|| spec.fallback.and_then(resolve_program));
+            match resolved {
+                Some(path) => DetectedDependency {
+                    name: spec.name.to_string(),
+                    purpose: spec.purpose.to_string(),
+                    category: spec.category.to_string(),
+                    found: true,
+                    path: Some(path.to_string_lossy().to_string()),
+                    version: probe_version(&path),
+                },
+                None => DetectedDependency {
+                    name: spec.name.to_string(),
+                    purpose: spec.purpose.to_string(),
+                    category: spec.category.to_string(),
+                    found: false,
+                    path: None,
+                    version: None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The Tauri command wrapper. No auth gate: this returns ONLY non-secret machine
+/// capability metadata (which CLIs exist + their resolved path/version), so the
+/// Settings UI can populate the Dependencies tab before/while the vault is locked.
+/// It never reads vault secrets and never sends user data anywhere. The resolution +
+/// `--version` probes are blocking, so they run off the async reactor via
+/// `spawn_blocking` (a join failure — task panicked — degrades to an error string).
+#[tauri::command]
+pub async fn detect_dependencies() -> Result<Vec<DetectedDependency>, String> {
+    tauri::async_runtime::spawn_blocking(detect_all_dependencies)
+        .await
+        .map_err(|e| format!("dependency detection failed: {e}"))
 }
 
 #[cfg(test)]

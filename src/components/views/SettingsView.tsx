@@ -5,6 +5,7 @@ import {
   ShieldCheck,
   UserCircle,
   Lock,
+  Wrench,
   type LucideIcon,
 } from "lucide-react";
 import { useAppActions, useAppContext } from "../../context/AppContext";
@@ -13,6 +14,7 @@ import { SecretsView } from "./SecretsView";
 import { DevicesView } from "./DevicesView";
 import { WorkspaceView } from "./WorkspaceView";
 import { ProvidersModelsTab } from "../settings/ProvidersModelsTab";
+import { DependenciesTab } from "../settings/DependenciesTab";
 import { mapLegacySettingsTab, type SettingsTabId } from "./settingsTabs";
 import { CollapsibleSection } from "./CollapsibleSection";
 
@@ -43,6 +45,7 @@ export function SettingsView() {
       { id: "providers", label: "Providers & Models", icon: BrainCircuit },
       { id: "workspace", label: "Workspace & Index", icon: HardDrive },
       { id: "security", label: "Security", icon: ShieldCheck },
+      { id: "dependencies", label: "Dependencies", icon: Wrench },
     ],
     [],
   );
@@ -149,6 +152,8 @@ export function SettingsView() {
           {canSeeDevices && <DevicesView />}
         </div>
       )}
+
+      {activeTab === "dependencies" && <DependenciesTab />}
     </div>
   );
 }

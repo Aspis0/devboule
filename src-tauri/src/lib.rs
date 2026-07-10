@@ -766,6 +766,7 @@ pub fn run() {
             backend::design_generate::design_generate,
             backend::design_generate::design_cancel_generation,
             backend::provider_detect::detect_providers,
+            backend::provider_detect::detect_dependencies,
             backend::hardware::detect_hardware,
             backend::budget::poll_backend_memory,
             backend::budget::recommend_resource_config,

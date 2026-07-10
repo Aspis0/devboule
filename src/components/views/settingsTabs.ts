@@ -29,7 +29,12 @@
 // This is applied INSIDE SettingsView's pendingTab effect, AFTER consumePendingTab.
 // Pure (no React, no DOM) — unit-tested in settingsTabs.test.ts.
 
-export type SettingsTabId = "account" | "providers" | "workspace" | "security";
+export type SettingsTabId =
+  | "account"
+  | "providers"
+  | "workspace"
+  | "security"
+  | "dependencies";
 
 // The legacy → new map. Listed explicitly (not derived) so a reviewer can read the
 // full contract at a glance and a new legacy id is a deliberate addition.
@@ -43,6 +48,9 @@ const LEGACY_SETTINGS_TAB_MAP: Record<string, SettingsTabId> = {
   // is a no-op rather than falling through to the default.
   providers: "providers",
   security: "security",
+  // TASK #13: the Dependencies tab also maps to itself (it is a genuine tab id, not
+  // a legacy alias) so a deep-link using it is a no-op.
+  dependencies: "dependencies",
 };
 
 export function mapLegacySettingsTab(old: string): SettingsTabId {

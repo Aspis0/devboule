@@ -1814,6 +1814,26 @@ export interface CliAgentsStatus {
 	warning: string | null;
 }
 
+// TASK #13 — the Settings "Dependencies" tab: every external CLI Devboule can use,
+// its resolved location + version (best-effort). Mirror of the Rust
+// `backend::provider_detect::DetectedDependency` (camelCase over IPC). Unlike
+// `DetectedProvider`, `path` IS exposed here — the Dependencies page is
+// user-requested diagnostics that intentionally show WHERE each tool was found.
+export interface DetectedDependency {
+	/** The tool's binary name (monospace in the UI). */
+	name: string;
+	/** What Devboule uses the tool for. */
+	purpose: string;
+	/** Grouping bucket shown as a section header in the UI. */
+	category: string;
+	/** Whether the binary was found on the augmented PATH. */
+	found: boolean;
+	/** Resolved absolute path, or null when not found. */
+	path: string | null;
+	/** Best-effort `tool --version` output (first line), or null. */
+	version: string | null;
+}
+
 const ORACLE_ERROR_KINDS: ReadonlySet<string> = new Set<OracleErrorKind>([
 	"noWorkspaceRoot",
 	"serverUnavailable",
