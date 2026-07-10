@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 //
-// D4 (planner-chat demolition): delivery failures, launch guidance and the 90s
+// D4 (planner-chat demolition): delivery failures, launch guidance and the 60s
 // silence watchdog are composer CHROME — an amber banner strip above the composer —
 // never fake assistant messages spliced into the transcript. While the banner is
 // set it also supersedes the "thinking…" pill (the strip explains why there is no
@@ -51,6 +51,17 @@ describe("PlannerChat banner (D4 chrome)", () => {
     // The empty-transcript hint still shows: the banner added no message rows.
     expect(out).toContain("delivery failed");
     expect(out).toContain("Describe a goal");
+  });
+
+  it("renders a Restart button in the banner when onResetChat is set", () => {
+    const out = html({ banner: "stalled", onResetChat: () => {} });
+    expect(out).toContain('data-testid="planner-banner-restart"');
+    expect(out).toContain("Restart orchestrator");
+  });
+
+  it("omits the Restart button when onResetChat is absent", () => {
+    const out = html({ banner: "stalled" });
+    expect(out).not.toContain("planner-banner-restart");
   });
 });
 

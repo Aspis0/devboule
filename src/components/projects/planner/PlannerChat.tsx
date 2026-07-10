@@ -15,7 +15,7 @@ interface PlannerChatProps {
 	live: boolean;
 	awaitingReply: boolean;
 	/** D4 (planner-chat demolition): composer CHROME for delivery failures, launch
-	 *  guidance and the 90s silence watchdog — rendered as an amber strip ABOVE the
+	 *  guidance and the 60s silence watchdog — rendered as an amber strip ABOVE the
 	 *  composer, never spliced into the transcript as a fake assistant message.
 	 *  While set it also supersedes the "thinking…" pill (the strip explains why
 	 *  there is no reply; a spinning pill next to it would contradict it). */
@@ -258,7 +258,7 @@ export function PlannerChat({
 							alignItems: "center",
 							justifyContent: "center",
 							cursor: onResetChat ? "pointer" : "default",
-							opacity: onResetChat ? 0.45 : 0.25,
+							opacity: onResetChat ? 0.7 : 0.25,
 							transition: "opacity 0.15s",
 							padding: 0,
 						}}
@@ -280,8 +280,8 @@ export function PlannerChat({
 					data-testid="planner-banner"
 					style={{
 						display: "flex",
-						alignItems: "flex-start",
-						gap: 7,
+						alignItems: "center",
+						gap: 8,
 						padding: "8px 13px",
 						borderTop: "1px solid #EED9B7",
 						background: "#FBF3E2",
@@ -290,10 +290,21 @@ export function PlannerChat({
 						lineHeight: 1.45,
 					}}
 				>
-					<span aria-hidden style={{ flex: "none", marginTop: 1 }}>
+					<span aria-hidden style={{ flex: "none" }}>
 						⚠︎
 					</span>
-					<span>{banner}</span>
+					<span style={{ flex: 1 }}>{banner}</span>
+					{onResetChat ? (
+						<button
+							type="button"
+							data-testid="planner-banner-restart"
+							onClick={() => onResetChat?.()}
+							style={{ flex: "none", cursor: "pointer", border: "1px solid #D9B673", background: "#F3E4C4", color: "#7A5A20", fontSize: 11, fontWeight: 600, borderRadius: 6, padding: "4px 10px", display: "flex", alignItems: "center", gap: 5 }}
+						>
+							<RotateCcw size={11} />
+							Restart orchestrator
+						</button>
+					) : null}
 				</div>
 			) : null}
 

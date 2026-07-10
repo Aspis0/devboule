@@ -1347,7 +1347,7 @@ export function ProjectsView() {
 	// (max-recall: a single tool-call row after the user's turn used to disarm the
 	// watchdog entirely, so an orchestrator that tool-called once and then hung gave
 	// zero feedback forever). Any convo change (milestones and deltas included) still
-	// resets the timer, so it fires only after 90s of TOTAL silence — and it raises
+	// resets the timer, so it fires only after 60s of TOTAL silence — and it raises
 	// the composer BANNER (chrome), never a fake assistant message in the transcript.
 	useEffect(() => {
 		let lastChat: (typeof plannerConvoLive)[number] | undefined;
@@ -1360,9 +1360,9 @@ export function ProjectsView() {
 		if (!plannerActivityAgentId || lastChat?.role !== "user") return;
 		const timer = setTimeout(() => {
 			setPlannerBanner(
-				"No reply from the orchestrator in 7 minutes. If it runs on a local model, the model may still be loading — check the oMLX/Ollama window. Otherwise relaunch the orchestrator or switch backend.",
+				"No reply from the orchestrator in 60s. If it runs on a local model (oMLX/Ollama), the model may still be loading — give it a moment. Otherwise use Restart orchestrator to start a fresh session.",
 			);
-		}, 7 * 60_000);
+		}, 60_000);
 		return () => clearTimeout(timer);
 	}, [plannerConvoLive, plannerActivityAgentId]);
 
