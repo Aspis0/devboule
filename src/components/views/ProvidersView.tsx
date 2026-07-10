@@ -433,6 +433,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
       </section>
 
       {VISIBLE_CONSOLE_PROVIDERS.length > 0 && (
+      <>
       <section>
         <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
@@ -602,6 +603,7 @@ export function ProvidersView({ config }: ProvidersViewProps) {
           </div>
         </div>
       </section>
+      </>
       )}
 
       {/* Operational providers */}

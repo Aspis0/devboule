@@ -82,7 +82,7 @@ function resolveKindVariant(
  * Build the set of blocked tile keys from city data.
  * Blocked = building footprint tiles + road path tiles + water tiles + sand tiles.
  */
-function buildBlockedTiles(city: CityState): Set<string> {
+function buildBlockedTiles(city: ResourceCity): Set<string> {
   const blocked = new Set<string>();
 
   // Building footprints (with 1-tile Chebyshev margin).

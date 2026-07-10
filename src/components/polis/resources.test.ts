@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { planResourceSites, resourceSiteTiles, type ResourceCity } from "./resources";
+import type { CityState } from "../../types/city";
 
 /** Minimal CityState fixture for testing. */
 function makeCity(overrides: Partial<CityState> = {}): CityState {

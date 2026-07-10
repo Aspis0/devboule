@@ -62,8 +62,6 @@ beforeEach(() => {
       purpose: "Oracle indexing and embeddings.",
       category: "Runtime",
       found: false,
-      path: null,
-      version: null,
     },
     {
       name: "ruff",
@@ -78,8 +76,6 @@ beforeEach(() => {
       purpose: "JS/TS linter (Censor gate, if configured).",
       category: "Code review (Censor)",
       found: false,
-      path: null,
-      version: null,
     },
   ];
   detectCalls = 0;
