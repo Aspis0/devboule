@@ -126,6 +126,20 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
     if img.getbbox() is None:
         raise ValueError(f"fully transparent image: {in_rel}")
 
+    # Optional [x, y, w, h] crop applied FIRST — this is how flip-book frames
+    # are cut out of a sprite strip/grid. Bounds-checked so a bad spec fails
+    # the job loudly instead of silently wrapping.
+    crop = job.get("crop")
+    if crop is not None:
+        if not (isinstance(crop, (list, tuple)) and len(crop) == 4):
+            raise ValueError(f"crop must be [x, y, w, h], got {crop!r}")
+        x, y, w, h = (int(v) for v in crop)
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > img.width or y + h > img.height:
+            raise ValueError(f"crop {crop} outside image {img.width}x{img.height}")
+        img = img.crop((x, y, x + w, y + h))
+        if img.getbbox() is None:
+            raise ValueError(f"crop {crop} is fully transparent: {in_rel}")
+
     if do_trim:
         bbox = img.getbbox()
         if bbox is not None:
@@ -156,6 +170,8 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
         "scale": scale,
         "anchor": anchor_out,
     }
+    if crop is not None:
+        meta["crop"] = [int(v) for v in crop]
     if foot is not None:
         meta["foot"] = list(foot)
     meta["hasBakedShadow"] = has_baked

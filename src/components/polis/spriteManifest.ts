@@ -59,6 +59,7 @@ export interface SpriteManifest {
 export const SPRITE_MANIFEST: SpriteManifest = {
   version: 1,
   atlases: {
+    "fx-0": "/polis/atlas/fx-0.json",
     "prop-0": "/polis/atlas/prop-0.json",
     "walk-0": "/polis/atlas/walk-0.json"
   },
@@ -79,6 +80,51 @@ export const SPRITE_MANIFEST: SpriteManifest = {
     "tex:wood": "/polis/atlas/tex__wood.png"
   },
   entries: {
+    "fx:fire:f0": {
+      frame: "fx:fire:f0",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f1": {
+      frame: "fx:fire:f1",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f2": {
+      frame: "fx:fire:f2",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f3": {
+      frame: "fx:fire:f3",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f4": {
+      frame: "fx:fire:f4",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f5": {
+      frame: "fx:fire:f5",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f6": {
+      frame: "fx:fire:f6",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f7": {
+      frame: "fx:fire:f7",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
+    "fx:fire:f8": {
+      frame: "fx:fire:f8",
+      atlas: "fx-0",
+      anchor: [0.5, 0.95]
+    },
     "prop:cypress:v0": {
       frame: "prop:cypress:v0",
       atlas: "prop-0",

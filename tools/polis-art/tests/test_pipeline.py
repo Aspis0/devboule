@@ -504,3 +504,40 @@ def test_manifest_dual_presence_error(tmp_path):
                         "--ledger", str(ledger), "--out", str(out)])
     assert rc == 1
     assert not out.exists()
+
+
+# --------------------------------------------------------------------------- #
+# crop (A7 — flip-book frames cut from sprite strips/grids)
+# --------------------------------------------------------------------------- #
+def test_crop_cuts_grid_cell(tmp_path):
+    """A 3x3 grid of 4px cells: crop [4,4,4,4] isolates the center cell."""
+    raw = POLIS_ART_under(tmp_path) / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    img = Image.new("RGBA", (12, 12), (10, 10, 10, 255))
+    px = img.load()
+    for y in range(4, 8):
+        for x in range(4, 8):
+            px[x, y] = (250, 60, 0, 255)
+    img.save(raw / "grid.png")
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "fx:fire:f0", "source": "s",
+                       "in": "tools/polis-art/raw/grid.png",
+                       "trim": False, "crop": [4, 4, 4, 4]}])
+    rc = normalize.main(["--spec", str(spec), "--root", str(tmp_path)])
+    assert rc == 0
+    out_png = staged_dir(tmp_path) / "fx" / "fx__fire__f0.png"
+    out = Image.open(out_png)
+    assert out.size == (4, 4)
+    assert out.getpixel((0, 0)) == (250, 60, 0, 255)
+    meta = json.loads((staged_dir(tmp_path) / "fx" / "fx__fire__f0.meta.json").read_text())
+    assert meta["crop"] == [4, 4, 4, 4]
+
+
+def test_crop_out_of_bounds_skips_job(tmp_path):
+    in_rel = make_raw(tmp_path, "small4.png", 4, (10, 10, 10, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "fx:fire:f0", "source": "s", "in": in_rel,
+                       "trim": False, "crop": [2, 2, 4, 4]}])
+    rc = normalize.main(["--spec", str(spec), "--root", str(tmp_path)])
+    assert rc == 1  # SKIP => nonzero, batch continues
+    assert not (staged_dir(tmp_path) / "fx" / "fx__fire__f0.png").exists()

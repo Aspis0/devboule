@@ -147,18 +147,86 @@ export interface FireAtlas {
 }
 
 /**
+ * A7 — resolve the real flip-book frames (`fx:fire:f0..f7`) from the sprite
+ * bank. All-or-nothing (a partial set would stutter the cycle); null keeps the
+ * procedural flame bands. Only FIRE_FRAMES (8) of the strip's 9 frames are
+ * used so every consumer's `% FIRE_FRAMES` indexing stays valid.
+ */
+function resolveFireArt(
+  bank: { get(key: string): Texture | null } | null | undefined,
+): Texture[] | null {
+  if (!bank) return null;
+  const frames: Texture[] = [];
+  for (let i = 0; i < FIRE_FRAMES; i++) {
+    const tex = bank.get(`fx:fire:f${i}`);
+    if (!tex) return null;
+    frames.push(tex);
+  }
+  return frames;
+}
+
+/**
  * Bake fire + smoke flip-book textures. Call ONCE per session (in PolisRenderer
  * constructor) with the real PIXI renderer. Matches the buildingAtlas generateTexture
  * pattern: draw Graphics off-screen, call renderer.generateTexture, destroy Graphics.
+ *
+ * A7 — with a sprite bank carrying the OGA 9-frame fire strip, the flame bands
+ * re-bake the REAL pixel-art frames per severity (scale + tint) instead of the
+ * procedural ellipses; the atlas contract (frame counts, ownership, destroy
+ * path) is identical either way. Smoke stays procedural (the strip has none).
  */
-export function bakeFireAtlas(renderer: FireTextureSource): FireAtlas {
-  const flames = {
-    smoke: bakeFlameBand(renderer, 0.22, 0xffffff),
-    fire: bakeFlameBand(renderer, 0.4, 0xffffff),
-    inferno: bakeFlameBand(renderer, 0.6, 0xcc3322),
-  };
+export function bakeFireAtlas(
+  renderer: FireTextureSource,
+  bank?: { get(key: string): Texture | null } | null,
+): FireAtlas {
+  const art = resolveFireArt(bank);
+  // Band scales match the procedural bands' on-screen heights: a procedural
+  // flame at band scale s is ~60s px tall; the art frame's flame is ~56px.
+  const flames = art
+    ? {
+        smoke: bakeFlameBandFromArt(renderer, art, 0.24, 0xffffff),
+        fire: bakeFlameBandFromArt(renderer, art, 0.43, 0xffffff),
+        // Milder red than the procedural 0xcc3322 — the pixel art is already
+        // saturated; a hard multiply would crush it toward black.
+        inferno: bakeFlameBandFromArt(renderer, art, 0.64, 0xffb0a0),
+      }
+    : {
+        smoke: bakeFlameBand(renderer, 0.22, 0xffffff),
+        fire: bakeFlameBand(renderer, 0.4, 0xffffff),
+        inferno: bakeFlameBand(renderer, 0.6, 0xcc3322),
+      };
   const smokes = bakeSmokeBand(renderer, 0.28);
   return { flames, smokes };
+}
+
+/**
+ * Bake one severity band from the real strip frames: each frame is drawn
+ * through an off-screen Sprite (scaled + tinted) into its own RenderTexture,
+ * so the returned textures are OWNED by the atlas exactly like the procedural
+ * ones (destroyFireAtlas destroys them; the bank's source frames are never
+ * destroyed here).
+ */
+function bakeFlameBandFromArt(
+  renderer: FireTextureSource,
+  art: Texture[],
+  scale: number,
+  tint: number,
+): Texture[] {
+  const frames: Texture[] = [];
+  const sp = new Sprite();
+  sp.tint = tint;
+  sp.scale.set(scale);
+  const container = new Container();
+  container.addChild(sp);
+  for (const frameTex of art) {
+    sp.texture = frameTex;
+    frames.push(
+      renderer.generateTexture({ target: container, resolution: 1, antialias: false }),
+    );
+  }
+  sp.destroy(); // texture stays owned by the bank
+  container.destroy({ children: false });
+  return frames;
 }
 
 function bakeFlameBand(renderer: FireTextureSource, scale: number, tint: number): Texture[] {

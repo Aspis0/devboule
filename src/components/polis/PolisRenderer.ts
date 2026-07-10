@@ -791,8 +791,12 @@ export class PolisRenderer {
     this.effectsBudget = new EffectsBudget(this.profile, () => performance.now() / 1000);
     // P5.1 — bake fire atlas (Flame/Smoke → RenderTexture flip-book frames).
     // The PIXI renderer is required; it is ready by the time the constructor runs.
+    // A7 — with a sprite bank, the flame bands bake the REAL OGA strip frames.
     try {
-      this.fireAtlas = bakeFireAtlas(this.app.renderer as unknown as import('./fire').FireTextureSource);
+      this.fireAtlas = bakeFireAtlas(
+        this.app.renderer as unknown as import('./fire').FireTextureSource,
+        this.spriteBank,
+      );
     } catch {
       this.debugLog("P5.1 fire atlas bake failed — crowd fires disabled");
     }

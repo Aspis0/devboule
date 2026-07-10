@@ -1,0 +1,148 @@
+{
+  "jobs": [
+    {
+      "key": "fx:fire:f0",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        0,
+        0,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f1",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        64,
+        0,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f2",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        128,
+        0,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f3",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        0,
+        64,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f4",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        64,
+        64,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f5",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        128,
+        64,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f6",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        0,
+        128,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f7",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        64,
+        128,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    },
+    {
+      "key": "fx:fire:f8",
+      "source": "oga-fire-9frame",
+      "in": "tools/polis-art/raw/fire/fire-9frame-64x.png",
+      "trim": false,
+      "crop": [
+        128,
+        128,
+        64,
+        64
+      ],
+      "anchor": [
+        0.5,
+        0.95
+      ]
+    }
+  ]
+}
