@@ -108,6 +108,16 @@ export const HELP_SECTIONS: HelpSection[] = [
       "The bell / notification icon in the header shows agents that need you — a question, an approve/deny decision, or a risk flag — so you never miss a hand-off.",
     ],
   },
+  {
+    id: "acknowledgments",
+    title: "Acknowledgments",
+    body: [
+      "Devboule is built on the shoulders of giants — first among them is pi, the open-source coding-agent runtime by earendil-works (@earendil-works/pi-coding-agent). Our orchestrator and coders run on pi; it bundles the pi agent loop, AI, and TUI pieces that our own agents are wired into every day, and we're deeply grateful to earendil-works for releasing it as open source.",
+      "Under the hood, Devboule leans on an incredible open-source stack (the genuine npm/cargo dependencies). The desktop app is powered by Tauri, with a React + Vite frontend styled with Tailwind CSS and icons from lucide-react, state managed with Zustand, and in-app terminals rendered with xterm.js. The living Polis map is drawn with PixiJS (pixi.js, with pixi-filters and pixi-viewport), its dependency arrows laid out with d3-force and perfect-arrows, and UI motion from GSAP. The Censor's deterministic review is grounded in tree-sitter's multi-language parsing, agent terminals ride on portable-pty, and DOMPurify keeps rendered HTML safe. Separately, Devboule integrates at runtime with a local retrieval/inference stack — the Oracle knowledge layer and its semantic search run on LanceDB, with local Qwen embeddings and on-device MLX (oMLX) inference — but these are external runtime services and models the app talks to, not npm/cargo dependencies.",
+      "Polis isn't just code — it's also open art. The isometric city is built from open-licensed sprite work we're thrilled to credit: seamless terrain and material textures from Screaming Brain Studios' Tiny Texture Pack (CC0); the trees and walking-crowd walk cycles from the Unknown Horizons team (CC-BY-SA 3.0); and the burning-building fire animation by FoshyTakashi (CC-BY 3.0). Thank you to these artists for sharing their work.",
+      "And, of course, the many other open-source projects — from the Rust crates in our Tauri backend to the npm packages in our frontend — listed in our dependency manifests. Thank you.",
+    ],
+  },
 ];
 
 export function HelpView() {

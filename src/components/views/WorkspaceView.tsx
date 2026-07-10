@@ -345,8 +345,9 @@ export function WorkspaceView() {
               </div>
             </div>
             <p className="max-w-3xl text-[12px] leading-5 text-cream-500">
-              Code stays in GitHub repos. Data, caches, models, outputs, secrets
-              and agent logs stay out of Git and out of Oracle full indexing.
+              Your workspace is the top folder Devboule works in. This screen shows
+              how healthy it is — its size, files, large files, and any messy Git
+              repos — so agents stay fast and safe.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -483,6 +484,16 @@ export function WorkspaceView() {
             />
           </section>
 
+          <p className="max-w-3xl text-[12px] leading-5 text-cream-500">
+            “Oracle” counts the text/code files Oracle would index for codebase
+            search. “Dirty Repos” have uncommitted changes; “Heavy” is large
+            non-code files (models, caches) that bloat the workspace.
+          </p>
+          <p className="max-w-3xl text-[11px] leading-4 text-cream-400">
+            “Index” = Oracle's searchable index of your code (the vector database
+            behind codebase Q&A).
+          </p>
+
           <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
             <section className="rounded-lg border border-cream-200 bg-white p-4">
               <div className="mb-3 flex items-center justify-between gap-3">
@@ -491,7 +502,9 @@ export function WorkspaceView() {
                     Code Repositories
                   </h3>
                   <p className="mt-1 text-[12px] text-cream-400">
-                    These are the repos a collaborator should clone.
+                    Every Git repo found in your workspace, with its branch and
+                    whether it has uncommitted changes. “Copy clone” gives a safe
+                    clone command with credentials stripped.
                   </p>
                 </div>
                 <span className="rounded-md bg-cream-50 px-2 py-1 text-[10px] font-semibold text-cream-500">
@@ -575,6 +588,11 @@ export function WorkspaceView() {
                     Policies
                   </h3>
                 </div>
+                <p className="mb-3 text-[12px] leading-5 text-cream-500">
+                  Policy files are .gitignore-style rules that tell Devboule which
+                  files to exclude from Oracle indexing and hygiene scans. Missing
+                  policies mean everything is included.
+                </p>
                 <div className="space-y-2">
                   {(snapshot?.policyFiles ?? []).map((policy) => (
                     <div
@@ -632,6 +650,10 @@ export function WorkspaceView() {
                     Classification
                   </h3>
                 </div>
+                <p className="mb-3 text-[12px] leading-5 text-cream-500">
+                  After a scan, files are labeled (code, data, model, cache, secret)
+                  so you can see what's taking space and what Oracle should skip.
+                </p>
                 <div className="space-y-2">
                   {(snapshot?.classifications ?? [])
                     .slice(0, 12)
@@ -780,10 +802,8 @@ function CustomAgentClientsCard() {
         </h3>
       </div>
       <p className="mb-3 max-w-3xl text-[12px] leading-5 text-cream-500">
-        Add your own agent command-line tools. Each one appears in the Spawn panel
-        next to Codex and Claude and launches the same way. The command runs as
-        written; the prompt is on the clipboard and at{" "}
-        <span className="font-mono">$ASPIS_AGENT_PROMPT_FILE</span>.
+        Register your own command-line agents (e.g. a DeepSeek or local CLI). They
+        then appear in the Spawn panel next to Claude and Codex.
       </p>
 
       {clients.length > 0 ? (
@@ -1229,10 +1249,8 @@ export function CensorLocalAiCard() {
         </h3>
       </div>
       <p className="mb-4 max-w-3xl text-[12px] leading-5 text-cream-500">
-        Choose the model provider Censor uses for its optional tier-2 (Gemma)
-        review. Ollama is the default; oMLX points Censor at a local MLX server;
-        Apple on-device uses macOS Foundation Models. Cloud is an opt-in remote
-        HTTPS endpoint — it sends your code off-device, so use it deliberately.
+        Censor is Devboule's optional local code reviewer. Here you pick which model
+        runs it — a local Ollama/oMLX server, Apple on-device, or a cloud endpoint.
       </p>
 
       <div className="grid gap-3 rounded-2xl border border-cream-200 p-3 md:grid-cols-2">
@@ -1453,9 +1471,9 @@ function WorkspaceBootstrapPanel({
             </h3>
           </div>
           <p className="max-w-3xl text-[12px] leading-5 text-cream-500">
-            Create one encrypted package for approved devices, then upload the
-            file to any cloud. A collaborator can decrypt it only from an
-            approved Devboule install.
+            Bootstrap packages are encrypted snapshots of your workspace setup, used
+            to onboard a collaborator's machine. Create, download, or decrypt one
+            here.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -1899,6 +1917,10 @@ function InventoryPanel({ items }: { items: WorkspaceSizeEntry[] }) {
           Top-Level Size
         </h3>
       </div>
+      <p className="mb-3 text-[12px] leading-5 text-cream-500">
+        Where the workspace's size actually lives — the biggest top-level folders,
+        so you can spot caches and data that shouldn't be in Git.
+      </p>
       <div className="space-y-2">
         {items.map((item) => (
           <div
@@ -1936,6 +1958,10 @@ function LargeFilePanel({ items }: { items: WorkspaceLargeFile[] }) {
           Large Files
         </h3>
       </div>
+      <p className="mb-3 text-[12px] leading-5 text-cream-500">
+        The biggest individual files — usually models, caches or datasets — that
+        bloat the workspace and should live outside Git and Oracle.
+      </p>
       <div className="space-y-2">
         {items.map((file) => (
           <div

@@ -1,4 +1,4 @@
-import { Search, Bell, Lock, AlertTriangle, AlertCircle, Info, UserCircle2 } from "lucide-react";
+import { Search, Bell, Lock, AlertTriangle, AlertCircle, Info, UserCircle2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   invokeBackendCommand,
@@ -13,6 +13,7 @@ import type {
   Role,
 } from "../types/backend";
 import { useAgentAttentionStore } from "../store/agentAttentionStore";
+import { useDismissedRisks, dismissRisk, clearRisks } from "../store/dismissedRisks";
 import { attentionSessions } from "./agents/agentFleet";
 import { stripSpoofChars } from "./agents/attentionNotifier";
 import { combineBadgeCount } from "./headerBadge";
@@ -119,7 +120,10 @@ export function Header() {
   const notificationsRef = useRef<HTMLDivElement | null>(null);
   const cleanQuery = query.trim().toLowerCase();
   const risks = cloudSnapshot?.risks ?? [];
-  const riskCount = risks.length;
+  // Risk flags are advisory warnings with stable ids — a user may dismiss them.
+  const dismissed = useDismissedRisks();
+  const visibleRisks = risks.filter((r) => !dismissed.has(r.id));
+  const riskCount = visibleRisks.length;
 
   // Agents needing the human. Fed by the existing agent-live-state pollers via
   // the attention store (no new poller). A live clock keeps stale/lost health
@@ -131,6 +135,9 @@ export function Header() {
     [attentionStoreSessions, now],
   );
   const attentionCount = attention.length;
+  // Attention items are LIVE: an agent literally waiting on a human, clearing
+  // only when answered. They are NOT manually dismissable — clicking opens the
+  // agent to resolve it, which is why there is no per-item dismiss control here.
   const badgeCount = combineBadgeCount(riskCount, attentionCount);
   const matches = useMemo(() => {
     if (!cleanQuery) return [];
@@ -305,45 +312,75 @@ export function Header() {
                 <p className="text-[11px] font-semibold uppercase tracking-widest text-cream-500">
                   Risk Flags
                 </p>
-                <span className="text-[11px] font-medium text-cream-400">
-                  {riskCount}
-                </span>
+                <div className="flex items-center gap-3">
+                  {visibleRisks.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => clearRisks(visibleRisks.map((r) => r.id))}
+                      className="text-[11px] font-medium text-cream-400 hover:text-terracotta transition-colors"
+                    >
+                      Clear all
+                    </button>
+                  )}
+                  <span className="text-[11px] font-medium text-cream-400">
+                    {riskCount}
+                  </span>
+                </div>
               </div>
               <div className="max-h-80 overflow-y-auto py-1">
-                {risks.map((risk) => {
+                {visibleRisks.map((risk) => {
                   const cfg =
                     riskIconConfig[risk.severity as keyof typeof riskIconConfig] ??
                     riskIconConfig.low;
                   const Icon = cfg.icon;
 
                   return (
-                    <button
+                    <div
                       key={risk.id}
-                      onClick={() => openView(viewForRisk(risk))}
-                      className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-cream-50"
+                      className="group flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-cream-50"
                     >
-                      <span
-                        className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${cfg.bg}`}
+                      <button
+                        type="button"
+                        onClick={() => openView(viewForRisk(risk))}
+                        className="flex min-w-0 flex-1 items-start gap-3 text-left"
                       >
-                        <Icon className={`h-3.5 w-3.5 ${cfg.text}`} />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[13px] font-semibold text-cream-800">
-                          {risk.title}
+                        <span
+                          className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${cfg.bg}`}
+                        >
+                          <Icon className={`h-3.5 w-3.5 ${cfg.text}`} />
                         </span>
-                        <span className="mt-0.5 line-clamp-2 block text-[11px] leading-relaxed text-cream-500">
-                          {risk.description}
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[13px] font-semibold text-cream-800">
+                            {risk.title}
+                          </span>
+                          <span className="mt-0.5 line-clamp-2 block text-[11px] leading-relaxed text-cream-500">
+                            {risk.description}
+                          </span>
+                          <span className="mt-1 block text-[10px] text-cream-400">
+                            {risk.source} · {risk.timestamp}
+                          </span>
                         </span>
-                        <span className="mt-1 block text-[10px] text-cream-400">
-                          {risk.source} · {risk.timestamp}
-                        </span>
-                      </span>
-                    </button>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Dismiss ${risk.title}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          dismissRisk(risk.id);
+                        }}
+                        className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-cream-300 opacity-0 transition-opacity hover:bg-cream-100 hover:text-coral group-hover:opacity-100 focus:opacity-100"
+                        title="Dismiss this risk flag"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   );
                 })}
                 {riskCount === 0 && (
                   <p className="px-4 py-3 text-[12px] text-cream-400">
-                    No provider risks reported.
+                    {risks.length === 0
+                      ? "No provider risks reported."
+                      : "No visible risk flags."}
                   </p>
                 )}
               </div>

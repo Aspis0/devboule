@@ -3,7 +3,8 @@
 // Phase 5: the Providers & Models tab. We mock the child cards to lightweight
 // markers (their own persistence is tested in their own files) and provide a
 // detect_providers IPC mock, so this test proves the WIRING: the detection strip
-// renders the detected providers, and all sections mount in order.
+// renders the detected providers, and the semantic sub-tabs (Models / Gates &
+// helpers / Extensions / Design) switch which cards mount.
 //
 // Oracle LLM card was moved to OracleAdminPanel; OracleAnswerSettingsCard is no
 // longer mounted here. LocalCoderBackendCard was deleted (redundant with
@@ -70,6 +71,11 @@ vi.mock("./UserMcpServersCard", () => ({
 vi.mock("../views/PiExtensionsCard", () => ({
   PiExtensionsCard: () =>
     createElement("div", { "data-testid": "pi-extensions-card" }),
+}));
+// RecommendedConfigCard renders for real but only uses the mocked invokeBackendCommand.
+vi.mock("./RecommendedConfigCard", () => ({
+  RecommendedConfigCard: () =>
+    createElement("div", { "data-testid": "recommended-config-card" }),
 }));
 
 import { ProvidersModelsTab } from "./ProvidersModelsTab";
@@ -167,55 +173,184 @@ describe("ProvidersModelsTab", () => {
     expect(html).toContain("running (1 model)");
   });
 
-  it("renders all per-role card sections", async () => {
-    await mount();
-    // Default-open surfaces render immediately: the unified Roles table, the Models group
-    // (Model registry), and the Gates & helpers group (Censor + Design LLM + Mini write behavior).
-    expect(
-      container.querySelector('[data-testid="roles-table-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="model-registry-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="censor-model-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="design-llm-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="mini-write-behavior-card"]'),
-    ).not.toBeNull();
-
-    // The "Extensions" group is collapsed by default — expand it, then assert.
-    const extBtn = Array.from(container.querySelectorAll("button")).find((b) =>
-      (b.textContent ?? "").includes("Extensions"),
-    );
-    await act(async () => {
-      extBtn?.click();
-    });
-    expect(
-      container.querySelector('[data-testid="web-search-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="bundled-extensions-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="user-mcp-servers-card"]'),
-    ).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="pi-extensions-card"]'),
-    ).not.toBeNull();
-
-    // Oracle LLM card is NOT here — it moved to OracleAdminPanel.
-    expect(
-      container.querySelector('[data-testid="oracle-llm-card"]'),
-    ).toBeNull();
-  });
-
   it("shows an empty-state note when nothing is detected", async () => {
     detectResult = [];
     await mount();
     expect(container.innerHTML).toContain("No local CLI or HTTP provider detected");
+  });
+
+  describe("semantic sub-tabs", () => {
+    /** Grab a sub-panel by its stable id (all four are always mounted). */
+    function panel(id: string): HTMLElement | null {
+      return container.querySelector(`#subtab-panel-${id}`);
+    }
+
+    it("shows the 4 sub-tab labels and has tablist/tab ARIA with one panel per tab", async () => {
+      await mount();
+      const tabs = Array.from(
+        container.querySelectorAll('[role="tab"]'),
+      ) as HTMLButtonElement[];
+      const labels = tabs.map((t) => t.textContent ?? "");
+      expect(labels).toContain("Models");
+      expect(labels).toContain("Gates & helpers");
+      expect(labels).toContain("Extensions");
+      expect(labels).toContain("Design");
+      expect(tabs).toHaveLength(4);
+      // One tablist + four tabpanels (one per tab), each labelled by its tab.
+      expect(container.querySelector('[role="tablist"]')).not.toBeNull();
+      const panels = Array.from(
+        container.querySelectorAll('[role="tabpanel"]'),
+      ) as HTMLElement[];
+      expect(panels).toHaveLength(4);
+      // Every tab's aria-controls points at a panel that actually exists, and
+      // every panel's aria-labelledby points back at its tab id.
+      for (const tab of tabs) {
+        const controls = tab.getAttribute("aria-controls")!;
+        const target = container.querySelector(`#${controls}`);
+        expect(target).not.toBeNull();
+        expect(target?.getAttribute("role")).toBe("tabpanel");
+        expect(target?.getAttribute("aria-labelledby")).toBe(tab.id);
+      }
+    });
+
+    it("has Models active by default: its cards show, the other panels are mounted but hidden", async () => {
+      await mount();
+      const tabs = Array.from(
+        container.querySelectorAll('[role="tab"]'),
+      ) as HTMLButtonElement[];
+      const modelsTab = tabs.find((t) => (t.textContent ?? "") === "Models")!;
+      expect(modelsTab.getAttribute("aria-selected")).toBe("true");
+
+      // Models panel is visible and its cards are in the document.
+      expect(panel("models")?.hasAttribute("hidden")).toBe(false);
+      expect(
+        container.querySelector('[data-testid="recommended-config-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="roles-table-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="model-registry-card"]'),
+      ).not.toBeNull();
+
+      // The other three panels stay MOUNTED (their cards exist in the DOM) but
+      // are hidden, so they are NOT visible while Models is active.
+      expect(panel("gates")?.hasAttribute("hidden")).toBe(true);
+      expect(panel("extensions")?.hasAttribute("hidden")).toBe(true);
+      expect(panel("design")?.hasAttribute("hidden")).toBe(true);
+      expect(
+        container.querySelector('[data-testid="bundled-extensions-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="user-mcp-servers-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="pi-extensions-card"]'),
+      ).not.toBeNull();
+    });
+
+    it("swaps to Extensions when its sub-tab is clicked, keeping panels mounted", async () => {
+      await mount();
+      const tabs = Array.from(
+        container.querySelectorAll('[role="tab"]'),
+      ) as HTMLButtonElement[];
+      const extTab = tabs.find((t) => (t.textContent ?? "") === "Extensions")!;
+
+      await act(async () => {
+        extTab.click();
+      });
+
+      expect(extTab.getAttribute("aria-selected")).toBe("true");
+      // Extensions panel now visible; Models panel hidden.
+      expect(panel("extensions")?.hasAttribute("hidden")).toBe(false);
+      expect(panel("models")?.hasAttribute("hidden")).toBe(true);
+
+      // Extensions-group cards are present (mounted) and now visible.
+      expect(
+        container.querySelector('[data-testid="bundled-extensions-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="user-mcp-servers-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="pi-extensions-card"]'),
+      ).not.toBeNull();
+
+      // Models-group cards are STILL in the document (not unmounted) — they are
+      // just hidden because their panel is inactive.
+      expect(
+        container.querySelector('[data-testid="roles-table-card"]'),
+      ).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="model-registry-card"]'),
+      ).not.toBeNull();
+
+      // Oracle LLM card is NOT here — it moved to OracleAdminPanel.
+      expect(
+        container.querySelector('[data-testid="oracle-llm-card"]'),
+      ).toBeNull();
+    });
+
+    it("keeps every sub-panel mounted and toggles visibility without unmounting", async () => {
+      await mount();
+      const tabs = Array.from(
+        container.querySelectorAll('[role="tab"]'),
+      ) as HTMLButtonElement[];
+
+      // All four panels exist in the DOM initially regardless of which is active.
+      for (const id of ["models", "gates", "extensions", "design"]) {
+        expect(panel(id)).not.toBeNull();
+      }
+
+      // Click every tab in turn; the cards from every group stay mounted the
+      // whole time (switching only toggles the `hidden` attribute).
+      const order = ["Gates & helpers", "Extensions", "Design", "Models"];
+      for (const label of order) {
+        const tab = tabs.find((t) => (t.textContent ?? "") === label)!;
+        await act(async () => {
+          tab.click();
+        });
+        // Still all mounted after the switch.
+        expect(container.querySelector('[data-testid="roles-table-card"]')).not.toBeNull();
+        expect(container.querySelector('[data-testid="censor-model-card"]')).not.toBeNull();
+        expect(container.querySelector('[data-testid="bundled-extensions-card"]')).not.toBeNull();
+        expect(container.querySelector('[data-testid="design-llm-card"]')).not.toBeNull();
+      }
+      // Final state: Models active again, others hidden.
+      expect(panel("models")?.hasAttribute("hidden")).toBe(false);
+      expect(panel("gates")?.hasAttribute("hidden")).toBe(true);
+      expect(panel("extensions")?.hasAttribute("hidden")).toBe(true);
+      expect(panel("design")?.hasAttribute("hidden")).toBe(true);
+    });
+
+    it("renders each remaining sub-tab's cards and no card is dropped", async () => {
+      await mount();
+
+      async function clickSubTab(label: string) {
+        const tab = Array.from(
+          container.querySelectorAll('[role="tab"]'),
+        ) as HTMLButtonElement[];
+        const target = tab.find((t) => (t.textContent ?? "") === label)!;
+        await act(async () => {
+          target.click();
+        });
+      }
+
+      // Gates & helpers: Censor, Mini write behavior, WebSearch.
+      await clickSubTab("Gates & helpers");
+      expect(panel("gates")?.hasAttribute("hidden")).toBe(false);
+      expect(container.querySelector('[data-testid="censor-model-card"]')).not.toBeNull();
+      expect(
+        container.querySelector('[data-testid="mini-write-behavior-card"]'),
+      ).not.toBeNull();
+      expect(container.querySelector('[data-testid="web-search-card"]')).not.toBeNull();
+
+      // Design: Design LLM only.
+      await clickSubTab("Design");
+      expect(panel("design")?.hasAttribute("hidden")).toBe(false);
+      expect(container.querySelector('[data-testid="design-llm-card"]')).not.toBeNull();
+      // Gates panel is now hidden (its cards remain mounted, just not visible).
+      expect(panel("gates")?.hasAttribute("hidden")).toBe(true);
+    });
   });
 });

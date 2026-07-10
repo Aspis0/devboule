@@ -316,6 +316,24 @@ function collectHelpItems(activeView: string) {
 	return items;
 }
 
+/**
+ * Help mode should engage ONLY on a BARE Alt (Option on macOS) keydown.
+ *
+ * A bare Alt keydown is `event.key === "Alt"` with no other modifier held.
+ * We must NOT trigger on `event.altKey === true` for other keys: on macOS,
+ * Option is a dead-key used to compose special characters (Option+8 = •,
+ * Option+e = accents, etc.). If help mode fired on any Alt+char combo, it would
+ * hijack those keystrokes and block typing in inputs/textareas.
+ */
+export function shouldEnterHelpMode(event: KeyboardEvent): boolean {
+	return (
+		event.key === "Alt" &&
+		!event.shiftKey &&
+		!event.ctrlKey &&
+		!event.metaKey
+	);
+}
+
 export function HelpModeOverlay() {
 	const { activeView } = useAppContext();
 	// helpMode lives here, not in the global AppContext: holding/releasing Alt
@@ -327,9 +345,14 @@ export function HelpModeOverlay() {
 	// on Alt press/release.
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
-			if (event.key === "Alt" || event.altKey) setHelpMode(true);
+			// Only a lone Alt (Option) keydown reveals help mode. Alt combined with a
+			// character or another modifier is left alone so Option+char typing on
+			// macOS reaches inputs/textareas normally.
+			if (shouldEnterHelpMode(event)) setHelpMode(true);
 		};
 		const onKeyUp = (event: KeyboardEvent) => {
+			// Hide when the bare Alt key is released, or whenever Alt is no longer
+			// held. Never blocks input because we never call preventDefault.
 			if (event.key === "Alt" || !event.altKey) setHelpMode(false);
 		};
 		const onBlur = () => setHelpMode(false);
