@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::polis::model::{Building, Road};
-use crate::polis::terrain::{classify, Terrain, TerrainData, Tile};
+use crate::polis::terrain::{classify, River, Terrain, TerrainData, Tile};
 
 /// Walkability predicate — the heart of the guarantee. A citizen/agent/porter may
 /// stand ONLY on these terrains; everything else (`Grass`, `Sand`, `River`, `Sea`)
@@ -56,8 +56,8 @@ pub struct NavGrid {
     sea_x: i32,
     min_y: i32,
     max_y: i32,
-    /// River channel columns (with `gx < sea_x`), copied from `TerrainData::rivers`.
-    rivers: Vec<(i32, i32)>,
+    /// River channels, copied from `TerrainData::rivers`.
+    rivers: Vec<River>,
     /// Tiles a routed road covers (rasterized from every `Road::path`). A road tile
     /// over a river column is a `Bridge`; otherwise `Road`.
     roads: BTreeSet<Tile>,
@@ -83,11 +83,7 @@ impl NavGrid {
         let roads = road_path_tiles(roads);
         let bridges: BTreeSet<Tile> = terrain.bridges.iter().copied().collect();
         let occ = building_tiles(buildings);
-        let rivers = terrain
-            .rivers
-            .iter()
-            .map(|r| (r.gx_min, r.gx_max))
-            .collect();
+        let rivers = terrain.rivers.clone();
         let min_x = buildings
             .iter()
             .map(|b| b.coords.x.round() as i32)
@@ -122,7 +118,7 @@ impl NavGrid {
             self.min_y,
             self.max_y,
             self.sea_x,
-            &rivers_as_slice(&self.rivers),
+            &self.rivers,
             is_road,
         );
         // A tile explicitly marked Bridge stays a Bridge even if (defensively)
@@ -257,14 +253,6 @@ fn reconstruct(came_from: &BTreeMap<Tile, Tile>, goal: Tile) -> Vec<Tile> {
     path
 }
 
-/// `rivers` stored as `(min, max)` pairs → the `terrain::River` slice `classify`
-/// expects. Local helper so `NavGrid` can keep the compact pair form.
-fn rivers_as_slice(rivers: &[(i32, i32)]) -> Vec<crate::polis::terrain::River> {
-    rivers
-        .iter()
-        .map(|&(gx_min, gx_max)| crate::polis::terrain::River { gx_min, gx_max })
-        .collect()
-}
 
 /// All tiles a building footprint occupies, in absolute tile space —
 /// `[coords.x, coords.x + W) x [coords.y, coords.y + D)`. Mirrors
@@ -401,15 +389,20 @@ mod tests {
     /// Same wide spread of small houses as the terrain tests, so a river + sea
     /// frame is generated to navigate around.
     fn wide_city() -> Vec<Building> {
+        // Two clusters of houses on the left (x=0,3,5) and right (x=17,19,22)
+        // leaving a 11-column corridor (x=6..=16) in the middle for a
+        // meandering river.  step_by(4) left only 3-wide gaps — too narrow
+        // for the new precise clearance which needs 4 free tiles per row.
+        let x_positions = [0.0, 3.0, 5.0, 17.0, 19.0, 22.0];
         let mut v = Vec::new();
-        for (i, x) in (0..=24).step_by(4).enumerate() {
-            for (j, y) in (0..=8).step_by(4).enumerate() {
+        for (i, &x) in x_positions.iter().enumerate() {
+            for (j, y) in [0.0, 4.0, 8.0].iter().enumerate() {
                 v.push(bld(
                     &format!("b{i}-{j}"),
                     purpose::HOUSE,
                     visual_tier::KALYBE,
-                    x as f64,
-                    y as f64,
+                    x,
+                    *y,
                 ));
             }
         }
@@ -436,14 +429,14 @@ mod tests {
         // A long east-west road plus a north-south road so there is a connected
         // street network to route over.
         let roads = vec![
-            road_with_path("r0", vec![(0, 1), (24, 1)]),
+            road_with_path("r0", vec![(0, 1), (22, 1)]),
             road_with_path("r1", vec![(2, 0), (2, 8)]),
         ];
         let terrain = build_terrain(&buildings, &roads, 0);
         let nav = NavGrid::new(&buildings, &roads, &terrain);
 
         let start = Tile::new(0, 1);
-        let goal = Tile::new(24, 1);
+        let goal = Tile::new(22, 1);
         assert!(nav.is_node(start), "start road tile is a node");
         assert!(nav.is_node(goal), "goal road tile is a node");
 
@@ -481,7 +474,7 @@ mod tests {
         let buildings = wide_city();
         // First, find the river the terrain places for this city.
         let t0 = build_terrain(&buildings, &[], 0);
-        let river = t0.rivers[0];
+        let river = &t0.rivers[0];
         let cross_y = t0.min_y + 1;
 
         // A single east-west road crossing the river channel at `cross_y`, with a
@@ -527,7 +520,7 @@ mod tests {
     fn astar_none_when_unreachable_across_unbridged_river() {
         let buildings = wide_city();
         let t0 = build_terrain(&buildings, &[], 0);
-        let river = t0.rivers[0];
+        let river = &t0.rivers[0];
         let row = t0.min_y + 1;
 
         // Two road STUBS on opposite banks that DO NOT cross the river (no bridge):
@@ -629,7 +622,7 @@ mod tests {
     fn every_routed_road_path_tile_is_walkable() {
         let buildings = wide_city();
         let t0 = build_terrain(&buildings, &[], 0);
-        let river = t0.rivers[0];
+        let river = &t0.rivers[0];
         // Roads that DO cross the river (so they exercise the bridge path) and roads
         // that run on land — all must be entirely walkable.
         let roads = vec![
@@ -640,7 +633,7 @@ mod tests {
                     (river.gx_max + 3, t0.min_y + 1),
                 ],
             ),
-            road_with_path("land", vec![(0, 2), (24, 2)]),
+            road_with_path("land", vec![(0, 2), (22, 2)]),
             road_with_path("vert", vec![(2, 0), (2, 8)]),
         ];
         let terrain = build_terrain(&buildings, &roads, 0);
@@ -681,7 +674,7 @@ mod tests {
     fn astar_is_deterministic() {
         let buildings = wide_city();
         let roads = vec![
-            road_with_path("r0", vec![(0, 1), (24, 1)]),
+            road_with_path("r0", vec![(0, 1), (22, 1)]),
             road_with_path("r1", vec![(2, 0), (2, 8)]),
             road_with_path("r2", vec![(10, 1), (10, 8)]),
         ];
@@ -712,7 +705,7 @@ mod tests {
     fn terrain_at_matches_emitted_frame() {
         let buildings = wide_city();
         let t0 = build_terrain(&buildings, &[], 0);
-        let river = t0.rivers[0];
+        let river = &t0.rivers[0];
         let cross_y = t0.min_y + 1;
         let road = road_with_path(
             "r",
@@ -751,7 +744,7 @@ mod tests {
     fn bridge_tile_not_in_road_set_is_not_bridge() {
         let buildings = wide_city();
         let t0 = build_terrain(&buildings, &[], 0);
-        let river = t0.rivers[0];
+        let river = &t0.rivers[0];
         let cross_y = t0.min_y + 1;
         // A real crossing road so the terrain frame + a legitimate bridge exist.
         let road = road_with_path(
@@ -787,5 +780,98 @@ mod tests {
             nav.terrain_at(Tile::new(river.gx_min, cross_y)),
             Terrain::Bridge
         );
+    }
+
+    // Regression: NavGrid::terrain_at must agree with the emitted water tile
+    // set for every tile in the river band — catches the bug where NavGrid
+    // stored River as (gx_min,gx_max) tuples and rivers_as_slice rebuilt
+    // Rivers with empty channels, causing is_river_tile to misclassify.
+    //
+    // The fixture is chosen so the river actually uses offset −1 somewhere
+    // (channels.min() < channels[0]), exercising the per-row channel path
+    // rather than the envelope fallback.
+    #[test]
+    fn terrain_at_agrees_with_emitted_water_for_every_tile() {
+        let buildings = wide_city();
+        let terrain = build_terrain(&buildings, &[], 0);
+        assert!(!terrain.rivers.is_empty(), "need at least one river");
+
+        // Force a river that actually meanders into offset −1 so the per-row
+        // channel path is exercised (not just the envelope fallback).
+        let r0 = &terrain.rivers[0];
+        let has_neg1 = r0.channels.windows(2).any(|w| (w[1] - w[0]).abs() > 0)
+            || r0.channels.iter().any(|&ch| ch < r0.channels[0]);
+        // If the standard fixture never hits offset −1, find a wider geometry.
+        // Try progressively wider gaps by rebuilding with shifted buildings.
+        let (terrain, buildings_for_nav) = if has_neg1 {
+            (terrain, buildings)
+        } else {
+            // Build a city with an extra-wide corridor so the meander has room
+            // to shift to offset −1.
+            let mut wide_buildings = Vec::new();
+            // Left cluster far left, right cluster far right → 18-col corridor.
+            let xs = [0.0, 2.0, 4.0, 22.0, 24.0, 26.0];
+            for (i, &x) in xs.iter().enumerate() {
+                for (j, y) in [0.0, 4.0, 8.0].iter().enumerate() {
+                    wide_buildings.push(bld(
+                        &format!("w{i}-{j}"),
+                        purpose::HOUSE,
+                        visual_tier::KALYBE,
+                        x,
+                        *y,
+                    ));
+                }
+            }
+            let t2 = build_terrain(&wide_buildings, &[], 0);
+            assert!(!t2.rivers.is_empty(), "wider city must have a river");
+            let r = &t2.rivers[0];
+            assert!(
+                r.channels.iter().any(|&ch| ch < r.channels[0]),
+                "wider city river must use offset −1 somewhere; channels = {:?}",
+                r.channels
+            );
+            (t2, wide_buildings)
+        };
+
+        let nav = NavGrid::new(&buildings_for_nav, &[], &terrain);
+        let water_set: BTreeSet<Tile> = terrain
+            .water
+            .iter()
+            .map(|w| Tile::new(w.gx, w.gy))
+            .collect();
+
+        // For every tile in the terrain band, check consistency.
+        for gy in terrain.min_y..terrain.max_y {
+            // The river band extends up to sea_x (exclusive).
+            for gx in 0..terrain.sea_x {
+                let tile = Tile::new(gx, gy);
+                let t_at = nav.terrain_at(tile);
+                let in_water = water_set.contains(&tile);
+
+                if in_water {
+                    // Water tile → terrain_at must be River (or Bridge if road).
+                    let is_road = nav.roads.contains(&tile);
+                    if is_road {
+                        assert_eq!(
+                            t_at, Terrain::Bridge,
+                            "water+road tile {tile:?} must be Bridge"
+                        );
+                    } else {
+                        assert_eq!(
+                            t_at, Terrain::River,
+                            "water tile {tile:?} must be River, got {t_at:?}"
+                        );
+                    }
+                }
+
+                // Reverse: if terrain_at says River, tile must be in water set.
+                if t_at == Terrain::River {
+                    assert!(
+                        in_water,
+                        "terrain_at says River at {tile:?} but it is NOT in the water set"
+                    );
+                }
+            }
+        }
     }
 }

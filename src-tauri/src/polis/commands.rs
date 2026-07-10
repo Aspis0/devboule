@@ -2380,6 +2380,7 @@ mod tests {
             rivers: vec![crate::polis::terrain::River {
                 gx_min: 3,
                 gx_max: 4,
+                channels: Vec::new(),
             }],
             water: vec![crate::polis::terrain::WaterTile {
                 gx: 10,

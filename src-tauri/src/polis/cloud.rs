@@ -652,10 +652,14 @@ mod tests {
     // A spread of houses wide enough that `build_terrain` frames a sea + a river to
     // route around (mirrors the terrain/nav tests' `wide_city`).
     fn wide_buildings() -> Vec<Building> {
+        // Two clusters of houses on the left (x=0,3,5) and right (x=17,19,22)
+        // leaving a wide corridor in the middle for a river (mirrors nav's
+        // wide_city).
+        let x_positions = [0.0, 3.0, 5.0, 17.0, 19.0, 22.0];
         let mut v = Vec::new();
-        for (i, x) in (0..=24).step_by(4).enumerate() {
-            for (j, y) in (0..=8).step_by(4).enumerate() {
-                v.push(building_at(&format!("b{i}-{j}"), x as f64, y as f64));
+        for (i, &x) in x_positions.iter().enumerate() {
+            for (j, y) in [0.0, 4.0, 8.0].iter().enumerate() {
+                v.push(building_at(&format!("b{i}-{j}"), x, *y));
             }
         }
         v
@@ -674,14 +678,14 @@ mod tests {
         // Find the river the terrain places for these buildings, then route a road
         // that crosses it (so the bridge path is exercised) plus a land road.
         let t0 = build_terrain(&buildings, &[], 0);
-        let river = t0.rivers[0];
+        let river = &t0.rivers[0];
         let cross_y = t0.min_y + 1;
         let roads = vec![
             road_with_path(
                 "cross",
                 vec![(river.gx_min - 3, cross_y), (river.gx_max + 3, cross_y)],
             ),
-            road_with_path("land", vec![(0, 2), (24, 2)]),
+            road_with_path("land", vec![(0, 2), (22, 2)]),
         ];
 
         let mut city = CityState::empty("Test", "Alpha");
