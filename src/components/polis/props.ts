@@ -20,11 +20,15 @@ import { Graphics, Sprite, type Container } from "pixi.js";
 import { cartToIso } from "./iso";
 import { buildingFootprintTiles } from "./navWalkable";
 import { DERIVED } from "./palette";
-import { rngFromCoords, type Rng } from "./rng";
+import { rngFromCoords, hashCoords, type Rng } from "./rng";
 import type { SpriteBank } from "./spriteAssets";
 import type { TerrainExtent } from "./terrain";
 
 const MAX_PROPS = 2800;
+// Raised cap for forest patches: forests add concentrated tree density that
+// can push total props beyond the base cap. The cap is raised proportionally
+// when forest patches exist (see planForestPatches).
+const FOREST_EXTRA_PROPS_PER_PATCH = 120;
 
 // Interleaved lattice passes (see drawProps): spreads a cap hit uniformly.
 const SCAN_PHASES = 16;
@@ -42,6 +46,13 @@ const P_OLIVE = 0.14;
 const P_ROCK = 0.08;
 const P_STALL = 0.02;
 
+// Forest patch constants.
+const FOREST_PATCH_COUNT_MIN = 3;
+const FOREST_PATCH_COUNT_MAX = 5;
+const FOREST_RADIUS_MIN = 3;
+const FOREST_RADIUS_MAX = 6;
+const FOREST_LATTICE_STEP = 18; // spacing between candidate patch centres
+
 // A4 — real tree sprites (UH maples/tupelos). Trees are TALL (≈2 tiles
 // up-screen) and props live BELOW the buildings layer, so a tree drawn too
 // close to a building would be wrongly covered by it. Trees therefore only
@@ -50,8 +61,20 @@ const P_STALL = 0.02;
 const TREE_CLEARANCE = 2;
 // Among clearance-eligible olive rolls: chance the tile gets a sprite tree.
 const P_TREE_GIVEN_OLIVE = 0.85;
+// In a forest patch: boosted olive → tree probability (near-certain).
+const P_TREE_GIVEN_OLIVE_FOREST = 0.98;
 // Of the sprite trees: chance of the tall dark cypress (tupelo) variant.
 const P_CYPRESS = 0.3;
+// In a forest: boosted cypress proportion (more dark foliage variety).
+const P_CYPRESS_FOREST = 0.45;
+
+export interface ForestPatch {
+  /** Centre tile of the patch. */
+  cx: number;
+  cy: number;
+  /** Radius in tiles (Chebyshev). */
+  radius: number;
+}
 
 /** True when every tile within `ring` Chebyshev distance is unoccupied. */
 function hasClearance(
@@ -179,6 +202,58 @@ function drawStall(g: Graphics, cx: number, cy: number, rng: Rng): void {
 }
 
 /**
+ * Plan 3-5 forest patches on the countryside. Pure function of extent + blockers.
+ * Deterministic: hash-based seeds from the lattice scan, no Math.random.
+ *
+ * Returns the list of patches and a raised MAX_PROPS that accommodates the
+ * concentrated tree density without truncating the global prop cap.
+ */
+export function planForestPatches(
+  ext: TerrainExtent,
+  occupied: Set<string>,
+): { patches: ForestPatch[]; cap: number } {
+  // Candidate lattice: step 18 tiles gives ~4–6 candidates per map side.
+  const cols = Math.max(1, Math.ceil((ext.maxX - ext.minX + 1) / FOREST_LATTICE_STEP));
+  const rows = Math.max(1, Math.ceil((ext.maxY - ext.minY + 1) / FOREST_LATTICE_STEP));
+  const n = cols * rows;
+
+  const candidates: ForestPatch[] = [];
+  for (let i = 0; i < n; i++) {
+    const gx = ext.minX + (i % cols) * FOREST_LATTICE_STEP + FOREST_LATTICE_STEP / 2;
+    const gy = ext.minY + Math.floor(i / cols) * FOREST_LATTICE_STEP + FOREST_LATTICE_STEP / 2;
+    // Deterministic radius from hash.
+    const h = hashCoords(gx, gy);
+    const radius = FOREST_RADIUS_MIN + (h % (FOREST_RADIUS_MAX - FOREST_RADIUS_MIN + 1));
+    // Check that the centre is not inside an occupied tile.
+    if (occupied.has(`${Math.round(gx)},${Math.round(gy)}`)) continue;
+    candidates.push({ cx: Math.round(gx), cy: Math.round(gy), radius });
+  }
+
+  // Pick patches deterministically: hash each candidate, sort by hash, take first N.
+  candidates.sort((a, b) => {
+    const ha = hashCoords(a.cx, a.cy);
+    const hb = hashCoords(b.cx, b.cy);
+    return ha - hb;
+  });
+  const count = Math.min(candidates.length, FOREST_PATCH_COUNT_MIN + ((hashCoords(ext.minX, ext.minY) % (FOREST_PATCH_COUNT_MAX - FOREST_PATCH_COUNT_MIN + 1))));
+  const patches = candidates.slice(0, count);
+
+  // Raised cap: each patch adds concentrated tree density.
+  const cap = MAX_PROPS + patches.length * FOREST_EXTRA_PROPS_PER_PATCH;
+  return { patches, cap };
+}
+
+/** True when (tx, ty) is inside any forest patch (Chebyshev distance). */
+function inForestPatch(patches: ForestPatch[], tx: number, ty: number): boolean {
+  for (const p of patches) {
+    const dx = Math.abs(tx - p.cx);
+    const dy = Math.abs(ty - p.cy);
+    if (dx <= p.radius && dy <= p.radius) return true;
+  }
+  return false;
+}
+
+/**
  * Draw decorative props on empty tiles within `ext`. Returns a FLAT array of
  * Graphics (caller owns destruction) plus the placed count.
  *
@@ -194,8 +269,16 @@ export function drawProps(
   // parcels are flat, so trees standing over them are z-safe and read as
   // hedgerows). Defaults to `occupied` when the caller doesn't split them.
   tallBlockers: Set<string> = occupied,
+  // Optional pre-planned forest patches. When provided and sprites are enabled,
+  // tree density is boosted inside patches. Passed from the renderer.
+  forestPatches?: ForestPatch[] | null,
+  // Optional cap override: when provided (e.g. from planForestPatches), used
+  // instead of the default base cap. This is the single source of truth for
+  // the prop count limit when forest patches are active.
+  capOverride?: number,
 ): { graphics: (Graphics | Container)[]; propCount: number } {
   const chunks: (Graphics | Container)[] = [];
+  const cap = capOverride ?? MAX_PROPS;
   // MAX-RECALL fix — tree Sprites are collected SEPARATELY and appended after
   // every Graphics chunk: interleaving them (all on the prop-0 atlas page)
   // between singles-textured Graphics broke the batch per tree — one draw
@@ -217,8 +300,8 @@ export function drawProps(
   const cols = ext.maxX - ext.minX + 1;
   const rows = ext.maxY - ext.minY + 1;
   const n = cols * rows;
-  for (let phase = 0; phase < SCAN_PHASES && placed < MAX_PROPS; phase++) {
-    for (let i = phase; i < n && placed < MAX_PROPS; i += SCAN_PHASES) {
+  for (let phase = 0; phase < SCAN_PHASES && placed < cap; phase++) {
+    for (let i = phase; i < n && placed < cap; i += SCAN_PHASES) {
       const tx = ext.minX + (i % cols);
       const ty = ext.minY + Math.floor(i / cols);
       if (occupied.has(`${tx},${ty}`)) continue;
@@ -253,13 +336,20 @@ export function drawProps(
         // whether the sprite load happened to win its 3s race.
         const treeRoll = rng.float();
         const cypressRoll = rng.float();
+        const inForest = forestPatches != null && forestPatches.length > 0
+          ? inForestPatch(forestPatches, tx, ty)
+          : false;
+        // Forest patches boost tree probability and cypress ratio — more trees,
+        // more dark foliage variety inside the patch radius.
+        const treeProb = inForest ? P_TREE_GIVEN_OLIVE_FOREST : P_TREE_GIVEN_OLIVE;
+        const cypressProb = inForest ? P_CYPRESS_FOREST : P_CYPRESS;
         let treeKey: string | null = null;
         if (
           bank &&
-          treeRoll < P_TREE_GIVEN_OLIVE &&
+          treeRoll < treeProb &&
           hasClearance(tallBlockers, tx, ty, TREE_CLEARANCE)
         ) {
-          const family = cypressRoll < P_CYPRESS ? "prop:cypress" : "prop:tree";
+          const family = cypressRoll < cypressProb ? "prop:cypress" : "prop:tree";
           treeKey = bank.pickVariant(family, `${tx},${ty}`);
         }
         const texture = treeKey ? bank!.get(treeKey) : null;

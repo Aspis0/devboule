@@ -88,6 +88,7 @@ export interface CreatePolisOptions {
   /** A cloud outpost ("harbour" node) was clicked — surface the REAL external
    *  service (provider/type/name/status) in the inspect sidebar. */
   onSelectExternalService?: (service: ExternalService | null) => void;
+  onSelectResource?: (site: import("./resources").ResourceSite | null) => void;
   background?: number;
 }
 
@@ -229,6 +230,7 @@ export async function createPolis(
       onSelectAgent: opts.onSelectAgent,
       onSelectConnection: opts.onSelectConnection,
       onSelectExternalService: opts.onSelectExternalService,
+      onSelectResource: opts.onSelectResource,
     },
     // B2c — thread the chosen profile (+ raw hardware for the PROFILE debug line).
     profile,

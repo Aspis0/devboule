@@ -59,6 +59,7 @@ import {
   blend,
   type IsoPoint,
 } from "./iso";
+import { hashString } from "./rng";
 import { PALETTE, ALPHA, getProfile, tierScale, tierRank } from "./palette";
 import { AgentLayer } from "./AgentLayer";
 import { AmbientLayer, desiredAmbientCount } from "./AmbientLayer";
@@ -82,8 +83,9 @@ import {
   buildTerrainFrame,
   type TerrainChunk,
 } from "./terrain";
-import { occupiedTiles, drawProps } from "./props";
+import { occupiedTiles, drawProps, planForestPatches } from "./props";
 import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fields";
+import { planResourceSites, resourceSiteTiles, type ResourceSite } from "./resources";
 import { buildBuildingParts, type BuiltParts } from "./buildings";
 import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
@@ -223,6 +225,8 @@ export interface PolisRendererCallbacks {
   /** A cloud outpost ("harbour" node) was clicked — surface the REAL external
    *  service (provider/type/name/status) in the inspect sidebar. Null clears. */
   onSelectExternalService?: (service: ExternalService | null) => void;
+  /** A resource site (quarry/mine) was clicked — surface in the inspect sidebar. Null clears. */
+  onSelectResource?: (site: import("./resources").ResourceSite | null) => void;
 }
 
 /** Progress of the chunked city build. `done`/`total` are building counts;
@@ -389,6 +393,7 @@ export class PolisRenderer {
     // the road south of it never overlaps the sprite. Real, arrow-marked agents
     // stay on the `agents` layer above buildings so a parked omino at a door is
     // never swallowed by the facade.
+    resourceSites: new Container(),
     crowd: new Container(),
     buildings: new Container(),
     // External cloud services ("harbour / cloud outposts") at the seaward margin.
@@ -673,6 +678,9 @@ export class PolisRenderer {
   private onBackgroundTap: (() => void) | null = null;
   // A3 — real-art sprite bank; null means every draw path stays procedural.
   private spriteBank: SpriteBank | null = null;
+  // Resource sites (quarry/mine) — planned from city data, rendered as sprites
+  // on a dedicated layer between terrain and crowd.
+
 
   constructor(
     app: Application,
@@ -733,6 +741,7 @@ export class PolisRenderer {
     this.onBackgroundTap = () => {
       this.callbacks.onSelectBuilding?.(null);
       this.callbacks.onSelectAgent?.(null);
+      this.callbacks.onSelectResource?.(null);
     };
     this.viewport.on("pointertap", this.onBackgroundTap);
 
@@ -2356,6 +2365,7 @@ export class PolisRenderer {
       this.fieldsGraphics.destroy();
       this.fieldsGraphics = null;
     }
+    this.clearResourceSites();
     const ext = computeExtent(
       buildings.map((b) => b.coords),
       gridSize.w,
@@ -2394,7 +2404,22 @@ export class PolisRenderer {
       }
     }
 
-    this.drawPropsLayer(ext, buildings, fieldTileSet);
+    // Resource sites — planned from city data, rendered on their own layer.
+    let resourceSiteTileSet: Set<string> | null = null;
+    if (districts && districts.length > 0) {
+      // Build a minimal CityState-like object for the planner.
+      const resourceCity: { districts: District[]; buildings: Building[]; roads: Road[]; terrain?: TerrainData } = {
+        districts,
+        buildings,
+        roads: roads ?? [],
+        terrain,
+      };
+      const sites = planResourceSites(resourceCity as CityState);
+      this.drawResourceSites(sites);
+      resourceSiteTileSet = resourceSiteTiles(sites);
+    }
+
+    this.drawPropsLayer(ext, buildings, fieldTileSet, resourceSiteTileSet);
     // Water frame on top of the grass ground but BELOW everything else (it lives
     // in the terrain layer). Chunked so the cull pass can hide off-screen water.
     this.drawWaterFrame(terrain);
@@ -2451,6 +2476,7 @@ export class PolisRenderer {
     ext: ReturnType<typeof computeExtent>,
     buildings: Building[],
     fieldTiles?: Set<string> | null,
+    resourceSiteTiles?: Set<string> | null,
   ): void {
     const occupied = occupiedTiles(buildings.map((b) => b.coords));
     // Buildings-only snapshot: tall tree sprites only need clearance from
@@ -2460,8 +2486,90 @@ export class PolisRenderer {
     if (fieldTiles) {
       for (const key of fieldTiles) occupied.add(key);
     }
-    const { graphics } = drawProps(ext, occupied, this.spriteBank, tallBlockers);
+    // Union resource site tiles so props don't spawn inside quarry/mine footprints.
+    if (resourceSiteTiles) {
+      for (const key of resourceSiteTiles) occupied.add(key);
+    }
+    // Plan forest patches: 3-5 dense tree clusters in the countryside.
+    const { patches: forestPatches, cap: forestCap } = planForestPatches(ext, occupied);
+    const { graphics } = drawProps(ext, occupied, this.spriteBank, tallBlockers, forestPatches, forestCap);
     for (const g of graphics) this.layers.terrain.addChild(g);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Resource sites (quarry / mine)
+  // ---------------------------------------------------------------------------
+
+  /** Clear + rebuild resource site sprites from the given sites. Each site gets
+   *  one Sprite (res:mine or res:quarry:vN) + 2-4 prop:rock:v* rocks around it,
+   *  all in the resourceSites layer (between terrain and crowd). Sites without
+   *  sprite keys (or when sprites are disabled) draw nothing. */
+  private drawResourceSites(sites: ResourceSite[]): void {
+    this.clearResourceSites();
+    if (!this.spriteBank || sites.length === 0) return;
+
+    const container = this.layers.resourceSites;
+
+    for (const site of sites) {
+      const key = site.kind === "mine"
+        ? "res:mine"
+        : site.variant === 1 ? "res:quarry:v1" : "res:quarry:v0";
+      const texture = this.spriteBank.get(key);
+      if (!texture) continue; // sprite not in bank — skip this site
+
+      const sprite = new Sprite(texture);
+      const [ax, ay] = this.spriteBank.anchor(key);
+      sprite.anchor.set(ax, ay);
+      // Position at the centre of the site's footprint (bottom-center convention).
+      const fp = site.kind === "quarry" ? { w: 3, h: 3 } : { w: 5, h: 5 };
+      const centreGx = site.gx + fp.w / 2;
+      const centreGy = site.gy + fp.h / 2;
+      const iso = cartToIso(centreGx, centreGy);
+      sprite.position.set(iso.x, iso.y);
+      sprite.scale.set(1.5, 1.5);
+      sprite.eventMode = "static";
+      sprite.cursor = "pointer";
+      sprite.on("pointertap", (e) => {
+        e.stopPropagation();
+        this.callbacks.onSelectResource?.(site);
+      });
+
+      container.addChild(sprite);
+
+      // Scatter 2-4 prop:rock sprites around the site.
+      const rockCount = 2 + (hashString(`rocks:${site.id}`) % 3); // 2, 3, or 4
+      for (let r = 0; r < rockCount; r++) {
+        const rockVariant = hashString(`rockv:${site.id}:${r}`) % 5;
+        const rockKey = `prop:rock:v${rockVariant}`;
+        const rockTex = this.spriteBank.get(rockKey);
+        if (!rockTex) continue;
+        const rockSprite = new Sprite(rockTex);
+        const [rAx, rAy] = this.spriteBank.anchor(rockKey);
+        rockSprite.anchor.set(rAx, rAy);
+        // Deterministic offset: 1-2 tiles out from site centre.
+        const angle = (hashString(`rocka:${site.id}:${r}`) % 1000) / 1000 * Math.PI * 2;
+        const dist = 1 + (hashString(`rockd:${site.id}:${r}`) % 2000) / 1000;
+        const rockGx = centreGx + Math.cos(angle) * dist;
+        const rockGy = centreGy + Math.sin(angle) * dist;
+        const rockIso = cartToIso(rockGx, rockGy);
+        rockSprite.position.set(rockIso.x, rockIso.y);
+        const s = 0.6 + (hashString(`rocksz:${site.id}:${r}`) % 400) / 1000;
+        rockSprite.scale.set(s, s);
+        rockSprite.eventMode = "none";
+        container.addChild(rockSprite);
+      }
+    }
+
+    // Y-sort all children in the resourceSites layer (site + rocks interleaved).
+    // Sort by ascending position.y so south trees paint over north ones.
+    container.children.sort((a, b) => a.position.y - b.position.y);
+  }
+
+  /** Tear down all resource site sprites. */
+  private clearResourceSites(): void {
+    this.layers.resourceSites
+      .removeChildren()
+      .forEach((c) => c.destroy({ children: true }));
   }
 
   // ---------------------------------------------------------------------------
@@ -3904,6 +4012,7 @@ export class PolisRenderer {
     this.terrainChunks = [];
     this.fieldsGraphics = null;
     this.terrainGridGraphics = null;
+    this.clearResourceSites();
     this.layers.districts.removeChildren().forEach((c) => c.destroy());
     // Roads are now sub-containers (minor/trunk) each wrapping a Graphics, so
     // destroy children too. Drop the LOD handle.

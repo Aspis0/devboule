@@ -52,6 +52,7 @@ import {
   Droplets,
   Drama,
   Hammer,
+  Mountain,
   Share2,
   Building2,
   Home,
@@ -83,6 +84,7 @@ import type {
   Agent,
   ExternalService,
 } from "../../types/city";
+import type { ResourceSite } from "./resources";
 const AnomalySection = React.lazy(() => import("./AnomalySection"));
 const KinSection = React.lazy(() => import("./KinSection"));
 import type { OracleAnswer } from "../../types/backend";
@@ -108,6 +110,9 @@ export type InspectSubject =
   // the map margin. Inspect-only (provider/type/name/status) — no secret, no
   // spawn action in this phase.
   | { kind: "externalService"; service: ExternalService }
+  // A RESOURCE SITE (quarry / mine): a clickable sprite outside a district whose
+  // static-asset census meets the threshold. Compact info card.
+  | { kind: "resource"; site: ResourceSite }
   | null;
 
 interface InspectSidebarProps {
@@ -354,6 +359,9 @@ export function InspectSidebar({
       )}
       {subject?.kind === "externalService" && (
         <ExternalServicePopup service={subject.service} onClose={onClose} />
+      )}
+      {subject?.kind === "resource" && (
+        <ResourceCard site={subject.site} onClose={onClose} />
       )}
     </div>
   );
@@ -1444,6 +1452,56 @@ function ExternalServicePopup({
         Inspect-only. Spawning and stopping cloud resources from the map is not
         wired yet.
       </p>
+    </PopupFrame>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Resource site card — compact info for a quarry / mine.
+// ---------------------------------------------------------------------------
+
+function ResourceCard({
+  site,
+  onClose,
+}: {
+  site: ResourceSite;
+  onClose: () => void;
+}) {
+  const total = site.census.images + site.census.fonts + site.census.media;
+  const isQuarry = site.kind === "quarry";
+  const Icon = isQuarry ? Hammer : Mountain;
+  const title = isQuarry ? `Quarry of ${site.districtLabel}` : `Mine of ${site.districtLabel}`;
+
+  // Build the census breakdown list (omit zero groups).
+  const groups: string[] = [];
+  if (site.census.images > 0) groups.push(`${site.census.images} images`);
+  if (site.census.fonts > 0) groups.push(`${site.census.fonts} fonts`);
+  if (site.census.media > 0) groups.push(`${site.census.media} media`);
+
+  return (
+    <PopupFrame
+      icon={Icon}
+      title={title}
+      subtitle={isQuarry ? "Stone deposit" : "Mountain mine"}
+      onClose={onClose}
+    >
+      <section className="rounded-xl border border-terracotta-200 bg-white px-3 py-2.5">
+        <h4 className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-terracotta-500">
+          <Hammer className="h-3.5 w-3.5" /> Asset census
+        </h4>
+        <p className="text-[12px] leading-5 text-cream-600">
+          This district's folders hold {total.toLocaleString()} static asset{total === 1 ? "" : "s"}.
+        </p>
+        {groups.length > 0 && (
+          <p className="mt-1.5 text-[11px] font-medium text-cream-500">
+            {groups.join(" · ")}
+          </p>
+        )}
+      </section>
+
+      <div className="mt-2 grid grid-cols-1 gap-1.5">
+        <Stat icon={MapPin} label="District" value={site.districtLabel} />
+      </div>
     </PopupFrame>
   );
 }
