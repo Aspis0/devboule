@@ -601,6 +601,14 @@ export function ProjectsView() {
 			) {
 				setProject(detail);
 			}
+		} catch (e) {
+			// Surface a failed project load instead of leaving the click silent
+			// (a rejected promise with no feedback = "the card did nothing").
+			if (requestSeq === loadProjectSeqRef.current) {
+				setError(
+					e instanceof Error ? e.message : "Project could not be loaded.",
+				);
+			}
 		} finally {
 			if (requestSeq === loadProjectSeqRef.current) {
 				setLoadingProjectId(null);
@@ -807,11 +815,7 @@ export function ProjectsView() {
 			setProject(null);
 			return;
 		}
-		void loadProject(selectedId).catch((e) => {
-			if (selectedIdRef.current !== selectedId) return;
-			setProject(null);
-			setError(e instanceof Error ? e.message : "Project could not be loaded.");
-		});
+		void loadProject(selectedId);
 	}, [loadProject, selectedId]);
 
 	// Per-project reset (keyed on project id). Tracks the PREVIOUS id so we only wipe the
@@ -1976,6 +1980,11 @@ export function ProjectsView() {
 	const verifiedTaskKeysRef = useRef<Set<string>>(new Set());
 	const maxRecallFiredRef = useRef<Set<string>>(new Set());
 	const nudgedRef = useRef<Set<string>>(new Set());
+	// Verifier launches that already FAILED (per-task auto-spawn). Tracked so a
+	// key that just failed is NOT immediately retried on the next task reload
+	// and does NOT re-`setError` repeatedly. Cleared when the task leaves the
+	// review state (genuine change) or is manually retried.
+	const verifierFailedKeysRef = useRef<Set<string>>(new Set());
 
 	useEffect(() => {
 		if (!currentProject || isArchived) return;
@@ -2008,12 +2017,30 @@ export function ProjectsView() {
 		if (controls.verifierPerTask) {
 			for (const t of tasks) {
 				const key = `${pid}:${t.id}`;
-				if (t.status === "review" && !verifiedTaskKeysRef.current.has(key)) {
-					verifiedTaskKeysRef.current.add(key);
-					void spawnVerifier(t.id, 0).catch(() =>
-						verifiedTaskKeysRef.current.delete(key),
-					);
+				// A task that left the review state may legitimately retry later —
+				// drop any prior failure so a re-entry into review re-arms the spawn.
+				if (t.status !== "review") {
+					verifierFailedKeysRef.current.delete(key);
+					continue;
 				}
+				if (
+					verifiedTaskKeysRef.current.has(key) ||
+					verifierFailedKeysRef.current.has(key)
+				) {
+					continue;
+				}
+				verifiedTaskKeysRef.current.add(key);
+				void spawnVerifier(t.id, 0).catch((e) => {
+					verifiedTaskKeysRef.current.delete(key);
+					// Record the failure so we don't retry + re-error every reload;
+					// the error is surfaced ONCE here.
+					verifierFailedKeysRef.current.add(key);
+					setError(
+						e instanceof Error
+							? e.message
+							: "Verifier could not be launched.",
+					);
+				});
 			}
 		}
 
@@ -2027,7 +2054,14 @@ export function ProjectsView() {
 				if (!maxRecallFiredRef.current.has(pid)) {
 					maxRecallFiredRef.current.add(pid);
 					for (let i = 0; i < 3; i++)
-						void spawnVerifier(null, i).catch(() => {});
+						void spawnVerifier(null, i).catch((e) =>
+							// Make the fan-out failure visible rather than swallowed.
+							setError(
+								e instanceof Error
+									? e.message
+									: "Verifier could not be launched.",
+							),
+						);
 				}
 			} else if (!nudgedRef.current.has(pid)) {
 				nudgedRef.current.add(pid);
@@ -3275,13 +3309,18 @@ export function ProjectsView() {
 																	task.id,
 																)
 															}
-															onLaunchVerifier={() =>
-																void launchAgent(
-																	"verifier",
-																	effectiveVerifierClient,
-																	task.id,
-																)
-															}
+															onLaunchVerifier={() => {
+															// Manual retry clears any prior auto-spawn
+															// failure for this task so it can be retried.
+															verifierFailedKeysRef.current.delete(
+																`${currentProject.metadata.id}:${task.id}`,
+															);
+															void launchAgent(
+																"verifier",
+																effectiveVerifierClient,
+																task.id,
+															);
+														}}
 															onCopyManualPrompt={() =>
 																void copyAgentPrompt(
 																	recommendedTaskRole(task),

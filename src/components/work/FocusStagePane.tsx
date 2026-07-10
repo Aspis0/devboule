@@ -60,10 +60,22 @@ export function FocusStagePane({
   const activity = useAgentConsole(agentId);
 
   const [view, setView] = useState<"activity" | "raw">("activity");
+  // Transient error for a failed dispatch (send/quick-action/answer) so a dropped
+  // message isn't silent — FocusStage has no error slot, so we keep it local here.
+  const [dispatchError, setDispatchError] = useState<string | null>(null);
+  const dispatchErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Reset to Activity whenever this pane's agent changes, so a Raw view (or its external-
-  // console note) never leaks across agents.
+  // console note) never leaks across agents. Also clear any transient dispatch error
+  // and its pending auto-dismiss timer (the cleanup runs on agent-switch AND unmount).
   useEffect(() => {
     setView("activity");
+    setDispatchError(null);
+    return () => {
+      if (dispatchErrorTimerRef.current) {
+        clearTimeout(dispatchErrorTimerRef.current);
+        dispatchErrorTimerRef.current = null;
+      }
+    };
   }, [agentId]);
 
   // Direction A/B dispatch through a ref so the callbacks stay stable across the 5s sessions
@@ -89,8 +101,15 @@ export function FocusStagePane({
     if (!t || !target) return;
     const ch = agentChannel(target, { miniManaged }, dir);
     if (!ch) return;
-    void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch(() => {});
-  }, []);
+    void invokeBackendCommand(ch.command, ch.buildArgs(t)).catch((e) => {
+      // A failed backend command must surface instead of silently dropping the message.
+      const message =
+        e instanceof Error ? e.message : "The message could not be sent.";
+      setDispatchError(message);
+      if (dispatchErrorTimerRef.current) clearTimeout(dispatchErrorTimerRef.current);
+      dispatchErrorTimerRef.current = setTimeout(() => setDispatchError(null), 5000);
+    });
+  }, [setDispatchError]);
   const onSendMessage = useCallback((t: string) => dispatch(t, "message"), [dispatch]);
   const onAnswer = useCallback((t: string) => dispatch(t, "answer"), [dispatch]);
   const onQuickAction = useCallback(
@@ -115,6 +134,11 @@ export function FocusStagePane({
   return (
     <div className="relative h-full overflow-hidden rounded-2xl border border-cream-200 bg-white">
       {onClose ? <CloseButton onClose={onClose} /> : null}
+      {dispatchError ? (
+        <div className="absolute inset-x-0 top-0 z-20 rounded-t-2xl bg-coral/10 px-3 py-1.5 text-[11px] leading-4 text-coral-dark">
+          {dispatchError}
+        </div>
+      ) : null}
       <FocusStage
         node={node}
         activity={activity}

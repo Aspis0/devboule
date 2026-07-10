@@ -665,3 +665,109 @@ describe("OracleAdminPanel — CollapsibleSections", () => {
     expect(container.querySelector('[data-testid="cli-agents-card"]')).not.toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stall-aware Index-now gate (TASK #4b): a job stuck in queued/running must
+// not permanently lock out the "Index now" button — once the stall detector
+// (indexPollStale) fires, the gate must treat jobActive as NOT active so the
+// user can retry.
+// ---------------------------------------------------------------------------
+describe("OracleAdminPanel — stall-aware Index-now gate", () => {
+  it("re-enables 'Index now' once the poll goes stale while a job is active", async () => {
+    vi.useFakeTimers();
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 5,
+        expectedFiles: 100,
+        pendingFiles: 0,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+
+    const { container, root } = await render();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const indexNow = (): HTMLButtonElement =>
+      buttons(container).find((b) => b.textContent?.includes("Index now"))!;
+
+    // Before the stall detector trips: job is active → button is disabled.
+    expect(indexNow().disabled).toBe(true);
+
+    // Advance past the 5-minute stall cap with no progress → indexPollStale fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(306000);
+    });
+    rerender(root);
+
+    // Stale: the gate must ignore jobActive and re-enable the button for retry.
+    expect(indexNow().disabled).toBe(false);
+    act(() => root.unmount());
+  });
+
+  it("keeps 'Index now' disabled when a job is active and not stale", async () => {
+    vi.useFakeTimers();
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 5,
+        expectedFiles: 100,
+        pendingFiles: 0,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+
+    const { container, root } = await render();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const indexNow = (): HTMLButtonElement =>
+      buttons(container).find((b) => b.textContent?.includes("Index now"))!;
+    // A freshly-started job that is still progressing stays disabled.
+    expect(indexNow().disabled).toBe(true);
+    act(() => root.unmount());
+  });
+
+  it("does not double-fire startOracleIndexJob on rapid repeated clicks (F1 guard)", async () => {
+    vi.useFakeTimers();
+    ctx.oracleIndexPreferences = { autoWatchOnUnlock: true, indexRoot: "/repo" };
+    ctx.oracleIndexStatus = {
+      job: { status: "running" },
+      watcherRunning: false,
+      index: {
+        root: "/repo",
+        indexedFiles: 5,
+        expectedFiles: 100,
+        pendingFiles: 0,
+        staleFiles: 0,
+      },
+    } as unknown as OracleIndexStatus;
+
+    const { container } = await render();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(306000);
+    });
+    const indexNow = buttons(container).find((b) =>
+      b.textContent?.includes("Index now"),
+    )!;
+    // Stale → enabled; a slow-but-alive job can also be here, so the re-entrancy
+    // guard must block a second click from starting a SECOND concurrent job.
+    expect(indexNow.disabled).toBe(false);
+
+    await act(async () => {
+      // Two synchronous clicks before any microtask resolves the first call.
+      indexNow.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      indexNow.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+    // Only ONE index job is started despite two clicks.
+    expect(ctx.startOracleIndexJob).toHaveBeenCalledTimes(1);
+  });
+});

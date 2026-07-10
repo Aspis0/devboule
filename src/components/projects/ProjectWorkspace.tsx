@@ -366,6 +366,11 @@ export function ProjectWorkspace({
     [sessions, selectedAgentId],
   );
 
+  // Clear a stale Stop/Compact failure when the selected agent changes, so the
+  // error never lingers attached to a different agent.
+  useEffect(() => {
+    setMiniActionError(null);
+  }, [selectedSession]);
   // MC-P5: the Stop (kill) safety brake is gated to a SELECTED mini session only —
   // a mini is a session with a parentAgentId. A normal agent's stop is the
   // separate `stop_agent` flow wired through onStopAgent below, NOT this 1-click
@@ -580,9 +585,14 @@ export function ProjectWorkspace({
     if (!selectedSession) return;
     const call = miniKillCall(selectedSession);
     if (!call) return; // not a mini — no 1-click kill for a normal agent.
-    void invokeBackendCommand(call.command, call.args).catch(() => {
-      /* swallow — the executor backstops a runaway mini regardless */
-    });
+    setMiniActionError(null);
+    // Surface a failed kill instead of swallowing it — a silently-dropped Stop
+    // leaves the user thinking the brake did nothing while the mini keeps running.
+    void invokeBackendCommand(call.command, call.args).catch((e) =>
+      setMiniActionError(
+        e instanceof Error ? e.message : "Mini-coder could not be stopped.",
+      ),
+    );
   }, [selectedSession]);
 
   // MC-P7: run `/compact` in the selected Claude agent's terminal. Reuses the
@@ -595,9 +605,13 @@ export function ProjectWorkspace({
     if (!selectedSession) return;
     const call = compactWriteCall(selectedSession);
     if (!call) return; // not a claude client — no Compact for it.
-    void invokeBackendCommand(call.command, call.args).catch(() => {
-      /* swallow — Compact is a convenience; a write failure is non-fatal */
-    });
+    setMiniActionError(null);
+    // Surface a failed compact instead of swallowing it.
+    void invokeBackendCommand(call.command, call.args).catch((e) =>
+      setMiniActionError(
+        e instanceof Error ? e.message : "Compact could not be run.",
+      ),
+    );
   }, [readOnly, selectedSession]);
 
   // Stop a NORMAL (non-mini) selected agent via the parent's restored
@@ -650,6 +664,9 @@ export function ProjectWorkspace({
   const [pendingConsents, setPendingConsents] = useState<ConsentRequest[]>([]);
   const [consentBusy, setConsentBusy] = useState(false);
   const [consentError, setConsentError] = useState<string | null>(null);
+  // Inline error for the fire-and-forget mini/compact actions — they used to
+  // swallow backend rejections silently, so a failed Stop/Compact looked dead.
+  const [miniActionError, setMiniActionError] = useState<string | null>(null);
   const consentMountedRef = useRef(true);
   // max-recall: a SYNCHRONOUS busy guard. `consentBusy` is React state and commits a tick
   // late, so a rapid double-tap can fire two decisions before it flips — delivering the same
@@ -1239,6 +1256,11 @@ export function ProjectWorkspace({
                     drawer ▸
                   </button>
                 </div>
+                {miniActionError ? (
+                  <p className="mt-1 text-[10px] leading-4 text-coral-dark">
+                    {miniActionError}
+                  </p>
+                ) : null}
               </div>
 
               {/* Unified Work Console: the FocusStage merges the raw PTY terminal (Raw)

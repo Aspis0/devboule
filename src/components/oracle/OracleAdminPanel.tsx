@@ -129,6 +129,13 @@ export function OracleAdminPanel() {
     count: -1,
     at: 0,
   });
+  // Synchronous re-entrancy guard for the "Index now" click. The disabled gate
+  // is intentionally relaxed when the poll goes stale (so a genuinely stuck job
+  // can be retried), but a slow-but-alive single large file can also trip the
+  // stale flag — without this guard a double-click would start a SECOND
+  // concurrent index job. The ref is flipped synchronously, so a second click
+  // is rejected immediately even while the button is momentarily enabled.
+  const indexFiringRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -733,8 +740,22 @@ export function OracleAdminPanel() {
 
             <div className="mt-3 flex flex-wrap gap-2">
               <button
-                onClick={() => void startOracleIndexJob(false, 1, false, true)}
-                disabled={isLoading || jobActive}
+                onClick={() => {
+                  // Re-entrancy guard: never let a click double-fire a
+                  // (possibly already-running) index job even while the gate is
+                  // relaxed for a stalled state. Reset in the promise finally.
+                  if (indexFiringRef.current) return;
+                  indexFiringRef.current = true;
+                  void startOracleIndexJob(false, 1, false, true).finally(
+                    () => {
+                      indexFiringRef.current = false;
+                    },
+                  );
+                }}
+                // Stall-aware gate: if the stall detector has fired (the job is
+                // stuck in queued/running and not progressing), re-enable so the
+                // user can retry instead of being permanently locked out.
+                disabled={isLoading || (jobActive && !indexPollStale)}
                 data-help-title="This starts a dense Oracle indexing job."
                 data-help-lines="Dense indexing turns chunks into vectors LanceDB can search semantically.|It uses the configured local embedding pipeline and can be slow on huge folders.|The job is resumable and should only process pending files unless Force is enabled.|Watch RAM and temperature when running many batches."
                 className="inline-flex items-center gap-1.5 rounded-xl bg-teal px-3 py-2 text-[12px] font-semibold text-white disabled:opacity-60"
