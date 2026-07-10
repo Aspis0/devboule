@@ -682,6 +682,16 @@ fn spawn_pi_session_inner(
     // sidecar's event channel never drifts from Rust's session slot.
     cmd.env("DEVBOULE_SESSION_ID", session_id);
 
+    // Task #2b: surface the Pigeon-enabled feature flag to the sidecar so it can
+    // skip prompt classification (which Rust never answers) when Pigeon is off.
+    // Reuse `read_pigeon_enabled` (the same reader backing `get_pigeon_enabled`)
+    // rather than duplicating the config.json lookup — default false on error.
+    let pigeon_enabled = crate::backend::pigeon_service::read_pigeon_enabled(app);
+    cmd.env(
+        "DEVBOULE_PIGEON_ENABLED",
+        if pigeon_enabled { "true" } else { "false" },
+    );
+
     if let Some(role) = role {
         // A/B: name the session so the sidecar stamps the correct `_devboule`
         // metadata and the frontend console subscribes to the right channel.
@@ -1326,6 +1336,12 @@ struct EventMapper {
     /// A: the persisted `agentRole` from the event stream's `_devboule` field.
     /// Refreshed on every event; survives across events in the same session.
     current_role: Option<String>,
+    /// Live-thinking tracker (#2a): the index of the in-place `ConsoleEntry::Thinking`
+    /// that is being updated on every `thinking_delta`. `None` means no live thinking
+    /// entry is currently tracked (either never started, or the tracked row was
+    /// front-evicted by the sliding window). Lets us stream thinking tokens live into
+    /// a single entry instead of waiting for `thinking_end`.
+    live_thinking_idx: Option<usize>,
 }
 
 /// Cap a string at `cap` CHARS (not bytes) appending `…` when truncated. UTF-8
@@ -1424,6 +1440,7 @@ impl EventMapper {
             active_tool_progress: HashMap::new(),
             evicted_count: 0,
             current_role: None,
+            live_thinking_idx: None,
         }
     }
 
@@ -1433,11 +1450,12 @@ impl EventMapper {
     /// so the window holds exactly MAX_CONSOLE_ENTRIES entries.
     ///
     /// Part B: the front-eviction shifts every surviving entry's index down by one,
-    /// which would corrupt `active_tool_progress`'s stored indices. Adjust ALL of
-    /// them here, at the single mutation site, so each tracker stays pointed at the
-    /// right row: when a tracked entry is itself evicted (it was at index 0
-    /// pre-shift) that tracker is removed entirely. This is the only place entries
-    /// are added/removed, so the hazard is fully contained.
+    /// which would corrupt `active_tool_progress`'s stored indices AND the
+    /// `live_thinking_idx` tracker (#2a). Adjust ALL of them here, at the single
+    /// mutation site, so each tracker stays pointed at the right row: when a
+    /// tracked entry is itself evicted (it was at index 0 pre-shift) that tracker
+    /// is removed/cleared entirely. This is the only place entries are
+    /// added/removed, so the hazard is fully contained.
     fn push_entry(&mut self, entry: ConsoleEntry) {
         self.entries.push(entry);
         if self.entries.len() > MAX_CONSOLE_ENTRIES {
@@ -1456,6 +1474,20 @@ impl EventMapper {
             }
             for id in evicted_ids {
                 self.active_tool_progress.remove(&id);
+            }
+            // #2a (FIX 1): the SAME front-eviction shifts `live_thinking_idx`'s
+            // tracked row down by one. If the live thinking entry itself was the
+            // one evicted (it was at index 0) the tracker is invalid → clear it so
+            // the next delta re-pushes a fresh live entry. Otherwise decrement it
+            // to follow the surviving row. Kept in lock-step with `active_tool_progress`
+            // here, at the single mutation site, so the moving-window hazard is
+            // fully contained.
+            if let Some(ref mut idx) = self.live_thinking_idx {
+                if *idx == 0 {
+                    self.live_thinking_idx = None;
+                } else {
+                    *idx -= 1;
+                }
             }
         }
     }
@@ -1530,7 +1562,50 @@ impl EventMapper {
     }
 
     fn flush_thinking_block(&mut self) {
-        if !self.accumulated_thinking.is_empty() {
+        // #2a: if a live thinking entry is being streamed in place, finalize it
+        // there (write the final text into the existing row) and DON'T push a
+        // duplicate entry. Only when there is no tracked live entry do we fall
+        // back to pushing a fresh Thinking entry (e.g. interrupted thinking
+        // flushed by `agent_end`, or thinking that never received a delta).
+        //
+        // FIX 2: the index is guarded with the SAME predicate `upsert_live_thinking`
+        // uses (`idx < len && is a Thinking entry`) before any write/remove. Because
+        // `push_entry` keeps `live_thinking_idx` in sync on FIFO eviction (FIX 1),
+        // the tracked row can never silently point at an unrelated entry — but we
+        // still guard defensively and fall back to `push_entry` if the guard fails.
+        if let Some(idx) = self.live_thinking_idx {
+            let valid = idx < self.entries.len()
+                && matches!(self.entries[idx], ConsoleEntry::Thinking { .. });
+            if valid {
+                if !self.accumulated_thinking.is_empty() {
+                    // Non-empty: finalize the existing live row in place.
+                    let text = std::mem::take(&mut self.accumulated_thinking);
+                    self.entries[idx] = ConsoleEntry::Thinking {
+                        text,
+                        time: Self::now_str(),
+                    };
+                } else {
+                    // Empty thinking (delta never carried text): the row already
+                    // shows the streamed (empty) Thinking entry, so just finalize
+                    // the tracker + accumulator WITHOUT removing it — raw `remove`
+                    // would shift `active_tool_progress` indices out from under us.
+                    self.accumulated_thinking.clear();
+                }
+            } else {
+                // Guard failed (tracker stale / row mutated): push a fresh entry
+                // if there is any content; never corrupt an unrelated row.
+                if !self.accumulated_thinking.is_empty() {
+                    let text = std::mem::take(&mut self.accumulated_thinking);
+                    self.push_entry(ConsoleEntry::Thinking {
+                        text,
+                        time: Self::now_str(),
+                    });
+                } else {
+                    self.accumulated_thinking.clear();
+                }
+            }
+            self.live_thinking_idx = None;
+        } else if !self.accumulated_thinking.is_empty() {
             // Take the text out FIRST so the `push_entry(&mut self)` call does
             // not conflict with the mutable borrow of `self.accumulated_thinking`.
             let text = std::mem::take(&mut self.accumulated_thinking);
@@ -1538,6 +1613,47 @@ impl EventMapper {
                 text,
                 time: Self::now_str(),
             });
+        }
+    }
+
+    /// #2a: stream the accumulated thinking into a SINGLE live `ConsoleEntry::Thinking`
+    /// that updates in place on every `thinking_delta`. The first delta pushes a new
+    /// Thinking entry and remembers its index; subsequent deltas overwrite that same
+    /// entry's text. If the tracked index was front-evicted by the sliding window the
+    /// tracker is reset and a fresh live entry is pushed. Called from the `thinking_delta`
+    /// arm of `apply_message_delta`; `message_update` re-emits the snapshot right after,
+    /// so each delta is broadcast live (no snapshot change needed).
+    fn upsert_live_thinking(&mut self) {
+        let live_idx = match self.live_thinking_idx {
+            Some(idx) => {
+                if idx < self.entries.len()
+                    && matches!(self.entries[idx], ConsoleEntry::Thinking { .. })
+                {
+                    Some(idx)
+                } else {
+                    // Index invalidated by FIFO eviction (or row mutated): start fresh.
+                    None
+                }
+            }
+            None => None,
+        };
+        match live_idx {
+            Some(idx) => {
+                // Overwrite the existing live entry's text in place.
+                let text = self.accumulated_thinking.clone();
+                self.entries[idx] = ConsoleEntry::Thinking {
+                    text,
+                    time: Self::now_str(),
+                };
+            }
+            None => {
+                self.live_thinking_idx = None;
+                self.push_entry(ConsoleEntry::Thinking {
+                    text: self.accumulated_thinking.clone(),
+                    time: Self::now_str(),
+                });
+                self.live_thinking_idx = Some(self.entries.len() - 1);
+            }
         }
     }
 
@@ -1563,6 +1679,8 @@ impl EventMapper {
                 if let Some(ref d) = delta.delta {
                     self.accumulated_thinking.push_str(d);
                 }
+                // #2a: stream thinking LIVE into a single in-place Thinking entry.
+                self.upsert_live_thinking();
             }
             "thinking_end" => {
                 self.flush_thinking_block();
@@ -1624,6 +1742,7 @@ impl EventMapper {
                 self.turn_seq += 1;
                 self.accumulated_text.clear();
                 self.accumulated_thinking.clear();
+                self.live_thinking_idx = None;
                 self.active_content_index = None;
                 self.emit_snapshot(app);
             }
@@ -3317,6 +3436,272 @@ mod tests {
             }
             other => panic!("expected Thinking entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_thinking_streams_in_place_then_finalizes_once() {
+        // #2a: thinking deltas must surface LIVE in a single in-place Thinking entry
+        // that grows with each delta, and `thinking_end` must finalize that same
+        // entry WITHOUT pushing a duplicate. After end, `accumulated_thinking` is
+        // empty and `live_thinking_idx` is None.
+        let mut mapper = EventMapper::new("pi-think-live");
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("Rea".to_string()),
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("soning".to_string()),
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("…".to_string()),
+            content_index: Some(0),
+        });
+
+        // Before end: exactly ONE live Thinking entry, growing to "Reasoning…".
+        let live_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(live_count, 1, "exactly one Thinking entry while live");
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Thinking { text, .. }) => {
+                assert_eq!(text, "Reasoning…", "live thinking text must grow");
+            }
+            other => panic!("expected live Thinking entry, got {other:?}"),
+        }
+        assert_eq!(
+            mapper.accumulated_thinking, "Reasoning…",
+            "accumulator mirrors live text"
+        );
+        assert!(
+            mapper.live_thinking_idx.is_some(),
+            "live tracker should be set"
+        );
+
+        // Finalize.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+
+        let final_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(final_count, 1, "still exactly ONE Thinking entry, no dup");
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Thinking { text, .. }) => {
+                assert_eq!(text, "Reasoning…", "finalized thinking text");
+            }
+            other => panic!("expected finalized Thinking entry, got {other:?}"),
+        }
+        assert!(
+            mapper.accumulated_thinking.is_empty(),
+            "accumulator cleared after flush"
+        );
+        assert!(
+            mapper.live_thinking_idx.is_none(),
+            "live tracker cleared after finalize"
+        );
+    }
+
+    #[test]
+    fn live_thinking_index_shifts_with_fifo_eviction() {
+        // FIX 1: when the sliding window evicts the oldest entry during a live
+        // thinking stream, `live_thinking_idx` must follow the surviving row
+        // (decremented by one) so the next delta still updates the SAME entry
+        // in place — and `thinking_end` finalizes it without corrupting an
+        // unrelated row or duplicating.
+        let mut mapper = EventMapper::new("evict-shift");
+        // Fill to 498 (cap is 500) — no eviction yet.
+        for i in 0..498u32 {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: format!("c{i}"),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        assert_eq!(mapper.entries.len(), 498);
+        assert_eq!(mapper.evicted_count, 0);
+
+        // Start a live thinking stream -> pushes a Thinking entry at index 498.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("A".to_string()),
+            content_index: Some(0),
+        });
+        assert_eq!(mapper.entries.len(), 499);
+        assert_eq!(mapper.live_thinking_idx, Some(498));
+        assert!(matches!(mapper.entries[498], ConsoleEntry::Thinking { .. }));
+
+        // Push 2 more entries: the 2nd crosses the cap and evicts the front,
+        // shifting the tracked thinking row 498 -> 497.
+        mapper.push_entry(ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "c498".to_string(),
+            time: String::new(),
+            msg_id: None,
+        });
+        assert_eq!(mapper.entries.len(), 500); // 499 + 1, still no eviction
+        mapper.push_entry(ConsoleEntry::Chat {
+            role: "user".to_string(),
+            text: "c499".to_string(),
+            time: String::new(),
+            msg_id: None,
+        });
+        // 501 > 500 -> eviction; tracker 498 -> 497, Thinking shifts to 497.
+        assert_eq!(mapper.evicted_count, 1);
+        assert_eq!(mapper.live_thinking_idx, Some(497));
+        assert_eq!(mapper.entries.len(), 500);
+        assert!(
+            matches!(mapper.entries[497], ConsoleEntry::Thinking { .. }),
+            "live thinking entry survived eviction at shifted index"
+        );
+
+        // Subsequent delta updates the SAME entry in place at the shifted index.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("B".to_string()),
+            content_index: Some(0),
+        });
+        match mapper.entries[497] {
+            ConsoleEntry::Thinking { ref text, .. } => assert_eq!(text, "AB"),
+            ref other => panic!("expected Thinking at shifted idx, got {other:?}"),
+        }
+        assert_eq!(
+            mapper.live_thinking_idx, Some(497),
+            "tracker still points at shifted live entry"
+        );
+
+        // Finalize: in place, no dup, no corruption of other rows.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        let thinking_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(thinking_count, 1, "exactly one Thinking entry after finalize");
+        match mapper.entries[497] {
+            ConsoleEntry::Thinking { ref text, .. } => assert_eq!(text, "AB"),
+            ref other => panic!("expected finalized Thinking at idx 497, got {other:?}"),
+        }
+        assert!(mapper.accumulated_thinking.is_empty());
+        assert!(mapper.live_thinking_idx.is_none());
+        assert_eq!(mapper.entries.len(), 500, "window still bounded");
+        assert!(
+            matches!(mapper.entries[0], ConsoleEntry::Chat { .. }),
+            "front entry is an unrelated Chat, not corrupted"
+        );
+    }
+
+    #[test]
+    fn live_thinking_tracker_cleared_when_entry_evicted() {
+        // FIX 1/2: if the live thinking entry itself is front-evicted before
+        // `thinking_end`, the tracker must be cleared (not point at a stale row).
+        // A later delta re-pushes a fresh live entry; `thinking_end` finalizes
+        // that fresh entry without corrupting anything else.
+        let mut mapper = EventMapper::new("evict-clear");
+        // Fill to 499 so the thinking entry lands at index 499 (cap 500).
+        for i in 0..499u32 {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: format!("c{i}"),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        assert_eq!(mapper.entries.len(), 499);
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("A".to_string()),
+            content_index: Some(0),
+        });
+        assert_eq!(mapper.live_thinking_idx, Some(499));
+        assert_eq!(mapper.entries.len(), 500);
+
+        // Push 500 more entries; the thinking entry (at 499) is fully evicted,
+        // pulling the tracker down to 0 then clearing it.
+        for i in 0..500u32 {
+            mapper.push_entry(ConsoleEntry::Chat {
+                role: "user".to_string(),
+                text: format!("x{i}"),
+                time: String::new(),
+                msg_id: None,
+            });
+        }
+        assert_eq!(mapper.evicted_count, 500);
+        assert_eq!(
+            mapper.live_thinking_idx, None,
+            "tracked thinking entry was evicted -> tracker cleared"
+        );
+        let thinking_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(thinking_count, 0, "live thinking entry evicted, none remain");
+
+        // A later delta re-pushes a fresh live entry at the tail. Note: FIFO
+        // eviction drops the *visual* entry but does NOT reset `accumulated_thinking`
+        // (that buffer is only cleared at thinking_end / agent_start), so the "B"
+        // delta appends to the still-held "A" giving "AB".
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("B".to_string()),
+            content_index: Some(0),
+        });
+        assert_eq!(
+            mapper.live_thinking_idx,
+            Some(499),
+            "fresh live entry re-pushed at tail after eviction"
+        );
+        assert_eq!(mapper.entries.len(), 500);
+
+        // Finalize -> in place, no duplicate.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        let final_count = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(final_count, 1, "exactly one Thinking entry after finalize");
+        match mapper.entries.last() {
+            Some(ConsoleEntry::Thinking { text, .. }) => assert_eq!(text, "AB"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        assert!(mapper.accumulated_thinking.is_empty());
+        assert!(mapper.live_thinking_idx.is_none());
     }
 
     // -- Part B: partial result snippet extraction -----------------------------
