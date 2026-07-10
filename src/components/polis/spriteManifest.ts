@@ -58,7 +58,9 @@ export interface SpriteManifest {
 /** Shipped manifest. Empty until phase A2/A3 land the first packed atlases. */
 export const SPRITE_MANIFEST: SpriteManifest = {
   version: 1,
-  atlases: {},
+  atlases: {
+    "prop-0": "/polis/atlas/prop-0.json"
+  },
   singles: {
     "tex:cobble": "/polis/atlas/tex__cobble.png",
     "tex:dirt": "/polis/atlas/tex__dirt.png",
@@ -68,5 +70,41 @@ export const SPRITE_MANIFEST: SpriteManifest = {
     "tex:grassdry": "/polis/atlas/tex__grassdry.png",
     "tex:stonegrey": "/polis/atlas/tex__stonegrey.png"
   },
-  entries: {}
+  entries: {
+    "prop:cypress:v0": {
+      frame: "prop:cypress:v0",
+      atlas: "prop-0",
+      foot: [1, 1]
+    },
+    "prop:cypress:v1": {
+      frame: "prop:cypress:v1",
+      atlas: "prop-0",
+      foot: [1, 1]
+    },
+    "prop:cypress:v2": {
+      frame: "prop:cypress:v2",
+      atlas: "prop-0",
+      foot: [1, 1]
+    },
+    "prop:tree:v0": {
+      frame: "prop:tree:v0",
+      atlas: "prop-0",
+      foot: [1, 1]
+    },
+    "prop:tree:v1": {
+      frame: "prop:tree:v1",
+      atlas: "prop-0",
+      foot: [1, 1]
+    },
+    "prop:tree:v2": {
+      frame: "prop:tree:v2",
+      atlas: "prop-0",
+      foot: [1, 1]
+    },
+    "prop:tree:v3": {
+      frame: "prop:tree:v3",
+      atlas: "prop-0",
+      foot: [1, 1]
+    }
+  }
 };

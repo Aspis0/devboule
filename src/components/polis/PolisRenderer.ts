@@ -2413,11 +2413,14 @@ export class PolisRenderer {
     fieldTiles?: Set<string> | null,
   ): void {
     const occupied = occupiedTiles(buildings.map((b) => b.coords));
+    // Buildings-only snapshot: tall tree sprites only need clearance from
+    // BUILDINGS (z-order safety) — flat field parcels don't block them.
+    const tallBlockers = new Set(occupied);
     // Union field parcel tiles into occupied so props never spawn inside parcels.
     if (fieldTiles) {
       for (const key of fieldTiles) occupied.add(key);
     }
-    const { graphics } = drawProps(ext, occupied);
+    const { graphics } = drawProps(ext, occupied, this.spriteBank, tallBlockers);
     for (const g of graphics) this.layers.terrain.addChild(g);
   }
 

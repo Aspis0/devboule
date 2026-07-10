@@ -16,11 +16,12 @@
 // PERFORMANCE: drawn ONCE into a single Graphics at setCityState time; never
 // touched per frame. A hard cap bounds the total prop count.
 
-import { Graphics } from "pixi.js";
+import { Graphics, Sprite, type Container } from "pixi.js";
 import { cartToIso } from "./iso";
 import { buildingFootprintTiles } from "./navWalkable";
 import { DERIVED } from "./palette";
 import { rngFromCoords, type Rng } from "./rng";
+import type { SpriteBank } from "./spriteAssets";
 import type { TerrainExtent } from "./terrain";
 
 const MAX_PROPS = 2800;
@@ -40,6 +41,32 @@ const CHUNK_PROPS = 80;
 const P_OLIVE = 0.14;
 const P_ROCK = 0.08;
 const P_STALL = 0.02;
+
+// A4 — real tree sprites (UH maples/tupelos). Trees are TALL (≈2 tiles
+// up-screen) and props live BELOW the buildings layer, so a tree drawn too
+// close to a building would be wrongly covered by it. Trees therefore only
+// spawn with a clear Chebyshev ring around them (countryside); inside the
+// city the short procedural olive clusters keep working.
+const TREE_CLEARANCE = 2;
+// Among clearance-eligible olive rolls: chance the tile gets a sprite tree.
+const P_TREE_GIVEN_OLIVE = 0.85;
+// Of the sprite trees: chance of the tall dark cypress (tupelo) variant.
+const P_CYPRESS = 0.3;
+
+/** True when every tile within `ring` Chebyshev distance is unoccupied. */
+function hasClearance(
+  occupied: Set<string>,
+  tx: number,
+  ty: number,
+  ring: number,
+): boolean {
+  for (let dy = -ring; dy <= ring; dy++) {
+    for (let dx = -ring; dx <= ring; dx++) {
+      if (occupied.has(`${tx + dx},${ty + dy}`)) return false;
+    }
+  }
+  return true;
+}
 
 /** Build the set of occupied tile keys ("tx,ty") from building coords. */
 export function occupiedTiles(coords: { x: number; y: number }[]): Set<string> {
@@ -162,8 +189,13 @@ function drawStall(g: Graphics, cx: number, cy: number, rng: Rng): void {
 export function drawProps(
   ext: TerrainExtent,
   occupied: Set<string>,
-): { graphics: Graphics[]; propCount: number } {
-  const chunks: Graphics[] = [];
+  bank?: SpriteBank | null,
+  // Tiles that block TALL sprites' clearance ring (buildings only — field
+  // parcels are flat, so trees standing over them are z-safe and read as
+  // hedgerows). Defaults to `occupied` when the caller doesn't split them.
+  tallBlockers: Set<string> = occupied,
+): { graphics: (Graphics | Container)[]; propCount: number } {
+  const chunks: (Graphics | Container)[] = [];
   let g = new Graphics();
   let chunkCount = 0;
   let placed = 0;
@@ -202,7 +234,31 @@ export function drawProps(
         placed++;
         chunkCount++;
       } else if (roll < P_STALL + P_ROCK + P_OLIVE) {
-        drawOliveCluster(g, cx, cy, rng);
+        // Real tree sprite when the bank has one AND the tile sits in open
+        // countryside (see TREE_CLEARANCE); otherwise the classic olive blobs.
+        let treeKey: string | null = null;
+        if (
+          bank &&
+          rng.float() < P_TREE_GIVEN_OLIVE &&
+          hasClearance(tallBlockers, tx, ty, TREE_CLEARANCE)
+        ) {
+          const family = rng.float() < P_CYPRESS ? "prop:cypress" : "prop:tree";
+          treeKey = bank.pickVariant(family, `${tx},${ty}`);
+        }
+        const texture = treeKey ? bank!.get(treeKey) : null;
+        if (treeKey && texture) {
+          const sprite = new Sprite(texture);
+          const [ax, ay] = bank!.anchor(treeKey);
+          sprite.anchor.set(ax, ay);
+          // Base at the tile-center ground point (same spot the olive
+          // cluster uses); slight seeded scale variety keeps rows organic.
+          sprite.position.set(cx, cy + 6);
+          const s = rng.range(0.85, 1.1);
+          sprite.scale.set(s, s);
+          chunks.push(sprite);
+        } else {
+          drawOliveCluster(g, cx, cy, rng);
+        }
         placed++;
         chunkCount++;
       }
