@@ -3841,10 +3841,14 @@ pub const MIN_DISTRICT_BUILDINGS: usize = 3;
 ///   - v1 — blind golden-angle spiral district placement (pre-A2).
 ///   - v2 — A2 SEMANTIC placement (coupling meta-graph + weighted-centroid seeds)
 ///          AND the adaptive district split (deep feature ids).
+///   - v3 — Water-affine harbor/lighthouse east-edge snap: port-purpose buildings
+///          swap to the eastmost same-size cell in their district so they sit
+///          on the sea-facing edge; rivers route near port districts via
+///          anchor-based candidate columns.
 ///
 /// BUMP THIS on any future change to placement semantics or the split that should
 /// re-deploy to existing cities.
-pub const LAYOUT_ALGO_VERSION: u32 = 2;
+pub const LAYOUT_ALGO_VERSION: u32 = 3;
 
 /// The `District::type` string for a feature kind (Polis F3). A CLOSED vocabulary
 /// mirroring `FeatureKind` — `commons` / `feature` / `external`. The renderer
@@ -4231,6 +4235,92 @@ pub fn layout(
     // Deterministic; never produces an overlap. The stable path holds whenever
     // the persisted layout is already valid under the current footprints (the
     // common case once a city has been laid out by THIS algorithm).
+    //
+    // WATER-AFFINE SNAP (harbor/lighthouse): buildings whose purpose is
+    // "harbor" or "lighthouse" are snapped to the water-facing edge (EAST)
+    // of their district. We swap their district-local placement (x,y) with
+    // the eastmost same-size placement in the same district. This is a pure
+    // swap of equal-size reserved cells, so packing shape is preserved and
+    // no overlap can be introduced. The swap modifies `packed` before
+    // entries are built, so it feeds into both the fresh-packing path AND
+    // the persisted-coord reuse path (persisted coords override the swap
+    // when active, which is correct: a stable city keeps its persisted
+    // positions).
+    //
+    // WATER-FACING EDGE: the sea is always east (max world x), so port
+    // buildings should be on the east edge of their district. Rivers
+    // (placed later in terrain.rs) will be routed near port districts via
+    // port-anchor candidates, connecting ports to the water network.
+    for pd in packed.iter_mut() {
+        // Collect harbor/lighthouse indices in deterministic order (by file_id).
+        let mut port_bis: Vec<usize> = pd
+            .placements
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                let purpose = &buildings[p.bi].purpose;
+                purpose == "harbor" || purpose == "lighthouse"
+            })
+            .map(|(pi, _)| pi)
+            .collect();
+        port_bis.sort_by_key(|&pi| buildings[pd.placements[pi].bi].file_id.clone());
+
+        if port_bis.is_empty() {
+            continue;
+        }
+
+        // Track which placement indices are already used as swap targets.
+        let mut used_targets: HashSet<usize> = HashSet::new();
+
+        for &port_pi in &port_bis {
+            let port_w = pd.placements[port_pi].w;
+            let port_h = pd.placements[port_pi].h;
+
+            // Find the eastmost same-size placement not already used as a
+            // swap target. Eastmost = max(x + w); ties broken by smaller y,
+            // then smaller x (deterministic).
+            let mut best_pi: Option<usize> = None;
+            let mut best_east: u32 = 0;
+            let mut best_y: u32 = u32::MAX;
+            let mut best_x: u32 = u32::MAX;
+
+            for (pi, p) in pd.placements.iter().enumerate() {
+                if pi == port_pi || used_targets.contains(&pi) {
+                    continue;
+                }
+                if p.w != port_w || p.h != port_h {
+                    continue;
+                }
+                let east = p.x + p.w;
+                if east > best_east
+                    || (east == best_east && p.y < best_y)
+                    || (east == best_east && p.y == best_y && p.x < best_x)
+                {
+                    best_east = east;
+                    best_y = p.y;
+                    best_x = p.x;
+                    best_pi = Some(pi);
+                }
+            }
+
+            // If an eastmost same-size placement exists and it is farther
+            // east than the port building's own placement, swap their (x,y).
+            if let Some(target_pi) = best_pi {
+                let port_east = pd.placements[port_pi].x + pd.placements[port_pi].w;
+                let target_east = pd.placements[target_pi].x + pd.placements[target_pi].w;
+                if target_east > port_east {
+                    // Pure swap of (x, y) — same-size cells cannot overlap.
+                    let tmp_x = pd.placements[port_pi].x;
+                    let tmp_y = pd.placements[port_pi].y;
+                    pd.placements[port_pi].x = pd.placements[target_pi].x;
+                    pd.placements[port_pi].y = pd.placements[target_pi].y;
+                    pd.placements[target_pi].x = tmp_x;
+                    pd.placements[target_pi].y = tmp_y;
+                    used_targets.insert(target_pi);
+                }
+            }
+        }
+    }
     //
     // First, gather the fresh footprint-aware placement for every building.
     // `entry`: (building_index, packed_world_coords, footprint_w, footprint_d).
@@ -7226,6 +7316,52 @@ const y = await import('@/lazy');
             buildings2[0].coords, original,
             "persisted coords must survive re-scan"
         );
+    }
+
+    /// Water-affine snap: a district containing a harbor building and several
+    /// same-size houses. After layout, the harbor's world x is >= every
+    /// same-size sibling's world x in that district (it took the east-most
+    /// same-size cell). This verifies Part 2 of the water-affine placement.
+    #[test]
+    fn layout_harbor_snaps_to_eastmost_same_size_cell() {
+        let features = vec![mk_feature("commons", FeatureKind::Commons)];
+        // 1 harbor + 4 houses, all same purpose (HOUSE) so same footprint.
+        // The harbor gets swapped to the eastmost same-size cell.
+        let mut buildings = vec![
+            mk_building_feat("1", "src/port.ts", purpose::HARBOR, 50, "commons"),
+            mk_building_feat("2", "src/a.ts", purpose::HOUSE, 50, "commons"),
+            mk_building_feat("3", "src/b.ts", purpose::HOUSE, 50, "commons"),
+            mk_building_feat("4", "src/c.ts", purpose::HOUSE, 50, "commons"),
+            mk_building_feat("5", "src/d.ts", purpose::HOUSE, 50, "commons"),
+        ];
+        let mut meta = MetaStore::default();
+        let districts = layout(&mut buildings, &mut meta, &features, &[]);
+        assert!(!districts.is_empty());
+
+        // All buildings are in the commons district.
+        for b in &buildings {
+            assert_eq!(b.district_id, "commons");
+        }
+
+        // The harbor (building index 0) must have world x >= every same-size
+        // sibling (houses at indices 1..4). House purpose=HOUSE and harbor
+        // purpose=HARBOR may have different footprints, so we compare against
+        // houses that share the harbor's reserved cell size.
+        let harbor = &buildings[0];
+        let (harbor_fw, harbor_fd) =
+            crate::polis::footprint::building_footprint(&harbor.purpose, &harbor.visual_tier);
+        for b in buildings.iter().skip(1) {
+            let (fw, fd) = crate::polis::footprint::building_footprint(&b.purpose, &b.visual_tier);
+            if fw == harbor_fw && fd == harbor_fd {
+                assert!(
+                    harbor.coords.x >= b.coords.x,
+                    "harbor x={} must be >= same-size house x={} (file {})",
+                    harbor.coords.x, b.coords.x, b.file_id
+                );
+            }
+        }
+
+        assert_no_footprint_overlap(&buildings);
     }
 
     /// BLOCKER (pre-F3 first scan): a meta that has persisted COORDS for every

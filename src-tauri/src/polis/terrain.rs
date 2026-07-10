@@ -294,7 +294,7 @@ pub fn build_terrain(
     // --- river placement (deterministic, between districts, off buildings) ---
     // Rivers + their shores live in the LAND band only — never in the harbour
     // extension rows below the land (there is no land there to flow through).
-    let rivers = place_rivers(min_x, max_x, min_y, land_max_y, &occ);
+    let rivers = place_rivers(min_x, max_x, min_y, land_max_y, &occ, buildings);
 
     // --- routed road tiles (rasterized from each road's corner polyline) -----
     let road_tiles = road_tiles(roads);
@@ -585,6 +585,7 @@ fn place_rivers(
     min_y: i32,
     max_y: i32,
     occ: &BTreeSet<Tile>,
+    buildings: &[Building],
 ) -> Vec<River> {
     let width = max_x - min_x;
     // Too narrow to host an internal river with land+shore on both sides.
@@ -595,17 +596,95 @@ fn place_rivers(
 
     let propose = |frac_num: i32, frac_den: i32| -> i32 { min_x + (width * frac_num) / frac_den };
 
-    // First river ~1/3 across; second ~2/3. The order (1/3 then 2/3) is fixed so
-    // the result is deterministic.
-    let candidates: Vec<i32> = if width >= 18 {
-        vec![propose(1, 3), propose(2, 3)]
+    // Water-affine river placement: prefer flowing near harbor/lighthouse districts.
+    // Port anchors are the sorted gx centers of harbor/lighthouse buildings.
+    // When anchors exist, river base candidates target those columns instead of
+    // the geometric midpoint/thirds, so the river passes next to port districts.
+    let port_anchors: Vec<i32> = {
+        let mut gxs: Vec<i32> = buildings
+            .iter()
+            .filter(|b| b.purpose == "harbor" || b.purpose == "lighthouse")
+            .map(|b| b.coords.x.floor() as i32)
+            .collect();
+        gxs.sort_unstable();
+        gxs.dedup();
+        gxs
+    };
+
+    // Build candidate base columns. The number of candidates matches the slot
+    // count (1 when width<18, 2 when width>=18). When port anchors exist, each
+    // candidate targets the anchor nearest the corresponding positional slot
+    // (median for 1 slot; 1/3 and 2/3 for 2 slots). When both slots resolve to
+    // the same anchor (a single mid-map cluster), the anchor fills the slot it
+    // is closest to and the other slot gets the original geometric thirds column
+    // — preserving the 2-river count for wide cities. Without anchors, fall back
+    // to the geometric midpoint/thirds — preserving original behavior verbatim.
+    let num_slots = if width >= 18 { 2 } else { 1 };
+    let candidates: Vec<i32> = if port_anchors.is_empty() {
+        // No harbor/lighthouse buildings: geometric midpoint/thirds (original).
+        if width >= 18 {
+            vec![propose(1, 3), propose(2, 3)]
+        } else {
+            vec![propose(1, 2)]
+        }
+    } else if num_slots == 1 {
+        // One slot: the median anchor (middle element, or single element).
+        vec![port_anchors[port_anchors.len() / 2]]
     } else {
-        vec![propose(1, 2)]
+        // Two slots: the anchors nearest the 1/3 and 2/3 positional targets.
+        // Targets in gx space: the geometric thirds of the land band.
+        let target_third = min_x + width / 3;
+        let target_two_thirds = min_x + (width * 2) / 3;
+        // Find the anchor nearest each target. Ties broken by smaller gx
+        // (deterministic, i64 cast so negative anchors lose correctly).
+        let find_nearest = |target: i32| -> i32 {
+            *port_anchors
+                .iter()
+                .min_by_key(|&&gx| {
+                    let dist = (gx - target).unsigned_abs() as u64;
+                    // Tie-break: smaller gx wins (deterministic).
+                    (dist, gx as i64)
+                })
+                .unwrap()
+        };
+        let a = find_nearest(target_third);
+        let b = find_nearest(target_two_thirds);
+        if a == b {
+            // Same anchor is nearest both thirds. Give it to the slot it is
+            // CLOSEST to and fill the other slot with the original geometric
+            // candidate (the plain thirds column) so we still emit 2 rivers
+            // when the width allows it — a city with harbors must not silently
+            // lose a river vs a harbor-less city of the same width.
+            let dist_to_third = (a - target_third).unsigned_abs();
+            let dist_to_two_thirds = (a - target_two_thirds).unsigned_abs();
+            let mut candidates = Vec::with_capacity(2);
+            if dist_to_third <= dist_to_two_thirds {
+                // Anchor takes the 1/3 slot; 2/3 slot gets the geometric column.
+                candidates.push(a);
+                let geometric_2_3 = propose(2, 3);
+                if geometric_2_3 != a {
+                    candidates.push(geometric_2_3);
+                }
+            } else {
+                // Anchor takes the 2/3 slot; 1/3 slot gets the geometric column.
+                let geometric_1_3 = propose(1, 3);
+                if geometric_1_3 != a {
+                    candidates.push(geometric_1_3);
+                }
+                candidates.push(a);
+            }
+            candidates
+        } else {
+            // Deterministic order: smaller gx first.
+            if a < b { vec![a, b] } else { vec![b, a] }
+        }
     };
 
     // Try with meander first (gentle offset ±1). If no candidate finds a clear
     // lane, fall back to a straight channel (offset always 0) which needs exactly
     // 4 free columns — fitting corridors the meander cannot.
+    // NOTE: the candidate list now derives from port anchors when available, so
+    // the river naturally flows near harbor/lighthouse districts.
     for &channel_fn in &[
         channel_start as fn(i32, i32) -> i32,
         straight_channel_start as fn(i32, i32) -> i32,
@@ -1388,5 +1467,75 @@ mod tests {
             let off = meander_offset(base, gy);
             assert_eq!(ch, base + off, "channel_start consistency at gy={}", gy);
         }
+    }
+
+    /// Water-affine river placement: a city with harbor/lighthouse buildings at a
+    /// known gx far from the midpoint gets a river whose envelope is within a
+    /// few columns of that cluster (port anchor pulls the river). A control city
+    /// without harbors keeps the midpoint river.
+    ///
+    /// Also covers the single-anchor-both-slots case: ONE harbor at x=20 is
+    /// nearest both 1/3 and 2/3 positional targets (for width=24, targets are
+    /// x=8 and x=16). The anchor fills the slot it is closest to (2/3 → x=16,
+    /// closest to x=20) and the other slot gets the geometric candidate (x=8),
+    /// so the city still gets 2 rivers like a harbor-less city of the same width.
+    #[test]
+    fn rivers_prefer_port_anchor_positions() {
+        // Wide city (width=24): houses at x=0..22, gap corridor in the middle.
+        // ONE harbor at x=20 — nearest both thirds (8 and 16), closest to 16.
+        let mut port_buildings = wide_city();
+        port_buildings.push(bld("port-a", purpose::HARBOR, visual_tier::KALYBE, 20.0, 2.0));
+
+        let t_port = build_terrain(&port_buildings, &[], 0);
+        // Must get 2 rivers (width >= 18), even though the single anchor maps
+        // to both positional slots — the other slot gets the geometric candidate.
+        assert_eq!(
+            t_port.rivers.len(),
+            2,
+            "single-anchor city with width>=18 must still get 2 rivers, got {}",
+            t_port.rivers.len()
+        );
+
+        // One river should be near the anchor (x=20), the other near the
+        // geometric 1/3 column (x=8).
+        let centers: Vec<i32> = t_port
+            .rivers
+            .iter()
+            .map(|r| (r.gx_min + r.gx_max) / 2)
+            .collect();
+        let near_anchor = centers.iter().any(|&c| (c - 20).unsigned_abs() <= 6);
+        let near_geometric = centers.iter().any(|&c| (c - 8).unsigned_abs() <= 6);
+        assert!(
+            near_anchor,
+            "one river should be near the harbor anchor x=20, got centers {:?}",
+            centers
+        );
+        assert!(
+            near_geometric,
+            "one river should be near the geometric 1/3 x=8, got centers {:?}",
+            centers
+        );
+
+        // Control: same city WITHOUT harbors. Must also get 2 rivers near the
+        // geometric thirds (x=8 and x=16).
+        let t_no_port = build_terrain(&wide_city(), &[], 0);
+        assert_eq!(t_no_port.rivers.len(), 2, "no-port city gets 2 rivers");
+        let ctrl_centers: Vec<i32> = t_no_port
+            .rivers
+            .iter()
+            .map(|r| (r.gx_min + r.gx_max) / 2)
+            .collect();
+        let ctrl_near_8 = ctrl_centers.iter().any(|&c| (c - 8).unsigned_abs() <= 6);
+        let ctrl_near_16 = ctrl_centers.iter().any(|&c| (c - 16).unsigned_abs() <= 6);
+        assert!(
+            ctrl_near_8,
+            "no-port river near geometric 1/3 x=8, got {:?}",
+            ctrl_centers
+        );
+        assert!(
+            ctrl_near_16,
+            "no-port river near geometric 2/3 x=16, got {:?}",
+            ctrl_centers
+        );
     }
 }
