@@ -162,6 +162,9 @@ const TEX_KEY: Record<string, string> = {
   ashlar: "tex:ashlar",
   stone: "tex:ashlar",
   plaster: "tex:plaster",
+  // Warm mottled variant for the warm-toned walls (marbleWarm/mud). Only a
+  // TEXTURE pick — the procedural texFace fallback keeps kind "plaster".
+  plasterwarm: "tex:plasterwarm",
   marble: "tex:marble",
   wood: "tex:wood",
   rooftile: "tex:rooftile",
@@ -195,9 +198,10 @@ function kindForMat(col: number): string | null {
     case MAT.marbleCool:
       return "marble";
     case MAT.marbleWarm:
+    case MAT.mud:
+      return "plasterwarm";
     case MAT.plaster:
     case MAT.plasterDk:
-    case MAT.mud:
       return "plaster";
     case MAT.stone:
     case MAT.plinth:
@@ -548,8 +552,15 @@ export function box(
   // over a light material texture. When textured, the procedural texFace
   // line-work is SKIPPED (its coursing would double-pattern the texture's).
   // fillL/fillR resolve from the same key, so they are null together.
-  const fillL = opt.tex ? kitFill(opt.tex, cL) : null;
-  const fillR = opt.tex ? kitFill(opt.tex, cR) : null;
+  // Warm-toned plaster walls (marbleWarm/mud) pick the warm mottled texture;
+  // the texFace fallback below still receives the caller's "plaster" kind.
+  const texKind =
+    opt.tex === "plaster" &&
+    (baseColor === MAT.marbleWarm || baseColor === MAT.mud)
+      ? "plasterwarm"
+      : opt.tex;
+  const fillL = texKind ? kitFill(texKind, cL) : null;
+  const fillR = texKind ? kitFill(texKind, cR) : null;
   if (fillL) polyFill(g, Lq, fillL);
   else poly(g, Lq, cL);
   if (fillR) polyFill(g, Rq, fillR);

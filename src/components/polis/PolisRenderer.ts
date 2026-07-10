@@ -3911,6 +3911,11 @@ export class PolisRenderer {
     // so they must be freed exactly once, here, after clearScene has torn down all
     // the sprites that referenced them.
     this.buildingAtlas.destroy();
+    // A5a — clear the kit's module-level sprite bank alongside its owning
+    // renderer. createPolis unloads the bank's Assets urls right after this
+    // destroy; a stale kitBank would hand any later bake textures with a dead
+    // GPU backing (black faces). The next constructor sets it fresh.
+    setKitSpriteBank(null);
     // L2: detach + destroy the growth-effect pool Graphics BEFORE the effects
     // layer is destroyed below (no removeFromParent leak — the L1 audit caught
     // this exact pattern).
