@@ -601,6 +601,13 @@ fn pi_sandbox_policy(project_root: &Path) -> SandboxPolicy {
     policy
 }
 
+/// Map the Pigeon-enabled flag to the exact env-var string the sidecar reads.
+/// The sidecar treats ONLY the literal "true" as enabled (see sidecar.mjs
+/// `DEVBOULE_PIGEON_ENABLED === "true"`); everything else is OFF.
+fn pigeon_enabled_env_value(enabled: bool) -> &'static str {
+    if enabled { "true" } else { "false" }
+}
+
 /// Spawn a new pi sidecar session with the given session id. Reads the coder
 /// backend from the vault/config and passes provider+model+key as env vars.
 /// Starts a stdout JSONL reader thread that emits events on `mini-activity://<sessionId>`.
@@ -687,11 +694,7 @@ fn spawn_pi_session_inner(
     // Restart-scoped, mirrors `pigeon_enabled_cached` used by the transport paths.
     cmd.env(
         "DEVBOULE_PIGEON_ENABLED",
-        if crate::backend::pigeon_service::pigeon_enabled_cached(app) {
-            "true"
-        } else {
-            "false"
-        },
+        pigeon_enabled_env_value(crate::backend::pigeon_service::pigeon_enabled_cached(app)),
     );
 
     if let Some(role) = role {
@@ -4722,6 +4725,14 @@ mod tests {
             });
             assert_eq!(pairs.len(), 1, "provider {provider} must produce exactly one env pair");
         }
+    }
+
+    // -- pigeon_enabled_env_value (flag→sidecar contract, §13) -----------------
+
+    #[test]
+    fn pigeon_enabled_env_value_maps_to_literal_true_false() {
+        assert_eq!(pigeon_enabled_env_value(true), "true");
+        assert_eq!(pigeon_enabled_env_value(false), "false");
     }
 }
 

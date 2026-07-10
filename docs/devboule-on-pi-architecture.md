@@ -286,7 +286,7 @@ The Rust EventMapper reads `_devboule` and maps enriched events to the correct `
 
 1. **Phase 0 — Spike (bfd11bb):** Node sidecar embeds pi SDK, bridge proven end-to-end.
 2. **Phase 1 — Infra+Tools (ea015be→c7c58e7):** per-session IDs, vault adapter, UI trigger, Censor hook, Oracle MCP cleanup.
-3. **Phase 2 — Pigeon routing (8f8ade7):** multi-factor classifier (Puppetmaster MIT), PromptTier/AgentPath, tier table.
+3. **Phase 2 — Pigeon routing (8f8ade7):** multi-factor classifier (Puppetmaster MIT), PromptTier/AgentPath, tier table. **(2026-07-10: AgentPath/Terminal removed and tier-routing gated behind `pigeon.enabled` — see §13.)**
 4. **Phase 3 — Subagents (096ec2a→b5b69c5):** main-coder, mini-coder, reviewer/verifier .md definitions. 3-layer verification.
 5. **Console pipeline (69843e9→a8cb886):** `_devboule` enrichment, EventMapper, agent ID namespaces, all 3 consoles conditional pi wiring. Hostile-audited, 13 findings fixed.
 6. **Phase 4 — Archive (e244a60):** `devboule-coder/` → `archived/`. ~22K LOC removed. Build clean.
@@ -423,7 +423,7 @@ Resolved by M (this section overrides the earlier open questions):
 7. **Sidecar lifecycle — per-session (tentative).** `createAgentSession()` is cheap; spawn a sidecar per Devboule coding session rather than a long-lived daemon. M flagged this as "maybe" — confirm during Phase 0 spike (measure spawn cost + warm-start benefit).
 8. **Branding — credit pi.** Devboule must disclose it is "built on top of Pi" (pi is MIT). Pi otherwise invisible in the UX.
 9. **Config silo (AI providers) — RESOLVED → (b) vault stays source of truth, adapter at spawn.** Devboule's AI-provider config (`ProvidersModelsTab.tsx` → vault via `save_oracle_llm_settings`, `src-tauri/src/backend/vault.rs:927`) is the single source of truth and **stays**. pi's own provider system (`pi.registerProvider()` / `pi.setModel()` / `~/.pi/agent/models.json`) is **NOT written by Devboule**. Instead: the Rust backend (which already reads the vault and already spawns the sidecar via `std::process::Command`) resolves the relevant role's provider+model and passes it to the Node sidecar at spawn time (env var or JSONL handshake); the Devboule pi extension calls `pi.setProvider()`/`pi.setModel()` on session start. Rationale: (i) `~/.pi/agent/models.json` is the user's GLOBAL pi config — writing to it per-project would clobber their pi CLI setup; (ii) Devboule's value is per-role provider assignment (Oracle / Censor / Designer / coder / mini each their own), which pi's per-session `setModel()` would flatten; (iii) one edit surface (vault → ProvidersModelsTab) matches the "pride" UX; (iv) the adapter is minimal — Rust already spawns the sidecar, passing one extra config blob is trivial. **Scope note:** this only affects pi-driven agents (main coder, mini-as-subagent). Oracle, Censor LLM, Designer read the vault directly and are unchanged.
-10. **Claude external-MCP block (2026-07) — FUTURE, do not block Phase 0.** Claude recently blocked external MCP integrations, so Claude **cannot be used as a provider inside pi-dev**. Consequence: the existing **Claude-terminal subprocess path stays as-is** for Claude sessions — it is NOT migrated onto pi in this plan. pi-dev hosts the non-Claude agents (main coder, mini-as-subagent, and any pi-supported provider: local oMLX/Ollama, Codex/OpenRouter, etc.). Pigeon therefore routes on **two axes**: (a) local-vs-cloud as before, and (b) **pi-path vs terminal-path** — Claude → terminal subprocess (unchanged), everything else → pi sidecar. The eventual integration of Claude onto pi is **future work** to be scoped in a later phase, NOT part of Phase 0–4.
+10. **Claude external-MCP block (2026-07) — FUTURE, do not block Phase 0.** Claude recently blocked external MCP integrations, so Claude **cannot be used as a provider inside pi-dev**. Consequence: the existing **Claude-terminal subprocess path stays as-is** for Claude sessions — it is NOT migrated onto pi in this plan. pi-dev hosts the non-Claude agents (main coder, mini-as-subagent, and any pi-supported provider: local oMLX/Ollama, Codex/OpenRouter, etc.). Pigeon therefore routes on **two axes**: (a) local-vs-cloud as before, and (b) **pi-path vs terminal-path** — Claude → terminal subprocess (unchanged), everything else → pi sidecar. The eventual integration of Claude onto pi is **future work** to be scoped in a later phase, NOT part of Phase 0–4. **(2026-07-10 update: the pi-path-vs-terminal split was removed as an unimplemented stub — see §13; Claude-on-terminal remains future work.)**
 11. **macOS sandbox (coder sandbox) — REUSE WITH ADAPTATION (verified 2026-07-07).** The sandbox (`src-tauri/src/backend/sandbox/`, ~400 LOC: `mod.rs` `SandboxPolicy`/`wrap()`, `seatbelt.rs` SBPL profile builder with kernel regression tests) is independent of the deleted `devboule-coder/` (never imported it). macOS `sandbox-exec` + Seatbelt: confines file writes (deny-by-default + allowlist), network, rlimits, `.git`/`.devboule` write guards. **Reuse:** in `pi_sidecar.rs`, wrap the bare `Command::new("node")` with `sandbox::wrap()`, confining pi's `edit`/`write`/`bash` to the project dir. `wrap()`/`build_profile()` need NO changes — add only a policy helper. macOS-only for OS confinement; pass-through (unrestricted) on Linux/Windows.
 
 ### Updated delete/keep table (post-decisions)
@@ -467,4 +467,43 @@ Files kept (added to the keep list): `src-tauri/src/polis/` (all 11 files), `src
 
 ---
 
-**No code has been changed.** This document is for M's review. Decision needed on §11 before Phase 0 spike begins.
+## 13. Pigeon unification & simplification (2026-07-10)
+
+**Context.** Two unrelated subsystems were both named "Pigeon", which caused confusion and a real
+bug: the local orchestrator never used its configured oMLX model, because prompt classification ran
+unconditionally and rerouted the model — even though Pigeon was disabled.
+
+**The two "Pigeons":**
+1. *Pigeon transport* — the durable mailbox / pool message-passing (`pigeon_service.rs`, mini-pool /
+   censor-pool). Correctly gated by `pigeon.enabled` (config.json, default false).
+2. *"Pigeon routing"* — prompt tier-classification + model switching in the pi sidecar. It reused
+   the name but was NOT gated by the flag; it ran on every prompt.
+
+**Decision: one Pigeon, one flag.** `pigeon.enabled` now governs the whole concept:
+- **OFF (default):** no classification, no `setModel`, no terminal redirect. Every prompt runs on
+  the role's spawn-time configured model (e.g. orchestrator → `localCoderBackend` oMLX model).
+- **ON:** transport + tier/model classification routing, as before.
+
+**Flag → sidecar contract.** Rust injects `DEVBOULE_PIGEON_ENABLED` (`"true"`/`"false"`) as a spawn
+env var from `pigeon_enabled_cached(app)` (restart-scoped). The sidecar treats only the literal
+`"true"` as enabled; absent/anything else = OFF (safe default for an old-Rust / new-sidecar skew).
+
+**Removed (dead code):** `AgentPath`, `decide_agent_path`/`_text`, the vault-aware `resolve_tier`
+plus its `CACHED_LOCAL_CODER` cache, the `Classification.path` field, and the `redirect_to_claude`
+control arm (a no-op stub that silently swallowed the turn). The Claude-terminal redirect (decision
+#10) is **removed, not implemented** — deferred to a future phase (Phase-3 TODO).
+`resolve_tier_defaults(tier)` and `classify_prompt_full(text)` lost their `path`/`app` params.
+
+**Complexity.** Before: the sidecar event-bridge closure was CCN 32 and `prompt_routing.rs` carried
+the dead routing paths. After: `prompt_routing.rs` shed ~140 LOC (no function above ~12 CCN); the
+event bridge was decomposed into 5 named helpers (no function above 15 CCN in `sidecar.mjs`).
+Pre-existing high-CCN core functions unrelated to Pigeon (`spawn_pi_session_inner` ~26,
+`handle_event` ~18) were left as a documented follow-up rather than risk critical spawn/event paths.
+
+**UX recovery.** A wedged orchestrator chat now surfaces an actionable "Restart orchestrator" button
+inside a 60s stall banner (reusing `planner_reset_chat`), replacing an invisible reset icon and a
+passive 7-minute watchdog.
+
+Shipped 2026-07-10 as phases P1–P5 (commits e535696, efa5a85, a903df7, bc565ec, + this doc commit).
+
+**Status:** the Pigeon unification (§13) is implemented (2026-07-10); the rest of this document remains the Phase-0 design record for M's review.
