@@ -538,6 +538,46 @@
       "id": "tex:waterdeep",
       "source": "sbs-textures",
       "modified": true
+    },
+    {
+      "id": "res:mine",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "res:quarry:v0",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "res:quarry:v1",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:rock:v0",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:rock:v1",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:rock:v2",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:rock:v3",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:rock:v4",
+      "source": "unknown-horizons",
+      "modified": true
     }
   ]
 }

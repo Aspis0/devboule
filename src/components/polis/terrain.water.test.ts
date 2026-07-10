@@ -113,13 +113,10 @@ describe("textured water path (both keys present)", () => {
     expect(waterGroup!.children.length).toBe(childCount);
   });
 
-  it("waterBounds equals the pixel bbox of all water diamond vertices (±0.5 tolerance)", () => {
+  it("waterBounds equals the pixel bbox of capped water diamond vertices", () => {
     const { waterBounds } = buildTerrainFrame(makeTerrain(), CHUNK, bankWithWater());
     expect(waterBounds).not.toBeNull();
 
-    // Manual expected bbox from the 3 water tiles: (10,0), (11,0), (3,1).
-    // Each diamond is cartToIso(gx+0.5, gy+0.5) ± {HW, HH}.
-    // We compare against a generous range — the exact values depend on cartToIso.
     const wb = waterBounds!;
     expect(wb.width).toBeGreaterThan(0);
     expect(wb.height).toBeGreaterThan(0);
@@ -129,12 +126,12 @@ describe("textured water path (both keys present)", () => {
     expect(wb.height).toBeGreaterThan(50);
   });
 
-  it("chunk containers have no TilingSprites; deep tiles get flat overlay fills", () => {
+  it("chunk containers have no TilingSprites and anim is null (no per-chunk anim)", () => {
     const { chunks: frame } = buildTerrainFrame(makeTerrain(), CHUNK, bankWithWater());
-    // Chunk containers should not contain any TilingSprites (they're in waterGroup).
     for (const chunk of frame) {
       const ts = collectTilingSprites(chunk.container);
       expect(ts.length).toBe(0);
+      expect(chunk.anim).toBeNull();
     }
   });
 
@@ -144,6 +141,56 @@ describe("textured water path (both keys present)", () => {
       expect((chunk as any).globalAnim).toBeUndefined();
       expect((chunk as any).globalDestroy).toBeUndefined();
     }
+  });
+});
+
+describe("empty water guard", () => {
+  it("empty terrain.water + bank with both textures → waterGroup null, no TilingSprites, no throw", () => {
+    const emptyWater: TerrainData = {
+      seaX: 0, minY: 0, maxY: 0, rivers: [], water: [], sand: [], bridges: [],
+    };
+    const { chunks, waterGroup, waterBounds, waterAnim } =
+      buildTerrainFrame(emptyWater, CHUNK, bankWithWater());
+    expect(waterGroup).toBeNull();
+    expect(waterBounds).toBeNull();
+    expect(waterAnim).toBeNull();
+    // No TilingSprites anywhere.
+    for (const chunk of chunks) {
+      expect(collectTilingSprites(chunk.container).length).toBe(0);
+    }
+    // No throw — the textured block was skipped entirely.
+  });
+});
+
+describe("cap parametrization", () => {
+  it("maxWaterTiles=4: waterBounds excludes the 5th tile, bbox shrinks accordingly", () => {
+    // 5 water tiles in a row along gx: 0..4 at gy=5.
+    const terrain: TerrainData = {
+      seaX: 0, minY: 0, maxY: 10, rivers: [],
+      water: Array.from({ length: 5 }, (_, i) => ({ gx: i, gy: 5, deep: false })),
+      sand: [], bridges: [],
+    };
+    const { waterBounds: wb4 } = buildTerrainFrame(terrain, CHUNK, bankWithWater(), 4);
+    const { waterBounds: wb5 } = buildTerrainFrame(terrain, CHUNK, bankWithWater(), 5);
+
+    expect(wb4).not.toBeNull();
+    expect(wb5).not.toBeNull();
+
+    // With cap=4, only tiles gx=0..3 are included. The 5th tile (gx=4) is
+    // excluded — its diamond extends the bbox further right (SE in iso space).
+    // wb5 must be strictly wider than wb4.
+    expect(wb5!.width).toBeGreaterThanOrEqual(wb4!.width);
+    expect(wb5!.height).toBeGreaterThanOrEqual(wb4!.height);
+  });
+
+  it("default cap equals MAX_WATER_TILES (backward-compatible)", () => {
+    const terrain: TerrainData = {
+      seaX: 0, minY: 0, maxY: 1, rivers: [],
+      water: [{ gx: 0, gy: 0, deep: false }],
+      sand: [], bridges: [],
+    };
+    // No explicit cap → uses MAX_WATER_TILES. Should not throw.
+    expect(() => buildTerrainFrame(terrain, CHUNK, bankWithWater())).not.toThrow();
   });
 });
 

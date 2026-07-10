@@ -36,6 +36,7 @@ import {
 import { agentColor } from "./palette";
 import { createPolis, type PolisHandle } from "./createPolis";
 import { InspectSidebar, type InspectSubject } from "./InspectSidebar";
+import { planResourceSites, type ResourceSite } from "./resources";
 import { PolisBottomBar } from "./PolisBottomBar";
 import { findBuildingByCitation } from "./findBuildingByCitation";
 import { computeFilterSets } from "./filterModel";
@@ -59,6 +60,8 @@ export function PolisView() {
   const [ready, setReady] = useState(false);
   // The inspect subject is either a BUILDING, an AGENT, or nothing.
   const [selected, setSelected] = useState<InspectSubject>(null);
+  // A selected resource site (quarry/mine) — shown in the inspect sidebar.
+  const [selectedResource, setSelectedResource] = useState<ResourceSite | null>(null);
   const [immersive, setImmersive] = useState(false);
   // Progress of the renderer's NON-BLOCKING chunked build. The backend scan
   // (`loading`) finishes before the renderer starts placing buildings in batches
@@ -191,6 +194,11 @@ export function PolisView() {
       // service (provider/type/name/status). Inspect-only, no secret.
       onSelectExternalService: (s) =>
         setSelected(s ? { kind: "externalService", service: s } : null),
+      onSelectResource: (r) => {
+        setSelectedResource(r);
+        // Selecting a resource clears any building selection and vice versa.
+        if (r) setSelected(null);
+      },
     })
       .then((h) => {
         if (cancelled) {
@@ -253,6 +261,7 @@ export function PolisView() {
     // A genuinely newer object still diffs correctly.
     liveRenderedRef.current = null;
     setSelected(null);
+    setSelectedResource(null);
     return () => {
       // A new cityState (or unmount) supersedes this build; stop reacting to its
       // progress. The renderer's own buildToken aborts the rAF batch loop.
@@ -296,6 +305,16 @@ export function PolisView() {
       }
       return prev;
     });
+    // Reconcile selectedResource: re-plan sites on the updated city and check
+    // whether the selected site still exists (district may have been removed or
+    // its census dropped below threshold). Refresh the stored object so counts
+    // stay current; clear if the site is gone.
+    setSelectedResource((prev) => {
+      if (!prev) return null;
+      const updatedSites = planResourceSites(liveCity.city);
+      const fresh = updatedSites.find((s) => s.id === prev.id);
+      return fresh ?? null;
+    });
   }, [ready, liveCity]);
 
   // DEEP-LINK focus (GAP B): once a city containing the target agent is loaded,
@@ -312,6 +331,7 @@ export function PolisView() {
     if (agent) {
       pendingFocusAgentRef.current = null;
       setSelected({ kind: "agent", agent });
+      setSelectedResource(null);
       handleRef.current?.recenter();
     }
   }, [ready, cityState]);
@@ -507,6 +527,7 @@ export function PolisView() {
   // the target. Use the Recenter button to refit.)
   const selectBuilding = useCallback((b: Building) => {
     setSelected({ kind: "building", building: b });
+    setSelectedResource(null);
   }, []);
 
   // Oracle citation focus: resolve a citation's fileSource to the matching
@@ -526,6 +547,7 @@ export function PolisView() {
   // Select an agent (from the roster).
   const selectAgent = useCallback((a: Agent) => {
     setSelected({ kind: "agent", agent: a });
+    setSelectedResource(null);
   }, []);
 
   const buildings = cityState?.buildings ?? [];
@@ -876,9 +898,9 @@ export function PolisView() {
 
         {/* Inspect sidebar */}
         <InspectSidebar
-          subject={selected}
+          subject={selected ?? (selectedResource ? { kind: "resource", site: selectedResource } : null)}
           city={cityState}
-          onClose={() => setSelected(null)}
+          onClose={() => { setSelected(null); setSelectedResource(null); }}
           onSelectBuilding={selectBuilding}
         />
 

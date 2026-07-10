@@ -253,6 +253,12 @@ export interface District {
   bounds: Bounds;
   wallStyle: WallStyle;
   colorAccent: string;
+  /**
+   * Per-district static-asset census (images / fonts / media). Absent when the
+   * district has zero static assets (sparse wire). Mirrors the Rust
+   * `AssetCensus` struct in `src-tauri/src/polis/model.rs`.
+   */
+  assetCensus?: { images: number; fonts: number; media: number };
 }
 
 export interface Building {
