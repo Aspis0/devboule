@@ -26,7 +26,7 @@
       "license": "CC-BY-SA-3.0 (art; some pieces CC-BY-3.0) per doc/LICENSE",
       "licenseVerified": "2026-07-09 — doc/LICENSE on disk: 'Published under the terms of Creative Commons Attribution Sharealike 3.0'",
       "contents": "buildings (128x128 per rotation, tile 64x32 => x1.5 to our 96x48), terrain/trees (64x128), units with 8-direction x 4-frame walk cycles (~32x42/frame, move + move_full carrying variants: carrier, farmer, fisherman, priest, inhabitant, ...)",
-      "curationVerdict": "ACCEPTED — Mediterranean subset curated per building (verified excellent: merchants/as_bath stone+columns+terracotta, merchants/as_estate1 plastered house); trees ACCEPTED; units = A6 walker verdict YES",
+      "curationVerdict": "ACCEPTED — Mediterranean subset curated per building (verified excellent: merchants/as_bath stone+columns+terracotta, merchants/as_estate1 plastered house); trees ACCEPTED; units = A6 walker verdict YES | SHIPPED: trees (A4, prop-0), citizen m/f 8-dir x 4-frame walk cycles (A6, walk-0). Buildings REJECTED (A5b: 128px vs native kit bake).",
       "shareAlikeNote": "any edited/recolored UH sprite we ship stays CC-BY-SA and is flagged modified:true here + listed in public/polis/CREDITS.md",
       "lightDirection": "reads NW-consistent on sampled sprites; re-check per building at staging"
     },
@@ -50,11 +50,11 @@
     },
     "oga-fire-9frame": {
       "url": "https://opengameart.org/content/9-frame-fire-animation-16x-32x-64x",
-      "author": "see OGA page (recorded at staging time before any frame ships)",
+      "author": "FoshyTakashi",
       "license": "CC-BY-3.0",
-      "licenseVerified": "2026-07-09 — OGA page license block",
+      "licenseVerified": "2026-07-09 — OGA page license block CC-BY 3.0; author FoshyTakashi; page note: 'As long as you are not selling these directly do whatever. if you publish a game let me know'",
       "contents": "9-frame fire strips 32x (96x96 grid) + 64x (192x192 grid)",
-      "curationVerdict": "CANDIDATE for A7 F1 crowd-fire flipbook; hero fire stays particle-based",
+      "curationVerdict": "SHIPPED (A7) — 8 of 9 frames of the 64x strip cut via normalize crop into fx-0 atlas, re-baked per severity band; hero fire stays particle-based",
       "lightDirection": "n/a (emissive)"
     }
   },

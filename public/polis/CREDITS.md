@@ -17,7 +17,21 @@ License notes:
 ## Sources
 
 - **Screaming Brain Studios** — seamless terrain/material textures (grass,
-  dirt, stone; `tex:*`) from the "Tiny Texture Pack" series.
+  dirt, stone, plaster, ashlar/brick, marble, wood planks, terracotta roof
+  tiles, thatch; `tex:*`) from the "Tiny Texture Pack" series.
   https://opengameart.org/content/tiny-texture-pack — License: **CC0**
   ("released under the CC0/Public Domain License", pack License.txt).
-  Used unmodified except rescaling. Thank you!
+  Used rescaled, some desaturated/brightened to fit the palette. Thank you!
+
+- **Unknown Horizons team** — tree sprites (`prop:tree`, `prop:cypress`) and
+  the ambient crowd's walk cycles (`walk:citizen*`, 8 directions × 4 frames).
+  https://github.com/unknown-horizons/unknown-horizons (content/gfx) —
+  License: **CC-BY-SA 3.0** (art, per the project's doc/LICENSE; multiple
+  artists — see their doc/AUTHORS.md). Rescaled/re-packed for this app; the
+  modified sprite files remain CC-BY-SA per the share-alike note above.
+
+- **FoshyTakashi** — 9-frame fire animation (`fx:fire:*`, the burning-building
+  flip-book frames).
+  https://opengameart.org/content/9-frame-fire-animation-16x-32x-64x —
+  License: **CC-BY 3.0**. Frames cut from the 64px strip, rescaled and tinted
+  per fire severity. Thank you!
