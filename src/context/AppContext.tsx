@@ -65,11 +65,14 @@ import { mapLegacyViewTarget } from "../utils/deepLink";
 import { installVisibilityLock } from "../utils/visibilityLock";
 
 const LIVE_SYNC_INTERVAL_MS = 60_000;
-// Auto-lock only after the window has stayed hidden this long — a brief hide
-// (Space switch, a window briefly covering it, the dev-rebuild flash) that
-// returns to visible before this elapses does NOT lock. Security intent kept:
-// walking away (staying hidden) still locks.
-const VISIBILITY_LOCK_GRACE_MS = 20_000;
+// Auto-lock only after the window has stayed hidden this long — bumped from
+// 20s to 120s (2 minutes). A short hide (macOS App Nap flap, a Space switch,
+// a window briefly covering it, the dev-rebuild flash) that returns to visible
+// before this elapses does NOT lock. The longer grace avoids locking the user
+// out on transient macOS occlusion/App-Nap events that previously made the app
+// feel "minimized + frozen". Security intent kept: a genuine walk-away (staying
+// hidden) still locks after 2 minutes.
+const VISIBILITY_LOCK_GRACE_MS = 120_000;
 const SCALEWAY_ACTION_FOLLOWUP_DELAYS_MS = [5_000, 15_000, 30_000];
 
 const EMPTY_CONFIG: AppConfig = {
