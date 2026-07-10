@@ -298,6 +298,28 @@ impl CityState {
 }
 
 // ---------------------------------------------------------------------------
+// AssetCensus — per-district static-asset counts (images / fonts / media)
+// ---------------------------------------------------------------------------
+
+/// Per-district count of non-code static asset files, grouped by extension
+/// family. Attached to each [`District`] during the scan so the frontend can
+/// place map furniture (quarry / mine) next to asset-heavy districts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetCensus {
+    pub images: u32,
+    pub fonts: u32,
+    pub media: u32,
+}
+
+impl AssetCensus {
+    /// Total number of static assets across all families.
+    pub fn total(&self) -> u32 {
+        self.images + self.fonts + self.media
+    }
+}
+
+// ---------------------------------------------------------------------------
 // District
 // ---------------------------------------------------------------------------
 
@@ -313,6 +335,10 @@ pub struct District {
     /// "roman_wall" | "aqueduct" | "palisade" | "none"
     pub wall_style: String,
     pub color_accent: String,
+    /// Per-district static-asset census (images / fonts / media). `None` when
+    /// the district has zero static assets — keeps the wire sparse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_census: Option<AssetCensus>,
 }
 
 // ---------------------------------------------------------------------------

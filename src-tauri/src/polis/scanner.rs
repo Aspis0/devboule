@@ -158,6 +158,47 @@ pub fn default_extensions() -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Asset census — per-directory static-asset counting (piggybacks on the walk)
+// ---------------------------------------------------------------------------
+
+/// Extension families for the asset census (case-insensitive, no leading dot).
+const ASSET_IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "svg", "ico",
+];
+const ASSET_FONT_EXTS: &[&str] = &["ttf", "otf", "woff", "woff2"];
+const ASSET_MEDIA_EXTS: &[&str] = &["mp3", "wav", "ogg", "mp4", "webm"];
+
+/// Intermediate per-directory asset tally accumulated during the walk.
+/// `pub(crate)` so the scanner can fold it into districts; the struct is
+/// intentionally not serialized (the final `AssetCensus` on `District` is).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AssetCounts {
+    pub images: u32,
+    pub fonts: u32,
+    pub media: u32,
+}
+
+impl AssetCounts {
+    fn is_empty(&self) -> bool {
+        self.images == 0 && self.fonts == 0 && self.media == 0
+    }
+}
+
+/// Categorize a lowercase file extension into an asset family.
+/// Returns `None` for non-asset extensions.
+fn categorize_asset_ext(ext: &str) -> Option<&'static str> {
+    if ASSET_IMAGE_EXTS.contains(&ext) {
+        Some("images")
+    } else if ASSET_FONT_EXTS.contains(&ext) {
+        Some("fonts")
+    } else if ASSET_MEDIA_EXTS.contains(&ext) {
+        Some("media")
+    } else {
+        None
+    }
+}
+
 /// "Critical" JSON files we keep (everything else `.json` is dropped).
 const CRITICAL_JSON: &[&str] = &[
     "package.json",
@@ -253,7 +294,7 @@ pub(crate) fn generate_city_state_with_metrics(
         .enabled_extensions()
         .cloned()
         .unwrap_or_else(default_extensions);
-    let (mut scanned, scan_note) = scan_files_with(project_path, &allowed_exts)?;
+    let (mut scanned, scan_note, asset_dir_counts) = scan_files_with(project_path, &allowed_exts)?;
     // Deterministic order regardless of filesystem iteration order.
     scanned.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
@@ -479,6 +520,74 @@ pub(crate) fn generate_city_state_with_metrics(
     // cached); F2 reclassify refines the overrides, not this.
     meta.set_features(feature_result.features.clone());
 
+    // --- ASSET CENSUS ATTRIBUTION (piggybacks on F1 feature assignment) ------
+    // Map each asset directory to its nearest ancestor that contains a code file,
+    // then fold per-dir AssetCounts into per-district AssetCensus via the feature
+    // id -> district id resolution (sub-MIN features fold into commons, same as
+    // buildings). Deterministic: BTreeMap iteration, feature_result is stable.
+    let asset_census_by_district: BTreeMap<String, AssetCensus> = {
+        // Set of directories containing at least one scanned code file.
+        let code_dirs: HashSet<String> = scanned
+            .iter()
+            .map(|f| {
+                let p = Path::new(&f.rel_path);
+                normalize_rel_path(&p.parent().unwrap_or(p).to_string_lossy())
+            })
+            .collect();
+        // Feature id -> resolved district id (same min-size merge as buildings).
+        let target_district_for = |fid: &str| -> String {
+            if fid.is_empty() || fid == COMMONS_FEATURE_ID {
+                return COMMONS_FEATURE_ID.to_string();
+            }
+            let n = f1_result
+                .by_path
+                .values()
+                .filter(|a| a.feature_id == fid)
+                .count();
+            if n < MIN_DISTRICT_BUILDINGS {
+                COMMONS_FEATURE_ID.to_string()
+            } else {
+                fid.to_string()
+            }
+        };
+        let mut by_district: BTreeMap<String, AssetCensus> = BTreeMap::new();
+        for (dir_key, counts) in &asset_dir_counts {
+            if counts.is_empty() {
+                continue;
+            }
+            // Walk UP from the asset directory to find the nearest ancestor with
+            // a code file, then use that code file's feature_id as the district.
+            let dir_path = std::path::Path::new(dir_key.as_str());
+            let mut found = None;
+            let mut cursor = dir_path.to_path_buf();
+            loop {
+                let norm = normalize_rel_path(&cursor.to_string_lossy());
+                if code_dirs.contains(&norm) {
+                    // Find a code file in this dir and use its feature_id.
+                    if let Some(b) = buildings.iter().find(|b| {
+                        let p = std::path::Path::new(&b.file_path);
+                        p.parent()
+                            .map(|pp| normalize_rel_path(&pp.to_string_lossy()) == norm)
+                            .unwrap_or(false)
+                    }) {
+                        found = Some(target_district_for(&b.feature_id));
+                    }
+                    break;
+                }
+                if !cursor.pop() {
+                    break;
+                }
+            }
+            if let Some(district_id) = found {
+                let entry = by_district.entry(district_id).or_default();
+                entry.images += counts.images;
+                entry.fonts += counts.fonts;
+                entry.media += counts.media;
+            }
+        }
+        by_district
+    };
+
     // Phase 4a — PROPORTIONAL ROAD CAP (applied BEFORE layout + routing so a
     // dropped road never pays the per-road A* cost AND so the A2 semantic-placement
     // meta-graph is built from the SAME capped road set the city actually ships —
@@ -500,6 +609,7 @@ pub(crate) fn generate_city_state_with_metrics(
         &mut meta,
         &feature_result.features,
         &roads,
+        &asset_census_by_district,
     );
 
     // Phase 4b — WORLD-GRID road routing. Now that buildings have coords, route
@@ -786,18 +896,26 @@ pub(crate) fn format_build_log(m: &BuildMetrics) -> String {
 /// directories and stop reading further files (no wasted IO).
 /// Scan with the DEFAULT extension set. Back-compat entry point used by the unit
 /// tests and any caller that doesn't thread a per-workspace override.
-pub fn scan_files(root: &Path) -> Result<(Vec<ScannedFile>, Option<String>), String> {
+pub fn scan_files(root: &Path) -> Result<(Vec<ScannedFile>, Option<String>, HashMap<String, AssetCounts>), String> {
     scan_files_with(root, DEFAULT_KEPT_EXTENSIONS)
 }
 
 /// Like `scan_files`, but keeps only files whose extension is in `allowed`
 /// (lowercase, no leading dot). Critical JSON is always kept; `.d.ts`/`.md`/
 /// test/spec are always excluded (see `should_keep_file_with`).
+///
+/// The third return value is a per-directory asset census accumulated during
+/// the walk: directory path (project-relative, normalized) -> `AssetCounts`.
+/// Only directories containing at least one asset file appear; empty dirs are
+/// omitted. This reuses the SAME walk+ignore chain as the code-file scan so
+/// assets in ignored directories (`.git`, `node_modules`, etc.) are never
+/// counted — zero extra traversal.
 pub fn scan_files_with(
     root: &Path,
     allowed: &[impl AsRef<str>],
-) -> Result<(Vec<ScannedFile>, Option<String>), String> {
+) -> Result<(Vec<ScannedFile>, Option<String>, HashMap<String, AssetCounts>), String> {
     let mut out: Vec<ScannedFile> = Vec::new();
+    let mut asset_counts: HashMap<String, AssetCounts> = HashMap::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     if let Ok(c) = root.canonicalize() {
         visited.insert(c);
@@ -909,12 +1027,36 @@ pub fn scan_files_with(
 
             let name = entry.file_name();
             let name = name.to_string_lossy().to_string();
-            if !should_keep_file_with(&name, allowed) {
-                continue;
-            }
 
             // HONOR .oracleignore + .gitignore for files too.
             if ignored_by_chain(&chain, &path, false) {
+                continue;
+            }
+
+            // ASSET CENSUS: count non-code static asset files (images / fonts /
+            // media) per directory, piggybacking on the same walk + ignore chain.
+            // Asset files are NOT kept as buildings (no code extension), but we
+            // count them here while we have the extension and directory context.
+            // No content read, no allocation beyond the counter.
+            {
+                let lower_name = name.to_ascii_lowercase();
+                if let Some(ext) = lower_name.rsplit('.').next() {
+                    if lower_name.contains('.') {
+                        if let Some(family) = categorize_asset_ext(ext) {
+                            let dir_key = rel_path(root, &dir);
+                            let counts = asset_counts.entry(dir_key).or_default();
+                            match family {
+                                "images" => counts.images += 1,
+                                "fonts" => counts.fonts += 1,
+                                "media" => counts.media += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !should_keep_file_with(&name, allowed) {
                 continue;
             }
 
@@ -992,7 +1134,7 @@ pub fn scan_files_with(
         None
     };
 
-    Ok((out, note))
+    Ok((out, note, asset_counts))
 }
 
 /// Project-relative, forward-slash, normalized key.
@@ -3970,6 +4112,7 @@ pub fn layout(
     meta: &mut MetaStore,
     features: &[Feature],
     roads: &[Road],
+    asset_census_by_district: &BTreeMap<String, AssetCensus>,
 ) -> Vec<District> {
     // --- Feature registry lookups (deterministic; BTreeMap-sorted). ---
     // id -> Feature, plus a building count per feature id.
@@ -4458,6 +4601,10 @@ pub fn layout(
             ),
         };
 
+        let asset_census = asset_census_by_district
+            .get(district_id.as_str())
+            .cloned();
+
         districts.push(District {
             district_id,
             name,
@@ -4465,6 +4612,7 @@ pub fn layout(
             bounds,
             wall_style: feature_wall_style(kind).to_string(),
             color_accent,
+            asset_census,
         });
     }
 
@@ -7240,11 +7388,11 @@ const y = await import('@/lazy');
 
         let mut b1 = make();
         let mut m1 = MetaStore::default();
-        layout(&mut b1, &mut m1, &features, &[]);
+        layout(&mut b1, &mut m1, &features, &[], &BTreeMap::new());
 
         let mut b2 = make();
         let mut m2 = MetaStore::default();
-        layout(&mut b2, &mut m2, &features, &[]);
+        layout(&mut b2, &mut m2, &features, &[], &BTreeMap::new());
 
         // Determinism: same inputs -> identical coords.
         for (x, y) in b1.iter().zip(b2.iter()) {
@@ -7277,7 +7425,7 @@ const y = await import('@/lazy');
             mk_building_feat("2", "src/oracle/b.ts", purpose::TEMPLE, 50, "commons"), // kalybe 2x3
         ];
         let mut meta = MetaStore::default();
-        layout(&mut b1, &mut meta, &features, &[]);
+        layout(&mut b1, &mut meta, &features, &[], &BTreeMap::new());
         assert_no_footprint_overlap(&b1);
 
         // Second scan: both grow to mnemeion (4x6). If we blindly reused the
@@ -7287,7 +7435,7 @@ const y = await import('@/lazy');
             mk_building_feat("1", "src/oracle/a.ts", purpose::TEMPLE, 5000, "commons"), // mnemeion 4x6
             mk_building_feat("2", "src/oracle/b.ts", purpose::TEMPLE, 5000, "commons"), // mnemeion 4x6
         ];
-        layout(&mut b2, &mut meta, &features, &[]);
+        layout(&mut b2, &mut meta, &features, &[], &BTreeMap::new());
         assert_no_footprint_overlap(&b2);
     }
 
@@ -7299,7 +7447,7 @@ const y = await import('@/lazy');
             mk_building_feat("2", "src/a.ts", purpose::HOUSE, 50, "commons"),
         ];
         let mut meta = MetaStore::default();
-        layout(&mut buildings, &mut meta, &features, &[]);
+        layout(&mut buildings, &mut meta, &features, &[], &BTreeMap::new());
         let original = buildings[0].coords;
         assert_eq!(meta.coords("src/main.tsx"), Some(original));
 
@@ -7311,7 +7459,7 @@ const y = await import('@/lazy');
             mk_building_feat("1", "src/main.tsx", purpose::WORKSHOP, 50, "commons"),
             mk_building_feat("2", "src/a.ts", purpose::HOUSE, 50, "commons"),
         ];
-        layout(&mut buildings2, &mut meta, &features, &[]);
+        layout(&mut buildings2, &mut meta, &features, &[], &BTreeMap::new());
         assert_eq!(
             buildings2[0].coords, original,
             "persisted coords must survive re-scan"
@@ -7335,7 +7483,7 @@ const y = await import('@/lazy');
             mk_building_feat("5", "src/d.ts", purpose::HOUSE, 50, "commons"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut buildings, &mut meta, &features, &[]);
+        let districts = layout(&mut buildings, &mut meta, &features, &[], &BTreeMap::new());
         assert!(!districts.is_empty());
 
         // All buildings are in the commons district.
@@ -7394,7 +7542,7 @@ const y = await import('@/lazy');
         // The deterministic, correct F3 layout for these inputs (fresh meta).
         let mut fresh = make();
         let mut fresh_meta = MetaStore::default();
-        layout(&mut fresh, &mut fresh_meta, &features, &[]);
+        layout(&mut fresh, &mut fresh_meta, &features, &[], &BTreeMap::new());
         let fresh_coord = |id: &str| fresh.iter().find(|x| x.file_id == id).unwrap().coords;
 
         // Simulate a PRE-F3 meta: persist STALE, non-overlapping coords for every
@@ -7421,7 +7569,7 @@ const y = await import('@/lazy');
         // FIRST F3 scan over the pre-F3 meta: must IGNORE the stale coords and
         // repack to the correct feature-grouped layout.
         let mut b1 = make();
-        layout(&mut b1, &mut meta, &features, &[]);
+        layout(&mut b1, &mut meta, &features, &[], &BTreeMap::new());
 
         // The stale coords were NOT reused: every building matches the fresh
         // repack, not its stale persisted position.
@@ -7457,7 +7605,7 @@ const y = await import('@/lazy');
         // SECOND scan with the now-F3 meta resumes the stable reuse fast path:
         // coords are unchanged (no district move).
         let mut b2 = make();
-        layout(&mut b2, &mut meta, &features, &[]);
+        layout(&mut b2, &mut meta, &features, &[], &BTreeMap::new());
         for b in &b2 {
             assert_eq!(
                 b.coords,
@@ -7487,7 +7635,7 @@ const y = await import('@/lazy');
         // Lay out fresh -> persists coords, district ids, and the CURRENT version.
         let mut meta = MetaStore::default();
         let mut b0 = make();
-        layout(&mut b0, &mut meta, &features, &[]);
+        layout(&mut b0, &mut meta, &features, &[], &BTreeMap::new());
         assert_eq!(meta.layout_version(), LAYOUT_ALGO_VERSION, "version stamped");
         let laid = |id: &str| b0.iter().find(|x| x.file_id == id).unwrap().coords;
 
@@ -7507,7 +7655,7 @@ const y = await import('@/lazy');
 
         // Re-layout: stale-version -> MUST repack to the fresh coords, NOT reuse.
         let mut b1 = make();
-        layout(&mut b1, &mut meta, &features, &[]);
+        layout(&mut b1, &mut meta, &features, &[], &BTreeMap::new());
         for b in &b1 {
             assert_eq!(
                 b.coords,
@@ -7526,7 +7674,7 @@ const y = await import('@/lazy');
 
         // CURRENT version now -> the fast path reuses the (coherent) coords.
         let mut b2 = make();
-        layout(&mut b2, &mut meta, &features, &[]);
+        layout(&mut b2, &mut meta, &features, &[], &BTreeMap::new());
         for b in &b2 {
             assert_eq!(b.coords, laid(&b.file_id), "current version reuses coords");
         }
@@ -7547,7 +7695,7 @@ const y = await import('@/lazy');
         // Compute the canonical fresh layout.
         let mut fresh = make();
         let mut fresh_meta = MetaStore::default();
-        layout(&mut fresh, &mut fresh_meta, &features, &[]);
+        layout(&mut fresh, &mut fresh_meta, &features, &[], &BTreeMap::new());
         let fresh_coord = |id: &str| fresh.iter().find(|x| x.file_id == id).unwrap().coords;
 
         // Build a meta with coherent district ids + non-overlapping STALE coords
@@ -7560,7 +7708,7 @@ const y = await import('@/lazy');
         assert_eq!(meta.layout_version(), 0, "old meta defaults to 0");
 
         let mut b1 = make();
-        layout(&mut b1, &mut meta, &features, &[]);
+        layout(&mut b1, &mut meta, &features, &[], &BTreeMap::new());
         for b in &b1 {
             assert_eq!(
                 b.coords,
@@ -7605,7 +7753,7 @@ const y = await import('@/lazy');
             mk_building_feat("6", "src/billing/conf.toml", purpose::TOWER, 100, "billing"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
 
         // Same feature -> same district; different feature -> different district.
         let dist = |id: &str| {
@@ -7654,7 +7802,7 @@ const y = await import('@/lazy');
             mk_building_feat("g3", "src/big/c.ts", purpose::HOUSE, 50, "big"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
 
         let get = |id: &str| b.iter().find(|x| x.file_id == id).unwrap();
         // Folded into commons spatially...
@@ -7692,7 +7840,7 @@ const y = await import('@/lazy');
             mk_building_feat("g3", "src/big/c.ts", purpose::HOUSE, 50, "big"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
 
         let get = |id: &str| b.iter().find(|x| x.file_id == id).unwrap();
         assert_eq!(get("t1").district_id, "commons");
@@ -7716,7 +7864,7 @@ const y = await import('@/lazy');
             mk_building("2", "src/y.ts", purpose::HOUSE, 50),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
         assert_eq!(b[0].district_id, "commons");
         assert_eq!(b[1].district_id, "commons");
         assert_no_orphan_districts(&b, &districts);
@@ -7745,7 +7893,7 @@ const y = await import('@/lazy');
 
         let mut a = make();
         let mut ma = MetaStore::default();
-        let da = layout(&mut a, &mut ma, &features, &[]);
+        let da = layout(&mut a, &mut ma, &features, &[], &BTreeMap::new());
 
         // Reverse the input order AND reverse the feature-registry order: the
         // output must be byte-identical (sorted internally).
@@ -7754,7 +7902,7 @@ const y = await import('@/lazy');
         let mut feat_rev = features.clone();
         feat_rev.reverse();
         let mut mb = MetaStore::default();
-        let db = layout(&mut bvec, &mut mb, &feat_rev, &[]);
+        let db = layout(&mut bvec, &mut mb, &feat_rev, &[], &BTreeMap::new());
 
         // Same coords + district per file_id, regardless of input order.
         for x in &a {
@@ -7797,7 +7945,7 @@ const y = await import('@/lazy');
             mk_building_feat("s3", "src/small/c.ts", purpose::HOUSE, 50, "small"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
 
         // Commons district straddles the origin (bounds contain (0,0)) — it is
         // anchored at the world centre (ring 0).
@@ -7852,7 +8000,7 @@ const y = await import('@/lazy');
             mk_building_feat("b2", "src/beta/b.ts", purpose::HOUSE, 100, "beta"),
             mk_building_feat("b3", "src/beta/c.ts", purpose::HOUSE, 100, "beta"),
         ];
-        let districts1 = layout(&mut b1, &mut meta, &features, &[]);
+        let districts1 = layout(&mut b1, &mut meta, &features, &[], &BTreeMap::new());
         assert_no_orphan_districts(&b1, &districts1);
         let coord_of =
             |bs: &[Building], id: &str| bs.iter().find(|x| x.file_id == id).unwrap().coords;
@@ -7872,7 +8020,7 @@ const y = await import('@/lazy');
             mk_building_feat("b2", "src/beta/b.ts", purpose::HOUSE, 100, "beta"),
             mk_building_feat("b3", "src/beta/c.ts", purpose::HOUSE, 100, "beta"),
         ];
-        let districts2 = layout(&mut b2, &mut meta, &features, &[]);
+        let districts2 = layout(&mut b2, &mut meta, &features, &[], &BTreeMap::new());
 
         // a1 now lives in beta's district, not alpha's.
         assert!(coord_of(&b2, "a1").x.is_finite());
@@ -7892,7 +8040,7 @@ const y = await import('@/lazy');
             x.coords = Coords::new(0.0, 0.0);
         }
         let mut meta3 = MetaStore::default();
-        layout(&mut b3, &mut meta3, &features, &[]);
+        layout(&mut b3, &mut meta3, &features, &[], &BTreeMap::new());
         for x in &b2 {
             let y = b3.iter().find(|z| z.file_id == x.file_id).unwrap();
             assert_eq!(x.coords, y.coords, "repack must be deterministic");
@@ -8001,7 +8149,7 @@ const y = await import('@/lazy');
             mk_import_road("d1", "d3", 5),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &roads);
+        let districts = layout(&mut b, &mut meta, &features, &roads, &BTreeMap::new());
         let order: Vec<&str> = districts.iter().map(|d| d.district_id.as_str()).collect();
         let pos = |id: &str| order.iter().position(|x| *x == id).unwrap();
         // commons first; a and b (coupled) BEFORE c (intra-district roads ignored).
@@ -8028,7 +8176,7 @@ const y = await import('@/lazy');
             mk_building_feat("x3", "src/x/c.ts", purpose::HOUSE, 50, "x"),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
         assert_eq!(
             districts.first().map(|d| d.district_id.as_str()),
             Some("commons"),
@@ -8077,7 +8225,7 @@ const y = await import('@/lazy');
             mk_import_road("a1", "b2", 5),
         ];
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &roads);
+        let districts = layout(&mut b, &mut meta, &features, &roads, &BTreeMap::new());
 
         let ca = district_centre(&districts, "a");
         let cb = district_centre(&districts, "b");
@@ -8146,7 +8294,7 @@ const y = await import('@/lazy');
         ];
         let mut meta = MetaStore::default();
         // No roads at all.
-        let districts = layout(&mut b, &mut meta, &features, &[]);
+        let districts = layout(&mut b, &mut meta, &features, &[], &BTreeMap::new());
         // All four districts emitted.
         let mut ids: Vec<&str> = districts.iter().map(|d| d.district_id.as_str()).collect();
         ids.sort_unstable();
@@ -8185,10 +8333,10 @@ const y = await import('@/lazy');
 
         let mut b1 = make();
         let mut m1 = MetaStore::default();
-        let d1 = layout(&mut b1, &mut m1, &features, &roads);
+        let d1 = layout(&mut b1, &mut m1, &features, &roads, &BTreeMap::new());
         let mut b2 = make();
         let mut m2 = MetaStore::default();
-        let d2 = layout(&mut b2, &mut m2, &features, &roads);
+        let d2 = layout(&mut b2, &mut m2, &features, &roads, &BTreeMap::new());
         for (x, y) in b1.iter().zip(b2.iter()) {
             assert_eq!(x.coords, y.coords, "coords must be deterministic");
         }
@@ -8252,7 +8400,7 @@ const y = await import('@/lazy');
             emit("a1", "m1", a_weight, "a");
             emit("r1", "m1", 256, "r");
             let mut meta = MetaStore::default();
-            let districts = layout(&mut b, &mut meta, &features, &roads);
+            let districts = layout(&mut b, &mut meta, &features, &roads, &BTreeMap::new());
             districts.iter().map(|d| d.district_id.clone()).collect()
         };
 
@@ -8475,7 +8623,7 @@ import { cdn } from 'https://cdn.example.com/x';
         t.file(".idea/workspace.ts", "x;\n"); // excluded (editor metadata)
         t.file(".vscode/settings.ts", "x;\n"); // excluded (editor metadata)
 
-        let (files, note) = scan_files(&t.root).unwrap();
+        let (files, note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
         assert!(paths.contains("src/main.tsx"));
@@ -8603,7 +8751,7 @@ import { cdn } from 'https://cdn.example.com/x';
         // Real user source OUTSIDE the env must survive.
         t.file("proj/src/app.py", "def main():\n    return 1\n");
 
-        let (files, note) = scan_files(&t.root).unwrap();
+        let (files, note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
         assert!(
@@ -8635,7 +8783,7 @@ import { cdn } from 'https://cdn.example.com/x';
         // __pycache__ bytecode (kept dirs are walked, but .pyc isn't a kept ext).
         t.file("proj/pkg/__pycache__/app.cpython-312.pyc", "\x00\x01");
 
-        let (files, note) = scan_files(&t.root).unwrap();
+        let (files, note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
         // The CORE invariant: the subtree was NOT pruned as a vendored env. The
@@ -8682,7 +8830,7 @@ import { cdn } from 'https://cdn.example.com/x';
         t.file("vendored/x.py", "x = 1\n");
         t.file("src/y.py", "y = 2\n");
 
-        let (files, _note) = scan_files(&t.root).unwrap();
+        let (files, _note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
         assert!(paths.contains("src/y.py"), "non-ignored source must be kept");
@@ -8700,7 +8848,7 @@ import { cdn } from 'https://cdn.example.com/x';
         t.file("src/a.gen.ts", "x;\n"); // file-glob ignore
         t.file("src/b.ts", "x;\n"); // kept
 
-        let (files, _note) = scan_files(&t.root).unwrap();
+        let (files, _note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
         assert!(paths.contains("src/b.ts"));
@@ -8723,7 +8871,7 @@ import { cdn } from 'https://cdn.example.com/x';
         t.file("pkg/keep.ts", "x;\n"); // kept
         t.file("local/elsewhere.ts", "x;\n"); // a sibling `local/` NOT under pkg -> kept
 
-        let (files, _note) = scan_files(&t.root).unwrap();
+        let (files, _note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
         assert!(paths.contains("pkg/keep.ts"));
@@ -8742,7 +8890,7 @@ import { cdn } from 'https://cdn.example.com/x';
         let big = "a".repeat((MAX_FILE_BYTES as usize) + 10);
         t.file("src/big.ts", &big);
 
-        let (files, note) = scan_files(&t.root).unwrap();
+        let (files, note, _asset_dirs) = scan_files(&t.root).unwrap();
         let paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
         assert!(paths.contains("src/small.ts"));
         assert!(!paths.contains("src/big.ts"));
@@ -11625,11 +11773,11 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
 
         let mut b1 = buildings_a;
         let mut m1 = MetaStore::default();
-        let d1 = layout(&mut b1, &mut m1, &features, &roads);
+        let d1 = layout(&mut b1, &mut m1, &features, &roads, &BTreeMap::new());
 
         let mut b2 = buildings_b;
         let mut m2 = MetaStore::default();
-        let d2 = layout(&mut b2, &mut m2, &features, &roads);
+        let d2 = layout(&mut b2, &mut m2, &features, &roads, &BTreeMap::new());
 
         for (x, y) in b1.iter().zip(b2.iter()) {
             assert_eq!(x.coords, y.coords, "coords must be deterministic");
@@ -11649,7 +11797,7 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         let (buildings, features, roads) = make_compaction_city();
         let mut b = buildings;
         let mut meta = MetaStore::default();
-        let districts = layout(&mut b, &mut meta, &features, &roads);
+        let districts = layout(&mut b, &mut meta, &features, &roads, &BTreeMap::new());
 
         // Rebuild placed boxes from district bounds.
         let boxes: Vec<(f64, f64, f64, f64)> = districts
@@ -11683,7 +11831,7 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         // New placement — extract district-level boxes from emitted Districts.
         let mut b_new = buildings.clone();
         let mut m_new = MetaStore::default();
-        let d_new = layout(&mut b_new, &mut m_new, &features, &roads);
+        let d_new = layout(&mut b_new, &mut m_new, &features, &roads, &BTreeMap::new());
         let new_boxes: Vec<(f64, f64, f64, f64)> = d_new
             .iter()
             .map(|d| (d.bounds.x, d.bounds.y, d.bounds.w, d.bounds.h))
@@ -11694,7 +11842,7 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         // district_ids, then extract packed boxes and feed to old algo.
         let mut b_old = buildings.clone();
         let mut m_old = MetaStore::default();
-        layout(&mut b_old, &mut m_old, &features, &roads);
+        layout(&mut b_old, &mut m_old, &features, &roads, &BTreeMap::new());
         let packed = packed_boxes_for(&b_old, &features, &roads);
 
         // Reconstruct coupling from roads for old_layout_boxes.
@@ -11770,7 +11918,7 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         // New placement.
         let mut b_new = buildings.clone();
         let mut m_new = MetaStore::default();
-        let d_new = layout(&mut b_new, &mut m_new, &features, &[]);
+        let d_new = layout(&mut b_new, &mut m_new, &features, &[], &BTreeMap::new());
         let new_min_x = d_new.iter().map(|d| d.bounds.x).fold(f64::MAX, f64::min);
         let new_max_x = d_new
             .iter()
@@ -11830,6 +11978,171 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
 
         assert_no_district_box_overlap(&d_new);
         assert_no_footprint_overlap(&b_new);
+    }
+
+    // ---- ASSET CENSUS (B3a) --------------------------------------------------
+
+    /// A fixture tree with two feature folders: one containing 3 png + 2 woff2 +
+    /// 1 mp3 assets, another with none. The first district gets the right census;
+    /// the second gets `None`.
+    #[test]
+    fn asset_census_counts_per_district_and_omits_none() {
+        let tree = TempTree::new("asset_census_basic");
+        // Need >= MIN_DISTRICT_BUILDINGS (3) code files per feature to avoid
+        // the fold-to-commons merge.
+        tree.file("alpha/a.ts", "export const x = 1;");
+        tree.file("alpha/b.ts", "export const x = 2;");
+        tree.file("alpha/c.ts", "export const x = 3;");
+        tree.file("beta/a.ts", "export const y = 1;");
+        tree.file("beta/b.ts", "export const y = 2;");
+        tree.file("beta/c.ts", "export const y = 3;");
+        // Assets in alpha.
+        tree.file("alpha/logo.png", "");
+        tree.file("alpha/icon.png", "");
+        tree.file("alpha/bg.png", "");
+        tree.file("alpha/head.woff2", "");
+        tree.file("alpha/body.woff2", "");
+        tree.file("alpha/beep.mp3", "");
+        // No assets in beta.
+
+        let city = generate_city_state(&tree.root).expect("scan succeeds");
+
+        // Find the alpha and beta districts.
+        let alpha = city
+            .districts
+            .iter()
+            .find(|d| d.name.to_lowercase().contains("alpha"))
+            .expect("alpha district exists");
+        let beta = city
+            .districts
+            .iter()
+            .find(|d| d.name.to_lowercase().contains("beta"))
+            .expect("beta district exists");
+
+        // Alpha has 3 images + 2 fonts + 1 media = 6 assets.
+        let census = alpha.asset_census.expect("alpha has assets");
+        assert_eq!(census.images, 3, "alpha images");
+        assert_eq!(census.fonts, 2, "alpha fonts");
+        assert_eq!(census.media, 1, "alpha media");
+        assert_eq!(census.total(), 6, "alpha total");
+
+        // Beta has zero assets -> None.
+        assert!(beta.asset_census.is_none(), "beta has no assets -> None");
+    }
+
+    /// Assets in an ignored directory (node_modules) are NOT counted.
+    #[test]
+    fn asset_census_ignores_excluded_dirs() {
+        let tree = TempTree::new("asset_census_ignored");
+        tree.file("src/app.ts", "export const a = 1;");
+        // Assets in an excluded dir should NOT be counted.
+        tree.file("node_modules/pkg/logo.png", "");
+        tree.file("node_modules/pkg/font.woff2", "");
+        // Assets in a .gitignored dir should NOT be counted.
+        tree.file(".gitignore", "build/\n");
+        tree.file("build/out.png", "");
+
+        let city = generate_city_state(&tree.root).expect("scan succeeds");
+
+        // The src district should have NO assets (node_modules and build excluded).
+        for d in &city.districts {
+            if let Some(c) = &d.asset_census {
+                assert_eq!(c.total(), 0, "no assets should come from excluded dirs");
+            }
+        }
+    }
+
+    /// An asset in a subfolder of a feature folder counts toward that feature's
+    /// district (attribution walks UP to the nearest code-bearing ancestor).
+    #[test]
+    fn asset_in_subfolder_attributed_to_parent_feature() {
+        let tree = TempTree::new("asset_census_subfolder");
+        // Enough code files to avoid min-size fold into commons.
+        tree.file("myfeature/a.ts", "export const v = 1;");
+        tree.file("myfeature/b.ts", "export const v = 2;");
+        tree.file("myfeature/c.ts", "export const v = 3;");
+        // Asset in a deeper subfolder of the same feature.
+        tree.file("myfeature/assets/deep/icon.png", "");
+        tree.file("myfeature/assets/sound.mp3", "");
+
+        let city = generate_city_state(&tree.root).expect("scan succeeds");
+
+        let feature_dist = city
+            .districts
+            .iter()
+            .find(|d| d.name.to_lowercase().contains("myfeature"))
+            .expect("myfeature district exists");
+
+        let census = feature_dist.asset_census.expect("has assets");
+        assert_eq!(census.images, 1, "deep icon attributed to parent");
+        assert_eq!(census.media, 1, "deep sound attributed to parent");
+        assert_eq!(census.total(), 2);
+    }
+
+    /// Wire format: serialized district JSON has camelCase `assetCensus` when
+    /// present and omits it entirely when None.
+    #[test]
+    fn asset_census_wire_camel_case_and_sparse() {
+        let mut city = CityState::empty("wiretest", "Alpha");
+        city.districts.push(District {
+            district_id: "with-assets".into(),
+            name: "With Assets".into(),
+            district_type: "domain".into(),
+            bounds: Bounds { x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+            wall_style: "none".into(),
+            color_accent: "#aaa".into(),
+            asset_census: Some(AssetCensus { images: 5, fonts: 1, media: 2 }),
+        });
+        city.districts.push(District {
+            district_id: "no-assets".into(),
+            name: "No Assets".into(),
+            district_type: "domain".into(),
+            bounds: Bounds { x: 20.0, y: 0.0, w: 10.0, h: 10.0 },
+            wall_style: "none".into(),
+            color_accent: "#bbb".into(),
+            asset_census: None,
+        });
+
+        let json = serde_json::to_string(&city).unwrap();
+        // camelCase present on the district with assets.
+        assert!(json.contains("\"assetCensus\":{\"images\":5,\"fonts\":1,\"media\":2}"));
+        // Omitted on the district without assets.
+        let no_assets_idx = json.find("no-assets").unwrap();
+        let segment = &json[no_assets_idx..];
+        assert!(!segment.contains("assetCensus"),
+            "assetCensus must be omitted (skip_serializing_if) when None");
+
+        // Round-trip.
+        let back: CityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.districts[0].asset_census, Some(AssetCensus { images: 5, fonts: 1, media: 2 }));
+        assert_eq!(back.districts[1].asset_census, None);
+    }
+
+    /// Scan_files_with returns asset dir counts from the walk.
+    #[test]
+    fn scan_files_with_returns_asset_dir_counts() {
+        let tree = TempTree::new("asset_dir_counts");
+        tree.file("src/app.ts", "export const x = 1;");
+        tree.file("src/logo.png", "");
+        tree.file("src/icon.svg", "");
+        tree.file("src/font.woff2", "");
+        tree.file("src/song.mp3", "");
+        // Ignored.
+        tree.file("node_modules/pkg/img.png", "");
+
+        let (_files, _note, asset_dirs) =
+            scan_files_with(&tree.root, &DEFAULT_KEPT_EXTENSIONS).unwrap();
+
+        // src/ should have 2 images + 1 font + 1 media.
+        let src_key = asset_dirs.keys().find(|k| k.ends_with("src")).expect("src dir found");
+        let c = &asset_dirs[src_key];
+        assert_eq!(c.images, 2, "src images");
+        assert_eq!(c.fonts, 1, "src fonts");
+        assert_eq!(c.media, 1, "src media");
+
+        // node_modules dir should NOT appear.
+        assert!(!asset_dirs.keys().any(|k| k.contains("node_modules")),
+            "excluded dirs must not appear in asset counts");
     }
 
 }
