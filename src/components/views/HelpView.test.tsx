@@ -97,6 +97,26 @@ describe("HelpView (static help page)", () => {
     expect(requestView).toHaveBeenCalledWith("skills");
   });
 
+  it("includes the key enriched help sections", () => {
+    const ids = HELP_SECTIONS.map((s) => s.id);
+    // The planner/orchestrator, Oracle, Security & lock, Dependencies, and
+    // Acknowledgments sections are the core additions — assert they exist.
+    for (const expected of [
+      "planner",
+      "oracle",
+      "security-lock",
+      "dependencies",
+      "acknowledgments",
+    ]) {
+      expect(ids).toContain(expected);
+    }
+    // Every section must carry a human-readable title for the sticky nav.
+    for (const section of HELP_SECTIONS) {
+      expect(typeof section.title).toBe("string");
+      expect(section.title.length).toBeGreaterThan(0);
+    }
+  });
+
   it("renders an in-page nav with an anchor for every section", async () => {
     await mount();
     const nav = document.querySelector("nav");
