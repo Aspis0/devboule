@@ -1828,10 +1828,10 @@ export interface DetectedDependency {
 	category: string;
 	/** Whether the binary was found on the augmented PATH. */
 	found: boolean;
-	/** Resolved absolute path, or null when not found. */
-	path: string | null;
-	/** Best-effort `tool --version` output (first line), or null. */
-	version: string | null;
+	/** Resolved absolute path, or omitted when not found (serde skip_serializing_if). */
+	path?: string;
+	/** Best-effort `tool --version` output (first line), or omitted. */
+	version?: string;
 }
 
 const ORACLE_ERROR_KINDS: ReadonlySet<string> = new Set<OracleErrorKind>([

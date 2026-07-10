@@ -682,16 +682,6 @@ fn spawn_pi_session_inner(
     // sidecar's event channel never drifts from Rust's session slot.
     cmd.env("DEVBOULE_SESSION_ID", session_id);
 
-    // Task #2b: surface the Pigeon-enabled feature flag to the sidecar so it can
-    // skip prompt classification (which Rust never answers) when Pigeon is off.
-    // Reuse `read_pigeon_enabled` (the same reader backing `get_pigeon_enabled`)
-    // rather than duplicating the config.json lookup — default false on error.
-    let pigeon_enabled = crate::backend::pigeon_service::read_pigeon_enabled(app);
-    cmd.env(
-        "DEVBOULE_PIGEON_ENABLED",
-        if pigeon_enabled { "true" } else { "false" },
-    );
-
     if let Some(role) = role {
         // A/B: name the session so the sidecar stamps the correct `_devboule`
         // metadata and the frontend console subscribes to the right channel.
@@ -1673,7 +1663,11 @@ impl EventMapper {
                 }
             }
             "thinking_start" => {
-                // Thinking precedes text in a message; nothing to flush.
+                // FIX C: a new thinking block may arrive without a preceding
+                // `thinking_end` (out-of-order / dropped end). Finalize the previous
+                // live block so it isn't overwritten by the new one — symmetry with
+                // `text_start`, which also flushes both blocks.
+                self.flush_thinking_block();
             }
             "thinking_delta" => {
                 if let Some(ref d) = delta.delta {
@@ -1732,6 +1726,11 @@ impl EventMapper {
         self.apply_devboule_role(event);
         match event.event_type.as_str() {
             "agent_start" => {
+                // FIX C: finalize any still-live thinking entry from a prior turn /
+                // abnormal reconnect (orphan guard) BEFORE resetting the
+                // accumulators. flush_thinking_block() uses live_thinking_idx to
+                // finalize the row, so it MUST run before we clear that index below.
+                self.flush_thinking_block();
                 // #4: clear the tool_names cache so it doesn't leak entries
                 // across agent runs in the same session.
                 self.tool_names.clear();
@@ -3700,6 +3699,99 @@ mod tests {
             Some(ConsoleEntry::Thinking { text, .. }) => assert_eq!(text, "AB"),
             other => panic!("expected Thinking, got {other:?}"),
         }
+        assert!(mapper.accumulated_thinking.is_empty());
+        assert!(mapper.live_thinking_idx.is_none());
+    }
+
+    #[test]
+    fn live_thinking_orphan_finalized_by_agent_start() {
+        // FIX C: a live thinking entry that is still open when a new turn begins
+        // (abnormal reconnect / out-of-order / dropped thinking_end) must be
+        // finalized as its OWN entry before the turn resets — not orphaned, not
+        // merged into the next turn's thinking. Drive:
+        //   thinking_delta("A") -> [agent_start: flush THEN reset] ->
+        //   thinking_delta("B") -> thinking_end
+        // and assert: exactly two Thinking entries ("A" then "B"), no orphan, no
+        // stale-merge ("A" must NOT bleed into "B").
+        //
+        // `handle_event` isn't directly callable in a unit test (it needs an
+        // `AppHandle` for the snapshot), so we replay the exact body of the
+        // `agent_start` arm: flush_thinking_block() FIRST (finalizes the open
+        // row via live_thinking_idx), THEN clear the accumulators/index. The
+        // flush-before-clear ordering is precisely the FIX C guarantee.
+        let mut mapper = EventMapper::new("orphan-finalize");
+
+        // Open turn 1 thinking and stream "A".
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_start".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("A".to_string()),
+            content_index: Some(0),
+        });
+        assert_eq!(mapper.live_thinking_idx, Some(0));
+        assert_eq!(mapper.accumulated_thinking, "A");
+        assert!(matches!(mapper.entries[0], ConsoleEntry::Thinking { .. }));
+
+        // New turn begins WITHOUT a preceding thinking_end -> replicate the
+        // `agent_start` arm (FIX C: flush open thinking BEFORE clearing index).
+        mapper.flush_thinking_block();
+        mapper.accumulated_text.clear();
+        mapper.accumulated_thinking.clear();
+        mapper.live_thinking_idx = None;
+        mapper.active_content_index = None;
+        // Exactly one Thinking entry so far, finalized with "A".
+        let count_after_start = mapper
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ConsoleEntry::Thinking { .. }))
+            .count();
+        assert_eq!(count_after_start, 1, "open 'A' finalized, no orphan");
+        match mapper.entries[0] {
+            ConsoleEntry::Thinking { ref text, .. } => assert_eq!(text, "A"),
+            ref other => panic!("expected finalized 'A' Thinking, got {other:?}"),
+        }
+        assert!(
+            mapper.live_thinking_idx.is_none(),
+            "tracker cleared by agent_start flush"
+        );
+        assert!(
+            mapper.accumulated_thinking.is_empty(),
+            "thinking accumulator cleared by agent_start"
+        );
+
+        // Stream "B" in the new turn.
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_delta".to_string(),
+            delta: Some("B".to_string()),
+            content_index: Some(0),
+        });
+        assert_eq!(mapper.live_thinking_idx, Some(1), "'B' pushed as a new entry");
+
+        // Finalize "B".
+        mapper.apply_message_delta(&AssistantMessageEvent {
+            delta_type: "thinking_end".to_string(),
+            delta: None,
+            content_index: Some(0),
+        });
+
+        // Exactly two Thinking entries: "A" (its own row) and "B" (its own row).
+        // No merge, no duplicate, no orphan.
+        let final_thinking: Vec<String> = mapper
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ConsoleEntry::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            final_thinking, vec!["A".to_string(), "B".to_string()],
+            "'A' and 'B' finalized as separate entries, no stale-merge"
+        );
         assert!(mapper.accumulated_thinking.is_empty());
         assert!(mapper.live_thinking_idx.is_none());
     }

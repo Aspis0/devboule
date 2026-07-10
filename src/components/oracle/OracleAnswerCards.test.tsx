@@ -118,6 +118,27 @@ describe("AskErrorCard — indexing awareness", () => {
     );
   });
 
+  it("shows the HARD error (not indexing) when the watcher is down despite a job being set", () => {
+    // TASK #10 — a job may linger in the status, but if the watcher is not
+    // running the server is genuinely down; STALE indexing must not hide it.
+    ctx.oracleIndexStatus = {
+      ...indexingStatus(),
+      watcherRunning: false,
+    };
+    const container = renderCard(transientError);
+    // No calm indexing copy.
+    expect(container.textContent).not.toContain(
+      "Oracle is indexing your workspace",
+    );
+    expect(container.textContent).not.toContain(
+      "It's building the search index right now",
+    );
+    // The hard "unavailable" error MUST be shown (server is really down).
+    expect(container.textContent).toContain("Oracle server is not responding");
+    // The "Run doctor" recovery button MUST be present.
+    expect(container.textContent).toContain("Run doctor");
+  });
+
   it("mentions indexing-in-progress for indexEmpty while indexing", () => {
     ctx.oracleIndexStatus = indexingStatus();
     const container = renderCard({

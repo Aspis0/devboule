@@ -19,6 +19,7 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { AppProvider, useAppContext } from "./context/AppContext";
 import { isViewAllowedForRole } from "./utils/roles";
 import { useAgentAttentionStore } from "./store/agentAttentionStore";
+import { useDesignVisible } from "./store/labsSettings";
 import { startAttentionWatcher } from "./components/agents/attentionNotifier";
 import { startAttentionPoller } from "./components/agents/attentionPoller";
 import { invokeBackendCommand } from "./context/AppContext";
@@ -77,6 +78,11 @@ function AppShell() {
     roleStatus,
     unlock,
   } = useAppContext();
+
+  // Whether the Labs "Design" nav entry is visible. Used here to reconcile an
+  // already-open Design view if the user flips the toggle OFF (the Sidebar drops
+  // the nav entry but activeView would still be "design").
+  const designVisible = useDesignVisible();
 
   // Escape hatch so a collaborator can never get wedged in onboarding (audit H1):
   // if their grant keeps failing, they can continue into the app with the default
@@ -212,9 +218,11 @@ function AppShell() {
           </ErrorBoundary>
         );
       case "design":
-        // Lazy design module in its own error boundary + Suspense (mirrors Polis):
-        // a throw inside the canvas/DOMPurify shows a contained fallback rather
-        // than blanking the app.
+        // If the Labs "Design" toggle is OFF, the nav entry is gone but the
+        // user may still have `activeView === "design"`. Don't keep rendering
+        // the (now orphaned) Design module — fall back to the default view so
+        // the screen stays reachable and consistent with the sidebar.
+        if (!designVisible) return <ProjectsView />;
         return (
           <ErrorBoundary label="Design">
             <Suspense fallback={<ViewFallback />}>

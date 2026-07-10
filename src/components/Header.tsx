@@ -18,6 +18,7 @@ import { attentionSessions } from "./agents/agentFleet";
 import { stripSpoofChars } from "./agents/attentionNotifier";
 import { combineBadgeCount } from "./headerBadge";
 import { useNow } from "../hooks/useNow";
+import { ALPHA_HIDDEN_PROVIDERS } from "../lib/alphaHidden";
 
 const viewTitles: Record<string, string> = {
   providers: "Providers & Cloud",
@@ -86,6 +87,16 @@ function viewForRisk(flag: RiskFlag): string {
   return "providers";
 }
 
+// The provider a risk resolves to (the deep-link tab, e.g. "scaleway" from
+// "providers#scaleway"). Used to drop risk flags whose target provider is in
+// ALPHA_HIDDEN_PROVIDERS so a hidden-tab risk can't inflate the badge nor
+// deep-link to a tab that no longer exists.
+function riskTargetProvider(flag: RiskFlag): string {
+  const target = viewForRisk(flag);
+  const hash = target.indexOf("#");
+  return hash === -1 ? "" : target.slice(hash + 1);
+}
+
 // Compact "how long ago" label for an agent's needsUser.since timestamp. Returns
 // "" for a missing/unparsable value so the caller can omit the age.
 function formatSinceAge(since: string | null | undefined, nowMs: number): string {
@@ -121,8 +132,18 @@ export function Header() {
   const cleanQuery = query.trim().toLowerCase();
   const risks = cloudSnapshot?.risks ?? [];
   // Risk flags are advisory warnings with stable ids — a user may dismiss them.
+  // A risk whose target provider is hidden by ALPHA_HIDDEN_PROVIDERS is also
+  // dropped: it would otherwise deep-link to a tab that no longer exists.
   const dismissed = useDismissedRisks();
-  const visibleRisks = risks.filter((r) => !dismissed.has(r.id));
+  const visibleRisks = useMemo(
+    () =>
+      risks.filter(
+        (r) =>
+          !dismissed.has(r.id) &&
+          !ALPHA_HIDDEN_PROVIDERS.has(riskTargetProvider(r)),
+      ),
+    [risks, dismissed],
+  );
   const riskCount = visibleRisks.length;
 
   // Agents needing the human. Fed by the existing agent-live-state pollers via

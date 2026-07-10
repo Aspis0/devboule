@@ -11,9 +11,6 @@
  *   DEVBOULE_PI_MODEL     — model id (e.g. "tencent/hy3:free", "qwen2.5-coder:7b")
  *   DEVBOULE_PI_BASE_URL  — custom base URL for local endpoints (optional; if set,
  *                            a temp models.json is written with a custom provider)
- *   DEVBOULE_PIGEON_ENABLED — Pigeon feature flag (Task #2b). "1"/"true"/"yes"/
- *                            "on" ⇒ classification path on; anything else (incl.
- *                            unset/"0"/"false"/"no"/"off") ⇒ OFF (default).
  *   OPENAI_API_KEY        — for openai provider (set by Rust for local omlx/ollama)
  *   OPENROUTER_API_KEY    — for openrouter provider (set by Rust for cloud backend)
  *   ANTHROPIC_API_KEY     — for anthropic provider (NOT used; Claude blocked per #10)
@@ -155,23 +152,6 @@ function createJsonlReader(stream, onLine) {
 let pendingClassification = null;
 
 /**
- * Task #2b: read the Pigeon-enabled flag set by the Rust backend at spawn time.
- * Tolerant truthy parse — unset/empty/`0`/`false`/`no`/`off` ⇒ false;
- * `1`/`true`/`yes`/`on` ⇒ true. DEFAULT OFF (Pigeon routing is not implemented
- * Rust-side), so ANY value that isn't an explicit opt-in keeps classification
- * disabled and prompts run through `session.prompt` immediately.
- */
-export function pigeonEnabled() {
-	const raw = process.env.DEVBOULE_PIGEON_ENABLED;
-	if (raw == null) return false;
-	const v = String(raw).trim().toLowerCase();
-	if (v === "" || v === "0" || v === "false" || v === "no" || v === "off") return false;
-	if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
-	// Unknown value ⇒ default OFF (safe). Do NOT treat arbitrary strings as on.
-	return false;
-}
-
-/**
  * Emit a `classify_prompt` request to the Rust sidecar and await its `classified`
  * response (delivered on our stdin). Resolves with { tier, provider, model, path }.
  */
@@ -211,9 +191,10 @@ async function applyPigeonRouting(session, modelRegistry, classification) {
 	console.error(
 		`[pi-sidecar] Pigeon: tier=${tier} provider=${provider} model=${model} path=${classification.path}`,
 	);
-	// Task #2b: never crash on a null/undefined classification target. When the
-	// Rust side doesn't implement `classify_prompt`/`classified`, classification
-	// resolves to { provider: null, model: null } — keep the session model.
+	// Defensive null-guard: keep the session model if the classification target is
+	// null/undefined (e.g. the 5s timeout-fallback default where provider/model are
+	// null, or a classification that resolved no routing target). Harmless in the
+	// normal Rust-answered path, and protects against deref/setModel crashes.
 	if (!provider || !model) {
 		console.error(
 			"[pi-sidecar] Pigeon: no routing target, keeping session model",
@@ -245,22 +226,6 @@ async function applyPigeonRouting(session, modelRegistry, classification) {
  * or apply the tier→model routing and run the turn in pi.
  */
 async function handlePromptCommand(cmd, session, modelRegistry) {
-	// Task #2b: Pigeon classification is meaningless when Pigeon is disabled
-	// (the Rust side never implements `classify_prompt`/`classified`). Skip the
-	// 5s classification stall and `applyPigeonRouting` null-deref entirely; run
-	// the turn through the session model directly.
-	if (!pigeonEnabled()) {
-		console.error("[pi-sidecar] Pigeon disabled — running prompt without classification");
-		await session.prompt(cmd.message, {
-			streamingBehavior: cmd.streamingBehavior,
-		});
-		emit({
-			type: "response",
-			command: "prompt",
-			success: true,
-		});
-		return;
-	}
 	const classification = await requestClassification(cmd.message);
 	// Phase 2: AgentPath routing only. Full multi-tier model switching
 	// (vault-aware tier resolution) deferred to Phase 3 — the spawn-time minimal
@@ -269,9 +234,6 @@ async function handlePromptCommand(cmd, session, modelRegistry) {
 		`[pi-sidecar] Pigeon routing: path=${classification.path}, model switching deferred (Phase 3)`,
 	);
 	if (classification.path === "terminal") {
-		// NOTE: this branch is only reachable when Pigeon is ON. With Pigeon OFF we
-		// early-return above; and in Rust `terminal` is a Phase-3 TODO stub, so the
-		// `redirect_to_claude` path is not yet wired end-to-end (no current regress).
 		// Route to the legacy Claude-terminal subprocess (decision #10): skip
 		// session.prompt() and let Rust handle the redirect.
 		emit({ type: "redirect_to_claude", message: cmd.message });

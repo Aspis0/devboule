@@ -21,6 +21,15 @@ export function LockedScreen({
   const helloUnavailable = desktopRuntimeAvailable && helloAvailable === false;
   const unlockDisabled = isLoading || unlockRetryBlocked || !desktopRuntimeAvailable || helloUnavailable;
 
+  // Platform-correct "protected by" footer. macOS uses Touch ID; Windows uses
+  // Windows Hello with the PIN/face/fingerprint qualifier it lost in the earlier
+  // footer simplification. Keep using the shared isAppleHost()/authMethodLabel so
+  // the label stays the single source of truth.
+  const isApple = isAppleHost();
+  const protectionCopy = isApple
+    ? `Protected by ${authMethodLabel(isApple)}`
+    : `Protected by ${authMethodLabel(isApple)} — PIN, face, or fingerprint`;
+
   function unlockButtonLabel(): string {
     if (isLoading) return "Waiting for device authentication...";
     if (unlockRetryBlocked) return "Retry in a moment";
@@ -77,7 +86,7 @@ export function LockedScreen({
         )}
 
         <p className="text-[11px] text-cream-400 mt-4">
-          Protected by {authMethodLabel(isAppleHost())}
+          {protectionCopy}
         </p>
       </div>
     </div>

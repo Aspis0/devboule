@@ -773,12 +773,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   const refreshOracleIndexStatus = useCallback(async () => {
-    const requestEpoch = authEpochRef.current;
-    const status = await invokeBackendCommand<OracleIndexStatus>(
-      "get_oracle_index_status",
-    );
-    if (requestEpoch !== authEpochRef.current) return;
-    setOracleIndexStatus(status);
+    try {
+      const requestEpoch = authEpochRef.current;
+      const status = await invokeBackendCommand<OracleIndexStatus>(
+        "get_oracle_index_status",
+      );
+      if (requestEpoch !== authEpochRef.current) return;
+      setOracleIndexStatus(status);
+    } catch {
+      // A failed fetch means the server is unreachable — a stale "indexing"
+      // status must NOT survive an outage and mask a genuinely-down Oracle.
+      setOracleIndexStatus(null);
+    }
   }, []);
 
   const syncOracleTextChunks = useCallback(async () => {

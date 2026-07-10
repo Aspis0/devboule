@@ -118,8 +118,8 @@ export function AskErrorCard({
   // state — NOT actually down. Use it to soften transient-availability errors.
   const { oracleIndexStatus } = useAppContext();
   const isIndexing =
-    !!oracleIndexStatus?.job ||
-    (oracleIndexStatus?.index?.pendingFiles ?? 0) > 0;
+    oracleIndexStatus?.watcherRunning === true &&
+    (!!oracleIndexStatus?.job || (oracleIndexStatus?.index?.pendingFiles ?? 0) > 0);
 
   const transientAvailability =
     kind === "serverUnavailable" ||
