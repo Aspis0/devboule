@@ -292,6 +292,27 @@ export const defaultAtlasLoader: AtlasLoader = async (url) => {
 };
 
 /**
+ * Release every manifest-named asset from PIXI.Assets' module-level cache.
+ * Call ONLY after all sprites/fills referencing them are destroyed (the
+ * teardown contract in the module header): Assets caches Texture objects
+ * across app instances, and a destroyed WebGL context leaves cache hits with
+ * dead GPU backings on the next mount. Fire-and-forget: unload failures cost
+ * memory, not correctness.
+ */
+export function unloadPolisSpriteAssets(manifest: SpriteManifest = SPRITE_MANIFEST): void {
+  const urls = [
+    ...Object.values(manifest.atlases),
+    ...Object.values(manifest.singles ?? {}),
+  ];
+  if (urls.length === 0) return;
+  void import("pixi.js")
+    .then(({ Assets }) => Promise.allSettled(urls.map((u) => Assets.unload(u))))
+    .catch(() => {
+      /* cache cleanup is best-effort */
+    });
+}
+
+/**
  * Production single-PNG loader. Flips the texture source to wrap-repeat —
  * singles exist exclusively to be tiled/filled, and the pipeline guarantees
  * pow2 dimensions (repeat requires them on WebGL1-class fallbacks).

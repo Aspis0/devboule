@@ -197,6 +197,9 @@ export function drawProps(
 ): { graphics: (Graphics | Container)[]; propCount: number } {
   const chunks: (Graphics | Container)[] = [];
   let g = new Graphics();
+  // Draw ops in the CURRENT Graphics chunk only — sprite trees bypass `g`
+  // (they're standalone children), so counting them here would rotate
+  // under-filled (or empty) Graphics chunks: wasted draw calls.
   let chunkCount = 0;
   let placed = 0;
 
@@ -255,12 +258,12 @@ export function drawProps(
           sprite.position.set(cx, cy + 6);
           const s = rng.range(0.85, 1.1);
           sprite.scale.set(s, s);
-          chunks.push(sprite);
+          chunks.push(sprite); // NOT in `g` — doesn't advance chunkCount
         } else {
           drawOliveCluster(g, cx, cy, rng);
+          chunkCount++;
         }
         placed++;
-        chunkCount++;
       }
     }
   }

@@ -30,6 +30,7 @@ import {
   defaultTextureLoader,
   loadPolisSprites,
   spritesDisabled,
+  unloadPolisSpriteAssets,
   type SpriteBank,
 } from "./spriteAssets";
 import {
@@ -251,6 +252,14 @@ export async function createPolis(
       // Viewport may already be detached by app.destroy; ignore.
     }
     app.destroy(true, { children: true, texture: true });
+    // A3/A4 — release the sprite art from PIXI.Assets' module-level cache.
+    // Ordering is the documented contract (spriteAssets.ts): sprite nodes are
+    // already destroyed above, so unloading can't yank textures from live
+    // sprites. WITHOUT this, a remount gets cache-hit Texture objects whose
+    // GPU backing died with this app's context ⇒ black fills. Safe here
+    // because Polis mounts one instance at a time; fire-and-forget (unload is
+    // async and a failed unload only costs memory, never correctness).
+    unloadPolisSpriteAssets();
   };
 
   return {
