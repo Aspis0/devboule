@@ -239,8 +239,8 @@ export function LabsView() {
         />
         <FeatureToggleCard
           title="Pigeon"
-          subtitle="Async agent mailbox"
-          description="Persistent mailbox that lets agents hand off tasks across model load/unload. Optional; off by default."
+          subtitle="Async mailbox + auto model routing"
+          description="When ON: agents hand off tasks via a persistent mailbox AND prompts are auto-classified into tiers to pick a model. When OFF (default): each agent runs on its configured model, no classification. Applies on app restart."
           switchLabel="Toggle Pigeon"
           getCommand="get_pigeon_enabled"
           setCommand="set_pigeon_enabled"

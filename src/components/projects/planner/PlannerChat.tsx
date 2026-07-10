@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import type { KeyboardEvent } from "react";
 import { Send, RotateCcw } from "lucide-react";
 import type { PlannerMessage } from "./plannerModel";
@@ -55,7 +55,12 @@ export function PlannerChat({
 	onOrchestratorChange,
 }: PlannerChatProps) {
 	const [value, setValue] = useState("");
+	const [resetting, setResetting] = useState(false);
 	const slash = useSlashCommands();
+
+	useEffect(() => {
+		setResetting(false);
+	}, [banner]);
 
 	const send = () => {
 		const trimmed = value.trim();
@@ -298,11 +303,16 @@ export function PlannerChat({
 						<button
 							type="button"
 							data-testid="planner-banner-restart"
-							onClick={() => onResetChat?.()}
-							style={{ flex: "none", cursor: "pointer", border: "1px solid #D9B673", background: "#F3E4C4", color: "#7A5A20", fontSize: 11, fontWeight: 600, borderRadius: 6, padding: "4px 10px", display: "flex", alignItems: "center", gap: 5 }}
+							disabled={resetting}
+							onClick={() => {
+								if (resetting) return;
+								setResetting(true);
+								onResetChat?.();
+							}}
+							style={{ flex: "none", cursor: resetting ? "default" : "pointer", opacity: resetting ? 0.55 : 1, border: "1px solid #D9B673", background: "#F3E4C4", color: "#7A5A20", fontSize: 11, fontWeight: 600, borderRadius: 6, padding: "4px 10px", display: "flex", alignItems: "center", gap: 5 }}
 						>
 							<RotateCcw size={11} />
-							Restart orchestrator
+							{resetting ? "Restarting…" : "Restart orchestrator"}
 						</button>
 					) : null}
 				</div>
