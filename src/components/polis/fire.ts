@@ -220,9 +220,18 @@ function bakeFlameBandFromArt(
   container.addChild(sp);
   for (const frameTex of art) {
     sp.texture = frameTex;
-    frames.push(
-      renderer.generateTexture({ target: container, resolution: 1, antialias: false }),
-    );
+    const baked = renderer.generateTexture({
+      target: container,
+      resolution: 1,
+      antialias: false,
+    });
+    // MAX-RECALL fix — the source is PIXEL ART: under the default linear
+    // filter, magnification at high zoom (MAX_ZOOM 3) smears the chunky
+    // texels into mush. Nearest keeps the crunch; the procedural bands stay
+    // linear (smooth vector shapes benefit from it). Guarded: unit tests
+    // bake through a stub renderer whose textures have no source.
+    if (baked.source) baked.source.scaleMode = "nearest";
+    frames.push(baked);
   }
   sp.destroy(); // texture stays owned by the bank
   container.destroy({ children: false });

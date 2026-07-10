@@ -2802,6 +2802,12 @@ export class PolisRenderer {
     // per building because the animated parts are positioned from its geometry,
     // but the HEAVY static body Graphics is captured to a SHARED texture and
     // destroyed (by the atlas on a miss, by us on a hit) so it is never retained.
+    // MAX-RECALL fix — re-assert THIS renderer's bank before the kit draws:
+    // kitBank is module-level and an overlapping instance (StrictMode double
+    // mount / fast view switch) may have overwritten or nulled it between our
+    // constructor and this lazily-triggered bake. Without this, later-baked
+    // variants silently lose their textures for the rest of the session.
+    setKitSpriteBank(this.spriteBank);
     const built = buildBuildingParts(b, profile, scale);
 
     // Was the (purpose, level) variant already cached? If so the atlas will NOT
@@ -3123,6 +3129,9 @@ export class PolisRenderer {
 
     // Build the new kit parts (for fresh anims/pennant/metrics) + the new variant
     // texture. Same atlas hit/miss disposal contract as createBuildingNode.
+    // Re-assert this renderer's bank first (see createBuildingNode: kitBank is
+    // module-level and an overlapping instance may have clobbered it).
+    setKitSpriteBank(this.spriteBank);
     const built = buildBuildingParts(b, profile, scale);
     const wasCached = this.buildingAtlas.has(b.purpose, level);
     let variant: import("./buildingAtlas").BuildingVariant;

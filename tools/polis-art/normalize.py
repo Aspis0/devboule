@@ -172,6 +172,10 @@ def process_job(job: dict, repo_root: Path, staged: Path) -> None:
     }
     if crop is not None:
         meta["crop"] = [int(v) for v in crop]
+    if recolor:
+        # Recorded so provenance tooling can derive `modified` (share-alike
+        # accounting needs to know a shipped file differs from the source).
+        meta["recolor"] = {k: float(recolor[k]) for k in ("hue", "sat", "val") if k in recolor}
     if foot is not None:
         meta["foot"] = list(foot)
     meta["hasBakedShadow"] = has_baked

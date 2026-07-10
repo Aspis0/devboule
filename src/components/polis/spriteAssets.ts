@@ -191,6 +191,11 @@ export async function loadPolisSprites(opts: {
   const atlasIds = Object.keys(manifest.atlases);
   const singleKeys = Object.keys(manifest.singles ?? {});
   if (atlasIds.length === 0 && singleKeys.length === 0) return null;
+  // MAX-RECALL fix — a fast unmount→remount can start this load while the
+  // previous instance's Assets.unload is still in flight; loading through
+  // that window cache-hits Textures that are mid-destruction (black fills).
+  // Wait the unload out first (no-op in the common case).
+  if (pendingUnload) await pendingUnload;
 
   const pages = new Map<string, Record<string, Texture>>();
   const textures = new Map<string, Texture>();
@@ -291,22 +296,62 @@ export const defaultAtlasLoader: AtlasLoader = async (url) => {
   return sheetTextures(await Assets.load(url), url);
 };
 
+// MAX-RECALL fix — the Assets cache is MODULE-LEVEL and shared, but Polis
+// instances can transiently OVERLAP (React StrictMode double-mount; fast
+// view switch while the async createPolis is still settling — PolisView's
+// `cancelled` + destroy() path exists exactly for that overlap). An
+// unconditional unload from the doomed instance would destroy Texture
+// objects the SURVIVING instance is actively rendering with. So the cache
+// is REFCOUNTED: createPolis retains once per instance; unload only runs
+// when the last live consumer releases. `pendingUnload` additionally closes
+// the unmount→fast-remount race: the next load AWAITS any in-flight unload
+// so it can never cache-hit a texture that is mid-destruction.
+let bankConsumers = 0;
+let pendingUnload: Promise<void> | null = null;
+
+/** One live Polis instance is (about to start) using the sprite-asset cache.
+ *  Pair every call with exactly one unloadPolisSpriteAssets(). */
+export function retainPolisSpriteAssets(): void {
+  bankConsumers++;
+}
+
+/** TEST-ONLY: reset the module refcount/unload state between tests. */
+export function resetPolisSpriteAssetsForTest(): void {
+  bankConsumers = 0;
+  pendingUnload = null;
+}
+
+/** TEST-ONLY: observable lifecycle state (consumers + whether an unload is
+ *  scheduled/in flight). Production code must never branch on this. */
+export function spriteAssetsLifecycleState(): {
+  consumers: number;
+  unloadInFlight: boolean;
+} {
+  return { consumers: bankConsumers, unloadInFlight: pendingUnload !== null };
+}
+
 /**
- * Release every manifest-named asset from PIXI.Assets' module-level cache.
- * Call ONLY after all sprites/fills referencing them are destroyed (the
- * teardown contract in the module header): Assets caches Texture objects
- * across app instances, and a destroyed WebGL context leaves cache hits with
- * dead GPU backings on the next mount. Fire-and-forget: unload failures cost
- * memory, not correctness.
+ * Release one consumer of the sprite-asset cache; when the LAST live consumer
+ * releases, every manifest-named asset is unloaded from PIXI.Assets'
+ * module-level cache. Call ONLY after all sprites/fills referencing them are
+ * destroyed (the teardown contract in the module header): Assets caches
+ * Texture objects across app instances, and a destroyed WebGL context leaves
+ * cache hits with dead GPU backings on the next mount. Fire-and-forget:
+ * unload failures cost memory, not correctness.
  */
 export function unloadPolisSpriteAssets(manifest: SpriteManifest = SPRITE_MANIFEST): void {
+  bankConsumers = Math.max(0, bankConsumers - 1);
+  if (bankConsumers > 0) return; // another live Polis still renders with these
   const urls = [
     ...Object.values(manifest.atlases),
     ...Object.values(manifest.singles ?? {}),
   ];
   if (urls.length === 0) return;
-  void import("pixi.js")
+  const prior = pendingUnload ?? Promise.resolve();
+  pendingUnload = prior
+    .then(() => import("pixi.js"))
     .then(({ Assets }) => Promise.allSettled(urls.map((u) => Assets.unload(u))))
+    .then(() => undefined)
     .catch(() => {
       /* cache cleanup is best-effort */
     });

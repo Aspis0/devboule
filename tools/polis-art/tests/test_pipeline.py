@@ -199,9 +199,20 @@ def test_oversize_sprite(tmp_path, capfd):
 # --------------------------------------------------------------------------- #
 # manifest (end-to-end)
 # --------------------------------------------------------------------------- #
-def _mini_ledger(path: Path, sources: dict):
+def _assets_for(root: Path) -> list[dict]:
+    """Per-asset ledger entries derived from the staged metas — the exact
+    derivation manifest.validate enforces (source + modified flag)."""
+    out = []
+    for mp in sorted(staged_dir(root).glob("*/*.meta.json")):
+        m = json.loads(mp.read_text())
+        out.append({"id": m["key"], "source": m["source"],
+                    "modified": manifest.derived_modified(m)})
+    return out
+
+
+def _mini_ledger(path: Path, sources: dict, assets: list | None = None):
     path.write_text(json.dumps(
-        {"version": 1, "sources": sources, "assets": []}, indent=2))
+        {"version": 1, "sources": sources, "assets": assets or []}, indent=2))
 
 
 def test_manifest_end_to_end(tmp_path):
@@ -217,7 +228,7 @@ def test_manifest_end_to_end(tmp_path):
     assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
 
     ledger = tmp_path / "ledger.json"
-    _mini_ledger(ledger, {"test-src": {"license": "CC0"}})
+    _mini_ledger(ledger, {"test-src": {"license": "CC0"}}, _assets_for(tmp_path))
 
     out_ts = tmp_path / "spriteManifest.ts"
     rc = manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
@@ -232,7 +243,7 @@ def test_manifest_end_to_end(tmp_path):
 
     # Missing source in ledger => validation failure, no output written.
     bad_ledger = tmp_path / "ledger_bad.json"
-    _mini_ledger(bad_ledger, {})
+    _mini_ledger(bad_ledger, {}, _assets_for(tmp_path))
     out_ts.unlink()
     rc2 = manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
                          "--ledger", str(bad_ledger), "--out", str(out_ts)])
@@ -358,7 +369,7 @@ def test_manifest_deterministic_rerun(tmp_path):
     atlas = tmp_path / "atlas"
     assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    _mini_ledger(ledger, {"s": {}}, _assets_for(tmp_path))
     out1 = tmp_path / "out1.ts"
     out2 = tmp_path / "out2.ts"
     assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
@@ -378,7 +389,7 @@ def test_manifest_custom_anchor_propagates(tmp_path):
     atlas = tmp_path / "atlas"
     assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    _mini_ledger(ledger, {"s": {}}, _assets_for(tmp_path))
     out = tmp_path / "out.ts"
     assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
                           "--ledger", str(ledger), "--out", str(out)]) == 0
@@ -444,7 +455,7 @@ def test_manifest_emits_singles_and_injection_idempotent(tmp_path):
     atlas = tmp_path / "atlas"
     assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps({"version": 1, "sources": {"s": {}}, "assets": []}))
+    _mini_ledger(ledger, {"s": {}}, _assets_for(tmp_path))
     out = tmp_path / "out.ts"
     assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
                           "--ledger", str(ledger), "--out", str(out)]) == 0
@@ -541,3 +552,40 @@ def test_crop_out_of_bounds_skips_job(tmp_path):
     rc = normalize.main(["--spec", str(spec), "--root", str(tmp_path)])
     assert rc == 1  # SKIP => nonzero, batch continues
     assert not (staged_dir(tmp_path) / "fx" / "fx__fire__f0.png").exists()
+
+
+# --------------------------------------------------------------------------- #
+# per-asset ledger enforcement (max-recall — share-alike accounting)
+# --------------------------------------------------------------------------- #
+def test_manifest_requires_per_asset_ledger_entry(tmp_path):
+    """A staged key without an assets[] entry (or with a drifted `modified`
+    flag) must FAIL validation — the ledger RULE is machine-enforced."""
+    in_rel = make_raw(tmp_path, "o.png", 12, (0, 128, 0, 255))
+    spec = tmp_path / "spec.json"
+    write_spec(spec, [{"key": "prop:o:v0", "source": "s", "in": in_rel,
+                       "scale": 1.5}])  # scaled => modified=True
+    assert normalize.main(["--spec", str(spec), "--root", str(tmp_path)]) == 0
+    staged = staged_dir(tmp_path)
+    atlas = tmp_path / "atlas"
+    assert pack_atlas.main(["--staged", str(staged), "--out", str(atlas)]) == 0
+    out = tmp_path / "out.ts"
+
+    # (a) empty assets[] => missing per-asset entry => rc 1, no output.
+    ledger = tmp_path / "ledger.json"
+    _mini_ledger(ledger, {"s": {}})
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out)]) == 1
+    assert not out.exists()
+
+    # (b) entry present but modified flag drifted => rc 1.
+    _mini_ledger(ledger, {"s": {}},
+                 [{"id": "prop:o:v0", "source": "s", "modified": False}])
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out)]) == 1
+
+    # (c) correct entry => rc 0.
+    _mini_ledger(ledger, {"s": {}},
+                 [{"id": "prop:o:v0", "source": "s", "modified": True}])
+    assert manifest.main(["--staged", str(staged), "--atlas-dir", str(atlas),
+                          "--ledger", str(ledger), "--out", str(out)]) == 0
+    assert out.exists()

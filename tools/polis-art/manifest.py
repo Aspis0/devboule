@@ -181,11 +181,26 @@ def check_variant_families(metas: list[dict], warnings: list[str]) -> None:
             )
 
 
+def derived_modified(meta: dict) -> bool:
+    """A shipped file is 'modified' vs its source when the pipeline scaled,
+    cropped or recolored it — the flag share-alike accounting keys off."""
+    return (
+        bool(meta.get("crop"))
+        or bool(meta.get("recolor"))
+        or float(meta.get("scale", 1.0)) != 1.0
+    )
+
+
 def validate(loaded: list[tuple[dict, str]], page_files: dict[str, str],
              frame_pages: dict[str, set], atlas_dir: Path,
-             ledger_sources: dict, singles_groups: set[str]) -> tuple[list[str], list[str]]:
+             ledger_sources: dict, singles_groups: set[str],
+             ledger_assets: dict | None = None) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
+    # None (param omitted) skips per-asset checks — the historical test-suite
+    # call shape. A real ledger ALWAYS provides the dict (possibly empty, in
+    # which case every staged key errors: the RULE in the ledger header).
+    assets = ledger_assets
 
     seen_keys: dict[str, int] = {}
     for m, name in loaded:
@@ -218,6 +233,29 @@ def validate(loaded: list[tuple[dict, str]], page_files: dict[str, str],
             errors.append(
                 f"source '{source}' for key '{key}' not listed in ledger"
             )
+        # Per-asset provenance (the ledger header's RULE): every shipped key
+        # needs an assets[] entry whose source matches and whose `modified`
+        # flag agrees with what the pipeline actually did (share-alike
+        # accounting is meaningless if the flag can drift from reality).
+        if assets is not None:
+            entry = assets.get(key)
+            mod = derived_modified(m)
+            if entry is None:
+                errors.append(
+                    f"key '{key}' has no per-asset ledger entry (assets[])"
+                )
+            else:
+                if entry.get("source") != source:
+                    errors.append(
+                        f"ledger asset '{key}' source "
+                        f"'{entry.get('source')}' != meta source '{source}'"
+                    )
+                if bool(entry.get("modified")) != mod:
+                    errors.append(
+                        f"ledger asset '{key}' modified="
+                        f"{bool(entry.get('modified'))} but pipeline derived "
+                        f"{mod} (scale/crop/recolor)"
+                    )
         seen_keys[key] = seen_keys.get(key, 0) + 1
 
     for key, count in seen_keys.items():
@@ -330,11 +368,14 @@ def main(argv: list[str] | None = None) -> int:
     page_files, frame_pages = load_atlases(args.atlas_dir)
     ledger = json.loads(args.ledger.read_text(encoding="utf-8"))
     ledger_sources = ledger.get("sources", {})
+    ledger_assets = {
+        a.get("id"): a for a in ledger.get("assets", []) if a.get("id")
+    }
     singles_groups = {g.strip() for g in args.singles_groups.split(",")
                       if g.strip()}
 
     errors, warnings = validate(loaded, page_files, frame_pages, args.atlas_dir,
-                                ledger_sources, singles_groups)
+                                ledger_sources, singles_groups, ledger_assets)
     for w in warnings:
         print(f"WARNING {w}", file=sys.stderr)
     if errors:

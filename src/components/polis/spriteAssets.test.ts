@@ -319,3 +319,56 @@ describe("spritesDisabled", () => {
     expect(spritesDisabled("?sprites")).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// MAX-RECALL regression — refcounted Assets-cache lifecycle.
+//
+// Polis instances can transiently OVERLAP (StrictMode double-mount, fast view
+// switch): the doomed instance's release must NOT unload textures the
+// surviving instance still renders with; only the LAST consumer's release
+// schedules the real unload, and the next load waits any in-flight unload out.
+// ---------------------------------------------------------------------------
+import {
+  resetPolisSpriteAssetsForTest,
+  retainPolisSpriteAssets,
+  spriteAssetsLifecycleState,
+  unloadPolisSpriteAssets,
+} from "./spriteAssets";
+
+describe("sprite assets refcount lifecycle", () => {
+  const URL_MANIFEST = manifest(
+    { a: "/polis/atlas/a.json" },
+    { "prop:olive:v0": { frame: "olive0", atlas: "a" } },
+  );
+
+  it("does not unload while another live consumer holds the cache", () => {
+    resetPolisSpriteAssetsForTest();
+    retainPolisSpriteAssets();
+    retainPolisSpriteAssets(); // overlapping second instance
+    unloadPolisSpriteAssets(URL_MANIFEST); // doomed instance releases
+    expect(spriteAssetsLifecycleState()).toEqual({
+      consumers: 1,
+      unloadInFlight: false,
+    });
+    resetPolisSpriteAssetsForTest();
+  });
+
+  it("schedules the unload when the last consumer releases", () => {
+    resetPolisSpriteAssetsForTest();
+    retainPolisSpriteAssets();
+    unloadPolisSpriteAssets(URL_MANIFEST);
+    expect(spriteAssetsLifecycleState()).toEqual({
+      consumers: 0,
+      unloadInFlight: true,
+    });
+    resetPolisSpriteAssetsForTest();
+  });
+
+  it("never goes negative on extra releases", () => {
+    resetPolisSpriteAssetsForTest();
+    unloadPolisSpriteAssets(URL_MANIFEST);
+    unloadPolisSpriteAssets(URL_MANIFEST);
+    expect(spriteAssetsLifecycleState().consumers).toBe(0);
+    resetPolisSpriteAssetsForTest();
+  });
+});

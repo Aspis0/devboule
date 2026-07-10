@@ -196,6 +196,14 @@ export function drawProps(
   tallBlockers: Set<string> = occupied,
 ): { graphics: (Graphics | Container)[]; propCount: number } {
   const chunks: (Graphics | Container)[] = [];
+  // MAX-RECALL fix — tree Sprites are collected SEPARATELY and appended after
+  // every Graphics chunk: interleaving them (all on the prop-0 atlas page)
+  // between singles-textured Graphics broke the batch per tree — one draw
+  // call each. As one contiguous block the batcher merges them; being flat
+  // decoration below every tree, the ground chunks may safely all paint
+  // first. Within the block, painter's order = ascending y (a south tree
+  // must cover a north one).
+  const treeSprites: Sprite[] = [];
   let g = new Graphics();
   // Draw ops in the CURRENT Graphics chunk only — sprite trees bypass `g`
   // (they're standalone children), so counting them here would rotate
@@ -239,13 +247,19 @@ export function drawProps(
       } else if (roll < P_STALL + P_ROCK + P_OLIVE) {
         // Real tree sprite when the bank has one AND the tile sits in open
         // countryside (see TREE_CLEARANCE); otherwise the classic olive blobs.
+        // MAX-RECALL fix — the tree/cypress rolls are drawn UNCONDITIONALLY
+        // so the per-tile rng stream is identical with and without a bank:
+        // the procedural fallback cluster must not change shape based on
+        // whether the sprite load happened to win its 3s race.
+        const treeRoll = rng.float();
+        const cypressRoll = rng.float();
         let treeKey: string | null = null;
         if (
           bank &&
-          rng.float() < P_TREE_GIVEN_OLIVE &&
+          treeRoll < P_TREE_GIVEN_OLIVE &&
           hasClearance(tallBlockers, tx, ty, TREE_CLEARANCE)
         ) {
-          const family = rng.float() < P_CYPRESS ? "prop:cypress" : "prop:tree";
+          const family = cypressRoll < P_CYPRESS ? "prop:cypress" : "prop:tree";
           treeKey = bank.pickVariant(family, `${tx},${ty}`);
         }
         const texture = treeKey ? bank!.get(treeKey) : null;
@@ -258,7 +272,7 @@ export function drawProps(
           sprite.position.set(cx, cy + 6);
           const s = rng.range(0.85, 1.1);
           sprite.scale.set(s, s);
-          chunks.push(sprite); // NOT in `g` — doesn't advance chunkCount
+          treeSprites.push(sprite); // NOT in `g` — doesn't advance chunkCount
         } else {
           drawOliveCluster(g, cx, cy, rng);
           chunkCount++;
@@ -268,8 +282,10 @@ export function drawProps(
     }
   }
 
-  // Flush the last partial chunk.
+  // Flush the last partial chunk, then the tree block (see treeSprites note).
   if (chunkCount > 0) chunks.push(g);
+  treeSprites.sort((a, b) => a.position.y - b.position.y);
+  for (const s of treeSprites) chunks.push(s);
 
   return { graphics: chunks, propCount: placed };
 }

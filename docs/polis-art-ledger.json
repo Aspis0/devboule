@@ -58,5 +58,476 @@
       "lightDirection": "n/a (emissive)"
     }
   },
-  "assets": []
+  "assets": [
+    {
+      "id": "fx:fire:f0",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f1",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f2",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f3",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f4",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f5",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f6",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f7",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "fx:fire:f8",
+      "source": "oga-fire-9frame",
+      "modified": true
+    },
+    {
+      "id": "prop:cypress:v0",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:cypress:v1",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:cypress:v2",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:tree:v0",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:tree:v1",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:tree:v2",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "prop:tree:v3",
+      "source": "unknown-horizons",
+      "modified": true
+    },
+    {
+      "id": "tex:ashlar",
+      "source": "sbs-textures",
+      "modified": true
+    },
+    {
+      "id": "tex:cobble",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:dirt",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:dirtolive",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:grass",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:grassdark",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:grassdry",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:marble",
+      "source": "sbs-textures",
+      "modified": true
+    },
+    {
+      "id": "tex:plaster",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:plasterwarm",
+      "source": "sbs-textures",
+      "modified": true
+    },
+    {
+      "id": "tex:rooftile",
+      "source": "sbs-textures",
+      "modified": true
+    },
+    {
+      "id": "tex:stonegrey",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "tex:thatch",
+      "source": "sbs-textures",
+      "modified": true
+    },
+    {
+      "id": "tex:wood",
+      "source": "sbs-textures",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:0:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:0:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:0:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:0:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:135:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:135:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:135:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:135:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:180:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:180:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:180:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:180:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:225:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:225:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:225:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:225:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:270:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:270:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:270:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:270:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:315:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:315:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:315:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:315:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:45:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:45:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:45:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:45:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:90:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:90:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:90:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenf:90:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:0:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:0:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:0:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:0:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:135:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:135:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:135:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:135:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:180:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:180:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:180:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:180:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:225:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:225:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:225:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:225:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:270:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:270:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:270:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:270:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:315:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:315:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:315:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:315:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:45:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:45:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:45:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:45:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:90:f0",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:90:f1",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:90:f2",
+      "source": "unknown-horizons",
+      "modified": false
+    },
+    {
+      "id": "walk:citizenm:90:f3",
+      "source": "unknown-horizons",
+      "modified": false
+    }
+  ]
 }

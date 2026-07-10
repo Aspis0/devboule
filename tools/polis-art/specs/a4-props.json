@@ -1,11 +1,81 @@
 {
   "jobs": [
-    { "key": "prop:tree:v0", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple0/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] },
-    { "key": "prop:tree:v1", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple1/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] },
-    { "key": "prop:tree:v2", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple2/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] },
-    { "key": "prop:tree:v3", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple3/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] },
-    { "key": "prop:cypress:v0", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_tupelo0/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] },
-    { "key": "prop:cypress:v1", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_tupelo1/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] },
-    { "key": "prop:cypress:v2", "source": "unknown-horizons", "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_tupelo2/idle_full/45/0.png", "scale": 1.5, "foot": [1, 1] }
+    {
+      "key": "prop:tree:v0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple0/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    },
+    {
+      "key": "prop:tree:v1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple1/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    },
+    {
+      "key": "prop:tree:v2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple2/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    },
+    {
+      "key": "prop:tree:v3",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_maple3/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    },
+    {
+      "key": "prop:cypress:v0",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_tupelo0/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    },
+    {
+      "key": "prop:cypress:v1",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_tupelo1/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    },
+    {
+      "key": "prop:cypress:v2",
+      "source": "unknown-horizons",
+      "in": "tools/polis-art/raw/uh/content/gfx/terrain/trees/as_tupelo2/idle_full/45/0.png",
+      "scale": 1.5,
+      "foot": [
+        1,
+        1
+      ],
+      "trim": true
+    }
   ]
 }

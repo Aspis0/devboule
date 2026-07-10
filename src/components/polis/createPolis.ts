@@ -29,6 +29,7 @@ import {
   defaultAtlasLoader,
   defaultTextureLoader,
   loadPolisSprites,
+  retainPolisSpriteAssets,
   spritesDisabled,
   unloadPolisSpriteAssets,
   type SpriteBank,
@@ -143,6 +144,11 @@ export async function createPolis(
   // A3 — kick off the real-art sprite load NOW so it overlaps app.init (both
   // are network/GPU-bound). Bounded by a soft timeout: art is an enhancement,
   // never worth stalling the city mount — late/failed ⇒ null ⇒ procedural kit.
+  // MAX-RECALL fix — refcount the shared Assets cache: this instance is a
+  // live consumer from now until its destroy (or the bail below) releases.
+  // Overlapping instances (StrictMode double-mount, fast view switch) would
+  // otherwise unload textures the surviving instance still renders with.
+  retainPolisSpriteAssets();
   const spriteBankPromise: Promise<SpriteBank | null> = loadPolisSprites({
     loader: defaultAtlasLoader,
     textureLoader: defaultTextureLoader,
@@ -173,6 +179,10 @@ export async function createPolis(
   // If the component unmounted while init() was awaiting, bail cleanly.
   if (!host.isConnected) {
     app.destroy(true, { children: true });
+    // MAX-RECALL fix — release this instance's Assets-cache retain (the
+    // normal release lives in destroy(), which never runs on this path).
+    // With another live instance holding the cache this is a pure decrement.
+    unloadPolisSpriteAssets();
     throw new Error("Polis host detached before init completed.");
   }
 
@@ -252,13 +262,16 @@ export async function createPolis(
       // Viewport may already be detached by app.destroy; ignore.
     }
     app.destroy(true, { children: true, texture: true });
-    // A3/A4 — release the sprite art from PIXI.Assets' module-level cache.
-    // Ordering is the documented contract (spriteAssets.ts): sprite nodes are
-    // already destroyed above, so unloading can't yank textures from live
-    // sprites. WITHOUT this, a remount gets cache-hit Texture objects whose
-    // GPU backing died with this app's context ⇒ black fills. Safe here
-    // because Polis mounts one instance at a time; fire-and-forget (unload is
-    // async and a failed unload only costs memory, never correctness).
+    // A3/A4 — release this instance's hold on PIXI.Assets' module-level
+    // cache. Ordering is the documented contract (spriteAssets.ts): sprite
+    // nodes are already destroyed above, so unloading can't yank textures
+    // from live sprites. WITHOUT this, a remount gets cache-hit Texture
+    // objects whose GPU backing died with this app's context ⇒ black fills.
+    // REFCOUNTED (max-recall fix): with a second live instance (StrictMode
+    // double-mount / fast view switch) this only decrements — the actual
+    // unload runs when the LAST consumer releases, and the next load awaits
+    // any in-flight unload. Fire-and-forget (a failed unload only costs
+    // memory, never correctness).
     unloadPolisSpriteAssets();
   };
 
