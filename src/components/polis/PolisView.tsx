@@ -62,6 +62,15 @@ export function PolisView() {
   const [selected, setSelected] = useState<InspectSubject>(null);
   // A selected resource site (quarry/mine) — shown in the inspect sidebar.
   const [selectedResource, setSelectedResource] = useState<ResourceSite | null>(null);
+
+  /** Set the primary inspect subject (building/agent/connection/external) and
+   *  ALWAYS clear selectedResource. Every path that sets `selected` must go
+   *  through here to prevent stale resource cards from resurfacing. */
+  const selectPrimary = useCallback((subject: InspectSubject) => {
+    setSelected(subject);
+    setSelectedResource(null);
+  }, []);
+
   const [immersive, setImmersive] = useState(false);
   // Progress of the renderer's NON-BLOCKING chunked build. The backend scan
   // (`loading`) finishes before the renderer starts placing buildings in batches
@@ -183,20 +192,15 @@ export function PolisView() {
 
     void createPolis(host, {
       onSelectBuilding: (b) =>
-        setSelected(b ? { kind: "building", building: b } : null),
+        selectPrimary(b ? { kind: "building", building: b } : null),
       onSelectAgent: (a) =>
-        setSelected(a ? { kind: "agent", agent: a } : null),
-      // A trade-route porter (or its road) was clicked → surface the REAL import
-      // edge in the inspector ("<from> imports <to>"), tied to real buildings.
+        selectPrimary(a ? { kind: "agent", agent: a } : null),
       onSelectConnection: (from, to) =>
-        setSelected({ kind: "connection", from, to }),
-      // A cloud outpost ("harbour" node) was clicked → surface the REAL external
-      // service (provider/type/name/status). Inspect-only, no secret.
+        selectPrimary({ kind: "connection", from, to }),
       onSelectExternalService: (s) =>
-        setSelected(s ? { kind: "externalService", service: s } : null),
+        selectPrimary(s ? { kind: "externalService", service: s } : null),
       onSelectResource: (r) => {
         setSelectedResource(r);
-        // Selecting a resource clears any building selection and vice versa.
         if (r) setSelected(null);
       },
     })
@@ -305,15 +309,29 @@ export function PolisView() {
       }
       return prev;
     });
-    // Reconcile selectedResource: re-plan sites on the updated city and check
-    // whether the selected site still exists (district may have been removed or
-    // its census dropped below threshold). Refresh the stored object so counts
-    // stay current; clear if the site is gone.
+    // Reconcile selectedResource: check whether the selected site's district
+    // still qualifies (census ≥ threshold, bounds unchanged). Cheap guard:
+    // compare the district's census + bounds directly; only re-plan when they
+    // differ (T9 — skip expensive planResourceSites on every diff).
     setSelectedResource((prev) => {
       if (!prev) return null;
+      const district = liveCity.city.districts.find(
+        (d) => d.districtId === prev.districtId,
+      );
+      if (!district) return null; // district removed
+      const c = district.assetCensus ?? { images: 0, fonts: 0, media: 0 };
+      const total = c.images + c.fonts + c.media;
+      if (total < 8) return null; // census dropped below threshold
+      const b = district.bounds;
+      const bChanged =
+        b.x !== prev.gx || b.y !== prev.gy || // rough: bounds changed
+        c.images !== prev.census.images ||
+        c.fonts !== prev.census.fonts ||
+        c.media !== prev.census.media;
+      if (!bChanged) return prev; // unchanged — keep as-is
+      // Census or bounds changed — refresh by re-planning.
       const updatedSites = planResourceSites(liveCity.city);
-      const fresh = updatedSites.find((s) => s.id === prev.id);
-      return fresh ?? null;
+      return updatedSites.find((s) => s.id === prev.id) ?? null;
     });
   }, [ready, liveCity]);
 
@@ -330,8 +348,7 @@ export function PolisView() {
     const agent = cityState.agents.find((a) => a.agentId === wantId);
     if (agent) {
       pendingFocusAgentRef.current = null;
-      setSelected({ kind: "agent", agent });
-      setSelectedResource(null);
+      selectPrimary({ kind: "agent", agent });
       handleRef.current?.recenter();
     }
   }, [ready, cityState]);
@@ -447,6 +464,8 @@ export function PolisView() {
         }
         return prev;
       });
+      // Also clear any resource selection when a filter hides content.
+      setSelectedResource(null);
     }
   }, [ready, filterSets]);
 
@@ -525,10 +544,7 @@ export function PolisView() {
   // popup to it and tell the renderer to ring it. (Recenter is intentionally
   // omitted to avoid a jarring camera jump on every import click; the ring marks
   // the target. Use the Recenter button to refit.)
-  const selectBuilding = useCallback((b: Building) => {
-    setSelected({ kind: "building", building: b });
-    setSelectedResource(null);
-  }, []);
+
 
   // Oracle citation focus: resolve a citation's fileSource to the matching
   // Polis building (suffix-match aware), ring it in the renderer and select it.
@@ -538,17 +554,21 @@ export function PolisView() {
       if (!cityState) return;
       const building = findBuildingByCitation(cityState, fileSource);
       if (!building) return;
-      setSelected({ kind: "building", building });
+      selectPrimary({ kind: "building", building });
       handleRef.current?.recenter();
     },
-    [cityState],
+    [cityState, selectPrimary],
   );
+
+  // Select a building from the popup (import navigation) or elsewhere.
+  const selectBuilding = useCallback((b: Building) => {
+    selectPrimary({ kind: "building", building: b });
+  }, [selectPrimary]);
 
   // Select an agent (from the roster).
   const selectAgent = useCallback((a: Agent) => {
-    setSelected({ kind: "agent", agent: a });
-    setSelectedResource(null);
-  }, []);
+    selectPrimary({ kind: "agent", agent: a });
+  }, [selectPrimary]);
 
   const buildings = cityState?.buildings ?? [];
   const agents = cityState?.agents ?? [];
@@ -900,7 +920,7 @@ export function PolisView() {
         <InspectSidebar
           subject={selected ?? (selectedResource ? { kind: "resource", site: selectedResource } : null)}
           city={cityState}
-          onClose={() => { setSelected(null); setSelectedResource(null); }}
+          onClose={() => selectPrimary(null)}
           onSelectBuilding={selectBuilding}
         />
 

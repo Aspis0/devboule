@@ -539,10 +539,12 @@ pub(crate) fn generate_city_state_with_metrics(
             if fid.is_empty() || fid == COMMONS_FEATURE_ID {
                 return COMMONS_FEATURE_ID.to_string();
             }
-            let n = f1_result
-                .by_path
-                .values()
-                .filter(|a| a.feature_id == fid)
+            // Count from the canonical buildings (post-overlay feature_ids)
+            // rather than from f1_result (pre-overlay raw ids) so merged
+            // features count correctly.
+            let n = buildings
+                .iter()
+                .filter(|b| b.feature_id == fid)
                 .count();
             if n < MIN_DISTRICT_BUILDINGS {
                 COMMONS_FEATURE_ID.to_string()
@@ -1028,16 +1030,17 @@ pub fn scan_files_with(
             let name = entry.file_name();
             let name = name.to_string_lossy().to_string();
 
-            // HONOR .oracleignore + .gitignore for files too.
-            if ignored_by_chain(&chain, &path, false) {
-                continue;
-            }
-
             // ASSET CENSUS: count non-code static asset files (images / fonts /
-            // media) per directory, piggybacking on the same walk + ignore chain.
-            // Asset files are NOT kept as buildings (no code extension), but we
-            // count them here while we have the extension and directory context.
-            // No content read, no allocation beyond the counter.
+            // media) per directory, piggybacking on the same walk.
+            //
+            // IMPORTANT: this runs BEFORE the file-level ignore-chain check
+            // because `.oracleignore` patterns (e.g. `*.png`, `*.svg`) are
+            // intended to exclude assets from the Oracle *content indexer*,
+            // NOT from the Polis asset *census*.  The census only needs to
+            // COUNT files — it never reads content — so oracleignored assets
+            // must still be tallied.  Directory-level ignores (EXCLUDED_DIRS,
+            // directory-style gitignore patterns) already prevent descending
+            // into truly excluded dirs (`node_modules`, `dist`, `.git`, etc.).
             {
                 let lower_name = name.to_ascii_lowercase();
                 if let Some(ext) = lower_name.rsplit('.').next() {
@@ -1054,6 +1057,11 @@ pub fn scan_files_with(
                         }
                     }
                 }
+            }
+
+            // HONOR .oracleignore + .gitignore for files too.
+            if ignored_by_chain(&chain, &path, false) {
+                continue;
             }
 
             if !should_keep_file_with(&name, allowed) {
@@ -10751,6 +10759,72 @@ import { cdn } from 'https://cdn.example.com/x';
         assert_eq!(districts.len(), 1, "merged feature -> exactly one district");
     }
 
+    // R1 BLOCKER regression: after an Oracle overlay merge, the asset census must
+    // attribute to the MERGED canonical district (not commons) because
+    // target_district_for counts from canonical building feature_ids, not from
+    // the pre-overlay f1_result.
+    #[test]
+    fn asset_census_follows_overlay_merge_to_canonical_district() {
+        let tree = TempTree::new("f2_asset_census_merge");
+        let root = &tree.root;
+        // Two distinct F1 spines (alpha + beta), each with enough files to survive
+        // the min-size fold. Give beta 8 assets so the census is non-trivial.
+        for rel in [
+            "src/alpha/a1.ts",
+            "src/alpha/a2.ts",
+            "src/alpha/a3.ts",
+            "src/beta/b1.ts",
+            "src/beta/b2.ts",
+            "src/beta/b3.ts",
+        ] {
+            tree.file(rel, "export const x = 1;\n");
+        }
+        // Assets in the beta tree — should end up on the MERGED alpha district.
+        for name in [
+            "src/beta/img1.png",
+            "src/beta/img2.png",
+            "src/beta/img3.png",
+            "src/beta/img4.png",
+            "src/beta/img5.png",
+            "src/beta/img6.png",
+            "src/beta/img7.png",
+            "src/beta/img8.png",
+        ] {
+            tree.file(name, "");
+        }
+        // No assets in alpha.
+
+        // First scan establishes F1 features + meta store.
+        let _ = generate_city_state(root).unwrap();
+
+        // Persist the merge: beta -> alpha (canonical).
+        let mut meta = MetaStore::load(root);
+        let mut merges = BTreeMap::new();
+        merges.insert("beta".to_string(), "alpha".to_string());
+        meta.set_feature_merges(merges);
+        meta.save(root).unwrap();
+
+        let city = generate_city_state(root).unwrap();
+        // All 6 buildings carry canonical "alpha".
+        assert_eq!(
+            city.buildings.iter().filter(|b| b.feature_id == "alpha").count(),
+            6
+        );
+        // The alpha district must have the 8 images from beta.
+        let alpha = city
+            .districts
+            .iter()
+            .find(|d| d.district_id == "alpha")
+            .expect("alpha district exists after merge");
+        let census = alpha
+            .asset_census
+            .expect("merged alpha district must carry beta's assets");
+        assert_eq!(census.images, 8, "8 png assets from beta -> alpha district");
+        assert_eq!(census.fonts, 0);
+        assert_eq!(census.media, 0);
+        assert_eq!(census.total(), 8);
+    }
+
     #[test]
     fn applying_new_merge_repacks_affected_buildings_then_reuses() {
         // Coord-stability vs merge: a NEW merge changes the canonical feature ->
@@ -12143,6 +12217,79 @@ connected=380000 waypoints=1234567 districts=42 agents=3 json_bytes=98765432"
         // node_modules dir should NOT appear.
         assert!(!asset_dirs.keys().any(|k| k.contains("node_modules")),
             "excluded dirs must not appear in asset counts");
+    }
+
+    /// Assets that match `.oracleignore` patterns (e.g. `*.png`, `*.svg`) must
+    /// STILL be counted by the census.  `.oracleignore` excludes files from the
+    /// Oracle *content indexer*, not from the Polis asset *count*.  This
+    /// regression test mirrors the real-repo failure: `src-tauri/icons/*.png`
+    /// were pruned by the root `.oracleignore` before the census could tally
+    /// them, yielding ZERO assetCensus on every district.
+    #[test]
+    fn asset_census_counts_assets_matching_oracleignore_patterns() {
+        let tree = TempTree::new("asset_census_oracleignore");
+        // Code files in two feature dirs (enough for MIN_DISTRICT_BUILDINGS).
+        tree.file("feature_a/mod.ts", "export const a = 1;");
+        tree.file("feature_a/util.ts", "export const b = 2;");
+        tree.file("feature_a/types.ts", "export const c = 3;");
+        tree.file("feature_b/mod.ts", "export const d = 1;");
+        tree.file("feature_b/util.ts", "export const e = 2;");
+        tree.file("feature_b/types.ts", "export const f = 3;");
+        // Assets that match oracleignore patterns (the real-repo shape).
+        tree.file("feature_a/icons/logo.png", "");
+        tree.file("feature_a/icons/app.svg", "");
+        tree.file("feature_b/images/bg.png", "");
+        // .oracleignore at the root \u2014 mimics the real Aspis repo.
+        tree.file(".oracleignore", "*.png\n*.svg\n*.jpg\n");
+
+        let city = generate_city_state(&tree.root).expect("scan succeeds");
+
+        // feature_a should have 2 images (logo.png + app.svg).
+        // District name is "Feature A" (title-cased from feature_id "feature_a").
+        let a = city
+            .districts
+            .iter()
+            .find(|d| d.district_id == "feature_a")
+            .expect("feature_a district");
+        let census = a.asset_census.expect("feature_a has assets");
+        assert_eq!(census.images, 2, "oracleignored assets still counted");
+
+        // feature_b should have 1 image.
+        let b = city
+            .districts
+            .iter()
+            .find(|d| d.district_id == "feature_b")
+            .expect("feature_b district");
+        let census_b = b.asset_census.expect("feature_b has assets");
+        assert_eq!(census_b.images, 1);
+    }
+
+    /// Assets in a SIBLING directory of code files are attributed correctly.
+    /// This mirrors `src-tauri/icons/*.png` vs `src-tauri/src/*.rs` +
+    /// `src-tauri/Cargo.toml`: icons has no code, but the parent `src-tauri/`
+    /// does (via Cargo.toml).  The walk-UP must find the parent code dir.
+    #[test]
+    fn asset_in_sibling_dir_attributed_to_shared_parent() {
+        let tree = TempTree::new("asset_sibling_attribution");
+        // Code file in the shared parent dir (e.g. Cargo.toml).
+        tree.file("project/manifest.toml", "[package]\nname = \"p\"");
+        // More code in a child dir (enough for a feature district).
+        tree.file("project/src/a.ts", "export const x = 1;");
+        tree.file("project/src/b.ts", "export const y = 2;");
+        tree.file("project/src/c.ts", "export const z = 3;");
+        // Asset in a SIBLING dir of src/ \u2014 same parent, different child.
+        tree.file("project/icons/logo.png", "");
+
+        let city = generate_city_state(&tree.root).expect("scan succeeds");
+
+        // The project/ district should include the icon assets.
+        let proj = city
+            .districts
+            .iter()
+            .find(|d| d.name.to_lowercase().contains("project"))
+            .expect("project district");
+        let census = proj.asset_census.expect("project has assets");
+        assert_eq!(census.images, 1, "sibling-dir asset attributed via parent");
     }
 
 }

@@ -485,7 +485,8 @@ mod tests {
         let terrain = build_terrain(&buildings, &[road.clone()], 0);
         let nav = NavGrid::new(&buildings, &[road], &terrain);
 
-        let bridge = Tile::new(river.gx_min, cross_y);
+        let ch_at_cross = river.channels[(cross_y - t0.min_y) as usize];
+        let bridge = Tile::new(ch_at_cross, cross_y);
         assert_eq!(
             nav.terrain_at(bridge),
             Terrain::Bridge,
@@ -719,14 +720,16 @@ mod tests {
             nav.terrain_at(Tile::new(river.gx_min - 2, cross_y)),
             Terrain::Road
         );
-        // Bridge over the river.
+        // Bridge over the river (use per-row channel lookup for meander).
+        let ch_at_cross = river.channels[(cross_y - t0.min_y) as usize];
         assert_eq!(
-            nav.terrain_at(Tile::new(river.gx_min, cross_y)),
+            nav.terrain_at(Tile::new(ch_at_cross, cross_y)),
             Terrain::Bridge
         );
-        // Un-bridged river tile elsewhere.
+        // Un-bridged river tile elsewhere (per-row channel at min_y).
+        let ch_at_min = river.channels[0];
         assert_eq!(
-            nav.terrain_at(Tile::new(river.gx_min, t0.min_y)),
+            nav.terrain_at(Tile::new(ch_at_min, t0.min_y)),
             Terrain::River
         );
         // Open sea.

@@ -477,6 +477,10 @@ export function buildTerrainFrame(
       const w = terrain.water[i];
       const a = accs.get(chunkKey(w.gx, w.gy));
       if (!a) continue;
+      // Early-skip: fully surrounded tiles have 0 land-facing edges.
+      // Saves diamondAt + 4 branches for internal water (common in large seas).
+      const edges = foamEdges(waterSet, w.gx, w.gy);
+      if (edges === 0) continue;
       const p = diamondAt(w.gx, w.gy);
       // Diamond winding: TOP=p[0,1] RIGHT=p[2,3] BOTTOM=p[4,5] LEFT=p[6,7]
       // gx-1 neighbor → NW edge = LEFT–TOP;  gx+1 → SE edge = RIGHT–BOTTOM
@@ -607,12 +611,18 @@ export function buildTerrainFrame(
     waterBounds = { x: gMinX, y: gMinY, width: wW, height: wH };
 
     // 6) Animation (allocation-free): opposite-drift parallax.
+    // Precompute the texture periods so the drift wraps before float32
+    // precision degrades (T7 — unbounded drift after days of runtime).
+    const basePeriodX = base.texture.width * WATER_TILE_SCALE;
+    const basePeriodY = base.texture.height * WATER_TILE_SCALE;
+    const deepPeriodX = deepLayer.texture.width * WATERDEEP_TILE_SCALE;
+    const deepPeriodY = deepLayer.texture.height * WATERDEEP_TILE_SCALE;
     waterAnim = {
       update(t: number): void {
-        base.tilePosition.x = t * 6;
-        base.tilePosition.y = t * 2.4;
-        deepLayer.tilePosition.x = -t * 3.2;
-        deepLayer.tilePosition.y = -t * 1.1;
+        base.tilePosition.x = (t * 6) % basePeriodX;
+        base.tilePosition.y = (t * 2.4) % basePeriodY;
+        deepLayer.tilePosition.x = (-t * 3.2) % deepPeriodX;
+        deepLayer.tilePosition.y = (-t * 1.1) % deepPeriodY;
       },
     };
   }

@@ -16,6 +16,7 @@
 
 import type { CityState, Building } from "../../types/city";
 import { createPolis, type PolisHandle } from "./createPolis";
+import type { ResourceSite } from "./resources";
 // Bundled at build time (dev-only chunk), not fetched. Root fixture produced by
 // the backend `dump_real_city_state` test.
 import cityFixture from "../../../polis-dev-city.json";
@@ -46,6 +47,18 @@ export async function mountDevHarness(host: HTMLElement): Promise<void> {
   try {
     handle = await createPolis(host, {
       onSelectBuilding: (b) => setInfo(b),
+      onSelectResource: (site: ResourceSite | null) => {
+        const el = document.getElementById("polis-dev-info");
+        if (!el) return;
+        if (!site) { setInfo(null); return; }
+        const noun = site.kind === "quarry" ? "Quarry" : "Mine";
+        el.textContent = `${noun} of ${site.districtLabel} — ${site.census.images} images, ${site.census.fonts} fonts, ${site.census.media} media`;
+      },
+      onSelectConnection: (from: string, to: string) => {
+        const el = document.getElementById("polis-dev-info");
+        if (!el) return;
+        el.textContent = `Road: ${from} -> ${to}`;
+      },
     });
   } catch (e) {
     setStatus(

@@ -604,7 +604,7 @@ fn place_rivers(
         let mut gxs: Vec<i32> = buildings
             .iter()
             .filter(|b| b.purpose == "harbor" || b.purpose == "lighthouse")
-            .map(|b| b.coords.x.floor() as i32)
+            .map(|b| b.coords.x.round() as i32)
             .collect();
         gxs.sort_unstable();
         gxs.dedup();
@@ -952,7 +952,8 @@ mod tests {
         // The river spans the whole y-band (flows from the north edge into the
         // sea band), and its banks are classified Sand — row-aware for meander.
         let r = &t.rivers[0];
-        for gy in t.min_y..t.max_y {
+        let chan_end = t.min_y + r.channels.len() as i32;
+        for gy in t.min_y..chan_end {
             let ch = r.channels[(gy - t.min_y) as usize];
             // Both channel columns are River
             assert_eq!(
@@ -1099,7 +1100,10 @@ mod tests {
             let mut ch_run_len = 0i32;
             let mut prev_ch_val = None;
 
-            for gy in t.min_y..t.max_y {
+            // Bound by channels.len() — with n_harbours > 0, max_y may extend
+            // past the land band but channels only cover the original band.
+            let chan_end = t.min_y + r.channels.len() as i32;
+            for gy in t.min_y..chan_end {
                 let ch = r.channels[(gy - t.min_y) as usize];
 
                 // Exactly 2 river columns at this row
@@ -1180,27 +1184,39 @@ mod tests {
         let t = build_terrain(&buildings, &[], 0);
         let occ = building_tiles(&buildings);
 
+        // Compute the land min_x so the bank-tile check is in-band.
+        let land_min_x = map_extent(&buildings)
+            .map(|(mn, _, _, _)| mn.floor() as i32)
+            .unwrap_or(0);
+        let mut bank_assertions = 0u32;
         for r in &t.rivers {
-            for gy in t.min_y..t.max_y {
+            let chan_end = t.min_y + r.channels.len() as i32;
+            for gy in t.min_y..chan_end {
                 let ch = r.channels[(gy - t.min_y) as usize];
                 // Left bank
                 let left = Tile::new(ch - 1, gy);
-                if left.gx >= t.sea_x - 1 && !occ.contains(&left) {
+                if left.gx >= land_min_x && left.gx < t.sea_x && !occ.contains(&left) {
                     assert!(
                         t.sand.contains(&left),
                         "left bank tile {left:?} must be sand at gy={gy}"
                     );
+                    bank_assertions += 1;
                 }
                 // Right bank
                 let right = Tile::new(ch + 2, gy);
-                if right.gx >= t.sea_x - 1 && !occ.contains(&right) {
+                if right.gx >= land_min_x && right.gx < t.sea_x && !occ.contains(&right) {
                     assert!(
                         t.sand.contains(&right),
                         "right bank tile {right:?} must be sand at gy={gy}"
                     );
+                    bank_assertions += 1;
                 }
             }
         }
+        assert!(
+            bank_assertions > 0,
+            "the sand bank assertion must fire for at least one tile"
+        );
         // No sand tile is under a building footprint
         for s in &t.sand {
             assert!(
@@ -1412,7 +1428,8 @@ mod tests {
             );
 
             let mut prev_ch: Option<i32> = None;
-            for gy in t.min_y..t.max_y {
+            let chan_end = t.min_y + r.channels.len() as i32;
+            for gy in t.min_y..chan_end {
                 let ch_precomputed = r.channels[(gy - t.min_y) as usize];
 
                 // Exactly 2 river columns per row.

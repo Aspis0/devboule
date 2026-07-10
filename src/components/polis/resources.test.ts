@@ -4,8 +4,7 @@
 // and that sites are placed outside district bbox.
 
 import { describe, expect, it } from "vitest";
-import { planResourceSites, resourceSiteTiles } from "./resources";
-import type { CityState } from "../../types/city";
+import { planResourceSites, resourceSiteTiles, type ResourceCity } from "./resources";
 
 /** Minimal CityState fixture for testing. */
 function makeCity(overrides: Partial<CityState> = {}): CityState {
@@ -208,6 +207,55 @@ describe("planResourceSites", () => {
       expect(sites[0].gx + 3).toBeLessThanOrEqual(38);
     }
     // Even if no site fits (all 4 directions hit sea/blocked), it should not crash.
+  });
+
+  it("accepts a partial object without gridSize (no crash)", () => {
+    // T1 regression: the planner must accept ResourceCity which has no gridSize.
+    const city: ResourceCity = {
+      districts: [highCensusQuarryDistrict],
+      buildings: [],
+      roads: [],
+    };
+    const sites = planResourceSites(city);
+    expect(sites).toHaveLength(1);
+    expect(sites[0].kind).toBe("quarry");
+  });
+
+  it("plans sites in negative coordinate space", () => {
+    // Polis world coords go negative (spiral around origin).
+    const negDistrict = {
+      ...highCensusQuarryDistrict,
+      districtId: "d-neg",
+      bounds: { x: -50, y: -40, w: 6, h: 6 },
+    };
+    const city: ResourceCity = {
+      districts: [negDistrict],
+      buildings: [],
+      roads: [],
+    };
+    const sites = planResourceSites(city);
+    expect(sites).toHaveLength(1);
+    // Site must be near the district, not clamped to 0.
+    expect(sites[0].gx).toBeLessThan(0);
+  });
+
+  it("rejects candidates outside terrain y-band", () => {
+    const nearEdgeDistrict = {
+      ...highCensusQuarryDistrict,
+      districtId: "d-edge",
+      bounds: { x: 30, y: 2, w: 6, h: 6 },
+    };
+    // N midpoint would place site at y = 2 - 3 - 4 = -5, below minY=0.
+    const city: ResourceCity = {
+      districts: [nearEdgeDistrict],
+      buildings: [],
+      roads: [],
+      terrain: { seaX: 100, minY: 0, maxY: 100, rivers: [], water: [], sand: [], bridges: [] },
+    };
+    const sites = planResourceSites(city);
+    for (const s of sites) {
+      expect(s.gy).toBeGreaterThanOrEqual(0);
+    }
   });
 
   it("skips census absent (sparse wire) gracefully", () => {

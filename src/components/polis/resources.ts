@@ -9,8 +9,16 @@
 // Sprite per site + scattered prop:rock sprites (y-sorted).
 
 import { hashString } from "./rng";
-import type { CityState } from "../../types/city";
-import type { Bounds } from "../../types/city";
+import type { Bounds, TerrainData } from "../../types/city";
+
+/** Minimal structural type for the planner — avoids importing CityState
+ *  (which has gridSize, agents, etc.) so tsc catches missing fields. */
+export type ResourceCity = {
+  districts: { districtId: string; name: string; bounds: Bounds; assetCensus?: { images: number; fonts: number; media: number } }[];
+  buildings: { coords: { x: number; y: number } }[];
+  roads: { path?: { x: number; y: number }[] }[];
+  terrain?: TerrainData;
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -188,12 +196,15 @@ function sideMidpoints(
  *   margin ~4 tiles, expanding up to 3 times. First non-overlapping spot wins.
  * - Deterministic: same input → identical output.
  */
-export function planResourceSites(city: CityState): ResourceSite[] {
+export function planResourceSites(city: ResourceCity): ResourceSite[] {
   const blocked = buildBlockedTiles(city);
-  // Map extent guard: reject candidates beyond the grid or past the sea edge.
+  // Terrain band guard: reject candidates past the sea edge or outside the
+  // terrain y-band.  When terrain is absent, no edge guard is needed (the city
+  // lives in arbitrary negative-space coords — a spiral layout).
   const seaX = city.terrain?.seaX ?? Infinity;
-  const gridW = city.gridSize.w;
-  const gridH = city.gridSize.h;
+  const bandMinY = city.terrain?.minY ?? -Infinity;
+  const bandMaxY = city.terrain?.maxY ?? Infinity;
+  const hasTerrain = city.terrain != null;
   const sites: ResourceSite[] = [];
   const placedFootprints: { gx: number; gy: number; w: number; h: number }[] = [];
   const otherBounds: Bounds[] = [];
@@ -218,14 +229,14 @@ export function planResourceSites(city: CityState): ResourceSite[] {
       const candidates = sideMidpoints(district.bounds, fp.w, fp.h, margin);
 
       for (const cand of candidates) {
-        // Map extent guard: reject if any footprint tile is outside the grid or
-        // beyond the sea edge (prevents sites in the void past the coastline).
-        const outOfBounds =
-          cand.gx < 0 || cand.gy < 0 ||
-          cand.gx + fp.w > gridW || cand.gy + fp.h > gridH ||
-          cand.gx >= seaX || cand.gx + fp.w > seaX;
+        // Terrain band guard: reject if any footprint tile is past the sea
+        // edge (gx >= seaX) or outside the terrain y-band.
+        const outOfTerrainBand = hasTerrain && (
+          cand.gx >= seaX || cand.gx + fp.w > seaX ||
+          cand.gy < bandMinY || cand.gy + fp.h > bandMaxY
+        );
         if (
-          !outOfBounds &&
+          !outOfTerrainBand &&
           !footprintOverlaps(cand.gx, cand.gy, fp.w, fp.h, blocked, otherBounds, placedFootprints)
         ) {
           sites.push({

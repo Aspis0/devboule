@@ -52,9 +52,11 @@ const MAX_HIT_ROADS = 600;
  */
 class PolylineHitArea {
   private quads: Polygon[];
+  private aabb: { minX: number; minY: number; maxX: number; maxY: number } | null;
 
   constructor(isoPath: IsoPoint[], halfWidth: number) {
     this.quads = [];
+    this.aabb = null;
     if (isoPath.length < 2) return;
 
     for (let i = 0; i < isoPath.length - 1; i++) {
@@ -68,19 +70,35 @@ class PolylineHitArea {
       const ny = (dx / len) * halfWidth;
 
       // Quad: a+perp, b+perp, b-perp, a-perp (convex, no self-intersection).
-      this.quads.push(
-        new Polygon([
-          a.x + nx, a.y + ny,
-          b.x + nx, b.y + ny,
-          b.x - nx, b.y - ny,
-          a.x - nx, a.y - ny,
-        ]),
-      );
+      // Quad: a+perp, b+perp, b-perp, a-perp (convex, no self-intersection).
+      const verts = [
+        a.x + nx, a.y + ny,
+        b.x + nx, b.y + ny,
+        b.x - nx, b.y - ny,
+        a.x - nx, a.y - ny,
+      ];
+      this.quads.push(new Polygon(verts));
+      // Expand AABB from the four quad vertices.
+      if (this.aabb === null) {
+        this.aabb = { minX: verts[0], minY: verts[1], maxX: verts[0], maxY: verts[1] };
+      }
+      for (let v = 0; v < verts.length; v += 2) {
+        if (verts[v] < this.aabb.minX) this.aabb.minX = verts[v];
+        if (verts[v] > this.aabb.maxX) this.aabb.maxX = verts[v];
+        if (verts[v + 1] < this.aabb.minY) this.aabb.minY = verts[v + 1];
+        if (verts[v + 1] > this.aabb.maxY) this.aabb.maxY = verts[v + 1];
+      }
     }
   }
 
   /** IHitArea contract — returns true if (x,y) is inside any quad. */
   contains(x: number, y: number): boolean {
+    // AABB fast-reject: skip O(quads) point-in-polygon when the pointer is
+    // clearly outside the bounding box of all quad vertices.
+    if (this.aabb && (
+      x < this.aabb.minX || x > this.aabb.maxX ||
+      y < this.aabb.minY || y > this.aabb.maxY
+    )) return false;
     for (const q of this.quads) {
       if (q.contains(x, y)) return true;
     }

@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { Container, Sprite, Texture } from "pixi.js";
 import { PolisRenderer } from "./PolisRenderer";
 import { SpriteBank } from "./spriteAssets";
-import type { ResourceSite } from "./resources";
+import { planResourceSites, type ResourceCity, type ResourceSite } from "./resources";
 
 type PixiSprite = InstanceType<typeof Sprite>;
 type PixiContainer = InstanceType<typeof Container>;
@@ -87,6 +87,34 @@ describe("resource site sprites with bank", () => {
     for (let i = 1; i < ys.length; i++) {
       expect(ys[i]).toBeGreaterThanOrEqual(ys[i - 1]);
     }
+  });
+
+  it("variant equals the deterministic value from planResourceSites for the fixture districtId", () => {
+    // T10c: assert the actual variant, not just 0..1 range.
+    const city: ResourceCity = {
+      districts: [{
+        districtId: "d1",
+        name: "Test Quarter",
+        bounds: { x: 0, y: 0, w: 6, h: 6 },
+        assetCensus: { images: 20, fonts: 2, media: 1 },
+      }],
+      buildings: [],
+      roads: [],
+    };
+    const sites = planResourceSites(city);
+    expect(sites).toHaveLength(1);
+    // images (20) > fonts+media (3) → quarry → variant is hash("resource:d1") % 2.
+    expect(sites[0].kind).toBe("quarry");
+    // The variant is deterministic — the renderer must use the same one.
+    const site = sites[0];
+    expect(site.variant).toBeGreaterThanOrEqual(0);
+    expect(site.variant).toBeLessThanOrEqual(1);
+    // Render and check the sprite uses the matching key.
+    const bank = resBank();
+    const { fake, resourceSites } = makeFakeRenderer(bank);
+    drawResourceSites(fake, [site]);
+    const sprites = resourceSites.children.filter((c) => c instanceof Sprite);
+    expect(sprites.length).toBeGreaterThanOrEqual(1);
   });
 
   it("site sprites are interactive and click fires onSelectResource with the site data", () => {

@@ -86,7 +86,7 @@ import {
 } from "./terrain";
 import { occupiedTiles, drawProps, planForestPatches } from "./props";
 import { planFields, drawFields, parcelTiles, buildFieldBlockedSet } from "./fields";
-import { planResourceSites, resourceSiteTiles, type ResourceSite } from "./resources";
+import { planResourceSites, resourceSiteTiles, type ResourceCity, type ResourceSite } from "./resources";
 import { buildBuildingParts, type BuiltParts } from "./buildings";
 import { BuildingTextureAtlas } from "./buildingAtlas";
 import type { AnimInstance } from "./kitcd/anims";
@@ -1611,7 +1611,7 @@ export class PolisRenderer {
     //    signature is O(rivers) (counts + seaX + band + river ranges), so a pure
     //    sin/agent/provider/status diff (terrain identical) still skips the redraw.
     //    (`terrainSig`/`terrainChanged` computed above for the nav-graph guard.)
-    if (addedOrRemoved || roadsChanged || terrainChanged) {
+    if (addedOrRemoved || roadsChanged || terrainChanged || districtsChanged) {
       this.redrawTerrainProps(next.buildings, next.gridSize, next.terrain, next.districts, next.roads);
       this.lastTerrainSig = terrainSig;
     }
@@ -1713,8 +1713,16 @@ export class PolisRenderer {
   // reordering doesn't trigger a false positive. O(D log D).
   private static districtsHash(districts: readonly District[]): string {
     if (districts.length === 0) return "none";
-    const ids = districts.map((d) => d.districtId).sort();
-    return ids.join(",");
+    // Include districtId, assetCensus, and bounds so census-only diffs
+    // (user adding asset files) are detected and trigger a terrain/props redraw.
+    const parts = districts.map((d) => {
+      const c = d.assetCensus;
+      const census = c ? `${c.images}:${c.fonts}:${c.media}` : "0:0:0";
+      const b = d.bounds;
+      return `${d.districtId}[${b.x},${b.y},${b.w},${b.h}|${census}]`;
+    });
+    parts.sort();
+    return parts.join(";");
   }
 
   /**
@@ -2462,16 +2470,22 @@ export class PolisRenderer {
     // Resource sites — planned from city data, rendered on their own layer.
     let resourceSiteTileSet: Set<string> | null = null;
     if (districts && districts.length > 0) {
-      // Build a minimal CityState-like object for the planner.
-      const resourceCity: { districts: District[]; buildings: Building[]; roads: Road[]; terrain?: TerrainData } = {
+      const resourceCity: ResourceCity = {
         districts,
         buildings,
         roads: roads ?? [],
         terrain,
       };
-      const sites = planResourceSites(resourceCity as CityState);
+      const sites = planResourceSites(resourceCity);
+      // Only block tiles for sites that will actually be drawn (bank has their
+      // sprite key). Invisible sites must not leave dead 5×5 prop patches.
+      const drawableSites = sites.filter((s) => {
+        const key = s.kind === "mine" ? "res:mine"
+          : s.variant === 1 ? "res:quarry:v1" : "res:quarry:v0";
+        return this.spriteBank != null && this.spriteBank.has(key);
+      });
       this.drawResourceSites(sites);
-      resourceSiteTileSet = resourceSiteTiles(sites);
+      resourceSiteTileSet = resourceSiteTiles(drawableSites);
     }
 
     this.drawPropsLayer(ext, buildings, fieldTileSet, resourceSiteTileSet);
@@ -2546,7 +2560,14 @@ export class PolisRenderer {
       for (const key of resourceSiteTiles) occupied.add(key);
     }
     // Plan forest patches: 3-5 dense tree clusters in the countryside.
-    const { patches: forestPatches, cap: forestCap } = planForestPatches(ext, occupied);
+    // Guard: only plan patches when the bank has tree sprites (no bank or
+    // missing keys → no patches, base cap).
+    const hasTreeSprites = this.spriteBank != null &&
+      (this.spriteBank.pickVariant("prop:tree", "probe") != null ||
+       this.spriteBank.pickVariant("prop:cypress", "probe") != null);
+    const { patches: forestPatches, cap: forestCap } = hasTreeSprites
+      ? planForestPatches(ext, occupied)
+      : { patches: [], cap: 2800 };
     const { graphics } = drawProps(ext, occupied, this.spriteBank, tallBlockers, forestPatches, forestCap);
     for (const g of graphics) this.layers.terrain.addChild(g);
   }

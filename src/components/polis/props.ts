@@ -45,6 +45,10 @@ const CHUNK_PROPS = 80;
 const P_OLIVE = 0.14;
 const P_ROCK = 0.08;
 const P_STALL = 0.02;
+// Inside a forest patch: boosted BASE olive probability so patches visually
+// read as dense woodland clusters (~0.65/lattice-tile) vs scattered singles
+// outside (~0.14). The rng draw stays unconditional so stream parity holds.
+const P_OLIVE_FOREST = 0.65;
 
 // Forest patch constants.
 const FOREST_PATCH_COUNT_MIN = 3;
@@ -319,6 +323,12 @@ export function drawProps(
         chunkCount = 0;
       }
 
+      // Pre-compute forest membership once per tile (no rng draw, no stream change).
+      const inForest = forestPatches != null && forestPatches.length > 0
+        ? inForestPatch(forestPatches, tx, ty)
+        : false;
+      const oliveThreshold = inForest ? P_OLIVE_FOREST : P_OLIVE;
+
       if (roll < P_STALL) {
         drawStall(g, cx, cy, rng);
         placed++;
@@ -327,7 +337,7 @@ export function drawProps(
         drawRocks(g, cx, cy, rng);
         placed++;
         chunkCount++;
-      } else if (roll < P_STALL + P_ROCK + P_OLIVE) {
+      } else if (roll < P_STALL + P_ROCK + oliveThreshold) {
         // Real tree sprite when the bank has one AND the tile sits in open
         // countryside (see TREE_CLEARANCE); otherwise the classic olive blobs.
         // MAX-RECALL fix — the tree/cypress rolls are drawn UNCONDITIONALLY
@@ -336,9 +346,6 @@ export function drawProps(
         // whether the sprite load happened to win its 3s race.
         const treeRoll = rng.float();
         const cypressRoll = rng.float();
-        const inForest = forestPatches != null && forestPatches.length > 0
-          ? inForestPatch(forestPatches, tx, ty)
-          : false;
         // Forest patches boost tree probability and cypress ratio — more trees,
         // more dark foliage variety inside the patch radius.
         const treeProb = inForest ? P_TREE_GIVEN_OLIVE_FOREST : P_TREE_GIVEN_OLIVE;
