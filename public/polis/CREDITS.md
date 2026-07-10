@@ -18,7 +18,7 @@ License notes:
 
 - **Screaming Brain Studios** — seamless terrain/material textures (grass,
   dirt, stone, plaster, ashlar/brick, marble, wood planks, terracotta roof
-  tiles, thatch; `tex:*`) from the "Tiny Texture Pack" series.
+  tiles, thatch, sea water + underwater caustics; `tex:*`) from the "Tiny Texture Pack" series.
   https://opengameart.org/content/tiny-texture-pack — License: **CC0**
   ("released under the CC0/Public Domain License", pack License.txt).
   Used rescaled, some desaturated/brightened to fit the palette. Thank you!

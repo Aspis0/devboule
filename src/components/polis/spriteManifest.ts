@@ -77,6 +77,8 @@ export const SPRITE_MANIFEST: SpriteManifest = {
     "tex:rooftile": "/polis/atlas/tex__rooftile.png",
     "tex:stonegrey": "/polis/atlas/tex__stonegrey.png",
     "tex:thatch": "/polis/atlas/tex__thatch.png",
+    "tex:water": "/polis/atlas/tex__water.png",
+    "tex:waterdeep": "/polis/atlas/tex__waterdeep.png",
     "tex:wood": "/polis/atlas/tex__wood.png"
   },
   entries: {

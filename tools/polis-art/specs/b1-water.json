@@ -1,0 +1,6 @@
+{
+  "jobs": [
+    { "key": "tex:water", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Elements/Elements_17-256x256.png", "trim": false, "recolor": { "sat": 0.18, "val": 1.28 } },
+    { "key": "tex:waterdeep", "source": "sbs-textures", "in": "tools/polis-art/raw/sbs-textures/256x256/Elements/Elements_19-256x256.png", "trim": false, "recolor": { "sat": 0.22, "val": 1.12 } }
+  ]
+}

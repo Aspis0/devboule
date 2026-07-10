@@ -61,8 +61,8 @@ function captureGraphicsCalls(terrain: TerrainData) {
 
 describe("buildTerrainFrame", () => {
   it("returns no chunks for undefined / empty terrain", () => {
-    expect(buildTerrainFrame(undefined, CHUNK)).toEqual([]);
-    expect(buildTerrainFrame(emptyTerrain(), CHUNK)).toEqual([]);
+    expect(buildTerrainFrame(undefined, CHUNK)).toEqual({ chunks: [], waterGroup: null, waterBounds: null, waterAnim: null });
+    expect(buildTerrainFrame(emptyTerrain(), CHUNK)).toEqual({ chunks: [], waterGroup: null, waterBounds: null, waterAnim: null });
   });
 
   it("buckets water/sand/bridge tiles into CHUNK-keyed containers", () => {
@@ -82,7 +82,7 @@ describe("buildTerrainFrame", () => {
       ],
       bridges: [{ gx: 3, gy: 1 }],
     };
-    const frame = buildTerrainFrame(terrain, CHUNK);
+    const { chunks: frame } = buildTerrainFrame(terrain, CHUNK);
     expect(frame.length).toBeGreaterThanOrEqual(2);
     const keys = frame.map((c) => c.key).sort();
     expect(keys).toContain("0,0");
@@ -102,7 +102,7 @@ describe("buildTerrainFrame", () => {
       sand: [],
       bridges: [],
     };
-    const frame = buildTerrainFrame(terrain, CHUNK);
+    const { chunks: frame } = buildTerrainFrame(terrain, CHUNK);
     const anim = frame.find((c) => c.anim)?.anim;
     expect(anim).toBeTruthy();
     expect(() => {
@@ -152,9 +152,9 @@ describe("buildTerrainFrame", () => {
       sand: [{ gx: 3, gy: 10 }],
       bridges: [{ gx: 4, gy: 10 }],
     };
-    const a = buildTerrainFrame(terrain, CHUNK).map((c) => c.key);
-    const b = buildTerrainFrame(terrain, CHUNK).map((c) => c.key);
-    expect(a).toEqual(b);
+    const { chunks: a } = buildTerrainFrame(terrain, CHUNK);
+    const { chunks: b } = buildTerrainFrame(terrain, CHUNK);
+    expect(a.map((c) => c.key)).toEqual(b.map((c) => c.key));
   });
 });
 
@@ -178,8 +178,8 @@ describe("drawBridgeDeck — stone arch bridge", () => {
         { gx: 2, gy: 3 },
       ],
     };
-    const frame = buildTerrainFrame(terrain, CHUNK);
-    const chunk = frame.find((c) => c.key === "0,0");
+    const { chunks } = buildTerrainFrame(terrain, CHUNK);
+    const chunk = chunks.find((c) => c.key === "0,0");
     expect(chunk).toBeDefined();
     expect(chunk!.container).toBeInstanceOf(Container);
   });
@@ -199,8 +199,8 @@ describe("drawBridgeDeck — stone arch bridge", () => {
         { gx: 3, gy: 2 },
       ],
     };
-    const frame = buildTerrainFrame(terrain, CHUNK);
-    const chunk = frame.find((c) => c.key === "0,0");
+    const { chunks } = buildTerrainFrame(terrain, CHUNK);
+    const chunk = chunks.find((c) => c.key === "0,0");
     expect(chunk).toBeDefined();
     expect(chunk!.container).toBeInstanceOf(Container);
   });
@@ -437,7 +437,7 @@ describe("drawBridgeDeck — stone arch bridge", () => {
       sand: [{ gx: 4, gy: 1 }],
       bridges: [{ gx: 5, gy: 3 }],
     };
-    const frame = buildTerrainFrame(terrain, CHUNK);
+    const { chunks: frame } = buildTerrainFrame(terrain, CHUNK);
     const seaChunk = frame.find((c) => c.anim);
     expect(seaChunk).toBeTruthy();
     expect(() => { seaChunk!.anim!.update(0); seaChunk!.anim!.update(1.5); }).not.toThrow();

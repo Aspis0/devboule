@@ -2403,8 +2403,30 @@ export class PolisRenderer {
   /** Build the sparse sea/river/sand/bridge frame into CHUNK-keyed containers and
    *  track their iso bounds so the cull pass can toggle them with the buildings. */
   private drawWaterFrame(terrain?: TerrainData): void {
-    const frame = buildTerrainFrame(terrain, CHUNK_SIZE);
-    for (const chunk of frame) {
+    const { chunks, waterGroup, waterBounds, waterAnim } = buildTerrainFrame(
+      terrain, CHUNK_SIZE, this.spriteBank,
+    );
+    // Water group (TilingSprites + mask) sits BELOW sand/bridge chunks so
+    // water body renders under shore diamonds and bridge decks.
+    if (waterGroup && waterBounds) {
+      this.layers.terrain.addChild(waterGroup);
+      const pad = 96; // flat pad — water has no tall geometry
+      this.terrainChunks.push({
+        chunk: {
+          key: "_water",
+          container: waterGroup,
+          anim: waterAnim,
+        },
+        bounds: new Rectangle(
+          waterBounds.x - pad,
+          waterBounds.y - pad,
+          waterBounds.width + pad * 2,
+          waterBounds.height + pad * 2,
+        ),
+        visible: true,
+      });
+    }
+    for (const chunk of chunks) {
       this.layers.terrain.addChild(chunk.container);
       this.terrainChunks.push({
         chunk,

@@ -528,6 +528,16 @@
       "id": "walk:citizenm:90:f3",
       "source": "unknown-horizons",
       "modified": false
+    },
+    {
+      "id": "tex:water",
+      "source": "sbs-textures",
+      "modified": true
+    },
+    {
+      "id": "tex:waterdeep",
+      "source": "sbs-textures",
+      "modified": true
     }
   ]
 }
