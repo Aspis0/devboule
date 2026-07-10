@@ -166,6 +166,7 @@ function makeRenderer(profileTier: "rich" | "lean" | "minimal" = "rich") {
     "syncAmbient",
     "reconcileAgents",
     "syncTradeRoutes",
+    "syncRoadHitLayer",
     "recenter",
   ]) {
     (fake as unknown as AnyRec)[m] = noop;

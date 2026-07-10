@@ -74,6 +74,7 @@ import {
   type ResolvedBuilding,
 } from "./censorPresence";
 import { TradeRouteLayer, TRADE_LOD_ZOOM } from "./TradeRouteLayer";
+import { RoadHitLayer } from "./RoadHitLayer";
 import { ExternalServiceLayer } from "./ExternalServiceLayer";
 import { RoadGraph } from "./roadGraph";
 import { makeWaterBlocker, makeBuildingBlocker, combineBlockers } from "./navWalkable";
@@ -458,6 +459,10 @@ export class PolisRenderer {
   // dependencies read as the busiest streets. ZOOM-IN ONLY (hidden below
   // TRADE_LOD_ZOOM) and visible-chunk-only. Rebuilt ONLY when roads change.
   private tradeRouteLayer: TradeRouteLayer;
+  // B5 — clickable inter-district roads. Hit nodes for roads whose consumer and
+  // supplier buildings live in DIFFERENT districts. Click surfaces the EXISTING
+  // connection card. Hover draws a shared overlay highlight. ZOOM-IN ONLY.
+  private roadHitLayer: RoadHitLayer;
   // Polis 5 — external cloud services ("the city meets the cloud"). Data-bound
   // procedural harbour/outpost nodes at the seaward margin, sourced ONLY from the
   // real synced provider inventory (`city.externalServices`). Pooled by serviceId,
@@ -500,6 +505,11 @@ export class PolisRenderer {
   // actually changes, so a pure sin/agent/provider diff (terrain identical) stays
   // cheap. Null until the first build.
   private lastTerrainSig: string | null = null;
+  // B5 — stable hash of the districts array. A live diff compares the incoming
+  // districts' IDs to this; when it differs, a building may have been reassigned
+  // to a different district (feature reclassify), so the inter-district road
+  // classification must be recomputed. Cheap O(D) comparison.
+  private lastDistrictsHash: string | null = null;
 
   private buildingNodes = new Map<string, BuildingNode>();
   // SPRITE-SHEET BUILDINGS — lazy per-variant texture cache. Each building on the
@@ -773,6 +783,15 @@ export class PolisRenderer {
     // the click-discipline rationale). A porter click surfaces the real import
     // connection through the renderer callback.
     this.tradeRouteLayer = new TradeRouteLayer(
+      this.layers.tradeRoutes,
+      (from, to) => {
+        this.callbacks.onSelectConnection?.(from, to);
+      },
+    );
+    // B5 — clickable inter-district roads: hit nodes on the same tradeRoutes
+    // layer (above road cobble, below buildings). A road click surfaces the
+    // EXISTING connection card (same channel as porters).
+    this.roadHitLayer = new RoadHitLayer(
       this.layers.tradeRoutes,
       (from, to) => {
         this.callbacks.onSelectConnection?.(from, to);
@@ -1078,6 +1097,10 @@ export class PolisRenderer {
         // walkability guard (no porter ever walks onto water).
         this.syncTradeRoutes(city.roads, city.terrain);
         this.debugLog("FINALIZE syncTradeRoutes done");
+        // B5 — clickable inter-district roads: rebuild hit nodes from buildings.
+        this.syncRoadHitLayer(city.roads, city.buildings);
+        this.lastDistrictsHash = PolisRenderer.districtsHash(city.districts);
+        this.debugLog("FINALIZE syncRoadHitLayer done");
         // External cloud outposts: built from the REAL synced inventory list. The
         // backend already placed them at the seaward margin (outside the grid).
         this.externalLayer.setServices(city.externalServices ?? []);
@@ -1545,6 +1568,11 @@ export class PolisRenderer {
     // must refresh the guard even though the roads are identical.
     const terrainSig = PolisRenderer.terrainSignature(next.terrain);
     const terrainChanged = terrainSig !== this.lastTerrainSig;
+    // B5 — districts changed? A building may have been reassigned to a different
+    // district (feature reclassify) without roads/buildings changing, so the
+    // inter-district road classification must be recomputed.
+    const districtsHash = PolisRenderer.districtsHash(next.districts);
+    const districtsChanged = districtsHash !== this.lastDistrictsHash;
     const graphRebuilt = roadsChanged || terrainChanged;
     if (graphRebuilt) {
       const waterBlocked = makeWaterBlocker(next.terrain);
@@ -1605,6 +1633,13 @@ export class PolisRenderer {
     // changed — a pure sin/status diff leaves the flow walking untouched. Porters
     // are derived from the road set + weights + the terrain walkability guard.
     if (graphRebuilt) this.syncTradeRoutes(next.roads, next.terrain);
+    // B5 — clickable inter-district roads: rebuild when roads/terrain/buildings/
+    // districts change. A district-only diff (feature reclassify) can flip a
+    // building's districtId without touching roads, so districtsChanged is needed.
+    if (addedOrRemoved || graphRebuilt || districtsChanged) {
+      this.syncRoadHitLayer(next.roads, next.buildings);
+      this.lastDistrictsHash = districtsHash;
+    }
 
     // 6b) External cloud outposts — reconcile against the fresh inventory list
     //     (status may flip, a resource may appear/vanish). Cheap (few services,
@@ -1674,6 +1709,14 @@ export class PolisRenderer {
     return sig;
   }
 
+  // B5 — cheap districts signature for diff gating. Sorted by districtId so
+  // reordering doesn't trigger a false positive. O(D log D).
+  private static districtsHash(districts: readonly District[]): string {
+    if (districts.length === 0) return "none";
+    const ids = districts.map((d) => d.districtId).sort();
+    return ids.join(",");
+  }
+
   /**
    * Polis-P5 — normalize a project-relative path to the canonical key used by the
    * `fileIdByPath` index, MIRRORING the Rust `meta_store::normalize_rel_path` so a
@@ -1705,6 +1748,18 @@ export class PolisRenderer {
    * polyline to walk. Pooled merchant figures are torn down + rebuilt inside the
    * layer (clean removeFromParent + destroy).
    */
+  /**
+   * B5 — rebuild inter-district road hit nodes from the current roads + buildings.
+   * Called on city build and on road-changed live diffs.
+   */
+  private syncRoadHitLayer(
+    roads: readonly Road[],
+    buildings: readonly Building[],
+  ): void {
+    this.roadHitLayer.setWorld(roads, buildings);
+    this.roadHitLayer.setLodVisible(this.viewport.scale.x >= TRADE_LOD_ZOOM);
+  }
+
   private syncTradeRoutes(roads: readonly Road[], terrain?: TerrainData): void {
     this.tradeRouteLayer.setWorld(
       roads,
@@ -3526,6 +3581,8 @@ export class PolisRenderer {
       // layer is hidden and roads render exactly as they do today (no zoom-out
       // flow). The per-step visible-chunk cull still gates which porters draw.
       this.tradeRouteLayer.setLodVisible(scale >= TRADE_LOD_ZOOM);
+      // B5 — inter-district road hit nodes: same LOD gate as trade-route porters.
+      this.roadHitLayer.setLodVisible(scale >= TRADE_LOD_ZOOM);
       // External cloud outposts: hidden in the far view (same band as agents) so
       // the seaward margin doesn't speckle the zoomed-out overview.
       this.externalLayer.setLodVisible(scale >= LOD_EXTERNAL);

@@ -118,6 +118,7 @@ function driveCulling(fake: unknown, scale: number): void {
   r["agentLayer"] = lodStub;
   r["ambientLayer"] = lodStub;
   r["tradeRouteLayer"] = lodStub;
+  r["roadHitLayer"] = lodStub;
   r["externalLayer"] = lodStub;
   // A very large viewport so every chunk intersects (no node is culled out).
   r["viewport"] = {

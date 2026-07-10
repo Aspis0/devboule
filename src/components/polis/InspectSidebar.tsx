@@ -1186,32 +1186,43 @@ function ConnectionPopup({
   onClose: () => void;
   onSelectBuilding: (b: Building) => void;
 }) {
-  const { consumer, supplier, weight } = useMemo(() => {
+  const { consumer, supplier, weight, provenance, consumerDistrict, supplierDistrict } = useMemo(() => {
     if (!city)
       return {
         consumer: null as Building | null,
         supplier: null as Building | null,
         weight: 0,
+        provenance: null as "ast" | "regex" | "semantic" | null,
+        consumerDistrict: null as string | null,
+        supplierDistrict: null as string | null,
       };
     const byId = new Map(city.buildings.map((b) => [b.fileId, b]));
-    // The road's weight (for the "imports" strength), matched by endpoints.
+    const districtById = new Map(city.districts.map((d) => [d.districtId, d]));
+    // The road's weight + provenance (for the "imports" strength), matched by endpoints.
     let w = 0;
+    let prov: "ast" | "regex" | "semantic" | null = null;
     for (const r of city.roads) {
       if (r.from === from && r.to === to) {
         w = r.weight;
+        prov = r.provenance ?? null;
         break;
       }
     }
+    const c = byId.get(from) ?? null;
+    const s = byId.get(to) ?? null;
     return {
-      consumer: byId.get(from) ?? null,
-      supplier: byId.get(to) ?? null,
+      consumer: c,
+      supplier: s,
       weight: w,
+      provenance: prov,
+      consumerDistrict: c ? (districtById.get(c.districtId)?.name ?? null) : null,
+      supplierDistrict: s ? (districtById.get(s.districtId)?.name ?? null) : null,
     };
     // Depend on the buildings/roads arrays specifically — NOT the whole `city`
     // reference, which changes on every live agent/sin/status diff and would
     // needlessly rebuild the byId Map while the popup is open. The memo only
     // reads `city.buildings` (endpoint resolution) and `city.roads` (weight).
-  }, [city?.buildings, city?.roads, from, to]);
+  }, [city?.buildings, city?.roads, city?.districts, from, to]);
 
   return (
     <PopupFrame
@@ -1230,18 +1241,22 @@ function ConnectionPopup({
               <ArrowRight className="h-3.5 w-3.5" /> Relationship
             </h4>
             <p className="text-[12.5px] leading-5 text-cream-600">
-              <span className="font-semibold text-cream-800">
-                {consumer.label}
-              </span>{" "}
-              imports{" "}
-              <span className="font-semibold text-cream-800">
-                {supplier.label}
-              </span>
-              .
+              Connects{' '}<span className="font-semibold text-cream-800">{consumer.label}</span>
+              {consumerDistrict && (
+                <> (<span className="text-[11px] text-cream-400">district {consumerDistrict}</span>)</>
+              )}{' to '}<span className="font-semibold text-cream-800">{supplier.label}</span>
+              {supplierDistrict && (
+                <> (<span className="text-[11px] text-cream-400">district {supplierDistrict}</span>)</>
+              )}
             </p>
             {weight > 0 && (
               <p className="mt-1 text-[11px] text-cream-400">
                 Route weight {weight} — porters per road scale with this.
+              </p>
+            )}
+            {provenance && (
+              <p className="mt-0.5 text-[11px] text-cream-400">
+                Provenance: {provenance}
               </p>
             )}
           </section>

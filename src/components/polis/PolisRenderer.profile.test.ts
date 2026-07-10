@@ -89,6 +89,7 @@ function driveCulling(fake: unknown, scale: number): void {
   r["agentLayer"] = lodStub;
   r["ambientLayer"] = lodStub;
   r["tradeRouteLayer"] = lodStub;
+  r["roadHitLayer"] = lodStub;
   r["externalLayer"] = lodStub;
   r["viewport"] = {
     scale: { x: scale },
