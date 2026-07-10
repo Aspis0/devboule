@@ -15,6 +15,7 @@ import type { Bounds, TerrainData } from "../../types/city";
 import { Proj, Z_UNIT } from "./kitcd/iso";
 import { gardenBed } from "./kitcd/detail";
 import { roundTile } from "./navWalkable";
+import { texFillStyle, type SpriteBank } from "./spriteAssets";
 import {
   cropRows,
   vineyard,
@@ -321,6 +322,7 @@ export function parcelTiles(parcels: FieldParcel[]): Set<string> {
 export function drawFields(
   _ext: TerrainExtent,
   parcels: FieldParcel[],
+  bank?: SpriteBank | null,
 ): { graphics: Graphics } {
   // Build a simple Proj that maps tile coords to iso screen space.
   // This is equivalent to cartToIso but with the Proj interface the kitcd
@@ -336,24 +338,35 @@ export function drawFields(
 
   const g = new Graphics();
 
+  // A4 — per-kind textured parcel bases (null ⇒ each primitive's flat base).
+  // Multiply tints pull the stock textures toward each kind's tone: fresh
+  // green for gardens/orchards, worked earth for crops/vineyard/fallow.
+  const baseByKind = {
+    garden: texFillStyle(bank, "tex:grass", 0xc6cf96, 1),
+    crops: texFillStyle(bank, "tex:dirtolive", 0xd8d0a8, 1),
+    vineyard: texFillStyle(bank, "tex:dirt", 0xe4d9b4, 1),
+    orchard: texFillStyle(bank, "tex:grass", 0xaeb886, 1),
+    fallow: texFillStyle(bank, "tex:dirt", 0xd4c8a4, 1),
+  } as const;
+
   for (const parcel of parcels) {
     const { x, y, w, h, kind, accents, seed } = parcel;
 
     switch (kind) {
       case "garden":
-        gardenBed(g, proj, x, y, w, h, seed);
+        gardenBed(g, proj, x, y, w, h, seed, baseByKind.garden);
         break;
       case "crops":
-        cropRows(g, proj, x, y, w, h, seed);
+        cropRows(g, proj, x, y, w, h, seed, baseByKind.crops);
         break;
       case "vineyard":
-        vineyard(g, proj, x, y, w, h, seed);
+        vineyard(g, proj, x, y, w, h, seed, baseByKind.vineyard);
         break;
       case "orchard":
-        orchardGrid(g, proj, x, y, w, h, seed);
+        orchardGrid(g, proj, x, y, w, h, seed, baseByKind.orchard);
         break;
       case "fallow":
-        fallowField(g, proj, x, y, w, h, seed);
+        fallowField(g, proj, x, y, w, h, seed, baseByKind.fallow);
         break;
     }
 

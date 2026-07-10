@@ -20,6 +20,7 @@
 // (fileId, tile coords) — same project, same city, pixel for pixel. No
 // Math.random anywhere (render-path rule).
 
+import { Matrix as PixiMatrix } from "pixi.js";
 import type { Texture } from "pixi.js";
 import { hashString } from "./rng";
 import {
@@ -57,6 +58,46 @@ export function spritesDisabled(search: string): boolean {
 
 /** `${base}:v${n}` — the variant-family key shape pickVariant draws from. */
 const VARIANT_RE = /^(.+):v(\d+)$/;
+
+/** Graphics fill style produced by {@link texFillStyle}. */
+export interface TexFillStyle {
+  texture: Texture;
+  matrix: import("pixi.js").Matrix;
+  /**
+   * LOAD-BEARING: pixi v8 defaults to "local", which stretches the texture
+   * across the shape's BOUNDING BOX — on a large polygon that renders one
+   * giant blurry copy instead of a repeating carpet. "global" ties UVs to the
+   * Graphics' coordinate space so the matrix controls the repeat size and the
+   * pattern stays continuous across every shape sharing the Graphics.
+   */
+  textureSpace: "global";
+  color: number;
+  alpha: number;
+}
+
+/**
+ * Build a repeating-texture Graphics fill from a bank single, or null when
+ * the bank misses (caller falls back to its flat-color fill). `scale` sizes
+ * the repeat: 0.35 ⇒ a 256px source repeats every ~90 world px (~1 tile).
+ * The multiply `tint` can only DARKEN the texture — pick light sources.
+ */
+export function texFillStyle(
+  bank: SpriteBank | null | undefined,
+  key: string,
+  tint: number,
+  alpha: number,
+  scale = 0.35,
+): TexFillStyle | null {
+  const texture = bank?.get(key) ?? null;
+  if (!texture) return null;
+  return {
+    texture,
+    matrix: new PixiMatrix().scale(scale, scale),
+    textureSpace: "global",
+    color: tint,
+    alpha,
+  };
+}
 
 /**
  * Resolved sprite lookup. Only FULLY resolved entries are present: an entry

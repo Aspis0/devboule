@@ -117,14 +117,21 @@ export function gardenBed(
   w: number,
   d: number,
   seed?: number,
+  // A4 — optional real-art base (repeating grass texture fill); flowers and
+  // outline still draw on top. Pixi's FillInput: kit stays spriteAssets-free.
+  baseFill?: import("pixi.js").FillInput | null,
 ): void {
   seed = seed || 1;
   const a = proj.p(x0, y0, 0.02);
   const b = proj.p(x0 + w, y0, 0.02);
   const c = proj.p(x0 + w, y0 + d, 0.02);
   const e = proj.p(x0, y0 + d, 0.02);
-  isoPoly(g, [a, b, c, e], M.grassDk);
-  isoPoly(g, [a, b, c, e], M.grass, 0.55);
+  if (baseFill) {
+    g.poly([a.x, a.y, b.x, b.y, c.x, c.y, e.x, e.y]).fill(baseFill);
+  } else {
+    isoPoly(g, [a, b, c, e], M.grassDk);
+    isoPoly(g, [a, b, c, e], M.grass, 0.55);
+  }
   outlinePoly(g, [a, b, c, e], S(M.grassDk, 0.8), 1.4, 0.6);
   const cols = [M.flowerA, M.flowerB, M.flowerC];
   for (let i = 0; i < Math.round(w * d * 8); i++) {

@@ -11,6 +11,29 @@ import { Graphics } from "pixi.js";
 import { MAT, shade as S, poly as isoPoly, outlinePoly, type Proj } from "./iso";
 import { olive } from "./detail";
 
+/**
+ * Optional real-art base fill (A4): when provided, the parcel's flat base
+ * quad is painted with this style (a repeating texture from the sprite bank)
+ * instead of the flat MAT color; all detail work (furrows, vines, trees,
+ * tufts) still draws on top. Null/undefined ⇒ the original flat base.
+ * Type is pixi's own FillInput to avoid importing spriteAssets from the kit.
+ */
+export type ParcelBaseFill = import("pixi.js").FillInput;
+
+/** Paint the parcel base quad: textured when `baseFill` given, flat otherwise. */
+function parcelBase(
+  g: Graphics,
+  pts: { x: number; y: number }[],
+  baseFill: ParcelBaseFill | null | undefined,
+  flatColor: number,
+): void {
+  if (baseFill) {
+    g.poly(pts.flatMap((p) => [p.x, p.y])).fill(baseFill);
+  } else {
+    isoPoly(g, pts, flatColor);
+  }
+}
+
 // Seeded sin-hash (same as detail.ts).
 const rnd = (seed: number): number => {
   const x = Math.sin(seed * 99.13) * 43758.5;
@@ -45,6 +68,7 @@ export function cropRows(
   w: number,
   d: number,
   seed: number,
+  baseFill?: ParcelBaseFill | null,
 ): void {
   drawParcelBorder(g, proj, gx, gy, w, d);
   // Base earth fill.
@@ -52,7 +76,7 @@ export function cropRows(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  isoPoly(g, [a, b, c, e], S(MAT.earth, 0.95));
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.earth, 0.95));
 
   // Furrow rows along the parcel's x-axis (long axis).
   const rowCount = Math.round(w * 3.5 + rnd(seed) * 1.5);
@@ -101,6 +125,7 @@ export function vineyard(
   w: number,
   d: number,
   seed: number,
+  baseFill?: ParcelBaseFill | null,
 ): void {
   drawParcelBorder(g, proj, gx, gy, w, d);
   // Bare earth base.
@@ -108,7 +133,7 @@ export function vineyard(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  isoPoly(g, [a, b, c, e], S(MAT.sand, 0.9));
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.sand, 0.9));
 
   // Vine rows — fewer than crops (1 per ~1.5 tiles of depth).
   const rowCount = Math.max(2, Math.round(d / 1.5));
@@ -155,6 +180,7 @@ export function orchardGrid(
   w: number,
   d: number,
   seed: number,
+  baseFill?: ParcelBaseFill | null,
 ): void {
   drawParcelBorder(g, proj, gx, gy, w, d);
   // Light grass base.
@@ -162,7 +188,7 @@ export function orchardGrid(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  isoPoly(g, [a, b, c, e], S(MAT.grassDk, 0.95));
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.grassDk, 0.95));
 
   // Tree grid — ~1 tree per 1.5 tiles.
   const spacing = 1.5;
@@ -189,6 +215,7 @@ export function fallowField(
   w: number,
   d: number,
   seed: number,
+  baseFill?: ParcelBaseFill | null,
 ): void {
   drawParcelBorder(g, proj, gx, gy, w, d);
   // Bare earth base.
@@ -196,7 +223,7 @@ export function fallowField(
   const b = proj.p(gx + w, gy, 0.015);
   const c = proj.p(gx + w, gy + d, 0.015);
   const e = proj.p(gx, gy + d, 0.015);
-  isoPoly(g, [a, b, c, e], S(MAT.earth, 0.88));
+  parcelBase(g, [a, b, c, e], baseFill, S(MAT.earth, 0.88));
 
   // Sparse dry-grass tufts.
   const tufts = Math.round(w * d * 3);

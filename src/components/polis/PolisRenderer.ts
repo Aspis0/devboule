@@ -2365,7 +2365,7 @@ export class PolisRenderer {
         centre,
       });
       if (parcels.length > 0) {
-        const { graphics } = drawFields(ext, parcels);
+        const { graphics } = drawFields(ext, parcels, this.spriteBank);
         this.fieldsGraphics = graphics;
         // Apply LOD immediately so a live-diff rebuild at low zoom doesn't
         // leave the fresh Graphics visible=true (PixiJS default) until the

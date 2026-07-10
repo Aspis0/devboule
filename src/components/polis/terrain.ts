@@ -15,11 +15,11 @@
 // (one per shade band + one for seams) at setCityState time. Nothing here is
 // touched per frame.
 
-import { Container, Graphics, Matrix } from "pixi.js";
+import { Container, Graphics } from "pixi.js";
 import { cartToIso } from "./iso";
 import { DERIVED } from "./palette";
 import { valueNoise } from "./rng";
-import type { SpriteBank } from "./spriteAssets";
+import { texFillStyle, type SpriteBank } from "./spriteAssets";
 import type { TerrainData } from "../../types/city";
 
 export interface TerrainExtent {
@@ -119,36 +119,14 @@ const TEX_SCALE = 0.35;
 const GRASS_TINT = 0xd9d6a4;
 const DIRT_TINT = 0xe0d5b8;
 
-/**
- * Texture fill style, or null when the bank misses.
- * `textureSpace: "global"` is LOAD-BEARING: pixi v8 defaults to "local",
- * which STRETCHES the texture across the shape's bounding box — on the
- * full-extent base polygon that renders one giant blurry copy instead of a
- * repeating carpet. "global" ties UVs to the Graphics' coordinate space so
- * the matrix controls the repeat size and the pattern is continuous across
- * every shape sharing the Graphics.
- */
+/** Shared repeating-texture fill helper (see spriteAssets.texFillStyle). */
 function texFill(
   bank: SpriteBank | null | undefined,
   key: string,
   tint: number,
   alpha: number,
-): {
-  texture: import("pixi.js").Texture;
-  matrix: Matrix;
-  textureSpace: "global";
-  color: number;
-  alpha: number;
-} | null {
-  const texture = bank?.get(key) ?? null;
-  if (!texture) return null;
-  return {
-    texture,
-    matrix: new Matrix().scale(TEX_SCALE, TEX_SCALE),
-    textureSpace: "global",
-    color: tint,
-    alpha,
-  };
+) {
+  return texFillStyle(bank, key, tint, alpha, TEX_SCALE);
 }
 
 export function drawTerrain(
