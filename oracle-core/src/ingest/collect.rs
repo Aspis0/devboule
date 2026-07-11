@@ -129,13 +129,15 @@ fn basename_is_secret(name: &str) -> bool {
     if lower == ".env" || lower.starts_with(".env.") {
         return true;
     }
-    // Content-word secret dumps for data extensions only
-    let dot = lower.rfind('.');
-    if let Some(suffix) = dot.map(|d| &lower[d..]) {
-        if SECRET_DATA_EXTENSIONS.contains(&suffix) {
-            if SECRET_CONTENT_WORDS.iter().any(|w| lower.contains(w)) {
-                return true;
-            }
+    // Content-word secret dumps for data extensions only.
+    // Python: `suffix = lower[dot:] if dot > 0 else ""` — a leading-dot name
+    // (dot == 0) yields NO suffix, so dotfiles never take this branch.
+    if let Some(dot) = lower.rfind('.').filter(|&d| d > 0) {
+        let suffix = &lower[dot..];
+        if SECRET_DATA_EXTENSIONS.contains(&suffix)
+            && SECRET_CONTENT_WORDS.iter().any(|w| lower.contains(w))
+        {
+            return true;
         }
     }
     false
@@ -283,12 +285,16 @@ fn fnmatch_inner(p: &[char], t: &[char]) -> bool {
 }
 
 fn find_bracket_close(p: &[char], open: usize) -> Option<usize> {
-    for i in (open + 1)..p.len() {
-        if p[i] == ']' {
-            return Some(i);
-        }
+    // Python fnmatch: a `]` IMMEDIATELY after `[` (or `[!`/`[^`) is a literal
+    // class member, not the closing bracket — `[]abc]` is the class `]abc`.
+    let mut scan_from = open + 1;
+    if scan_from < p.len() && (p[scan_from] == '!' || p[scan_from] == '^') {
+        scan_from += 1;
     }
-    None
+    if scan_from < p.len() && p[scan_from] == ']' {
+        scan_from += 1;
+    }
+    (scan_from..p.len()).find(|&i| p[i] == ']')
 }
 
 fn char_in_class(ch: char, class_body: &[char], negated: bool) -> bool {
@@ -659,18 +665,31 @@ fn walk_recursive(
         Err(_) => return,
     };
 
-    // Separate into dirs and files (mimicking os.walk)
+    // Separate into dirs and files, mimicking `os.walk(followlinks=False)`:
+    // a symlink-to-dir shows up in dirnames (visible to the install-root
+    // check) but is NEVER descended into; a symlink-to-file shows up in
+    // filenames and is read through the link, exactly like Python.
     let mut dirnames: Vec<String> = Vec::new();
+    let mut no_descend: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut filenames: Vec<String> = Vec::new();
 
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Ok(ft) = entry.file_type() {
-            if ft.is_dir() {
-                dirnames.push(name);
-            } else if ft.is_file() {
-                filenames.push(name);
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            // DirEntry::file_type never follows links; classify by target.
+            match fs::metadata(entry.path()) {
+                Ok(m) if m.is_dir() => {
+                    no_descend.insert(name.clone());
+                    dirnames.push(name);
+                }
+                Ok(m) if m.is_file() => filenames.push(name),
+                _ => {}
             }
+        } else if ft.is_dir() {
+            dirnames.push(name);
+        } else if ft.is_file() {
+            filenames.push(name);
         }
     }
 
@@ -713,6 +732,34 @@ fn walk_recursive(
     // Sort dirnames for deterministic walk order
     dirnames.sort();
     for dirname in &dirnames {
+        if no_descend.contains(dirname) {
+            continue; // symlink-to-dir: listed, never walked (os.walk parity)
+        }
         walk_recursive(&current.join(dirname), root, ignore_policy, files);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ground truth from Python `fnmatch.fnmatchcase` (probed 2026-07-11):
+    /// a `]` right after `[` (or `[!`) is a literal class member.
+    #[test]
+    fn fnmatch_bracket_literal_close() {
+        assert!(fnmatch("[]abc]", "]"));
+        assert!(fnmatch("[]abc]", "a"));
+        assert!(!fnmatch("[]abc]", "d"));
+        assert!(!fnmatch("[!]a]", "]"));
+        assert!(fnmatch("[!]a]", "b"));
+        assert!(!fnmatch("[!]a]", "a"));
+    }
+
+    /// Python: dotfiles (rfind('.') == 0) never take the content-word branch.
+    #[test]
+    fn dotfile_never_secret_by_content_words() {
+        assert!(!basename_is_secret(".tokenrc")); // no data extension anyway
+        assert!(basename_is_secret("my-secret-config.json"));
+        assert!(!basename_is_secret("readme.json"));
     }
 }

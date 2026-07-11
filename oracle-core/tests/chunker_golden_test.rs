@@ -185,3 +185,43 @@ fn golden_chunks_match_fixture() {
         }
     }
 }
+
+// ── P2-review regression tests ──────────────────────────────────────────────
+
+/// os.walk(followlinks=False) parity: symlink-to-FILE is collected (read
+/// through the link); symlink-to-DIR is never descended into.
+#[cfg(unix)]
+#[test]
+fn collect_symlink_walk_parity() {
+    use oracle_core::ingest::collect::collect_text_files;
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("real.py"), "print('hi')\n").unwrap();
+    symlink(root.join("real.py"), root.join("linked.py")).unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("hidden.py"), "print('no')\n").unwrap();
+    symlink(outside.path(), root.join("linked_dir")).unwrap();
+
+    let files = collect_text_files(root);
+    let names: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    assert!(names.contains(&"real.py".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"linked.py".to_string()),
+        "symlinked FILE must be collected like Python os.walk: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("hidden.py")),
+        "symlinked DIR must never be descended: {names:?}"
+    );
+}

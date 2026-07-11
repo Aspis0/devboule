@@ -177,7 +177,8 @@ fn extract_symbols_used(text: &str, language: &str) -> Vec<String> {
     for pattern in &patterns {
         for caps in pattern.captures_iter(text) {
             if caps.len() == 1 {
-                if let Some(m) = caps.get(1) {
+                // No capturing groups: Python's findall returns the FULL match.
+                if let Some(m) = caps.get(0) {
                     let g = m.as_str().trim();
                     if !g.is_empty() && !g.starts_with('.') && g.len() >= 2 {
                         symbols.insert(g.to_string());

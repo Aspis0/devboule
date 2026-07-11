@@ -182,3 +182,20 @@ parse `symbols_used` as JSON before iterating:
    uses `lexical_chunk_score()` directly (pure function over chunk dicts) and
    ranks by score, which is equivalent for the deterministic fixture since our
    corpus has no vector store. The top-10 ranking is by lexical score only.
+
+### `end_char` over-extends into the next chunk (semantic chunker)
+
+**Function:** `oracle/ingestion/ast_chunker.py` — end-of-chunk offset arithmetic
+(`char_positions[end_line] + len(prev_line)` for non-final semantic chunks).
+
+**Bug:** for every non-final semantic chunk, the stored `end_char` metadata
+extends PAST the chunk's own text into the beginning of the next chunk
+(probe: `text[start_char:end_char]` returns cross-chunk garbage). The chunk's
+`text` field itself is correct (built from line joins, not offsets) — only the
+`start_char`/`end_char` metadata pair violates its documented semantics.
+
+**Status:** found by the P2 hostile review (2026-07-11), CONFIRMED with a
+Python probe. The Rust port (`oracle-core/src/ingest/ast_chunker.rs`)
+reproduces it faithfully and the golden fixtures freeze the wrong values.
+Fix post-port together with the `symbols_used` bug via a chunk-profile bump
+(both change on-disk chunk records → full re-chunk + re-embed).
