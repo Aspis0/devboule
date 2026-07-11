@@ -493,8 +493,8 @@ pub struct MiniCoderDirective {
     #[serde(default, skip_serializing_if = "is_mini_tier")]
     pub tier: DirectiveTier,
     /// ROLE UNTANGLE Phase 3: EXPLICIT project scope for an APP-AUTHORED directive
-    /// (one whose `parent_agent_id` is the "app-user" sentinel, e.g. the UI's
-    /// `spawn_main_coder_directive` command). MCP-dispatched directives derive
+    /// (one whose `parent_agent_id` is the "app-user" sentinel, i.e. appended by
+    /// `append_main_coder_directive`, today called from `polis_fix_sin`). MCP-dispatched directives derive
     /// their project from the live parent session (`snapshot_parent_project`) and
     /// leave this None; when Some, the executor prefers it and skips the
     /// parent-liveness auto-kill (the human IS the supervisor of an app-authored

@@ -25,7 +25,7 @@ fn generate_id() -> String {
 ///
 /// This is extracted as a pure helper so the Tauri command can stay thin and
 /// the validation logic is directly testable without an AppHandle.
-pub(crate) fn validate_main_coder_request(
+fn validate_main_coder_request(
     task: &str,
     files: &[String],
 ) -> Result<(String, Vec<String>), String> {
@@ -88,9 +88,12 @@ pub(crate) fn validate_main_coder_request(
 
 /// Append a first-class Main coder directive to the shared agent ledger.
 ///
-/// Core logic extracted from the `spawn_main_coder_directive` Tauri command so
-/// that non-command code (e.g. `polis_fix_sin`) can dispatch directives without
-/// needing a `State<BackendState>` handle. The caller is responsible for the
+/// Core logic extracted as a plain helper so that non-command code (today
+/// only `polis_fix_sin`) can dispatch an app-authored directive without
+/// needing a `State<BackendState>` handle. (The Python MCP tool
+/// `spawn_main_coder` is the conceptual twin on the MCP path, but it goes
+/// through the `.aspis-agents.json` bridge and never calls this function.)
+/// The caller is responsible for the
 /// unlocked-vault check — this helper does NOT call `ensure_unlocked`.
 ///
 /// Returns the generated directive id on success.

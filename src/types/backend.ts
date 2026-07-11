@@ -1805,7 +1805,6 @@ export interface CliAgentsStatus {
 	claudeConfigured: boolean;
 	claudeConfigPath: string | null;
 	codexConfigured: boolean;
-	codexConfigPath: string | null;
 	codexNote: string | null;
 	interpreter: string | null;
 	root: string | null;

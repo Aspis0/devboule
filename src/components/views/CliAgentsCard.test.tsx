@@ -43,7 +43,6 @@ const READY_STATUS: CliAgentsStatus = {
   claudeConfigured: false,
   claudeConfigPath: null,
   codexConfigured: false,
-  codexConfigPath: null,
   codexNote: null,
   interpreter: null,
   root: null,

@@ -4377,7 +4377,7 @@ fn clarification_banner_sub_surfaces_the_question_to_the_human() {
 
 #[test]
 fn app_authored_directive_carries_its_own_project_and_never_loses_a_parent() {
-    // The UI's spawn_main_coder_directive appends parent="app-user" (an event-log
+    // `append_main_coder_directive` (called from polis_fix_sin) appends parent="app-user" (an event-log
     // sentinel, never a live session) + an explicit projectId. The executor must
     // scope it from the directive itself and skip the parent-liveness auto-kill —
     // this is the hostile-review BLOCKER regression test (a session-derived scope

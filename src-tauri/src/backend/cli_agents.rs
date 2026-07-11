@@ -49,8 +49,6 @@ pub struct CliAgentsStatus {
     pub claude_config_path: Option<String>,
     /// The `aspis-management` MCP entry is present in `~/.codex/config.toml`.
     pub codex_configured: bool,
-    /// Absolute path to the Codex config (when Codex support is built).
-    pub codex_config_path: Option<String>,
     /// Human-readable note about Codex support state (e.g. deferred).
     pub codex_note: Option<String>,
     /// Resolved venv (or fallback) interpreter that the entry's `command` points at.
@@ -77,7 +75,6 @@ impl CliAgentsStatus {
             claude_configured: false,
             claude_config_path: None,
             codex_configured: false,
-            codex_config_path: None,
             codex_note: Some(CODEX_DEFERRED_NOTE.to_string()),
             interpreter: None,
             root: None,

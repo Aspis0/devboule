@@ -422,7 +422,7 @@ pub const NO_LOCAL_ORCHESTRATOR_MODEL_MSG: &str =
     "No local orchestrator model is configured — pick one in Settings → Providers, or switch \
      the orchestrator to Claude/Codex.";
 
-pub fn local_model_preflight_verdict(
+fn local_model_preflight_verdict(
     base_url: &str,
     model: &str,
     listed: Option<&[String]>,

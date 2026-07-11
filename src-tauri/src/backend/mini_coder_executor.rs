@@ -2887,7 +2887,8 @@ fn snapshot_parent_project(
 }
 
 /// ROLE UNTANGLE Phase 3: the sentinel `parent_agent_id` of an APP-AUTHORED
-/// directive (the UI's `spawn_main_coder_directive` command). It is an event-log
+/// directive (appended by `append_main_coder_directive`, called from
+/// `polis_fix_sin`). It is an event-log
 /// identity, never a live session — such directives carry their project scope
 /// EXPLICITLY (`directive.project_id`) and have no parent session to lose.
 pub(crate) const APP_USER_PARENT: &str = "app-user";
