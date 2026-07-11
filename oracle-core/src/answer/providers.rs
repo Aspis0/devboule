@@ -214,14 +214,31 @@ pub fn validate_remote_llm_config(config: &LlmConfig) -> Result<(), AnswerError>
             "Remote Oracle LLM base URL must be HTTPS.".to_string(),
         ));
     }
-    let hostname = parsed.host_str().unwrap_or("");
+    // Python compares `urlparse(url).netloc.lower()` — the RAW authority
+    // including any explicit port — against a plain-host allowlist, so ANY
+    // explicit port (even :443) is rejected. `Url::host_str()`/`port()`
+    // normalize default ports away, which would let
+    // `https://api.scaleway.ai:8443/...` through; extract the raw netloc
+    // from the string instead.
+    let netloc = raw_netloc(&base_url).to_lowercase();
     let allowed_hosts = provider_allowed_hosts(&provider);
-    if !allowed_hosts.contains(hostname) {
+    if !allowed_hosts.contains(netloc.as_str()) {
         return Err(AnswerError::Validation(
             "Remote Oracle LLM base URL host does not match the selected provider.".to_string(),
         ));
     }
     Ok(())
+}
+
+/// The raw authority component (`host[:port]`, incl. userinfo if present) of
+/// a URL string — Python `urlparse(url).netloc` equivalent.
+fn raw_netloc(url: &str) -> &str {
+    let rest = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => return "",
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &rest[..end]
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

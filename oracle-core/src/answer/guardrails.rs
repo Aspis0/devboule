@@ -190,11 +190,18 @@ pub fn normalize_citations(
         let ref_id = match raw {
             serde_json::Value::String(s) => Some(s.clone()),
             serde_json::Value::Object(map) => {
+                // Python: `raw.get("ref") or raw.get("source_ref")` — a null
+                // or EMPTY "ref" falls through to source_ref (falsy chain).
+                let non_empty_str = |v: &serde_json::Value| {
+                    v.as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                };
                 let ref_val = map
                     .get("ref")
-                    .or_else(|| map.get("source_ref"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                    .and_then(non_empty_str)
+                    .or_else(|| map.get("source_ref").and_then(non_empty_str));
                 if let Some(ref r) = ref_val {
                     // Try chunk_id resolution.
                     if let Some(item) = context.iter().find(|c| c.chunk_id == *r) {
@@ -259,13 +266,16 @@ pub fn answer_is_too_generic(query: &str, answer: &str, context: &[PreparedChunk
     }
 
     let q_terms = crate::answer::context::excerpt_query_terms_set(query);
-    let _rnaseq_q: HashSet<&str> = [
+    // Python gates this whole check on RNA-seq terms in the QUERY:
+    // `({"rna-seq", ...} & q_terms) and len(answer) > 40`.
+    let rnaseq_q: HashSet<&str> = [
         "rna-seq", "rnaseq", "output", "outputs", "download", "browser",
     ]
     .iter()
     .copied()
     .collect();
-    if !q_terms.is_empty() && answer.len() > 40 {
+    let rnaseq_query = q_terms.iter().any(|t| rnaseq_q.contains(t.as_str()));
+    if rnaseq_query && answer.len() > 40 {
         let domain_terms = [
             "output_renders",
             "artifact_url",
@@ -504,16 +514,45 @@ pub fn normalize_grounding_term(term: &str) -> String {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn answer_sentences(answer: &str) -> Vec<String> {
-    sentence_split_re()
-        .split(answer)
+    split_after_sentence_punct(answer, false)
+        .into_iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn sentence_split_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[.!?]+\s+").unwrap())
+/// Python `re.split(r"(?<=[.!?])\s+", text)` (and, when
+/// `split_newline_runs`, the `|\n+` alternative of `best_sentence`):
+/// split at whitespace runs that FOLLOW sentence punctuation, KEEPING the
+/// punctuation on the sentence — the `regex` crate has no lookbehind, so
+/// this is a char-walk with identical semantics.
+pub(crate) fn split_after_sentence_punct(text: &str, split_newline_runs: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let after_punct = matches!(cur.chars().last(), Some('.' | '!' | '?'));
+        if c.is_whitespace() && after_punct {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            parts.push(std::mem::take(&mut cur));
+            continue;
+        }
+        if split_newline_runs && c == '\n' {
+            while i < chars.len() && chars[i] == '\n' {
+                i += 1;
+            }
+            parts.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    parts.push(cur);
+    parts
 }
 
 pub fn natural_claim_terms(sentence: &str) -> Vec<String> {
@@ -573,10 +612,24 @@ pub fn parse_json_response(raw: &str) -> ParsedAnswer {
     ParsedAnswer::default()
 }
 
+/// Python `bool(value)` over a JSON value.
+fn json_truthy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
 fn json_value_to_parsed(obj: &serde_json::Map<String, serde_json::Value>) -> ParsedAnswer {
     ParsedAnswer {
         answer: obj.get("answer").and_then(|v| v.as_str()).map(String::from),
         citations: obj.get("citations").and_then(|v| v.as_array()).cloned(),
-        not_found: obj.get("not_found").and_then(|v| v.as_bool()),
+        // Python: `bool(parsed.get("not_found"))` — TRUTHINESS, not strict
+        // bool: "false" (non-empty string) is TRUE, 0/""/null/[] are false.
+        not_found: obj.get("not_found").map(json_truthy),
     }
 }

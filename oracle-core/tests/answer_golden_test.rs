@@ -444,3 +444,79 @@ fn test_chat_completions_url() {
         "https://api.scaleway.ai/v1/chat/completions"
     );
 }
+
+// ── P5-review regression tests ──────────────────────────────────────────────
+
+fn cfg(provider: &str, base_url: &str) -> oracle_core::answer::providers::LlmConfig {
+    oracle_core::answer::providers::LlmConfig {
+        provider: provider.to_string(),
+        model: "test-model".to_string(),
+        base_url: base_url.to_string(),
+        api_key: "test-key".to_string(),
+    }
+}
+
+/// Python compares the RAW netloc (host:port) against a plain-host allowlist,
+/// so ANY explicit port — even :443 — must be rejected (review F1).
+#[test]
+fn provider_gate_rejects_explicit_ports() {
+    use oracle_core::answer::providers::validate_remote_llm_config;
+    assert!(
+        validate_remote_llm_config(&cfg("scaleway", "https://api.scaleway.ai:8443/v1")).is_err()
+    );
+    assert!(
+        validate_remote_llm_config(&cfg("scaleway", "https://api.scaleway.ai:443/v1")).is_err()
+    );
+    // Case-insensitive host match (Python lowercases the netloc).
+    assert!(validate_remote_llm_config(&cfg("scaleway", "https://Api.SCALEWAY.AI/v1")).is_ok());
+    // Subdomain trick must fail: netloc compare is exact, not contains.
+    assert!(
+        validate_remote_llm_config(&cfg("scaleway", "https://api.scaleway.ai.evil.com/v1"))
+            .is_err()
+    );
+}
+
+/// focused_excerpt behavior (review F14): untested by the golden prompts
+/// because the fixtures disable it via a huge limit.
+#[test]
+fn focused_excerpt_behavior() {
+    use oracle_core::answer::context::focused_excerpt;
+
+    // Short text passes through untouched.
+    let short = "fn spawn_gpu() {}";
+    assert_eq!(focused_excerpt(short, "gpu spawn", 2800), short);
+
+    // Long text with a late match: the excerpt window centers on matched
+    // terms and carries the mid-chunk markers.
+    let filler = "x".repeat(4000);
+    let long = format!("{filler}\nThe scaleway gpu spawn limit lives here.\n{filler}");
+    let out = focused_excerpt(&long, "scaleway gpu spawn limit", 400);
+    assert!(
+        out.contains("scaleway gpu spawn limit"),
+        "window must cover the match"
+    );
+    assert!(
+        out.contains("[excerpt starts mid-chunk]"),
+        "leading marker expected"
+    );
+    assert!(
+        out.contains("[excerpt ends mid-chunk]"),
+        "trailing marker expected"
+    );
+    assert!(
+        out.chars().count() < long.chars().count(),
+        "must actually truncate"
+    );
+
+    // No term matches: Python falls back to truncate_text (head + marker).
+    let no_match = focused_excerpt(&long, "zzz qqq", 400);
+    assert!(no_match.contains("[truncated]"));
+    assert!(!no_match.contains("[excerpt starts mid-chunk]"));
+
+    // Determinism: identical inputs give identical output (unlike Python,
+    // whose per-term 40-position cap depends on hash-seeded term order).
+    assert_eq!(
+        focused_excerpt(&long, "scaleway gpu spawn limit", 400),
+        focused_excerpt(&long, "scaleway gpu spawn limit", 400)
+    );
+}

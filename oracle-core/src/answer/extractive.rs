@@ -561,23 +561,22 @@ pub fn structural_extractive_answer(
             }
         }
     }
-    let _summary = if !symbols.is_empty() {
-        let syms: Vec<&str> = symbols.iter().take(5).map(|s| s.as_str()).collect();
-        format!(
-            "Found relevant code in {} file(s) covering: {}.",
-            file_count,
-            syms.join(", ")
-        )
-    } else {
-        format!("Found relevant context in {} file(s).", file_count)
-    };
+    // Python's structural_extractive_answer also emits a "summary" key, but
+    // ask() IGNORES it (query_engine.py:186 builds summary from
+    // generated["answer"]), so it never reaches any consumer — not ported.
     Some(NormalizedAnswer {
         answer: truncate_text(&body, max_answer_chars()),
         citations: all_citations,
         not_found: false,
         suggested_path: None,
         answer_source: Some("extractive_synthesis".to_string()),
-        fallback_reason: Some(reason.unwrap_or("structural_extractive").to_string()),
+        // Python: `reason or "structural_extractive"` — empty string is falsy.
+        fallback_reason: Some(
+            reason
+                .filter(|r| !r.is_empty())
+                .unwrap_or("structural_extractive")
+                .to_string(),
+        ),
         llm_provider: None,
         llm_model: None,
     })
@@ -594,8 +593,10 @@ pub fn best_sentence(text: &str, query: &str) -> Option<String> {
         return None;
     }
     let terms = crate::answer::context::excerpt_query_terms_set(query);
-    let candidates: Vec<&str> = sentence_split_re()
-        .split(&cleaned)
+    // Python: re.split(r"(?<=[.!?])\s+|\n+", cleaned) — punctuation KEPT.
+    let split = crate::answer::guardrails::split_after_sentence_punct(&cleaned, true);
+    let candidates: Vec<&str> = split
+        .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
@@ -625,9 +626,4 @@ pub fn best_sentence(text: &str, query: &str) -> Option<String> {
 fn sentence_ws_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"\s+").unwrap())
-}
-
-fn sentence_split_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"[.!?]+\s+|[.!?]+\n+").unwrap())
 }

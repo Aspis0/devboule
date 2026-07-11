@@ -166,11 +166,14 @@ pub fn prepared_context(chunks: &[RawChunk], query: &str) -> Vec<PreparedChunk> 
 pub fn is_superseded_context(chunk: &RawChunk) -> bool {
     let source = chunk_file_source(chunk).to_lowercase();
     let text = chunk.text.to_lowercase();
-    let text_head = if text.len() > 1600 {
-        &text[..1600]
-    } else {
-        &text
-    };
+    // Python slices CHARACTERS ([:1600]); a byte slice can split a UTF-8
+    // char and panic. Find the char-safe boundary.
+    let head_end = text
+        .char_indices()
+        .nth(1600)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let text_head = &text[..head_end];
     if text_head.contains("superseded") {
         return true;
     }
@@ -269,6 +272,11 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
     if terms.is_empty() {
         return truncate_text(text, limit);
     }
+    // Python iterates a set (hash-seed order) into the 40-position cap, so
+    // its excerpt varies across processes. Rust picks ONE deterministic
+    // order (sorted) — always a member of Python's possible-output family.
+    let mut terms: Vec<String> = terms.into_iter().collect();
+    terms.sort();
 
     let lower = text.to_lowercase();
     let mut positions: Vec<usize> = Vec::new();
@@ -304,9 +312,12 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
         // start = max(0, position - limit // 3)
         // end = min(len(text), start + limit)
         // start = max(0, end - limit)
+        // NOTE: Python counts CHARS; these are byte offsets, so on multibyte
+        // text the window is slightly SHORTER than Python's (never longer).
+        // Boundaries are clamped to char boundaries so slicing cannot panic.
         let py_start = 0_usize.max(position.saturating_sub(limit / 3));
-        let py_end = text.len().min(py_start + limit);
-        let py_start2 = 0_usize.max(py_end.saturating_sub(limit));
+        let py_end = floor_char_boundary(text, text.len().min(py_start + limit));
+        let py_start2 = floor_char_boundary(text, 0_usize.max(py_end.saturating_sub(limit)));
 
         let window = &lower[py_start2..py_end];
         let mut score: i64 = 0;
@@ -320,7 +331,7 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
         }
     }
 
-    let excerpt_end = (best_start + limit).min(text.len());
+    let excerpt_end = floor_char_boundary(text, (best_start + limit).min(text.len()));
     let mut result = text[best_start..excerpt_end].trim().to_string();
 
     if best_start > 0 {
@@ -330,6 +341,16 @@ pub fn focused_excerpt(text: &str, query: &str, limit: usize) -> String {
         result = format!("{}\n[excerpt ends mid-chunk]", result);
     }
     result
+}
+
+/// Largest char-boundary index `<= i` (stable equivalent of the nightly
+/// `str::floor_char_boundary`).
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Extract query terms for focused_excerpt — byte-exact port of Python.
@@ -360,14 +381,15 @@ fn term_weight(term: &str) -> i64 {
 }
 
 /// Truncate text with a marker — mirrors `answerer.py::truncate_text`.
+/// Python counts CHARACTERS; slice on a char boundary, never mid-UTF-8.
 pub fn truncate_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        text.to_string()
-    } else {
-        // Python: text[:limit].rstrip() + "\n[truncated]"
-        let truncated = &text[..limit];
-        let rstripped = truncated.trim_end();
-        format!("{}\n[truncated]", rstripped)
+    match text.char_indices().nth(limit) {
+        None => text.to_string(),
+        Some((byte_end, _)) => {
+            // Python: text[:limit].rstrip() + "\n[truncated]"
+            let rstripped = text[..byte_end].trim_end();
+            format!("{}\n[truncated]", rstripped)
+        }
     }
 }
 

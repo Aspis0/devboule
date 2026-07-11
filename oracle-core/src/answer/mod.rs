@@ -85,12 +85,12 @@ pub fn answer_from_context(
     query: &str,
     chunks: &[ContextChunk],
     llm_config: Option<&LlmConfig>,
-) -> NormalizedAnswer {
+) -> Result<NormalizedAnswer, AnswerError> {
     let raw_chunks: Vec<RawChunk> = chunks.iter().map(context_chunk_to_raw).collect();
     let context = context::prepared_context(&raw_chunks, query);
 
     if context.is_empty() {
-        return extractive::not_found_answer(query, &[], None);
+        return Ok(extractive::not_found_answer(query, &[], None));
     }
 
     if env::var("ORACLE_ASK_DISABLE_LLM")
@@ -98,30 +98,25 @@ pub fn answer_from_context(
         .trim()
         == "1"
     {
-        return extractive_answer(
+        return Ok(extractive_answer(
             query,
             &context,
             Some("LLM disabled for bounded smoke/test run"),
-        );
+        ));
     }
 
     let prompt = build_answer_prompt(query, &context);
     let config = match normalize_llm_config(llm_config) {
         Ok(c) => c,
-        Err(AnswerError::PrivacyGate(e)) => {
-            return NormalizedAnswer {
-                answer: format!("Privacy gate error: {}", e),
-                citations: vec![],
-                not_found: true,
-                suggested_path: None,
-                answer_source: Some("error".to_string()),
-                fallback_reason: Some(e),
-                llm_provider: None,
-                llm_model: None,
-            };
-        }
+        // Python RE-RAISES OraclePrivacyGateError — the caller answers HTTP
+        // 500, an answer dict is never fabricated. Mirror it: propagate.
+        Err(e @ AnswerError::PrivacyGate(_)) => return Err(e),
         Err(_) => {
-            return extractive_answer(query, &context, Some("LLM config normalization failed"));
+            return Ok(extractive_answer(
+                query,
+                &context,
+                Some("LLM config normalization failed"),
+            ));
         }
     };
 
@@ -134,7 +129,7 @@ fn answer_with_llm_config(
     prompt: &str,
     context: &[PreparedChunk],
     config: &LlmConfig,
-) -> NormalizedAnswer {
+) -> Result<NormalizedAnswer, AnswerError> {
     let is_local = providers::LOCAL_LLM_PROVIDERS.contains(&config.provider.as_str());
     let needs_key = !is_local;
 
@@ -147,23 +142,13 @@ fn answer_with_llm_config(
         let mut answer = extractive_answer(query, context, Some(reason));
         answer.llm_provider = Some(config.provider.clone());
         answer.llm_model = Some(config.model.clone());
-        return answer;
+        return Ok(answer);
     }
 
     let raw_response = match generate_with_openai_compatible(prompt, config) {
         Ok(r) => r,
-        Err(AnswerError::PrivacyGate(e)) => {
-            return NormalizedAnswer {
-                answer: format!("Privacy gate error: {}", e),
-                citations: vec![],
-                not_found: true,
-                suggested_path: None,
-                answer_source: Some("error".to_string()),
-                fallback_reason: Some(e),
-                llm_provider: Some(config.provider.clone()),
-                llm_model: Some(config.model.clone()),
-            };
-        }
+        // Python re-raises the privacy gate; everything else degrades.
+        Err(e @ AnswerError::PrivacyGate(_)) => return Err(e),
         Err(e) => {
             let short = short_error_string(&e.to_string());
             let mut answer = extractive_answer(
@@ -173,7 +158,7 @@ fn answer_with_llm_config(
             );
             answer.llm_provider = Some(config.provider.clone());
             answer.llm_model = Some(config.model.clone());
-            return answer;
+            return Ok(answer);
         }
     };
 
@@ -181,7 +166,7 @@ fn answer_with_llm_config(
     let mut answer = normalize_answer(query, &parsed, context);
     answer.llm_provider = Some(config.provider.clone());
     answer.llm_model = Some(config.model.clone());
-    answer
+    Ok(answer)
 }
 
 /// Convert a ContextChunk to a RawChunk.
@@ -204,12 +189,15 @@ fn context_chunk_to_raw(c: &ContextChunk) -> RawChunk {
     }
 }
 
+/// Python `short_error`: whitespace-collapse, 220 CHARS, class-name fallback
+/// for empty messages (Rust has no class name — "error" stands in).
 fn short_error_string(s: &str) -> String {
     let cleaned: String = s.split_whitespace().collect::<Vec<&str>>().join(" ");
-    if cleaned.len() > 220 {
-        cleaned[..220].to_string()
+    let truncated: String = cleaned.chars().take(220).collect();
+    if truncated.is_empty() {
+        "error".to_string()
     } else {
-        cleaned
+        truncated
     }
 }
 
@@ -236,7 +224,9 @@ impl LlmAnswerer {
 
 impl ContextAnswerer for LlmAnswerer {
     fn answer(&self, query: &str, context_chunks: &[ContextChunk]) -> Result<AnswerPayload> {
-        let result = answer_from_context(query, context_chunks, self.config.as_ref());
+        // A privacy-gate violation propagates as Err (Python re-raises it and
+        // the HTTP layer answers 500); every other failure degraded already.
+        let result = answer_from_context(query, context_chunks, self.config.as_ref())?;
 
         Ok(AnswerPayload {
             answer: result.answer,
