@@ -91,15 +91,9 @@ fn symbol_patterns() -> &'static [Regex; 7] {
     PATTERNS.get_or_init(|| {
         [
             // JS/TS function
-            Regex::new(
-                r"\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)",
-            )
-            .unwrap(),
+            Regex::new(r"\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)").unwrap(),
             // JS/TS const/let/var
-            Regex::new(
-                r"\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
-            )
-            .unwrap(),
+            Regex::new(r"\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=").unwrap(),
             // JS/TS class
             Regex::new(r"\b(?:export\s+)?class\s+([A-Za-z_$][\w$]*)").unwrap(),
             // Rust fn
@@ -117,10 +111,8 @@ fn symbol_patterns() -> &'static [Regex; 7] {
 fn route_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r#"['"](/(?:api/|workers/|artifacts/|outputs/|jobs/|projects/)[^'"\s)]+)"#,
-        )
-        .unwrap()
+        Regex::new(r#"['"](/(?:api/|workers/|artifacts/|outputs/|jobs/|projects/)[^'"\s)]+)"#)
+            .unwrap()
     })
 }
 
@@ -286,7 +278,12 @@ pub fn classify_domains(source: &str, text: &str) -> Vec<String> {
     );
     add(
         "oracle_answering",
-        &["answer_from_context", "queryengine", "oracle_ask", "oracle_context"],
+        &[
+            "answer_from_context",
+            "queryengine",
+            "oracle_ask",
+            "oracle_context",
+        ],
     );
     add(
         "oracle_mcp_agents",
@@ -313,11 +310,26 @@ pub fn classify_domains(source: &str, text: &str) -> Vec<String> {
     );
     add(
         "provider_privacy",
-        &["zdr", "gdpr", "infomaniak", "mistral", "openrouter", "scaleway"],
+        &[
+            "zdr",
+            "gdpr",
+            "infomaniak",
+            "mistral",
+            "openrouter",
+            "scaleway",
+        ],
     );
     add(
         "gpu_cpu_lifecycle",
-        &["gpu", "cpu", "vm", "egpu", "terminate", "delete", "scale-to-zero"],
+        &[
+            "gpu",
+            "cpu",
+            "vm",
+            "egpu",
+            "terminate",
+            "delete",
+            "scale-to-zero",
+        ],
     );
 
     domains
@@ -459,9 +471,8 @@ pub fn question_templates(domains: &[String], source: &str, symbols: &[String]) 
                 );
             }
             "cloudflare_worker_secret_rotation" => {
-                questions.push(
-                    "Where is Cloudflare Worker secret rotation implemented?".to_string(),
-                );
+                questions
+                    .push("Where is Cloudflare Worker secret rotation implemented?".to_string());
                 questions.push(
                     "Which code writes Cloudflare Worker secrets and validates rotation requests?"
                         .to_string(),
@@ -485,14 +496,14 @@ pub fn question_templates(domains: &[String], source: &str, symbols: &[String]) 
             }
             "oracle_indexing" => {
                 questions.push(
-                    "How does Oracle chunk, embed, index, and refresh LanceDB records?"
-                        .to_string(),
+                    "How does Oracle chunk, embed, index, and refresh LanceDB records?".to_string(),
                 );
                 questions.push("Where is incremental Oracle indexing implemented?".to_string());
             }
             "oracle_answering" => {
                 questions.push(
-                    "How does Oracle retrieve context and answer questions from chunks?".to_string(),
+                    "How does Oracle retrieve context and answer questions from chunks?"
+                        .to_string(),
                 );
             }
             "oracle_mcp_agents" => {

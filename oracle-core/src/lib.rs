@@ -5,8 +5,8 @@
 //! For now it hosts the proven embedding backends and the LanceDB query path.
 
 pub mod config;
-pub mod ingest;
 pub mod embedder;
+pub mod ingest;
 pub mod lance;
 pub mod onnx_embedder;
 pub mod store;

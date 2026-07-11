@@ -9,8 +9,7 @@ use std::fs;
 use serde::Deserialize;
 
 use oracle_core::ingest::retrieval_text::{
-    chunk_embedding_text, classify_domains, classify_source_kind, query_embedding_text,
-    ChunkMeta,
+    chunk_embedding_text, classify_domains, classify_source_kind, query_embedding_text, ChunkMeta,
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
@@ -141,8 +140,8 @@ fn golden_chunk_embedding_texts() {
     let chunks_json = load_string(&fixture_path("golden/fixtures/chunks.json"));
     let emb_json = load_string(&fixture_path("golden/fixtures/embedding_texts.json"));
 
-    let raw_chunks: HashMap<String, Vec<RawChunk>> = serde_json::from_str(&chunks_json)
-        .expect("Failed to parse chunks.json");
+    let raw_chunks: HashMap<String, Vec<RawChunk>> =
+        serde_json::from_str(&chunks_json).expect("Failed to parse chunks.json");
     let emb: EmbeddingTexts =
         serde_json::from_str(&emb_json).expect("Failed to parse embedding_texts.json");
 
@@ -204,8 +203,8 @@ fn golden_classify() {
     let chunks_json = load_string(&fixture_path("golden/fixtures/chunks.json"));
     let classify_json = load_string(&fixture_path("golden/fixtures/classify.json"));
 
-    let raw_chunks: HashMap<String, Vec<RawChunk>> = serde_json::from_str(&chunks_json)
-        .expect("Failed to parse chunks.json");
+    let raw_chunks: HashMap<String, Vec<RawChunk>> =
+        serde_json::from_str(&chunks_json).expect("Failed to parse chunks.json");
     let expected_map: HashMap<String, ClassifyExpected> =
         serde_json::from_str(&classify_json).expect("Failed to parse classify.json");
 
@@ -223,7 +222,11 @@ fn golden_classify() {
             Err(_) => {
                 // Fallback: concatenate chunk texts (imperfect but won't match fixture).
                 let chunks = &raw_chunks[file_id];
-                chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n")
+                chunks
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
         };
 
