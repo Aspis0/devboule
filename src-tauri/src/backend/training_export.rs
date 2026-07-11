@@ -124,14 +124,6 @@ fn severity_token(s: Severity) -> &'static str {
     }
 }
 
-/// Severity ordering for `maxSeverity` (high > medium > low).
-fn severity_rank(s: Severity) -> u8 {
-    match s {
-        Severity::High => 2,
-        Severity::Medium => 1,
-        Severity::Low => 0,
-    }
-}
 
 /// The directive's best "activity time": the most recent of started/claimed/created
 /// timestamps that parses as RFC3339. None if the directive carries no parseable
@@ -642,7 +634,7 @@ pub fn record_findings_batch(
             let max_sev = findings
                 .iter()
                 .map(|f| f.severity)
-                .max_by_key(|s| severity_rank(*s))
+                .max_by_key(|s| s.rank())
                 .map(severity_token);
             let open_findings = findings.len();
             let verdict = json!({

@@ -81,14 +81,6 @@ const TITLE_MERGE_JACCARD: f64 = 0.6;
 /// merging same-title findings whose rationales describe different things.
 const BODY_MERGE_JACCARD: f64 = 0.4;
 
-/// Higher = more severe. Used to pick a cluster's representative finding.
-fn severity_rank(s: Severity) -> u8 {
-    match s {
-        Severity::High => 2,
-        Severity::Medium => 1,
-        Severity::Low => 0,
-    }
-}
 
 /// The clustering key for a finding: its 1-based line, or [`FILE_LEVEL_LINE`] when the
 /// finding is file-level (no line).
@@ -348,8 +340,8 @@ fn finalize_cluster(cluster: &[(i64, usize, RawFinding)]) -> VotedFinding {
             // beats an equal-severity file-level one: after the drifted-assertion merge a
             // file-level fragment can share a cluster with a pinpointed one, and the
             // output must not lose the line a sample actually provided.
-            let rank = severity_rank(f.severity);
-            let rep_rank = severity_rank(g.rep.severity);
+            let rank = f.severity.rank();
+            let rep_rank = g.rep.severity.rank();
             if rank > rep_rank || (rank == rep_rank && g.rep.line.is_none() && f.line.is_some()) {
                 g.rep = f;
             }
@@ -367,7 +359,7 @@ fn finalize_cluster(cluster: &[(i64, usize, RawFinding)]) -> VotedFinding {
     for g in &groups[1..] {
         let more_votes = g.samples.len() > best.samples.len();
         let equal_votes = g.samples.len() == best.samples.len();
-        let higher_sev = severity_rank(g.rep.severity) > severity_rank(best.rep.severity);
+        let higher_sev = g.rep.severity.rank() > best.rep.severity.rank();
         if more_votes || (equal_votes && higher_sev) {
             best = g;
         }
@@ -406,7 +398,7 @@ pub fn split_by_threshold(
     voted.sort_by(|a, b| {
         b.votes
             .cmp(&a.votes)
-            .then_with(|| severity_rank(b.finding.severity).cmp(&severity_rank(a.finding.severity)))
+            .then_with(|| b.finding.severity.rank().cmp(&a.finding.severity.rank()))
     });
 
     let mut confirmed: Vec<RawFinding> = Vec::new();

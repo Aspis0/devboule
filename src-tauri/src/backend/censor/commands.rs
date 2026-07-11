@@ -687,14 +687,6 @@ pub fn kill_all_on_exit(app: &AppHandle) {
     }
 }
 
-/// Rank a severity for sorting: High=0, Medium=1, Low=2.
-fn severity_rank(s: Severity) -> u8 {
-    match s {
-        Severity::High => 0,
-        Severity::Medium => 1,
-        Severity::Low => 2,
-    }
-}
 
 /// Format Censor findings as human-readable text for agent context.
 /// Token budget: max 10 findings, max 4096 bytes, sorted by severity.
@@ -706,7 +698,7 @@ pub fn format_findings_text(findings: &[Finding]) -> String {
         return String::new();
     }
     let mut sorted: Vec<&Finding> = findings.iter().collect();
-    sorted.sort_by_key(|f| severity_rank(f.severity));
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.severity.rank()));
     let mut out = String::new();
     for (i, f) in sorted.iter().enumerate() {
         if i >= 10 {
@@ -809,7 +801,7 @@ pub fn drain_censor_queue(root: &Path) -> Vec<crate::backend::censor::schema::Fi
             }
         }
     }
-    out.sort_by_key(|f| severity_rank(f.severity));
+    out.sort_by_key(|f| std::cmp::Reverse(f.severity.rank()));
     out
 }
 

@@ -25,6 +25,21 @@ pub enum Severity {
     Low,
 }
 
+impl Severity {
+    /// Numeric severity rank: higher = more severe (`High` > `Medium` > `Low`).
+    /// The single source of truth for severity ordering across the censor module —
+    /// do not reintroduce a local `severity_rank` fn; callers that need ASCENDING
+    /// ("least severe first") order should sort by `Reverse(sev.rank())` or an
+    /// explicit `b.rank().cmp(&a.rank())` comparator instead of inverting the enum values.
+    pub fn rank(self) -> u8 {
+        match self {
+            Severity::High => 2,
+            Severity::Medium => 1,
+            Severity::Low => 0,
+        }
+    }
+}
+
 /// Finding category. `dead-code` is kebab-cased over the wire to match the TS
 /// union in the plan; the rest are single lowercase words.
 ///
