@@ -2,4 +2,5 @@
 //!
 //! Ported from `oracle/server/query_engine.py` with golden-verified parity.
 
+pub mod engine;
 pub mod lexical;
