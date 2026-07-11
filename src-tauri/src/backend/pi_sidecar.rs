@@ -11,8 +11,6 @@
 //! - Per-session generation counters (Arc<AtomicU64>) — spawning session B does NOT
 //!   kill session A's reader thread.
 //! - Multi-session state: HashMap<sessionId, session> + per-session generation.
-//! - `spike_pi_prompt(sessionId?)`: creates new session if absent, routes to existing if present.
-//! - `spike_pi_stop(sessionId)`: kills a session, joins reader, drops state.
 //! - Vault adapter: reads coder backend from config.json + API key from keyring,
 //!   passes as env vars to the Node sidecar.
 //!
@@ -1038,39 +1036,6 @@ fn get_or_spawn_session(
 
 // ---- Tauri commands --------------------------------------------------------
 
-/// Tauri command: send a prompt text to a pi sidecar session. If `session_id`
-/// is None, creates a new session and returns its id. If present, routes to
-/// that session (creating it if it doesn't exist yet).
-#[tauri::command]
-pub async fn spike_pi_prompt(
-    app: AppHandle,
-    text: String,
-    session_id: Option<String>,
-) -> Result<SessionInfo, String> {
-    let (sid, is_new) = get_or_spawn_session(&app, session_id, None, None)?;
-
-    // 3e: a fresh (non-censor) user prompt breaks any in-flight review→fix→review
-    // loop, so reset this session's consecutive censor-triggered round counter.
-    censor_loop_reset(&sid);
-
-    // Deliver the prompt to the freshly spawned session's stdin. The entire
-    // liveness-check + JSONL write + zombie-cleanup block now lives in
-    // `send_prompt_to_session` (shared with the project-side orchestrator/coder
-    // launches). Errors are surfaced — never swallowed — because a launched but
-    // idle session is worse than a loud failure.
-    send_prompt_to_session(&app, &sid, &text)?;
-
-    let channel = super::mini_activity::mini_activity_channel(&sid);
-    Ok(SessionInfo {
-        session_id: sid,
-        is_new,
-        // The legacy spike path does not set DEVBOULE_AGENT_ROLE, so the sidecar
-        // defaults to `main-coder` — report that here for consistency.
-        agent_role: "main-coder".to_string(),
-        channel,
-    })
-}
-
 /// Deliver a prompt to a running pi sidecar session by writing
 /// `{"type":"prompt","message":<text>}` JSONL to the session's shared stdin.
 ///
@@ -1209,12 +1174,6 @@ pub fn spawn_sidecar_for_role(
         agent_role: role.to_string(),
         channel,
     })
-}
-
-/// Tauri command: stop a specific pi sidecar session.
-#[tauri::command]
-pub async fn spike_pi_stop(app: AppHandle, session_id: String) -> Result<bool, String> {
-    stop_pi_session(&app, &session_id)
 }
 
 // ---- event mapping ---------------------------------------------------------
@@ -2143,6 +2102,9 @@ fn censor_loop_bump_in(map: &mut HashMap<String, u8>, session_id: &str) {
 }
 
 /// Pure: reset the consecutive-round count for `session_id` to 0.
+// Retained for unit-test coverage; production wrapper (censor_loop_reset) was
+// removed with the dead spike_pi_prompt command.
+#[allow(dead_code)]
 fn censor_loop_reset_in(map: &mut HashMap<String, u8>, session_id: &str) {
     map.insert(session_id.to_string(), 0);
 }
@@ -2163,13 +2125,6 @@ fn censor_loop_bump(session_id: &str) {
     censor_loop_bump_in(&mut map, session_id);
 }
 
-/// Reset the consecutive-round counter — called on a fresh (non-censor) user prompt.
-fn censor_loop_reset(session_id: &str) {
-    let mut map = censor_loop_counters()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    censor_loop_reset_in(&mut map, session_id);
-}
 
 // ---- Fix 4: per-session delivered-finding ids (dedup across rounds) -------
 //
