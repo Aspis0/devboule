@@ -530,14 +530,12 @@ function CensorStatusBar({
 		// Clear any previous timeout so rapid clicks don't cancel each other.
 		if (copyTimer.current) clearTimeout(copyTimer.current);
 		try {
-			await invokeBackendCommand("clipboard_write", { text: hint });
+			await navigator.clipboard.writeText(hint);
 			setCopied(name);
 			copyTimer.current = setTimeout(() => setCopied(null), 1500);
 		} catch {
-			void navigator.clipboard?.writeText(hint).catch(() => {});
-			// Still show feedback even if only the fallback was attempted.
-			setCopied(name);
-			copyTimer.current = setTimeout(() => setCopied(null), 1500);
+			// Clipboard write failed (permission denied / insecure context) — do not
+			// claim success.
 		}
 	};
 

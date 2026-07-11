@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { CensorPanelView } from "./CensorPanel";
+// Vite `?raw` imports inline the file's text at transform time (no node:fs, which
+// this tsconfig has no types for). We assert against the raw component source.
+import censorPanelSrc from "./CensorPanel.tsx?raw";
 import { finalReviewLaunchInput } from "./censorPanelModel";
 import type { CensorFinding, CensorStatus } from "../../types/backend";
 
@@ -168,6 +171,10 @@ describe("CensorPanelView states", () => {
       />,
     );
     expect(html).toContain("Could not enable Censor for this project.");
+  });
+
+  it("does not contain the nonexistent clipboard_write backend command (source-level guard)", () => {
+    expect(censorPanelSrc).not.toContain("clipboard_write");
   });
 });
 
