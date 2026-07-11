@@ -11747,11 +11747,13 @@ mod tests {
                     .take_while(|l| !l.is_empty())
                     .count();
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body,
                 );
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         format!("http://127.0.0.1:{}", addr.port())
@@ -11771,12 +11773,14 @@ mod tests {
                     .count();
                 let body = "error";
                 let response = format!(
-                    "HTTP/1.1 {} Error\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     status,
                     body.len(),
                     body,
                 );
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
         format!("http://127.0.0.1:{}", addr.port())
@@ -11844,16 +11848,23 @@ mod tests {
                         .take_while(|l| !l.is_empty())
                         .count();
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body,
                     );
                     let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
                 }
             }
         });
         let base = format!("http://127.0.0.1:{}", addr.port());
-        let client = reqwest::Client::new();
+        // Disable connection pooling so every page opens a fresh TCP connection,
+        // preventing keep-alive reuse from stalling against our simple mock server.
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
 
         let result = fetch_scaleway_paginated::<TestEnvelope, TestItem>(
             &client,
