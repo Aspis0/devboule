@@ -2439,7 +2439,15 @@ export function ProjectsView() {
 		input: SpawnLaunchInput,
 	): Promise<string | null> => {
 		if (isArchived) return null; // archived project is read-only.
-		if (busyRef.current) return null;
+		if (busyRef.current) {
+			// FAIL LOUD for the planner: a silent null here read as "the
+			// orchestrator ignores me" (callers show nothing on a null result).
+			if (input.role === "orchestrator")
+				setPlannerBanner(
+					"Another operation is still running — the orchestrator launch was skipped. Try again in a moment.",
+				);
+			return null;
+		}
 		busyRef.current = true;
 		setIsBusy(true);
 		setError(null);
@@ -2544,7 +2552,13 @@ export function ProjectsView() {
 		// carries it back (`initialGoalMsgId`) so the optimistic copy drains by identity.
 		goalMsgId: string,
 	) => {
-		if (busyRef.current || orchestratorPlanRef.current) return;
+		if (busyRef.current || orchestratorPlanRef.current) {
+			// FAIL LOUD (review #1): the last silent black-hole guard on the send path.
+			setPlannerBanner(
+				"The Planner is busy with a previous operation — this message was NOT delivered. Try again in a moment.",
+			);
+			return;
+		}
 		const folder = newProjectRootDraft.trim();
 		if (!folder) {
 			// The Folder is required (the project depends on a working tree). D4: guidance
@@ -2602,7 +2616,7 @@ export function ProjectsView() {
 			// ROLE UNTANGLE: a planner launch IS an orchestrator launch — pass the role
 			// truthfully so the ledger stores role:"orchestrator" for the local binary
 			// AND for a cloud CLI in duplex mode (the Stage binding is role-based now).
-			await launchFromSpawnPanel({
+			const landedId = await launchFromSpawnPanel({
 				projectId: detail.metadata.id,
 				role: "orchestrator",
 				// The chosen orchestrator backend: local Devboule ("orchestrator") or a cloud CLI
@@ -2623,6 +2637,12 @@ export function ProjectsView() {
 				// Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
 				cloudDuplex: plannerOrchestratorClient !== "orchestrator",
 			});
+			// A null result = no launch (silent archived/busy returns) — drop the
+			// seeded goal bubble; nothing will ever echo it.
+			if (!landedId)
+				setPlannerPending((prev) =>
+					prev.filter((p) => p.msgId !== goalMsgId),
+				);
 		} finally {
 			orchestratorPlanRef.current = false;
 		}
@@ -2644,16 +2664,30 @@ export function ProjectsView() {
 		// bubble (no echo can ever drain it).
 		const dropPendingGoal = () =>
 			setPlannerPending((prev) => prev.filter((p) => p.msgId !== goalMsgId));
+		// FAIL LOUD (unstick round): every early return here used to drop the
+		// message with NO feedback — the composer read as a black hole.
 		if (isArchived) {
 			dropPendingGoal();
+			setPlannerBanner(
+				"This project is archived (read-only) — the message was NOT delivered. Unarchive it to keep planning.",
+			);
 			return;
 		}
-		if (
-			!currentProject?.metadata.rootPath ||
-			busyRef.current ||
-			orchestratorPlanRef.current
-		) {
+		// Review #2: a missing folder must not masquerade as "busy" — Reset chat
+		// can never fix it (reachable via onRecallOrchestrator, which has no
+		// rootPath pre-check).
+		if (!currentProject?.metadata.rootPath) {
 			dropPendingGoal();
+			setPlannerBanner(
+				"This project has no folder yet — the message was NOT delivered. Pick a folder, then send again.",
+			);
+			return;
+		}
+		if (busyRef.current || orchestratorPlanRef.current) {
+			dropPendingGoal();
+			setPlannerBanner(
+				"The Planner is busy with a previous operation — this message was NOT delivered. Try again in a moment, or use Reset chat.",
+			);
 			return;
 		}
 		orchestratorPlanRef.current = true;
@@ -2671,12 +2705,16 @@ export function ProjectsView() {
 			);
 			if (!detail) {
 				dropPendingGoal();
+				// runMutation already raised the error toast; say it in the composer too.
+				setPlannerBanner(
+					"Couldn't record the goal (project update failed) — the message was NOT delivered. Try again.",
+				);
 				return;
 			}
 			beginPlannerLaunch();
 			// ROLE UNTANGLE: pass the planner's true role — the ledger stores
 			// role:"orchestrator" for local and cloud-duplex planners alike.
-			await launchFromSpawnPanel({
+			const launchedId = await launchFromSpawnPanel({
 				projectId: currentProject.metadata.id,
 				role: "orchestrator",
 				client: plannerOrchestratorClient,
@@ -2696,6 +2734,10 @@ export function ProjectsView() {
 				// Phase D: a CLOUD orchestrator runs as a duplex child (drives the Stage).
 				cloudDuplex: plannerOrchestratorClient !== "orchestrator",
 			});
+			// A null result means the launch never happened (error path already
+			// dropped the pending + raised the banner; the SILENT archived/busy
+			// returns did neither) — never leave a ghost bubble no echo can drain.
+			if (!launchedId) dropPendingGoal();
 		} finally {
 			orchestratorPlanRef.current = false;
 		}
@@ -3776,7 +3818,15 @@ export function ProjectsView() {
 								: undefined
 						}
 						onResetChat={
-							(orchestratorAgentId || cloudOrchestratorAgentId)
+							// UNSTICK: bind reset to the STABLE orchestrator id, NOT the live
+							// session ids — a stuck/idle chat (the exact state you need reset
+							// from) has no live session, and gating on liveness left the reset
+							// icon permanently disabled with a month-old wedged transcript.
+							// planner_reset_chat explicitly supports resetting an idle chat.
+							// Review #3: still OFF while archived (read-only) and while a
+							// launch is in flight (don't wipe a session mid-creation; the
+							// 30s plannerLaunching safety timeout bounds the wait).
+							plannerActivityAgentId && !isArchived && !plannerLaunching
 								? () => {
 									if (
 										!window.confirm(
@@ -3785,7 +3835,9 @@ export function ProjectsView() {
 									)
 										return;
 									const targetId =
-										orchestratorAgentId || cloudOrchestratorAgentId;
+										orchestratorAgentId ||
+										cloudOrchestratorAgentId ||
+										plannerActivityAgentId;
 									if (!targetId) return;
 									void (async () => {
 										try {
@@ -3914,7 +3966,15 @@ export function ProjectsView() {
 								setError("Select a folder for this project before planning.");
 								return;
 							}
-							if (busyRef.current || orchestratorPlanRef.current) return;
+							if (busyRef.current || orchestratorPlanRef.current) {
+								// FAIL LOUD: this guard used to swallow the message with zero
+								// feedback — with a wedged busy flag the composer looked like a
+								// black hole ("everything I type disappears").
+								setPlannerBanner(
+									"The Planner is busy with a previous operation — this message was NOT delivered. Try again in a moment, or use Reset chat.",
+								);
+								return;
+							}
 							setPlannerGoal(msg);
 							setPlannerPending((prev) => [...prev, { text: msg, msgId }]);
 							void planWithOrchestrator(
