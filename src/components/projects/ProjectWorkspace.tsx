@@ -71,6 +71,8 @@ import { BUILTIN_CLIENTS, SpawnPanel } from "../agents/SpawnPanel";
 import { SkillsToolsModal } from "../work/SkillsToolsModal";
 import { CensorStrip } from "../work/CensorStrip";
 import { buildCensorStrip } from "../work/censorStripModel";
+import { useMiniStuckReports } from "../work/useMiniStuckReports";
+import { MiniStuckBanner } from "../work/MiniStuckBanner";
 import { buildWorkConsoleModel, type WorkNode } from "../work/workConsoleModel";
 import { CensorFindingsTracker } from "./censorPanelModel";
 import { AgentConsentModal } from "./AgentConsentModal";
@@ -347,6 +349,22 @@ export function ProjectWorkspace({
       selectBoth(next, taskIdForAgent(next, sessions, claims));
     }
   }, [sessions, claims, selectBoth]);
+
+  // Stuck-report filter: match against BOTH current and previous sessions so a
+  // parent-gone stuck report (emitted after the parent left `sessions`) is still
+  // visible for one render cycle — prevSessionsRef holds the prior snapshot until
+  // the next effect run advances it.
+  const { reports: stuckReports, dismiss: dismissStuck } = useMiniStuckReports();
+  const stuckAgentIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of sessions) ids.add(s.agentId);
+    for (const s of prevSessionsRef.current) ids.add(s.agentId);
+    return ids;
+  }, [sessions]);
+  const filteredStuckReports = useMemo(
+    () => stuckReports.filter((r) => stuckAgentIds.has(r.agentId)),
+    [stuckReports, stuckAgentIds],
+  );
 
   // Auto-unpin the split's second pane when its agent's session disappears (reaped/exited),
   // so a dead agent can't leave a stale "unsplit" state or a wasted activity subscription.
@@ -879,6 +897,9 @@ export function ProjectWorkspace({
           </button>
         </div>
       )}
+
+      {/* ---- Mini-stuck banner ---- */}
+      <MiniStuckBanner reports={filteredStuckReports} onDismiss={dismissStuck} />
 
       {/* ---- Top bar ---- */}
       <div className="flex flex-col gap-2 rounded-2xl border border-cream-200 bg-white p-3 lg:flex-row lg:items-center lg:justify-between">

@@ -11,6 +11,9 @@ const MAX_OUTPUT_EXCERPT: usize = 800;
 #[serde(rename_all = "camelCase")]
 pub struct StuckReport {
     pub task_id: String,
+    /// The agent/coder that spawned the stuck mini — needed so the frontend can route the
+    /// report to the correct console panel.
+    pub agent_id: String,
     /// Why it's stuck: "timeout" | "failed" | "loop" (free string, caller-provided).
     pub reason: String,
     pub attempts: u32,
@@ -24,6 +27,7 @@ impl StuckReport {
     /// on a valid UTF-8 char boundary (never panics on multi-byte input).
     pub fn new(
         task_id: impl Into<String>,
+        agent_id: impl Into<String>,
         reason: impl Into<String>,
         attempts: u32,
         raw_output: &str,
@@ -38,6 +42,7 @@ impl StuckReport {
 
         StuckReport {
             task_id: task_id.into(),
+            agent_id: agent_id.into(),
             reason: reason.into(),
             attempts,
             last_output,
@@ -64,7 +69,7 @@ mod tests {
     #[test]
     fn new_truncates_long_output_to_tail() {
         let long = "x".repeat(1500);
-        let report = StuckReport::new("T1", "timeout", 2, &long, vec![]);
+        let report = StuckReport::new("T1", "agent-1", "timeout", 2, &long, vec![]);
         assert!(report.last_output.len() <= MAX_OUTPUT_EXCERPT);
         assert_eq!(report.last_output.len(), MAX_OUTPUT_EXCERPT);
         // The tail should be the last 800 chars, all 'x'.
@@ -74,21 +79,21 @@ mod tests {
     #[test]
     fn new_short_output_kept_whole() {
         let short = "hello";
-        let report = StuckReport::new("T2", "failed", 1, short, vec![]);
+        let report = StuckReport::new("T2", "agent-1", "failed", 1, short, vec![]);
         assert_eq!(report.last_output, short);
     }
 
     #[test]
     fn new_multibyte_utf8_no_panic() {
         let utf8: String = "日本語".repeat(500);
-        let report = StuckReport::new("T3", "loop", 3, &utf8, vec![]);
+        let report = StuckReport::new("T3", "agent-1", "loop", 3, &utf8, vec![]);
         // Should not panic; char count must be on a valid boundary.
         assert_eq!(report.last_output.chars().count(), MAX_OUTPUT_EXCERPT);
     }
 
     #[test]
     fn human_summary_contains_task_id_and_reason() {
-        let report = StuckReport::new("T42", "timeout", 5, "", vec!["a.rs".into(), "b.rs".into()]);
+        let report = StuckReport::new("T42", "agent-1", "timeout", 5, "", vec!["a.rs".into(), "b.rs".into()]);
         let summary = report.human_summary();
         assert!(summary.len() >= 12, "summary must be at least 12 chars, got: {}", summary);
         assert!(summary.contains("T42"));
@@ -100,7 +105,7 @@ mod tests {
 
     #[test]
     fn human_summary_empty_files_touched_omits_touched() {
-        let report = StuckReport::new("T99", "failed", 1, "", vec![]);
+        let report = StuckReport::new("T99", "agent-1", "failed", 1, "", vec![]);
         let summary = report.human_summary();
         assert!(summary.len() >= 12, "summary must be at least 12 chars, got: {}", summary);
         assert!(!summary.contains("touched:"));

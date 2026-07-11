@@ -835,6 +835,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             if !was_aborted {
                 let report = crate::backend::stuck_report::StuckReport::new(
                     directive.id.clone(),
+                    directive.parent_agent_id.clone(),
                     "timeout",
                     directive.attempt.saturating_add(1),
                     "",
@@ -888,6 +889,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             if !directive.kill_requested {
                 let report = crate::backend::stuck_report::StuckReport::new(
                     directive.id.clone(),
+                    directive.parent_agent_id.clone(),
                     "failed",
                     directive.attempt.saturating_add(1),
                     "",
@@ -964,6 +966,7 @@ fn run_pass(app: &AppHandle) -> Result<(), String> {
             if !directive.kill_requested {
                 let report = crate::backend::stuck_report::StuckReport::new(
                     id.clone(),
+                    directive.parent_agent_id.clone(),
                     "failed",
                     directive.attempt.saturating_add(1),
                     "",
@@ -2150,6 +2153,7 @@ fn finalize_finished_mini(app: &AppHandle, directive: &MiniCoderDirective) {
             .unwrap_or("");
         let report = crate::backend::stuck_report::StuckReport::new(
             directive.id.clone(),
+            directive.parent_agent_id.clone(),
             reason,
             directive.attempt.saturating_add(1),
             raw,
